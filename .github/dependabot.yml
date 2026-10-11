@@ -12,3 +12,6 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # The msrv job must use the Rust version promised in Cargo.toml.
+    ignore:
+      - dependency-name: dtolnay/rust-toolchain
