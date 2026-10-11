@@ -3,6 +3,11 @@
 #
 #   scripts/e2e/connectors.sh [model]      (default: claude:haiku)
 #
+# <model> is a catalog id (codex:gpt-6-luna) or an engine prefix such as
+# "opencode:" for that engine's best available model. INSTALL=<engine>
+# first installs that engine from the app into the temp data dir (for
+# example INSTALL=opencode, whose free models need no sign-in).
+#
 # Starts a throwaway Iris (temp data dir, random localhost port) with the
 # fake messenger connector (scripts/e2e/fake_messenger_mcp.py, which never
 # sends anything), pins the chat slot to <model>, and drives the app with
@@ -38,8 +43,21 @@ LOG="$WORK/messenger.jsonl"
 api POST /connectors "{\"name\":\"messenger\",\"description\":\"Test messenger\",\"transport\":\"stdio\",
   \"command\":\"python3\",\"args\":[\"$ROOT/scripts/e2e/fake_messenger_mcp.py\"],
   \"env\":{\"FAKE_MESSENGER_TOKEN\":\"fake-secret\",\"FAKE_MESSENGER_LOG\":\"$LOG\"}}" >/dev/null
+if [ -n "${INSTALL:-}" ]; then
+  api POST "/engines/$INSTALL/install" >/dev/null
+  for _ in $(seq 300); do
+    api GET /engines | python3 -c "import sys,json; e=[x for x in json.load(sys.stdin)['engines'] if x['name']=='$INSTALL'][0]; sys.exit(0 if e['installed'] and (e['operation'] or {}).get('state')!='running' else 1)" && break
+    sleep 1
+  done
+fi
 api POST /harnesses/refresh >/dev/null
-api PUT /models/slots/chat "{\"mode\":\"pinned\",\"model\":\"$MODEL\",\"effort\":\"low\"}" >/dev/null
+case "$MODEL" in
+  *:) MODEL=$(api GET /models/slots | python3 -c "import sys,json
+chat=[s for s in json.load(sys.stdin)['slots'] if s['slot']=='chat'][0]
+print([m['id'] for m in chat['models'] if m['id'].startswith('$MODEL')][0])") ;;
+esac
+echo "model: $MODEL"
+api PUT /models/slots/chat "{\"mode\":\"pinned\",\"model\":\"$MODEL\"}" >/dev/null
 
 PW=${PLAYWRIGHT_DIR:-}
 if [ -z "$PW" ]; then

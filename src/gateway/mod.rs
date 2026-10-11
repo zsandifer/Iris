@@ -94,6 +94,8 @@ struct Session {
     /// Bearer token it currently uses (OAuth connectors).
     bearer: Mutex<Option<String>>,
     last_used: AtomicI64,
+    /// Calls running right now (an idle reaper must not stop them).
+    inflight: std::sync::atomic::AtomicUsize,
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<Arc<Session>>>>;
@@ -518,6 +520,7 @@ async fn session(state: &AppState, con: &Connector) -> Result<Arc<Session>, Call
         fingerprint: fp,
         bearer: Mutex::new(bearer),
         last_used: AtomicI64::new(now_ms()),
+        inflight: Default::default(),
     });
     *guard = Some(s.clone());
     Ok(s)
@@ -555,9 +558,10 @@ pub async fn reap_idle(state: &AppState) {
         let Ok(mut guard) = slot.try_lock() else {
             continue;
         };
-        let idle = guard
-            .as_ref()
-            .is_some_and(|s| s.last_used.load(Ordering::SeqCst) < cutoff || !s.upstream.alive());
+        let idle = guard.as_ref().is_some_and(|s| {
+            s.inflight.load(Ordering::SeqCst) == 0
+                && (s.last_used.load(Ordering::SeqCst) < cutoff || !s.upstream.alive())
+        });
         if idle && let Some(s) = guard.take() {
             s.upstream.close().await;
             crate::info!("connector {id}: stopped (idle)");
@@ -860,7 +864,11 @@ async fn forward(
     for attempt in 0..2 {
         let s = session(state, con).await?;
         s.last_used.store(now_ms(), Ordering::SeqCst);
-        match s.upstream.call_tool(tool, args, CALL_TIMEOUT).await {
+        s.inflight.fetch_add(1, Ordering::SeqCst);
+        let result = s.upstream.call_tool(tool, args, CALL_TIMEOUT).await;
+        s.inflight.fetch_sub(1, Ordering::SeqCst);
+        s.last_used.store(now_ms(), Ordering::SeqCst);
+        match result {
             Ok(v) => {
                 if s.upstream.tools_changed() {
                     state
@@ -973,6 +981,7 @@ pub async fn pause_connector(state: &AppState, con: &Connector, reason: &str) {
         })
         .await;
     crate::warn!("connector {}: paused by a tripwire", con.name);
+    crate::connectors::broadcast_changed(state).await;
     let label = service_label(con);
     let card = json!({
         "type": "action",
@@ -1044,6 +1053,7 @@ pub async fn needs_sign_in(state: &AppState, con: &Connector) {
             .await;
     }
     stop(state, &con.id).await;
+    crate::connectors::broadcast_changed(state).await;
     crate::login::on_connector_auth_error(state, &con.name).await;
 }
 

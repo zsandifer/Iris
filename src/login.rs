@@ -176,6 +176,7 @@ pub async fn start(state: &AppState, harness: &str) -> Result<LoginStatus> {
     let mut cmd = Command::new(&program);
     cmd.args(&spec.args)
         .current_dir(state.paths.workspace_dir())
+        .env("PWD", state.paths.workspace_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

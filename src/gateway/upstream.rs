@@ -137,6 +137,7 @@ fn base_command(
     let mut cmd = Command::new(program);
     cmd.args(args)
         .current_dir(cwd)
+        .env("PWD", cwd)
         .kill_on_drop(true)
         .process_group(0);
     for k in STRIPPED_ENV {

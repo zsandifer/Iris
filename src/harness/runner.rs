@@ -63,7 +63,10 @@ pub struct RunRequest<'a> {
 
 fn base_command(program: &Path, cwd: &Path, env_remove: &[&str]) -> Command {
     let mut cmd = Command::new(program);
+    // Some CLIs take their project root from PWD rather than the real
+    // working directory; never let them inherit the daemon's.
     cmd.current_dir(cwd)
+        .env("PWD", cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -281,7 +284,7 @@ mod tests {
     #[tokio::test]
     async fn streams_stdin_through_and_finishes() {
         let (out, evs) = sh(
-            "cat; echo \"k=${IRIS_TEST_SECRET:-unset}\"",
+            "cat; echo \"k=${IRIS_TEST_SECRET:-unset} pwd=$PWD\"",
             b"a\nb\n",
             5000,
         )
@@ -292,8 +295,9 @@ mod tests {
             vec![
                 HarnessEvent::TextDelta { text: "a".into() },
                 HarnessEvent::TextDelta { text: "b".into() },
+                // PWD is the run's directory, not the daemon's.
                 HarnessEvent::TextDelta {
-                    text: "k=unset".into()
+                    text: "k=unset pwd=/".into()
                 },
                 HarnessEvent::Done
             ]
