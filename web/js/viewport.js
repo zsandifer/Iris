@@ -140,8 +140,12 @@ export function trackViewport(root) {
     else correctPosition();
   };
   // activeElement still names the departing input during focusout.
-  const afterBlur = () => {
-    if (prediction !== null) {
+  const afterBlur = (e) => {
+    // Focus moving straight into another text field (e.g. into the
+    // composer) keeps the keyboard up, so keep the prediction.
+    const next = e?.relatedTarget;
+    const staysEditing = !!next && (next.isContentEditable || next.matches?.('input, textarea'));
+    if (prediction !== null && !staysEditing) {
       clearPrediction();
       update();
     }
