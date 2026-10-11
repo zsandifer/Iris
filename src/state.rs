@@ -268,57 +268,66 @@ impl AppState {
     }
 
     async fn refresh_one(&self, entry: &HarnessEntry) {
-        {
-            let before = entry.status();
-            let mut next = before.clone();
-            next.checked_at = Some(now_ms());
-            match (entry.cfg.enabled, entry.program()) {
-                (false, _) => {
-                    next.installed = entry.program().is_some();
-                }
-                (true, None) => {
-                    next.installed = false;
-                    next.path = None;
-                    next.version = None;
-                    next.auth = AuthState::Unknown;
-                }
-                (true, Some(program)) => {
-                    next.installed = true;
-                    next.path = Some(program.to_string_lossy().into_owned());
-                    let cwd = self.paths.workspace_dir();
-                    let strip = self.strip_env(entry);
-                    if let Ok((_, out, _)) =
-                        runner::probe(&program, &["--version".into()], &cwd, &strip).await
-                    {
-                        let v = out.lines().next().unwrap_or("").trim();
-                        next.version = (!v.is_empty()).then(|| v.chars().take(80).collect());
+        // Probe first, then apply only what the probes found onto the
+        // status as it is by then: a turn may report a sign-in change (the
+        // only source for Gemini) while a probe runs.
+        let program = entry.program();
+        let mut version: Option<Option<String>> = None;
+        let mut auth: Option<(AuthState, Option<String>)> = None;
+        if let (true, Some(program)) = (entry.cfg.enabled, &program) {
+            let cwd = self.paths.workspace_dir();
+            let strip = self.strip_env(entry);
+            if let Ok((_, out, _)) =
+                runner::probe(program, &["--version".into()], &cwd, &strip).await
+            {
+                let v = out.lines().next().unwrap_or("").trim();
+                version = Some((!v.is_empty()).then(|| v.chars().take(80).collect()));
+            }
+            if let Some(args) = entry.harness.auth_probe_args() {
+                auth = Some(match runner::probe(program, &args, &cwd, &strip).await {
+                    Ok((ok, out, err)) => {
+                        let state = entry.harness.parse_auth_probe(ok, &out, &err);
+                        let message = (state == AuthState::AuthRequired)
+                            .then(|| "The CLI reports it is not signed in".to_string());
+                        (state, message)
                     }
-                    if let Some(args) = entry.harness.auth_probe_args() {
-                        match runner::probe(&program, &args, &cwd, &strip).await {
-                            Ok((ok, out, err)) => {
-                                next.auth = entry.harness.parse_auth_probe(ok, &out, &err);
-                                next.auth_message = (next.auth == AuthState::AuthRequired)
-                                    .then(|| "The CLI reports it is not signed in".to_string());
-                            }
-                            Err(_) => next.auth = AuthState::Unknown,
-                        }
-                    }
-                    // Without a status command the state comes from turns
-                    // and is kept (see `recheck_harnesses`).
-                    self.probe_models(entry, &program).await;
+                    Err(_) => (AuthState::Unknown, None),
+                });
+            }
+            // Without a status command the state comes from turns and is
+            // kept (see `recheck_auth`).
+            self.probe_models(entry, program).await;
+        }
+        let (before, next) = {
+            let mut status = entry.status.write().unwrap_or_else(|p| p.into_inner());
+            let before = status.clone();
+            status.checked_at = Some(now_ms());
+            status.installed = program.is_some();
+            if entry.cfg.enabled {
+                status.path = program.as_ref().map(|p| p.to_string_lossy().into_owned());
+                if program.is_none() {
+                    status.version = None;
+                    status.auth = AuthState::Unknown;
                 }
             }
-            let changed = before.installed != next.installed
-                || before.auth != next.auth
-                || before.version != next.version;
-            *entry.status.write().unwrap_or_else(|p| p.into_inner()) = next.clone();
-            if changed {
-                self.broadcast_harness(&next);
+            if let Some(v) = version {
+                status.version = v;
             }
-            if before.auth != next.auth {
-                self.auth_transition(entry.harness.name(), before.auth, next.auth)
-                    .await;
+            if let Some((state, message)) = auth {
+                status.auth = state;
+                status.auth_message = message;
             }
+            (before, status.clone())
+        };
+        let changed = before.installed != next.installed
+            || before.auth != next.auth
+            || before.version != next.version;
+        if changed {
+            self.broadcast_harness(&next);
+        }
+        if before.auth != next.auth {
+            self.auth_transition(entry.harness.name(), before.auth, next.auth)
+                .await;
         }
     }
 

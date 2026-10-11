@@ -1152,6 +1152,40 @@ esac
         assert_eq!(s, StatusCode::UNAUTHORIZED);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_probe_never_overwrites_a_newer_sign_in_report() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let db = crate::db::Db::open(&paths.db_file()).unwrap();
+        let mut cfg = Config::default();
+        for h in cfg.harness.values_mut() {
+            h.enabled = false;
+        }
+        // A slow `--version`, so a turn can report in the middle.
+        let script = tmp.path().join("fake-gemini");
+        std::fs::write(&script, "#!/bin/sh\nsleep 0.5\necho 0.0.1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let gemini = cfg.harness.get_mut("gemini").unwrap();
+        gemini.enabled = true;
+        gemini.command = script.to_string_lossy().into_owned();
+        let state = AppState::new(cfg, paths, db).unwrap();
+        let st = state.clone();
+        let probe = tokio::spawn(async move { st.refresh_harnesses().await });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        state
+            .note_auth("gemini", crate::harness::AuthState::AuthRequired, None)
+            .await;
+        probe.await.unwrap();
+        let status = state.harness("gemini").unwrap().status();
+        assert_eq!(status.auth, crate::harness::AuthState::AuthRequired);
+        assert_eq!(status.version.as_deref(), Some("0.0.1"));
+    }
+
     #[tokio::test]
     async fn reconnect_clears_a_stale_gemini_sign_in_failure() {
         use std::os::unix::fs::PermissionsExt;
@@ -2074,6 +2108,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         t.wait_for("first run", || started.exists()).await;
         // A message in the owner's private group waits for the slot...
         let gid = t.create("group", &[]).await;
+        let mut rx = t.h.state.hub.subscribe();
         let (s, b) = send(
             &t.h.app,
             "POST",
@@ -2084,6 +2119,18 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         .await;
         assert_eq!(s, StatusCode::ACCEPTED);
         let queued = b["assistant_message"]["id"].as_str().unwrap().to_string();
+        // It has read the members (owner only) and is waiting.
+        loop {
+            let env = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("queued status")
+                .unwrap();
+            let v: Value = serde_json::from_str(&env.json).unwrap();
+            if v["type"] == "turn.status" && v["message_id"] == queued.as_str() {
+                assert_eq!(v["status"], "queued");
+                break;
+            }
+        }
         // ...while someone joins.
         let (s, _) = send(
             &t.h.app,

@@ -859,13 +859,7 @@ async fn consume(
             HarnessEvent::Activity(a) => {
                 let merged = match acc.activities.iter_mut().find(|x| x.id == a.id) {
                     Some(existing) => {
-                        existing.status = a.status.clone();
-                        if !a.summary.is_empty() {
-                            existing.summary = a.summary.clone();
-                        }
-                        if !a.name.is_empty() {
-                            existing.name = a.name.clone();
-                        }
+                        merge_activity(existing, &a);
                         existing.clone()
                     }
                     None => {
@@ -885,6 +879,19 @@ async fn consume(
         }
     }
     acc
+}
+
+/// Fold a later update of the same tool call into what was shown so far.
+fn merge_activity(existing: &mut Activity, update: &Activity) {
+    existing.status = update.status.clone();
+    if !update.summary.is_empty() {
+        existing.summary = update.summary.clone();
+    }
+    if !update.name.is_empty() {
+        existing.name = update.name.clone();
+    }
+    // A connector refusing its sign-in is only known when the call fails.
+    existing.auth_error |= update.auth_error;
 }
 
 /// Newest message this harness session has now seen: everything up to this
@@ -1387,6 +1394,26 @@ mod tests {
             a("iris/create_card"),
         ]);
         assert_eq!(kinds, vec!["goals", "feed"]);
+    }
+
+    #[test]
+    fn a_failed_call_keeps_its_sign_in_error() {
+        let mut shown = Activity {
+            id: "t1".into(),
+            kind: "mcp".into(),
+            name: "notes/search".into(),
+            status: "started".into(),
+            summary: "q".into(),
+            auth_error: false,
+        };
+        let failed = Activity {
+            status: "failed".into(),
+            summary: String::new(),
+            auth_error: true,
+            ..shown.clone()
+        };
+        merge_activity(&mut shown, &failed);
+        assert!(shown.auth_error && shown.status == "failed" && shown.summary == "q");
     }
 
     #[test]
