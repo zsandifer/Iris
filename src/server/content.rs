@@ -113,6 +113,9 @@ async fn feed_status(State(state): State<AppState>, user: AuthUser) -> ApiResult
 #[derive(Deserialize)]
 struct Activity {
     event: String,
+    /// `last_batch_at` of the batch on screen; the event counts for its day.
+    #[serde(default)]
+    batch_at: Option<i64>,
 }
 
 /// The app reports feed opens and reaching the end of today's posts; they
@@ -125,7 +128,7 @@ async fn feed_activity(
     if !matches!(body.event.as_str(), "opened" | "reached_end") {
         return Err(ApiError::bad_request("event must be opened or reached_end"));
     }
-    crate::feed::record_activity(&state, user.id(), &body.event).await?;
+    crate::feed::record_activity(&state, user.id(), &body.event, body.batch_at).await?;
     ok(json!({"ok": true}))
 }
 

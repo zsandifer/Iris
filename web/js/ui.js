@@ -79,25 +79,37 @@ export function useBlob(src, enabled = true) {
 
 const canObserve = typeof IntersectionObserver === 'function';
 
-/** Image from a URL; `/api/...` paths are fetched with the device token once near the viewport. */
-export function Img({ src, alt = '', cls = '', onLoad, onError, ...rest }) {
+/**
+ * Image from a URL; `/api/...` paths are fetched with the device token once
+ * near the viewport. With `transient`, the bytes are also let go once the
+ * image is far out of view (long feeds), and fetched again on the way back;
+ * use it only where the box keeps its size without the image.
+ */
+export function Img({ src, alt = '', cls = '', onLoad, onError, transient = false, ...rest }) {
   const authed = !!src && src.startsWith('/api/');
   const ph = useRef();
   const [near, setNear] = useState(!canObserve);
   const [blob, blobFailed] = useBlob(authed ? src : null, near);
   const [failed, setFailed] = useState(false);
   useEffect(() => { setFailed(false); }, [src]);
+  const shown = !!(authed ? blob : src);
   useEffect(() => {
-    if (near || !authed || !ph.current) return undefined;
+    if (!authed || !canObserve || !ph.current || (near && !transient)) return undefined;
     const io = new IntersectionObserver((es) => {
-      if (es.some((e) => e.isIntersecting)) { io.disconnect(); setNear(true); }
-    }, { rootMargin: '400px', scrollMargin: '400px' });
+      const e = es[es.length - 1];
+      if (e.isIntersecting) {
+        if (!transient) io.disconnect();
+        setNear(true);
+      } else if (transient) {
+        setNear(false);
+      }
+    }, transient ? { rootMargin: '1500px 500px' } : { rootMargin: '400px', scrollMargin: '400px' });
     io.observe(ph.current);
     return () => io.disconnect();
-  }, [near, authed]);
+  }, [near, authed, transient, shown]);
   const url = authed ? blob : src;
   if (!url || failed || blobFailed) return html`<div ref=${ph} class=${'img-ph ' + cls} />`;
-  return html`<img class=${cls} src=${url} alt=${alt} loading="lazy" decoding="async"
+  return html`<img ref=${ph} class=${cls} src=${url} alt=${alt} loading="lazy" decoding="async"
     referrerpolicy="no-referrer" onLoad=${onLoad}
     onError=${() => { setFailed(true); onError?.(); }} ...${rest} />`;
 }

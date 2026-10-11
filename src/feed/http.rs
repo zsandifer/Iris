@@ -523,7 +523,7 @@ impl Robots {
                     if let Some(g) = groups.last_mut()
                         && !value.is_empty()
                     {
-                        g.rules.push((key == "allow", value.to_string()));
+                        g.rules.push((key == "allow", normalize_path(value)));
                     }
                 }
                 "crawl-delay" => {
@@ -566,9 +566,10 @@ impl Robots {
 
     /// Longest matching rule wins; allow wins ties; no match allows.
     pub fn allowed(&self, path: &str) -> bool {
+        let path = normalize_path(path);
         let mut best: Option<(usize, bool)> = None;
         for (allow, pat) in &self.rules {
-            if pattern_matches(pat, path) {
+            if pattern_matches(pat, &path) {
                 let len = pat.len();
                 match best {
                     Some((l, a)) if l > len || (l == len && a) => {}
@@ -578,6 +579,40 @@ impl Robots {
         }
         best.is_none_or(|(_, a)| a)
     }
+}
+
+/// One spelling for paths and rules (RFC 9309, 2.2.2): `%XX` escapes of
+/// unreserved characters are decoded, other escapes get uppercase hex, and
+/// non-ASCII characters are percent-encoded as UTF-8.
+fn normalize_path(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'%'
+            && let (Some(h), Some(l)) = (
+                b.get(i + 1).copied().and_then(hex),
+                b.get(i + 2).copied().and_then(hex),
+            )
+        {
+            let v = h * 16 + l;
+            if v.is_ascii_alphanumeric() || matches!(v, b'-' | b'.' | b'_' | b'~') {
+                out.push(v as char);
+            } else {
+                out.push_str(&format!("%{v:02X}"));
+            }
+            i += 3;
+        } else if c.is_ascii() {
+            out.push(c as char);
+            i += 1;
+        } else {
+            out.push_str(&format!("%{c:02X}"));
+            i += 1;
+        }
+    }
+    out
 }
 
 /// robots.txt path pattern: prefix match with `*` wildcards and `$` end.
@@ -659,6 +694,15 @@ mod tests {
         );
         assert!(specific.allowed("/story"));
         assert!(!specific.allowed("/search?q=1"));
+        // Escapes and non-ASCII paths match their rules (RFC 9309, 2.2.2).
+        let enc = Robots::parse(
+            "User-agent: *\nDisallow: /private/\nDisallow: /café\n",
+            "irisfeed",
+        );
+        assert!(!enc.allowed("/%70rivate/photo.jpg"));
+        assert!(!enc.allowed("/caf%C3%A9/menu"));
+        assert!(!enc.allowed("/caf%c3%a9"));
+        assert!(enc.allowed("/public"));
         let all = Robots::parse("User-agent: *\nDisallow: /", "irisfeed");
         assert!(!all.allowed("/anything"));
         assert!(Robots::parse("", "irisfeed").allowed("/x"));

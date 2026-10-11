@@ -220,11 +220,14 @@ pub fn add_source(
 ) -> rusqlite::Result<Option<Source>> {
     let id = new_id();
     let now = now_ms();
+    // Decided in the INSERT itself: a suggestion that would contact a host
+    // of the model's choosing is never enabled, not even for a moment.
+    let enabled = origin != "suggested" || super::auto_enable(kind);
     let n = conn.execute(
         "INSERT OR IGNORE INTO feed_sources (id, user_id, kind, value, label, topic, origin,
-                                             created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-        params![id, user_id, kind, value, label, topic, origin, now],
+                                             enabled, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+        params![id, user_id, kind, value, label, topic, origin, enabled, now],
     )?;
     if n == 0 {
         return Ok(None);
@@ -239,23 +242,17 @@ pub fn set_source_enabled(
     enabled: bool,
 ) -> rusqlite::Result<bool> {
     Ok(conn.execute(
-        "UPDATE feed_sources SET enabled = ?3, fail_count = CASE WHEN ?3 THEN 0 ELSE fail_count END,
-                updated_at = ?4 WHERE id = ?1 AND user_id = ?2",
+        "UPDATE feed_sources SET enabled = ?3, decided = 1,
+                fail_count = CASE WHEN ?3 THEN 0 ELSE fail_count END,
+                updated_at = ?4 WHERE id = ?1 AND user_id = ?2 AND removed = 0",
         params![id, user_id, enabled, now_ms()],
     )? > 0)
 }
 
-/// Remove a source. The user's own are deleted; suggested and imported
-/// ones are hidden instead, so the next suggestion or import does not add
-/// them back.
+/// Remove a source. It is hidden rather than deleted, so a later
+/// suggestion or YouTube import does not add it back; adding it by hand
+/// restores it.
 pub fn delete_source(conn: &Connection, user_id: &str, id: &str) -> rusqlite::Result<bool> {
-    let n = conn.execute(
-        "DELETE FROM feed_sources WHERE id = ?1 AND user_id = ?2 AND origin = 'user'",
-        params![id, user_id],
-    )?;
-    if n > 0 {
-        return Ok(true);
-    }
     Ok(conn.execute(
         "UPDATE feed_sources SET removed = 1, enabled = 0, updated_at = ?3
          WHERE id = ?1 AND user_id = ?2 AND removed = 0",
@@ -274,8 +271,8 @@ pub fn add_user_source(
 ) -> rusqlite::Result<Option<Source>> {
     if add_source(conn, user_id, kind, value, None, topic, "user")?.is_none() {
         conn.execute(
-            "UPDATE feed_sources SET origin = 'user', enabled = 1, removed = 0, fail_count = 0,
-                    updated_at = ?4
+            "UPDATE feed_sources SET origin = 'user', enabled = 1, removed = 0, decided = 1,
+                    fail_count = 0, updated_at = ?4
              WHERE user_id = ?1 AND kind = ?2 AND value = ?3",
             params![user_id, kind, value, now_ms()],
         )?;
@@ -319,7 +316,8 @@ pub fn record_fetch(
 pub fn trim_suggested(conn: &Connection, user_id: &str, max: usize) -> rusqlite::Result<usize> {
     conn.execute(
         "DELETE FROM feed_sources WHERE id IN (
-             SELECT id FROM feed_sources WHERE user_id = ?1 AND origin = 'suggested' AND removed = 0
+             SELECT id FROM feed_sources WHERE user_id = ?1 AND origin = 'suggested'
+               AND removed = 0 AND decided = 0
              ORDER BY enabled DESC, created_at DESC LIMIT -1 OFFSET ?2)",
         params![user_id, max as i64],
     )
@@ -707,10 +705,31 @@ mod tests {
             assert_eq!(back.id, g.id);
             assert_eq!((back.origin.as_str(), back.enabled), ("user", true));
             assert!(delete_source(c, u, &g.id)?);
+            assert!(get_source(c, u, &g.id)?.is_none());
             assert!(
-                get_source(c, u, &g.id)?.is_none(),
-                "the user's own are deleted"
+                add_source(c, u, "youtube", ch, None, None, "google")?.is_none(),
+                "still remembered after it became the user's"
             );
+
+            // Hand-picked suggestions survive trimming; arbitrary hosts
+            // start off.
+            let picked = add_source(
+                c,
+                u,
+                "rss",
+                "https://keep.example/feed",
+                None,
+                None,
+                "suggested",
+            )?
+            .unwrap();
+            assert!(!picked.enabled, "arbitrary host starts off");
+            set_source_enabled(c, u, &picked.id, true)?;
+            for i in 0..5 {
+                add_source(c, u, "reddit", &format!("more{i}"), None, None, "suggested")?;
+            }
+            trim_suggested(c, u, 1)?;
+            assert!(get_source(c, u, &picked.id)?.unwrap().enabled);
 
             add_seen(c, u, &["u:a".into(), "t:b".into()])?;
             assert!(seen_keys(c, u)?.contains("t:b"));

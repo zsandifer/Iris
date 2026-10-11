@@ -487,12 +487,32 @@ mod tests {
             "web_search=\"disabled\"",
             "--ignore-user-config",
             "--ephemeral",
-            "shell_tool",
-            "view_image",
-            "code_mode_host",
         ] {
             assert!(x.args.iter().any(|a| a == o), "{o}");
         }
+        // Every tool feature is switched off, as a `--disable <feature>` pair.
+        for f in [
+            "shell_tool",
+            "unified_exec",
+            "apps",
+            "plugins",
+            "browser_use",
+            "browser_use_external",
+            "in_app_browser",
+            "computer_use",
+            "image_generation",
+            "view_image",
+            "code_mode_host",
+            "tool_suggest",
+            "goals",
+            "sleep_tool",
+        ] {
+            assert!(
+                x.args.windows(2).any(|w| w[0] == "--disable" && w[1] == f),
+                "--disable {f}"
+            );
+        }
+        assert!(!x.args.iter().any(|a| a == "--enable"));
         assert!(!x.args.iter().any(|a| a.contains("workspace-write")));
 
         let gem = gemini::Gemini::new(HarnessConfig::gemini_default());

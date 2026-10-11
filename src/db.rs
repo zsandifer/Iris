@@ -255,6 +255,8 @@ CREATE TABLE feed_sources (
     -- Removed by the user: kept (hidden) so suggestions and imports do not
     -- bring it back; adding it again clears this.
     removed       INTEGER NOT NULL DEFAULT 0,
+    -- The owner turned it on or off by hand: automatic trimming leaves it.
+    decided       INTEGER NOT NULL DEFAULT 0,
     state         TEXT NOT NULL DEFAULT '{}',
     last_fetch_at INTEGER,
     last_ok_at    INTEGER,

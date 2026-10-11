@@ -54,6 +54,9 @@ pub struct Item {
     /// Identity keys of other URLs for the same page (where the link
     /// redirected to, the page's canonical URL).
     pub aliases: Vec<String>,
+    /// The link is the post itself on a social platform (a status, a
+    /// Bluesky post), not an article page.
+    pub native: bool,
 }
 
 impl Item {
@@ -559,6 +562,7 @@ pub fn hn_items(v: &Value) -> Vec<Item> {
         return Vec::new();
     };
     hits.iter()
+        .take(MAX_ENTRIES)
         .filter_map(|h| {
             let title = clean_title(s(&h["title"]));
             if title.is_empty() {
@@ -603,6 +607,7 @@ pub fn reddit_items(v: &Value) -> Vec<Item> {
     };
     children
         .iter()
+        .take(MAX_ENTRIES)
         .filter_map(|c| {
             let d = &c["data"];
             if d["over_18"].as_bool() == Some(true) || d["stickied"].as_bool() == Some(true) {
@@ -699,6 +704,7 @@ pub fn bluesky_items(v: &Value) -> Vec<Item> {
         return Vec::new();
     };
     feed.iter()
+        .take(MAX_ENTRIES)
         .filter_map(|entry| {
             if entry.get("reason").is_some_and(|r| !r.is_null())
                 || entry.get("reply").is_some_and(|r| !r.is_null())
@@ -731,6 +737,7 @@ pub fn bluesky_items(v: &Value) -> Vec<Item> {
                     5_000.0,
                 ),
                 url: post_url.clone(),
+                native: true,
                 favicon: p["author"]["avatar"].as_str().map(str::to_string),
                 ..Default::default()
             };
@@ -745,6 +752,7 @@ pub fn bluesky_items(v: &Value) -> Vec<Item> {
                     .as_str()
                     .filter(|u| markup::split_url(u).is_some())
                 {
+                    item.native = false;
                     item.url = u.to_string();
                     item.title = clean_title(s(&ext["title"]));
                     let d = collapse_ws(s(&ext["description"]));
@@ -796,6 +804,7 @@ pub fn mastodon_items(v: &Value) -> Vec<Item> {
         return Vec::new();
     };
     list.iter()
+        .take(MAX_ENTRIES)
         .filter_map(|st| {
             let st = if st["reblog"].is_object() {
                 &st["reblog"]
@@ -817,6 +826,7 @@ pub fn mastodon_items(v: &Value) -> Vec<Item> {
                 .unwrap_or(s(&account["acct"]));
             let mut item = Item {
                 url: url.to_string(),
+                native: true,
                 source_name: name.to_string(),
                 source_kind: "mastodon".into(),
                 published_ms: parse_date(s(&st["created_at"])),
@@ -841,6 +851,7 @@ pub fn mastodon_items(v: &Value) -> Vec<Item> {
                 .as_str()
                 .filter(|u| markup::split_url(u).is_some())
             {
+                item.native = false;
                 item.url = cu.to_string();
                 item.title = clean_title(s(&card["title"]));
                 if let Some(im) = card["image"].as_str() {
@@ -1158,6 +1169,20 @@ mod tests {
         ]);
         let items = mastodon_items(&m);
         assert_eq!(items.len(), 1);
+        assert!(
+            items[0].native,
+            "a status without a link card is the post itself"
+        );
+        let shared = json!([{"url": "https://social.example/@c/3", "content": "<p>Read this</p>",
+            "account": {"acct": "c"}, "card": {"url": "https://medium.com/@writer/story", "title": "Story", "description": ""}}]);
+        let ext = &mastodon_items(&shared)[0];
+        assert_eq!(ext.url, "https://medium.com/@writer/story");
+        assert!(!ext.native, "an article shared from Mastodon gets enriched");
+        // Listings are capped before any work per entry.
+        let many: Vec<Value> = (0..5000)
+            .map(|i| json!({"url": format!("https://social.example/@a/{i}"), "content": "<p>Hello there friends</p>", "account": {"acct": "a"}}))
+            .collect();
+        assert_eq!(mastodon_items(&Value::Array(many)).len(), MAX_ENTRIES);
         assert_eq!(items[0].title, "New telescope images are in!");
         assert_eq!(items[0].images, vec!["https://files.social.example/1.png"]);
     }

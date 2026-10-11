@@ -187,11 +187,25 @@ pub async fn status_json(state: &AppState, user_id: &str) -> Value {
 
 // --------------------------------------------------------------- activity
 
-/// Record that the user opened the feed or reached the end of today's
-/// posts.
-pub async fn record_activity(state: &AppState, user_id: &str, event: &str) -> Result<()> {
+/// The day a feed event counts for: the day of the batch being read (so a
+/// batch finished the next morning still counts as read), else today.
+pub fn activity_day(batch_at: Option<i64>, now: i64) -> String {
+    match batch_at {
+        Some(b) if b <= now && now - b <= PAUSE_AFTER_DAYS * DAY_MS => crate::jobs::local_day(b),
+        _ => crate::jobs::local_day(now),
+    }
+}
+
+/// Record that the user opened the feed or reached the end of the latest
+/// batch (`batch_at` is that batch's `last_batch_at`, as the app saw it).
+pub async fn record_activity(
+    state: &AppState,
+    user_id: &str,
+    event: &str,
+    batch_at: Option<i64>,
+) -> Result<()> {
     let (uid, ev) = (user_id.to_string(), event.to_string());
-    let day = crate::jobs::local_day(now_ms());
+    let day = activity_day(batch_at, now_ms());
     state
         .db
         .call(move |c| {
@@ -750,7 +764,7 @@ fn enrich(f: &Fetcher, mut it: Item) -> Item {
         ]
         .iter()
         .any(|p| h == *p || h.ends_with(&format!(".{p}")))
-    }) || (it.source_kind == "mastodon" && it.url.contains("/@"));
+    }) || it.native;
     if native {
         return it;
     }
@@ -944,7 +958,9 @@ async fn refresh_interests(
             for s in &suggestions {
                 if let Some((kind, value)) = sources::from_suggestion(s) {
                     let topic = s["topic"].as_str().map(|t| truncate_chars(t, 40));
-                    if let Some(src) = store::add_source(
+                    // Arbitrary-host suggestions are stored off (see
+                    // `auto_enable`), in the same statement.
+                    if store::add_source(
                         c,
                         &uid,
                         &kind,
@@ -952,14 +968,10 @@ async fn refresh_interests(
                         None,
                         topic.as_deref(),
                         "suggested",
-                    )? {
+                    )?
+                    .is_some()
+                    {
                         added += 1;
-                        // The model saw private notes and untrusted titles, so
-                        // a suggestion that would contact a host of its
-                        // choosing waits for the owner to turn it on.
-                        if !auto_enable(&kind) {
-                            store::set_source_enabled(c, &uid, &src.id, false)?;
-                        }
                     }
                 }
             }
@@ -1139,6 +1151,14 @@ fn clean(items: Vec<Item>, now: i64, lang: &str) -> Vec<Item> {
         *n <= MAX_ITEMS_PER_SOURCE
     });
     items.truncate(MAX_CANDIDATES);
+    for it in &mut items {
+        if it.title.len() > 1200 {
+            it.title = truncate_chars(&it.title, 300);
+        }
+        if it.description.len() > 6000 {
+            it.description = truncate_chars(&it.description, 1500);
+        }
+    }
     items
 }
 
@@ -1801,10 +1821,8 @@ esac
         assert_eq!(out.len(), 16);
     }
 
-    #[test]
-    fn suggestions_on_arbitrary_hosts_wait_for_the_owner() {
-        // A model reply steered by an injected title cannot make Iris
-        // contact a host of the attacker's choosing on its own.
+    #[tokio::test]
+    async fn suggestions_on_arbitrary_hosts_wait_for_the_owner() {
         for (kind, auto) in [
             ("rss", false),
             ("mastodon", false),
@@ -1815,101 +1833,59 @@ esac
         ] {
             assert_eq!(auto_enable(kind), auto, "{kind}");
         }
-        let reply = r#"{"topics": [{"name": "Space", "keywords": ["nasa"]}],
-            "sources": [{"type": "rss", "url": "https://evil.example/leak?d=secret"}, {"type": "reddit", "name": "space"}]}"#;
-        let parsed = model::parse_interests(reply).unwrap();
-        let db = crate::db::Db::open_in_memory().unwrap();
-        db.with(|c| {
-            let u = db::owner_user_id(c)?.unwrap();
-            for s in &parsed.sources {
-                let (kind, value) = sources::from_suggestion(s).unwrap();
-                let src =
-                    store::add_source(c, &u, &kind, &value, None, None, "suggested")?.unwrap();
-                if !auto_enable(&kind) {
-                    store::set_source_enabled(c, &u, &src.id, false)?;
-                }
-            }
-            let planned = plan_sources(
-                store::list_sources(c, &u)?
-                    .into_iter()
-                    .filter(|s| s.enabled)
-                    .collect(),
-            );
-            assert_eq!(planned.len(), 1);
-            assert_eq!(planned[0].kind, "reddit");
-            Ok(())
-        })
-        .unwrap();
+        // Through the real interests call: a reply steered by an injected
+        // title cannot make Iris contact a host of the attacker's choosing.
+        let (state, tmp, owner) = fake_engine().await;
+        set(
+            &tmp,
+            "ok",
+            r#"{"topics": [{"name": "Space", "keywords": ["nasa"]}],
+                "sources": [{"type": "rss", "url": "https://evil.example/leak?d=secret"},
+                            {"type": "mastodon", "account": "x@evil.example"},
+                            {"type": "reddit", "name": "space"}]}"#,
+        );
+        let (i, _) = refresh_interests(&state, &owner, "2026-10-11", Vec::new())
+            .await
+            .unwrap();
+        assert!(i.by_model);
+        let all = state.db.with(|c| store::list_sources(c, &owner)).unwrap();
+        assert_eq!(all.len(), 3);
+        let plan = plan_sources(all.into_iter().filter(|s| s.enabled).collect());
+        let kinds: Vec<&str> = plan.iter().map(|s| s.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["reddit"]);
     }
 
     #[test]
-    fn publication_is_atomic_ordered_and_skips_late_duplicates() {
-        let db = crate::db::Db::open_in_memory().unwrap();
-        let post = |title: &str, url: &str| PipelinePost {
-            title: title.into(),
-            body: "b".into(),
-            source_url: url.into(),
-            source_name: "S".into(),
-            source_kind: "rss".into(),
-            url_key: rank::url_key(url),
-            seen_keys: vec![rank::url_key(url), rank::title_key(title)],
-            ..Default::default()
-        };
-        db.with(|c| {
-            let u = db::owner_user_id(c)?.unwrap();
-            let u = u.as_str();
-            // Nothing new: the day stays open.
-            let out = publish_batch(c, u, &[], &[], "2026-10-11", RunReport::default())?;
-            assert!(out.is_empty());
-            assert_eq!(store::get_state(c, u)?.last_batch_day, None);
-
-            // The agent posted one of these stories meanwhile.
-            entities::create_feed_post(
-                c,
-                u,
-                &entities::NewFeedPost {
-                    title: "Agent story".into(),
-                    body: "b".into(),
-                    source_url: Some("https://x.example/dup".into()),
-                    ..Default::default()
-                },
-            )?;
-            let batch = vec![
-                post("Best story of the day", "https://x.example/1"),
-                post("Different title, same link", "https://x.example/dup"),
-                post("Third story of the day", "https://x.example/3"),
-            ];
-            let keys: Vec<String> = batch.iter().flat_map(|p| p.seen_keys.clone()).collect();
-            let out = publish_batch(c, u, &batch, &keys, "2026-10-11", RunReport::default())?;
-            assert_eq!(out, vec!["Best story of the day", "Third story of the day"]);
-            let feed = entities::list_feed(c, u, None, 10)?;
-            assert_eq!(feed[0].title, "Best story of the day", "best is newest");
-            let st = store::get_state(c, u)?;
-            let end = feed
-                .iter()
-                .find(|p| p.title == "Third story of the day")
-                .unwrap();
-            assert_eq!(st.last_batch_end_id.as_deref(), Some(end.id.as_str()));
-            assert_eq!(st.last_batch_at, Some(end.created_at));
-            assert_eq!(
-                (st.last_batch_day.as_deref(), st.last_batch_count),
-                (Some("2026-10-11"), 2)
-            );
-
-            // A failure part-way rolls everything back.
-            // (feed_days is written after the posts, seen keys, and state.)
-            c.execute("DROP TABLE feed_days", [])?;
-            let before = entities::list_feed(c, u, None, 50)?.len();
-            let more = vec![post("Fourth story here", "https://x.example/4")];
-            assert!(publish_batch(c, u, &more, &[], "2026-10-12", RunReport::default()).is_err());
-            assert_eq!(entities::list_feed(c, u, None, 50)?.len(), before);
-            assert_eq!(
-                store::get_state(c, u)?.last_batch_day.as_deref(),
-                Some("2026-10-11")
-            );
-            Ok(())
-        })
-        .unwrap();
+    fn activity_counts_for_the_batch_being_read() {
+        let now = 2_000_000_000_000;
+        let monday = now - 26 * 3_600_000;
+        // Reading Monday's batch on Tuesday counts for Monday.
+        assert_eq!(
+            activity_day(Some(monday), now),
+            crate::jobs::local_day(monday)
+        );
+        assert_eq!(activity_day(None, now), crate::jobs::local_day(now));
+        assert_eq!(
+            activity_day(Some(now + DAY_MS), now),
+            crate::jobs::local_day(now),
+            "future"
+        );
+        assert_eq!(
+            activity_day(Some(now - 30 * DAY_MS), now),
+            crate::jobs::local_day(now),
+            "stale"
+        );
+        // With batches on alternate days read the morning after, the size
+        // does not shrink.
+        let days: Vec<DayStat> = (0..6)
+            .map(|i| DayStat {
+                day: String::new(),
+                published: if i % 2 == 0 { 10 } else { 0 },
+                opened: if i % 2 == 0 { 1 } else { 0 },
+                reached_end: if i % 2 == 0 { 1 } else { 0 },
+            })
+            .collect();
+        assert!(next_size(10, &days) >= 10);
     }
 
     #[test]

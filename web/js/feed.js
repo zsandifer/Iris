@@ -88,7 +88,7 @@ function Carousel({ urls, alt }) {
   const onScroll = (e) => setI(Math.round(e.currentTarget.scrollLeft / e.currentTarget.clientWidth));
   if (!urls.length) return null;
   return html`<div class="car" onScroll=${onScroll}>
-      ${urls.map((u) => html`<div class="car-i"><${Img} src=${u} alt=${alt} /></div>`)}
+      ${urls.map((u) => html`<div class="car-i"><${Img} src=${u} alt=${alt} transient /></div>`)}
     </div>
     ${urls.length > 1 && html`<div class="dots">${urls.map((_, j) => html`<i class=${j === i ? 'on' : ''} />`)}</div>`}`;
 }
@@ -102,7 +102,10 @@ const money = (pr) => {
 function Facts({ p }) {
   const ev = p.facts?.event;
   if (ev?.start_ms) {
-    const when = new Date(ev.start_ms).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+    // The day the event page states (no time-zone shift), else start_ms.
+    const [y, m, d] = String(ev.local_date || '').split('-').map(Number);
+    const day = y && m && d ? new Date(y, m - 1, d, 12) : new Date(ev.start_ms);
+    const when = day.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
     return html`<div class="fact"><${Icon} name="target" size=${13} /> ${[when, ev.location].filter(Boolean).join(' · ')}</div>`;
   }
   if (p.source_kind === 'price_drop' && p.facts?.price) {
@@ -140,7 +143,7 @@ export function Post({ p }) {
 // ------------------------------------------------------------ feed screen
 
 /** Report feed use (drives the adaptive daily size and the 2-week pause). */
-const report = (event) => apiPost('/feed/activity', { event }).catch(() => {});
+const report = (event) => apiPost('/feed/activity', { event, batch_at: S.feed?.status?.last_batch_at ?? null }).catch(() => {});
 
 function useEndTracking(posts, status) {
   // The end of today's batch is its last (lowest-ranked) post; it may not
@@ -166,9 +169,13 @@ function useEndTracking(posts, status) {
   }, [endId, loaded]);
 }
 
-/** Report an open on mount and whenever the app comes back to the front. */
-function useOpenTracking() {
+/**
+ * Report an open once the feed (and so the batch on screen) has loaded, and
+ * whenever the app comes back to the front.
+ */
+function useOpenTracking(loaded) {
   useEffect(() => {
+    if (!loaded) return undefined;
     let last = 0;
     const opened = () => {
       if (document.visibilityState !== 'visible' || Date.now() - last < 30 * 60e3) return;
@@ -178,7 +185,7 @@ function useOpenTracking() {
     opened();
     document.addEventListener('visibilitychange', opened);
     return () => document.removeEventListener('visibilitychange', opened);
-  }, []);
+  }, [loaded]);
 }
 
 function PausedCard({ status }) {
@@ -200,7 +207,7 @@ export function FeedScreen() {
   useStore();
   const [busy, setBusy] = useState(false);
   useEffect(() => { if (!S.feed) loadFeed().catch((e) => toast(e.message)); }, []);
-  useOpenTracking();
+  useOpenTracking(!!S.feed);
   const posts = S.feed?.posts || [];
   const st = S.feed?.status;
   useEndTracking(posts, st);
@@ -244,7 +251,7 @@ export function FeedScreen() {
     ${st?.running && posts.length > 0 && html`<div class="feed-run"><span class="shimmer">Finding today's posts…</span></div>`}
     ${tps.length > 0 && html`<div class="rail" role="list">
       ${tps.map((t, i) => html`<button class="stile" role="listitem" onClick=${() => set({ story: { t: i, s: 0 } })}>
-        <${Img} src=${photos(t.stories[0])[0]} alt="" cls="stile-im" />
+        <${Img} src=${photos(t.stories[0])[0]} alt="" cls="stile-im" transient />
         <div class="stile-src"><${Favicon} p=${t.stories[0]} size=${22} /></div>
         <small>${t.name}</small>
       </button>`)}

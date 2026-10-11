@@ -702,13 +702,14 @@ day's batch the best-ranked post is the newest.
 #### `POST /api/feed/activity`
 
 ```json
-{"event": "opened"}
+{"event": "opened", "batch_at": 1791700000000}
 ```
 
 `event` is `opened` (the feed screen was shown, or the app came back to
 the front on it) or `reached_end` (the bottom of the `last_batch_end_id`
-post came into view); anything else is `400`. Counts are kept per local day
-and drive the adaptive daily size; either event counts as use for the
+post came into view); anything else is `400`. Counts are kept per local day (the
+day of the batch on screen when `batch_at`, its `last_batch_at`, is given
+and within two weeks; else today) and drive the adaptive daily size; either event counts as use for the
 two-week pause. Response `{"ok": true}`.
 
 #### `POST /api/feed/pause`, `POST /api/feed/resume`
