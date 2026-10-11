@@ -85,8 +85,10 @@ pub struct Invocation {
     pub stdin: Vec<u8>,
     /// Private files to delete when the turn ends.
     pub temp_files: Vec<PathBuf>,
-    /// Extra environment variables (paths to private per-turn files; never
-    /// secrets).
+    /// Extra environment variables for the CLI process: paths to private
+    /// per-turn files, or connector header values a CLI can only read by
+    /// variable name (Codex `env_http_headers`). Unlike argv, a process's
+    /// environment is readable only by its own user. Never logged.
     pub env: Vec<(String, String)>,
     /// Working directory override (defaults to `TurnSpec::cwd`).
     pub cwd: Option<PathBuf>,

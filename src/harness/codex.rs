@@ -7,16 +7,25 @@
 //! - Resume: `codex exec resume <thread_id>`. `resume` does not accept
 //!   `-s`/`--add-dir`, so sandbox settings are always passed as `-c`
 //!   overrides, identically for new and resumed threads.
-//! - MCP: `-c mcp_servers.<name>.<key>=<toml value>` per server.
+//! - MCP: `-c mcp_servers.<name>.<key>=<toml value>` per server. Connector
+//!   secrets never go on the command line (other local users can read
+//!   argv): a stdio server's environment is written to a private file in
+//!   the run directory and applied by `iris mcp-exec`, which then execs the
+//!   real command; HTTP headers travel as `env_http_headers`, naming
+//!   variables set only in Codex's own environment. Their names contain
+//!   `SECRET`, so Codex's default shell environment policy keeps them out
+//!   of commands the agent runs.
 //! - Prompt on stdin (`-`); images via `-i <file>`.
 
 use super::{
     Activity, AuthState, Capabilities, Harness, HarnessEvent, Invocation, McpServer, McpTransport,
     StreamParser, TurnSpec, looks_like_auth_error, summarize,
 };
-use crate::config::HarnessConfig;
+use crate::config::{HarnessConfig, write_private_file};
 use crate::util::Result;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 pub struct Codex {
     cfg: HarnessConfig,
@@ -36,6 +45,30 @@ fn toml_str_array(items: &[String]) -> String {
     toml::Value::Array(items.iter().cloned().map(toml::Value::String).collect()).to_string()
 }
 
+/// Linux caps a single argument at 128 KiB (`MAX_ARG_STRLEN`).
+const MAX_ARG_BYTES: usize = 128 * 1024 - 1;
+
+/// The `developer_instructions` override, shortened if TOML escaping
+/// pushes it over the per-argument limit (the persona is already capped in
+/// bytes, but quotes and control characters grow when escaped).
+fn developer_instructions_arg(prompt: &str) -> String {
+    let mut p = prompt;
+    loop {
+        let arg = format!("developer_instructions={}", toml_str(p));
+        if arg.len() <= MAX_ARG_BYTES || p.is_empty() {
+            return arg;
+        }
+        // Shrink in proportion to the overshoot (escaping can grow a byte
+        // up to six times), always by at least one byte.
+        let mut end = (p.len() as u64 * (MAX_ARG_BYTES as u64 - 64) / arg.len() as u64) as usize;
+        end = end.min(p.len() - 1);
+        while !p.is_char_boundary(end) {
+            end -= 1;
+        }
+        p = &p[..end];
+    }
+}
+
 /// Bare TOML keys only, so values can be addressed with dotted `-c` paths.
 fn bare_key(k: &str) -> bool {
     !k.is_empty()
@@ -43,32 +76,75 @@ fn bare_key(k: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// `-c` overrides that register the given MCP servers.
-pub fn mcp_overrides(servers: &[McpServer]) -> Vec<String> {
-    let mut out = Vec::new();
-    for s in servers {
+/// How MCP servers reach Codex: `-c` overrides that carry no secrets, the
+/// variables those overrides refer to, and private files to delete after
+/// the turn.
+#[derive(Debug, Default)]
+pub struct McpSetup {
+    pub overrides: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub temp_files: Vec<PathBuf>,
+}
+
+/// Prefix of the variables that carry connector HTTP headers. It contains
+/// `SECRET` so Codex's default `shell_environment_policy` excludes them
+/// from commands the agent runs.
+const SECRET_ENV_PREFIX: &str = "IRIS_MCP_SECRET_";
+
+/// Register the given MCP servers. `exe` is the Iris binary (it wraps stdio
+/// servers that need environment variables); `run_dir`/`turn_id` name the
+/// private per-turn files.
+pub fn mcp_setup(
+    servers: &[McpServer],
+    exe: &Path,
+    run_dir: &Path,
+    turn_id: &str,
+) -> Result<McpSetup> {
+    let mut out = McpSetup::default();
+    for (i, s) in servers.iter().enumerate() {
         let p = format!("mcp_servers.{}", s.name);
         // Headless turns cannot answer approval prompts. Servers passed by
         // Iris (its own bridge and connectors the owner enabled) are
         // pre-approved, matching `--allowedTools mcp__<name>` for Claude.
-        out.push(format!("{p}.default_tools_approval_mode=\"approve\""));
+        out.overrides
+            .push(format!("{p}.default_tools_approval_mode=\"approve\""));
         match &s.transport {
             McpTransport::Stdio { command, args, env } => {
-                out.push(format!("{p}.command={}", toml_str(command)));
-                out.push(format!("{p}.args={}", toml_str_array(args)));
-                for (k, v) in env.iter().filter(|(k, _)| bare_key(k)) {
-                    out.push(format!("{p}.env.{k}={}", toml_str(v)));
+                let env: BTreeMap<&String, &String> =
+                    env.iter().filter(|(k, _)| bare_key(k)).collect();
+                if env.is_empty() {
+                    out.overrides
+                        .push(format!("{p}.command={}", toml_str(command)));
+                    out.overrides
+                        .push(format!("{p}.args={}", toml_str_array(args)));
+                } else {
+                    let file = run_dir.join(format!("{turn_id}.mcp{i}.env.json"));
+                    write_private_file(&file, &serde_json::to_vec(&env)?)?;
+                    out.temp_files.push(file.clone());
+                    let mut wrapped = vec![
+                        "mcp-exec".to_string(),
+                        file.to_string_lossy().into_owned(),
+                        command.clone(),
+                    ];
+                    wrapped.extend(args.iter().cloned());
+                    out.overrides
+                        .push(format!("{p}.command={}", toml_str(&exe.to_string_lossy())));
+                    out.overrides
+                        .push(format!("{p}.args={}", toml_str_array(&wrapped)));
                 }
             }
             McpTransport::Http { url, headers } => {
-                out.push(format!("{p}.url={}", toml_str(url)));
-                for (k, v) in headers.iter().filter(|(k, _)| bare_key(k)) {
-                    out.push(format!("{p}.http_headers.{k}={}", toml_str(v)));
+                out.overrides.push(format!("{p}.url={}", toml_str(url)));
+                for (j, (k, v)) in headers.iter().filter(|(k, _)| bare_key(k)).enumerate() {
+                    let var = format!("{SECRET_ENV_PREFIX}{i}_{j}");
+                    out.overrides
+                        .push(format!("{p}.env_http_headers.{k}={}", toml_str(&var)));
+                    out.env.push((var, v.clone()));
                 }
             }
         }
     }
-    out
+    Ok(out)
 }
 
 impl Harness for Codex {
@@ -102,10 +178,7 @@ impl Harness for Codex {
         if let Some(e) = &spec.effort {
             overrides.push(format!("model_reasoning_effort={}", toml_str(e)));
         }
-        overrides.push(format!(
-            "developer_instructions={}",
-            toml_str(&spec.system_prompt)
-        ));
+        overrides.push(developer_instructions_arg(&spec.system_prompt));
         if !self.cfg.sandbox.is_empty() {
             overrides.push(format!("sandbox_mode={}", toml_str(&self.cfg.sandbox)));
             if self.cfg.sandbox == "workspace-write" && !spec.writable_dirs.is_empty() {
@@ -120,7 +193,9 @@ impl Harness for Codex {
                 ));
             }
         }
-        overrides.extend(mcp_overrides(&spec.mcp_servers));
+        let exe = std::env::current_exe()?;
+        let mcp = mcp_setup(&spec.mcp_servers, &exe, &spec.run_dir, &spec.turn_id)?;
+        overrides.extend(mcp.overrides);
         for o in overrides {
             a.push("-c".into());
             a.push(o);
@@ -133,6 +208,8 @@ impl Harness for Codex {
         Ok(Invocation {
             args: a,
             stdin: spec.prompt.as_bytes().to_vec(),
+            env: mcp.env,
+            temp_files: mcp.temp_files,
             ..Invocation::default()
         })
     }
@@ -479,9 +556,15 @@ mod tests {
 
     #[test]
     fn builds_new_and_resume_invocations() {
+        let run = tempfile::tempdir().unwrap();
         let mut env = BTreeMap::new();
-        env.insert("IRIS_DATA_DIR".to_string(), "/d".to_string());
+        env.insert("API_TOKEN".to_string(), "env-secret-value".to_string());
         env.insert("bad key".to_string(), "x".to_string());
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer header-secret".to_string(),
+        );
         let mut spec = TurnSpec {
             turn_id: "t".into(),
             prompt: "hello".into(),
@@ -493,17 +576,34 @@ mod tests {
             model: "gpt-6-luna".into(),
             effort: Some("low".into()),
             resume: None,
-            mcp_servers: vec![McpServer {
-                name: "iris".into(),
-                transport: McpTransport::Stdio {
-                    command: "/bin/iris".into(),
-                    args: vec!["mcp".into(), "--conversation".into(), "c1".into()],
-                    env,
+            mcp_servers: vec![
+                McpServer {
+                    name: "iris".into(),
+                    transport: McpTransport::Stdio {
+                        command: "/bin/iris".into(),
+                        args: vec!["mcp".into(), "--conversation".into(), "c1".into()],
+                        env: BTreeMap::new(),
+                    },
                 },
-            }],
+                McpServer {
+                    name: "notes".into(),
+                    transport: McpTransport::Stdio {
+                        command: "npx".into(),
+                        args: vec!["-y".into(), "notes-mcp".into()],
+                        env,
+                    },
+                },
+                McpServer {
+                    name: "web".into(),
+                    transport: McpTransport::Http {
+                        url: "https://mcp.example.com".into(),
+                        headers,
+                    },
+                },
+            ],
             cwd: "/w".into(),
             writable_dirs: vec!["/m".into()],
-            run_dir: "/r".into(),
+            run_dir: run.path().into(),
             scope: "c1".into(),
         };
         let mut cfg = HarnessConfig::codex_default();
@@ -539,9 +639,55 @@ mod tests {
         );
         assert!(
             inv.args
-                .contains(&r#"mcp_servers.iris.env.IRIS_DATA_DIR="/d""#.to_string())
+                .contains(&r#"mcp_servers.iris.command="/bin/iris""#.to_string())
+        );
+        // Connector secrets never reach the command line.
+        assert!(
+            !inv.args
+                .iter()
+                .any(|a| a.contains("secret-value") || a.contains("header-secret")),
+            "{:?}",
+            inv.args
         );
         assert!(!inv.args.iter().any(|a| a.contains("bad key")));
+        // Stdio env: a private file applied by `iris mcp-exec`.
+        let exe = std::env::current_exe().unwrap();
+        let env_file = run.path().join("t.mcp1.env.json");
+        assert!(inv.args.contains(&format!(
+            "mcp_servers.notes.command={}",
+            toml_str(&exe.to_string_lossy())
+        )));
+        assert!(inv.args.contains(&format!(
+            "mcp_servers.notes.args={}",
+            toml_str_array(&[
+                "mcp-exec".into(),
+                env_file.to_string_lossy().into_owned(),
+                "npx".into(),
+                "-y".into(),
+                "notes-mcp".into(),
+            ])
+        )));
+        let written: Value = serde_json::from_slice(&std::fs::read(&env_file).unwrap()).unwrap();
+        assert_eq!(written, json!({"API_TOKEN": "env-secret-value"}));
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&env_file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "env file is private");
+        assert!(inv.temp_files.contains(&env_file));
+        // HTTP headers: named variables in Codex's own environment.
+        assert!(inv.args.contains(
+            &r#"mcp_servers.web.env_http_headers.Authorization="IRIS_MCP_SECRET_2_0""#.to_string()
+        ));
+        assert!(
+            inv.args
+                .contains(&r#"mcp_servers.web.url="https://mcp.example.com""#.to_string())
+        );
+        assert_eq!(
+            inv.env,
+            vec![(
+                "IRIS_MCP_SECRET_2_0".to_string(),
+                "Bearer header-secret".to_string()
+            )]
+        );
         assert!(
             inv.args
                 .contains(&r#"mcp_servers.iris.default_tools_approval_mode="approve""#.to_string())
@@ -555,6 +701,29 @@ mod tests {
         assert_eq!(&inv.args[..3], ["exec", "resume", "--json"]);
         let n = inv.args.len();
         assert_eq!(&inv.args[n - 2..], ["th-1", "-"]);
+    }
+
+    #[test]
+    fn developer_instructions_fit_one_argument() {
+        for prompt in [
+            "\"".repeat(100_000),
+            "\n".repeat(100_000),
+            "漢".repeat(33_000),
+            "\u{1}".repeat(100_000),
+        ] {
+            let arg = developer_instructions_arg(&prompt);
+            assert!(arg.len() <= MAX_ARG_BYTES, "{}", arg.len());
+            let (_, value) = arg.split_once('=').unwrap();
+            let parsed: toml::Table = toml::from_str(&format!("x = {value}")).unwrap();
+            let kept = parsed["x"].as_str().unwrap();
+            assert!(
+                prompt.starts_with(kept) && kept.len() > 20_000,
+                "{}",
+                kept.len()
+            );
+        }
+        let short = developer_instructions_arg("hi");
+        assert_eq!(short, r#"developer_instructions="hi""#);
     }
 
     #[test]

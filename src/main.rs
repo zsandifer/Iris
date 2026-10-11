@@ -43,6 +43,10 @@ Usage:
                                    Copy persona/memory files from OpenClaw
   iris mcp --data-dir DIR --user ID [--conversation ID] [--shared]
                                    Iris MCP bridge (launched by harnesses)
+  iris mcp-exec ENV_FILE COMMAND [ARGS...]
+                                   Run an MCP server with the environment in
+                                   ENV_FILE (launched by harnesses, so
+                                   connector secrets stay off command lines)
   iris engines <install|update|uninstall> <NAME> [--dir PATH]
   iris engines list [--dir PATH]   Install/update the official CLIs (claude,
                                    codex, gemini, opencode) into the engines
@@ -117,7 +121,15 @@ impl Args {
 }
 
 fn main() {
-    let args = match Args::parse(std::env::args().skip(1)) {
+    // `mcp-exec` passes the server's own arguments through untouched, so it
+    // bypasses the option parser.
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("mcp-exec") {
+        let err = mcp_exec(&raw[1..]);
+        eprintln!("iris mcp-exec: {err}");
+        std::process::exit(127);
+    }
+    let args = match Args::parse(raw.into_iter()) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}\n\n{USAGE}");
@@ -221,6 +233,27 @@ fn run(args: Args) -> Result<()> {
         ["import", ..] => Err("usage: iris import openclaw <PATH> [--dry-run] [--force]".into()),
         other => Err(format!("unknown command '{}'\n\n{USAGE}", other.join(" ")).into()),
     }
+}
+
+/// Replace this process with `COMMAND ARGS...`, adding the variables from
+/// the private JSON file `ENV_FILE`. Returns only on failure.
+fn mcp_exec(raw: &[String]) -> String {
+    use std::os::unix::process::CommandExt;
+    let [env_file, command, rest @ ..] = raw else {
+        return "usage: iris mcp-exec ENV_FILE COMMAND [ARGS...]".into();
+    };
+    let env: std::collections::BTreeMap<String, String> = match std::fs::read(env_file)
+        .map_err(|e| e.to_string())
+        .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
+    {
+        Ok(env) => env,
+        Err(e) => return format!("cannot read environment file: {e}"),
+    };
+    let err = std::process::Command::new(command)
+        .args(rest)
+        .envs(env)
+        .exec();
+    format!("cannot run {command}: {err}")
 }
 
 fn init(paths: &Paths) -> Result<()> {
