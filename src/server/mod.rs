@@ -692,6 +692,58 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_credential_updates_keep_every_field() {
+        let h = setup();
+        let t = pair_as(&h, None).await;
+        let (_, c) = send(
+            &h.app,
+            "POST",
+            "/api/credentials",
+            Some(&t),
+            Some(
+                json!({"kind": "login", "label": "Bank", "site": "bank.example",
+                        "username": "someone", "password": "pw-0"}),
+            ),
+        )
+        .await;
+        let id = c["credential"]["id"].as_str().unwrap().to_string();
+        let uri = format!("/api/credentials/{id}");
+        let owner = h.state.db.with(db::owner_user_id).unwrap().unwrap();
+        for i in 1..=25 {
+            let (a, b) = tokio::join!(
+                send(
+                    &h.app,
+                    "PATCH",
+                    &uri,
+                    Some(&t),
+                    Some(json!({"password": format!("pw-{i}")}))
+                ),
+                send(
+                    &h.app,
+                    "PATCH",
+                    &uri,
+                    Some(&t),
+                    Some(json!({"notes": format!("n-{i}")}))
+                ),
+            );
+            assert_eq!((a.0, b.0), (StatusCode::OK, StatusCode::OK));
+            let ct = h
+                .state
+                .db
+                .with(|c| crate::entities::get_credential_ciphertext(c, &owner, &id))
+                .unwrap()
+                .unwrap();
+            let secret: Value =
+                serde_json::from_slice(&h.state.vault.decrypt(&ct, &id).unwrap()).unwrap();
+            assert_eq!(
+                secret,
+                json!({"password": format!("pw-{i}"), "notes": format!("n-{i}")}),
+                "round {i}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn group_permissions_and_owner_only_routes() {
         let h = setup();

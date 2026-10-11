@@ -357,7 +357,7 @@ async fn run_locked(
             let (c, before) = (conv_id.to_string(), input.user_message.created_at);
             state
                 .db
-                .call(move |db| db::messages_between(db, &c, after, before))
+                .call(move |db| db::replay_messages(db, &c, after, before, MAX_REPLAY_MESSAGES))
                 .await
                 .unwrap_or_default()
         } else {
@@ -801,19 +801,12 @@ async fn consume(
 /// Newest message this harness session has now seen: everything up to this
 /// turn's reply, plus cards the agent created during the turn. Messages
 /// that arrived meanwhile (queued user messages, heartbeat posts) stay
-/// unsynced so they are replayed if another harness answers them.
+/// unsynced so they are replayed later (see `db::synced_watermark`).
 async fn synced_through(state: &AppState, conv_id: &str, placeholder_created_at: i64) -> i64 {
     let c = conv_id.to_string();
     state
         .db
-        .call(move |db| {
-            db.query_row(
-                "SELECT COALESCE(MAX(created_at), 0) FROM messages
-                 WHERE conversation_id = ?1 AND (created_at <= ?2 OR kind = 'card')",
-                rusqlite::params![c, placeholder_created_at],
-                |r| r.get(0),
-            )
-        })
+        .call(move |db| db::synced_watermark(db, &c, placeholder_created_at))
         .await
         .unwrap_or(placeholder_created_at)
 }
