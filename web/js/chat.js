@@ -69,8 +69,8 @@ function Assistant({ m, list }) {
     ${failed && m.meta?.error?.kind !== 'paused' && retryFor(list, m) && html`<button class="retry" onClick=${retry}><${Icon} name="refresh" size=${15} /> Try again</button>`}`;
 }
 
-function Message({ m, list, members }) {
-  if (m.kind === 'card') return html`<${Card} m=${m} />`;
+function Message({ m, list, members, composing }) {
+  if (m.kind === 'card') return html`<${Card} m=${m} inactive=${composing} />`;
   if (m.role === 'user') {
     const mine = m.author_user_id === S.me?.user?.id;
     const who = !mine && members?.[m.author_user_id];
@@ -129,6 +129,7 @@ export function ChatScreen({ cid }) {
   const box = S.msgs[cid];
   const list = box?.list || [];
   const [members, setMembers] = useState(null);
+  const [composing, setComposing] = useState(false);
 
   useEffect(() => {
     stick.current = true;
@@ -161,6 +162,17 @@ export function ChatScreen({ cid }) {
     prevHeight.current = el.scrollHeight;
   });
 
+  // Resizing the viewport or a growing composer does not render this
+  // component. Follow the bottom through those changes, too.
+  useLayoutEffect(() => {
+    const el = scr.current;
+    const observer = new ResizeObserver(() => {
+      if (stick.current) el.scrollTop = el.scrollHeight;
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
   const lastId = list.at(-1)?.id;
   useEffect(() => {
     if (lastId && isId(cid) && document.visibilityState === 'visible') post(`/conversations/${seg(cid)}/read`).catch(() => {});
@@ -189,8 +201,8 @@ export function ChatScreen({ cid }) {
     if (held.has(m.id)) continue;
     if (!prev || m.created_at - prev > GAP) rows.push(html`<div class="ts" key=${'t' + m.id}>${stamp(m.created_at)}</div>`);
     prev = m.created_at;
-    for (const a of asks[m.id] || []) rows.push(html`<div class="row" key=${a.id}><${Message} m=${a} list=${list} members=${members} /></div>`);
-    rows.push(html`<div class="row" key=${m.id}><${Message} m=${m} list=${list} members=${members} /></div>`);
+    for (const a of asks[m.id] || []) rows.push(html`<div class="row" key=${a.id}><${Message} m=${a} list=${list} members=${members} composing=${composing} /></div>`);
+    rows.push(html`<div class="row" key=${m.id}><${Message} m=${m} list=${list} members=${members} composing=${composing} /></div>`);
   }
   const isMain = cid === mainId();
   return html`<div class=${'chat' + (S.settings?.paused ? ' paused' : '')}>
@@ -201,7 +213,7 @@ export function ChatScreen({ cid }) {
       ${isMain && box && !box.hasMore && html`<${NotifyPrompt} />`}
       ${rows}
     </div>
-    <${Composer} cid=${cid} running=${running} />
+    <${Composer} cid=${cid} running=${running} onFocus=${() => { stick.current = true; setComposing(true); }} onBlur=${() => setComposing(false)} />
   </div>`;
 }
 
@@ -229,7 +241,7 @@ async function shrink(file) {
 const MAX_PHOTOS = 4; // per message (server limit)
 const unpreview = (list) => list.forEach((a) => a.preview && URL.revokeObjectURL(a.preview));
 
-function Composer({ cid, running }) {
+function Composer({ cid, running, onFocus, onBlur }) {
   const [text, setText] = useState('');
   const [atts, setAtts] = useState([]);
   const [rec, setRec] = useState(null);
@@ -359,9 +371,10 @@ function Composer({ cid, running }) {
     </div>`)}</div>`}
     <div class=${'inp' + (rec ? ' listening' : '')}>
       <button class="pl" aria-label="Add photos" onClick=${() => file.current.click()} disabled=${atts.length >= MAX_PHOTOS}><${Icon} name="plus" size=${20} /></button>
-      <input ref=${file} type="file" accept="image/*" multiple hidden onChange=${pick} />
+      <input ref=${file} type="file" accept="image/*" multiple hidden tabindex="-1" onChange=${pick} />
       <textarea ref=${ta} rows="1" value=${text} placeholder=${rec ? 'Listening…' : `Talk to ${agentName()}…`}
         aria-label="Message" enterkeyhint=${touch ? 'enter' : 'send'}
+        onFocus=${onFocus} onBlur=${onBlur}
         onInput=${(e) => setText(e.target.value)}
         onKeyDown=${(e) => { if (e.key === 'Enter' && !e.shiftKey && !touch && !e.isComposing) { e.preventDefault(); send(); } }} />
       ${action}

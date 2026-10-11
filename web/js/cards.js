@@ -350,9 +350,12 @@ const CARDS = {
   approval: ApprovalCard,
 };
 
-export function Card({ m }) {
+export function Card({ m, inactive = false }) {
   const c = m.card || {};
   let C = CARDS[c.type] || InfoCard;
   if (c.type === 'link' && c.image_url) C = ResultCard;
-  return html`<div class="card-wrap"><${C} c=${c} m=${m} /></div>`;
+  // Sign-in cards can contain inputs. Keep them out of iOS's form
+  // navigation while the composer has focus; scrolling stays on .scr.
+  const signin = c.type === 'engine_signin' || c.type === 'connector_reconnect';
+  return html`<div class="card-wrap" inert=${inactive && signin}><${C} c=${c} m=${m} /></div>`;
 }
