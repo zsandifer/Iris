@@ -1,6 +1,6 @@
 // For you: story cards per topic, Instagram-like posts, full-screen stories.
 import { html, useEffect, useRef, useState } from './h.js';
-import { post as apiPost, seg } from './api.js';
+import { post as apiPost, seg, sessionGen } from './api.js';
 import { S, set, useStore, loadFeed, go, toast, isOwner, touchList } from './store.js';
 import { Icon, Img, LetterTile, Empty, Spinner, ago, hostOf, safeUrl } from './ui.js';
 import { md, plain } from './md.js';
@@ -45,10 +45,12 @@ export function findPost(id) {
   return S.library?.saved.find((x) => x.id === id) || S.feed?.posts.find((x) => x.id === id);
 }
 
-async function like(p) {
+export async function like(p) {
   const liked = !p.liked;
+  const gen = sessionGen();
   markLiked(p, liked);
   try { await apiPost(`/feed/${seg(p.id)}/like`, { liked }); } catch (e) {
+    if (gen !== sessionGen()) return; // another session now: not ours to roll back
     toast(e.message);
     markLiked(p, !liked);
   }

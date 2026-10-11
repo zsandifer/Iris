@@ -148,3 +148,39 @@ test('a library preview pending across a re-pair never opens', async () => {
   await p;
   assert.equal(S.sheet, null);
 });
+
+test('changing the signed-in session clears storage and reloads at the app root', async () => {
+  const { restarts } = await import('../../web/js/api.js');
+  const seen = [];
+  location.replace = (u) => seen.push(u);
+  try {
+    setToken('');
+    seen.length = 0;
+    const n = restarts.count;
+    setToken('first'); // pairing from nothing: no reload
+    assert.equal(restarts.count, n);
+    sessionStorage.setItem('iris.nav', '1');
+    setToken('second');
+    assert.deepEqual(seen, ['/']);
+    assert.equal(sessionStorage.getItem('iris.nav'), null);
+    setToken('second'); // unchanged
+    assert.equal(seen.length, 1);
+  } finally { delete location.replace; }
+});
+
+test('an unlike that fails after re-pairing does not touch the new session', async () => {
+  const { like } = await import('../../web/js/feed.js');
+  const { S, set } = await import('../../web/js/store.js');
+  let release;
+  setToken('owner');
+  onFetch((url, opts) => new Promise((r) => { release = () => r(reply(opts, { status: 500, body: { error: { message: 'x' } } })); }));
+  set({ library: { saved: [], photos: [], items: [] }, feed: { posts: [] } });
+  const post = { id: 'd'.repeat(32), liked: true };
+  const p = like(post);
+  await tick();
+  setToken('guest');
+  set({ library: { saved: [], photos: [], items: [] } });
+  release();
+  await p;
+  assert.deepEqual(S.library.saved, []);
+});
