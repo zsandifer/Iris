@@ -815,12 +815,17 @@ async fn private_paths(
     // the other ones for a shared turn (their folders go when they are
     // deleted, so this stays as short as the list of Together chats).
     let together = p.data_dir.join("together");
+    let _ = crate::config::ensure_private_dir(&together);
     if !shared {
         out.push(together);
     } else if let Ok(rd) = std::fs::read_dir(&together) {
         out.extend(rd.flatten().map(|e| e.path()).filter(|d| d != cwd));
     }
     out.extend(cli_data_paths());
+    // Only what exists: Codex's sandbox masks a denied path that does not
+    // exist yet by creating an empty file there, which would break the
+    // folder Iris creates later (and there is nothing in it to protect).
+    out.retain(|p| std::fs::symlink_metadata(p).is_ok());
     out
 }
 
