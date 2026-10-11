@@ -66,8 +66,10 @@ phone / browser ──HTTPS (Tailscale) or loopback──▶ iris serve (axum, S
   your data directory and are editable from the app. They are assembled into
   a system prompt for every turn and injected through each CLI's own
   mechanism (`--append-system-prompt-file` for Claude Code,
-  `developer_instructions` for Codex, `GEMINI_SYSTEM_MD` for Gemini CLI, an
-  `instructions` file for OpenCode), before your message.
+  `GEMINI_SYSTEM_MD` for Gemini CLI, an `instructions` file for OpenCode),
+  before your message. Codex only accepts developer instructions on its
+  command line, which other local users can read, so for Codex the prompt
+  is sent on stdin at the start of each new session instead.
 - **Sessions**: each conversation keeps a CLI session per harness and resumes
   it (`--resume`, `codex exec resume`, `-s`). If a conversation switches harness,
   Iris replays the messages that harness has not seen.

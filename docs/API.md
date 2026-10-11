@@ -2190,7 +2190,7 @@ in.
 | Harness | System prompt | MCP | Effort | Images | Resume |
 |---|---|---|---|---|---|
 | `claude` | `--append-system-prompt-file` (+ `--system-prompt-snapshot off`) | `--mcp-config` file | `--effort` | stream-json content blocks | `--resume` |
-| `codex` | `-c developer_instructions=...` | `-c mcp_servers.*` | `-c model_reasoning_effort` | `-i` | `exec resume` (new session when the persona changes) |
+| `codex` | on stdin in `<iris_instructions>` before the first message of each thread (`-c developer_instructions` only points to it, so private files stay off argv) | `-c mcp_servers.*` | `-c model_reasoning_effort` | `-i` | `exec resume` (new session when the persona changes) |
 | `gemini` | `GEMINI_SYSTEM_MD` file (replaces Gemini's coding prompt; lists tools) | per-conversation `.gemini/settings.json`, servers trusted | none | `@path` references | `--resume <session id>` |
 | `opencode` | `instructions` in a private `OPENCODE_CONFIG` file | same file (`mcp`) | `--variant` | `-f` (per-model support from `opencode models --verbose`) | `-s <session id>` |
 
