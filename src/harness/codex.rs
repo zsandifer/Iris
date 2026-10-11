@@ -52,6 +52,16 @@ pub fn mcp_overrides(servers: &[McpServer]) -> Vec<String> {
         // Iris (its own bridge and connectors the owner enabled) are
         // pre-approved, matching `--allowedTools mcp__<name>` for Claude.
         out.push(format!("{p}.default_tools_approval_mode=\"approve\""));
+        // Iris's browser tools may wait for the owner (take-over, card
+        // approval) longer than Codex's 60 s default.
+        if [
+            crate::browser::tools::SERVER,
+            crate::browser::tools::SERVER_ALT,
+        ]
+        .contains(&s.name.as_str())
+        {
+            out.push(format!("{p}.tool_timeout_sec=180"));
+        }
         match &s.transport {
             McpTransport::Stdio { command, args, env } => {
                 out.push(format!("{p}.command={}", toml_str(command)));

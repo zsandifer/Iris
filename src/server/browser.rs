@@ -20,6 +20,7 @@ pub fn routes() -> Router<AppState> {
         .route("/browser/handback", post(hand_back))
         .route("/browser/navigate", post(navigate))
         .route("/browser/install", post(install))
+        .route("/browser/sandbox", post(sandbox))
 }
 
 /// Status plus how to get a browser if there is none.
@@ -116,3 +117,46 @@ async fn install(State(state): State<AppState>, user: AuthUser) -> ApiResult {
     let started = crate::setup::start_op(&state, "browser", "install")?;
     ok(json!({"started": started, "browser": status_json(&state)}))
 }
+
+#[derive(Deserialize)]
+struct SandboxBody {
+    allow_without: bool,
+}
+
+/// Where Chrome's sandbox cannot start (for example Ubuntu's AppArmor
+/// restriction on user namespaces), the owner may choose to run the browser
+/// without it. Off by default; saved; `false` takes it back.
+async fn sandbox(
+    State(state): State<AppState>,
+    user: AuthUser,
+    JsonBody(body): JsonBody<SandboxBody>,
+) -> ApiResult {
+    user.require_owner()?;
+    let allow = body.allow_without;
+    state
+        .db
+        .call(move |c| {
+            if allow {
+                crate::db::set_setting(c, ALLOW_NO_SANDBOX, "true")
+            } else {
+                crate::db::delete_setting(c, ALLOW_NO_SANDBOX)
+            }
+        })
+        .await?;
+    state.browser.set_allow_no_sandbox(allow);
+    crate::info!(
+        "owner {} running the browser without Chrome's sandbox",
+        if allow { "allowed" } else { "disallowed" }
+    );
+    if !allow {
+        // A running unsandboxed browser must not outlive the choice.
+        if state.browser.running().is_some_and(|r| r.no_sandbox) {
+            state.browser.close().await;
+        }
+    }
+    broadcast(&state);
+    ok(json!({"browser": status_json(&state)}))
+}
+
+/// Settings key for the owner's sandbox choice.
+pub const ALLOW_NO_SANDBOX: &str = "browser.allow_no_sandbox";

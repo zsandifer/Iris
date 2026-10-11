@@ -148,6 +148,39 @@ mod tests {
         assert_eq!(p, path(&long));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn round_trip_through_the_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::browser::tools::tests::test_state(tmp.path());
+        let sock = path(&state.paths);
+        tokio::spawn(serve(state.clone()));
+        for _ in 0..50 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let g = state.browser.begin_turn("u", "c", "m", &[]);
+        let token = g.token().to_string();
+        let s2 = sock.clone();
+        // The tool process side is blocking I/O.
+        let ask = move |token: String, name: &'static str| {
+            let s = s2.clone();
+            tokio::task::spawn_blocking(move || forward(&s, &token, name, &json!({"x": 1})))
+        };
+        // A live token reaches the tools (an unknown tool name is refused
+        // by them, proving the call arrived with its name and token).
+        let r = ask(token.clone(), "no_such_tool").await.unwrap();
+        assert_eq!(r["isError"], true);
+        assert_eq!(r["content"][0]["text"], "unknown tool no_such_tool");
+        // A wrong or expired token is refused before anything runs.
+        let r = ask("bogus".into(), "snapshot").await.unwrap();
+        assert_eq!(r["content"][0]["text"], crate::browser::TURN_ENDED);
+        drop(g);
+        let r = ask(token, "snapshot").await.unwrap();
+        assert_eq!(r["content"][0]["text"], crate::browser::TURN_ENDED);
+    }
+
     #[test]
     fn forward_reports_a_missing_server() {
         let tmp = tempfile::tempdir().unwrap();

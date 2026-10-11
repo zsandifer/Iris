@@ -533,7 +533,7 @@ async fn create_connector(
     let name = body.name.clone().unwrap_or_default();
     if !valid_server_name(&name) || RESERVED_CONNECTOR_NAMES.contains(&name.as_str()) {
         return Err(ApiError::bad_request(
-            "name must be 1-48 characters of A-Z, a-z, 0-9, _ or - (and not 'iris' or 'browser')",
+            "name must be 1-48 characters of A-Z, a-z, 0-9, _ or - (and not 'iris', 'browser', or 'iris_browser')",
         ));
     }
     let description = body.description.clone().unwrap_or_default();

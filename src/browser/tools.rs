@@ -17,6 +17,9 @@ use tokio::sync::broadcast;
 
 /// MCP server name (tool prefix `mcp__browser__`).
 pub const SERVER: &str = "browser";
+/// Name used instead when an older install already has a connector called
+/// `browser` (that connector keeps working).
+pub const SERVER_ALT: &str = "iris_browser";
 /// Helpers injected into an isolated world of each page.
 const PAGE_JS: &str = include_str!("page.js");
 const SNAPSHOT_CHARS: usize = 12_000;
@@ -167,7 +170,11 @@ pub fn definitions() -> Vec<Value> {
 }
 
 /// System prompt section when the browser is attached.
-pub const GUIDE: &str = "
+pub fn guide(server: &str) -> String {
+    GUIDE.replace("the `browser` tools", &format!("the `{server}` tools"))
+}
+
+const GUIDE: &str = "
 ## Your browser
 
 You have your own web browser (the `browser` tools), which the user can watch
@@ -193,7 +200,7 @@ quick reading, ordinary web search or fetch tools are fine.
 pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Output {
     let b = &state.browser;
     let Some(ctx) = b.turn(token) else {
-        return Output::error("This browser session has ended.");
+        return Output::error(super::TURN_ENDED);
     };
     if !definitions().iter().any(|d| d["name"] == name) {
         return Output::error(format!("unknown tool {name}"));
@@ -205,13 +212,28 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Ou
         );
     }
     b.mark_used(&ctx);
-    if !b.wait_for_agent().await {
-        return Output::text(
-            "The user has taken over the browser and is still using it. Wait a bit and try \
-             again, or tell them you are waiting for them to hand it back.",
-        );
+    // Wait while the owner has control, then hold the page; control is
+    // checked again once the page is ours, so a call queued behind another
+    // never runs after a take-over.
+    let _op = loop {
+        if !b.wait_for_agent(&ctx).await {
+            return if ctx.is_ended() {
+                Output::error(super::TURN_ENDED)
+            } else {
+                Output::text(super::TAKEN_OVER)
+            };
+        }
+        let guard = tokio::select! {
+            g = b.op_lock.lock() => g,
+            _ = ctx.wait_ended() => return Output::error(super::TURN_ENDED),
+        };
+        if b.control() == super::Control::Agent {
+            break guard;
+        }
+    };
+    if let Err(e) = b.check_agent(&ctx) {
+        return Output::error(e.to_string());
     }
-    let _op = b.op_lock.lock().await;
     let run = match b.ensure().await {
         Ok(r) => r,
         Err(e) => return Output::error(format!("The browser could not start: {e}")),
@@ -227,6 +249,9 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Ou
     if !dialogs.is_empty() {
         out.text = format!("(Dialog: {})\n\n{}", dialogs.join("; "), out.text);
     }
+    // A page can echo a filled secret (a dialog, another field, its title):
+    // never let it reach the agent.
+    out.text = run.redact(&out.text);
     crate::info!(
         "browser: {name} {} in {}ms",
         if out.is_error { "failed" } else { "ok" },
@@ -246,6 +271,7 @@ async fn run_tool(
     let page = run.page();
     let s = Some(page.session_id.as_str());
     let arg = |k: &str| a.get(k).and_then(Value::as_str).unwrap_or("");
+    let b = &state.browser;
     match name {
         "navigate" => {
             let url = normalize_url(arg("url"))?;
@@ -270,6 +296,7 @@ async fn run_tool(
                 p["y"].as_f64().unwrap_or(0.0),
             );
             let events = cdp.subscribe();
+            b.check_agent(ctx)?;
             click_at(cdp, s, x, y).await?;
             settle(events, &page, Duration::from_millis(600)).await;
             let mut out = snapshot(run).await?;
@@ -296,6 +323,13 @@ async fn run_tool(
                     stale_message(e)
                 }));
             }
+            if f["ok"] != true {
+                return Ok(Output::error(
+                    "That field did not take the focus (something else on the page did); take \
+                     a new snapshot.",
+                ));
+            }
+            b.check_agent(ctx)?;
             cdp.call("Input.insertText", json!({"text": text}), s)
                 .await?;
             if a["submit"].as_bool().unwrap_or(false) {
@@ -357,6 +391,15 @@ async fn run_tool(
             snapshot(run).await
         }
         "screenshot" => {
+            // Text can be redacted, pixels cannot: no picture while the page
+            // shows a secret Iris filled (outside the masked fields).
+            let shown = eval(run, "pageText()").await?;
+            if run.shows_secret(shown.as_str().unwrap_or("")) {
+                return Ok(Output::error(
+                    "No screenshot right now: this page shows saved sign-in or card details. \
+                     Use snapshot instead.",
+                ));
+            }
             let m = cdp.call("Page.getLayoutMetrics", json!({}), s).await?;
             let vv = &m["cssVisualViewport"];
             let clip = json!({
@@ -737,8 +780,63 @@ async fn settle(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn test_state(tmp: &std::path::Path) -> AppState {
+        let paths = crate::config::Paths {
+            config_file: tmp.join("config.toml"),
+            data_dir: tmp.join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let db = crate::db::Db::open(&paths.db_file()).unwrap();
+        let mut cfg = crate::config::Config::default();
+        for h in cfg.harness.values_mut() {
+            h.enabled = false;
+        }
+        AppState::new(cfg, paths, db).unwrap()
+    }
+
+    #[tokio::test]
+    async fn queued_calls_respect_take_over_and_turn_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let b = state.browser.clone();
+        let g = b.begin_turn("u", "c", "m", &[]);
+        let token = g.token().to_string();
+        // Another call holds the page.
+        let held = b.op_lock.lock().await;
+        let (st, tk) = (state.clone(), token.clone());
+        let queued =
+            tokio::spawn(
+                async move { call(&st, &tk, "navigate", &json!({"url": "a.test"})).await },
+            );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The owner takes over while the call waits for the page.
+        b.control.send_replace(super::super::Control::User {
+            user_id: "u".into(),
+            device_id: "d".into(),
+        });
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // It went back to waiting instead of running under the owner.
+        assert!(!queued.is_finished());
+        // The turn ends: the call gives up at once, having done nothing.
+        drop(g);
+        let out = tokio::time::timeout(Duration::from_secs(2), queued)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            out.is_error && out.text == super::super::TURN_ENDED,
+            "{}",
+            out.text
+        );
+        assert!(b.running().is_none());
+        // Unknown and expired tokens are refused.
+        assert!(call(&state, &token, "snapshot", &json!({})).await.is_error);
+        assert!(call(&state, "", "snapshot", &json!({})).await.is_error);
+    }
 
     #[test]
     fn urls_are_web_pages_only() {

@@ -9,7 +9,7 @@ mod content;
 mod web;
 mod ws;
 
-pub use browser::broadcast as browser_broadcast;
+pub use browser::{ALLOW_NO_SANDBOX, broadcast as browser_broadcast};
 pub use chat::sniff_image;
 
 use crate::auth::{self, PairError};
@@ -414,7 +414,7 @@ async fn user_pairing_code(
 // -------------------------------------------------------------- connectors
 
 /// Reserved MCP server names (the built-in bridge).
-pub const RESERVED_CONNECTOR_NAMES: &[&str] = &["iris", "browser"];
+pub const RESERVED_CONNECTOR_NAMES: &[&str] = &["iris", "browser", "iris_browser"];
 
 fn connector_aad(id: &str, field: &str, key: &str) -> String {
     format!("connector:{id}:{field}:{key}")
@@ -516,9 +516,9 @@ async fn shutdown_signal(state: AppState) {
     {
         let _ = tx.send(true);
     }
-    // Close the browser cleanly so its profile (sign-ins) is saved.
-    let browser = state.browser.clone();
-    tokio::spawn(async move { browser.close().await });
+    // Close the browser cleanly so its profile (sign-ins) is saved, before
+    // the runtime goes away.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(4), state.browser.close()).await;
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         std::process::exit(0);

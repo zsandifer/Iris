@@ -39,6 +39,27 @@ const CHECKOUT_PAGE: &str = r#"<!doctype html><html><head><title>Checkout</title
 <button>Pay now</button>
 </form></body></html>"#;
 
+/// A sign-in page that echoes what is typed into its password field: in a
+/// dialog, a paragraph, and another field (all must be redacted).
+const REFLECT_PAGE: &str = r#"<!doctype html><html><head><title>Echo sign in</title></head><body>
+<h1>Echo</h1><form>
+<input name="email" type="email" autocomplete="username" aria-label="Email">
+<input id="pw" name="password" type="password" aria-label="Password"
+  oninput="document.getElementById('echo').textContent = 'You typed ' + this.value;
+           document.getElementById('copy').value = this.value; alert('Got ' + this.value)">
+<input id="copy" aria-label="Copy">
+<button type="button" onclick="pw.type = 'text'">Show password</button>
+</form><p id="echo"></p></body></html>"#;
+
+/// Card fields recognized by name only (no autocomplete hints).
+const PLAIN_CHECKOUT: &str = r#"<!doctype html><html><head><title>Plain checkout</title></head><body>
+<h1>Pay</h1><form method="post" action="/pay">
+<label>Card number <input name="card_number"></label>
+<label>Expiry <input name="expiry" placeholder="MM/YY"></label>
+<label>Security code <input name="security_code"></label>
+<label>Name on card <input name="name_on_card"></label>
+<button>Pay</button></form></body></html>"#;
+
 /// Serve the test pages; returns the port and the request bodies posted.
 async fn test_site() -> (u16, Arc<Mutex<Vec<String>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -83,6 +104,10 @@ async fn test_site() -> (u16, Arc<Mutex<Vec<String>>>) {
                                 "<!doctype html><title>Paid</title><h1>Thanks</h1>".into()
                             } else if line.starts_with("GET /checkout") {
                                 CHECKOUT_PAGE.to_string()
+                            } else if line.starts_with("GET /plain-checkout") {
+                                PLAIN_CHECKOUT.to_string()
+                            } else if line.starts_with("GET /reflect") {
+                                REFLECT_PAGE.to_string()
                             } else if line.starts_with("GET / ") {
                                 LOGIN_PAGE.to_string()
                             } else {
@@ -112,11 +137,12 @@ fn ref_of(snapshot: &str, needle: &str) -> String {
     line[start..].split(']').next().unwrap().to_string()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn browses_fills_logins_and_cards_without_leaking_them() {
+/// A server state with a saved login (for 127.0.0.1 and localhost) and a
+/// wallet card. None when no Chromium is installed.
+fn setup() -> Option<(tempfile::TempDir, AppState, String, String)> {
     if super::launch::find("").is_none() {
         eprintln!("no Chromium found; skipping the browser end-to-end test");
-        return;
+        return None;
     }
     let tmp = tempfile::tempdir().unwrap();
     let paths = Paths {
@@ -130,6 +156,8 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
         h.enabled = false;
     }
     let state = AppState::new(cfg, paths, db).unwrap();
+    // Test machines often cannot start Chrome's sandbox.
+    state.browser.set_allow_no_sandbox(true);
     let (owner, conv) = state
         .db
         .with(|c| {
@@ -138,12 +166,17 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
             Ok((u, m))
         })
         .unwrap();
-    // A saved login for this test site and a wallet card.
     for (id, kind, meta, secret) in [
         (
             "cred-login",
             "login",
             json!({"site": "127.0.0.1", "username": "pat@example.com"}),
+            json!({"password": PASSWORD}),
+        ),
+        (
+            "cred-login-local",
+            "login",
+            json!({"site": "localhost", "username": "pat@example.com"}),
             json!({"password": PASSWORD}),
         ),
         (
@@ -163,6 +196,27 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
             .with(|c| crate::entities::insert_credential(c, id, &owner, kind, "Test", &meta, &ct))
             .unwrap();
     }
+    Some((tmp, state, owner, conv))
+}
+
+/// The wallet approval cards in a conversation, newest last.
+async fn approvals(state: &AppState, conv: &str) -> Vec<crate::db::Message> {
+    let c = conv.to_string();
+    state
+        .db
+        .call(move |db| crate::db::list_messages(db, &c, None, 50))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.card.as_ref().is_some_and(|c| c["type"] == "approval"))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browses_fills_logins_and_cards_without_leaking_them() {
+    let Some((_tmp, state, owner, conv)) = setup() else {
+        return;
+    };
     let (port, posted) = test_site().await;
     let guard = state
         .browser
@@ -343,4 +397,120 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
     );
     state.browser.close().await;
     assert!(state.browser.running().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reflected_secrets_pending_and_denied_cards_and_stale_refs() {
+    let Some((_tmp, state, owner, conv)) = setup() else {
+        return;
+    };
+    let (port, _posted) = test_site().await;
+    let guard = state
+        .browser
+        .begin_turn(&owner, &conv, "msg-2", std::slice::from_ref(&owner));
+    let token = guard.token().to_string();
+    let call = |name: &'static str, args: Value| {
+        let (st, tk) = (state.clone(), token.clone());
+        async move { tools::call(&st, &tk, name, &args).await }
+    };
+    let mut outputs: Vec<String> = Vec::new();
+
+    // A page that echoes the password everywhere it can.
+    let out = call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/reflect")}),
+    )
+    .await;
+    let stale = ref_of(&out.text, "button \"Show password\"");
+    let out = call("fill_login", json!({})).await;
+    assert!(out.text.ends_with("filled"), "{}", out.text);
+    assert!(out.text.contains("Dialog"), "{}", out.text);
+    outputs.push(out.text);
+    let snap = call("snapshot", json!({})).await;
+    assert!(snap.text.contains("You typed ••••"), "{}", snap.text);
+    outputs.push(snap.text.clone());
+    // Revealed as plain text: still masked in what the agent reads.
+    let show = ref_of(&snap.text, "button \"Show password\"");
+    let out = call("click", json!({"ref": show})).await;
+    outputs.push(out.text.clone());
+    assert!(out.text.contains("textbox \"Password\""), "{}", out.text);
+    // Pixels cannot be redacted: no screenshot while the page shows it.
+    let shot = call("screenshot", json!({})).await;
+    assert!(shot.is_error && shot.image.is_none(), "{}", shot.text);
+
+    // Refs from an earlier page never hit an element of a later one.
+    call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/about")}),
+    )
+    .await;
+    let out = call("click", json!({"ref": stale})).await;
+    assert!(
+        out.is_error && out.text.contains("new snapshot"),
+        "{}",
+        out.text
+    );
+
+    // Cards: nothing is typed while the OK is pending, or after a no.
+    let url = format!("http://localhost:{port}/plain-checkout");
+    call("navigate", json!({"url": url})).await;
+    let out = call("fill_card", json!({})).await;
+    assert!(out.text.starts_with("waiting for approval"), "{}", out.text);
+    let snap = call("snapshot", json!({})).await;
+    assert!(!snap.text.contains("value="), "{}", snap.text);
+    let pending = approvals(&state, &conv).await;
+    assert_eq!(pending.len(), 1);
+    let (id, mut card) = (pending[0].id.clone(), pending[0].card.clone().unwrap());
+    assert_eq!(card["state"], "pending");
+    card["state"] = "denied".into();
+    card["decided_at"] = crate::util::now_ms().into();
+    state
+        .db
+        .call(move |db| crate::db::update_message_card(db, &id, &card))
+        .await
+        .unwrap();
+    let out = call("fill_card", json!({})).await;
+    assert!(out.text.starts_with("denied"), "{}", out.text);
+    let snap = call("snapshot", json!({})).await;
+    assert!(!snap.text.contains("value="), "{}", snap.text);
+    // Still just the one card: a fresh "no" is not asked again at once.
+    assert_eq!(approvals(&state, &conv).await.len(), 1);
+
+    // Card fields found by name alone are masked once filled.
+    let url = format!("http://127.0.0.1:{port}/plain-checkout");
+    call("navigate", json!({"url": url})).await;
+    let approver = {
+        let st = state.clone();
+        let conv = conv.clone();
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if let Some(m) = approvals(&st, &conv)
+                    .await
+                    .into_iter()
+                    .find(|m| m.card.as_ref().is_some_and(|c| c["state"] == "pending"))
+                {
+                    let mut card = m.card.unwrap();
+                    card["state"] = "approved".into();
+                    st.db
+                        .call(move |db| crate::db::update_message_card(db, &m.id, &card))
+                        .await
+                        .unwrap();
+                    return;
+                }
+            }
+        })
+    };
+    let out = call("fill_card", json!({})).await;
+    approver.await.unwrap();
+    assert_eq!(out.text, "filled");
+    let snap = call("snapshot", json!({})).await;
+    assert!(snap.text.contains("value=\"08/31\""), "{}", snap.text);
+    outputs.push(snap.text);
+
+    for o in &outputs {
+        assert!(!o.contains(PASSWORD) && !o.contains(CARD), "{o}");
+    }
+    drop(guard);
+    state.browser.close().await;
 }

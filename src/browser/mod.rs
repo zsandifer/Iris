@@ -112,7 +112,27 @@ pub struct TurnCtx {
     pub message_id: String,
     pub audience: Vec<String>,
     used: AtomicBool,
+    /// Set when the turn ends; tool calls still in flight stop at their
+    /// next check (waits end at once).
+    ended: watch::Sender<bool>,
 }
+
+impl TurnCtx {
+    pub fn is_ended(&self) -> bool {
+        *self.ended.borrow()
+    }
+
+    /// Resolves when the turn ends.
+    pub async fn wait_ended(&self) {
+        let mut rx = self.ended.subscribe();
+        let _ = rx.wait_for(|e| *e).await;
+    }
+}
+
+/// Why the agent may not act right now.
+pub const TAKEN_OVER: &str = "The user has taken over the browser and is still using it. Wait a \
+    bit and try again, or tell them you are waiting for them to hand it back.";
+pub const TURN_ENDED: &str = "This browser session has ended.";
 
 /// Unregisters the turn when dropped; tells the chat the browser peek can
 /// go away.
@@ -130,6 +150,9 @@ impl TurnGuard {
 impl Drop for TurnGuard {
     fn drop(&mut self) {
         let ctx = lock(&self.browser.turns).remove(&self.token);
+        if let Some(ctx) = &ctx {
+            ctx.ended.send_replace(true);
+        }
         if let Some(ctx) = ctx
             && ctx.used.load(Ordering::SeqCst)
         {
@@ -150,11 +173,20 @@ pub struct Running {
     page: Mutex<PageRef>,
     pub no_sandbox: bool,
     pub version: String,
-    screencast: Mutex<Option<Mode>>,
+    /// Screencast actually running: (session, mode).
+    cast: Mutex<Option<(String, Mode)>>,
+    /// Serializes screencast changes (latest wish wins).
+    cast_lock: tokio::sync::Mutex<()>,
+    /// Serializes switching tabs.
+    attach_lock: tokio::sync::Mutex<()>,
     /// Dialogs Iris answered since the last tool result.
     dialogs: Mutex<Vec<String>>,
     /// Viewport size reported with the last frame (CSS pixels).
     last_meta: Mutex<(f64, f64)>,
+    /// Secrets Iris typed into pages in this browser session, so any copy a
+    /// page reflects (a dialog, another field, the title) is redacted from
+    /// what the agent reads. Memory only; gone when the browser closes.
+    secrets: Mutex<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -171,6 +203,51 @@ impl Running {
     pub fn take_dialogs(&self) -> Vec<String> {
         std::mem::take(&mut *lock(&self.dialogs))
     }
+
+    /// Remember a secret Iris typed (and common spaced forms of card
+    /// numbers) for redaction.
+    pub fn remember_secret(&self, secret: &str) {
+        if secret.chars().count() < 3 {
+            return;
+        }
+        let mut forms = vec![secret.to_string()];
+        if secret.len() >= 12 && secret.bytes().all(|b| b.is_ascii_digit()) {
+            let groups: Vec<&str> = secret
+                .as_bytes()
+                .chunks(4)
+                .map(|c| std::str::from_utf8(c).unwrap_or(""))
+                .collect();
+            forms.push(groups.join(" "));
+            forms.push(groups.join("-"));
+        }
+        let mut s = lock(&self.secrets);
+        for f in forms {
+            if !s.contains(&f) {
+                s.push(f);
+            }
+        }
+        // Longest first, so a secret containing another is replaced whole.
+        s.sort_by_key(|x| std::cmp::Reverse(x.len()));
+    }
+
+    /// Replace every remembered secret in text the agent will read.
+    pub fn redact(&self, text: &str) -> String {
+        let secrets = lock(&self.secrets);
+        let mut out = text.to_string();
+        for s in secrets.iter() {
+            if out.contains(s.as_str()) {
+                out = out.replace(s.as_str(), "••••");
+            }
+        }
+        out
+    }
+
+    /// Whether text contains a remembered secret.
+    pub fn shows_secret(&self, text: &str) -> bool {
+        lock(&self.secrets)
+            .iter()
+            .any(|s| text.contains(s.as_str()))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -179,6 +256,8 @@ struct View {
     title: String,
     error: Option<String>,
     busy: bool,
+    /// The last start failed only because Chrome's sandbox cannot run here.
+    sandbox_unavailable: bool,
 }
 
 /// Shared browser state (cheap to clone through `Arc`).
@@ -202,6 +281,9 @@ pub struct Shared {
     pub(crate) op_lock: tokio::sync::Mutex<()>,
     /// "Pause Iris" in the app: no turns, jobs, or browsing until resumed.
     paused: AtomicBool,
+    /// The owner agreed (in the app) to run without Chrome's sandbox on a
+    /// system where it cannot start.
+    allow_no_sandbox: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -248,6 +330,7 @@ impl Browser {
             last_input: AtomicI64::new(0),
             op_lock: tokio::sync::Mutex::new(()),
             paused: AtomicBool::new(false),
+            allow_no_sandbox: AtomicBool::new(false),
         }))
     }
 
@@ -274,6 +357,18 @@ impl Browser {
     /// Startup: restore the saved pause switch.
     pub fn init_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
+    }
+
+    pub fn allows_no_sandbox(&self) -> bool {
+        self.allow_no_sandbox.load(Ordering::SeqCst)
+    }
+
+    /// The owner's choice about running without Chrome's sandbox.
+    pub fn set_allow_no_sandbox(&self, allow: bool) {
+        self.allow_no_sandbox.store(allow, Ordering::SeqCst);
+        if allow {
+            lock(&self.view).sandbox_unavailable = false;
+        }
     }
 
     /// Pause (or resume) Iris. Pausing closes the browser; the caller stops
@@ -305,6 +400,7 @@ impl Browser {
                 message_id: message_id.into(),
                 audience: audience.to_vec(),
                 used: AtomicBool::new(false),
+                ended: watch::Sender::new(false),
             }),
         );
         TurnGuard {
@@ -341,12 +437,31 @@ impl Browser {
             .collect()
     }
 
-    /// Wait until the agent may drive (the owner is not in control).
-    pub async fn wait_for_agent(&self) -> bool {
+    /// Wait until the agent may drive (the owner is not in control). False
+    /// if the owner keeps control for a while or the turn ends.
+    pub async fn wait_for_agent(&self, ctx: &TurnCtx) -> bool {
         let mut rx = self.control.subscribe();
-        tokio::time::timeout(CONTROL_WAIT, rx.wait_for(|c| *c == Control::Agent))
-            .await
-            .is_ok_and(|r| r.is_ok())
+        tokio::select! {
+            r = tokio::time::timeout(CONTROL_WAIT, rx.wait_for(|c| *c == Control::Agent)) => {
+                r.is_ok_and(|r| r.is_ok()) && !ctx.is_ended()
+            }
+            _ = ctx.wait_ended() => false,
+        }
+    }
+
+    /// Checked right before every action on the page: the turn is still
+    /// running, Iris is not paused, and the owner has not taken over.
+    pub fn check_agent(&self, ctx: &TurnCtx) -> Result<()> {
+        if ctx.is_ended() {
+            return Err(TURN_ENDED.into());
+        }
+        if self.is_paused() {
+            return Err("The owner paused Iris, so the browser is off.".into());
+        }
+        if self.control() != Control::Agent {
+            return Err(TAKEN_OVER.into());
+        }
+        Ok(())
     }
 
     pub fn set_busy(&self, busy: bool) {
@@ -380,6 +495,8 @@ impl Browser {
             "active": self.active_turns(),
             "watchers": lock(&self.watchers).len(),
             "sandbox": run.as_ref().map(|r| !r.no_sandbox),
+            "sandbox_unavailable": v.sandbox_unavailable,
+            "allow_no_sandbox": self.allows_no_sandbox(),
             "version": run.as_ref().map(|r| r.version.clone()),
             "error": v.error,
         })
@@ -449,13 +566,18 @@ impl Browser {
             width: VIEW_W,
             height: VIEW_H,
             scale: SCALE,
+            allow_no_sandbox: self.allows_no_sandbox(),
         })
         .await;
         let launched = match launched {
             Ok(l) => l,
             Err(e) => {
                 crate::warn!("browser: could not start: {e}");
-                lock(&self.view).error = Some(e.to_string());
+                {
+                    let mut v = lock(&self.view);
+                    v.sandbox_unavailable = e.to_string() == launch::SANDBOX_UNAVAILABLE;
+                    v.error = Some(e.to_string());
+                }
                 self.broadcast_state();
                 return Err(e);
             }
@@ -473,9 +595,12 @@ impl Browser {
             page: Mutex::default(),
             no_sandbox: launched.no_sandbox,
             version,
-            screencast: Mutex::new(None),
+            cast: Mutex::new(None),
+            cast_lock: tokio::sync::Mutex::new(()),
+            attach_lock: tokio::sync::Mutex::new(()),
             dialogs: Mutex::default(),
             last_meta: Mutex::new((VIEW_W as f64, VIEW_H as f64)),
+            secrets: Mutex::default(),
         });
         let events = cdp.subscribe();
         cdp.call("Target.setDiscoverTargets", json!({"discover": true}), None)
@@ -495,10 +620,19 @@ impl Browser {
                 .unwrap_or_default()
                 .to_string(),
         };
-        self.attach(&run, &target).await?;
+        if let Err(e) = self.attach(&run, &target).await {
+            Self::shut(&run).await;
+            return Err(e);
+        }
+        // Paused (or turned off) while starting: do not publish it.
+        if self.is_paused() {
+            Self::shut(&run).await;
+            return Err("Iris is paused".into());
+        }
         {
             let mut v = lock(&self.view);
             v.error = None;
+            v.sandbox_unavailable = false;
             v.url = "about:blank".into();
             v.title = String::new();
         }
@@ -518,6 +652,10 @@ impl Browser {
 
     /// Attach to a page target and make it the current tab.
     pub async fn attach(&self, run: &Running, target_id: &str) -> Result<()> {
+        let _g = run.attach_lock.lock().await;
+        if run.page().target_id == target_id {
+            return Ok(());
+        }
         let cdp = &run.cdp;
         let a = cdp
             .call(
@@ -555,7 +693,7 @@ impl Browser {
                 session_id: session.clone(),
             },
         );
-        if !old.session_id.is_empty() && old.target_id != target_id {
+        if !old.session_id.is_empty() {
             let _ = cdp
                 .call(
                     "Target.detachFromTarget",
@@ -564,8 +702,7 @@ impl Browser {
                 )
                 .await;
         }
-        // Restart the screencast on the new tab if someone is watching.
-        *lock(&run.screencast) = None;
+        // Move the screencast to the new tab if someone is watching.
         self.update_screencast();
         if let Ok(info) = cdp
             .call("Target.getTargetInfo", json!({"targetId": target_id}), None)
@@ -580,29 +717,35 @@ impl Browser {
     }
 
     /// Close the browser (gracefully, so the profile and cookies are saved).
+    /// Waits for a start in progress, so nothing launched before the close
+    /// survives it.
     pub async fn close(&self) {
+        let _g = self.launch_lock.lock().await;
         let run = lock(&self.running).take();
         let Some(run) = run else {
             return;
         };
         crate::info!("browser: closing");
-        let _ = run
-            .cdp
-            .call_timeout("Browser.close", json!({}), None, Duration::from_secs(3))
-            .await;
-        let child = lock(&run.child).take();
-        if let Some(mut child) = child {
-            if tokio::time::timeout(Duration::from_secs(5), child.wait())
-                .await
-                .is_err()
-            {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-            }
-        }
+        Self::shut(&run).await;
         self.control.send_replace(Control::Agent);
         self.frames.send_replace(None);
         self.broadcast_state();
+    }
+
+    async fn shut(run: &Running) {
+        let _ = run
+            .cdp
+            .call_timeout("Browser.close", json!({}), None, Duration::from_secs(2))
+            .await;
+        let child = lock(&run.child).take();
+        if let Some(mut child) = child
+            && tokio::time::timeout(Duration::from_secs(3), child.wait())
+                .await
+                .is_err()
+        {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
     }
 
     async fn idle_loop(&self, run: Arc<Running>) {
@@ -762,7 +905,10 @@ impl Browser {
             meta["deviceHeight"].as_f64().unwrap_or(VIEW_H as f64),
         );
         *lock(&run.last_meta) = (w, h);
-        let mode = *lock(&run.screencast);
+        let mode = lock(&run.cast)
+            .as_ref()
+            .filter(|(s, _)| *s == page.session_id)
+            .map(|(_, m)| *m);
         if let (Some(mode), Some(data)) = (mode, p["data"].as_str()) {
             self.publish_frame(mode, w, h, data);
         }
@@ -839,44 +985,50 @@ impl Browser {
 
     /// Start, restart, or stop the screencast to match the watchers.
     fn update_screencast(&self) {
-        let want = lock(&self.watchers).values().copied().max();
         let Some(run) = self.running() else {
             return;
         };
-        let have = {
-            let mut cur = lock(&run.screencast);
-            let have = *cur;
-            *cur = want;
-            have
-        };
-        if have == want {
-            return;
-        }
+        let b = self.clone();
+        tokio::spawn(async move { b.reconcile_screencast(&run).await });
+    }
+
+    /// One change at a time, always toward the latest wish: the best mode
+    /// any watcher wants, on the current tab.
+    async fn reconcile_screencast(&self, run: &Running) {
+        let _g = run.cast_lock.lock().await;
+        let want = lock(&self.watchers).values().copied().max();
         let page = run.page();
         if page.session_id.is_empty() {
             return;
         }
-        let b = self.clone();
-        tokio::spawn(async move {
-            let cdp = &run.cdp;
-            let s = Some(page.session_id.as_str());
-            if have.is_some() {
-                let _ = cdp.call("Page.stopScreencast", json!({}), s).await;
+        let have = lock(&run.cast).clone();
+        let target = want.map(|m| (page.session_id.clone(), m));
+        if have == target {
+            return;
+        }
+        let cdp = &run.cdp;
+        // A screencast on a tab we left ended when we detached from it.
+        if let Some((sess, _)) = &have
+            && *sess == page.session_id
+        {
+            let _ = cdp.call("Page.stopScreencast", json!({}), Some(sess)).await;
+        }
+        *lock(&run.cast) = None;
+        if let Some(m) = want {
+            let w = m.max_width();
+            let started = cdp
+                .call(
+                    "Page.startScreencast",
+                    json!({"format": "jpeg", "quality": m.quality(), "maxWidth": w,
+                           "maxHeight": w * 2, "everyNthFrame": 1}),
+                    Some(&page.session_id),
+                )
+                .await;
+            if started.is_ok() {
+                *lock(&run.cast) = target;
+                let _ = self.publish_still(run, m).await;
             }
-            if let Some(m) = want {
-                let w = m.max_width();
-                let _ = cdp
-                    .call(
-                        "Page.startScreencast",
-                        json!({"format": "jpeg", "quality": m.quality(), "maxWidth": w,
-                               "maxHeight": w * 2,
-                               "everyNthFrame": 1}),
-                        s,
-                    )
-                    .await;
-                let _ = b.publish_still(&run, m).await;
-            }
-        });
+        }
     }
 
     // ----------------------------------------------------------- take over
@@ -1009,23 +1161,72 @@ mod tests {
     #[tokio::test]
     async fn take_over_pauses_the_agent_until_handed_back() {
         let (_t, b) = browser();
-        assert!(b.wait_for_agent().await);
+        let g = b.begin_turn("u", "c", "m", &[]);
+        let ctx = b.turn(g.token()).unwrap();
+        assert!(b.wait_for_agent(&ctx).await);
+        assert!(b.check_agent(&ctx).is_ok());
         b.control.send_replace(Control::User {
             user_id: "u".into(),
             device_id: "d".into(),
         });
         assert_eq!(b.state_json()["controller"], "user");
-        let b2 = b.clone();
-        let waiter = tokio::spawn(async move { b2.wait_for_agent().await });
+        assert_eq!(b.check_agent(&ctx).unwrap_err().to_string(), TAKEN_OVER);
+        let (b2, c2) = (b.clone(), ctx.clone());
+        let waiter = tokio::spawn(async move { b2.wait_for_agent(&c2).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!waiter.is_finished());
         b.hand_back();
         assert!(waiter.await.unwrap());
+        // Ending the turn ends a wait at once and blocks further actions.
+        b.control.send_replace(Control::User {
+            user_id: "u".into(),
+            device_id: "d".into(),
+        });
+        let (b3, c3) = (b.clone(), ctx.clone());
+        let waiter = tokio::spawn(async move { b3.wait_for_agent(&c3).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(g);
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(ctx.is_ended());
+        b.hand_back();
+        assert_eq!(b.check_agent(&ctx).unwrap_err().to_string(), TURN_ENDED);
         // Input is refused unless this device has control.
         let err = b
             .user_input("d", &json!({"kind": "text", "text": "hi"}))
             .await;
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn secrets_are_redacted_in_every_form() {
+        let run = Running {
+            cdp: Cdp::detached(),
+            child: Mutex::new(None),
+            page: Mutex::default(),
+            no_sandbox: false,
+            version: String::new(),
+            cast: Mutex::new(None),
+            cast_lock: tokio::sync::Mutex::new(()),
+            attach_lock: tokio::sync::Mutex::new(()),
+            dialogs: Mutex::default(),
+            last_meta: Mutex::new((0.0, 0.0)),
+            secrets: Mutex::default(),
+        };
+        run.remember_secret("hunter2-long");
+        run.remember_secret("4242424242424242");
+        run.remember_secret("12");
+        let text = "alert: hunter2-long / 4242 4242 4242 4242 / 4242-4242-4242-4242 / 4242424242424242 / 12";
+        let out = run.redact(text);
+        assert!(!out.contains("hunter2") && !out.contains("4242"), "{out}");
+        // Too short to redact safely (would mangle ordinary text).
+        assert!(out.ends_with("/ 12"));
+        assert!(run.shows_secret("x hunter2-long y"));
+        assert!(!run.shows_secret("nothing here"));
     }
 
     #[test]

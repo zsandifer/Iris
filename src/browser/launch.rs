@@ -170,10 +170,17 @@ pub struct LaunchOptions<'a> {
     pub width: u32,
     pub height: u32,
     pub scale: f64,
+    /// The owner agreed to run without Chrome's sandbox where it cannot
+    /// start. Without that, such a system gets `SANDBOX_UNAVAILABLE`.
+    pub allow_no_sandbox: bool,
 }
 
-/// Start the browser. Tries with Chrome's sandbox first and retries
-/// without it only if the sandbox itself cannot start on this machine.
+/// Error when Chrome's sandbox cannot start here and the owner has not
+/// agreed to run without it.
+pub const SANDBOX_UNAVAILABLE: &str = "Chrome's security sandbox cannot start on this server (the owner can sort this out in Iris's computer in the app)";
+
+/// Start the browser with Chrome's sandbox. Only if the sandbox itself
+/// cannot start on this machine, and the owner allowed it, start without.
 pub async fn launch(opts: &LaunchOptions<'_>) -> Result<Launched> {
     use std::sync::atomic::{AtomicBool, Ordering};
     /// Learned once per run: this system cannot start Chrome's sandbox.
@@ -182,16 +189,18 @@ pub async fn launch(opts: &LaunchOptions<'_>) -> Result<Launched> {
     if let Err(e) = set_profile_prefs(opts.profile_dir) {
         crate::warn!("browser: could not set profile preferences: {e}");
     }
-    let known = NO_SANDBOX.load(Ordering::Relaxed);
+    let known = opts.allow_no_sandbox && NO_SANDBOX.load(Ordering::Relaxed);
     match spawn(opts, known).await {
         Ok(l) => Ok(l),
-        Err(SpawnError::Sandbox) => {
+        Err(SpawnError::Sandbox) if opts.allow_no_sandbox => {
             crate::warn!(
-                "browser: Chrome's sandbox is unavailable on this system; running without it"
+                "browser: Chrome's sandbox is unavailable on this system; running without it \
+                 (allowed by the owner)"
             );
             NO_SANDBOX.store(true, Ordering::Relaxed);
             spawn(opts, true).await.map_err(|e| e.into_message().into())
         }
+        Err(SpawnError::Sandbox) => Err(SANDBOX_UNAVAILABLE.into()),
         Err(e) => Err(e.into_message().into()),
     }
 }

@@ -287,6 +287,7 @@ All paths are under `/api`. "Any" means any authenticated user.
 | POST | `/browser/handback` | **Owner** | Give control back to Iris |
 | POST | `/browser/navigate` | **Owner** | Open a page while in control |
 | POST | `/browser/install` | **Owner** | Install Chromium for Iris (`engines`) |
+| POST | `/browser/sandbox` | **Owner** | Allow (or stop allowing) running without Chrome's sandbox where it cannot start |
 | GET | `/push/vapid-public-key` | Any | VAPID public key |
 | GET | `/push/subscriptions` | Any | Your push subscriptions |
 | POST | `/push/subscriptions` | Any | Subscribe this device |
@@ -1482,7 +1483,9 @@ Playwright's browser cache (`$PLAYWRIGHT_BROWSERS_PATH` or
 | `busy` | bool | The agent is carrying out a browser action right now. |
 | `active` | array | `[{"conversation_id", "message_id"}]`: turns that have used the browser and are still running (show the chat peek for these). |
 | `watchers` | int | App sockets watching the live view. |
-| `sandbox` | bool or null | Chrome's sandbox is on (null while closed). It is turned off only when this system cannot start it (for example Ubuntu's AppArmor restriction on unprivileged user namespaces). |
+| `sandbox` | bool or null | Chrome's sandbox is on (null while closed). |
+| `sandbox_unavailable` | bool | The last start failed only because this system cannot start Chrome's sandbox (for example Ubuntu's AppArmor restriction on unprivileged user namespaces). The app then offers [`POST /api/browser/sandbox`](#post-apibrowsersandbox-owner). |
+| `allow_no_sandbox` | bool | The owner allowed running without the sandbox on such a system. |
 | `version` | string or null | Browser version while open. |
 | `error` | string or null | Why the last start failed (for example missing system libraries, with the command that fixes it). |
 | `managed`, `managed_version` | bool, string or null | Installed from the app. |
@@ -1513,6 +1516,15 @@ Give control back to the agent.
 `{"url": "https://..."}`: open a page while this device has control (for
 example a site's sign-in page). Only `http` and `https`; a bare domain gets
 `https://`. `400` unless this device has control.
+
+#### `POST /api/browser/sandbox` (Owner)
+
+`{"allow_without": true | false}`. Iris always starts Chrome with its
+sandbox; where the sandbox cannot start, the browser stays off until the
+owner either fixes the server (see the self-hosting guide) or allows
+running without it here. The choice is saved. `false` takes it back (and
+closes a browser running without the sandbox). Returns `{"browser":
+{BrowserStatus}}`.
 
 #### `POST /api/browser/install` (Owner)
 
@@ -1960,7 +1972,7 @@ changes are re-sent as `message.updated`.
 | `engine_signin` | `harness`, `flow` (`code_paste`, `device_code`, `manual`), `state` (`needs_reconnect`, `starting`, `waiting_for_code`, `waiting_for_approval`, `verifying`, `connected`, `failed`, `cancelled`), `url`, `user_code`, `error`, `instructions` (manual flow), `login_id` | Start with `POST /api/harnesses/{harness}/login`. For `waiting_for_code`, show `url` and a code field (`/login/code`); for `waiting_for_approval`, show `url` and `user_code`; for `manual`, show `instructions` and a "Check again" button (the same `POST`). |
 | `engine_setup` | `state` (`needs_setup`, `done`), `options: [{"harness", "label", "installed", "requires", "action": {"method", "path"}}]` | Each option installs that engine (`POST /api/engines/{name}/install`). |
 | `connector_reconnect` | `connector_id`, `service`, `state` (`needs_reconnect`, `connected`) | Open the connector's settings so the owner can update its credentials (`PATCH /api/connectors/{id}`); the card turns `connected` when they do. |
-| `approval` | `service`, `preview: {"to", "subject", "body"}`, `action_label` (e.g. "Send"), `approver_user_id`, `owner_only: false`, `state` (`pending`, `approved`, `denied`), `decided_at`; wallet approvals (`service: "wallet"`) add `wallet: {"credential_id", "origin", "used_at"}` | Show the preview exactly as given with Deny / `action_label`; decide with [`POST /api/messages/{id}/decision`](#post-apimessagesiddecision). The preview is built by Iris from the real action, never from agent text. For `wallet`, `preview.to` is the site and `preview.subject` the page title (the app labels them Site and Page); one approval fills the card once (`used_at` is set when it does) and expires after 30 minutes. |
+| `approval` | `service`, `preview: {"to", "subject", "body"}`, `action_label` (e.g. "Send"), `approver_user_id`, `owner_only: false`, `state` (`pending`, `approved`, `denied`), `decided_at`; wallet approvals (`service: "wallet"`) add `wallet: {"credential_id", "origin", "revision", "used_at"}` | Show the preview exactly as given with Deny / `action_label`; decide with [`POST /api/messages/{id}/decision`](#post-apimessagesiddecision). The preview is built by Iris from the real action, never from agent text. For `wallet`, `preview.to` is the site and `preview.subject` the page title (the app labels them Site and Page); one approval fills the card once (`used_at` is set when it does) and expires after 30 minutes. |
 
 ### Attachment
 
@@ -2425,8 +2437,11 @@ it as `message.created` right after the turn's `message.completed`.
 
 In the owner's personal (not shared) conversations and jobs, when a browser
 is available and Iris is not paused, each turn also gets a second MCP server
-named **`browser`** (reserved for connectors too; tool prefix
-`mcp__browser__`, activity names `browser/<tool>`):
+named **`browser`** (tool prefix `mcp__browser__`, activity names
+`browser/<tool>`). `browser` and `iris_browser` are reserved for new
+connectors; on an install that already has a connector named `browser`, that
+connector keeps working and Iris's server is named `iris_browser` instead.
+It is launched as:
 
 ```
 <path to iris binary> mcp --browser --data-dir <DATA_DIR>
@@ -2456,16 +2471,28 @@ does all the deciding.
 | `fill_login` | `site?` | `filled`, or `not found (<reason>)` |
 | `fill_card` | `card?` (name or last 4 digits) | `filled`, `denied (...)`, `waiting for approval (...)`, or `not found (...)` |
 
-Refs are valid until the page changes; a stale ref gets an error asking for
-a new snapshot. Values of password fields and of fields Iris filled from the
-vault are shown as `••••` in snapshots and masked on screen. JavaScript
-dialogs are answered (alerts and confirms accepted, prompts dismissed) and
-reported at the top of the next result.
+Refs are valid until the page changes (they are unique per document, so an
+old ref never hits an element of a newer page); a stale ref gets an error
+asking for a new snapshot. Values of password fields, card fields, and
+fields Iris filled from the vault are shown as `••••` in snapshots and
+masked on screen. JavaScript dialogs are answered (alerts and confirms
+accepted, prompts dismissed) and reported at the top of the next result.
+Every secret Iris typed in the current browser session is replaced with
+`••••` anywhere in a tool result (a page could echo it in a dialog, title,
+or other field), and `screenshot` refuses while the page shows one outside
+the masked fields.
+
+Each call waits while the owner has taken over, and checks again once it
+holds the page, so a queued call never acts under the owner's control.
+When the turn ends (finished, cancelled, or failed), its calls still waiting
+stop at once and nothing more is done for it. Codex gets a 180 s tool
+timeout for this server (its default is 60 s).
 
 `fill_login` takes the saved login whose `site` matches the current page's
 host (a subdomain matches too; the most recently used wins), finds the
 sign-in fields (also in same-origin frames), and types the username and
-password itself. It answers `not found` when the page is not that site, not
+password itself, each only into the field that really has the focus, while
+the same tab still shows the same document on the saved site. It answers `not found` when the page is not that site, not
 HTTPS (plain HTTP only on this machine), has no sign-in field, or nothing is
 saved for it.
 
@@ -2474,9 +2501,12 @@ page has a card number field, and posts an [approval card](#server-cards)
 in the conversation (with a push to the owner if no app is open), built
 from the real page and card. It waits up to 45 seconds for the decision;
 after that it answers `waiting for approval`, and calling it again on the
-same site later picks up the decision. After approval, Iris types the card
-number, expiry, CVC, and name itself; each approval fills once. Cards are
-never used in jobs (nobody could approve).
+same site later picks up the decision (the app sends "I approved the card.
+Go ahead." when the owner approves after the turn ended, which starts that
+call). An approval is for the card as it was: editing the card asks again.
+After approval, Iris types the card number, expiry, CVC, and name itself,
+on the approved page only; each approval fills once. Cards are never used in
+jobs (nobody could approve).
 
 ### `save_to_library` details
 

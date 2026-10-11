@@ -93,6 +93,21 @@ impl Cdp {
         }))
     }
 
+    /// A connection that is already closed (tests).
+    #[cfg(test)]
+    pub fn detached() -> Arc<Self> {
+        let (tx, _) = mpsc::unbounded_channel();
+        let (events, _) = broadcast::channel(1);
+        let (_closed_tx, closed) = watch::channel(true);
+        Arc::new(Self {
+            tx,
+            pending: Arc::default(),
+            next_id: AtomicU64::new(1),
+            events,
+            closed,
+        })
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<Event>> {
         self.events.subscribe()
     }

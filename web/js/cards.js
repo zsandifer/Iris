@@ -3,7 +3,7 @@
 // connector_reconnect, approval).
 import { html, useState } from './h.js';
 import { api, post, patch } from './api.js';
-import { S, set, go, isOwner, toast, loadGoals, loadEngines } from './store.js';
+import { S, set, go, isOwner, toast, loadGoals, loadEngines, sendMessage } from './store.js';
 import { Icon, Img, LetterTile, hostOf, safeUrl } from './ui.js';
 import { plain } from './md.js';
 
@@ -224,7 +224,13 @@ function ApprovalCard({ c, m }) {
   const mine = c.approver_user_id === S.me?.user?.id;
   const decide = async (approve) => {
     setBusy(true);
-    try { await post(`/messages/${m.id}/decision`, { approve }); } catch (e) { toast(e.message); }
+    try {
+      await post(`/messages/${m.id}/decision`, { approve });
+      // A card OK that came after Iris stopped waiting: tell Iris to go on.
+      const cid = m.conversation_id;
+      const running = (S.msgs[cid]?.list || []).some((x) => x.status === 'streaming');
+      if (approve && c.service === 'wallet' && !running) await sendMessage(cid, 'I approved the card. Go ahead.');
+    } catch (e) { toast(e.message); }
     setBusy(false);
   };
   const p = c.preview || {};

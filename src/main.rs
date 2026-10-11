@@ -293,6 +293,9 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
         state
             .browser
             .init_paused(state.setting("paused").await.is_some());
+        state
+            .browser
+            .set_allow_no_sandbox(state.setting(server::ALLOW_NO_SANDBOX).await.is_some());
         state.set_serving();
         let probe = state.clone();
         tokio::spawn(async move {

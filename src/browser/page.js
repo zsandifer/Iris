@@ -9,11 +9,16 @@ if (!globalThis.__iris) {
     const ids = new WeakMap(); // element -> ref
     const secret = new WeakSet(); // fields filled from the vault
     let next = 1;
+    // Refs and this id are unique per document, so a ref from an earlier
+    // page can never point at an element of a later one.
+    const letters = () => Array.from(crypto.getRandomValues(new Uint8Array(3)), (b) => 'abcdefghijklmnopqrstuvwxyz'[b % 26]).join('');
+    const prefix = letters();
+    const doc = letters() + letters() + letters();
 
     const refOf = (el) => {
       let r = ids.get(el);
       if (!r) {
-        r = 'e' + next++;
+        r = prefix + next++;
         ids.set(el, r);
       }
       refs.set(r, el);
@@ -256,8 +261,52 @@ if (!globalThis.__iris) {
         s.removeAllRanges();
         s.addRange(r);
       }
+      return { ok: focused(e) };
+    }
+
+    // The element really has focus, in its document and every frame up.
+    function focused(e) {
       const active = e.ownerDocument.activeElement;
-      return { ok: active === e || e.contains(active) };
+      if (!(active === e || e.contains(active))) return false;
+      let win = e.ownerDocument.defaultView;
+      while (win && win.frameElement) {
+        const fe = win.frameElement;
+        if (fe.ownerDocument.activeElement !== fe) return false;
+        win = fe.ownerDocument.defaultView;
+      }
+      return true;
+    }
+
+    // Before Iris types a saved secret: focus the field, mask it if asked,
+    // and report which document and page it is in. ok only if the field
+    // itself (not something a focus handler moved to) has focus.
+    function prepareInsert(ref, hide) {
+      const e = el(ref);
+      if (!e) return { ok: false };
+      const t = e.tagName.toLowerCase();
+      if (!['input', 'textarea'].includes(t) || e.disabled || e.readOnly) return { ok: false };
+      if (hide) {
+        secret.add(e);
+        e.style.setProperty('-webkit-text-security', 'disc', 'important');
+      }
+      e.scrollIntoView({ block: 'center', behavior: 'instant' });
+      e.focus();
+      try { e.select(); } catch { /* some input types cannot select */ }
+      const masked = !hide || getComputedStyle(e).getPropertyValue('-webkit-text-security') === 'disc'
+        || (e.getAttribute('type') || '').toLowerCase() === 'password';
+      return { ok: focused(e) && masked, doc, href: e.ownerDocument.location.href };
+    }
+
+    // Everything the page shows as text, for checking that no secret is
+    // visible before a screenshot (never returned to the agent). Masked
+    // fields and password fields show dots, so their values are left out.
+    function pageText() {
+      return docs().map((d) => {
+        const vals = [...d.querySelectorAll('input,textarea')]
+          .filter((e) => !secret.has(e) && (e.getAttribute('type') || '').toLowerCase() !== 'password')
+          .map((e) => e.value || '');
+        return [d.title, d.location.href, d.body ? d.body.innerText : '', ...vals].join('\n');
+      }).join('\n');
     }
 
     function choose(ref, wanted) {
@@ -336,20 +385,12 @@ if (!globalThis.__iris) {
       };
     }
 
-    function mask(ref) {
-      const e = el(ref);
-      if (!e) return { error: 'stale' };
-      secret.add(e);
-      e.style.setProperty('-webkit-text-security', 'disc', 'important');
-      return { ok: true };
-    }
-
     function hasText(text) {
       const want = String(text).toLowerCase();
       return docs().some((d) => (d.body ? d.body.innerText : '').toLowerCase().includes(want));
     }
 
-    return { snapshot, point, focus, choose, loginFields, cardFields, mask, hasText,
-      info: () => ({ url: location.href, title: document.title }) };
+    return { snapshot, point, focus, choose, loginFields, cardFields, prepareInsert, pageText, hasText,
+      info: () => ({ url: location.href, title: document.title, doc }) };
   })();
 }

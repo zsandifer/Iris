@@ -81,7 +81,7 @@ export function describe(a) {
   if (a.kind === 'mcp' || name.includes('/')) {
     const [server, tool = ''] = name.split('/');
     if (server === 'iris') return IRIS_TOOLS[tool] || ['Updating the app', 'Updated the app'];
-    if (server === 'browser') return browserPhrase(tool, sum);
+    if (server === 'browser' || server === 'iris_browser') return browserPhrase(tool, sum);
     const key = `${server} ${tool}`.toLowerCase();
     for (const [re, f] of SERVICES) if (re.test(key)) return f(tool.toLowerCase());
     return [`Checking ${title(server)}`, `Checked ${title(server)}`];

@@ -320,9 +320,13 @@ async fn run_locked(
         } else {
             Vec::new()
         };
-        let browser = mcp_servers
-            .iter()
-            .any(|s| s.name == crate::browser::tools::SERVER);
+        let browser = mcp_servers.iter().map(|s| s.name.as_str()).find(|n| {
+            [
+                crate::browser::tools::SERVER,
+                crate::browser::tools::SERVER_ALT,
+            ]
+            .contains(n)
+        });
         let participants: Vec<String> = ctx.names.values().cloned().collect();
         let system_prompt = persona::assemble(
             &state.paths,
@@ -1051,9 +1055,24 @@ async fn mcp_servers(
     if shared {
         return servers;
     }
+    let connectors = state
+        .db
+        .call(|c| crate::entities::list_connectors(c, true))
+        .await
+        .unwrap_or_default();
     if let Some(token) = browser_token {
+        // Installs from before Iris had a browser may have a connector
+        // called "browser"; it keeps its name and Iris's server steps aside.
+        let name = if connectors
+            .iter()
+            .any(|c| c.name == crate::browser::tools::SERVER)
+        {
+            crate::browser::tools::SERVER_ALT
+        } else {
+            crate::browser::tools::SERVER
+        };
         servers.push(McpServer {
-            name: crate::browser::tools::SERVER.into(),
+            name: name.into(),
             transport: McpTransport::Stdio {
                 command: state.exe.to_string_lossy().into_owned(),
                 args: vec![
@@ -1068,11 +1087,6 @@ async fn mcp_servers(
             },
         });
     }
-    let connectors = state
-        .db
-        .call(|c| crate::entities::list_connectors(c, true))
-        .await
-        .unwrap_or_default();
     for con in connectors {
         if servers.iter().any(|s| s.name == con.name) {
             crate::warn!("connector {} skipped: the name is taken by Iris", con.name);

@@ -276,11 +276,27 @@ out each tool call the CLI makes, nothing more.
   first with an approval card in the chat.
 - **Who gets it.** Only the owner's own conversations and jobs (the profile
   holds the owner's sign-ins); never shared chats.
-- **Sandbox.** Iris starts Chrome with its sandbox and turns it off only if
-  the system cannot start it (for example Ubuntu 24.04's AppArmor
-  restriction on unprivileged user namespaces; a warning is logged). To keep
-  it on there, allow user namespaces for Chrome with an AppArmor profile
-  (see Chromium's `apparmor-userns-restrictions.md`).
+- **Sandbox.** Iris always starts Chrome with its sandbox. Some systems
+  cannot start it (for example Ubuntu 23.10 and later, which restrict
+  unprivileged user namespaces with AppArmor). Then the browser does not
+  start, and Iris's computer explains and offers **Run without the
+  sandbox**: only if you tap it (a saved choice, `POST /api/browser/sandbox`)
+  does Iris run Chromium without it. The safer fix is one step as root, for
+  example an AppArmor profile that allows user namespaces for that one
+  binary (see Chromium's `docs/security/apparmor-userns-restrictions.md`):
+
+  ```sh
+  # replace the path with the browser Iris uses (GET /api/browser shows the
+  # error; `ls -l <engines dir>/bin/browser` shows the installed one)
+  sudo tee /etc/apparmor.d/iris-chrome <<'EOF2'
+  abi <abi/4.0>,
+  include <tunables/global>
+  profile iris-chrome /path/to/chrome flags=(unconfined) {
+    userns,
+  }
+  EOF2
+  sudo apparmor_parser -r /etc/apparmor.d/iris-chrome
+  ```
 - **Turning it off.** `[browser] enabled = false` removes the tools.
 
 ## Proactive jobs
@@ -321,8 +337,12 @@ Both are off by default, respect active hours, and can be triggered manually
 - Iris's browser is driven over a private pipe (no DevTools port is opened),
   and its tools reach the server through a Unix socket in the private run
   directory, accepted only for a running turn. Saved secrets go from the
-  vault straight into the page; filled fields are masked on screen and in
-  what the agent reads. Only `http`/`https` pages can be opened.
+  vault straight into the page (only into the field that really has focus,
+  on the same page and site that were checked); filled fields are masked on
+  screen and in what the agent reads, any copy a page echoes (a dialog,
+  another field) is redacted from tool results, and no screenshot is taken
+  while a page shows one. Only `http`/`https` pages can be opened. When a
+  turn ends or you take over, its pending browser actions stop.
 - "Pause Iris" in Iris's computer stops running turns, closes the browser,
   and holds chats and jobs until you turn it back on.
 

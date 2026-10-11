@@ -218,6 +218,30 @@ function setBrowserState(browser) {
 
 // -------------------------------------------------------------- the page
 
+/** Chrome's sandbox cannot start on this server: explain, and let the
+ * owner choose to run without it (or fix the server). */
+function NoSandbox() {
+  const allow = async () => {
+    const ok = await confirmSheet({
+      title: 'Run the browser without its sandbox?',
+      body: `The sandbox keeps a bad website from reaching the rest of your server. Without it, ${agentName()}'s browser still works, but a browser bug could expose your server. The safer fix is on the server (see "Iris's computer" in the self-hosting guide).`,
+      yes: 'Run without it',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      setBrowserState((await post('/browser/sandbox', { allow_without: true })).browser);
+      setBrowserState((await post('/browser/start')).browser);
+    } catch (e) { toast(e.message); }
+  };
+  return html`<div class="screen">
+    <${Icon} name="lock" size=${30} />
+    <b>The browser's safety sandbox can't run here</b>
+    <small>This server blocks the sandbox Chrome uses to keep websites away from the rest of the system (common on Ubuntu). You can allow it on the server once, or run without it.</small>
+    <button class="b1" onClick=${allow}>Run without the sandbox</button>
+  </div>`;
+}
+
 function Setup({ b }) {
   const install = async () => {
     try { setBrowserState((await post('/browser/install')).browser); } catch (e) { toast(e.message); }
@@ -285,21 +309,23 @@ export function Computer() {
     screen = html`<div class="screen"><${Icon} name="pause" size=${30} /><b>${agentName()} is paused</b>
       <small>Nothing runs until you turn ${agentName()} back on below.</small></div>`;
   } else if (!b.available) screen = html`<${Setup} b=${b} />`;
+  else if (b.sandbox_unavailable && !b.running) screen = html`<${NoSandbox} />`;
   else if (b.running) screen = html`<${LiveScreen} b=${b} />`;
   else {
     screen = html`<div class="screen"><${Icon} name="monitor" size=${30} />
       <b>${working ? `${agentName()} is working` : `${agentName()} is idle`}</b>
       <small>${b.error ? `The browser couldn't start: ${b.error}` : `The browser opens when ${agentName()} needs it. You can also open it to sign in to a site yourself.`}</small></div>`;
   }
+  const usable = b?.available && !paused && !(b.sandbox_unavailable && !b.running);
   const host = hostOf(b?.url);
   const line = b?.running ? (b.controller === 'user' ? 'You have control' : b.busy ? `${agentName()} is browsing${host ? ` ${host}` : ''}` : host ? `Open: ${host}` : 'Open') : null;
   return html`<${Page} title=${`${agentName()}'s computer`} sub=${`${agentName()}'s own browser on your server`}>
     ${screen}
     ${line && html`<div class="live-line mu">${line}</div>`}
-    ${b?.available && !paused && html`<div class="big2">
+    ${usable && html`<div class="big2">
       <button onClick=${watch}><${Icon} name="eye" size=${16} /> Watch</button>
       <button class="p" onClick=${takeOver}><${Icon} name="hand" size=${16} /> Take over</button></div>`}
-    ${b?.available && !paused && html`<div class="gnote">Take over to sign in to a site yourself or help ${agentName()} past a tricky step. ${agentName()} waits while you're in control. Sign-ins stay in its browser.</div>`}
+    ${usable && html`<div class="gnote">Take over to sign in to a site yourself or help ${agentName()} past a tricky step. ${agentName()} waits while you're in control. Sign-ins stay in its browser.</div>`}
     <${Group} label="Recently">
       ${!act ? html`<${Spinner} />` : act.items.length ? act.items.map((it) => html`<${Row} title=${activityTitle(it)} sub=${placeLabel(it)}
         value=${stamp(it.created_at)} chevron=${false} onClick=${it.conversation_kind === 'job' ? undefined : () => go(`chat/${it.conversation_id}`)} />`)
