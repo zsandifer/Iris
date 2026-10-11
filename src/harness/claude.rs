@@ -56,13 +56,19 @@ pub fn deny_rules(paths: &[std::path::PathBuf]) -> Vec<String> {
         if !s.starts_with('/') || s.contains([',', '(', ')', '\n']) {
             continue;
         }
-        let target = if p.is_dir() {
-            format!("/{}/**", s.trim_end_matches('/'))
-        } else {
-            format!("/{s}")
-        };
-        out.push(format!("Read({target})"));
-        out.push(format!("Edit({target})"));
+        let s = s.trim_end_matches('/');
+        // Folders get `/**`; a path that does not exist yet gets both forms.
+        let mut targets = Vec::new();
+        if !p.is_dir() {
+            targets.push(format!("/{s}"));
+        }
+        if !p.is_file() {
+            targets.push(format!("/{s}/**"));
+        }
+        for t in targets {
+            out.push(format!("Read({t})"));
+            out.push(format!("Edit({t})"));
+        }
     }
     out
 }
@@ -677,6 +683,7 @@ mod tests {
             private_paths: vec![tmp.path().join("other"), tmp.path().join("vault.key")],
         };
         std::fs::create_dir_all(tmp.path().join("other")).unwrap();
+        std::fs::write(tmp.path().join("vault.key"), "k").unwrap();
         let inv = Claude::new(HarnessConfig::claude_default())
             .build(&spec)
             .unwrap();
@@ -694,6 +701,15 @@ mod tests {
         );
         assert!(inv.args[i + 2].starts_with("--"), "followed by a flag");
         assert!(deny_rules(&["/a,b".into(), "rel".into()]).is_empty());
+        assert_eq!(
+            deny_rules(&["/no/such/dir".into()]),
+            [
+                "Read(//no/such/dir)",
+                "Edit(//no/such/dir)",
+                "Read(//no/such/dir/**)",
+                "Edit(//no/such/dir/**)"
+            ]
+        );
         assert!(args.starts_with("-p --output-format stream-json --verbose"));
         assert!(args.contains("--model haiku --effort low --resume sess-1"));
         assert!(args.contains("--system-prompt-snapshot off"));

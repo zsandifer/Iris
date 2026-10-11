@@ -216,6 +216,8 @@ fn seed_all(c: &Connection, paths: &Paths, assets: &Path, vault: &Vault) -> Resu
         params![sam, now - 30 * 24 * HOUR],
     )?;
     db::ensure_main_conversation(c, &sam)?;
+    // Sam's own Iris (persona and memory files).
+    crate::persona::seed_person(&paths.person_dirs(&sam, false))?;
 
     let img = |n: &str| s.attach(assets, n);
     let url = |id: &str| format!("/api/attachments/{id}");
