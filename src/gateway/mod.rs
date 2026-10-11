@@ -82,7 +82,8 @@ impl Drop for GrantGuard {
             .unwrap_or_else(|p| p.into_inner())
             .remove(&self.token);
         if let Some(g) = grant {
-            let _ = g.cancel.send(true);
+            // Sticky: a call that subscribes later still sees it.
+            g.cancel.send_replace(true);
         }
     }
 }
@@ -96,6 +97,8 @@ struct Session {
     last_used: AtomicI64,
     /// Calls running right now (an idle reaper must not stop them).
     inflight: std::sync::atomic::AtomicUsize,
+    /// Secret values it was started with, to scrub from diagnostics.
+    secrets: Vec<String>,
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<Arc<Session>>>>;
@@ -107,8 +110,9 @@ pub struct Gateway {
     slots: Mutex<HashMap<String, Slot>>,
     /// Tool lists by connector id, with the fingerprint they belong to.
     tools: Mutex<HashMap<String, (String, Vec<Value>)>>,
-    /// Approval cards waiting for the owner, by card message id.
-    pending: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    /// Approval cards waiting for the owner, by card message id, with
+    /// their connector id.
+    pending: Mutex<HashMap<String, (String, oneshot::Sender<bool>)>>,
     /// Last start failure per connector id (owner diagnostics).
     errors: Mutex<HashMap<String, String>>,
 }
@@ -222,7 +226,7 @@ pub async fn grant_for_turn(
         );
     // The CLI must wait for the owner's answer: allow the approval window
     // plus the call itself.
-    let timeout = state.cfg.safety.approval_timeout_secs + CALL_TIMEOUT.as_secs();
+    let timeout = state.cfg.approval_timeout_secs() + CALL_TIMEOUT.as_secs();
     let servers = names
         .into_iter()
         .map(|name| McpServer {
@@ -412,9 +416,32 @@ fn fingerprint(con: &Connector) -> String {
     )
 }
 
-fn launch_for(state: &AppState, con: &Connector, bearer: Option<&str>) -> Result<Launch, String> {
+/// Replace secret values in text shown to the owner or the agent.
+pub fn redact(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    for s in secrets.iter().filter(|s| s.len() >= 4) {
+        out = out.replace(s.as_str(), "[hidden]");
+    }
+    out
+}
+
+fn launch_for(
+    state: &AppState,
+    con: &Connector,
+    bearer: Option<&str>,
+) -> Result<(Launch, Vec<String>), String> {
     let mut env = open_secrets(state, con, "env", &con.config.env)?;
     let mut headers = open_secrets(state, con, "headers", &con.config.headers)?;
+    let mut secrets: Vec<String> = env.values().chain(headers.values()).cloned().collect();
+    secrets.extend(bearer.map(String::from));
+    if let Some(o) = &con.config.oauth
+        && let Some(cs) = &o.client_secret
+        && let Ok(plain) = state
+            .vault
+            .open_str(cs, &format!("connector:{}:oauth:client_secret", con.id))
+    {
+        secrets.push(plain);
+    }
     let cwd = connector_dir(state, &con.id);
     crate::config::ensure_private_dir(&cwd).map_err(|e| e.to_string())?;
     let token_env = con.config.oauth.as_ref().and_then(|o| o.token_env.clone());
@@ -423,29 +450,33 @@ fn launch_for(state: &AppState, con: &Connector, bearer: Option<&str>) -> Result
             if let (Some(k), Some(t)) = (token_env, bearer) {
                 env.insert(k, t.to_string());
             }
-            Ok(Launch::Stdio {
-                command: command.clone(),
-                args: con.config.args.clone(),
-                env,
-                cwd,
-            })
+            Ok((
+                Launch::Stdio {
+                    command: command.clone(),
+                    args: con.config.args.clone(),
+                    env,
+                    cwd,
+                },
+                secrets,
+            ))
         }
         ("http", command) => {
             let url = con.config.url.clone().ok_or("no web address saved")?;
             if let Some(t) = bearer {
                 headers.insert("Authorization".into(), format!("Bearer {t}"));
             }
-            match command {
-                Some(command) => Ok(Launch::Serve {
+            let launch = match command {
+                Some(command) => Launch::Serve {
                     command: command.clone(),
                     args: con.config.args.clone(),
                     env,
                     cwd,
                     url,
                     headers,
-                }),
-                None => Ok(Launch::Http { url, headers }),
-            }
+                },
+                None => Launch::Http { url, headers },
+            };
+            Ok((launch, secrets))
         }
         _ => Err("this connection is missing its program".into()),
     }
@@ -465,7 +496,8 @@ async fn session(state: &AppState, con: &Connector) -> Result<Arc<Session>, Call
             .is_some_and(|o| o.token_env.is_some());
         let same_bearer = *s.bearer.lock().unwrap_or_else(|p| p.into_inner()) == bearer;
         if !s.upstream.alive() {
-            // It stopped on its own: keep its last words for the owner.
+            // It stopped on its own: keep its last words (scrubbed) for
+            // the owner.
             let tail = s.upstream.stderr_tail();
             if let Some(last) = tail.lines().rev().find(|l| !l.trim().is_empty()) {
                 state
@@ -473,7 +505,10 @@ async fn session(state: &AppState, con: &Connector) -> Result<Arc<Session>, Call
                     .errors
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .insert(con.id.clone(), truncate_chars(last.trim(), 300));
+                    .insert(
+                        con.id.clone(),
+                        truncate_chars(&redact(last.trim(), &s.secrets), 300),
+                    );
             }
         }
         if s.upstream.alive() && s.fingerprint == fp && (same_bearer || !token_env) {
@@ -490,22 +525,27 @@ async fn session(state: &AppState, con: &Connector) -> Result<Arc<Session>, Call
         s.upstream.close().await;
         *guard = None;
     }
-    let launch = launch_for(state, con, bearer.as_deref()).map_err(CallError::Other)?;
+    let (launch, secrets) = launch_for(state, con, bearer.as_deref()).map_err(CallError::Other)?;
     crate::info!("connector {}: starting", con.name);
     let upstream = match Upstream::start(launch, START_TIMEOUT).await {
         Ok(u) => u,
         Err(e) => {
-            let msg = truncate_chars(&e.to_string(), 300);
+            // The detail (which may quote the program's output) is only
+            // for the owner, and scrubbed of the connector's secrets.
+            let msg = truncate_chars(&redact(&e.to_string(), &secrets), 300);
             state
                 .gateway
                 .errors
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .insert(con.id.clone(), msg.clone());
+                .insert(con.id.clone(), msg);
             crate::warn!("connector {}: failed to start", con.name);
             return Err(match e {
                 UpstreamError::Auth(_) => CallError::Auth,
-                _ => CallError::Other(format!("{} could not start: {msg}", con.name)),
+                _ => CallError::Other(format!(
+                    "{} could not start (the owner can see why on its page in the app)",
+                    con.name
+                )),
             });
         }
     };
@@ -521,6 +561,7 @@ async fn session(state: &AppState, con: &Connector) -> Result<Arc<Session>, Call
         bearer: Mutex::new(bearer),
         last_used: AtomicI64::new(now_ms()),
         inflight: Default::default(),
+        secrets,
     });
     *guard = Some(s.clone());
     Ok(s)
@@ -702,6 +743,49 @@ fn summary(p: &policy::Preview) -> String {
     parts.join(" · ")
 }
 
+/// Why a call may not run right now (Iris paused, the turn ended, the
+/// connection off, paused, or signed out), or None.
+async fn refusal(state: &AppState, grant: &Grant, con: &Connector) -> Option<String> {
+    if state.is_paused().await {
+        return Some(
+            "Iris is paused by the owner, so nothing was done. Tell the user it will work again \
+             once they resume Iris."
+                .into(),
+        );
+    }
+    if *grant.cancel.borrow() {
+        return Some("This request was cancelled, so nothing was done.".into());
+    }
+    if !con.enabled {
+        return Some("This connection is turned off, so nothing was done.".into());
+    }
+    if let Some(reason) = &con.paused_reason {
+        return Some(format!(
+            "This connection is paused ({reason}), so nothing was done. The owner can resume it \
+             in the app."
+        ));
+    }
+    if con.auth_state != "ok" {
+        return Some(format!(
+            "{} needs the owner to sign in again, so nothing was done.",
+            con.name
+        ));
+    }
+    None
+}
+
+/// The connector as it is now (it may have been edited, turned off, or
+/// removed while a call waited).
+async fn current(state: &AppState, id: &str) -> Option<Connector> {
+    let id = id.to_string();
+    state
+        .db
+        .call(move |c| entities::get_connector(c, &id))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Run one tool call through the gate. Returns an MCP `CallToolResult`.
 pub async fn call_tool(
     state: &AppState,
@@ -710,20 +794,8 @@ pub async fn call_tool(
     tool: &str,
     args: &Value,
 ) -> Value {
-    if state.is_paused().await {
-        return tool_error(
-            "Iris is paused by the owner, so nothing was done. Tell the user it will work \
-             again once they resume Iris.",
-        );
-    }
-    if !con.enabled {
-        return tool_error("This connection is turned off, so nothing was done.");
-    }
-    if let Some(reason) = &con.paused_reason {
-        return tool_error(&format!(
-            "This connection is paused ({reason}), so nothing was done. The owner can resume \
-             it in the app."
-        ));
+    if let Some(r) = refusal(state, grant, con).await {
+        return tool_error(&r);
     }
     let tools = upstream_tools(state, con).await;
     let annotations = tools
@@ -732,7 +804,7 @@ pub async fn call_tool(
         .and_then(|t| t.iter().find(|x| x["name"] == tool))
         .map(|t| t["annotations"].clone())
         .unwrap_or(Value::Null);
-    let category = policy::classify(tool, &annotations);
+    let category = policy::classify_call(tool, &annotations, args);
     let recipients = policy::recipients(args);
     let label = service_label(con);
     let preview = policy::preview(&label, tool, category, args);
@@ -742,14 +814,26 @@ pub async fn call_tool(
         .call(entities::known_recipients)
         .await
         .unwrap_or_default();
-    let verdict = policy::decide(
-        &con.policy,
-        tool,
-        category,
-        &recipients,
-        &|r| trusted.iter().any(|t| t == r),
-        &|r| known.iter().any(|k| k == r),
-    );
+    let judge = |policy: &policy::Policy| {
+        policy::decide(
+            policy,
+            tool,
+            category,
+            &recipients,
+            &|r| trusted.iter().any(|t| t == r),
+            &|r| known.iter().any(|k| k == r),
+        )
+    };
+    let mut verdict = judge(&con.policy);
+    if !matches!(verdict, Verdict::Block(_))
+        && policy::request_text(args).chars().count() > policy::MAX_DETAILS
+    {
+        // Never approve (or send) what the owner could not read in full.
+        verdict = Verdict::Block(
+            "the request is too large to show the owner in full; split it into smaller pieces"
+                .into(),
+        );
+    }
     let mut call = ConnectorCall {
         id: new_id(),
         connector_id: Some(con.id.clone()),
@@ -760,7 +844,6 @@ pub async fn call_tool(
         summary: summary(&preview),
         conversation_id: Some(grant.conversation_id.clone()),
         message_id: Some(grant.message_id.clone()),
-        created_at: now_ms(),
         ..ConnectorCall::default()
     };
 
@@ -772,15 +855,13 @@ pub async fn call_tool(
             "Not done: {reason}. Tell the user; they can change this connection's rules in the app."
         ));
     }
-    if let Some(trip) = tripwire(state, con, category).await {
+    // Early warning only; the binding check is `admit` at dispatch.
+    if let Some(trip) = tripwire_now(state, con, category).await {
         call.decision = "blocked".into();
         call.reason = trip.clone();
         record(state, &call).await;
         pause_connector(state, con, &trip).await;
-        return tool_error(&format!(
-            "Not done: Iris paused this connection because {trip}. The owner was notified and \
-             can resume it in the app. Do not try again."
-        ));
+        return tool_error(&tripped(&trip));
     }
 
     let decided_by = match verdict {
@@ -790,14 +871,7 @@ pub async fn call_tool(
             call.reason = reason.clone();
             record(state, &call).await;
             match ask(state, grant, con, &call, &preview, category).await {
-                Answer::Approved => {
-                    let r = recipients.clone();
-                    let _ = state
-                        .db
-                        .call(move |c| entities::add_known_recipients(c, &r))
-                        .await;
-                    "approved"
-                }
+                Answer::Approved => "approved",
                 Answer::Denied => {
                     return tool_error(
                         "The user denied this action, so it was not done. Tell them you did \
@@ -818,10 +892,44 @@ pub async fn call_tool(
         Verdict::Block(_) => unreachable!("handled above"),
     };
     if decided_by != "approved" {
-        call.decision = decided_by.into();
         record(state, &call).await;
     }
-    let result = forward(state, con, tool, args).await;
+
+    // Dispatch gate: things may have changed while the call waited. The
+    // connector must still exist, be on, unpaused, signed in, allowed by
+    // its current rules, the turn still running, and Iris not paused.
+    let refused = match current(state, &con.id).await {
+        None => Some("This connection was removed, so nothing was done.".to_string()),
+        Some(now) => match refusal(state, grant, &now).await {
+            Some(r) => Some(r),
+            None => match judge(&now.policy) {
+                Verdict::Block(reason) => Some(format!("Not done: {reason}.")),
+                Verdict::Ask(_) if decided_by != "approved" => Some(
+                    "Not done: this connection's rules changed and now ask first. Try again."
+                        .to_string(),
+                ),
+                _ => None,
+            },
+        },
+    };
+    if let Some(r) = refused {
+        set_decision(state, &call.id, "cancelled").await;
+        return tool_error(&r);
+    }
+    // Reserve the use against the tripwires atomically with recording it.
+    if let Some(trip) = admit(state, con, &call.id, category, decided_by).await {
+        pause_connector(state, con, &trip).await;
+        return tool_error(&tripped(&trip));
+    }
+    if decided_by == "approved" {
+        let r = recipients.clone();
+        let _ = state
+            .db
+            .call(move |c| entities::add_known_recipients(c, &r))
+            .await;
+    }
+
+    let result = forward(state, grant, &con.id, tool, args).await;
     let (outcome, bytes) = match &result {
         Ok(v) => (
             if v["isError"] == true { "error" } else { "ok" },
@@ -839,6 +947,11 @@ pub async fn call_tool(
         con.name,
         category.name()
     );
+    // A large result may have crossed the data tripwire: stop now rather
+    // than at the next call.
+    if let Some(trip) = volume_tripped(state, con).await {
+        pause_connector(state, con, &trip).await;
+    }
     match result {
         Ok(v) => v,
         Err(CallError::Auth) => {
@@ -853,19 +966,64 @@ pub async fn call_tool(
     }
 }
 
+fn tripped(trip: &str) -> String {
+    format!(
+        "Not done: Iris paused this connection because {trip}. The owner was notified and can \
+         resume it in the app. Do not try again."
+    )
+}
+
+async fn set_decision(state: &AppState, call_id: &str, decision: &'static str) {
+    let id = call_id.to_string();
+    let _ = state
+        .db
+        .call(move |c| entities::set_call_decision(c, &id, decision, None))
+        .await;
+}
+
 /// Forward a call to the connector, retrying once on a stale session or a
-/// refreshed token.
+/// rejected token (after refreshing it). Gives up as soon as the turn is
+/// cancelled or Iris is paused.
 async fn forward(
     state: &AppState,
-    con: &Connector,
+    grant: &Grant,
+    connector_id: &str,
     tool: &str,
     args: &Value,
 ) -> Result<Value, CallError> {
     for attempt in 0..2 {
-        let s = session(state, con).await?;
+        // Fresh state every attempt (a refresh may have rotated tokens).
+        let con = current(state, connector_id)
+            .await
+            .ok_or_else(|| CallError::Other("the connection was removed".into()))?;
+        let s = session(state, &con).await?;
+        // Starting it can take a while; check nothing changed meanwhile
+        // (a tripwire pause by another call does not stop one already
+        // admitted within the limits).
+        let con = current(state, connector_id)
+            .await
+            .ok_or_else(|| CallError::Other("the connection was removed".into()))?;
+        if let Some(r) = refusal(
+            state,
+            grant,
+            &Connector {
+                paused_reason: None,
+                ..con.clone()
+            },
+        )
+        .await
+        {
+            return Err(CallError::Other(r));
+        }
         s.last_used.store(now_ms(), Ordering::SeqCst);
         s.inflight.fetch_add(1, Ordering::SeqCst);
-        let result = s.upstream.call_tool(tool, args, CALL_TIMEOUT).await;
+        let mut cancel = grant.cancel.subscribe();
+        let result = tokio::select! {
+            r = s.upstream.call_tool(tool, args, CALL_TIMEOUT) => r,
+            _ = cancel.wait_for(|c| *c) => {
+                Err(UpstreamError::Transport("the request was cancelled".into()))
+            }
+        };
         s.inflight.fetch_sub(1, Ordering::SeqCst);
         s.last_used.store(now_ms(), Ordering::SeqCst);
         match result {
@@ -876,23 +1034,24 @@ async fn forward(
                         .tools
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .remove(&con.id);
+                        .remove(connector_id);
                 }
                 return Ok(v);
             }
             Err(UpstreamError::SessionExpired) if attempt == 0 => {
-                stop(state, &con.id).await;
+                stop(state, connector_id).await;
             }
             Err(UpstreamError::Auth(_)) if attempt == 0 && con.config.oauth.is_some() => {
                 // The token may have been revoked early: refresh and retry.
-                crate::oauth::invalidate(state, con).await;
-                stop(state, &con.id).await;
+                let used = s.bearer.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                crate::oauth::invalidate(state, connector_id, used.as_deref()).await;
+                stop(state, connector_id).await;
             }
             Err(UpstreamError::Auth(_)) => return Err(CallError::Auth),
             Err(UpstreamError::Timeout) => {
                 return Err(CallError::Other("it did not answer in time".into()));
             }
-            Err(e) => return Err(CallError::Other(e.to_string())),
+            Err(e) => return Err(CallError::Other(redact(&e.to_string(), &s.secrets))),
         }
     }
     Err(CallError::Auth)
@@ -933,35 +1092,100 @@ pub fn service_label(con: &Connector) -> String {
 
 // --------------------------------------------------------------- tripwires
 
-/// A tripwire that this call would cross, in plain words.
-async fn tripwire(state: &AppState, con: &Connector, category: Category) -> Option<String> {
+/// Which tripwire a call would cross, given the last hour's usage.
+fn tripwire(
+    cfg: &crate::config::SafetyConfig,
+    usage: (i64, i64, i64),
+    category: Category,
+) -> Option<String> {
+    let (calls, sends, bytes) = usage;
+    if category == Category::Send && sends >= cfg.max_sends_per_hour as i64 {
+        return Some(format!(
+            "it tried to send more than {} messages in an hour",
+            cfg.max_sends_per_hour
+        ));
+    }
+    if calls >= cfg.max_calls_per_hour as i64 {
+        return Some(format!(
+            "it was used more than {} times in an hour",
+            cfg.max_calls_per_hour
+        ));
+    }
+    if bytes >= cfg.max_read_mb_per_hour as i64 * 1024 * 1024 {
+        return Some(format!(
+            "it read more than {} MB of data in an hour, which looks like a bulk export",
+            cfg.max_read_mb_per_hour
+        ));
+    }
+    None
+}
+
+/// Early check before asking (so the owner is not asked for a call that
+/// cannot run).
+async fn tripwire_now(state: &AppState, con: &Connector, category: Category) -> Option<String> {
     let id = con.id.clone();
     let since = now_ms() - HOUR_MS;
-    let (calls, sends, bytes) = state
+    let usage = state
         .db
         .call(move |c| entities::connector_usage_since(c, &id, since))
         .await
         .ok()?;
-    let s = &state.cfg.safety;
-    if category == Category::Send && sends >= s.max_sends_per_hour as i64 {
-        return Some(format!(
-            "it tried to send more than {} messages in an hour",
-            s.max_sends_per_hour
-        ));
-    }
-    if calls >= s.max_calls_per_hour as i64 {
-        return Some(format!(
-            "it was used more than {} times in an hour",
-            s.max_calls_per_hour
-        ));
-    }
-    if bytes >= s.max_read_mb_per_hour as i64 * 1024 * 1024 {
-        return Some(format!(
+    tripwire(&state.cfg.safety, usage, category)
+}
+
+/// Check the tripwires and record the call as running in one database
+/// step, so concurrent calls (and approvals released together) cannot all
+/// pass against the same count. Returns the tripwire crossed, if any (the
+/// call is then recorded as blocked).
+async fn admit(
+    state: &AppState,
+    con: &Connector,
+    call_id: &str,
+    category: Category,
+    decided_by: &'static str,
+) -> Option<String> {
+    let (id, cid) = (con.id.clone(), call_id.to_string());
+    let cfg = state.cfg.safety.clone();
+    let since = now_ms() - HOUR_MS;
+    state
+        .db
+        .call(move |c| {
+            let usage = entities::connector_usage_since(c, &id, since)?;
+            match tripwire(&cfg, usage, category) {
+                Some(trip) => {
+                    entities::set_call_decision(c, &cid, "blocked", None)?;
+                    c.execute(
+                        "UPDATE connector_calls SET reason = ?2 WHERE id = ?1",
+                        rusqlite::params![cid, trip],
+                    )?;
+                    Ok(Some(trip))
+                }
+                None => {
+                    entities::set_call_decision(c, &cid, decided_by, None)?;
+                    Ok(None)
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Some("its activity could not be checked".into()))
+}
+
+/// The data tripwire, checked after a result was counted.
+async fn volume_tripped(state: &AppState, con: &Connector) -> Option<String> {
+    let id = con.id.clone();
+    let since = now_ms() - HOUR_MS;
+    let (_, _, bytes) = state
+        .db
+        .call(move |c| entities::connector_usage_since(c, &id, since))
+        .await
+        .ok()?;
+    let max = state.cfg.safety.max_read_mb_per_hour as i64 * 1024 * 1024;
+    (bytes >= max).then(|| {
+        format!(
             "it read more than {} MB of data in an hour, which looks like a bulk export",
-            s.max_read_mb_per_hour
-        ));
-    }
-    None
+            state.cfg.safety.max_read_mb_per_hour
+        )
+    })
 }
 
 /// Pause a connector after a tripwire and tell the owner (card + push).
@@ -981,6 +1205,9 @@ pub async fn pause_connector(state: &AppState, con: &Connector, reason: &str) {
         })
         .await;
     crate::warn!("connector {}: paused by a tripwire", con.name);
+    // Calls still waiting for approval are cancelled; ones already
+    // admitted (within the limits) finish.
+    cancel_approvals(state, Some(&con.id));
     crate::connectors::broadcast_changed(state).await;
     let label = service_label(con);
     let card = json!({
@@ -1076,7 +1303,7 @@ async fn ask(
     p: &policy::Preview,
     category: Category,
 ) -> Answer {
-    let timeout = Duration::from_secs(state.cfg.safety.approval_timeout_secs);
+    let timeout = Duration::from_secs(state.cfg.approval_timeout_secs());
     let expires_at = now_ms() + timeout.as_millis() as i64;
     let mut card = entities::approval_card(&entities::ApprovalRequest {
         title: &p.title,
@@ -1118,7 +1345,7 @@ async fn ask(
         .pending
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(msg.id.clone(), tx);
+        .insert(msg.id.clone(), (con.id.clone(), tx));
     let mut c = call.clone();
     c.card_message_id = Some(msg.id.clone());
     record(state, &c).await;
@@ -1168,11 +1395,14 @@ async fn ask(
         "cancelled" => Answer::Cancelled,
         _ => Answer::Expired,
     };
-    let (id, d) = (call.id.clone(), final_state.clone());
-    let _ = state
-        .db
-        .call(move |c| entities::set_call_decision(c, &id, &d, None))
-        .await;
+    // An approval is recorded when the call is admitted to run.
+    if final_state != "approved" {
+        let (id, d) = (call.id.clone(), final_state.clone());
+        let _ = state
+            .db
+            .call(move |c| entities::set_call_decision(c, &id, &d, None))
+            .await;
+    }
     decision
 }
 
@@ -1210,7 +1440,7 @@ async fn close_card(state: &AppState, card_id: &str, to: &'static str) -> String
 /// The owner decided an approval card (`POST /api/messages/{id}/decision`):
 /// release the held call.
 pub fn decided(state: &AppState, card_id: &str, approve: bool) {
-    if let Some(tx) = state
+    if let Some((_, tx)) = state
         .gateway
         .pending
         .lock()
@@ -1219,6 +1449,18 @@ pub fn decided(state: &AppState, card_id: &str, approve: bool) {
     {
         let _ = tx.send(approve);
     }
+}
+
+/// Cancel approvals waiting on one connector (or all): their cards become
+/// `cancelled` and the calls never run.
+pub fn cancel_approvals(state: &AppState, connector_id: Option<&str>) {
+    let mut pending = state
+        .gateway
+        .pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    // Dropping the sender wakes the waiter with "cancelled".
+    pending.retain(|_, (cid, _)| connector_id.is_some_and(|c| c != cid));
 }
 
 /// After a restart nothing waits for old approval cards: close them.
@@ -1262,6 +1504,15 @@ pub async fn disconnect_all(state: &AppState) -> usize {
         .call(entities::disable_all_connectors)
         .await
         .unwrap_or(0);
+    stop_all(state).await;
+    cancel_approvals(state, None);
+    crate::oauth::forget_flows(state, None);
+    crate::warn!("all connectors disconnected by the owner ({n} were on)");
+    n
+}
+
+/// Stop every connector's program or session.
+pub async fn stop_all(state: &AppState) {
     let ids: Vec<String> = state
         .gateway
         .slots
@@ -1273,9 +1524,6 @@ pub async fn disconnect_all(state: &AppState) -> usize {
     for id in ids {
         stop(state, &id).await;
     }
-    cancel_all_grants(state);
-    crate::warn!("all connectors disconnected by the owner ({n} were on)");
-    n
 }
 
 /// End every turn's connector access (their waiting approvals are
@@ -1288,7 +1536,7 @@ pub fn cancel_all_grants(state: &AppState) {
         .unwrap_or_else(|p| p.into_inner())
         .values()
     {
-        let _ = g.cancel.send(true);
+        g.cancel.send_replace(true);
     }
 }
 

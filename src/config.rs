@@ -413,12 +413,6 @@ impl Config {
         if self.safety.approval_timeout_secs < 30 {
             return Err("safety.approval_timeout_secs must be at least 30".into());
         }
-        if self.safety.approval_timeout_secs + 60 > self.turn_timeout_secs {
-            return Err(
-                "turn_timeout_secs must be at least a minute longer than safety.approval_timeout_secs"
-                    .into(),
-            );
-        }
         if self.safety.idle_minutes == 0 {
             return Err("safety.idle_minutes must be at least 1".into());
         }
@@ -437,6 +431,15 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// How long an approval card really waits: the configured time, but
+    /// at least a minute less than a turn may run (older configs with a
+    /// short `turn_timeout_secs` keep working).
+    pub fn approval_timeout_secs(&self) -> u64 {
+        let t = self.turn_timeout_secs;
+        let cap = if t > 60 { t - 60 } else { t / 2 };
+        self.safety.approval_timeout_secs.min(cap).max(1)
     }
 
     /// Engines directory (absolute).
@@ -607,6 +610,16 @@ mod tests {
         assert!(Config::parse("max_concurrent_turns = 0").is_err());
         assert!(Config::parse("[heartbeat]\nactive_start = \"25:00\"").is_err());
         assert!(Config::parse("agent_name = \" \"").is_err());
+    }
+
+    #[test]
+    fn short_turn_timeouts_still_load() {
+        let cfg = Config::parse("turn_timeout_secs = 120").unwrap();
+        assert_eq!(cfg.approval_timeout_secs(), 60);
+        assert_eq!(Config::default().approval_timeout_secs(), 300);
+        let tiny = Config::parse("turn_timeout_secs = 5").unwrap();
+        assert_eq!(tiny.approval_timeout_secs(), 2);
+        assert!(Config::parse("[safety]\napproval_timeout_secs = 5").is_err());
     }
 
     #[test]

@@ -29,6 +29,8 @@ pub enum Category {
     Delete,
     /// Exporting or downloading data in bulk.
     Export,
+    /// A multi-purpose tool whose operation argument Iris cannot place.
+    Unclear,
 }
 
 impl Category {
@@ -41,6 +43,30 @@ impl Category {
             Category::Purchase => "purchase",
             Category::Delete => "delete",
             Category::Export => "export",
+            Category::Unclear => "unclear",
+        }
+    }
+
+    /// How much harm a mistaken call could do (for picking the riskier of
+    /// two readings).
+    fn risk(self) -> u8 {
+        match self {
+            Category::Read => 0,
+            Category::Draft => 1,
+            Category::Write => 2,
+            Category::Unclear => 3,
+            Category::Export => 4,
+            Category::Delete => 5,
+            Category::Send => 6,
+            Category::Purchase => 7,
+        }
+    }
+
+    fn riskier(self, other: Category) -> Category {
+        if other.risk() > self.risk() {
+            other
+        } else {
+            self
         }
     }
 }
@@ -183,6 +209,8 @@ const READ_VERBS: &[&str] = &[
     "can",
 ];
 const SEND_WORDS: &[&str] = &[
+    "approve",
+    "merge",
     "send",
     "reply",
     "respond",
@@ -205,7 +233,7 @@ const SEND_WORDS: &[&str] = &[
 ];
 /// Verbs that only mean "send" in first position (`message_user`, but not
 /// `get_message`).
-const SEND_LEADING: &[&str] = &["message", "react"];
+const SEND_LEADING: &[&str] = &["message", "react", "request"];
 const PURCHASE_WORDS: &[&str] = &[
     "buy", "purchase", "pay", "payment", "payments", "checkout", "charge", "donate", "tip",
     "refund", "invoice", "withdraw", "deposit",
@@ -233,49 +261,137 @@ const DELETE_WORDS: &[&str] = &[
 const EXPORT_WORDS: &[&str] = &["export", "dump", "backup", "takeout", "bulk", "exfiltrate"];
 const DRAFT_WORDS: &[&str] = &["draft", "drafts", "compose"];
 
-/// Classify a tool call by its name and the MCP server's annotations
-/// (`readOnlyHint`, `destructiveHint`). Explicitly risky words in the name
-/// win over annotations, so a mislabeled tool still asks.
-pub fn classify(tool: &str, annotations: &Value) -> Category {
-    let w = words(tool);
+/// Ordinary changes (recognized, so an operation argument using them is
+/// not "unclear").
+const WRITE_VERBS: &[&str] = &[
+    "create",
+    "update",
+    "add",
+    "edit",
+    "set",
+    "modify",
+    "insert",
+    "upload",
+    "write",
+    "move",
+    "rename",
+    "label",
+    "mark",
+    "apply",
+    "star",
+    "pin",
+    "schedule",
+    "save",
+    "assign",
+    "patch",
+    "put",
+    "append",
+    "replace",
+    "change",
+    "enable",
+    "disable",
+    "lock",
+    "unlock",
+    "archive",
+    "copy",
+    "duplicate",
+    "tag",
+    "unpin",
+    "unstar",
+    "unlabel",
+];
+/// Arguments that choose what a multi-purpose tool does
+/// (`pull_request_review_write(method: "submit_pending")`).
+const SELECTOR_KEYS: &[&str] = &[
+    "method",
+    "action",
+    "operation",
+    "op",
+    "verb",
+    "command",
+    "event",
+];
+
+/// What explicit words say, or None when no rule matches.
+fn classify_words(w: &[String]) -> Option<Category> {
     let has = |set: &[&str]| w.iter().any(|x| set.contains(&x.as_str()));
     let first = w.first().map(String::as_str).unwrap_or("");
     let lead = |set: &[&str]| set.contains(&first);
     let read_first = lead(READ_VERBS);
 
     if has(PURCHASE_WORDS) && !(read_first && !has(&["pay", "buy", "purchase", "checkout"])) {
-        return Category::Purchase;
+        return Some(Category::Purchase);
     }
     if lead(PURCHASE_LEADING) || (!read_first && has(PURCHASE_NOUNS)) {
-        return Category::Purchase;
+        return Some(Category::Purchase);
     }
     if has(&["send", "reply", "forward", "publish", "invite", "tweet"])
         || (!read_first && (has(SEND_WORDS) || lead(SEND_LEADING)))
     {
         // `create_draft` and `draft_reply` stay drafts unless they send.
         if has(DRAFT_WORDS) && !has(&["send"]) {
-            return Category::Draft;
+            return Some(Category::Draft);
         }
-        return Category::Send;
+        return Some(Category::Send);
     }
     if has(&["delete", "trash", "destroy", "erase", "purge", "wipe"])
         || (!read_first && has(DELETE_WORDS))
     {
-        return Category::Delete;
+        return Some(Category::Delete);
     }
     if has(EXPORT_WORDS) || (has(&["download"]) && has(&["all", "everything"])) {
-        return Category::Export;
+        return Some(Category::Export);
     }
     if has(DRAFT_WORDS) {
-        return Category::Draft;
+        return Some(Category::Draft);
     }
-    if read_first || annotations["readOnlyHint"] == true {
-        return Category::Read;
+    if read_first {
+        return Some(Category::Read);
     }
-    if annotations["destructiveHint"] == true {
-        return Category::Delete;
+    if has(WRITE_VERBS) {
+        return Some(Category::Write);
     }
-    Category::Write
+    None
+}
+
+/// Classify a tool by its name and the MCP server's annotations
+/// (`readOnlyHint`, `destructiveHint`). Explicitly risky words in the name
+/// win over annotations, so a mislabeled tool still asks.
+pub fn classify(tool: &str, annotations: &Value) -> Category {
+    match classify_words(&words(tool)) {
+        Some(Category::Write) | None => {
+            if annotations["readOnlyHint"] == true {
+                Category::Read
+            } else if annotations["destructiveHint"] == true {
+                Category::Delete
+            } else {
+                Category::Write
+            }
+        }
+        Some(c) => c,
+    }
+}
+
+/// Classify one call: the tool, plus any operation argument that chooses
+/// what it does. The riskier reading wins; an operation on a tool that
+/// changes things that Iris cannot place is `Unclear` (it asks).
+pub fn classify_call(tool: &str, annotations: &Value, args: &Value) -> Category {
+    let base = classify(tool, annotations);
+    let mut cat = base;
+    if let Some(obj) = args.as_object() {
+        for (k, v) in obj {
+            if !SELECTOR_KEYS.contains(&norm_key(k).as_str()) {
+                continue;
+            }
+            let Some(text) = v.as_str() else { continue };
+            match classify_words(&words(text)) {
+                Some(c) => cat = cat.riskier(c),
+                None if base != Category::Read => cat = cat.riskier(Category::Unclear),
+                None => {}
+            }
+        }
+    }
+    cat
 }
 
 // -------------------------------------------------------------- recipients
@@ -447,6 +563,7 @@ fn ask_reason(category: Category) -> &'static str {
         Category::Purchase => "Spends money or commits you to something",
         Category::Delete => "Deletes or removes something",
         Category::Export => "Exports a lot of your data",
+        Category::Unclear => "Iris can't tell exactly what this does",
         Category::Write => "Changes something in your account",
         Category::Draft => "Writes a draft",
         Category::Read => "Reads from your account",
@@ -546,7 +663,9 @@ const BODY_KEYS: &[&str] = &[
     "status",
 ];
 pub const MAX_PREVIEW_BODY: usize = 4000;
-const MAX_DETAILS: usize = 8000;
+/// The longest request an approval card can show in full; larger ones are
+/// refused rather than approved unseen.
+pub const MAX_DETAILS: usize = 64_000;
 
 /// Make characters that could hide or reorder text visible, so the preview
 /// cannot look different from what is sent.
@@ -563,6 +682,12 @@ pub fn reveal_hidden(s: &str) -> String {
         }
     }
     out
+}
+
+/// The full request as the owner sees it (pretty JSON, hidden characters
+/// made visible).
+pub fn request_text(args: &Value) -> String {
+    reveal_hidden(&serde_json::to_string_pretty(args).unwrap_or_default())
 }
 
 fn cut(s: &str, max: usize) -> String {
@@ -617,10 +742,7 @@ pub fn preview(service_label: &str, tool: &str, category: Category, args: &Value
         .take(8)
         .map(|(k, t)| (humanize(&k), reveal_hidden(&t)))
         .collect();
-    let details = cut(
-        &reveal_hidden(&serde_json::to_string_pretty(args).unwrap_or_default()),
-        MAX_DETAILS,
-    );
+    let details = cut(&request_text(args), MAX_DETAILS);
     let action_label = match category {
         Category::Send => "Send",
         Category::Purchase => "Pay",
@@ -692,6 +814,63 @@ mod tests {
         assert_eq!(c("export_all_contacts"), Category::Export);
         assert_eq!(c("share_file"), Category::Send);
         assert_eq!(c("frobnicate"), Category::Write);
+    }
+
+    #[test]
+    fn operation_arguments_count() {
+        let none = Value::Null;
+        let review = |method: &str| {
+            classify_call(
+                "pull_request_review_write",
+                &json!({"readOnlyHint": false}),
+                &json!({"method": method, "owner": "o", "repo": "r", "pullNumber": 1}),
+            )
+        };
+        assert_eq!(review("create"), Category::Write);
+        assert_eq!(review("submit_pending"), Category::Send);
+        assert_eq!(review("delete_pending"), Category::Delete);
+        assert_eq!(review("frobnicate"), Category::Unclear);
+        assert_eq!(
+            classify_call(
+                "pull_request_review_write",
+                &none,
+                &json!({"method": "create", "event": "REQUEST_CHANGES"})
+            ),
+            Category::Send
+        );
+        assert_eq!(
+            classify_call(
+                "pull_request_review_write",
+                &none,
+                &json!({"method": "create", "event": "APPROVE"})
+            ),
+            Category::Send
+        );
+        // Reads stay reads whatever their options say, unless they name a
+        // risky operation.
+        assert_eq!(
+            classify_call(
+                "search_issues",
+                &none,
+                &json!({"mode": "fuzzy", "method": "bm25"})
+            ),
+            Category::Read
+        );
+        assert_eq!(
+            classify_call("list_things", &none, &json!({"action": "delete"})),
+            Category::Delete
+        );
+        assert!(matches!(
+            decide(
+                &Policy::default(),
+                "x",
+                Category::Unclear,
+                &[],
+                &|_| false,
+                &|_| false
+            ),
+            Verdict::Ask(_)
+        ));
     }
 
     #[test]

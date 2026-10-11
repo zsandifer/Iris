@@ -1162,13 +1162,15 @@ inherited ones). Subscription sign-ins are never read or touched.
 ##### `PUT /api/harnesses/{name}/keys/{env}` (Owner)
 
 `{"value": "..."}` (one line, no spaces, max 4,096). `env` must be one of the
-engine's `key_options` (`400`). Saves the key, then checks it with one tiny
-real request through the engine's own CLI (for OpenCode, with a model of
-that provider). Returns the `GET` body plus `auth`: `ok` (it works; the
-engine is marked signed in and its sign-in card turns `connected`),
-`auth_required` (the provider refused it; **the key is not kept**), or
-`unknown` (could not check, for example the engine is turned off; the key
-is kept and used from the next turn).
+engine's `key_options` (`400`). Checks the key first with one tiny real
+request through the engine's own CLI (for OpenCode, with a model of that
+provider), then saves it. Returns the `GET` body plus `auth`: `ok` (saved;
+the engine is marked signed in and its sign-in card turns `connected`),
+`auth_required` (the provider refused it; **it is not saved**, and a key
+saved earlier stays), or `unknown` (could not check, for example the engine
+is turned off; saved and used from the next turn). For OpenCode the per-run
+config also points each provider at Iris's variable, so a key added in the
+app wins over one saved with `opencode auth login`.
 
 ##### `DELETE /api/harnesses/{name}/keys/{env}` (Owner)
 
@@ -1235,8 +1237,12 @@ use and start again on the next call.
 **The approval gate.** Every call is classified from the real tool name,
 the server's own annotations (`readOnlyHint`, `destructiveHint`; risky words
 in the name win), and the real arguments: `read`, `draft`, `write`, `send`
-(email, messages, posts, replies, sharing, invites), `purchase` (buying,
-paying, ordering, booking), `delete`, or `export`. Recipients are read from
+(email, messages, posts, replies, sharing, invites, approving or merging),
+`purchase` (buying, paying, ordering, booking), `delete`, `export`, or
+`unclear`. Operation arguments of multi-purpose tools (`method`, `action`,
+`operation`, `op`, `verb`, `command`, `event`) count too: the riskier
+reading wins, and an operation Iris cannot place on a tool that changes
+things is `unclear`. Recipients are read from
 the arguments (`to`, `cc`, `bcc`, `recipients`, `attendees`, `email`,
 `phone`, `channel`, ...). With the default rules:
 
@@ -1246,25 +1252,33 @@ the arguments (`to`, `cc`, `bcc`, `recipients`, `attendees`, `email`,
 | write | Runs, unless it reaches someone new (a recipient not trusted and never approved before), which asks. |
 | send | Runs without asking only when every recipient is a [trusted person](#318-safety-pause-disconnect-trusted-people); otherwise asks. |
 | purchase | Always asks, whatever the rules. |
-| delete, export | Asks. |
+| delete, export, unclear | Asks. |
 
 Asking means: Iris holds the call, posts an [`approval` card](#server-cards)
 built from the exact arguments in the turn's chat (the owner's Main chat for
 scheduled jobs), sends a push (`kind: "approval"`), and waits. Approved: the
 held call runs unchanged and its recipients become known. Denied, no answer
-within `safety.approval_timeout_secs` (default 300; the card becomes
-`expired`), or the turn ended (cancelled, paused, disconnected; the card
-becomes `cancelled`): it never runs, and the agent gets an error result
-saying so. Tools that would ask are marked in their description; tools the
+within `safety.approval_timeout_secs` (default 300, and at most a minute
+less than `turn_timeout_secs`; the card becomes `expired`), or the turn
+ended, Iris was paused, or the connector was turned off, removed, or paused
+(the card becomes `cancelled`): it never runs, and the agent gets an error
+result saying so. Right before any call runs, Iris checks again that the
+connector still exists, is on, unpaused, and signed in, that its current
+rules still allow the call, that the turn is still running, and that Iris
+is not paused. A request too large to show in full on the card (over 64,000
+characters) is refused rather than approved unseen. Tools that would ask are marked in their description; tools the
 rules turn off are left out of `tools/list`.
 
-**Tripwires.** Counting calls that ran in the last hour through one
-connector: more than `safety.max_sends_per_hour` sends (default 5), more
+**Tripwires.** Checked and recorded in one step right before a call runs
+(so concurrent calls, or several approvals released together, cannot all
+pass), counting calls that ran in the last hour through one connector: more than `safety.max_sends_per_hour` sends (default 5), more
 than `safety.max_calls_per_hour` calls (200), or more than
 `safety.max_read_mb_per_hour` MB of results (25, a bulk export) pauses the
 connector: the call is refused, an `action` card "I paused <service>" with a
 Resume button is posted in the Main chat, and the owner gets a push (`kind:
-"safety"`). Every call (ran, asked, refused) is recorded in the
+"safety"`). Calls already admitted finish; waiting approvals for that
+connector are cancelled. The data limit is also checked right after each
+result. Every call (ran, asked, refused) is recorded in the
 [connector activity log](#get-apiconnectorsactivity).
 
 **Sign-in (OAuth 2.1 + PKCE).** A connector with `auth: "oauth"` signs in on
@@ -1278,7 +1292,10 @@ the service's own page:
   client registration (RFC 7591) when offered, and sends the RFC 8707
   `resource` parameter. Without registration the owner pastes the client
   ID (and secret) of an OAuth app they created (`409 needs_client`).
-  Discovered endpoints must be https (or loopback).
+  Every address Iris fetches while signing in must be https, must not
+  resolve to a loopback, private, or link-local address, and is not
+  followed through redirects (loopback is allowed only when the connector
+  itself is on this machine).
 - `preset` (Google): fixed endpoints and scopes, the owner's own OAuth
   client (`access_type=offline`).
 
@@ -1404,7 +1421,8 @@ Creates (or updates) the connector named after the service. Response
 #### `POST /api/connectors/{id}/oauth/start`
 
 `{"origin": "<the app's origin>"}`. Discovers and registers as needed and
-returns `{"authorize_url", "redirect_uri", "paste": bool}`. The app opens
+returns `{"authorize_url", "redirect_uri", "paste": bool}`. Turning the
+connector off or removing it drops a sign-in in progress. The app opens
 `authorize_url`; when the owner approves, the service sends the browser to
 `GET /api/oauth/callback`, or (when `paste`) the owner pastes the address
 they landed on into `POST /api/oauth/complete`. `409 needs_client` when the
@@ -1422,8 +1440,9 @@ one for the same connector.
 
 `?state&code` (or `?state&error`). No device token. Finishes the sign-in the
 `state` belongs to (one use, 15 minutes): exchanges the code with the PKCE
-verifier, stores the tokens, turns the connector on and `ok`, closes its
-reconnect card, and broadcasts `connectors.changed`. Answers with a small
+verifier, stores the tokens, marks the connector `ok` (it never turns a
+connector on by itself), closes its reconnect card, and broadcasts
+`connectors.changed`. Answers with a small
 HTML page ("Google is connected. You can close this page and go back to
 Iris.", or what went wrong).
 
@@ -2118,7 +2137,7 @@ changes are re-sent as `message.updated`.
 | `engine_signin` | `harness`, `flow` (`code_paste`, `device_code`, `manual`), `state` (`needs_reconnect`, `starting`, `waiting_for_code`, `waiting_for_approval`, `verifying`, `connected`, `failed`, `cancelled`), `url`, `user_code`, `error`, `instructions` (manual flow), `login_id` | Start with `POST /api/harnesses/{harness}/login`. For `waiting_for_code`, show `url` and a code field (`/login/code`); for `waiting_for_approval`, show `url` and `user_code`; for `manual`, show `instructions` and a "Check again" button (the same `POST`). |
 | `engine_setup` | `state` (`needs_setup`, `done`), `options: [{"harness", "label", "installed", "requires", "action": {"method", "path"}}]` | Each option installs that engine (`POST /api/engines/{name}/install`). |
 | `connector_reconnect` | `connector_id`, `service`, `auth` (`oauth` or `secrets`), `state` (`needs_reconnect`, `connected`) | `oauth`: sign in again (`POST /api/connectors/{id}/oauth/start`). `secrets`: open the connector's settings so the owner can update its credentials (`PATCH /api/connectors/{id}`). The card turns `connected` when they do. |
-| `approval` | `service`, `preview: {"to", "subject", "body", "fields": [{"label", "value"}]}`, `details` (the full arguments, pretty JSON, cut at 8,000 characters), `reason` (why it asks, e.g. "Sends a message to someone new: sam@example.com"), `tool`, `category`, `connector_id`, `turn_message_id` (the reply of the turn that asked; absent for scheduled jobs), `action_label` (`Send`, `Pay`, `Delete`, or `Allow`), `approver_user_id`, `owner_only: false`, `state` (`pending`, `approved`, `denied`, `expired`, `cancelled`), `expires_at`, `decided_at` | Show the preview exactly as given with Deny / `action_label`; decide with [`POST /api/messages/{id}/decision`](#post-apimessagesiddecision). Built by the gateway from the real arguments of the held call, never from agent text; characters that could hide or reorder text are shown as `[U+XXXX]`, and a body over 4,000 characters is cut with a note (the full text is in `details`). |
+| `approval` | `service`, `preview: {"to", "subject", "body", "fields": [{"label", "value"}]}`, `details` (the complete arguments, pretty JSON; requests too large to show in full are refused), `reason` (why it asks, e.g. "Sends a message to someone new: sam@example.com"), `tool`, `category`, `connector_id`, `turn_message_id` (the reply of the turn that asked; absent for scheduled jobs), `action_label` (`Send`, `Pay`, `Delete`, or `Allow`), `approver_user_id`, `owner_only: false`, `state` (`pending`, `approved`, `denied`, `expired`, `cancelled`), `expires_at`, `decided_at` | Show the preview exactly as given with Deny / `action_label`; decide with [`POST /api/messages/{id}/decision`](#post-apimessagesiddecision). Built by the gateway from the real arguments of the held call, never from agent text; characters that could hide or reorder text are shown as `[U+XXXX]`, and a body over 4,000 characters is cut with a note (the full text is in `details`). |
 
 ### Attachment
 
@@ -2230,7 +2249,7 @@ One call through the gateway (the connector activity log).
 | `id` | string | |
 | `connector_id`, `connector_name` | string | |
 | `tool` | string | Tool name. |
-| `category` | string | `read`, `draft`, `write`, `send`, `purchase`, `delete`, or `export`. |
+| `category` | string | `read`, `draft`, `write`, `send`, `purchase`, `delete`, `export`, or `unclear`. |
 | `decision` | string | `auto` (rules let it run), `trusted` (only trusted recipients), `approved`, `denied`, `expired`, `cancelled`, `blocked` (rules or a tripwire refused it), or `pending`. |
 | `outcome` | string or null | `ok` or `error` once it ran; null if it did not run. |
 | `reason` | string | Why it asked or was refused. |

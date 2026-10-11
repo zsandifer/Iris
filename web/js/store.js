@@ -202,9 +202,22 @@ export async function loadLibrary() {
   ]);
   set({ library: { items, photos, saved } });
 }
-export async function loadConnectors() {
-  if (!isOwner()) return;
-  set({ connectors: (await get('/connectors')).connectors });
+let connectorsLoading = null;
+/** Load the owner's connectors; concurrent callers share one request. */
+export function loadConnectors() {
+  if (!isOwner()) return Promise.resolve();
+  connectorsLoading ||= get('/connectors')
+    .then((r) => set({ connectors: r.connectors }))
+    .finally(() => { connectorsLoading = null; });
+  return connectorsLoading;
+}
+
+let connectorsTried = false;
+/** Load connectors once for cards that only need them for display. */
+export function ensureConnectors() {
+  if (S.connectors || connectorsTried || !isOwner()) return;
+  connectorsTried = true;
+  loadConnectors().catch(() => {});
 }
 export async function loadSlots() { set({ slots: (await get('/models/slots')).slots }); }
 export async function loadEngines() {

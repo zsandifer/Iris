@@ -132,20 +132,60 @@ fn host_of(url: &str) -> &str {
     }
 }
 
+/// The URL's host is this machine: `localhost` or a loopback IP address
+/// (parsed, so `127.example.com` does not count).
 pub fn is_loopback_url(url: &str) -> bool {
     let h = host_of(url);
-    h == "localhost" || h == "::1" || h.starts_with("127.")
+    h.eq_ignore_ascii_case("localhost")
+        || h.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Endpoints from metadata must be https (or loopback, for testing).
-fn check_endpoint(url: &str) -> Result<(), String> {
-    if url.starts_with("https://") || (url.starts_with("http://") && is_loopback_url(url)) {
-        Ok(())
-    } else {
-        Err(format!(
-            "the sign-in server uses an insecure address ({url})"
-        ))
+fn private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v) => {
+            v.is_loopback()
+                || v.is_private()
+                || v.is_link_local()
+                || v.is_unspecified()
+                || v.is_broadcast()
+                || v.octets()[0] == 100 && (64..128).contains(&v.octets()[1])
+        }
+        std::net::IpAddr::V6(v) => {
+            v.is_loopback()
+                || v.is_unspecified()
+                || (v.segments()[0] & 0xfe00) == 0xfc00
+                || (v.segments()[0] & 0xffc0) == 0xfe80
+                || v.to_ipv4_mapped().is_some_and(|m| private_ip(m.into()))
+        }
     }
+}
+
+/// An address Iris may fetch while signing in: https, and (unless the
+/// connector itself is on this machine) never a loopback, private, or
+/// link-local destination, so a remote server cannot point Iris at the
+/// owner's local network.
+fn check_endpoint(url: &str, allow_local: bool) -> Result<(), String> {
+    let local = is_loopback_url(url);
+    let scheme_ok = url.starts_with("https://") || (url.starts_with("http://") && local);
+    if !scheme_ok || (local && !allow_local) {
+        return Err(format!(
+            "the sign-in server uses an address Iris won't use ({url})"
+        ));
+    }
+    if !allow_local {
+        use std::net::ToSocketAddrs;
+        let port = if url.starts_with("https://") { 443 } else { 80 };
+        let addrs = (host_of(url), port)
+            .to_socket_addrs()
+            .map_err(|_| format!("could not find the sign-in server ({url})"))?;
+        if addrs.into_iter().any(|a| private_ip(a.ip())) {
+            return Err(format!(
+                "the sign-in server points to a private address ({url})"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn origin_of(url: &str) -> String {
@@ -169,6 +209,9 @@ fn path_of(url: &str) -> String {
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
+        // Redirects could lead anywhere; metadata and token endpoints are
+        // used exactly as published.
+        .max_redirects(0)
         .timeout_global(Some(HTTP_TIMEOUT))
         .user_agent(format!("iris/{}", env!("CARGO_PKG_VERSION")))
         .build()
@@ -288,9 +331,10 @@ pub fn discover(mcp_url: &str) -> Result<Discovered, String> {
     let path = path_of(mcp_url);
     // Metadata addresses a server points us to must be https (or this
     // machine, for testing), like the endpoints themselves.
+    let allow_local = is_loopback_url(mcp_url);
     let mut prm_urls: Vec<String> = rm
         .into_iter()
-        .filter(|u| check_endpoint(u).is_ok())
+        .filter(|u| check_endpoint(u, allow_local).is_ok())
         .collect();
     if !path.is_empty() {
         prm_urls.push(format!(
@@ -314,7 +358,7 @@ pub fn discover(mcp_url: &str) -> Result<Discovered, String> {
         // Older servers: the MCP server is its own authorization server.
         None => (origin.clone(), mcp_url.to_string(), Value::Null),
     };
-    check_endpoint(&issuer)?;
+    check_endpoint(&issuer, allow_local)?;
     let meta = as_metadata_urls(&issuer).iter().find_map(|u| get_json(u));
     let (auth, token, reg, scopes_meta) = match &meta {
         Some(m) => {
@@ -341,10 +385,10 @@ pub fn discover(mcp_url: &str) -> Result<Discovered, String> {
     let (Some(auth), Some(token)) = (auth, token) else {
         return Err("the sign-in server's details are incomplete".into());
     };
-    check_endpoint(&auth)?;
-    check_endpoint(&token)?;
+    check_endpoint(&auth, allow_local)?;
+    check_endpoint(&token, allow_local)?;
     if let Some(r) = &reg {
-        check_endpoint(r)?;
+        check_endpoint(r, allow_local)?;
     }
     let list = |v: &Value| -> Vec<String> {
         v.as_array()
@@ -574,11 +618,39 @@ pub fn id_token_email(jwt: &str) -> Option<String> {
 }
 
 /// Force a refresh on next use (the server refused the current token).
-pub async fn invalidate(state: &AppState, con: &entities::Connector) {
-    if let Some(mut o) = con.config.oauth.clone() {
-        o.expires_at = Some(0);
-        let _ = save(state, &con.id, o).await;
+pub async fn invalidate(state: &AppState, connector_id: &str, rejected: Option<&str>) {
+    // Serialized with refreshes, on the latest stored state: only expire
+    // the token that was refused, never restore older tokens.
+    let _guard = state.oauth.refresh.lock().await;
+    let id = connector_id.to_string();
+    let Some(o) = state
+        .db
+        .call(move |c| entities::get_connector(c, &id))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|c| c.config.oauth)
+    else {
+        return;
+    };
+    let current = open(state, connector_id, "access_token", &o.access_token);
+    if rejected.is_some() && current.as_deref() != rejected {
+        return; // Already replaced by a refresh.
     }
+    let mut o = o;
+    o.expires_at = Some(0);
+    let _ = save(state, connector_id, o).await;
+}
+
+/// Drop sign-ins in progress for a connector (or all): a connection that
+/// was turned off or removed is not signed in by an old browser tab.
+pub fn forget_flows(state: &AppState, connector_id: Option<&str>) {
+    state
+        .oauth
+        .flows
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|_, f| connector_id.is_some_and(|c| c != f.connector_id));
 }
 
 // ------------------------------------------------------------------- flows
@@ -846,7 +918,7 @@ pub async fn finish(
     let _ = state
         .db
         .call(move |c| {
-            entities::update_connector(c, &id, None, None, Some(true))?;
+            // Signing in never turns a connection on by itself.
             entities::set_connector_state(
                 c,
                 &id,
@@ -943,7 +1015,17 @@ mod tests {
             as_metadata_urls("https://auth.example.com/")[0],
             "https://auth.example.com/.well-known/oauth-authorization-server"
         );
-        assert!(check_endpoint("http://evil.example/token").is_err());
-        assert!(check_endpoint("http://127.0.0.1:9/token").is_ok());
+        assert!(check_endpoint("http://evil.example/token", false).is_err());
+        assert!(check_endpoint("http://127.0.0.1:9/token", true).is_ok());
+        // Remote servers cannot point Iris at this machine or the LAN.
+        assert!(check_endpoint("http://127.0.0.1:9/token", false).is_err());
+        assert!(check_endpoint("https://127.0.0.1/token", false).is_err());
+        assert!(check_endpoint("https://10.0.0.5/token", false).is_err());
+        assert!(check_endpoint("https://[::1]/token", false).is_err());
+        // Names that merely start with 127 are not loopback.
+        assert!(!is_loopback_url("http://127.attacker.example/token"));
+        assert!(check_endpoint("http://127.attacker.example/token", true).is_err());
+        assert!(is_loopback_url("http://[::1]:8/x"));
+        assert!(is_loopback_url("http://LOCALHOST/x"));
     }
 }

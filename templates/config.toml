@@ -19,7 +19,7 @@ agent_name = "Iris"
 max_concurrent_turns = 2
 
 # A turn that runs longer than this is killed (with its process group).
-# Must be at least a minute longer than safety.approval_timeout_secs.
+# Approval cards wait at most a minute less than this.
 turn_timeout_secs = 600
 
 # Tokio worker threads. A small number keeps idle memory low.

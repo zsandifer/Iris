@@ -136,7 +136,8 @@ pub fn option(harness: &str, env: &str) -> Option<KeyOption> {
 }
 
 /// Save (or replace) a key.
-pub async fn set(state: &AppState, harness: &str, env: &str, value: &str) -> Result<(), String> {
+/// The key as it will be saved, or why it can't be.
+pub fn check(harness: &str, env: &str, value: &str) -> Result<String, String> {
     let value = value.trim();
     if option(harness, env).is_none() {
         return Err(format!("{env} is not a key this engine uses"));
@@ -144,6 +145,12 @@ pub async fn set(state: &AppState, harness: &str, env: &str, value: &str) -> Res
     if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_whitespace) {
         return Err("paste the key exactly as shown (one line, no spaces)".into());
     }
+    Ok(value.to_string())
+}
+
+pub async fn set(state: &AppState, harness: &str, env: &str, value: &str) -> Result<(), String> {
+    let value = check(harness, env, value)?;
+    let value = value.as_str();
     let sealed = state
         .vault
         .seal_str(value, &aad(harness, env))
@@ -209,11 +216,15 @@ pub async fn env_for(state: &AppState, harness: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Check a saved key the only reliable way: one tiny real request through
-/// the engine's own CLI (a one-word reply, no tools, no session). A key
-/// that works marks the engine signed in; one the provider refuses is
-/// removed again.
-pub async fn verify(state: &AppState, harness: &str, env: &str) -> crate::harness::AuthState {
+/// Check a candidate key (not saved yet) the only reliable way: one tiny
+/// real request through the engine's own CLI (a one-word reply, no tools,
+/// no session), with the candidate in place of any saved key for `env`.
+pub async fn verify(
+    state: &AppState,
+    harness: &str,
+    env: &str,
+    candidate: &str,
+) -> crate::harness::AuthState {
     use crate::harness::runner::{self, RunRequest};
     use crate::harness::{AuthState, HarnessEvent, TurnSpec};
     let Some(entry) = state.harness(harness) else {
@@ -222,33 +233,45 @@ pub async fn verify(state: &AppState, harness: &str, env: &str) -> crate::harnes
     let Some(program) = entry.program() else {
         return AuthState::Unknown;
     };
-    // The engine's own (cheapest listed) model; OpenCode lists models per
-    // provider once its key is in place.
-    let _ = state.probe_auth(harness).await;
-    let catalog = state.catalog();
-    // OpenCode: a model of the provider this key is for.
-    let provider = option(harness, env).map(|o| o.provider).unwrap_or("");
-    let mine: Vec<&crate::catalog::ModelEntry> = catalog
-        .models
-        .iter()
-        .filter(|m| m.harness == harness)
-        .filter(|m| provider.is_empty() || m.model.starts_with(&format!("{provider}/")))
+    let mut keys: Vec<(String, String)> = env_for(state, harness)
+        .await
+        .into_iter()
+        .filter(|(k, _)| k != env)
         .collect();
-    // The background slot's ranking puts quick, cheap models first.
-    let Some(model) = state
-        .rankings
-        .rank(crate::ranking::Slot::Background, &mine)
-        .first()
-        .map(|r| r.entry.model.clone())
-    else {
-        if !provider.is_empty() {
-            return AuthState::Unknown;
+    keys.push((env.to_string(), candidate.to_string()));
+    let strip = state.strip_env(entry);
+    let provider = option(harness, env).map(|o| o.provider).unwrap_or("");
+    let model = if provider.is_empty() {
+        // The engine's own model the background slot ranks first (quick,
+        // cheap).
+        let catalog = state.catalog();
+        let mine: Vec<&crate::catalog::ModelEntry> = catalog
+            .models
+            .iter()
+            .filter(|m| m.harness == harness)
+            .collect();
+        state
+            .rankings
+            .rank(crate::ranking::Slot::Background, &mine)
+            .first()
+            .map(|r| r.entry.model.clone())
+    } else {
+        // OpenCode lists a provider's models once its key is present: a
+        // model of the provider this key is for.
+        let args = entry.harness.models_probe_args().unwrap_or_default();
+        match runner::probe(&program, &args, &state.paths.workspace_dir(), &strip, &keys).await {
+            Ok((true, out, _)) => entry
+                .harness
+                .parse_models(&out)
+                .into_iter()
+                .map(|m| m.model)
+                .find(|m| m.starts_with(&format!("{provider}/"))),
+            _ => None,
         }
-        return state
-            .harness(harness)
-            .map_or(AuthState::Unknown, |e| e.status().auth);
     };
-    let keys = env_for(state, harness).await;
+    let Some(model) = model else {
+        return AuthState::Unknown;
+    };
     let spec = TurnSpec {
         turn_id: crate::util::new_id(),
         prompt: "Reply with the single word OK.".into(),
@@ -268,7 +291,6 @@ pub async fn verify(state: &AppState, harness: &str, env: &str) -> crate::harnes
         return AuthState::Unknown;
     };
     invocation.env.extend(keys);
-    let strip = state.strip_env(entry);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let run = runner::run(
@@ -298,16 +320,6 @@ pub async fn verify(state: &AppState, harness: &str, env: &str) -> crate::harnes
         }
     }
     crate::info!("engine {harness}: key check {result:?}");
-    match result {
-        AuthState::Ok => state.note_auth(harness, result, None).await,
-        AuthState::AuthRequired => {
-            // A key the provider refuses is not kept: it would only send
-            // turns to a model that cannot answer.
-            delete(state, harness, env).await;
-            state.recheck_harnesses().await;
-        }
-        AuthState::Unknown => {}
-    }
     result
 }
 

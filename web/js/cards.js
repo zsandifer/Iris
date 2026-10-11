@@ -3,7 +3,7 @@
 // connector_reconnect, approval).
 import { html, useEffect, useState } from './h.js';
 import { api, get, post, put, patch, seg, isId } from './api.js';
-import { S, set, go, isOwner, toast, loadGoals, loadEngines, loadConnectors } from './store.js';
+import { S, set, go, isOwner, toast, loadGoals, loadEngines, ensureConnectors } from './store.js';
 import { Icon, Img, LetterTile, hostOf, safeUrl } from './ui.js';
 import { plain } from './md.js';
 import { ServiceSignIn, ServiceTile, labelOf } from './connect.js';
@@ -43,7 +43,7 @@ const CATALOG = ['google', 'github', 'custom'];
 function ConnectCard({ c }) {
   const service = String(c.service || c.title || '');
   const known = CATALOG.includes(service.toLowerCase()) ? service.toLowerCase() : null;
-  if (known && isOwner() && !S.connectors) loadConnectors().catch(() => {});
+  useEffect(() => { if (known) ensureConnectors(); }, [known]);
   const con = known && known !== 'custom' && (S.connectors || []).find((x) => x.service === known);
   const ready = con && con.enabled && con.auth_state === 'ok';
   const open = () => {
@@ -264,7 +264,7 @@ function SetupCard({ c }) {
 }
 
 function ConnectorReconnectCard({ c }) {
-  if (isOwner() && !S.connectors) loadConnectors().catch(() => {});
+  useEffect(() => { ensureConnectors(); }, []);
   const con = (S.connectors || []).find((x) => x.id === c.connector_id);
   const done = c.state === 'connected';
   return html`<div class=${'card-x' + (done ? ' done' : '')}>

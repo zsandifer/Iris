@@ -312,9 +312,13 @@ impl AppState {
                     }
                     if !keys.is_empty() && next.auth == AuthState::AuthRequired {
                         // The owner added an API key; some status commands
-                        // only know about the subscription sign-in. A
-                        // rejected key shows up in turns instead.
-                        next.auth = AuthState::Unknown;
+                        // only know about the subscription sign-in. Keep
+                        // what the key check or turns learned instead.
+                        next.auth = if before.auth == AuthState::Ok {
+                            AuthState::Ok
+                        } else {
+                            AuthState::Unknown
+                        };
                         next.auth_message = None;
                     }
                     // Without a status command the state comes from turns

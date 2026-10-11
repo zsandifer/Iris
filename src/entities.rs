@@ -1059,7 +1059,14 @@ fn call_from_row(r: &rusqlite::Row) -> rusqlite::Result<ConnectorCall> {
     })
 }
 
+/// Record a call. Its `created_at` is assigned here, unique and increasing
+/// (it is the activity log's page cursor).
 pub fn insert_connector_call(conn: &Connection, c: &ConnectorCall) -> rusqlite::Result<()> {
+    let last: Option<i64> =
+        conn.query_row("SELECT MAX(created_at) FROM connector_calls", [], |r| {
+            r.get(0)
+        })?;
+    let created_at = now_ms().max(last.map_or(0, |l| l + 1));
     conn.execute(
         "INSERT INTO connector_calls (id, connector_id, connector_name, tool, category, decision,
              outcome, reason, summary, conversation_id, message_id, card_message_id, result_bytes,
@@ -1079,7 +1086,7 @@ pub fn insert_connector_call(conn: &Connection, c: &ConnectorCall) -> rusqlite::
             c.message_id,
             c.card_message_id,
             c.result_bytes,
-            c.created_at,
+            created_at,
             c.finished_at
         ],
     )?;

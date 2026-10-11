@@ -80,6 +80,29 @@ pub fn mcp_config(servers: &[super::McpServer]) -> Value {
     Value::Object(map)
 }
 
+/// Keys the owner added in the app win over keys saved with `opencode auth
+/// login` (which OpenCode would otherwise load after the environment): the
+/// per-run config points each provider at Iris's variable. The values stay
+/// in the environment; the file only names them.
+pub fn provider_keys(key_env: &[String]) -> Value {
+    let mut map = Map::new();
+    for env in key_env {
+        if let Some(o) = crate::keys::option("opencode", env)
+            && !o.provider.is_empty()
+        {
+            map.insert(
+                o.provider.to_string(),
+                json!({"options": {"apiKey": format!("{{env:{env}}}")}}),
+            );
+        }
+    }
+    if map.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(map)
+    }
+}
+
 impl Harness for OpenCode {
     fn name(&self) -> &'static str {
         "opencode"
@@ -99,12 +122,16 @@ impl Harness for OpenCode {
         let prompt_file = spec.run_dir.join(format!("{}.prompt.md", spec.turn_id));
         write_private_file(&prompt_file, spec.system_prompt.as_bytes())?;
         inv.temp_files.push(prompt_file.clone());
-        let config = json!({
+        let mut config = json!({
             "$schema": "https://opencode.ai/config.json",
             "instructions": [prompt_file.to_string_lossy()],
             "permission": self.permissions(&spec.writable_dirs),
             "mcp": mcp_config(&spec.mcp_servers),
         });
+        let providers = provider_keys(&spec.key_env);
+        if !providers.is_null() {
+            config["provider"] = providers;
+        }
         // A private file rather than OPENCODE_CONFIG_CONTENT: connector
         // headers must not sit in the process environment.
         let config_file = spec.run_dir.join(format!("{}.opencode.json", spec.turn_id));
@@ -693,7 +720,7 @@ anthropic/claude-haiku-4-5
             writable_dirs: vec!["/data/memory".into()],
             run_dir: tmp.path().into(),
             scope: "c1".into(),
-            key_env: vec![],
+            key_env: vec!["OPENROUTER_API_KEY".into()],
         };
         let inv = OpenCode::new(HarnessConfig::opencode_default())
             .build(&spec)
@@ -725,6 +752,10 @@ anthropic/claude-haiku-4-5
         assert_eq!(cfg["mcp"]["iris"]["timeout"], 420_000);
         assert!(cfg["mcp"]["web"].get("timeout").is_none());
         assert_eq!(cfg["mcp"]["web"]["type"], "local");
+        assert_eq!(
+            cfg["provider"]["openrouter"]["options"]["apiKey"],
+            "{env:OPENROUTER_API_KEY}"
+        );
         assert_eq!(cfg["permission"]["bash"], "ask");
         assert_eq!(cfg["permission"]["edit"], "allow");
         assert_eq!(

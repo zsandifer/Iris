@@ -630,6 +630,10 @@ async fn update_connector(
         .call(move |c| entities::update_connector(c, &id, desc.as_deref(), cfg.as_ref(), enabled))
         .await?
         .ok_or_else(|| ApiError::not_found("connector"))?;
+    if enabled == Some(false) {
+        crate::gateway::cancel_approvals(&state, Some(&cid));
+        crate::oauth::forget_flows(&state, Some(&cid));
+    }
     if touches_config || enabled == Some(false) {
         crate::gateway::stop(&state, &cid).await;
     }
@@ -648,6 +652,8 @@ async fn set_enabled(state: &AppState, id: String, enabled: bool) -> ApiResult {
         .await?
         .ok_or_else(|| ApiError::not_found("connector"))?;
     if !enabled {
+        crate::gateway::cancel_approvals(state, Some(&cid));
+        crate::oauth::forget_flows(state, Some(&cid));
         crate::gateway::stop(state, &cid).await;
     }
     crate::connectors::broadcast_changed(state).await;
@@ -686,6 +692,8 @@ async fn delete_connector(
     {
         return Err(ApiError::not_found("connector"));
     }
+    crate::gateway::cancel_approvals(&state, Some(&cid));
+    crate::oauth::forget_flows(&state, Some(&cid));
     crate::gateway::stop(&state, &cid).await;
     let _ = std::fs::remove_dir_all(crate::gateway::connector_dir(&state, &cid));
     crate::connectors::broadcast_changed(&state).await;

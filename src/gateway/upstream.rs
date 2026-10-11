@@ -103,12 +103,8 @@ struct ServerProc {
 
 impl ServerProc {
     fn kill(&self) {
-        self.alive.store(false, Ordering::SeqCst);
-        if let Some(pid) = self.pid.and_then(|p| i32::try_from(p).ok()) {
-            // SAFETY: plain syscall on the process group we created.
-            unsafe {
-                libc::kill(-pid, libc::SIGTERM);
-            }
+        if self.alive.swap(false, Ordering::SeqCst) {
+            terminate_group(self.pid);
         }
     }
 }
@@ -148,19 +144,41 @@ fn base_command(
 }
 
 /// Keep the last ~2 KB a program wrote to stderr.
-fn keep_tail(pipe: tokio::process::ChildStderr, tail: Arc<Mutex<String>>) {
+fn keep_tail(mut pipe: tokio::process::ChildStderr, tail: Arc<Mutex<String>>) {
     tokio::spawn(async move {
-        let mut r = tokio::io::BufReader::new(pipe);
-        let mut line = String::new();
-        while r.read_line(&mut line).await.unwrap_or(0) > 0 {
+        // Fixed-size reads: a program that never prints a newline cannot
+        // make this grow.
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = match pipe.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
             let mut t = tail.lock().unwrap_or_else(|p| p.into_inner());
-            t.push_str(&line);
+            t.push_str(&String::from_utf8_lossy(&buf[..n]));
             if t.len() > 2000 {
                 let cut = t.len() - 2000;
                 let cut = (cut..t.len()).find(|i| t.is_char_boundary(*i)).unwrap_or(0);
                 t.drain(..cut);
             }
-            line.clear();
+        }
+    });
+}
+
+/// SIGTERM a connector's process group, then SIGKILL whatever is left a
+/// few seconds later.
+fn terminate_group(pid: Option<u32>) {
+    let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()).filter(|p| *p > 0) else {
+        return;
+    };
+    // SAFETY: plain syscalls on the process group we created.
+    unsafe {
+        libc::kill(-pid, libc::SIGTERM);
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(3));
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
         }
     });
 }
@@ -532,9 +550,24 @@ impl StdioConn {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(id, tx);
-        self.write(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
-            .await?;
-        match tokio::time::timeout(timeout, rx).await {
+        // One deadline for sending and answering: a program that stops
+        // reading its input must not hang the call.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        match tokio::time::timeout_at(deadline, self.write(&msg)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                self.forget(id);
+                return Err(e);
+            }
+            Err(_) => {
+                // A half-written message leaves the stream unusable.
+                self.forget(id);
+                self.kill();
+                return Err(UpstreamError::Timeout);
+            }
+        }
+        match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(msg)) => rpc_result(msg),
             Ok(Err(_)) => Err(UpstreamError::Transport(
                 "the connector program stopped".into(),
@@ -549,13 +582,16 @@ impl StdioConn {
         }
     }
 
+    fn forget(&self, id: i64) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
+    }
+
     fn kill(&self) {
-        self.alive.store(false, Ordering::SeqCst);
-        if let Some(pid) = self.pid.and_then(|p| i32::try_from(p).ok()) {
-            // SAFETY: plain syscall on the process group we created.
-            unsafe {
-                libc::kill(-pid, libc::SIGTERM);
-            }
+        if self.alive.swap(false, Ordering::SeqCst) {
+            terminate_group(self.pid);
         }
     }
 }

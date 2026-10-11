@@ -490,3 +490,199 @@ async fn restart_expires_old_approval_cards() {
         .unwrap();
     assert_eq!(m.card.unwrap()["state"], "expired");
 }
+
+#[tokio::test]
+async fn turning_a_connector_off_cancels_its_held_calls() {
+    let t = setup(|c| c.safety.approval_timeout_secs = 60);
+    let (token, _guard, _) = t.grant().await;
+    let (state, tok) = (t.state.clone(), token.clone());
+    let call = tokio::spawn(async move {
+        handle(
+            &state,
+            &json!({"token": tok, "connector": "chat", "request": {
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "send_message", "arguments": {"to": "kim@example.com", "text": "hi"}}}}),
+        )
+        .await
+    });
+    let card = t.pending_card().await;
+    // What `POST /api/connectors/{id}/disconnect` does.
+    let id = t.connector_id.clone();
+    t.state
+        .db
+        .with(|c| entities::update_connector(c, &id, None, None, Some(false)))
+        .unwrap();
+    cancel_approvals(&t.state, Some(&t.connector_id));
+    let r = call.await.unwrap()["result"].clone();
+    assert!(text(&r).contains("cancelled"), "{r}");
+    let m = t
+        .state
+        .db
+        .with(|c| db::get_message(c, &card.id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(m.card.unwrap()["state"], "cancelled");
+    assert!(!t.calls_log().contains("send_message"));
+}
+
+#[tokio::test]
+async fn an_approval_released_after_the_connector_changed_does_not_run() {
+    let t = setup(|c| c.safety.approval_timeout_secs = 60);
+    let (token, _guard, _) = t.grant().await;
+    let (state, tok) = (t.state.clone(), token.clone());
+    let call = tokio::spawn(async move {
+        handle(
+            &state,
+            &json!({"token": tok, "connector": "chat", "request": {
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "delete_message", "arguments": {"id": "m-1"}}}}),
+        )
+        .await
+    });
+    let card = t.pending_card().await;
+    // Turned off behind the gateway's back; the card is still approvable.
+    let id = t.connector_id.clone();
+    t.state
+        .db
+        .with(|c| entities::update_connector(c, &id, None, None, Some(false)))
+        .unwrap();
+    t.decide(&card.id, true);
+    let r = call.await.unwrap()["result"].clone();
+    assert!(text(&r).contains("turned off"), "{r}");
+    assert!(!t.calls_log().contains("delete_message"));
+    assert_eq!(t.calls()[0].decision, "cancelled");
+}
+
+#[tokio::test]
+async fn a_turn_that_already_ended_cannot_start_a_call() {
+    let t = setup(|_| {});
+    let (token, guard, _) = t.grant().await;
+    let grant = t.state.gateway.grant(&token).unwrap();
+    drop(guard);
+    let con = t.connector();
+    let r = call_tool(&t.state, &grant, &con, "search_messages", &json!({})).await;
+    assert!(text(&r).contains("cancelled"), "{r}");
+    assert!(t.calls_log().is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_sends_cannot_exceed_the_tripwire() {
+    let t = setup(|c| c.safety.max_sends_per_hour = 2);
+    t.state
+        .db
+        .with(|c| db::set_setting(c, "safety.trusted_recipients", r#"["sam@example.com"]"#))
+        .unwrap();
+    let (token, _guard, _) = t.grant().await;
+    let mut calls = Vec::new();
+    for i in 0..5 {
+        let (state, tok) = (t.state.clone(), token.clone());
+        calls.push(tokio::spawn(async move {
+            handle(
+                &state,
+                &json!({"token": tok, "connector": "chat", "request": {
+                    "jsonrpc": "2.0", "id": i, "method": "tools/call",
+                    "params": {"name": "send_message", "arguments": {"to": "sam@example.com", "text": "hi"}}}}),
+            )
+            .await
+        }));
+    }
+    for c in calls {
+        c.await.unwrap();
+    }
+    assert!(
+        t.calls_log().matches("send_message").count() <= 2,
+        "{}",
+        t.calls_log()
+    );
+    assert!(t.connector().paused_reason.is_some());
+}
+
+#[tokio::test]
+async fn approvals_released_together_respect_the_tripwire() {
+    let t = setup(|c| {
+        c.safety.max_sends_per_hour = 1;
+        c.safety.approval_timeout_secs = 60;
+    });
+    let (token, _guard, _) = t.grant().await;
+    let mut calls = Vec::new();
+    for (i, who) in ["a@example.com", "b@example.com"].into_iter().enumerate() {
+        let (state, tok) = (t.state.clone(), token.clone());
+        calls.push(tokio::spawn(async move {
+            handle(
+                &state,
+                &json!({"token": tok, "connector": "chat", "request": {
+                    "jsonrpc": "2.0", "id": i, "method": "tools/call",
+                    "params": {"name": "send_message", "arguments": {"to": who, "text": "hi"}}}}),
+            )
+            .await
+        }));
+    }
+    // Both cards wait; approve both.
+    let mut cards = Vec::new();
+    for _ in 0..200 {
+        let msgs = t
+            .state
+            .db
+            .with(|c| db::list_messages(c, &t.main, None, 50))
+            .unwrap();
+        cards = msgs
+            .into_iter()
+            .filter(|m| m.card.as_ref().is_some_and(|c| c["state"] == "pending"))
+            .collect();
+        if cards.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(cards.len(), 2);
+    for c in &cards {
+        t.decide(&c.id, true);
+    }
+    for c in calls {
+        c.await.unwrap();
+    }
+    assert_eq!(t.calls_log().matches("send_message").count(), 1);
+}
+
+#[tokio::test]
+async fn connector_diagnostics_never_show_its_secrets() {
+    let t = setup(|_| {});
+    // A program that prints its secret and dies.
+    let env = crate::server::seal_connector_secrets(
+        &t.state,
+        "leaky",
+        "env",
+        &BTreeMap::from([("LEAK".to_string(), "hunter2-secret".to_string())]),
+    )
+    .unwrap();
+    let cfg = entities::ConnectorConfig {
+        command: Some("/bin/sh".into()),
+        args: vec!["-c".into(), "echo \"oops $LEAK\" >&2; exit 3".into()],
+        env,
+        ..Default::default()
+    };
+    t.state
+        .db
+        .with(|c| entities::insert_connector(c, "leaky", "leaky", "", "stdio", &cfg, true))
+        .unwrap();
+    let con = t
+        .state
+        .db
+        .with(|c| entities::get_connector(c, "leaky"))
+        .unwrap()
+        .unwrap();
+    let err = describe_tools(&t.state, &con).await.unwrap_err();
+    assert!(!err.contains("hunter2"), "{err}");
+    let detail = t.state.gateway.last_error("leaky").unwrap_or_default();
+    assert!(!detail.contains("hunter2"), "{detail}");
+    let listed = list_tools(&t.state, &con).await.unwrap_err();
+    assert!(!listed.contains("hunter2"), "{listed}");
+}
+
+#[test]
+fn redacts_secret_values() {
+    assert_eq!(
+        redact("token=abcd1234 ok", &["abcd1234".into(), "ab".into()]),
+        "token=[hidden] ok"
+    );
+}

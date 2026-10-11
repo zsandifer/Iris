@@ -315,10 +315,13 @@ server's own hints, and the real arguments:
   new address) asks; once you approve someone, they are no longer new.
 
 Asking means Iris holds the call, posts an approval card built from the
-exact arguments (who, subject, the exact text, and the raw request if you
-want it), sends a push, and waits up to `safety.approval_timeout_secs`. On
-approve the held call runs unchanged; on deny, timeout, or when the turn
-ends, it never runs and the agent is told. Each connection's rules can be
+exact arguments (who, subject, the exact text, and the complete raw
+request), sends a push, and waits up to `safety.approval_timeout_secs`. On
+approve the held call runs unchanged, after Iris checks again that the
+connection is still on and allowed; on deny, timeout, when the turn ends,
+or when you pause Iris or turn the connection off, it never runs and the
+agent is told. Multi-purpose tools are judged by the operation they are
+asked to do, and an operation Iris can't place asks first. Each connection's rules can be
 changed in plain words (reads freely and asks before sending, buying, or
 deleting; asks before any change; only reads; asks every time), and each of
 its actions can be set to run, ask, or never. Purchases always ask.
@@ -328,8 +331,10 @@ one connection in an hour (all in `[safety]`) pauses that connection and
 notifies you with a Resume button. Every call is in the activity log
 (Settings, Activity log, Connected services).
 
-**Pause Iris** (Iris's computer) cancels whatever is running and starts
-nothing new (chats, check-ins, connection calls) until you resume.
+**Pause Iris** (Iris's computer) cancels whatever is running (including
+waiting approvals, and stops connection programs) and starts nothing new
+(chats, check-ins, connection calls) until you resume. A request already
+handed to a remote service before the pause cannot be recalled.
 **Disconnect everything** turns every connection off at once.
 
 **Signing in to services.** Connections that use OAuth (the MCP sign-in

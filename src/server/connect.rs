@@ -370,7 +370,7 @@ async fn safety_json(state: &AppState) -> Value {
         "trusted_recipients": state.trusted_recipients().await,
         "pending_approvals": state.gateway.pending_count(),
         "limits": {
-            "approval_timeout_secs": s.approval_timeout_secs,
+            "approval_timeout_secs": state.cfg.approval_timeout_secs(),
             "max_sends_per_hour": s.max_sends_per_hour,
             "max_calls_per_hour": s.max_calls_per_hour,
             "max_read_mb_per_hour": s.max_read_mb_per_hour,
@@ -445,6 +445,10 @@ pub async fn set_paused(state: &AppState, paused: bool) -> Result<(), ApiError> 
             crate::turn::cancel(state, conv);
         }
         crate::gateway::cancel_all_grants(state);
+        crate::gateway::cancel_approvals(state, None);
+        // Stop connector programs too, so nothing already sent to them
+        // keeps running.
+        crate::gateway::stop_all(state).await;
     }
     if was != paused {
         crate::warn!(
@@ -508,15 +512,24 @@ async fn put_key(
 ) -> ApiResult {
     user.require_owner()?;
     known_engine(&state, &name)?;
-    crate::keys::set(&state, &name, &env, &body.value)
-        .await
-        .map_err(ApiError::bad_request)?;
-    // Engines turned off in config are never run, not even to check.
+    let value = crate::keys::check(&name, &env, &body.value).map_err(ApiError::bad_request)?;
+    // Check the candidate before it replaces anything; engines turned off
+    // in config are never run, not even to check.
     let auth = if state.harness(&name).is_some_and(|e| e.cfg.enabled) {
-        crate::keys::verify(&state, &name, &env).await
+        crate::keys::verify(&state, &name, &env, &value).await
     } else {
         crate::harness::AuthState::Unknown
     };
+    // A refused key is not kept (a working saved key stays as it was).
+    if auth != crate::harness::AuthState::AuthRequired {
+        crate::keys::set(&state, &name, &env, &value)
+            .await
+            .map_err(ApiError::bad_request)?;
+        if auth == crate::harness::AuthState::Ok {
+            state.note_auth(&name, auth, None).await;
+        }
+        state.probe_auth(&name).await;
+    }
     let mut v = crate::keys::list_json(&state, &name).await;
     v["auth"] = serde_json::to_value(auth).unwrap_or(Value::Null);
     ok(v)
@@ -550,6 +563,9 @@ mod tests {
     #[derive(Default)]
     struct Provider {
         base: String,
+        /// Issue a long-lived token, then refuse it on tool calls (a token
+        /// revoked early): Iris must refresh and retry.
+        strict: bool,
         challenge: Option<String>,
         refreshed: bool,
         last_auth: Option<String>,
@@ -573,7 +589,10 @@ mod tests {
                 .map(String::from);
             let base = p.lock().unwrap().base.clone();
             p.lock().unwrap().last_auth = auth.clone();
-            if !matches!(auth.as_deref(), Some("Bearer at-1" | "Bearer at-2")) {
+            let strict = p.lock().unwrap().strict;
+            let revoked =
+                strict && auth.as_deref() == Some("Bearer at-1") && body.contains("tools/call");
+            if revoked || !matches!(auth.as_deref(), Some("Bearer at-1" | "Bearer at-2")) {
                 let mut r = (StatusCode::UNAUTHORIZED, "").into_response();
                 r.headers_mut().insert(
                     "www-authenticate",
@@ -639,8 +658,9 @@ mod tests {
                                 && g.challenge.as_deref()
                                     == Some(crate::oauth::pkce_challenge(&verifier).as_str());
                             if ok {
+                                let life = if g.strict { 3600 } else { 1 };
                                 axum::Json(json!({"access_token": "at-1", "refresh_token": "rt-1",
-                                                  "expires_in": 1, "token_type": "Bearer"}))
+                                                  "expires_in": life, "token_type": "Bearer"}))
                                 .into_response()
                             } else {
                                 (
@@ -701,7 +721,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_connector_signs_in_with_discovery_dcr_pkce_and_refresh() {
+        oauth_flow(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_refused_early_is_refreshed_and_the_call_retried() {
+        oauth_flow(true).await;
+    }
+
+    async fn oauth_flow(strict: bool) {
         let provider = fake_provider().await;
+        provider.lock().unwrap().strict = strict;
         let base = provider.lock().unwrap().base.clone();
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths {
@@ -848,9 +878,22 @@ mod tests {
         )
         .await;
         assert_eq!(r["result"]["content"][0]["text"], "3 unread", "{r}");
-        let p = provider.lock().unwrap();
-        assert!(p.refreshed);
-        assert_eq!(p.last_auth.as_deref(), Some("Bearer at-2"));
+        {
+            let p = provider.lock().unwrap();
+            assert!(p.refreshed);
+            assert_eq!(p.last_auth.as_deref(), Some("Bearer at-2"));
+        }
+        // Recovered without asking the owner to sign in again.
+        let (_, b) = send(&app, "GET", "/api/connectors", &token, None).await;
+        let list: Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(list["connectors"][0]["auth_state"], "ok");
+        let reconnect = state
+            .db
+            .with(|c| crate::db::list_messages(c, &main, None, 50))
+            .unwrap()
+            .into_iter()
+            .any(|m| m.card.is_some_and(|c| c["type"] == "connector_reconnect"));
+        assert!(!reconnect);
     }
 
     struct App {
@@ -1169,5 +1212,101 @@ mod tests {
         .await;
         assert_eq!(v["removed"], true);
         assert!(crate::keys::env_for(&a.state, "gemini").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn engine_keys_are_checked_before_they_are_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A stand-in Gemini CLI that accepts only "good-key".
+        let cli = tmp.path().join("fake-gemini");
+        let seen = tmp.path().join("seen");
+        std::fs::write(
+            &cli,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 0.0.0; exit 0; fi\ncat >/dev/null\n\
+                 echo \"$GEMINI_API_KEY\" >> {}\n\
+                 if [ \"$GEMINI_API_KEY\" = good-key ]; then echo '{{\"type\":\"result\",\"status\":\"success\"}}'; \
+                 else echo '{{\"type\":\"result\",\"status\":\"error\",\"error\":{{\"message\":\"API key not valid. Please pass a valid API key.\"}}}}'; exit 1; fi\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let paths = Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let db = crate::db::Db::open(&paths.db_file()).unwrap();
+        let mut cfg = Config::default();
+        for (name, h) in cfg.harness.iter_mut() {
+            h.enabled = name == "gemini";
+        }
+        cfg.harness.get_mut("gemini").unwrap().command = cli.to_string_lossy().into_owned();
+        cfg.push.enabled = false;
+        let state = AppState::new(cfg, paths, db).unwrap();
+        state.refresh_harnesses().await;
+        let a = App {
+            app: super::super::router(state.clone()),
+            token: {
+                let owner = state.db.with(crate::db::owner_user_id).unwrap().unwrap();
+                let code = state
+                    .db
+                    .with(|c| Ok(crate::auth::create_pairing_code(c, &owner)))
+                    .unwrap()
+                    .unwrap()
+                    .0;
+                let app = super::super::router(state.clone());
+                let (_, b) = send(&app, "POST", "/api/pair", "", Some(json!({"code": code}))).await;
+                serde_json::from_str::<Value>(&b).unwrap()["token"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            },
+            state,
+            _tmp: tmp,
+        };
+        let put = |v: &str| json!({"value": v});
+        let (_, v) = call(
+            &a,
+            "PUT",
+            "/api/harnesses/gemini/keys/GEMINI_API_KEY",
+            Some(put("bad-key")),
+        )
+        .await;
+        assert_eq!(v["auth"], "auth_required", "{v}");
+        assert_eq!(v["keys"], json!([]), "a refused key is not kept");
+        let (_, v) = call(
+            &a,
+            "PUT",
+            "/api/harnesses/gemini/keys/GEMINI_API_KEY",
+            Some(put("good-key")),
+        )
+        .await;
+        assert_eq!(v["auth"], "ok", "{v}");
+        assert_eq!(v["keys"][0]["env"], "GEMINI_API_KEY");
+        assert_eq!(
+            a.state.harness("gemini").unwrap().status().auth,
+            crate::harness::AuthState::Ok
+        );
+        // A bad replacement leaves the working key in place.
+        let (_, v) = call(
+            &a,
+            "PUT",
+            "/api/harnesses/gemini/keys/GEMINI_API_KEY",
+            Some(put("typo-key")),
+        )
+        .await;
+        assert_eq!(v["auth"], "auth_required");
+        assert_eq!(
+            crate::keys::env_for(&a.state, "gemini").await,
+            [("GEMINI_API_KEY".to_string(), "good-key".to_string())]
+        );
+        let seen = std::fs::read_to_string(a._tmp.path().join("seen")).unwrap();
+        assert_eq!(
+            seen.lines().collect::<Vec<_>>(),
+            ["bad-key", "good-key", "typo-key"]
+        );
     }
 }
