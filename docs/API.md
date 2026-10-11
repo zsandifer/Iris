@@ -1534,7 +1534,7 @@ starting). Returns `{"browser":
 Install (or update) Chromium for Iris, like
 [`POST /api/engines/browser/install`](#post-apienginesnameinstall-post-apienginesnameupdate):
 the official `playwright-core` npm package, then its `install chromium` into
-`<engines dir>/browser/browsers`, linked as `<engines dir>/bin/browser`.
+`<engines dir>/chromium/browsers`, linked as `<engines dir>/bin/browser`.
 Needs Node.js. Returns `{"started": bool, "browser": {BrowserStatus}}`;
 progress arrives as `browser.state`. If Chromium then fails to start for
 missing system libraries, `error` says so; the fix needs root once on the
@@ -1692,8 +1692,10 @@ image:
 | `navigate` | `url` | Open an http(s) page (as `POST /api/browser/navigate`). |
 
 Input from a device that does not have control, or a failed input, gets
-`{"type": "browser.input_error", "message": "..."}`. Typed text is never
-logged.
+`{"type": "browser.input_error", "message": "..."}`. Input is carried out in
+order on its own task, so a slow page never holds up the socket's frames or
+events (at most 64 inputs wait; more are refused with that error). Typed
+text is never logged.
 
 ### Keepalive and revocation
 
@@ -2487,10 +2489,15 @@ whitespace, cutting long values, or quoting, so no escaped or partial copy
 survives; its URL-encoded forms are covered too, and a line that still
 holds a secret once percent-decoded (an address in some other escaping)
 loses its query. Dialogs, the live title and address, and approval cards
-are redacted the same way. `screenshot` never shows a page Iris filled a
-secret into (a page could paint it where no text check sees), and refuses
-on any other page whose text or unmasked fields (open shadow roots too)
-show one. Saved secrets shorter than 3 characters are not filled (they
+are redacted the same way; card numbers are found in any grouping
+("3782 822463 10005"), and escapes in UTF-8 or Latin-1, in any letter case.
+The owner's saved passwords and card numbers are known to the redactor
+from the start (a page may show one it kept from an earlier session).
+`screenshot` never shows a site (origin) Iris ever filled a secret into
+(the list is kept on disk in `<data dir>/browser/tainted-origins.json`;
+a page could keep the value and paint it where no text check sees), and
+refuses on any other page whose text or unmasked fields (open shadow roots
+too) show a secret. Saved secrets shorter than 3 characters are not filled (they
 could not be told apart from ordinary text).
 
 Each call waits while the owner has taken over, and checks again once it
@@ -2498,7 +2505,8 @@ holds the page and right before every command that changes the page, so a
 queued or slow call never acts under the owner's control. When the turn
 ends (finished, cancelled, or failed), its calls stop at once, even in the
 middle of a wait, and nothing more is done for it. Codex gets a 180 s tool
-timeout for this server (its default is 60 s).
+timeout for this server (its default is 60 s); OpenCode gets the same
+(`timeout: 180000`).
 
 `fill_login` takes the saved login whose `site` matches the current page's
 host (a subdomain matches too; the most recently used wins), finds the

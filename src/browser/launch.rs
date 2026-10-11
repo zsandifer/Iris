@@ -485,6 +485,56 @@ mod tests {
         assert_eq!(v["autofill"]["credit_card_enabled"], false);
     }
 
+    /// A stand-in browser whose sandbox cannot start; records its args.
+    fn fake_browser(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("fake-chrome");
+        let log = dir.join("args.log");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$*\" in *--no-sandbox*) echo '[1:1:FATAL:x.cc] crashed for another reason' >&2; exit 1;; esac\necho '[1:1:FATAL:zygote_host_impl_linux.cc(128)] No usable sandbox!' >&2\nexit 1\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[tokio::test]
+    async fn never_drops_the_sandbox_without_consent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = fake_browser(tmp.path());
+        let opts = |allow| LaunchOptions {
+            program: &bin,
+            profile_dir: tmp.path(),
+            tmp_dir: tmp.path(),
+            width: 500,
+            height: 1000,
+            scale: 2.0,
+            allow_no_sandbox: allow,
+        };
+        let err = launch(&opts(false)).await.err().unwrap().to_string();
+        assert_eq!(err, SANDBOX_UNAVAILABLE);
+        let log = std::fs::read_to_string(tmp.path().join("args.log")).unwrap();
+        assert!(!log.contains("--no-sandbox"), "{log}");
+        // With the owner's OK it retries without, and reports that failure.
+        let err = launch(&opts(true)).await.err().unwrap().to_string();
+        assert!(err.contains("another reason"), "{err}");
+        let log = std::fs::read_to_string(tmp.path().join("args.log")).unwrap();
+        assert!(
+            log.lines().last().unwrap().contains("--no-sandbox"),
+            "{log}"
+        );
+        assert!(
+            log.lines()
+                .next()
+                .unwrap()
+                .contains("--remote-debugging-pipe")
+        );
+    }
+
     #[test]
     fn explains_launch_failures() {
         let missing = "chrome: error while loading shared libraries: libnss3.so: cannot open shared object file";

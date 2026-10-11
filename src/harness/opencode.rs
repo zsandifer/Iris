@@ -72,6 +72,17 @@ pub fn mcp_config(servers: &[super::McpServer]) -> Value {
                 json!({"type": "remote", "url": url, "headers": headers, "enabled": true})
             }
         };
+        let mut v = v;
+        // Iris's browser tools may wait for the owner (take-over, card
+        // approval) longer than the usual request timeout.
+        if [
+            crate::browser::tools::SERVER,
+            crate::browser::tools::SERVER_ALT,
+        ]
+        .contains(&s.name.as_str())
+        {
+            v["timeout"] = 180_000.into();
+        }
         map.insert(s.name.clone(), v);
     }
     Value::Object(map)

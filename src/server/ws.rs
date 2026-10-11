@@ -130,6 +130,10 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
     let mut ticks: u32 = 0;
     let is_owner = user.user.is_owner;
     let mut watching: Option<Watching> = None;
+    // Owner input runs in order on its own task, so a slow page never
+    // stalls this socket's live view or events.
+    let (input_err_tx, mut input_err) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mut input_tx: Option<tokio::sync::mpsc::Sender<Value>> = None;
     loop {
         let due = watching.as_ref().filter(|w| w.pending).map(Watching::due);
         tokio::select! {
@@ -153,10 +157,25 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
                                     });
                                 None
                             }
-                            "browser.input" => match state.browser.user_input(&user.device.id, &v).await {
-                                Ok(()) => None,
-                                Err(e) => Some(json!({"type": "browser.input_error", "message": e.to_string()})),
-                            },
+                            "browser.input" => {
+                                let tx = input_tx.get_or_insert_with(|| {
+                                    let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(64);
+                                    let (st, dev, errs) = (state.clone(), user.device.id.clone(), input_err_tx.clone());
+                                    tokio::spawn(async move {
+                                        while let Some(ev) = rx.recv().await {
+                                            if let Err(e) = st.browser.user_input(&dev, &ev).await {
+                                                let _ = errs.send(e.to_string());
+                                            }
+                                        }
+                                    });
+                                    tx
+                                });
+                                match tx.try_send(v) {
+                                    Ok(()) => None,
+                                    Err(_) => Some(json!({"type": "browser.input_error",
+                                        "message": "the browser is busy; try again in a moment"})),
+                                }
+                            }
                             _ => None,
                         };
                         if let Some(r) = reply && !send_json(&mut socket, &r).await {
@@ -176,6 +195,11 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
                 match (changed, watching.as_mut()) {
                     (Ok(()), Some(w)) => w.pending = true,
                     _ => watching = None,
+                }
+            }
+            Some(msg) = input_err.recv() => {
+                if !send_json(&mut socket, &json!({"type": "browser.input_error", "message": msg})).await {
+                    break;
                 }
             }
             _ = async {

@@ -19,7 +19,7 @@ const TRICKY: &str = concat!(
     "0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-",
     "0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-",
     "0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-",
-    "end"
+    "end-päss-ü"
 );
 const CARD: &str = "4242424242424242";
 const CVC: &str = "987";
@@ -67,10 +67,12 @@ const TRICKY_PAGE: &str = r#"<!doctype html><html><head><title>Tricky</title></h
 <input name="email" type="email" autocomplete="username" aria-label="Email">
 <input id="pw" name="password" type="password" aria-label="Password"
   onfocus="queueMicrotask(() => document.getElementById('other').focus())"
-  oninput="document.title = 'Hi ' + this.value; document.getElementById('mirror').value = this.value">
+  oninput="document.title = 'Hi ' + this.value; document.getElementById('mirror').value = this.value;
+           document.getElementById('esc').textContent = encodeURIComponent(this.value).replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase())">
 <input id="other" aria-label="Other">
 <label>Mirror <input id="mirror"></label>
 <button type="submit">Go</button>
+<p id="esc"></p>
 <button type="button" onclick="pw.type = 'text'; pw.style.removeProperty('-webkit-text-security')">Reveal</button>
 <input name="cardnumber" autocomplete="cc-number" aria-label="Card number">
 </form></body></html>"#;
@@ -651,7 +653,7 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
     assert_eq!(probe("document.getElementById('other').value").await, "");
     assert_eq!(
         probe("document.getElementById('pw').value.length").await,
-        TRICKY.len()
+        TRICKY.chars().count()
     );
     // Snapshot and title: the long, quoted secret never shows, not even cut.
     let snap = call("snapshot", json!({})).await;
@@ -686,10 +688,35 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
     let snap = call("snapshot", json!({})).await;
     let go = ref_of(&snap.text, "button \"Go\"");
     let after = call("click", json!({"ref": go})).await;
-    assert!(after.text.contains("password=••••"), "{}", after.text);
+    assert!(
+        after.text.contains("tricky?••••") || after.text.contains("password=••••"),
+        "{}",
+        after.text
+    );
     outputs.push(after.text);
     let status = state.browser.state_json().to_string();
     assert!(!leaks(&status), "{status}");
+    // Another page of the same site: still no screenshots there.
+    let shot = call("screenshot", json!({})).await;
+    assert!(shot.is_error && shot.image.is_none(), "{}", shot.text);
+    // Ordinary typing goes to the requested field even when a focus
+    // handler tries to move focus elsewhere.
+    let snap = call("snapshot", json!({})).await;
+    outputs.push(snap.text.clone());
+    let pw = ref_of(&snap.text, "password field \"Password\"");
+    let out = call("type", json!({"ref": pw, "text": "hello"})).await;
+    assert_eq!(out.text, "Typed it.");
+    let run = state.browser.running().unwrap();
+    let other = run
+        .cdp
+        .call(
+            "Runtime.evaluate",
+            json!({"expression": "document.getElementById('other').value + '|' + document.getElementById('pw').value", "returnByValue": true}),
+            Some(&run.page().session_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(other["result"]["value"], "|hello");
     for o in &outputs {
         assert!(!leaks(o), "{o}");
     }

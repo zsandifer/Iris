@@ -42,16 +42,27 @@ if (!globalThis.__iris) {
       }
       secrets = [...all].filter((x) => x.length >= 3).sort((a, b) => b.length - a.length);
     };
-    const decodeLoose = (s) => s.replace(/\+/g, ' ')
-      .replace(/%[0-9a-f]{2}/gi, (m) => { try { return decodeURIComponent(m); } catch { return m; } });
+    // Percent-decoding that never throws: runs of escapes are decoded
+    // together (multi-byte UTF-8, any letter case); bad runs byte by byte.
+    // Pages in legacy encodings escape bytes as Latin-1 (ä as %E4).
+    const decodeLoose = (s) => s.replace(/\+/g, ' ').replace(/(%[0-9a-f]{2})+/gi, (run) => {
+      try { return decodeURIComponent(run); } catch {
+        return run.replace(/%([0-9a-f]{2})/gi, (m, h) => String.fromCharCode(parseInt(h, 16)));
+      }
+    });
+    // Card numbers in any grouping ("3782 822463 10005", "4242-4242-...").
+    const digitRes = () => secrets.filter((x) => /^\d{12,19}$/.test(x))
+      .map((x) => new RegExp(x.split('').join('[\\s.\\u00a0-]*'), 'g'));
+    const leaks = (t) => secrets.some((x) => t.includes(x)) || digitRes().some((r) => { r.lastIndex = 0; return r.test(t); });
     const redact = (s) => {
       let out = String(s ?? '');
       for (const x of secrets) if (out.includes(x)) out = out.split(x).join('••••');
+      for (const r of digitRes()) out = out.replace(r, '••••');
       // Still there once percent-decoded (an address in another escaping):
-      // drop the query, or the whole piece.
-      if (secrets.length && secrets.some((x) => decodeLoose(out).includes(x))) {
+      // drop the query, or the whole piece if the rest still shows it.
+      if (secrets.length && leaks(decodeLoose(out))) {
         const q = out.indexOf('?');
-        out = q >= 0 ? out.slice(0, q) + '?••••' : '••••';
+        out = q >= 0 && !leaks(decodeLoose(out.slice(0, q))) ? out.slice(0, q) + '?••••' : '••••';
       }
       return out;
     };
@@ -297,8 +308,8 @@ if (!globalThis.__iris) {
 
     // The element really has focus, in its document and every frame up.
     function focused(e) {
-      const active = e.ownerDocument.activeElement;
-      if (!(active === e || e.contains(active))) return false;
+      // :focus also works inside shadow roots.
+      if (!(e.matches(':focus') || e.matches(':focus-within'))) return false;
       let win = e.ownerDocument.defaultView;
       while (win && win.frameElement) {
         const fe = win.frameElement;
@@ -336,6 +347,29 @@ if (!globalThis.__iris) {
       // count as filled.
       const digits = /^\d+$/.test(value) && e.value.replace(/\D/g, '') === value;
       return { ok: e.value === value || digits };
+    }
+
+    // The type tool: replace an input's or textarea's text on that exact
+    // element in one step (no ambient focus a page could redirect).
+    // Rich editors (contenteditable) are focused and typed into instead.
+    function setText(ref, value) {
+      const e = el(ref);
+      if (!e) return { error: 'stale' };
+      const t = e.tagName.toLowerCase();
+      if (t === 'select') return { error: 'select' };
+      if (t === 'input' || t === 'textarea') {
+        if (e.disabled || e.readOnly) return { error: 'hidden' };
+        e.scrollIntoView({ block: 'center', behavior: 'instant' });
+        e.focus();
+        const proto = t === 'input' ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+        setter.call(e, value);
+        e.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+        e.dispatchEvent(new Event('change', { bubbles: true }));
+        return { ok: true, set: true };
+      }
+      const f = focus(ref);
+      return f.error ? f : { ok: f.ok, set: false };
     }
 
     // The field shows dots right now (its type or style may have changed
@@ -450,7 +484,7 @@ if (!globalThis.__iris) {
       return docs().some((d) => (d.body ? d.body.innerText : '').toLowerCase().includes(want));
     }
 
-    return { snapshot, point, focus, choose, loginFields, cardFields, fillField, pageText, hasText, setSecrets,
+    return { snapshot, point, focus, setText, choose, loginFields, cardFields, fillField, pageText, hasText, setSecrets,
       info: () => ({ url: location.href, title: document.title, origin: location.origin, doc }) };
   })();
 }

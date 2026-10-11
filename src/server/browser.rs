@@ -133,6 +133,8 @@ async fn sandbox(
 ) -> ApiResult {
     user.require_owner()?;
     let allow = body.allow_without;
+    // Saved and live choice change together, in request order.
+    let _switch = state.browser.switch_lock.lock().await;
     state
         .db
         .call(move |c| {

@@ -82,6 +82,7 @@ pub fn secure_enough(scheme: &str, host: &str) -> bool {
 struct Pin {
     target: String,
     doc: String,
+    origin: String,
 }
 
 struct PageInfo {
@@ -170,6 +171,7 @@ async fn type_into(
         }
         run.remember_secret(text);
         run.remember_secret_doc(&pin.doc);
+        b.taint_origin(&pin.origin);
     }
     // Checked again right before the single command that fills.
     let p = eval_mut(
@@ -216,6 +218,40 @@ fn not_found_for(e: crate::util::BoxError) -> Result<Output> {
         Ok(Output::text(format!("not found ({msg})")))
     } else {
         Err(e)
+    }
+}
+
+/// Load every saved secret of the user for redaction (never filled or
+/// returned from here).
+pub async fn seed_secrets(state: &AppState, user_id: &str, run: &Running) {
+    let uid = user_id.to_string();
+    let rows = state
+        .db
+        .call(move |c| {
+            let list = entities::list_credentials(c, &uid)?;
+            let mut out = Vec::new();
+            for cred in list {
+                if let Some(ct) = entities::get_credential_ciphertext(c, &uid, &cred.id)? {
+                    out.push((cred.id, ct));
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .unwrap_or_default();
+    for (id, ct) in rows {
+        let Ok(plain) = state.vault.decrypt(&ct, &id) else {
+            continue;
+        };
+        let fields: serde_json::Map<String, Value> =
+            serde_json::from_slice(&plain).unwrap_or_default();
+        // Not CVCs: three digits are too common in ordinary text to hide on
+        // every page; a CVC is redacted once Iris fills it.
+        for k in ["password", "number"] {
+            if let Some(v) = fields.get(k).and_then(Value::as_str) {
+                run.remember_secret(v);
+            }
+        }
     }
 }
 
@@ -269,6 +305,7 @@ pub async fn login(
     let pin = Pin {
         target: pinned_target,
         doc: page.doc,
+        origin: page.origin,
     };
     let fields = eval(run, "loginFields()").await?;
     let (user_ref, pass_ref) = (fields["user"].as_str(), fields["pass"].as_str());
@@ -496,6 +533,7 @@ pub async fn card(
     let pin = Pin {
         target: pinned_target,
         doc: page.doc.clone(),
+        origin: page.origin.clone(),
     };
     let number = secret
         .get("number")

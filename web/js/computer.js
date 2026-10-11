@@ -202,7 +202,7 @@ function Viewer({ control }) {
     </div>
     ${driving && html`<div class="vw-bar">
       <button class="vw-btn" aria-label="Back" onClick=${() => input({ kind: 'back' })}><${Icon} name="back" size=${18} /></button>
-      <form class="vw-url" onSubmit=${go2}><input type="url" inputmode="url" autocapitalize="off" autocomplete="off" spellcheck=${false}
+      <form class="vw-url" onSubmit=${go2}><input type="text" inputmode="url" autocapitalize="off" autocomplete="off" spellcheck=${false}
         placeholder="Go to a website" value=${url} onInput=${(e) => setUrl(e.target.value)} aria-label="Web address" /></form>
       <button class="vw-btn" aria-label="Type" onClick=${keyboard}><${Icon} name="keyboard" size=${20} /></button>
       <input ref=${kb} class="vw-kb" aria-label="Type into the page" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck=${false}

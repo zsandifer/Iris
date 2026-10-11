@@ -115,6 +115,12 @@ async fn put_settings(
             (!p.trim().is_empty()).then(|| p.trim().to_string()),
         ));
     }
+    // Pause changes are ordered: the saved value and the live state always
+    // end up the same, whatever requests overlap.
+    let _switch = match body.paused {
+        Some(_) => Some(state.browser.switch_lock.lock().await),
+        None => None,
+    };
     state
         .db
         .call(move |c| {
@@ -132,7 +138,11 @@ async fn put_settings(
     {
         crate::info!("owner {} Iris", if p { "paused" } else { "resumed" });
         if p {
-            // Stop running turns (their CLI process groups are killed).
+            // Flag first, so a turn starting right now sees it; then stop
+            // every running turn (their CLI process groups are killed) and
+            // end their browser work at once.
+            state.browser.init_paused(true);
+            state.browser.end_turns(None);
             for tx in state
                 .running
                 .lock()

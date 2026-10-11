@@ -242,6 +242,10 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Ou
     if let Err(e) = b.check_agent(&ctx) {
         return Output::error(e.to_string());
     }
+    // Pages may show a secret kept from an earlier session: know them all.
+    if !run.seeded.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        super::fill::seed_secrets(state, &ctx.user_id, &run).await;
+    }
     b.set_busy(true);
     let started = std::time::Instant::now();
     // An ended turn stops its tool at once (and frees the page).
@@ -296,7 +300,7 @@ async fn run_tool(
         }
         "snapshot" => snapshot(run).await,
         "click" => {
-            let p = eval(run, &format!("point({})", json!(arg("ref")))).await?;
+            let p = eval_mut(run, b, ctx, &format!("point({})", json!(arg("ref")))).await?;
             if let Some(e) = p["error"].as_str() {
                 return Ok(Output::error(stale_message(e)));
             }
@@ -305,8 +309,7 @@ async fn run_tool(
                 p["y"].as_f64().unwrap_or(0.0),
             );
             let events = cdp.subscribe();
-            b.check_agent(ctx)?;
-            click_at(cdp, s, x, y).await?;
+            click_at(cdp, s, x, y, &|| b.check_agent(ctx)).await?;
             settle(events, &page, Duration::from_millis(600)).await;
             let mut out = snapshot(run).await?;
             if let Some(c) = p["covered"].as_str() {
@@ -324,7 +327,15 @@ async fn run_tool(
                     "That text is too long to type (5000 characters max).",
                 ));
             }
-            let f = eval(run, &format!("focus({})", json!(arg("ref")))).await?;
+            // Inputs and text areas get the text on that exact element in
+            // one step; rich editors are focused and typed into.
+            let f = eval_mut(
+                run,
+                b,
+                ctx,
+                &format!("setText({}, {})", json!(arg("ref")), json!(text)),
+            )
+            .await?;
             if let Some(e) = f["error"].as_str() {
                 return Ok(Output::error(if e == "select" {
                     "That is a dropdown; use select_option.".into()
@@ -338,13 +349,14 @@ async fn run_tool(
                      a new snapshot.",
                 ));
             }
-            b.check_agent(ctx)?;
-            cdp.call("Input.insertText", json!({"text": text}), s)
-                .await?;
+            if f["set"] != true {
+                b.check_agent(ctx)?;
+                cdp.call("Input.insertText", json!({"text": text}), s)
+                    .await?;
+            }
             if a["submit"].as_bool().unwrap_or(false) {
                 let events = cdp.subscribe();
-                b.check_agent(ctx)?;
-                press_key(cdp, s, "Enter").await?;
+                press_key(cdp, s, "Enter", &|| b.check_agent(ctx)).await?;
                 settle(events, &page, Duration::from_millis(800)).await;
                 return snapshot(run).await;
             }
@@ -374,7 +386,7 @@ async fn run_tool(
         }
         "press_key" => {
             let events = cdp.subscribe();
-            press_key(cdp, s, arg("key")).await?;
+            press_key(cdp, s, arg("key"), &|| b.check_agent(ctx)).await?;
             settle(events, &page, Duration::from_millis(500)).await;
             snapshot(run).await
         }
@@ -382,6 +394,7 @@ async fn run_tool(
             let pages = a["pages"].as_f64().unwrap_or(1.0).clamp(0.1, 10.0);
             let dy =
                 pages * VIEW_H as f64 * 0.8 * if arg("direction") == "up" { -1.0 } else { 1.0 };
+            b.check_agent(ctx)?;
             cdp.call(
                 "Input.dispatchMouseEvent",
                 json!({"type": "mouseWheel", "x": 200, "y": 400, "deltaX": 0, "deltaY": dy}),
@@ -406,10 +419,12 @@ async fn run_tool(
             // Text can be redacted, pixels cannot: no picture while the page
             // shows a secret Iris filled (outside the masked fields).
             let info = eval(run, "info()").await?;
-            if run.has_secret_doc(info["doc"].as_str().unwrap_or("")) {
+            if run.has_secret_doc(info["doc"].as_str().unwrap_or(""))
+                || b.is_tainted(info["origin"].as_str().unwrap_or(""))
+            {
                 return Ok(Output::error(
-                    "No screenshot of this page: Iris filled saved sign-in or card details \
-                     here. Use snapshot instead.",
+                    "No screenshots of this site: Iris has filled saved sign-in or card details \
+                     on it. Use snapshot instead.",
                 ));
             }
             let shown = eval(run, "pageText()").await?;
@@ -683,13 +698,24 @@ pub async fn snapshot(run: &Running) -> Result<Output> {
     Ok(Output::text(text))
 }
 
-pub async fn click_at(cdp: &Cdp, s: Option<&str>, x: f64, y: f64) -> Result<()> {
+/// `guard` runs before each input command (the agent's calls stop the
+/// moment the owner takes over or the turn ends; a press is always
+/// followed by its release).
+pub async fn click_at(
+    cdp: &Cdp,
+    s: Option<&str>,
+    x: f64,
+    y: f64,
+    guard: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<()> {
+    guard()?;
     cdp.call(
         "Input.dispatchMouseEvent",
         json!({"type": "mouseMoved", "x": x, "y": y}),
         s,
     )
     .await?;
+    guard()?;
     for t in ["mousePressed", "mouseReleased"] {
         cdp.call(
             "Input.dispatchMouseEvent",
@@ -722,7 +748,13 @@ fn key_info(key: &str) -> Option<(&'static str, &'static str, i64, &'static str)
     })
 }
 
-pub async fn press_key(cdp: &Cdp, s: Option<&str>, key: &str) -> Result<()> {
+pub async fn press_key(
+    cdp: &Cdp,
+    s: Option<&str>,
+    key: &str,
+    guard: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<()> {
+    guard()?;
     if let Some((k, code, vk, text)) = key_info(key) {
         let mut down = json!({"type": if text.is_empty() { "rawKeyDown" } else { "keyDown" },
             "key": k, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk});

@@ -192,11 +192,50 @@ pub struct Running {
     secret_docs: Mutex<std::collections::HashSet<String>>,
     /// Serializes recovering from a closed tab.
     recover_lock: tokio::sync::Mutex<()>,
+    /// The owner's saved secrets were loaded for redaction (a page may show
+    /// one it kept from an earlier session).
+    pub(crate) seeded: AtomicBool,
 }
 
 /// Shortest secret Iris fills: shorter ones could not be told apart from
 /// ordinary text when redacting, so Iris will not fill them.
 pub const MIN_SECRET: usize = 3;
+
+fn is_card_number(s: &str) -> bool {
+    (12..=19).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Replace `digits` written with any separators between them (spaces,
+/// dashes, dots); also says whether anything was replaced.
+fn redact_digit_run(text: &str, digits: &str) -> (String, bool) {
+    let want: Vec<char> = digits.chars().collect();
+    let chars: Vec<char> = text.chars().collect();
+    let sep = |c: char| matches!(c, ' ' | '-' | '.' | '\u{a0}');
+    let mut out = String::with_capacity(text.len());
+    let (mut i, mut hit) = (0, false);
+    while i < chars.len() {
+        if chars[i] == want[0] {
+            let (mut j, mut k) = (i + 1, 1);
+            while k < want.len() && j < chars.len() {
+                if chars[j] == want[k] {
+                    k += 1;
+                } else if !sep(chars[j]) {
+                    break;
+                }
+                j += 1;
+            }
+            if k == want.len() {
+                out.push_str("••••");
+                hit = true;
+                i = j;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    (out, hit)
+}
 
 /// Percent-decoding that never fails (`+` as space; bad escapes kept).
 fn decode_loose(s: &str) -> String {
@@ -219,7 +258,11 @@ fn decode_loose(s: &str) -> String {
         }
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    match String::from_utf8(out) {
+        Ok(s) => s,
+        // Pages in legacy encodings escape bytes as Latin-1 (ä as %E4).
+        Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
+    }
 }
 
 /// Percent-encoding as JavaScript's `encodeURIComponent`.
@@ -265,15 +308,6 @@ impl Running {
         if folded.chars().count() >= 3 && folded != secret {
             forms.push(folded);
         }
-        if secret.len() >= 12 && secret.bytes().all(|b| b.is_ascii_digit()) {
-            let groups: Vec<&str> = secret
-                .as_bytes()
-                .chunks(4)
-                .map(|c| std::str::from_utf8(c).unwrap_or(""))
-                .collect();
-            forms.push(groups.join(" "));
-            forms.push(groups.join("-"));
-        }
         let mut s = lock(&self.secrets);
         for f in forms {
             if !s.contains(&f) {
@@ -298,22 +332,25 @@ impl Running {
                 out = out.replace(s.as_str(), "••••");
             }
         }
-        let leaks = |line: &str| {
-            let d = decode_loose(line);
-            secrets.iter().any(|s| d.contains(s.as_str()))
+        // Card numbers in any grouping ("3782 822463 10005").
+        for s in secrets.iter().filter(|s| is_card_number(s)) {
+            out = redact_digit_run(&out, s).0;
+        }
+        let leaks = |t: &str| {
+            let d = decode_loose(t);
+            secrets
+                .iter()
+                .any(|s| d.contains(s.as_str()) || (is_card_number(s) && redact_digit_run(&d, s).1))
         };
         if !out.lines().any(leaks) {
             return out;
         }
         out.split('\n')
-            .map(|line| {
-                if !leaks(line) {
-                    line.to_string()
-                } else if let Some(q) = line.find('?') {
-                    format!("{}?••••", &line[..q])
-                } else {
-                    "••••".to_string()
-                }
+            .map(|line| match line.find('?') {
+                _ if !leaks(line) => line.to_string(),
+                // Drop the query, unless what is left still shows it.
+                Some(q) if !leaks(&line[..q]) => format!("{}?••••", &line[..q]),
+                _ => "••••".to_string(),
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -341,9 +378,11 @@ impl Running {
     pub fn shows_secret(&self, text: &str) -> bool {
         let secrets = lock(&self.secrets);
         let decoded = decode_loose(text);
-        secrets
-            .iter()
-            .any(|s| text.contains(s.as_str()) || decoded.contains(s.as_str()))
+        secrets.iter().any(|s| {
+            [text, decoded.as_str()]
+                .iter()
+                .any(|t| t.contains(s.as_str()) || (is_card_number(s) && redact_digit_run(t, s).1))
+        })
     }
 }
 
@@ -383,6 +422,13 @@ pub struct Shared {
     allow_no_sandbox: AtomicBool,
     /// Chromium is being installed, updated, or removed.
     maintenance: AtomicBool,
+    /// Origins Iris ever filled a secret into (kept on disk; not secret).
+    /// The agent never gets screenshots of them: a page can keep a value
+    /// and paint it later, even after a restart.
+    tainted: Mutex<std::collections::HashSet<String>>,
+    tainted_file: PathBuf,
+    /// Orders changes of the saved safety switches (pause, sandbox).
+    pub switch_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -431,7 +477,45 @@ impl Browser {
             paused: AtomicBool::new(false),
             allow_no_sandbox: AtomicBool::new(false),
             maintenance: AtomicBool::new(false),
+            tainted: Mutex::new(
+                std::fs::read(dir.join("tainted-origins.json"))
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok())
+                    .unwrap_or_default(),
+            ),
+            tainted_file: dir.join("tainted-origins.json"),
+            switch_lock: tokio::sync::Mutex::new(()),
         }))
+    }
+
+    /// Remember that Iris filled a secret into `origin`.
+    pub fn taint_origin(&self, origin: &str) {
+        let list = {
+            let mut t = lock(&self.tainted);
+            if !t.insert(origin.to_string()) {
+                return;
+            }
+            serde_json::to_vec(&*t).unwrap_or_default()
+        };
+        if let Some(dir) = self.tainted_file.parent()
+            && crate::config::ensure_private_dir(dir).is_ok()
+        {
+            let _ = crate::config::write_private_file(&self.tainted_file, &list);
+        }
+    }
+
+    pub fn is_tainted(&self, origin: &str) -> bool {
+        lock(&self.tainted).contains(origin)
+    }
+
+    /// Stop/Pause: the turns of a conversation (or all) end now for the
+    /// browser, even before the CLI has exited.
+    pub fn end_turns(&self, conversation_id: Option<&str>) {
+        for t in lock(&self.turns).values() {
+            if conversation_id.is_none_or(|c| c == t.conversation_id) {
+                t.ended.send_replace(true);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -743,6 +827,7 @@ impl Browser {
             secrets: Mutex::default(),
             secret_docs: Mutex::default(),
             recover_lock: tokio::sync::Mutex::new(()),
+            seeded: AtomicBool::new(false),
         });
         let events = cdp.subscribe();
         cdp.call("Target.setDiscoverTargets", json!({"discover": true}), None)
@@ -799,8 +884,15 @@ impl Browser {
 
     /// Attach to a page target and make it the current tab.
     pub async fn attach(&self, run: &Running, target_id: &str) -> Result<()> {
+        self.attach_if(run, target_id, None).await
+    }
+
+    /// Attach, but only if the current tab is still `expect` (when given):
+    /// another path may already have switched tabs.
+    async fn attach_if(&self, run: &Running, target_id: &str, expect: Option<&str>) -> Result<()> {
         let _g = run.attach_lock.lock().await;
-        if run.page().target_id == target_id {
+        let current = run.page().target_id;
+        if current == target_id || expect.is_some_and(|e| e != current) {
             return Ok(());
         }
         let cdp = &run.cdp;
@@ -1048,7 +1140,7 @@ impl Browser {
                 .unwrap_or_default()
                 .to_string(),
         };
-        self.attach(run, &target).await
+        self.attach_if(run, &target, Some(gone)).await
     }
 
     fn on_frame(&self, run: &Arc<Running>, p: &Value, page: &PageRef) {
@@ -1233,7 +1325,7 @@ impl Browser {
                     frac("x").ok_or("x is required")? * w,
                     frac("y").ok_or("y is required")? * h,
                 );
-                tools::click_at(cdp, s, x, y).await?;
+                tools::click_at(cdp, s, x, y, &|| Ok(())).await?;
             }
             "scroll" => {
                 let x = frac("x").unwrap_or(0.5) * w;
@@ -1259,7 +1351,7 @@ impl Browser {
             }
             "key" => {
                 let key = ev["key"].as_str().unwrap_or("");
-                tools::press_key(cdp, s, key).await?;
+                tools::press_key(cdp, s, key, &|| Ok(())).await?;
             }
             "back" => {
                 tools::history_step(cdp, s, -1, || Ok(())).await?;
@@ -1374,6 +1466,7 @@ mod tests {
             secrets: Mutex::default(),
             secret_docs: Mutex::default(),
             recover_lock: tokio::sync::Mutex::new(()),
+            seeded: AtomicBool::new(false),
         };
         run.remember_secret("hunter2-long");
         run.remember_secret("4242424242424242");
@@ -1389,6 +1482,13 @@ mod tests {
         assert_eq!(out, "Page: x\nhttp://h/p?••••\nnext line");
         assert!(run.shows_secret("t?q=a%20b%2Bc%2Fd?e"));
         assert_eq!(decode_loose("a%2"), "a%2");
+        // Any card grouping, and a secret in an address path.
+        run.remember_secret("378282246310005");
+        assert_eq!(run.redact("Amex 3782 822463 10005."), "Amex ••••.");
+        run.remember_secret("pa/ss?word");
+        assert_eq!(run.redact("https://shop.test/pa%2fss%3fword?x=1"), "••••");
+        assert_eq!(decode_loose("p%c3%A4ss"), "päss");
+        assert_eq!(decode_loose("p%E4ss"), "päss");
         assert_eq!(decode_loose("%41+%zz"), "A %zz");
         // Shorter than MIN_SECRET is never remembered: such secrets are
         // never filled (fill.rs refuses them).

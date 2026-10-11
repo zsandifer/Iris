@@ -12,7 +12,7 @@
 //! - Iris's browser: Chromium as packaged by Playwright. The official
 //!   `playwright-core` npm package is installed (npm verifies it), then its
 //!   own `install chromium` command downloads Chromium from Playwright's
-//!   download servers into `<root>/browser/browsers`.
+//!   download servers into `<root>/chromium/browsers`.
 //!
 //! Everything lands in one engines directory (`<root>/<name>/...`, with
 //! launchers in `<root>/bin`) that Iris searches before PATH. Only engines
@@ -125,6 +125,17 @@ pub struct Report {
     pub changed: bool,
 }
 
+/// Where an engine's files live. The browser's are in `chromium/`, never
+/// `browser/`: with `engines.dir` set to the data directory that would be
+/// Iris's browser profile (sign-ins), which removing the browser must not
+/// touch.
+pub fn install_dir(root: &Path, name: &str) -> PathBuf {
+    match name {
+        "browser" => root.join("chromium"),
+        n => root.join(n),
+    }
+}
+
 pub fn bin_dir(root: &Path) -> PathBuf {
     root.join("bin")
 }
@@ -140,7 +151,7 @@ pub fn is_installed(root: &Path, name: &str) -> bool {
 
 /// Version recorded at install time.
 pub fn installed_version(root: &Path, name: &str) -> Option<String> {
-    std::fs::read_to_string(root.join(name).join("VERSION"))
+    std::fs::read_to_string(install_dir(root, name).join("VERSION"))
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -438,10 +449,10 @@ fn install_npm(root: &Path, name: &str, package: &str, launcher_kind: Launcher) 
 
 /// Chromium for Iris's browser: the official `playwright-core` package,
 /// then its own installer, which downloads Chromium from Playwright's
-/// servers into `<root>/browser/browsers` (older builds are removed by
+/// servers into `<root>/chromium/browsers` (older builds are removed by
 /// Playwright itself).
 fn install_browser(root: &Path) -> Result<Report> {
-    let prefix = root.join("browser");
+    let prefix = install_dir(root, "browser");
     let before = installed_version(root, "browser");
     npm_install(root, &prefix, "the browser", "playwright-core")?;
     let cli = prefix.join("node_modules/playwright-core/cli.js");
@@ -505,7 +516,7 @@ pub fn install(root: &Path, name: &str) -> Result<Report> {
 pub fn uninstall(root: &Path, name: &str) -> Result<()> {
     source(name).ok_or_else(|| format!("unknown engine {name}"))?;
     let _ = std::fs::remove_file(launcher(root, name));
-    let dir = root.join(name);
+    let dir = install_dir(root, name);
     if dir.exists() {
         std::fs::remove_dir_all(dir)?;
     }
@@ -597,6 +608,12 @@ mod tests {
         assert!(!is_installed(root, "codex") && !root.join("codex").exists());
         assert!(outside.exists());
         assert!(uninstall(root, "../etc").is_err());
+        // Removing the browser never touches a profile in `browser/` (the
+        // layout when engines.dir is the data directory).
+        std::fs::create_dir_all(root.join("browser/profile")).unwrap();
+        std::fs::create_dir_all(root.join("chromium")).unwrap();
+        uninstall(root, "browser").unwrap();
+        assert!(root.join("browser/profile").exists() && !root.join("chromium").exists());
         assert!(install(root, "../etc").is_err());
         assert_eq!(sh_quote("a'b"), "'a'\\''b'");
     }
