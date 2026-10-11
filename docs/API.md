@@ -436,11 +436,16 @@ act on the creator's data.
 The Iris owner's **private context** (`USER.md`, `MEMORY.md` and the memory
 notes, write access to `memory/`, and connectors) is only given to turns in
 a conversation whose single member is the Iris owner, and to scheduled jobs.
-Other people's own chats and all shared conversations get none of it. When
+Other people's own chats and all shared conversations get none of it, and
+there the CLI also runs without the MCP servers, memory, and account
+integrations configured in the CLI itself (see the self-hosting guide's
+"Not done yet" for what each CLI allows). When
 the people in a conversation change (for example a group gets its second
 member), the CLI session is restarted rather than resumed, so nothing from
 a private session carries over; a member who leaves stops receiving a
-running turn's events at once.
+running turn's events at once. Membership is read when a turn actually
+starts (after any wait for a CLI slot), and a queued message whose sender
+has left by then is not answered (its reply ends `cancelled`).
 
 #### `GET /api/conversations`
 
@@ -615,10 +620,17 @@ newest use first, each image once. An upload that was never sent in a chat
 | Query | Type | Default | Notes |
 |---|---|---|---|
 | `limit` | int | 100 | Clamped to 1..500. |
+| `before` | int | none | Next page: the previous page's last `used_at`. |
+| `before_id` | string | none | With `before`: the previous page's last `id` (photos sent together share `used_at`). |
+
+Ordered by `used_at` (when the photo was last sent), then `id`, newest
+first.
 
 ```json
 {"attachments": [{"id": "...", "mime": "image/jpeg", "size": 48213, "sha256": "<64 hex>",
-                  "created_at": 1760000000000, "conversation_id": "...", "message_id": "..."}]}
+                  "created_at": 1760000000000, "conversation_id": "...", "message_id": "...",
+                  "used_at": 1760000005000}],
+ "has_more": false}
 ```
 
 #### `POST /api/attachments`
@@ -1395,12 +1407,12 @@ Body: the browser's `PushSubscription.toJSON()`. Extra fields such as
 
 | Field | Type | Notes |
 |---|---|---|
-| `endpoint` | string | Required, must start with `https://`, max 2,000. |
+| `endpoint` | string | Required, max 2,000. Must be an `https://` URL on a browser push service (`fcm.googleapis.com`, `android.googleapis.com`, `*.push.services.mozilla.com`, `*.push.apple.com`, `*.notify.windows.com`; default port, no credentials), so Iris never sends to addresses on its own network. Iris also follows no redirects when delivering. |
 | `keys.p256dh` | string | Required, base64url P-256 public key. |
 | `keys.auth` | string | Required, base64url 16-byte auth secret. |
 
 ```json
-{"endpoint": "https://push.example.com/send/abc", "expirationTime": null,
+{"endpoint": "https://fcm.googleapis.com/fcm/send/abc", "expirationTime": null,
  "keys": {"p256dh": "B...", "auth": "..."}}
 ```
 

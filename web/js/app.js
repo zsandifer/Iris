@@ -2,15 +2,18 @@
 import { html, render, useEffect, useRef, useState } from './h.js';
 import { api, get, post, patch, del, setToken, hasToken, onUnauthorized, connectEvents, ApiError, seg, isId } from './api.js';
 import {
-  S, set, useStore, go, toast, handleEvent, loadConvs, mainId, isOwner, parseRoute,
+  S, set, useStore, go, toast, handleEvent, loadConvs, mainId, isOwner, parseRoute, resetUserState,
+  loadArchived, convFor, setArchived,
 } from './store.js';
-import { Icon, Avatar, Img, Sheet, agentName, promptSheet, confirmSheet, openSheet, closeSheet, LetterTile } from './ui.js';
+import {
+  Icon, Avatar, Img, Sheet, agentName, promptSheet, confirmSheet, openSheet, closeSheet, LetterTile, Row, Spinner, ago,
+} from './ui.js';
 import { ChatScreen } from './chat.js';
 import { FeedScreen, StoryViewer, FeedSettings } from './feed.js';
 import { IdeasScreen, GoalsScreen, LibraryScreen } from './lists.js';
 import { Hub, Connections, ConnectorForm, Logins, Computer, Files, FileEditor, Folder } from './hub.js';
 import { Settings, AiEngine, Devices, People, ActivityLog } from './settings.js';
-import { isIOS, standalone } from './push.js';
+import { isIOS, standalone, syncPush, resetPush } from './push.js';
 
 const TABS = [
   ['chat', 'Chat', 'chat'],
@@ -48,6 +51,7 @@ function Pair() {
     setBusy(true);
     try {
       const r = await post('/pair', { code, device_name: deviceName() });
+      signedOut();
       setToken(r.token);
       boot();
     } catch (x) {
@@ -110,12 +114,29 @@ function Drawer() {
         ${(together.length > 0 || isOwner()) && html`<div class="sm">Together</div>`}
         ${together.map((c) => html`<${Item} c=${c} icon="users" />`)}
         ${isOwner() && html`<button class="it ac" onClick=${newTogether}><${Icon} name="plus" size=${18} /><span>New together chat</span></button>`}
+        <button class="it" onClick=${() => { set({ drawer: false }); openSheet(() => html`<${ArchivedSheet} />`); }}>
+          <${Icon} name="archive" size=${18} /><span>Archived chats</span></button>
       </div>
       <button class="profile" onClick=${() => go('iris')}>
         <${Avatar} size=${38} /><div class="grow"><b>${agentName()}</b><small>Connections, logins, settings</small></div>
         <${Icon} name="chev" size=${16} />
       </button>
     </nav>`;
+}
+
+function ArchivedSheet() {
+  useStore();
+  useEffect(() => { loadArchived().catch((e) => toast(e.message)); }, []);
+  const list = S.archived;
+  const unarchive = async (c) => {
+    try { await setArchived(c, false); toast('Back in your chats'); } catch (e) { toast(e.message); }
+  };
+  return html`<div class="sheet-body tall"><h3>Archived chats</h3>
+    ${!list ? html`<${Spinner} />` : !list.length ? html`<p class="mu">Nothing archived. Chats you archive wait here.</p>`
+      : html`<div class="grp">${list.map((c) => html`<${Row} key=${c.id} icon=${c.kind === 'group' || c.member_count > 1 ? 'users' : 'chat'}
+          title=${title(c)} sub=${ago(c.updated_at)} chevron=${false} onClick=${() => { closeSheet(); go(`chat/${c.id}`); }}
+          right=${html`<button class="cn" onClick=${() => unarchive(c)}>Unarchive</button>`} />`)}</div>`}
+  </div>`;
 }
 
 const title = (c) => (c.kind === 'main' ? 'Main chat' : c.title || (c.kind === 'group' ? 'Together' : 'New chat'));
@@ -135,26 +156,40 @@ function chatMenu(c) {
     closeSheet();
     const t = await promptSheet({ title: 'Rename chat', value: c.title });
     if (t == null) return;
-    try { await patch(`/conversations/${seg(c.id)}`, { title: t.trim() }); loadConvs(); } catch (e) { toast(e.message); }
+    try {
+      const r = await patch(`/conversations/${seg(c.id)}`, { title: t.trim() });
+      if (S.archived) set({ archived: S.archived.map((x) => (x.id === c.id ? r.conversation || { ...x, title: t.trim() } : x)) });
+      loadConvs();
+    } catch (e) { toast(e.message); }
   };
   const archive = async () => {
     closeSheet();
-    try { await patch(`/conversations/${seg(c.id)}`, { archived: true }); await loadConvs(); go('chat'); } catch (e) { toast(e.message); }
+    try { await setArchived(c, true); go('chat'); } catch (e) { toast(e.message); }
+  };
+  const unarchive = async () => {
+    closeSheet();
+    try { await setArchived(c, false); toast('Back in your chats'); } catch (e) { toast(e.message); }
   };
   const remove = async () => {
     closeSheet();
     if (!(await confirmSheet({ title: 'Delete this chat?', body: 'It is deleted for everyone in it.', yes: 'Delete', danger: true }))) return;
-    try { await del(`/conversations/${seg(c.id)}`); await loadConvs(); go('chat'); } catch (e) { toast(e.message); }
+    try {
+      await del(`/conversations/${seg(c.id)}`);
+      if (S.archived) set({ archived: S.archived.filter((x) => x.id !== c.id) });
+      await loadConvs();
+      go('chat');
+    } catch (e) { toast(e.message); }
   };
   openSheet(() => html`<div class="sheet-body"><h3>${title(c)}</h3><div class="grp">
     <div class="r tap" onClick=${rename}><div class="rt">Rename</div></div>
-    <div class="r tap" onClick=${archive}><div class="rt">Archive</div></div>
+    ${c.archived_at ? html`<div class="r tap" onClick=${unarchive}><div class="rt">Unarchive</div></div>`
+      : html`<div class="r tap" onClick=${archive}><div class="rt">Archive</div></div>`}
     <div class="r tap danger" onClick=${remove}><div class="rt">Delete</div></div></div></div>`);
 }
 
 function TopBar() {
   const cid = currentChat();
-  const conv = (S.convs || []).find((c) => c.id === cid);
+  const conv = convFor(cid);
   const busy = Object.keys(S.live).length > 0;
   let line = 'here for you';
   if (!S.online) line = 'reconnecting…';
@@ -257,6 +292,7 @@ async function boot() {
   try {
     const me = await api('GET', '/me', undefined, { timeout: 8000 });
     set({ me });
+    syncPush();
     await loadConvs();
     events?.close();
     events = connectEvents(handleEvent, (online) => set({ online }));
@@ -270,11 +306,20 @@ async function boot() {
 
 window.addEventListener('online', () => { if (!S.me && hasToken()) boot(); });
 
-onUnauthorized(() => {
+/**
+ * Drop the session and everything that belonged to it: events, token (which
+ * also clears cached images), all client state, and the old user's route.
+ */
+function signedOut() {
   events?.close();
+  events = null;
   setToken('');
-  set({ me: null, convs: null, msgs: {}, live: {} });
-});
+  resetPush();
+  if (location.hash && location.hash !== '#/') history.replaceState(null, '', '#/');
+  resetUserState();
+}
+
+onUnauthorized(signedOut);
 
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => {});

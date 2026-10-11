@@ -195,6 +195,38 @@ pub enum SendResult {
     Failed(u16),
 }
 
+/// The browsers' push services (Chrome and other Chromium browsers,
+/// Firefox, Safari, Edge). Endpoints come from users' browsers, so Iris only
+/// ever sends to these hosts, never to an address on its own network.
+const PUSH_SERVICE_DOMAINS: &[&str] = &[
+    "fcm.googleapis.com",
+    "android.googleapis.com",
+    "push.services.mozilla.com",
+    "push.apple.com",
+    "notify.windows.com",
+];
+
+/// Whether `endpoint` is an `https://` URL on a known browser push service
+/// (default port, no credentials in the URL).
+pub fn endpoint_allowed(endpoint: &str) -> bool {
+    let Some(rest) = endpoint.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.split_once(':') {
+        Some((h, "443")) => h,
+        Some(_) => return false,
+        None => authority,
+    }
+    .to_ascii_lowercase();
+    PUSH_SERVICE_DOMAINS
+        .iter()
+        .any(|d| host == *d || host.strip_suffix(d).is_some_and(|p| p.ends_with('.')))
+}
+
 /// HTTP client for push services. Endpoints come from users' browsers, so
 /// it never follows redirects and never speaks plain HTTP: a hostile
 /// endpoint cannot bounce the request into the server's own network.
@@ -217,6 +249,9 @@ pub fn send_blocking(
     auth: &str,
     payload: &serde_json::Value,
 ) -> Result<SendResult> {
+    if !endpoint_allowed(endpoint) {
+        return Err("not a browser push service endpoint".into());
+    }
     let body = encrypt(payload.to_string().as_bytes(), p256dh, auth)?;
     let authorization = keys.authorization(endpoint, subject, crate::util::now_ms() / 1000)?;
     let resp = push_agent()
@@ -304,6 +339,33 @@ mod tests {
         );
         assert!(sent.is_err());
         assert!(listener.accept().is_err(), "no connection was made");
+    }
+
+    #[test]
+    fn only_browser_push_services_are_reachable() {
+        for ok in [
+            "https://fcm.googleapis.com/fcm/send/abc",
+            "https://updates.push.services.mozilla.com/wpush/v2/abc",
+            "https://web.push.apple.com/abc",
+            "https://wns2-par02p.notify.windows.com/w/?token=abc",
+            "https://FCM.googleapis.com:443/x",
+        ] {
+            assert!(endpoint_allowed(ok), "{ok}");
+        }
+        for bad in [
+            "http://fcm.googleapis.com/x",
+            "https://192.168.1.10/push",
+            "https://100.64.0.1/push",
+            "https://localhost/push",
+            "https://nas.example.ts.net/push",
+            "https://evilfcm.googleapis.com.example.com/x",
+            "https://notfcm.googleapis.com/x",
+            "https://fcm.googleapis.com:8443/x",
+            "https://user@fcm.googleapis.com/x",
+            "https://fcm.googleapis.com.evil.example/x",
+        ] {
+            assert!(!endpoint_allowed(bad), "{bad}");
+        }
     }
 
     /// RFC 8291 Appendix A test vector.

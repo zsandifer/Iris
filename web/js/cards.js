@@ -39,10 +39,17 @@ function ResultCard({ c }) {
 
 function ConnectCard({ c }) {
   const service = c.service || c.title;
+  const url = safeUrl(c.url);
+  const label = c.action_label || 'Connect';
+  const manage = () => go(`iris/connections?service=${encodeURIComponent(service)}`);
+  // The card's url is the service's own connection page; Connections stays
+  // one tap away for the owner.
   return html`<div class="lk">
     <${LetterTile} name=${service} size=${36} radius=${11} />
-    <div class="grow"><b>${c.title}</b><small>${c.body ? plain(c.body, 90) : 'Connect it so I can help with it'}</small></div>
-    <button class="go" onClick=${() => go(`iris/connections?service=${encodeURIComponent(service)}`)}>${c.action_label || 'Connect'}</button>
+    <div class="grow"><b>${c.title}</b><small>${c.body ? plain(c.body, 90) : url ? hostOf(url) : 'Connect it so I can help with it'}</small>
+      ${url && isOwner() && html`<button class="lk-m" onClick=${manage}>Connections ›</button>`}</div>
+    ${url ? html`<a class="go" href=${url} target="_blank" rel="noopener noreferrer">${label}</a>`
+      : html`<button class="go" onClick=${manage}>${label}</button>`}
   </div>`;
 }
 

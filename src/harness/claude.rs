@@ -88,6 +88,14 @@ impl Harness for Claude {
         write_private_file(&prompt_file, spec.system_prompt.as_bytes())?;
         inv.temp_files.push(prompt_file.clone());
 
+        if spec.isolated {
+            for var in [
+                "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+                "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+            ] {
+                inv.env.push((var.into(), "1".into()));
+            }
+        }
         let a = &mut inv.args;
         a.extend(
             [
@@ -122,6 +130,12 @@ impl Harness for Claude {
             a.extend(self.cfg.extra_args.iter().cloned());
             inv.stdin = user_message_line(spec)?;
             return Ok(inv);
+        }
+        if spec.isolated {
+            // Someone else's chat: only Iris's MCP servers (not the owner's
+            // user, project, or claude.ai ones), and none of the owner's
+            // CLAUDE.md files or auto memory.
+            a.push("--strict-mcp-config".into());
         }
         if !self.cfg.permission_mode.is_empty() {
             a.push("--permission-mode".into());
@@ -666,6 +680,8 @@ mod tests {
             run_dir: tmp.path().into(),
             scope: "c1".into(),
             tools: true,
+            isolated: false,
+            own_mcp_servers: Vec::new(),
         };
         let inv = Claude::new(HarnessConfig::claude_default())
             .build(&spec)
@@ -689,5 +705,26 @@ mod tests {
         assert_eq!(stdin["message"]["content"][1]["source"]["data"], "UE5H");
         // The prompt never appears on the command line.
         assert!(!inv.args.iter().any(|a| a == "hi"));
+        // Someone else's chat: none of the CLI's own MCP servers or memory.
+        let plain = Claude::new(HarnessConfig::claude_default())
+            .build(&spec)
+            .unwrap();
+        assert!(!plain.args.contains(&"--strict-mcp-config".to_string()));
+        assert!(!plain.env.iter().any(|(k, _)| k.contains("MEMORY")));
+        let mut iso = spec.clone();
+        iso.isolated = true;
+        let inv = Claude::new(HarnessConfig::claude_default())
+            .build(&iso)
+            .unwrap();
+        assert!(inv.args.contains(&"--strict-mcp-config".to_string()));
+        for var in [
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+        ] {
+            assert!(
+                inv.env.contains(&(var.to_string(), "1".to_string())),
+                "{var}"
+            );
+        }
     }
 }

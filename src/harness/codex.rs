@@ -240,6 +240,22 @@ impl Harness for Codex {
         let exe = std::env::current_exe()?;
         let mcp = mcp_setup(&spec.mcp_servers, &exe, &spec.run_dir, &spec.turn_id)?;
         overrides.extend(mcp.overrides);
+        if spec.isolated {
+            // Someone else's chat: none of the owner's ChatGPT apps,
+            // plugins, memories, or MCP servers configured in Codex itself.
+            for f in ["apps", "plugins", "memories"] {
+                overrides.push(format!("features.{f}=false"));
+            }
+            for name in &spec.own_mcp_servers {
+                if spec.mcp_servers.iter().any(|s| &s.name == name) {
+                    continue;
+                }
+                if !bare_key(name) {
+                    return Err(format!("cannot switch off Codex MCP server {name:?}").into());
+                }
+                overrides.push(format!("mcp_servers.{name}.enabled=false"));
+            }
+        }
         for o in overrides {
             a.push("-c".into());
             a.push(o);
@@ -270,6 +286,20 @@ impl Harness for Codex {
 
     fn auth_probe_args(&self) -> Option<Vec<String>> {
         Some(vec!["login".into(), "status".into()])
+    }
+
+    /// Codex merges `-c mcp_servers` with its own config, so its own
+    /// servers are switched off by name in isolated turns.
+    fn own_mcp_servers_args(&self) -> Option<Vec<String>> {
+        Some(vec!["mcp".into(), "list".into(), "--json".into()])
+    }
+
+    fn parse_own_mcp_servers(&self, stdout: &str) -> Option<Vec<String>> {
+        serde_json::from_str::<Vec<Value>>(stdout.trim())
+            .ok()?
+            .iter()
+            .map(|s| s["name"].as_str().map(String::from))
+            .collect()
     }
 
     fn parse_auth_probe(&self, exit_ok: bool, stdout: &str, stderr: &str) -> AuthState {
@@ -650,6 +680,8 @@ mod tests {
             run_dir: run.path().into(),
             scope: "c1".into(),
             tools: true,
+            isolated: false,
+            own_mcp_servers: Vec::new(),
         };
         let mut cfg = HarnessConfig::codex_default();
         cfg.sandbox = "workspace-write".into();
@@ -746,6 +778,33 @@ mod tests {
         assert_eq!(&inv.args[..3], ["exec", "resume", "--json"]);
         let n = inv.args.len();
         assert_eq!(&inv.args[n - 2..], ["th-1", "-"]);
+
+        // Someone else's chat: Codex's own apps, plugins, memories, and MCP
+        // servers are switched off (Iris's own servers stay).
+        spec.isolated = true;
+        spec.own_mcp_servers = vec!["personal".into(), "notes".into()];
+        let inv = h.build(&spec).unwrap();
+        for o in [
+            "features.apps=false",
+            "features.plugins=false",
+            "features.memories=false",
+            "mcp_servers.personal.enabled=false",
+        ] {
+            assert!(inv.args.contains(&o.to_string()), "{o}");
+        }
+        assert!(
+            !inv.args
+                .contains(&"mcp_servers.notes.enabled=false".to_string())
+        );
+        spec.own_mcp_servers = vec!["has space".into()];
+        assert!(h.build(&spec).is_err(), "unknown servers are never left on");
+        assert_eq!(
+            h.parse_own_mcp_servers(r#"[{"name": "personal", "transport": {"env": {"T": "x"}}}]"#),
+            Some(vec!["personal".to_string()])
+        );
+        assert_eq!(h.parse_own_mcp_servers("[]"), Some(vec![]));
+        assert_eq!(h.parse_own_mcp_servers("not json"), None);
+        assert_eq!(h.parse_own_mcp_servers(r#"[{"nom": "x"}]"#), None);
     }
 
     #[test]

@@ -406,8 +406,41 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
+        if i + 1 == UNIQUE_TIMESTAMPS_VERSION {
+            for table in ["messages", "feed_posts"] {
+                spread_timestamps(&tx, table)?;
+            }
+        }
         tx.pragma_update(None, "user_version", (i + 1) as i64)?;
         tx.commit()?;
+    }
+    Ok(())
+}
+
+/// Schema version from which message and feed timestamps are unique.
+const UNIQUE_TIMESTAMPS_VERSION: usize = 3;
+
+/// Make `created_at` unique across `table`: rows written in the same
+/// millisecond before timestamps were allocated uniquely move forward a
+/// millisecond at a time, keeping their order, so timestamp page cursors
+/// are exact for old rows too.
+fn spread_timestamps(conn: &Connection, table: &str) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, i64)> = conn
+        .prepare(&format!(
+            "SELECT rowid, created_at FROM {table} ORDER BY created_at, rowid"
+        ))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut update = conn.prepare(&format!(
+        "UPDATE {table} SET created_at = ?2 WHERE rowid = ?1"
+    ))?;
+    let mut last = i64::MIN;
+    for (rowid, at) in rows {
+        let next = at.max(last.saturating_add(1));
+        if next != at {
+            update.execute(params![rowid, next])?;
+        }
+        last = next;
     }
     Ok(())
 }
@@ -1100,15 +1133,21 @@ pub struct SentPhoto {
     pub attachment: Attachment,
     pub conversation_id: String,
     pub message_id: String,
+    /// When it was last sent; with `id`, the page cursor.
+    pub used_at: i64,
 }
 
 /// Images the user attached to their own messages, newest first (each
-/// attachment once, at its latest use).
+/// attachment once, at its latest use). `before` is the last item of the
+/// previous page as `(used_at, id)`: one message can carry several photos
+/// with the same `used_at`, so the id breaks ties.
 pub fn sent_photos(
     conn: &Connection,
     user_id: &str,
+    before: Option<(i64, &str)>,
     limit: usize,
 ) -> rusqlite::Result<Vec<SentPhoto>> {
+    let (before_at, before_id) = before.unwrap_or((i64::MAX, ""));
     let mut stmt = conn.prepare(
         "SELECT a.id, a.user_id, a.mime, a.size, a.sha256, a.file_name, a.created_at,
                 m.conversation_id, m.id, MAX(m.created_at) AS used_at
@@ -1118,10 +1157,11 @@ pub fn sent_photos(
          JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ?1
          WHERE m.author_user_id = ?1 AND m.attachments != '[]'
          GROUP BY a.id
-         ORDER BY used_at DESC
+         HAVING used_at < ?3 OR (used_at = ?3 AND (?4 = '' OR a.id < ?4))
+         ORDER BY used_at DESC, a.id DESC
          LIMIT ?2",
     )?;
-    stmt.query_map(params![user_id, limit as i64], |r| {
+    stmt.query_map(params![user_id, limit as i64, before_at, before_id], |r| {
         Ok(SentPhoto {
             attachment: Attachment {
                 id: r.get(0)?,
@@ -1134,6 +1174,7 @@ pub fn sent_photos(
             },
             conversation_id: r.get(7)?,
             message_id: r.get(8)?,
+            used_at: r.get(9)?,
         })
     })?
     .collect()
@@ -1477,6 +1518,110 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn upgrading_spreads_existing_timestamp_ties() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        {
+            // A schema-2 database written before timestamps were unique.
+            let mut conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..2] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 2).unwrap();
+            let owner = ensure_owner(&conn).unwrap();
+            let main = ensure_main_conversation(&conn, &owner).unwrap();
+            let side = create_conversation(&conn, &owner, "side", "", None)
+                .unwrap()
+                .id;
+            let tx = conn.transaction().unwrap();
+            for (i, conv) in [&main, &side, &main, &side].iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO messages (id, conversation_id, role, kind, content, attachments,
+                         status, meta, created_at, updated_at)
+                     VALUES (?1, ?2, 'assistant', 'text', ?3, '[]', 'complete',
+                         '{\"activity\":[{\"id\":\"a\"}]}', 5000, 5000)",
+                    params![format!("m{i}"), conv, format!("reply {i}")],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO feed_posts (id, user_id, title, body, created_at, updated_at)
+                     VALUES (?1, ?2, 't', 'b', 7000, 7000)",
+                    params![format!("p{i}"), owner],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            let owner = owner_user_id(c)?.unwrap();
+            // Two per page: every tied row still shows up exactly once.
+            let (mut seen, mut before) = (Vec::new(), None);
+            loop {
+                let page = recent_activity(c, &owner, false, before, 2)?;
+                if page.is_empty() {
+                    break;
+                }
+                before = page.last().map(|e| e.created_at);
+                seen.extend(page.into_iter().map(|e| e.message_id));
+            }
+            seen.sort();
+            assert_eq!(seen, ["m0", "m1", "m2", "m3"]);
+            let (mut posts, mut before) = (0, None);
+            loop {
+                let page = crate::entities::list_feed(c, &owner, before, 2)?;
+                if page.is_empty() {
+                    break;
+                }
+                before = page.last().map(|p| p.created_at);
+                posts += page.len();
+            }
+            assert_eq!(posts, 4);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn sent_photos_page_through_photos_of_one_message() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            let owner = owner_user_id(c)?.unwrap();
+            let conv = ensure_main_conversation(c, &owner)?;
+            let ids: Vec<String> = (0..5).map(|_| new_id()).collect();
+            for id in &ids {
+                insert_attachment(c, id, &owner, "image/png", 1, "00", &format!("{id}.png"))?;
+            }
+            for chunk in [&ids[..3], &ids[3..]] {
+                insert_message(
+                    c,
+                    &NewMessage {
+                        attachments: chunk,
+                        ..text(&conv, &owner, "photos")
+                    },
+                )?;
+            }
+            let (mut seen, mut before) = (Vec::new(), None::<(i64, String)>);
+            loop {
+                let page =
+                    sent_photos(c, &owner, before.as_ref().map(|(a, i)| (*a, i.as_str())), 2)?;
+                if page.is_empty() {
+                    break;
+                }
+                let last = page.last().unwrap();
+                before = Some((last.used_at, last.attachment.id.clone()));
+                seen.extend(page.into_iter().map(|p| p.attachment.id));
+            }
+            let mut want = ids.clone();
+            want.sort();
+            seen.sort();
+            assert_eq!(seen, want);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

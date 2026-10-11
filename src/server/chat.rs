@@ -608,6 +608,8 @@ pub fn file_response(mime: &str, bytes: Vec<u8>) -> Response {
 struct LimitQuery {
     limit: Option<usize>,
     before: Option<i64>,
+    /// Photos only: id of the previous page's last item (ties on `before`).
+    before_id: Option<String>,
 }
 
 /// Photos the caller sent in chats (the Library's "Photos" section).
@@ -618,11 +620,18 @@ async fn list_sent_photos(
 ) -> ApiResult {
     let uid = user.id().to_string();
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
-    let photos = state
+    let mut photos = state
         .db
-        .call(move |c| db::sent_photos(c, &uid, limit))
+        .call(move |c| {
+            let before = q
+                .before
+                .map(|at| (at, q.before_id.as_deref().unwrap_or("")));
+            db::sent_photos(c, &uid, before, limit + 1)
+        })
         .await?;
-    ok(json!({"attachments": photos}))
+    let has_more = photos.len() > limit;
+    photos.truncate(limit);
+    ok(json!({"attachments": photos, "has_more": has_more}))
 }
 
 // --------------------------------------------------------------- activity

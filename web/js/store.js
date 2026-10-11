@@ -1,30 +1,36 @@
 // App state: one plain object, a change counter, and loaders that keep it
 // in sync with the REST API and the WebSocket event stream.
 import { useEffect, useReducer, useRef } from './h.js';
-import { get, post, seg } from './api.js';
+import { get, post, patch, seg } from './api.js';
 
-export const S = {
-  me: null,            // GET /api/me
-  settings: null,      // Settings
-  harnesses: [],       // HarnessStatus[]
-  online: false,       // WebSocket connected
-  convs: null,         // Conversation[]
-  msgs: {},            // conversation id -> {list, hasMore, loading}
-  live: {},            // assistant message id -> {text, acts: Activity[], queued}
-  logins: {},          // harness -> LoginStatus (owner)
-  engines: null,       // GET /api/engines (owner)
-  slots: null,         // Slot[]
-  feed: null,          // {posts, hasMore, status}
-  ideas: null,
-  goals: null,
-  library: null,
-  route: parseRoute(),
-  drawer: false,
-  story: null,         // {topic index, story index}
-  sheet: null,         // bottom sheet render function
-  toast: null,
-  drafts: {},          // conversation id -> composer text
-};
+/** Fresh client state: everything here belongs to the signed-in user. */
+function initialState() {
+  return {
+    me: null,            // GET /api/me
+    settings: null,      // Settings
+    harnesses: [],       // HarnessStatus[]
+    online: false,       // WebSocket connected
+    convs: null,         // Conversation[] (not archived)
+    archived: null,      // archived Conversation[] (loaded on demand)
+    msgs: {},            // conversation id -> {list, hasMore, loading}
+    live: {},            // assistant message id -> {text, acts: Activity[], queued}
+    logins: {},          // harness -> LoginStatus (owner)
+    engines: null,       // GET /api/engines (owner)
+    slots: null,         // Slot[]
+    feed: null,          // {posts, hasMore, status}
+    ideas: null,
+    goals: null,
+    library: null,
+    route: parseRoute(),
+    drawer: false,
+    story: null,         // {topic index, story index}
+    sheet: null,         // bottom sheet render function
+    toast: null,
+    drafts: {},          // conversation id -> composer text
+  };
+}
+
+export const S = initialState();
 
 const subs = new Set();
 let pending = false;
@@ -41,6 +47,16 @@ export function set(patch) {
       subs.forEach((f) => f());
     });
   }
+}
+
+/**
+ * Forget everything about the signed-in user (revoked device, re-pair):
+ * data, drafts, open sheets and overlays, and any ad hoc keys.
+ */
+export function resetUserState() {
+  const fresh = initialState();
+  for (const k of Object.keys(S)) if (!(k in fresh)) delete S[k];
+  set(fresh);
 }
 
 /** Re-render the calling component whenever the store changes. */
@@ -103,6 +119,37 @@ export const mainId = () => S.me?.main_conversation_id;
 export async function loadConvs() {
   const { conversations } = await get('/conversations');
   set({ convs: conversations });
+}
+
+export async function loadArchived() {
+  const { conversations } = await get('/conversations?archived=true');
+  set({ archived: conversations.filter((c) => c.archived_at) });
+}
+
+/** The conversation `cid`, also when it is archived (so not in S.convs). */
+export function convFor(cid) {
+  return S.convs?.find((c) => c.id === cid) || S.archived?.find((c) => c.id === cid);
+}
+
+/** A chat opened by URL that isn't in the list may be archived: look it up. */
+const lookingUp = new Set();
+export function lookUpConv(cid) {
+  if (!S.convs || convFor(cid) || lookingUp.has(cid)) return;
+  lookingUp.add(cid);
+  get(`/conversations/${seg(cid)}`)
+    .then(({ conversation: c }) => {
+      if (c?.archived_at && !convFor(c.id)) set({ archived: [...(S.archived || []), c] });
+    })
+    .catch(() => {})
+    .finally(() => lookingUp.delete(cid));
+}
+
+/** Archive or unarchive a chat and update both lists. */
+export async function setArchived(c, archived) {
+  const r = await patch(`/conversations/${seg(c.id)}`, { archived });
+  const rest = (S.archived || []).filter((x) => x.id !== c.id);
+  set({ archived: archived ? [r.conversation || { ...c, archived_at: Date.now() }, ...rest] : rest });
+  await loadConvs();
 }
 
 // A reply only ever moves from streaming to a final status, and every
@@ -193,13 +240,62 @@ export async function loadFeed(more = false) {
 }
 export async function loadIdeas() { set({ ideas: (await get('/ideas')).ideas }); }
 export async function loadGoals() { set({ goals: (await get('/goals?include_done=true')).goals }); }
+const SAVED_PAGE = 50;
+const PHOTO_PAGE = 60;
+// Feed posts page by created_at; photos by (used_at, id), newest first.
+const postOlder = (x, last) => x.created_at < last.created_at;
+const photoOlder = (x, last) => x.used_at < last.used_at || (x.used_at === last.used_at && x.id < last.id);
+const photoCursor = (p) => `&before=${p.used_at}&before_id=${encodeURIComponent(p.id)}`;
+
+/**
+ * A refreshed first page, keeping later pages that were already loaded, but
+ * only when the fresh page reaches back to them (so nothing in between is
+ * skipped); otherwise start over from the fresh page and its has_more.
+ */
+function keepOlder(fresh, freshMore, old, oldMore, older) {
+  if (!freshMore || !old?.length || !fresh.length) return [fresh, !!freshMore];
+  const last = fresh.at(-1);
+  const newestOld = old.reduce((n, x) => (older(n, x) ? x : n));
+  if (older(newestOld, last)) return [fresh, true]; // a gap: drop the old pages
+  const ids = new Set(fresh.map((x) => x.id));
+  const tail = old.filter((x) => !ids.has(x.id) && older(x, last))
+    .sort((a, b) => (older(a, b) ? 1 : older(b, a) ? -1 : 0));
+  return tail.length ? [[...fresh, ...tail], oldMore] : [fresh, true];
+}
+
 export async function loadLibrary() {
-  const [items, photos, saved] = await Promise.all([
+  const [items, ph, sv] = await Promise.all([
     get('/library').then((r) => r.items),
-    get('/attachments').then((r) => r.attachments),
-    get('/feed?liked=true&limit=100').then((r) => r.posts),
+    get(`/attachments?limit=${PHOTO_PAGE}`),
+    get(`/feed?liked=true&limit=${SAVED_PAGE}`),
   ]);
-  set({ library: { items, photos, saved } });
+  const cur = S.library;
+  const [photos, photosMore] = keepOlder(ph.attachments, ph.has_more, cur?.photos, cur?.photosMore, photoOlder);
+  const [saved, savedMore] = keepOlder(sv.posts, sv.has_more, cur?.saved, cur?.savedMore, postOlder);
+  set({ library: { items, photos, photosMore, saved, savedMore } });
+}
+
+const appendNew = (list, more) => {
+  const ids = new Set(list.map((x) => x.id));
+  return [...list, ...more.filter((x) => !ids.has(x.id))];
+};
+
+/** Next page of Library's Saved posts. */
+export async function loadMoreSaved() {
+  const last = S.library?.saved.at(-1);
+  if (!last) return;
+  const r = await get(`/feed?liked=true&limit=${SAVED_PAGE}&before=${last.created_at}`);
+  if (!S.library) return;
+  set({ library: { ...S.library, saved: appendNew(S.library.saved, r.posts), savedMore: !!r.has_more } });
+}
+
+/** Next page of Library's Photos. */
+export async function loadMorePhotos() {
+  const last = S.library?.photos.at(-1);
+  if (!last) return;
+  const r = await get(`/attachments?limit=${PHOTO_PAGE}${photoCursor(last)}`);
+  if (!S.library) return;
+  set({ library: { ...S.library, photos: appendNew(S.library.photos, r.attachments), photosMore: !!r.has_more } });
 }
 export async function loadSlots() { set({ slots: (await get('/models/slots')).slots }); }
 export async function loadEngines() {
@@ -237,10 +333,22 @@ function liveFor(mid) {
   return S.live[mid] || { text: '', acts: [] };
 }
 
+/**
+ * A finished sign-in ("connected") is stale once the CLI reports it is
+ * signed out again (`auth_required`); drop it so the UI offers Reconnect.
+ */
+export function currentLogins(harnesses) {
+  const logins = { ...S.logins };
+  for (const h of harnesses || []) {
+    if (h.auth === 'auth_required' && logins[h.name]?.state === 'connected') delete logins[h.name];
+  }
+  return logins;
+}
+
 export function handleEvent(ev) {
   switch (ev.type) {
     case 'ready':
-      set({ settings: ev.settings, harnesses: ev.harnesses });
+      set({ settings: ev.settings, harnesses: ev.harnesses, logins: currentLogins(ev.harnesses) });
       refreshAll();
       break;
     case 'resync':
@@ -297,7 +405,10 @@ export function handleEvent(ev) {
       set({ settings: ev.settings });
       break;
     case 'harness.status':
-      set({ harnesses: S.harnesses.map((h) => (h.name === ev.harness.name ? { ...h, ...ev.harness, path: h.path } : h)) });
+      set({
+        harnesses: S.harnesses.map((h) => (h.name === ev.harness.name ? { ...h, ...ev.harness, path: h.path } : h)),
+        logins: currentLogins([ev.harness]),
+      });
       break;
     case 'models.changed':
       set({ slots: ev.slots });

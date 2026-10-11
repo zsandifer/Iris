@@ -24,8 +24,9 @@ The CLI does all reasoning and tool use. Iris assembles the persona and
 context, picks a model, streams the reply to your devices, and keeps the app
 state (conversations, goals, feed, and so on) in SQLite.
 
-> Status: early. The backend and API are usable; the real phone app is being
-> designed separately. A bare test console is built in so you can try it.
+> Status: early. The phone app (an installable web app) is served at `/`;
+> shared chats with more than one person are a preview. A bare API test
+> console is also built in at `/console`.
 
 ## Contents
 
@@ -381,7 +382,18 @@ Contributor notes, architecture, and invariants are in
   browsing yet. Planned design: the agent requests a credential by id
   through a tool and Iris fills it into a browser session without the
   model ever seeing the secret.
-- **Live view of the agent's browser**, group chat UI.
+- **Live view of the agent's browser.**
+- **Per-person memory**: people you add chat with Iris in their own chats
+  and in shared chats, but only the owner has long-term memory, persona
+  notes, and connectors.
+- **Full engine isolation in other people's chats**: there Iris switches
+  off what the engines have configured themselves: Claude Code's MCP
+  servers (including claude.ai connectors), CLAUDE.md files, and auto
+  memory; Codex's MCP servers, ChatGPT apps, plugins, and memories; Gemini
+  CLI's MCP servers and extensions; OpenCode's plugins and Claude Code
+  files. Gemini CLI's global `GEMINI.md` context and MCP servers in
+  OpenCode's own global config still apply, so keep personal details out
+  of those if you add people.
 - **Gemini CLI and OpenCode sign-in from the app**: both need one step on
   the server (see above).
 

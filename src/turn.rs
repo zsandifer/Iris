@@ -177,12 +177,20 @@ struct Audience {
 }
 
 impl Audience {
-    fn new(state: &AppState, conv_id: &str, users: Vec<String>) -> Self {
+    /// `generation` must be read before `users` was loaded, so a removal
+    /// that lands in between is still noticed.
+    fn new(conv_id: &str, users: Vec<String>, generation: u64) -> Self {
         Self {
             conv_id: conv_id.to_string(),
             users,
-            generation: state.membership_generation.load(Ordering::SeqCst),
+            generation,
         }
+    }
+
+    /// Narrow to a fresher member list read after `generation`.
+    fn refresh(&mut self, members: &[String], generation: u64) {
+        self.users.retain(|u| members.contains(u));
+        self.generation = generation;
     }
 
     async fn current(&mut self, state: &AppState) -> &[String] {
@@ -211,6 +219,7 @@ async fn run_locked(
 ) -> TurnResult {
     let conv_id = input.conversation_id.as_str();
     let msg_id = input.assistant_message.id.as_str();
+    let generation = state.membership_generation.load(Ordering::SeqCst);
     let ctx = load_ctx(state, conv_id).await;
     if !ctx.exists {
         // Deleted while this turn waited in line: never run the CLI for it.
@@ -222,17 +231,14 @@ async fn run_locked(
     }
     // Job conversations are hidden; their turns are not streamed to anyone.
     let mut audience = Audience::new(
-        state,
         conv_id,
         if ctx.kind == "job" {
             Vec::new()
         } else {
             ctx.members.clone()
         },
+        generation,
     );
-    // Engine policy: more than one human. Privacy: see `Ctx::scope`.
-    let shared = ctx.members.len() > 1;
-    let scope = ctx.scope();
 
     if state.limiter.saturated() {
         state.hub.to_users(
@@ -246,6 +252,37 @@ async fn run_locked(
             return finish(state, input, &mut audience, &Acc::default(), json!(null), Outcome::Cancelled).await;
         }
     };
+    // Waiting for a slot can take long: decide who is in the conversation
+    // (privacy scope, engine policy) only now that the CLI is about to run.
+    let generation = state.membership_generation.load(Ordering::SeqCst);
+    let ctx = load_ctx(state, conv_id).await;
+    if !ctx.exists {
+        crate::info!("turn {msg_id}: conversation is gone; skipped");
+        return TurnResult {
+            message: input.assistant_message.clone(),
+            ok: false,
+        };
+    }
+    audience.refresh(&ctx.members, generation);
+    if let Some(author) = &input.user_message.author_user_id
+        && !ctx.members.contains(author)
+    {
+        // The sender left (or was removed) before the turn started; never
+        // answer them, least of all with whatever context remains.
+        crate::info!("turn {msg_id}: sender is no longer a member; skipped");
+        return finish(
+            state,
+            input,
+            &mut audience,
+            &Acc::default(),
+            json!(null),
+            Outcome::Cancelled,
+        )
+        .await;
+    }
+    // Engine policy: more than one human. Privacy: see `Ctx::scope`.
+    let shared = ctx.members.len() > 1;
+    let scope = ctx.scope();
     state.hub.to_users(
         audience.current(state).await,
         json!({"type": "turn.status", "conversation_id": conv_id, "message_id": msg_id, "status": "running"}),
@@ -411,7 +448,7 @@ async fn run_locked(
             .await
             .unwrap_or_default()
         };
-        let spec = TurnSpec {
+        let mut spec = TurnSpec {
             turn_id: new_id(),
             prompt,
             images,
@@ -430,8 +467,23 @@ async fn run_locked(
             run_dir: state.paths.run_dir(),
             scope: conv_id.to_string(),
             tools: true,
+            isolated: scope != Scope::Private,
+            own_mcp_servers: Vec::new(),
         };
-        let invocation = match entry.harness.build(&spec) {
+        if spec.isolated {
+            match own_mcp_servers(state, entry, &program).await {
+                Some(names) => spec.own_mcp_servers = names,
+                None => {
+                    // Cannot tell which of the CLI's own tools to switch
+                    // off: do not use it for someone else's chat.
+                    crate::warn!("turn {msg_id}: could not list {harness_name}'s own MCP servers");
+                    routing_notes.push(format!("{} could not be isolated", d.model));
+                    excluded.push(harness_name);
+                    continue;
+                }
+            }
+        }
+        let invocation = match build_invocation(state, &harness_name, &spec).await {
             Ok(mut i) => {
                 if harness_name == "claude" && crate::harness::is_managed(&program) {
                     // Iris updates the engines it installed; the CLI's own
@@ -780,10 +832,19 @@ pub async fn one_shot(
             writable_dirs: Vec::new(),
             run_dir: state.paths.run_dir(),
             scope: req.scope.to_string(),
-            // Helper calls read untrusted text (feed items): no tools at all.
+            // Helper calls read untrusted text (feed items): no tools at all,
+            // and none of the owner's CLI memory or integrations.
             tools: false,
+            isolated: true,
+            own_mcp_servers: match own_mcp_servers(state, entry, &program).await {
+                Some(names) => names,
+                None => {
+                    last_error = format!("could not list {}'s own MCP servers", m.harness);
+                    continue;
+                }
+            },
         };
-        let invocation = match entry.harness.build(&spec) {
+        let invocation = match build_invocation(state, &m.harness, &spec).await {
             Ok(i) => i,
             Err(e) => {
                 last_error = format!("could not build command: {e}");
@@ -859,6 +920,40 @@ pub async fn one_shot(
     })
 }
 
+/// Build the command line off the async workers: adapters read and encode
+/// images and write private files.
+async fn build_invocation(
+    state: &AppState,
+    harness: &str,
+    spec: &TurnSpec,
+) -> crate::util::Result<crate::harness::Invocation> {
+    let (st, name, spec) = (state.clone(), harness.to_string(), spec.clone());
+    tokio::task::spawn_blocking(move || match st.harness(&name) {
+        Some(e) => e.harness.build(&spec),
+        None => Err(format!("unknown harness {name}").into()),
+    })
+    .await
+    .map_err(|e| format!("build task failed: {e}"))?
+}
+
+/// MCP servers configured in the CLI itself, for CLIs that switch them off
+/// by name in isolated turns (empty for the others). None if the CLI could
+/// not be asked.
+async fn own_mcp_servers(
+    state: &AppState,
+    entry: &crate::state::HarnessEntry,
+    program: &std::path::Path,
+) -> Option<Vec<String>> {
+    let Some(args) = entry.harness.own_mcp_servers_args() else {
+        return Some(Vec::new());
+    };
+    let strip = state.strip_env(entry);
+    match runner::probe(program, &args, &state.paths.workspace_dir(), &strip).await {
+        Ok((true, out, _)) => entry.harness.parse_own_mcp_servers(&out),
+        _ => None,
+    }
+}
+
 /// In a shared conversation where Claude is the only engine, explain once
 /// (per conversation) with a one-tap opt-in card for the owner.
 async fn post_policy_card_once(state: &AppState, conv_id: &str) {
@@ -923,13 +1018,7 @@ async fn consume(
             HarnessEvent::Activity(a) => {
                 let merged = match acc.activities.iter_mut().find(|x| x.id == a.id) {
                     Some(existing) => {
-                        existing.status = a.status.clone();
-                        if !a.summary.is_empty() {
-                            existing.summary = a.summary.clone();
-                        }
-                        if !a.name.is_empty() {
-                            existing.name = a.name.clone();
-                        }
+                        merge_activity(existing, &a);
                         existing.clone()
                     }
                     None => {
@@ -949,6 +1038,19 @@ async fn consume(
         }
     }
     acc
+}
+
+/// Fold a later update of the same tool call into what was shown so far.
+fn merge_activity(existing: &mut Activity, update: &Activity) {
+    existing.status = update.status.clone();
+    if !update.summary.is_empty() {
+        existing.summary = update.summary.clone();
+    }
+    if !update.name.is_empty() {
+        existing.name = update.name.clone();
+    }
+    // A connector refusing its sign-in is only known when the call fails.
+    existing.auth_error |= update.auth_error;
 }
 
 /// Newest message this harness session has now seen: everything up to this
@@ -1451,6 +1553,26 @@ mod tests {
             a("iris/create_card"),
         ]);
         assert_eq!(kinds, vec!["goals", "feed"]);
+    }
+
+    #[test]
+    fn a_failed_call_keeps_its_sign_in_error() {
+        let mut shown = Activity {
+            id: "t1".into(),
+            kind: "mcp".into(),
+            name: "notes/search".into(),
+            status: "started".into(),
+            summary: "q".into(),
+            auth_error: false,
+        };
+        let failed = Activity {
+            status: "failed".into(),
+            summary: String::new(),
+            auth_error: true,
+            ..shown.clone()
+        };
+        merge_activity(&mut shown, &failed);
+        assert!(shown.auth_error && shown.status == "failed" && shown.summary == "q");
     }
 
     #[test]
