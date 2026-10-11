@@ -1,0 +1,171 @@
+# Iris configuration (written by `iris init`).
+# Every key is optional; the values below are the built-in defaults.
+
+# Address the HTTP API and WebSocket listen on. Keep the loopback default
+# unless you bind to a private interface such as your Tailscale IP
+# (for example "100.101.102.103:7420"). Never bind to a public interface.
+bind = "127.0.0.1:7420"
+
+# Base URL that `iris pair` prints for new devices (for example your
+# Tailscale MagicDNS name). Empty means "derive it from `bind`".
+public_url = ""
+
+# Default agent name. Users can rename the agent at any time from the app
+# (PUT /api/settings); the value stored in the database wins.
+agent_name = "Iris"
+
+# Maximum number of harness CLI subprocesses running at once. Extra turns
+# wait in a queue.
+max_concurrent_turns = 2
+
+# A turn that runs longer than this is killed (with its process group).
+turn_timeout_secs = 600
+
+# Tokio worker threads. A small number keeps idle memory low.
+worker_threads = 2
+
+# Remove ANTHROPIC_API_KEY / OPENAI_API_KEY / CODEX_API_KEY from the
+# environment of harness subprocesses so the CLIs use their own signed-in
+# subscription instead of pay-per-token API billing.
+strip_api_key_env = true
+
+# Largest accepted upload (images, avatar), in bytes.
+max_upload_bytes = 10485760
+
+# Harness adapters. Iris never installs, pins, or updates these CLIs; it runs
+# whatever version you have installed and signed in to.
+[harness.claude]
+enabled = true
+# Resolved from PATH unless absolute.
+command = "claude"
+# Model aliases or full model names accepted by `claude --model`.
+models = ["haiku", "sonnet", "opus"]
+# Values accepted by `claude --effort`.
+efforts = ["low", "medium", "high", "xhigh", "max"]
+discover_models = false
+sandbox = "read-only"
+# `--permission-mode` for headless turns. Anything that would need an
+# interactive approval is denied (`--permission-prompts none`).
+permission_mode = "acceptEdits"
+# Pre-approved built-in tools. Iris's own MCP bridge and enabled connectors
+# are always added.
+allowed_tools = ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]
+# Extra arguments appended to every invocation.
+extra_args = []
+
+[harness.codex]
+enabled = true
+command = "codex"
+# Model ids accepted by `codex exec -m`.
+models = ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"]
+# Values accepted by `-c model_reasoning_effort=...`.
+efforts = ["low", "medium", "high", "xhigh"]
+# Also offer the models (and their supported efforts) that the codex CLI
+# lists in $CODEX_HOME/models_cache.json. Only model metadata is read.
+discover_models = true
+# Sandbox for model-generated shell commands. "workspace-write" lets the
+# agent write only inside the data dir's workspace/ and memory/ folders.
+sandbox = "workspace-write"
+permission_mode = "acceptEdits"
+allowed_tools = []
+extra_args = []
+
+# Google Gemini CLI. Sign in once by running `gemini` on the server.
+[harness.gemini]
+enabled = true
+command = "gemini"
+# Aliases the CLI resolves to its newest version of each model.
+models = ["flash", "pro", "flash-lite"]
+# Gemini CLI has no reasoning-effort flag.
+efforts = []
+discover_models = false
+sandbox = ""
+# `--approval-mode` for headless turns: tools that would need approval are
+# not run. "auto_edit" auto-approves file edits.
+permission_mode = "auto_edit"
+allowed_tools = []
+extra_args = []
+
+# OpenCode: open source, reaches many providers including local models
+# (Ollama, LM Studio). Models come from `opencode models`.
+[harness.opencode]
+enabled = true
+command = "opencode"
+# Extra `provider/model` ids to offer even if `opencode models` omits them.
+models = []
+# Per-model efforts come from `opencode models --verbose` (variants).
+efforts = []
+discover_models = true
+# OpenCode has no OS sandbox. "workspace-write" allows file edits in the
+# workspace and memory folders and keeps shell commands behind approval
+# (rejected in headless turns); "read-only" also blocks edits;
+# "danger-full-access" allows everything.
+sandbox = "workspace-write"
+permission_mode = ""
+allowed_tools = []
+extra_args = []
+
+# Automatic engine selection (invisible to end users). Each turn uses a
+# slot: chat, chat_strong (clearly hard requests), background (heartbeat
+# and jobs), or feed. A slot's model is the highest-ranked model that is
+# available on this machine right now (installed, signed in, listed by its
+# CLI) unless you pin one in the app. Effort is chosen per message by a
+# rule-based classifier: low by default, higher for code, research,
+# planning, math, long inputs, and when you say an answer was wrong.
+[router]
+# Claude subscriptions are for individual use. Conversations with more than
+# one person never use Claude unless this is true (the owner can also turn
+# it on in the app). Keep it false unless your plan allows shared use.
+allow_claude_for_shared = false
+# Optional TOML file layered over the built-in model rankings
+# (see templates/model_rankings.toml in the source for the format).
+rankings_file = ""
+# Ask the `classifier` slot's (cheap) model about messages the rules find
+# ambiguous. One small extra request per such message.
+classifier_model = false
+# Message length thresholds (characters) for the effort classifier.
+long_chars = 1200
+very_long_chars = 6000
+
+# Proactive check-in: reads persona/HEARTBEAT.md and messages you in Main chat
+# only when something needs attention. Uses the `background` slot.
+[heartbeat]
+enabled = false
+interval_mins = 60
+# Local time window in which the job may run.
+active_start = "08:00"
+active_end = "22:00"
+
+# Feed generation: the agent writes posts about your interests (guided by the
+# feed prompt you can edit in the app).
+[feed]
+enabled = false
+interval_mins = 360
+active_start = "08:00"
+active_end = "22:00"
+
+# Web Push notifications (VAPID). Keys are generated on first run.
+[push]
+enabled = true
+# Contact URL for push services, e.g. "mailto:you@example.com". Some push
+# services reject subscriptions without one.
+vapid_subject = ""
+# Also push assistant replies when no app window is connected.
+notify_replies_when_offline = true
+
+# Installing and updating engines (the official CLIs) from the app. Iris
+# installs only from official sources (Anthropic's release manifest with
+# SHA-256 verification for Claude Code; the vendors' npm packages for Codex,
+# Gemini CLI, and OpenCode) and only ever updates or removes engines it
+# installed itself. Engines in this directory are used before PATH.
+[engines]
+# Empty means "<data dir>/engines" (single-user mode).
+dir = ""
+# Privilege split: run installs as a separate admin user that owns `dir`,
+# so the agent user can run engines but never modify them. Example (see
+# deploy/setup-engines.sh):
+#   helper = ["sudo", "-n", "-u", "iris", "/usr/local/bin/iris", "engines"]
+# Empty: installs run in-process as the user running Iris.
+helper = []
+# Update engines Iris installed once a day.
+auto_update = true

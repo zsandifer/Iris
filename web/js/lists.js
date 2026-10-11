@@ -1,0 +1,182 @@
+// Ideas, Goals, and Library tabs.
+import { html, useEffect, useState } from './h.js';
+import { post, patch, del, api, blobUrl } from './api.js';
+import { S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary } from './store.js';
+import { Icon, Img, Empty, Spinner, ago, since, openSheet, closeSheet, confirmSheet, hostOf } from './ui.js';
+import { md } from './md.js';
+import { Post } from './feed.js';
+
+function Head({ title, sub }) {
+  return html`<h1 class="ttl">${title}</h1>${sub && html`<div class="sub">${sub}</div>`}`;
+}
+
+// ------------------------------------------------------------------- ideas
+
+export function IdeasScreen() {
+  useStore();
+  const [busy, setBusy] = useState(null);
+  useEffect(() => { loadIdeas().catch((e) => toast(e.message)); }, []);
+  if (!S.ideas) return html`<div class="scr tabscr"><${Spinner} /></div>`;
+  const open = S.ideas.filter((i) => i.status === 'open');
+  const started = S.ideas.filter((i) => i.status === 'started');
+  const start = async (i) => {
+    setBusy(i.id);
+    try {
+      const r = await post(`/ideas/${i.id}/start`);
+      await loadIdeas();
+      go(`chat/${r.conversation.id}`);
+    } catch (e) { toast(e.message); }
+    setBusy(null);
+  };
+  const later = async (i) => {
+    set({ ideas: S.ideas.map((x) => (x.id === i.id ? { ...x, status: 'dismissed' } : x)) });
+    try { await patch(`/ideas/${i.id}`, { status: 'dismissed' }); } catch (e) { toast(e.message); loadIdeas(); }
+  };
+  return html`<div class="scr tabscr">
+    <${Head} title="Ideas" sub="Things I could do for you. Tap Do it and I'll get started." />
+    ${open.map((i) => html`<div class="card" key=${i.id}>
+      <b>${i.title}</b>${i.description && html`<p>${i.description}</p>`}
+      <div class="act"><button disabled=${busy === i.id} onClick=${() => start(i)}>Do it</button>
+        <button class="mu" onClick=${() => later(i)}>Not now</button></div>
+    </div>`)}
+    ${!open.length && html`<${Empty} icon="bulb" title="No new ideas right now">
+      As I learn what you care about, I'll suggest things I can take off your plate.<//>`}
+    ${started.length > 0 && html`<div class="gl">In progress</div>
+      <div class="grp">${started.map((i) => html`<div class="r tap" onClick=${() => i.conversation_id && go(`chat/${i.conversation_id}`)}>
+        <div class="ri"><${Icon} name="chat" size=${17} /></div><div class="rt">${i.title}<small>Started ${since(i.updated_at)}</small></div>
+        <${Icon} name="chev" size=${16} cls="rc" /></div>`)}</div>`}
+  </div>`;
+}
+
+// ------------------------------------------------------------------- goals
+
+export function GoalsScreen() {
+  useStore();
+  const [title, setTitle] = useState('');
+  const [showDone, setShowDone] = useState(false);
+  useEffect(() => { loadGoals().catch((e) => toast(e.message)); }, []);
+  if (!S.goals) return html`<div class="scr tabscr"><${Spinner} /></div>`;
+  const suggested = S.goals.filter((g) => g.suggested && !g.done);
+  const active = S.goals.filter((g) => !g.suggested && !g.done);
+  const done = S.goals.filter((g) => g.done);
+  const update = async (g, body) => {
+    set({ goals: S.goals.map((x) => (x.id === g.id ? { ...x, ...body } : x)) });
+    try { await patch(`/goals/${g.id}`, body); } catch (e) { toast(e.message); }
+    loadGoals().catch(() => {});
+  };
+  const remove = async (g) => {
+    set({ goals: S.goals.filter((x) => x.id !== g.id) });
+    try { await del(`/goals/${g.id}`); } catch (e) { toast(e.message); loadGoals(); }
+  };
+  const add = async (e) => {
+    e.preventDefault();
+    if (!title.trim()) return;
+    try { await post('/goals', { title: title.trim() }); setTitle(''); await loadGoals(); } catch (err) { toast(err.message); }
+  };
+  const menu = (g) => openSheet(() => html`<div class="sheet-body">
+    <h3>${g.title}</h3>${g.status_text && html`<p class="mu">${g.status_text}</p>`}
+    <div class="grp">
+      <div class="r tap" onClick=${() => { closeSheet(); update(g, { done: !g.done }); }}><div class="rt">${g.done ? 'Mark as not done' : 'Mark as done'}</div></div>
+      <div class="r tap danger" onClick=${async () => { closeSheet(); if (await confirmSheet({ title: 'Delete this goal?', yes: 'Delete', danger: true })) remove(g); }}><div class="rt">Delete goal</div></div>
+    </div></div>`);
+  const GoalRow = ({ g }) => html`<div class="goal">
+    <button class=${'chk' + (g.done ? ' on' : '')} aria-label=${g.done ? 'Mark not done' : 'Mark done'} onClick=${() => update(g, { done: !g.done })}>
+      ${g.done && html`<${Icon} name="check" size=${14} />`}</button>
+    <div class="grow" onClick=${() => menu(g)}><b>${g.title}</b>${g.status_text && html`<p>${g.status_text}</p>`}</div>
+  </div>`;
+  return html`<div class="scr tabscr">
+    <${Head} title="Goals" sub="What you're working toward. I keep the status up to date." />
+    ${suggested.map((g) => html`<div class="card suggest" key=${g.id}><span class="tag">I suggest</span>
+      <b>${g.title}</b>${g.status_text && html`<p>${g.status_text}</p>`}
+      <div class="act"><button onClick=${() => update(g, { suggested: false })}>Add goal</button>
+      <button class="mu" onClick=${() => remove(g)}>No thanks</button></div></div>`)}
+    ${active.length > 0 && html`<div class="grp goals">${active.map((g) => html`<${GoalRow} g=${g} key=${g.id} />`)}</div>`}
+    ${!active.length && !suggested.length && html`<${Empty} icon="target" title="No goals yet">
+      Tell me what you're working toward, or add one below. I'll help you keep track.<//>`}
+    <form class="add-row" onSubmit=${add}>
+      <input class="field" value=${title} placeholder="Add a goal…" onInput=${(e) => setTitle(e.target.value)} />
+      <button class="b1 sm" disabled=${!title.trim()}>Add</button>
+    </form>
+    ${done.length > 0 && html`<button class="gl tap-gl" onClick=${() => setShowDone(!showDone)}>Done (${done.length}) ${showDone ? '▾' : '›'}</button>
+      ${showDone && html`<div class="grp goals">${done.map((g) => html`<${GoalRow} g=${g} key=${g.id} />`)}</div>`}`}
+  </div>`;
+}
+
+// ----------------------------------------------------------------- library
+
+const KIND_ICON = (mime) => (mime.startsWith('image/') ? 'image' : mime.includes('html') ? 'globe' : 'file');
+
+async function openItem(it) {
+  openSheet(() => html`<div class="sheet-body"><${Spinner} /></div>`);
+  try {
+    const path = `/library/${it.id}/content`;
+    let view;
+    if (it.mime.startsWith('image/')) view = html`<${Img} src=${`/api${path}`} cls="lib-full" alt=${it.title} />`;
+    else if (it.mime.startsWith('text/') || it.mime === 'application/json') {
+      const text = await api('GET', path, undefined, { raw: true }).then((r) => r.text());
+      view = it.mime === 'text/markdown' ? html`<div class="md doc" dangerouslySetInnerHTML=${{ __html: md(text) }} />`
+        : html`<pre class="doc">${text}</pre>`;
+    } else view = html`<p class="mu">I can't show this kind of file here, but you can download it.</p>`;
+    const url = await blobUrl(`/api${path}`);
+    openSheet(() => html`<div class="sheet-body tall">
+      <h3>${it.title}</h3>${it.description && html`<p class="mu">${it.description}</p>`}
+      ${view}
+      <div class="btns">
+        ${it.conversation_id && html`<button class="b2" onClick=${() => { closeSheet(); go(`chat/${it.conversation_id}`); }}>Open chat</button>`}
+        <a class="b1" href=${url} download=${it.title}>Download</a>
+      </div></div>`);
+  } catch (e) { closeSheet(); toast(e.message); }
+}
+
+function MadeByIris({ items, limit }) {
+  const media = items.filter((i) => i.mime.startsWith('image/'));
+  const docs = items.filter((i) => !i.mime.startsWith('image/'));
+  const shown = limit ? docs.slice(0, limit) : docs;
+  return html`${media.length > 0 && html`<div class="grid">${(limit ? media.slice(0, 6) : media).map((it) => html`
+      <button class="gi" onClick=${() => openItem(it)}><${Img} src=${`/api/library/${it.id}/content`} alt=${it.title} /></button>`)}</div>`}
+    ${shown.length > 0 && html`<div class="grp">${shown.map((it) => html`<div class="r tap" onClick=${() => openItem(it)}>
+      <div class="ri"><${Icon} name=${KIND_ICON(it.mime)} size=${17} /></div>
+      <div class="rt">${it.title}<small>${it.description || it.mime} · ${ago(it.created_at)}</small></div>
+      <${Icon} name="chev" size=${16} cls="rc" /></div>`)}</div>`}`;
+}
+
+function PhotoGrid({ photos, limit }) {
+  const list = limit ? photos.slice(0, limit) : photos;
+  return html`<div class="grid">${list.map((p) => html`<button class="gi" onClick=${() => set({ lightbox: `/api/attachments/${p.id}`, lightboxChat: p.conversation_id })}>
+    <${Img} src=${`/api/attachments/${p.id}`} alt="Photo you sent" /></button>`)}</div>`;
+}
+
+function Saved({ posts, limit }) {
+  const list = limit ? posts.slice(0, limit) : posts;
+  const show = (p) => openSheet(() => html`<div class="sheet-body tall flush"><${Post} p=${p} /></div>`);
+  return html`<div class="grp">${list.map((p) => html`<div class="r tap" onClick=${() => show(p)}>
+    <div class="ri thumb">${(p.images?.[0] || p.image_url) ? html`<${Img} src=${p.images?.[0] || p.image_url} alt="" />` : html`<${Icon} name="heart" size=${16} />`}</div>
+    <div class="rt">${p.title}<small>${p.source_name || hostOf(p.source_url) || p.topic || 'Saved post'}</small></div>
+    <${Icon} name="chev" size=${16} cls="rc" /></div>`)}</div>`;
+}
+
+export function LibraryScreen() {
+  useStore();
+  const [tab, setTab] = useState('all');
+  useEffect(() => { loadLibrary().catch((e) => toast(e.message)); }, []);
+  const lib = S.library;
+  const tabs = [['all', 'All'], ['made', 'Made by me'], ['photos', 'Photos'], ['saved', 'Saved']];
+  let body;
+  if (!lib) body = html`<${Spinner} />`;
+  else if (tab === 'made') body = lib.items.length ? html`<${MadeByIris} items=${lib.items} />` : html`<${Empty} icon="file" title="Nothing yet">Reports, drafts, and images I make for you land here.<//>`;
+  else if (tab === 'photos') body = lib.photos.length ? html`<${PhotoGrid} photos=${lib.photos} />` : html`<${Empty} icon="image" title="No photos yet">Photos you send me show up here.<//>`;
+  else if (tab === 'saved') body = lib.saved.length ? html`<${Saved} posts=${lib.saved} />` : html`<${Empty} icon="heart" title="Nothing saved">Tap ♡ on a post in For you to keep it here.<//>`;
+  else {
+    const any = lib.items.length || lib.photos.length || lib.saved.length;
+    body = any ? html`
+      ${lib.items.length > 0 && html`<div class="gl">Made by me</div><${MadeByIris} items=${lib.items} limit=${4} />`}
+      ${lib.photos.length > 0 && html`<div class="gl">Photos you sent</div><${PhotoGrid} photos=${lib.photos} limit=${6} />`}
+      ${lib.saved.length > 0 && html`<div class="gl">Saved posts</div><${Saved} posts=${lib.saved} limit=${4} />`}`
+      : html`<${Empty} icon="library" title="Your library is empty">Things I make for you, photos you send, and posts you save all collect here.<//>`;
+  }
+  return html`<div class="scr tabscr">
+    <${Head} title="Library" sub="What I've made, photos you sent, and posts you saved." />
+    <div class="pills">${tabs.map(([k, l]) => html`<button class=${tab === k ? 'on' : ''} onClick=${() => setTab(k)}>${l}</button>`)}</div>
+    ${body}
+  </div>`;
+}

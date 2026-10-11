@@ -1,0 +1,20 @@
+# Build output
+/target
+
+# Local runtime state never belongs in the repo
+logs/
+*.db
+*.db-wal
+*.db-shm
+
+# Environment variables / secrets
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Per-machine tool state
+.claude/settings.local.json
+.gstack/

@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iris test console</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 0; display: grid; grid-template-rows: auto 1fr auto; height: 100vh; }
+  header, footer { padding: 8px 12px; border-bottom: 1px solid #8884; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  footer { border-top: 1px solid #8884; border-bottom: 0; }
+  main { overflow: auto; padding: 12px; }
+  .msg { margin: 6px 0; padding: 8px 10px; border-radius: 10px; max-width: 80ch; white-space: pre-wrap; }
+  .user { background: #4a7dff22; margin-left: auto; }
+  .assistant { background: #8882; }
+  .system, .card { background: #ffb34722; }
+  .meta { font-size: 11px; opacity: .6; margin-top: 4px; }
+  .act { font-size: 12px; opacity: .7; }
+  input[type=text] { flex: 1; min-width: 12ch; padding: 6px; }
+  small { opacity: .7; }
+</style>
+</head>
+<body>
+<header>
+  <strong>Iris</strong>
+  <span id="pairbox">
+    <input id="code" type="text" placeholder="pairing code" size="12">
+    <button id="pair">Pair</button>
+  </span>
+  <select id="convs"></select>
+  <button id="newside">New side chat</button>
+  <button id="forget">Forget token</button>
+  <small id="status">not paired</small>
+</header>
+<main id="log"></main>
+<footer>
+  <input id="text" type="text" placeholder="Message" autocomplete="off">
+  <input id="file" type="file" accept="image/png,image/jpeg,image/gif,image/webp">
+  <button id="send">Send</button>
+  <button id="cancel">Stop</button>
+</footer>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let token = localStorage.getItem("iris.token") || "";
+let conv = "";
+let ws = null;
+const nodes = new Map();
+
+async function api(method, path, body, raw) {
+  const headers = { Authorization: "Bearer " + token };
+  let payload;
+  if (raw) { payload = raw; }
+  else if (body !== undefined) { headers["Content-Type"] = "application/json"; payload = JSON.stringify(body); }
+  const r = await fetch("/api" + path, { method, headers, body: payload });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((j.error && j.error.message) || r.status);
+  return j;
+}
+
+function status(t) { $("status").textContent = t; }
+
+function render(m) {
+  let el = nodes.get(m.id);
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "msg " + (m.kind === "card" ? "card" : m.role);
+    el.innerHTML = '<div class="body"></div><div class="acts"></div><div class="meta"></div>';
+    nodes.set(m.id, el);
+    $("log").appendChild(el);
+  }
+  let text = m.content || "";
+  if (m.kind === "card" && m.card) text = "[" + m.card.type + "] " + m.card.title + (m.card.url ? "\n" + m.card.url : "") + (m.card.body ? "\n" + m.card.body : "");
+  el.querySelector(".body").textContent = text;
+  const bits = [m.status];
+  if (m.model) bits.push(m.model + (m.effort ? "/" + m.effort : ""));
+  if (m.meta && m.meta.error) bits.push("error: " + m.meta.error.kind);
+  if (m.attachments && m.attachments.length) bits.push(m.attachments.length + " image(s)");
+  el.querySelector(".meta").textContent = bits.join(" · ");
+  $("log").scrollTop = $("log").scrollHeight;
+  return el;
+}
+
+async function loadConvs() {
+  const { conversations } = await api("GET", "/conversations");
+  $("convs").innerHTML = "";
+  for (const c of conversations) {
+    const o = document.createElement("option");
+    o.value = c.id; o.textContent = (c.kind === "main" ? "Main chat" : c.title || "Side chat") + " (" + c.kind + ")";
+    $("convs").appendChild(o);
+  }
+  if (!conv && conversations.length) conv = conversations[0].id;
+  $("convs").value = conv;
+  await loadMessages();
+}
+
+async function loadMessages() {
+  nodes.clear(); $("log").innerHTML = "";
+  if (!conv) return;
+  const { messages } = await api("GET", "/conversations/" + conv + "/messages?limit=100");
+  messages.forEach(render);
+}
+
+function connect() {
+  if (ws) ws.close();
+  const proto = location.protocol === "https:" ? "wss://" : "ws://";
+  ws = new WebSocket(proto + location.host + "/api/ws");
+  ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token }));
+  ws.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    if (ev.type === "ready") { status("connected · " + ev.settings.agent_name); }
+    else if (ev.type === "error") { status(ev.message); }
+    else if (ev.conversation_id && ev.conversation_id !== conv) { return; }
+    else if (ev.type === "message.created" || ev.type === "message.completed") { render(ev.message); }
+    else if (ev.type === "message.delta") {
+      const el = nodes.get(ev.message_id);
+      if (el) { el.querySelector(".body").textContent += ev.text; $("log").scrollTop = $("log").scrollHeight; }
+    } else if (ev.type === "message.activity") {
+      const el = nodes.get(ev.message_id);
+      if (el) {
+        const a = ev.activity, box = el.querySelector(".acts");
+        let line = box.querySelector('[data-id="' + CSS.escape(a.id) + '"]');
+        if (!line) { line = document.createElement("div"); line.className = "act"; line.dataset.id = a.id; box.appendChild(line); }
+        line.textContent = "⚙ " + a.name + " " + a.status + (a.summary ? " · " + a.summary : "");
+      }
+    } else if (ev.type === "turn.status") { status("turn " + ev.status); }
+  };
+  ws.onclose = () => { status("disconnected"); setTimeout(() => token && connect(), 3000); };
+}
+
+async function start() {
+  if (!token) { status("not paired"); return; }
+  $("pairbox").style.display = "none";
+  try { await loadConvs(); connect(); } catch (e) { status(String(e)); }
+}
+
+$("pair").onclick = async () => {
+  try {
+    const r = await fetch("/api/pair", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: $("code").value, device_name: "Test console" }) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error.message);
+    token = j.token; localStorage.setItem("iris.token", token); start();
+  } catch (e) { status(String(e)); }
+};
+$("forget").onclick = () => { localStorage.removeItem("iris.token"); location.reload(); };
+$("convs").onchange = () => { conv = $("convs").value; loadMessages(); };
+$("newside").onclick = async () => {
+  const { conversation } = await api("POST", "/conversations", { kind: "side", title: "Side chat" });
+  conv = conversation.id; loadConvs();
+};
+$("cancel").onclick = () => conv && api("POST", "/conversations/" + conv + "/cancel", {});
+async function send() {
+  const text = $("text").value.trim();
+  const f = $("file").files[0];
+  if (!text && !f) return;
+  const attachments = [];
+  try {
+    if (f) { const { attachment } = await api("POST", "/attachments", undefined, f); attachments.push(attachment.id); }
+    $("text").value = ""; $("file").value = "";
+    await api("POST", "/conversations/" + conv + "/messages", { text, attachments });
+  } catch (e) { status(String(e)); }
+}
+$("send").onclick = send;
+$("text").onkeydown = (e) => { if (e.key === "Enter") send(); };
+start();
+</script>
+</body>
+</html>

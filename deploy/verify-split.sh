@@ -1,0 +1,244 @@
+#!/bin/sh
+# Check the Iris privilege split made by deploy/setup-engines.sh. Read-only
+# except for two throwaway probe files it tries (and is expected to fail) to
+# create. Run once as root:
+#
+#   sudo sh deploy/verify-split.sh [--agent-user NAME] [--iris-bin PATH]
+#                                  [--engines-dir PATH] [--url URL]
+#
+# Defaults match setup-engines.sh: agent iris-agent, admin iris,
+# /usr/local/bin/iris, /opt/iris/engines, and http://127.0.0.1:7420.
+# Prints one line per check and exits non-zero if any check fails.
+set -u
+
+ADMIN_USER="iris"
+AGENT_USER="iris-agent"
+IRIS_BIN="/usr/local/bin/iris"
+ENGINES_DIR="/opt/iris/engines"
+URL="http://127.0.0.1:7420"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --agent-user) AGENT_USER="$2"; shift 2 ;;
+        --iris-bin) IRIS_BIN="$2"; shift 2 ;;
+        --engines-dir) ENGINES_DIR="$2"; shift 2 ;;
+        --url) URL="$2"; shift 2 ;;
+        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+        *) echo "unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run this as root: sudo sh $0" >&2
+    exit 2
+fi
+
+PASS=0
+FAIL=0
+WARN=0
+pass() { PASS=$((PASS + 1)); printf 'PASS  %s\n' "$*"; }
+fail() { FAIL=$((FAIL + 1)); printf 'FAIL  %s\n' "$*"; }
+warn() { WARN=$((WARN + 1)); printf 'WARN  %s\n' "$*"; }
+# Run as the agent account, the way the service does (no tty, own HOME).
+as_agent() { runuser -u "$AGENT_USER" -- env HOME="$AGENT_HOME" PATH=/usr/local/bin:/usr/bin:/bin "$@"; }
+
+echo "Iris privilege split: admin=$ADMIN_USER agent=$AGENT_USER engines=$ENGINES_DIR"
+echo
+
+# --- accounts
+if id "$ADMIN_USER" >/dev/null 2>&1; then pass "admin account $ADMIN_USER exists"; else fail "admin account $ADMIN_USER is missing"; fi
+if id "$AGENT_USER" >/dev/null 2>&1; then pass "agent account $AGENT_USER exists"; else fail "agent account $AGENT_USER is missing"; echo; echo "$FAIL failed"; exit 1; fi
+AGENT_HOME=$(getent passwd "$AGENT_USER" | cut -d: -f6)
+case "$(getent passwd "$ADMIN_USER" | cut -d: -f7)" in
+    */nologin|*/false) pass "$ADMIN_USER has no login shell" ;;
+    *) fail "$ADMIN_USER has a login shell" ;;
+esac
+if [ "$AGENT_USER" = "iris-agent" ]; then
+    case "$(getent passwd "$AGENT_USER" | cut -d: -f7)" in
+        */nologin|*/false) pass "$AGENT_USER has no login shell" ;;
+        *) fail "$AGENT_USER has a login shell" ;;
+    esac
+fi
+GROUPS_OF_AGENT=$(id -nG "$AGENT_USER")
+case " $GROUPS_OF_AGENT " in
+    *" sudo "*|*" wheel "*|*" admin "*|*" root "*|*" $ADMIN_USER "*) fail "$AGENT_USER is in a privileged group ($GROUPS_OF_AGENT)" ;;
+    *) pass "$AGENT_USER is in no admin group ($GROUPS_OF_AGENT)" ;;
+esac
+
+# --- binary and engines directory
+if [ -x "$IRIS_BIN" ] && [ "$(stat -c %u "$IRIS_BIN")" = 0 ] && [ -z "$(find "$IRIS_BIN" -perm /022)" ]; then
+    pass "$IRIS_BIN is root-owned and not writable by others"
+else
+    fail "$IRIS_BIN must exist, be owned by root, and not be group/other writable"
+fi
+if [ -d "$ENGINES_DIR" ] && [ "$(stat -c %U "$ENGINES_DIR")" = "$ADMIN_USER" ]; then
+    pass "$ENGINES_DIR is owned by $ADMIN_USER"
+else
+    fail "$ENGINES_DIR is missing or not owned by $ADMIN_USER"
+fi
+WRITABLE=$(find "$ENGINES_DIR" ! -type l -perm /022 2>/dev/null | head -3)
+if [ -z "$WRITABLE" ]; then pass "nothing in $ENGINES_DIR is group/other writable"; else fail "group/other writable in $ENGINES_DIR: $WRITABLE"; fi
+NOT_ADMIN=$(find "$ENGINES_DIR" ! -user "$ADMIN_USER" 2>/dev/null | head -3)
+if [ -z "$NOT_ADMIN" ]; then pass "everything in $ENGINES_DIR belongs to $ADMIN_USER"; else fail "not owned by $ADMIN_USER: $NOT_ADMIN"; fi
+PROBE="$ENGINES_DIR/.agent-write-probe-$$"
+if as_agent sh -c "touch '$PROBE'" 2>/dev/null; then fail "$AGENT_USER can write into $ENGINES_DIR"; rm -f "$PROBE"; else pass "$AGENT_USER cannot write into $ENGINES_DIR"; fi
+if as_agent test -w "$IRIS_BIN"; then fail "$AGENT_USER can modify $IRIS_BIN"; else pass "$AGENT_USER cannot modify $IRIS_BIN"; fi
+if [ -d "$ENGINES_DIR/bin" ]; then
+    if as_agent sh -c "ls '$ENGINES_DIR/bin' >/dev/null"; then pass "$AGENT_USER can list and run installed engines"; else fail "$AGENT_USER cannot read $ENGINES_DIR/bin"; fi
+else
+    warn "no engines installed yet ($ENGINES_DIR/bin missing); install one from the app, then re-run"
+fi
+
+# --- sudo rule
+SUDOERS=/etc/sudoers.d/iris-engines
+if [ -f "$SUDOERS" ] && visudo -cf "$SUDOERS" >/dev/null 2>&1; then pass "$SUDOERS parses (visudo)"; else fail "$SUDOERS is missing or invalid"; fi
+if [ "$(stat -c %a "$SUDOERS" 2>/dev/null)" = 440 ] && [ "$(stat -c %u "$SUDOERS" 2>/dev/null)" = 0 ]; then pass "$SUDOERS is root-owned, mode 0440"; else fail "$SUDOERS must be root-owned with mode 0440"; fi
+LIST=$(sudo -l -U "$AGENT_USER" 2>/dev/null | tr -s " \n\t" "   ")
+if printf '%s\n' "$LIST" | grep -Eq '\((ALL|root)[^)]*\)'; then
+    fail "$AGENT_USER may run commands as root or ALL: check sudo -l -U $AGENT_USER"
+else
+    pass "$AGENT_USER may not run anything as root"
+fi
+if printf '%s\n' "$LIST" | grep -Eq "$IRIS_BIN engines install claude --dir $ENGINES_DIR|IRIS_ENGINES"; then
+    pass "$AGENT_USER may run the 'iris engines' commands as $ADMIN_USER"
+else
+    fail "sudo -l -U $AGENT_USER does not show the iris engines commands"
+fi
+OUT=$(as_agent sudo -n -u "$ADMIN_USER" "$IRIS_BIN" engines list --dir "$ENGINES_DIR" 2>&1)
+case "$OUT" in
+    \[*) pass "the helper works: $AGENT_USER -> sudo -u $ADMIN_USER iris engines list" ;;
+    *) fail "the helper failed: $OUT" ;;
+esac
+if as_agent sudo -n -u "$ADMIN_USER" /bin/true 2>/dev/null; then fail "$AGENT_USER can run arbitrary commands as $ADMIN_USER"; else pass "$AGENT_USER cannot run other commands as $ADMIN_USER"; fi
+# Every effective grant (from any sudoers file) must be one of the exact
+# engine commands: take what sudo lists, remove the allowed commands and
+# the expected decorations, and nothing may be left.
+case "$LIST" in
+    *"may run the following commands"*)
+        REST=${LIST#*may run the following commands}
+        REST=${REST#*:}
+        for op in install update uninstall; do
+            for name in claude codex gemini opencode tts stt; do
+                REST=$(printf '%s' "$REST" | sed "s#$IRIS_BIN engines $op $name --dir $ENGINES_DIR##g")
+            done
+        done
+        REST=$(printf '%s' "$REST" | sed "s#$IRIS_BIN engines list --dir $ENGINES_DIR##g; s#IRIS_ENGINES##g; s#($ADMIN_USER)##g; s#NOPASSWD:##g; s#[ ,]##g")
+        if [ -z "$REST" ]; then
+            pass "$AGENT_USER's effective sudo rights are exactly the engine commands"
+        else
+            fail "$AGENT_USER has other sudo rights: $(printf '%s' "$REST" | cut -c1-120)"
+        fi
+        ;;
+    *) fail "could not read the output of sudo -l -U $AGENT_USER" ;;
+esac
+# Every allowed command must be an exact `iris engines ... --dir <engines dir>`
+# (checked from the rule list, without running anything).
+CMDS=$(sed -n '/^Cmnd_Alias IRIS_ENGINES/,/[^\\]$/p' "$SUDOERS" | sed 's/^Cmnd_Alias IRIS_ENGINES = //; s/\\$//' \
+    | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$')
+if grep -v '^#' "$SUDOERS" | grep -v '^Cmnd_Alias' | grep -v '^ ' | grep -v '^$' | grep -qv "^$AGENT_USER ALL=($ADMIN_USER) NOPASSWD: IRIS_ENGINES\$"; then
+    fail "$SUDOERS has rules other than the IRIS_ENGINES alias for $AGENT_USER"
+fi
+BAD=$(printf '%s\n' "$CMDS" | grep -v "^$IRIS_BIN engines [a-z]* *[a-z]* *--dir $ENGINES_DIR\$" | head -3)
+if [ -n "$CMDS" ] && [ -z "$BAD" ]; then
+    pass "every command $AGENT_USER may run as $ADMIN_USER is an exact 'iris engines ... --dir $ENGINES_DIR'"
+else
+    fail "unexpected sudo rule for $AGENT_USER: ${BAD:-none found}"
+fi
+if as_agent sudo -n true 2>/dev/null; then fail "$AGENT_USER can run commands as root"; else pass "$AGENT_USER cannot sudo to root"; fi
+
+# --- what the agent can see
+HUMAN=${SUDO_USER:-}
+if [ -n "$HUMAN" ] && [ "$HUMAN" != "$AGENT_USER" ] && [ "$HUMAN" != root ]; then
+    HUMAN_HOME=$(getent passwd "$HUMAN" | cut -d: -f6)
+    if as_agent ls "$HUMAN_HOME" >/dev/null 2>&1; then
+        warn "$AGENT_USER can list $HUMAN_HOME outside the service (chmod 750 $HUMAN_HOME to close it; the service itself runs with ProtectHome=yes)"
+    else
+        pass "$AGENT_USER cannot read $HUMAN_HOME"
+    fi
+fi
+if [ "$(stat -c %a "$AGENT_HOME")" = 700 ]; then pass "$AGENT_HOME is private (0700)"; else warn "$AGENT_HOME is mode $(stat -c %a "$AGENT_HOME"); 0700 keeps Iris data private"; fi
+if runuser -u "$ADMIN_USER" -- ls "$AGENT_HOME" >/dev/null 2>&1; then fail "$ADMIN_USER can read $AGENT_HOME"; else pass "$ADMIN_USER cannot read Iris's data in $AGENT_HOME"; fi
+
+if [ -e "$AGENT_HOME/.codex/AGENTS.md" ] || [ -e "$AGENT_HOME/.codex/AGENTS.override.md" ]; then
+    warn "$AGENT_HOME/.codex has global AGENTS.md instructions; they would reach everyone's turns, so Iris keeps Codex to the owner's own chats"
+fi
+
+# --- config and service
+CONF="$AGENT_HOME/.config/iris/config.toml"
+if [ -f "$CONF" ] && grep -q "^helper = \[\"sudo\", \"-n\", \"-u\", \"$ADMIN_USER\"" "$CONF" && grep -q "^dir = \"$ENGINES_DIR\"" "$CONF"; then
+    pass "$CONF uses the helper and $ENGINES_DIR"
+else
+    fail "$CONF must set [engines] dir = \"$ENGINES_DIR\" and the sudo helper"
+fi
+if [ "$AGENT_USER" = "iris-agent" ] || systemctl cat iris >/dev/null 2>&1; then
+    if [ "$(systemctl show iris -p User --value 2>/dev/null)" = "$AGENT_USER" ]; then pass "iris.service runs as $AGENT_USER"; else fail "iris.service does not run as $AGENT_USER"; fi
+    if [ "$(systemctl show iris -p ProtectHome --value 2>/dev/null)" = yes ]; then pass "iris.service hides /home (ProtectHome=yes)"; else fail "iris.service does not set ProtectHome=yes (people's homes are visible to every engine)"; fi
+    if [ "$(systemctl show iris -p NoNewPrivileges --value 2>/dev/null)" = no ]; then pass "iris.service allows sudo for the helper (NoNewPrivileges=no)"; else fail "iris.service sets NoNewPrivileges, which blocks the engine helper"; fi
+    if systemctl is-active --quiet iris; then
+        pass "iris.service is running"
+        PID=$(systemctl show iris -p MainPID --value)
+        if [ "$(stat -c %U "/proc/$PID")" = "$AGENT_USER" ]; then pass "the running process belongs to $AGENT_USER (pid $PID)"; else fail "the running process does not belong to $AGENT_USER"; fi
+        # The helper must also work inside the service's own sandbox: run it
+        # in a transient unit with every sandboxing property the service has.
+        PROPS=""
+        for p in User ProtectSystem ProtectHome PrivateTmp PrivateDevices ProtectKernelTunables \
+            ProtectKernelModules ProtectKernelLogs ProtectClock ProtectHostname ProtectControlGroups \
+            RestrictRealtime RestrictNamespaces LockPersonality MemoryDenyWriteExecute \
+            NoNewPrivileges RestrictSUIDSGID SystemCallArchitectures; do
+            v=$(systemctl show iris -p "$p" --value 2>/dev/null)
+            [ -n "$v" ] && PROPS="$PROPS -p $p=$v"
+        done
+        RW=$(systemctl show iris -p ReadWritePaths --value 2>/dev/null)
+        FILTER=$(systemctl show iris -p SystemCallFilter --value 2>/dev/null)
+        # The service's syscall filter goes into the probe too (it can block
+        # sudo); an empty value means none.
+        set -- -p ReadWritePaths="$RW"
+        [ -n "$FILTER" ] && set -- "$@" -p SystemCallFilter="$FILTER"
+        # shellcheck disable=SC2086
+        if systemd-run --wait --quiet --collect --pipe $PROPS "$@" \
+            sudo -n -u "$ADMIN_USER" "$IRIS_BIN" engines list --dir "$ENGINES_DIR" 2>/dev/null | grep -q '^\['; then
+            pass "the helper works inside the service's sandbox"
+        else
+            fail "the helper fails inside the service's sandbox (check NoNewPrivileges and seccomp options)"
+        fi
+        # Installs write the engines folder: the admin account must be able
+        # to, inside the same sandbox (ReadWritePaths).
+        PROBE_W="$ENGINES_DIR/.verify-write-$$"
+        ADMIN_PROPS=$(printf '%s' "$PROPS" | sed "s/-p User=[^ ]*/-p User=$ADMIN_USER/")
+        # shellcheck disable=SC2086
+        if systemd-run --wait --quiet --collect --pipe $ADMIN_PROPS "$@" \
+            /bin/sh -c "touch '$PROBE_W' && rm -f '$PROBE_W'" 2>/dev/null; then
+            pass "$ADMIN_USER can write $ENGINES_DIR inside the service's sandbox"
+        else
+            rm -f "$PROBE_W"
+            fail "$ADMIN_USER cannot write $ENGINES_DIR inside the service's sandbox (ReadWritePaths)"
+        fi
+    else
+        fail "iris.service is not running: journalctl -u iris -n 50"
+    fi
+else
+    # Existing-account mode: Iris is that account's systemd user service.
+    AUID=$(id -u "$AGENT_USER")
+    as_user() { runuser -u "$AGENT_USER" -- env HOME="$AGENT_HOME" XDG_RUNTIME_DIR="/run/user/$AUID" "$@"; }
+    if [ "$(as_user systemctl --user show iris -p NoNewPrivileges --value 2>/dev/null)" = no ]; then
+        pass "$AGENT_USER's iris user service allows sudo for the helper (NoNewPrivileges=no)"
+    else
+        fail "$AGENT_USER's iris user service sets NoNewPrivileges or was not found (systemctl --user cat iris)"
+    fi
+    if as_user systemctl --user is-active --quiet iris 2>/dev/null; then
+        pass "$AGENT_USER's iris user service is running"
+        if as_user systemd-run --user --wait --quiet --collect --pipe -p NoNewPrivileges=no \
+            sudo -n -u "$ADMIN_USER" "$IRIS_BIN" engines list --dir "$ENGINES_DIR" 2>/dev/null | grep -q '^\['; then
+            pass "the helper works from $AGENT_USER's user services"
+        else
+            fail "the helper fails from $AGENT_USER's user services"
+        fi
+    else
+        fail "$AGENT_USER's iris user service is not running (needs loginctl enable-linger $AGENT_USER)"
+    fi
+fi
+if command -v curl >/dev/null 2>&1; then
+    if curl -sf "$URL/api/health" | grep -q '"ok":true'; then pass "Iris answers at $URL"; else fail "no answer from $URL/api/health"; fi
+fi
+
+echo
+echo "$PASS passed, $FAIL failed, $WARN warnings"
+[ "$FAIL" -eq 0 ]

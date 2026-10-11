@@ -1,0 +1,220 @@
+# Iris model rankings (built in). Iris picks, for each slot, the highest
+# ranked model that is really available on this machine right now: its CLI
+# is installed, enabled, and signed in, and the CLI lists the model.
+#
+# Override or extend this table with `router.rankings_file` in config.toml.
+# Families in your file are checked before these; a slot list in your file
+# replaces the built-in list for that slot.
+#
+# Matching. A family matches a catalog model when one of its `models` globs
+# matches the model name (case-insensitive; `*` is any run of characters,
+# `?` one character) and none of its `exclude` globs do. For OpenCode the
+# name is the part after `provider/`, so `ollama/qwen3:8b` is matched as
+# `qwen3:8b`. Optional filters: `harnesses` (also the preferred order when
+# several CLIs can run the same model), `local` (true: only models served
+# on this machine or LAN; false: only hosted), `min_params_b` (parameter
+# count parsed from names such as `qwen3:32b` or `llama3.3-70b`).
+#
+# Within one ranking position, newer versions come first (numbers in the
+# name: gpt-6.1 > gpt-6, gemini-3 > gemini-2.5), or larger models first when
+# the family says `order = "largest"`. Then the preferred harness wins.
+# Models matching no listed family are still offered, ranked below all
+# listed ones.
+#
+# cost: free | low | medium | high (informational; shown in the app).
+
+# ---------------------------------------------------------------- Anthropic
+
+[[family]]
+id = "claude-haiku"
+label = "Claude Haiku"
+provider = "anthropic"
+models = ["haiku", "claude-haiku*", "claude-*-haiku*"]
+harnesses = ["claude", "opencode"]
+cost = "low"
+
+[[family]]
+id = "claude-sonnet"
+label = "Claude Sonnet"
+provider = "anthropic"
+models = ["sonnet", "claude-sonnet*", "claude-*-sonnet*"]
+harnesses = ["claude", "opencode"]
+cost = "medium"
+
+[[family]]
+id = "claude-opus"
+label = "Claude Opus"
+provider = "anthropic"
+models = ["opus", "claude-opus*", "claude-*-opus*"]
+harnesses = ["claude", "opencode"]
+cost = "high"
+
+[[family]]
+id = "claude-fable"
+label = "Claude Fable"
+provider = "anthropic"
+models = ["fable", "claude-fable*", "claude-*-fable*"]
+harnesses = ["claude", "opencode"]
+cost = "high"
+
+# ------------------------------------------------------------------- OpenAI
+
+[[family]]
+id = "gpt-luna"
+label = "GPT Luna"
+provider = "openai"
+models = ["gpt-*-luna*", "gpt-*luna*"]
+harnesses = ["codex", "opencode"]
+cost = "low"
+
+[[family]]
+id = "gpt-sol"
+label = "GPT Sol"
+provider = "openai"
+models = ["gpt-*-sol*"]
+harnesses = ["codex", "opencode"]
+cost = "medium"
+
+[[family]]
+id = "gpt-astra"
+label = "GPT Astra"
+provider = "openai"
+models = ["gpt-*-astra*"]
+harnesses = ["codex", "opencode"]
+cost = "high"
+
+[[family]]
+id = "gpt-mini"
+label = "GPT mini"
+provider = "openai"
+models = ["gpt-*-mini*", "gpt-*-nano*"]
+exclude = ["gpt-oss*"]
+harnesses = ["codex", "opencode"]
+cost = "low"
+
+# ------------------------------------------------------------------- Google
+
+[[family]]
+id = "gemini-flash-lite"
+label = "Gemini Flash-Lite"
+provider = "google"
+models = ["flash-lite", "gemini-*flash-lite*"]
+harnesses = ["gemini", "opencode"]
+cost = "low"
+
+[[family]]
+id = "gemini-flash"
+label = "Gemini Flash"
+provider = "google"
+models = ["flash", "gemini-*flash*"]
+exclude = ["*lite*", "*image*", "*live*", "*tts*", "*audio*"]
+harnesses = ["gemini", "opencode"]
+cost = "low"
+
+[[family]]
+id = "gemini-pro"
+label = "Gemini Pro"
+provider = "google"
+models = ["pro", "gemini-*pro*"]
+exclude = ["*image*", "*tts*", "*customtools*"]
+harnesses = ["gemini", "opencode"]
+cost = "medium"
+
+# --------------------------------------------- Open-weight families (any host)
+
+[[family]]
+id = "qwen"
+label = "Qwen"
+models = ["qwen*", "qwq*"]
+cost = "low"
+
+[[family]]
+id = "llama"
+label = "Llama"
+models = ["llama*", "*-llama*"]
+cost = "low"
+
+[[family]]
+id = "gemma"
+label = "Gemma"
+models = ["gemma*"]
+cost = "low"
+
+[[family]]
+id = "mistral"
+label = "Mistral"
+models = ["mistral*", "ministral*", "mixtral*", "magistral*", "devstral*"]
+cost = "low"
+
+[[family]]
+id = "deepseek"
+label = "DeepSeek"
+models = ["deepseek*"]
+cost = "low"
+
+[[family]]
+id = "gpt-oss"
+label = "gpt-oss"
+models = ["gpt-oss*"]
+cost = "low"
+
+[[family]]
+id = "phi"
+label = "Phi"
+models = ["phi*"]
+cost = "low"
+
+# ------------------------------------------- Local models (Ollama, LM Studio)
+
+[[family]]
+id = "local-large"
+label = "Local model (large)"
+models = ["*"]
+local = true
+min_params_b = 30
+order = "largest"
+cost = "free"
+
+[[family]]
+id = "local"
+label = "Local model"
+models = ["*"]
+local = true
+cost = "free"
+
+# -------------------------------------------------------------------- Slots
+#
+# chat         everyday personal conversations
+# chat_strong  escalation target for clearly hard requests
+# background   heartbeat and other scheduled jobs
+# feed         feed generation
+# classifier   optional helper for ambiguous effort decisions (off by default)
+
+[slots]
+chat = [
+  "claude-haiku", "gpt-luna", "gemini-flash", "local",
+  "gpt-mini", "gemini-flash-lite", "qwen", "llama", "gemma", "mistral",
+  "deepseek", "gpt-oss", "phi",
+  "claude-sonnet", "gpt-sol", "gemini-pro", "claude-opus", "gpt-astra", "claude-fable",
+]
+chat_strong = [
+  "claude-sonnet", "gpt-sol", "gemini-pro", "local-large",
+  "claude-opus", "gpt-astra", "claude-fable",
+  "qwen", "deepseek", "llama", "mistral", "gpt-oss", "gemma",
+  "claude-haiku", "gpt-luna", "gemini-flash", "local",
+]
+background = [
+  "claude-haiku", "gpt-luna", "gemini-flash", "local",
+  "gpt-mini", "gemini-flash-lite", "qwen", "llama", "gemma", "mistral",
+  "deepseek", "gpt-oss", "phi",
+  "gpt-sol", "gemini-pro", "claude-sonnet", "gpt-astra", "claude-opus", "claude-fable",
+]
+feed = [
+  "claude-haiku", "gpt-luna", "gemini-flash", "local",
+  "gpt-mini", "gemini-flash-lite", "qwen", "llama", "gemma", "mistral",
+  "deepseek", "gpt-oss", "phi",
+  "gpt-sol", "gemini-pro", "claude-sonnet", "gpt-astra", "claude-opus", "claude-fable",
+]
+classifier = [
+  "gemini-flash-lite", "gpt-mini", "claude-haiku", "gpt-luna", "gemini-flash", "local",
+]
