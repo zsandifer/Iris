@@ -329,11 +329,23 @@ pub fn list_ideas(
     user_id: &str,
     status: Option<&str>,
 ) -> rusqlite::Result<Vec<Idea>> {
+    list_ideas_limited(conn, user_id, status, 200)
+}
+
+/// `status` may list several, comma-separated (`open,started`), so done
+/// and dismissed ideas never crowd out the ones still to act on.
+pub fn list_ideas_limited(
+    conn: &Connection,
+    user_id: &str,
+    status: Option<&str>,
+    limit: usize,
+) -> rusqlite::Result<Vec<Idea>> {
     let mut stmt = conn.prepare(
-        "SELECT * FROM ideas WHERE user_id = ?1 AND (?2 IS NULL OR status = ?2)
-         ORDER BY created_at DESC LIMIT 200",
+        "SELECT * FROM ideas WHERE user_id = ?1
+           AND (?2 IS NULL OR instr(',' || ?2 || ',', ',' || status || ',') > 0)
+         ORDER BY created_at DESC LIMIT ?3",
     )?;
-    stmt.query_map(params![user_id, status], idea_from_row)?
+    stmt.query_map(params![user_id, status, limit as i64], idea_from_row)?
         .collect()
 }
 
@@ -1112,6 +1124,30 @@ mod tests {
         db.with(|c| {
             let owner = owner_user_id(c)?.unwrap();
             f(c, &owner)
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn open_ideas_are_never_crowded_out_by_dismissed_ones() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            let owner = owner_user_id(c)?.unwrap();
+            let old = create_idea(c, &owner, "Old but open", "", None)?;
+            for i in 0..250 {
+                let idea = create_idea(c, &owner, &format!("dismissed {i}"), "", None)?;
+                update_idea(c, &owner, &idea.id, Some("dismissed"), None)?;
+            }
+            let all = list_ideas(c, &owner, None)?;
+            assert!(
+                all.iter().all(|i| i.id != old.id),
+                "the cap hides it in the full list"
+            );
+            let active = list_ideas(c, &owner, Some("open,started"))?;
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].id, old.id);
+            assert_eq!(list_ideas(c, &owner, Some("dismissed"))?.len(), 200);
+            Ok(())
         })
         .unwrap();
     }

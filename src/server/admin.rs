@@ -73,8 +73,8 @@ pub fn routes() -> Router<AppState> {
 
 // ----------------------------------------------------------------- settings
 
-async fn get_settings(State(state): State<AppState>, _user: AuthUser) -> ApiResult {
-    ok(state.settings_json().await)
+async fn get_settings(State(state): State<AppState>, user: AuthUser) -> ApiResult {
+    ok(state.settings_json(user.user.is_owner).await)
 }
 
 #[derive(Deserialize)]
@@ -122,12 +122,7 @@ async fn put_settings(
             Ok(())
         })
         .await?;
-    let settings = state.settings_json().await;
-    state.hub.send(
-        Audience::All,
-        json!({"type": "settings.changed", "settings": settings}),
-    );
-    ok(settings)
+    ok(state.broadcast_settings().await)
 }
 
 async fn put_avatar(State(state): State<AppState>, user: AuthUser, body: Bytes) -> ApiResult {
@@ -141,12 +136,7 @@ async fn put_avatar(State(state): State<AppState>, user: AuthUser, body: Bytes) 
             db::set_setting(c, "agent_avatar_updated", &now_ms().to_string())
         })
         .await?;
-    let settings = state.settings_json().await;
-    state.hub.send(
-        Audience::All,
-        json!({"type": "settings.changed", "settings": settings}),
-    );
-    ok(settings)
+    ok(state.broadcast_settings().await)
 }
 
 async fn delete_avatar(State(state): State<AppState>, user: AuthUser) -> ApiResult {
@@ -155,12 +145,7 @@ async fn delete_avatar(State(state): State<AppState>, user: AuthUser) -> ApiResu
         .db
         .call(|c| db::delete_setting(c, "agent_avatar"))
         .await?;
-    let settings = state.settings_json().await;
-    state.hub.send(
-        Audience::All,
-        json!({"type": "settings.changed", "settings": settings}),
-    );
-    ok(settings)
+    ok(state.broadcast_settings().await)
 }
 
 const DEFAULT_AVATAR: &str = include_str!("avatar.svg");

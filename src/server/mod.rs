@@ -1168,9 +1168,27 @@ esac
             })
             .unwrap();
         assert!(!dump.contains("good-code") && !dump.contains("bad-code"));
-        // Non-owners cannot drive sign-in.
+        // Nobody unpaired, and no non-owner, can drive sign-in.
         let (s, _) = send(&h.app, "POST", "/api/harnesses/claude/login", None, None).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let (_, u) = send(
+            &h.app,
+            "POST",
+            "/api/users",
+            Some(&t),
+            Some(json!({"display_name": "Sam"})),
+        )
+        .await;
+        let sam = pair_as(&h, u["user"]["id"].as_str()).await;
+        for (method, uri, body) in [
+            ("POST", "/api/harnesses/claude/login", None),
+            ("GET", "/api/harnesses/claude/login", None),
+            ("POST", code_uri, Some(json!({"code": "x"}))),
+            ("DELETE", "/api/harnesses/claude/login", None),
+        ] {
+            let (s, _) = send(&h.app, method, uri, Some(&sam), body).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{method} {uri}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1312,6 +1330,53 @@ esac
             msgs.iter()
                 .any(|m| m.kind == "card" && m.content == "Tracking")
         );
+    }
+
+    #[tokio::test]
+    async fn feed_instructions_are_the_owner_s_alone() {
+        let h = setup();
+        let owner_t = pair_as(&h, None).await;
+        let (s, _) = send(
+            &h.app,
+            "PUT",
+            "/api/settings",
+            Some(&owner_t),
+            Some(json!({"feed_prompt": "owner-interest: rare orchids"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, u) = send(
+            &h.app,
+            "POST",
+            "/api/users",
+            Some(&owner_t),
+            Some(json!({"display_name": "Sam"})),
+        )
+        .await;
+        let sam = pair_as(&h, u["user"]["id"].as_str()).await;
+        let (_, mine) = send(&h.app, "GET", "/api/settings", Some(&owner_t), None).await;
+        assert_eq!(mine["feed_prompt"], "owner-interest: rare orchids");
+        let (_, theirs) = send(&h.app, "GET", "/api/settings", Some(&sam), None).await;
+        assert!(theirs["feed_prompt"].is_null(), "{theirs}");
+        assert!(!theirs.to_string().contains("orchids"));
+        let (s, _) = send(&h.app, "GET", "/api/feed/prompt", Some(&sam), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        // Broadcasts carry it only to the owner.
+        let mut rx = h.state.hub.subscribe();
+        send(
+            &h.app,
+            "PUT",
+            "/api/settings",
+            Some(&owner_t),
+            Some(json!({"feed_prompt": "orchids again"})),
+        )
+        .await;
+        let sam_id = u["user"]["id"].as_str().unwrap().to_string();
+        while let Ok(env) = rx.try_recv() {
+            if env.json.contains("orchids") {
+                assert!(!env.audience.includes(&sam_id), "{}", env.json);
+            }
+        }
     }
 
     #[tokio::test]
@@ -2325,6 +2390,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
     async fn joining_during_a_private_reply_withholds_it() {
         let t = turn_setup(|c| c.router.allow_claude_for_shared = true).await;
         let gid = t.create("group", &[]).await;
+        let mut rx = t.h.state.hub.subscribe();
         std::fs::write(t.dir.join("hold"), "").unwrap();
         let (s, b) = send(
             &t.h.app,
@@ -2374,6 +2440,18 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert_eq!(reply["content"], "");
         assert_eq!(reply["meta"]["activity"], json!([]));
         assert_eq!(t.runs(), 1, "no retry with the private context");
+        // The owner's app is told the reply ended (it was streaming).
+        let owner = t.h.state.db.with(db::owner_user_id).unwrap().unwrap();
+        let mut completed = false;
+        while let Ok(env) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&env.json).unwrap();
+            if v["type"] == "message.completed" && v["message"]["id"] == reply_id.as_str() {
+                assert!(env.audience.includes(&owner));
+                assert_eq!(v["message"]["content"], "");
+                completed = true;
+            }
+        }
+        assert!(completed, "the owner got the terminal event");
     }
 
     #[tokio::test]

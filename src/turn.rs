@@ -497,6 +497,14 @@ async fn run_locked(
             isolated: scope != Scope::Private,
             own_mcp_servers: Vec::new(),
         };
+        if spec.isolated
+            && let Err(why) = entry.harness.can_isolate()
+        {
+            crate::warn!("turn {msg_id}: {harness_name} cannot be isolated: {why}");
+            routing_notes.push(format!("{} could not be isolated", d.model));
+            excluded.push(harness_name);
+            continue;
+        }
         if spec.isolated {
             match own_mcp_servers(state, entry, &program).await {
                 Some(names) => spec.own_mcp_servers = names,
@@ -754,6 +762,8 @@ async fn refine_with_model(
     let m = catalog.get(&model_id)?;
     let entry = state.harness(&m.harness)?;
     let program = entry.program()?;
+    // The classifier always runs isolated (it needs nothing of the CLI's).
+    entry.harness.can_isolate().ok()?;
     let effort = pin
         .and_then(|p| p.effort)
         .or_else(|| crate::ranking::default_effort(m));
@@ -1064,6 +1074,7 @@ async fn finish(
     // (held back as `pending` until now).
     let (m, c, s, mut mt) = (msg_id.clone(), content, status, meta);
     let (conv, private_owner) = (conv_id.clone(), audience.private_owner.clone());
+    let audience_private_owner = audience.private_owner.clone();
     let saved = state
         .db
         .call(move |db| {
@@ -1102,9 +1113,16 @@ async fn finish(
         }
     };
     crate::info!("turn {msg_id}: {} in {duration_ms}ms", message.status);
+    let withheld = audience.privacy_lost;
     let audience = audience.current(state).await.to_vec();
+    // A withheld reply streams to nobody any more, but its owner's app
+    // still shows it running: the (empty, cancelled) result ends it.
+    let completed_to = match (&audience_private_owner, withheld) {
+        (Some(owner), true) => vec![owner.clone()],
+        _ => audience.clone(),
+    };
     state.hub.to_users(
-        &audience,
+        &completed_to,
         json!({"type": "message.completed", "conversation_id": conv_id, "message": message}),
     );
 

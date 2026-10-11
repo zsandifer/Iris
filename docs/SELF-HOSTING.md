@@ -368,9 +368,11 @@ Contributor notes, architecture, and invariants are in
   servers (including claude.ai connectors), CLAUDE.md files, and auto
   memory; Codex's MCP servers, ChatGPT apps, plugins, and memories; Gemini
   CLI's MCP servers and extensions; OpenCode's plugins and Claude Code
-  files. Gemini CLI's global `GEMINI.md` context and MCP servers in
-  OpenCode's own global config still apply, so keep personal details out
-  of those if you add people.
+  files. Codex always loads a global `AGENTS.md` (or `AGENTS.override.md`)
+  from its home folder and cannot be told not to, so while one exists Iris
+  does not use Codex for other people's chats. Gemini CLI's global
+  `GEMINI.md` context and MCP servers in OpenCode's own global config still
+  apply, so keep personal details out of those if you add people.
 - **Gemini CLI and OpenCode sign-in from the app**: both need one step on
   the server (see above).
 

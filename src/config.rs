@@ -522,6 +522,34 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
 }
 
 /// Atomically write a file readable only by the owner.
+/// Create `path` (0600) with `contents` only if it does not exist yet, as
+/// one atomic step: a complete private file is hard-linked into place, which
+/// fails if another process created it first. Returns false if it existed.
+/// For keys: two processes starting at once must not each write their own.
+pub fn create_private_file_once(path: &Path, contents: &[u8]) -> Result<bool> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".{}.tmp", crate::util::new_id()));
+    let tmp = path.with_file_name(tmp_name);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;

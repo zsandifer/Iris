@@ -6,7 +6,6 @@
 //! `<data_dir>/vapid.json` (0600). Payloads are small JSON objects:
 //! `{"title", "body", "conversation_id", "message_id", "kind"}`.
 
-use crate::config::write_private_file;
 use crate::util::{Result, random_bytes};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes128Gcm, Nonce};
@@ -72,7 +71,13 @@ impl VapidKeys {
                     private_key: B64URL.encode(keys.secret.to_bytes()),
                     public_key: keys.public_key_b64.clone(),
                 };
-                write_private_file(path, serde_json::to_string_pretty(&file)?.as_bytes())?;
+                // Only the first of two concurrent creators wins.
+                if !crate::config::create_private_file_once(
+                    path,
+                    serde_json::to_string_pretty(&file)?.as_bytes(),
+                )? {
+                    return Self::load_or_create(path);
+                }
                 Ok(keys)
             }
             Err(e) => Err(e.into()),

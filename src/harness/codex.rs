@@ -49,6 +49,22 @@ fn toml_str_array(items: &[String]) -> String {
     toml::Value::Array(items.iter().cloned().map(toml::Value::String).collect()).to_string()
 }
 
+/// Codex's home: `CODEX_HOME`, else `~/.codex`.
+fn codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))
+}
+
+/// Whether Codex would load global instructions from `home` (only whether a
+/// non-empty file exists is checked; it is never read).
+fn has_global_instructions(home: &Path) -> bool {
+    ["AGENTS.override.md", "AGENTS.md"]
+        .iter()
+        .any(|f| std::fs::metadata(home.join(f)).is_ok_and(|m| m.is_file() && m.len() > 0))
+}
+
 /// The only developer instructions on the command line: where to find the
 /// real ones.
 const DEVELOPER_NOTE: &str = "The first message of this conversation begins with \
@@ -226,6 +242,10 @@ impl Harness for Codex {
             for f in ["apps", "plugins", "memories"] {
                 overrides.push(format!("features.{f}=false"));
             }
+            // No AGENTS.md from the shared workspace (an owner's turn could
+            // have written one). The global one cannot be switched off; see
+            // `can_isolate`.
+            overrides.push("project_doc_max_bytes=0".into());
             for name in &spec.own_mcp_servers {
                 if spec.mcp_servers.iter().any(|s| &s.name == name) {
                     continue;
@@ -266,6 +286,19 @@ impl Harness for Codex {
 
     fn auth_probe_args(&self) -> Option<Vec<String>> {
         Some(vec!["login".into(), "status".into()])
+    }
+
+    /// Codex always loads its home's AGENTS.md (the owner's own notes to
+    /// Codex) and has no setting to skip it, so it is not used for other
+    /// people's chats while one exists.
+    fn can_isolate(&self) -> std::result::Result<(), String> {
+        match codex_home() {
+            Some(home) if has_global_instructions(&home) => Err(format!(
+                "{} has AGENTS.md instructions Codex always loads",
+                home.display()
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Codex merges `-c mcp_servers` with its own config, so its own
@@ -787,6 +820,7 @@ mod tests {
             !inv.args
                 .contains(&"mcp_servers.notes.enabled=false".to_string())
         );
+        assert!(inv.args.contains(&"project_doc_max_bytes=0".to_string()));
         spec.own_mcp_servers = vec!["has space".into()];
         assert!(h.build(&spec).is_err(), "unknown servers are never left on");
         assert_eq!(
@@ -796,6 +830,22 @@ mod tests {
         assert_eq!(h.parse_own_mcp_servers("[]"), Some(vec![]));
         assert_eq!(h.parse_own_mcp_servers("not json"), None);
         assert_eq!(h.parse_own_mcp_servers(r#"[{"nom": "x"}]"#), None);
+    }
+
+    #[test]
+    fn global_instructions_block_isolation() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!has_global_instructions(tmp.path()));
+        std::fs::write(tmp.path().join("AGENTS.md"), "").unwrap();
+        assert!(
+            !has_global_instructions(tmp.path()),
+            "empty file loads nothing"
+        );
+        std::fs::write(tmp.path().join("AGENTS.override.md"), "owner notes").unwrap();
+        assert!(has_global_instructions(tmp.path()));
+        std::fs::remove_file(tmp.path().join("AGENTS.override.md")).unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "owner notes").unwrap();
+        assert!(has_global_instructions(tmp.path()));
     }
 
     #[test]
