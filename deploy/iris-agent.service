@@ -1,0 +1,60 @@
+# Iris as a system service running as its own account (the "agent user"),
+# separate from the "iris" admin account that owns and updates the engines.
+#
+# deploy/setup-engines.sh installs this file as /etc/systemd/system/iris.service
+# with the placeholders filled in; you do not need to copy it yourself.
+#
+#   @AGENT@        account Iris runs as (default iris-agent)
+#   @AGENT_HOME@   its home, holding Iris's config and data (default /var/lib/iris-agent)
+#   @IRIS_BIN@     root-owned iris binary (default /usr/local/bin/iris)
+#   @ENGINES_DIR@  engines directory owned by the admin account (default /opt/iris/engines)
+#
+# Logs: journalctl -u iris -f
+
+[Unit]
+Description=Iris personal AI agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@AGENT@
+Group=@AGENT@
+Environment=HOME=@AGENT_HOME@
+WorkingDirectory=@AGENT_HOME@
+ExecStart=@IRIS_BIN@ serve
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+# Engines installed from the app live in @ENGINES_DIR@ and are found
+# automatically; the rest of PATH is for system tools (node, tar, bzip2).
+Environment=PATH=@ENGINES_DIR@/bin:/usr/local/bin:/usr/bin:/bin
+
+# Iris never needs API keys: the CLIs use their own subscription sign-in.
+UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY CODEX_API_KEY GEMINI_API_KEY GOOGLE_API_KEY
+
+# Hardening. The agent account (and every CLI it runs) sees no /home, writes
+# only its own home, and cannot change the engines: @ENGINES_DIR@ is listed
+# below only so the admin account's install helper (run through sudo, in this
+# same sandbox) can write it; file permissions keep the agent out.
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=@AGENT_HOME@ @ENGINES_DIR@ -/run/sudo -/run/sudo-rs
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# sudo (the engine helper) is setuid, so new privileges must stay allowed;
+# the sudoers rule limits it to exact `iris engines ...` commands.
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

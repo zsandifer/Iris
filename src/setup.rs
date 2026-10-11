@@ -404,3 +404,55 @@ pub async fn update_setup_card(state: &AppState) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `deploy/setup-engines.sh --dry-run` writes the sudo rule, service,
+    /// and config it would install; check them without root.
+    #[test]
+    fn privilege_split_setup_dry_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/deploy/setup-engines.sh");
+        let out = std::process::Command::new("sh")
+            .arg(script)
+            .arg("--dry-run")
+            .env("DESTDIR", tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let read = |p: &str| std::fs::read_to_string(tmp.path().join(p)).unwrap();
+        // The agent may run exactly `iris engines <op> <name> --dir <root>`
+        // for every engine, and nothing else.
+        let sudoers = read("etc/sudoers.d/iris-engines");
+        for e in ENGINES {
+            for op in ["install", "update", "uninstall"] {
+                let cmd = format!(
+                    "/usr/local/bin/iris engines {op} {} --dir /opt/iris/engines",
+                    e.name
+                );
+                assert!(sudoers.contains(&cmd), "missing: {cmd}");
+            }
+        }
+        assert!(sudoers.contains("iris-agent ALL=(iris) NOPASSWD: IRIS_ENGINES"));
+        assert!(!sudoers.contains('*'), "no wildcards");
+        // The config the service uses parses and points at the helper.
+        let cfg =
+            crate::config::Config::parse(&read("var/lib/iris-agent/.config/iris/config.toml"))
+                .unwrap();
+        assert_eq!(cfg.engines.dir, "/opt/iris/engines");
+        assert_eq!(
+            cfg.engines.helper,
+            ["sudo", "-n", "-u", "iris", "/usr/local/bin/iris", "engines"]
+        );
+        let unit = read("etc/systemd/system/iris.service");
+        assert!(!unit.contains('@'), "placeholders filled in");
+        assert!(unit.contains("User=iris-agent") && unit.contains("ProtectHome=yes"));
+        assert!(unit.contains("ReadWritePaths=/var/lib/iris-agent /opt/iris/engines"));
+    }
+}
