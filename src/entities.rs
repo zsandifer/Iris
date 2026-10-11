@@ -501,6 +501,13 @@ pub struct LibraryItem {
     pub updated_at: i64,
 }
 
+/// Library columns. Items saved during a background job keep no chat link:
+/// job conversations are hidden, so there is nothing to open.
+const LIBRARY_SELECT: &str = "SELECT l.id, l.kind, l.title, l.description, l.mime, l.file_name,
+        l.size, CASE WHEN c.kind = 'job' THEN NULL ELSE l.conversation_id END AS conversation_id,
+        l.created_at, l.updated_at
+    FROM library_items l LEFT JOIN conversations c ON c.id = l.conversation_id";
+
 fn library_from_row(r: &rusqlite::Row) -> rusqlite::Result<LibraryItem> {
     Ok(LibraryItem {
         id: r.get("id")?,
@@ -559,7 +566,7 @@ pub fn get_library_item(
     id: &str,
 ) -> rusqlite::Result<Option<LibraryItem>> {
     conn.query_row(
-        "SELECT * FROM library_items WHERE id = ?1 AND user_id = ?2",
+        &format!("{LIBRARY_SELECT} WHERE l.id = ?1 AND l.user_id = ?2"),
         params![id, user_id],
         library_from_row,
     )
@@ -571,10 +578,10 @@ pub fn list_library(
     user_id: &str,
     kind: Option<&str>,
 ) -> rusqlite::Result<Vec<LibraryItem>> {
-    let mut stmt = conn.prepare(
-        "SELECT * FROM library_items WHERE user_id = ?1 AND (?2 IS NULL OR kind = ?2)
-         ORDER BY created_at DESC LIMIT 500",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "{LIBRARY_SELECT} WHERE l.user_id = ?1 AND (?2 IS NULL OR l.kind = ?2)
+         ORDER BY l.created_at DESC LIMIT 500"
+    ))?;
     stmt.query_map(params![user_id, kind], library_from_row)?
         .collect()
 }
@@ -1075,6 +1082,49 @@ mod tests {
         db.with(|c| {
             let owner = owner_user_id(c)?.unwrap();
             f(c, &owner)
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn job_artifacts_have_no_chat_link() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            let owner = owner_user_id(c)?.unwrap();
+            let main = crate::db::ensure_main_conversation(c, &owner)?;
+            let job = crate::db::ensure_job_conversation(c, &owner, "heartbeat")?;
+            for (id, conv) in [("a1", &main), ("a2", &job)] {
+                insert_library_item(
+                    c,
+                    &owner,
+                    &NewLibraryItem {
+                        id,
+                        kind: "artifact",
+                        title: id,
+                        description: "",
+                        mime: "text/markdown",
+                        file_name: &format!("{id}.md"),
+                        size: 1,
+                        conversation_id: Some(conv),
+                    },
+                )?;
+            }
+            let items = list_library(c, &owner, None)?;
+            let link = |id: &str| {
+                items
+                    .iter()
+                    .find(|i| i.id == id)
+                    .unwrap()
+                    .conversation_id
+                    .clone()
+            };
+            assert_eq!(link("a1").as_deref(), Some(main.as_str()));
+            assert_eq!(link("a2"), None);
+            assert_eq!(
+                get_library_item(c, &owner, "a2")?.unwrap().conversation_id,
+                None
+            );
+            Ok(())
         })
         .unwrap();
     }

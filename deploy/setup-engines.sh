@@ -42,27 +42,46 @@ if [ ! -x "$IRIS_BIN" ]; then
     echo "$IRIS_BIN is missing. Install it first, e.g.: install -Dm755 target/release/iris $IRIS_BIN" >&2
     exit 1
 fi
-# The sudo rule runs this file as the admin user, so nobody else may be able
-# to change it: a real file (no symlinks anywhere in its path), owned by
-# root and not writable by group or others, in directories that are all
-# owned by root and not writable by group or others.
-case "$IRIS_BIN" in
-    /*) ;;
-    *) echo "Give the iris binary as an absolute path." >&2; exit 1 ;;
-esac
-if [ "$(readlink -f "$IRIS_BIN")" != "$IRIS_BIN" ]; then
-    echo "$IRIS_BIN must be a real path without symlinks (use $(readlink -f "$IRIS_BIN"))." >&2
-    exit 1
-fi
-p="$IRIS_BIN"
-while :; do
-    if [ "$(stat -c %u "$p")" != "0" ] || [ $(( 0$(stat -c %a "$p") & 022 )) -ne 0 ]; then
-        echo "$p must be owned by root and not writable by group or others, so the agent user cannot replace $IRIS_BIN." >&2
+# Only root may be able to change what this script trusts: the paths must be
+# real (no symlinks anywhere) and every existing component owned by root and
+# not writable by group or others. Otherwise the agent user could swap the
+# helper binary, or point the engines directory at something root would then
+# hand over to the admin user.
+require_root_chain() { # path, what it is
+    case "$1" in
+        /*) ;;
+        *) echo "Give the $2 as an absolute path." >&2; exit 1 ;;
+    esac
+    p="$1"
+    while [ ! -e "$p" ] && [ ! -L "$p" ]; do p="$(dirname "$p")"; done
+    if [ "$(readlink -f "$p")" != "$p" ]; then
+        echo "The $2 must be a real path without symlinks ($p is one, or is inside one)." >&2
         exit 1
     fi
-    [ "$p" = / ] && break
-    p="$(dirname "$p")"
-done
+    while :; do
+        if [ "$(stat -c %u "$p")" != "0" ] || [ $(( 0$(stat -c %a "$p") & 022 )) -ne 0 ]; then
+            echo "$p must be owned by root and not writable by group or others, so the agent user cannot tamper with the $2." >&2
+            exit 1
+        fi
+        [ "$p" = / ] && break
+        p="$(dirname "$p")"
+    done
+}
+# The sudo rule runs this file as the admin user.
+require_root_chain "$IRIS_BIN" "iris binary"
+# The engines directory itself is the admin user's after a first run.
+if [ -e "$ENGINES_DIR" ] || [ -L "$ENGINES_DIR" ]; then
+    if [ -L "$ENGINES_DIR" ] || [ ! -d "$ENGINES_DIR" ]; then
+        echo "$ENGINES_DIR must be a directory, not a symlink or file." >&2
+        exit 1
+    fi
+    owner="$(stat -c %U "$ENGINES_DIR")"
+    if [ "$owner" != root ] && [ "$owner" != "$ADMIN_USER" ]; then
+        echo "$ENGINES_DIR is owned by $owner; use a new directory." >&2
+        exit 1
+    fi
+fi
+require_root_chain "$(dirname "$ENGINES_DIR")" "engines directory"
 
 # 1. The admin user: no login shell, owns the engines.
 if ! id "$ADMIN_USER" >/dev/null 2>&1; then

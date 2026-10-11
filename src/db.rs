@@ -328,9 +328,8 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
         if i + 1 == UNIQUE_TIMESTAMPS_VERSION {
-            for table in ["messages", "feed_posts"] {
-                spread_timestamps(&tx, table)?;
-            }
+            spread_message_timestamps(&tx)?;
+            spread_timestamps(&tx, "feed_posts")?;
         }
         tx.pragma_update(None, "user_version", (i + 1) as i64)?;
         tx.commit()?;
@@ -340,6 +339,38 @@ fn migrate(conn: &mut Connection) -> Result<()> {
 
 /// Schema version from which message and feed timestamps are unique.
 const UNIQUE_TIMESTAMPS_VERSION: usize = 3;
+
+/// Spread message timestamps, moving each harness session's watermark with
+/// the newest message it had seen, so nothing it already has is replayed.
+fn spread_message_timestamps(conn: &Connection) -> rusqlite::Result<()> {
+    let sessions: Vec<(String, String, i64)> = conn
+        .prepare("SELECT conversation_id, harness, synced_at FROM harness_sessions")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut anchors = Vec::new();
+    for (conv, harness, synced) in sessions {
+        let anchor: Option<i64> = conn
+            .query_row(
+                "SELECT rowid FROM messages WHERE conversation_id = ?1 AND created_at <= ?2
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![conv, synced],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(rowid) = anchor {
+            anchors.push((conv, harness, rowid));
+        }
+    }
+    spread_timestamps(conn, "messages")?;
+    for (conv, harness, rowid) in anchors {
+        conn.execute(
+            "UPDATE harness_sessions SET synced_at = (SELECT created_at FROM messages WHERE rowid = ?3)
+             WHERE conversation_id = ?1 AND harness = ?2",
+            params![conv, harness, rowid],
+        )?;
+    }
+    Ok(())
+}
 
 /// Make `created_at` unique across `table`: rows written in the same
 /// millisecond before timestamps were allocated uniquely move forward a
@@ -1476,9 +1507,36 @@ mod tests {
             }
             tx.commit().unwrap();
         }
+        // A session that had seen everything up to the ties.
+        {
+            let conn = Connection::open(&path).unwrap();
+            let main: String = conn
+                .query_row(
+                    "SELECT conversation_id FROM messages WHERE id = 'm0'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO harness_sessions (conversation_id, harness, session_id, synced_at, updated_at)
+                 VALUES (?1, 'codex', 's1', 5000, 0)",
+                params![main],
+            )
+            .unwrap();
+        }
         let db = Db::open(&path).unwrap();
         db.with(|c| {
             let owner = owner_user_id(c)?.unwrap();
+            let main: String = c.query_row(
+                "SELECT conversation_id FROM messages WHERE id = 'm0'",
+                [],
+                |r| r.get(0),
+            )?;
+            let session = get_harness_session(c, &main, "codex")?.unwrap();
+            assert!(
+                replay_messages(c, &main, session.synced_at, i64::MAX, 40)?.is_empty(),
+                "nothing the session saw is replayed"
+            );
             // Two per page: every tied row still shows up exactly once.
             let (mut seen, mut before) = (Vec::new(), None);
             loop {
