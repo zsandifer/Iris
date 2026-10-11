@@ -1,7 +1,7 @@
 // Chat: messages, live status phrases, receipts, cards, and the composer.
 import { html, useEffect, useLayoutEffect, useRef, useState } from './h.js';
-import { post, api } from './api.js';
-import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId } from './store.js';
+import { post, put, api } from './api.js';
+import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId, isOwner } from './store.js';
 import { Icon, Img, Avatar, agentName, stamp, Spinner } from './ui.js';
 import { md } from './md.js';
 import { Card } from './cards.js';
@@ -49,6 +49,8 @@ function Assistant({ m, list }) {
   if (m.status === 'streaming') {
     const text = live?.text || '';
     const running = (live?.acts || []).some((a) => a.status === 'started');
+    const waiting = list.some((x) => x.card?.type === 'approval' && x.card.turn_message_id === m.id && x.card.state === 'pending');
+    if (waiting) return html`${text && html`<div class="b" dangerouslySetInnerHTML=${{ __html: md(text) }} />`}<div class="status shimmer" aria-live="polite">Waiting for your OK…</div>`;
     if (!text) return html`<${StatusLine} live=${live} />`;
     return html`<div class="b" dangerouslySetInnerHTML=${{ __html: md(text) }} />
       ${running && html`<${StatusLine} live=${live} />`}`;
@@ -64,7 +66,7 @@ function Assistant({ m, list }) {
   return html`<${Receipt} meta=${m.meta} />
     ${content ? html`<div class=${'b' + (failed ? ' b-err' : '')} dangerouslySetInnerHTML=${{ __html: md(content) }} />`
       : m.status === 'cancelled' ? html`<div class="note">Stopped.</div>` : null}
-    ${failed && retryFor(list, m) && html`<button class="retry" onClick=${retry}><${Icon} name="refresh" size=${15} /> Try again</button>`}`;
+    ${failed && m.meta?.error?.kind !== 'paused' && retryFor(list, m) && html`<button class="retry" onClick=${retry}><${Icon} name="refresh" size=${15} /> Try again</button>`}`;
 }
 
 function Message({ m, list, members }) {
@@ -96,6 +98,17 @@ function NotifyPrompt() {
     <p>I'll notify you when I finish something, unless this chat is open.</p>
     <div class="act"><button onClick=${on}>Turn on</button><button class="mu" onClick=${dismiss}>Not now</button></div>
   </div>`;
+}
+
+/** Shown while the owner has paused Iris. */
+function PausedBanner() {
+  if (!S.settings?.paused) return null;
+  const resume = async () => {
+    try { await put('/safety', { paused: false }); toast(`${agentName()} is back`); } catch (e) { toast(e.message); }
+  };
+  return html`<div class="paused-bar" role="status"><${Icon} name="pause" size=${15} />
+    <span class="grow">${agentName()} is paused and won't reply or do anything until you resume.</span>
+    ${isOwner() && html`<button class="b1 sm" onClick=${resume}>Resume</button>`}</div>`;
 }
 
 function Welcome() {
@@ -158,15 +171,25 @@ export function ChatScreen({ cid }) {
   };
 
   const running = list.some((m) => m.status === 'streaming');
+  // Approval cards belong before the reply of the turn that asked.
+  const asks = {};
+  for (const m of list) {
+    const t = m.card?.type === 'approval' && m.card.turn_message_id;
+    if (t && list.some((x) => x.id === t)) (asks[t] ||= []).push(m);
+  }
+  const held = new Set(Object.values(asks).flat().map((m) => m.id));
   let prev = 0;
   const rows = [];
   for (const m of list) {
+    if (held.has(m.id)) continue;
     if (!prev || m.created_at - prev > GAP) rows.push(html`<div class="ts" key=${'t' + m.id}>${stamp(m.created_at)}</div>`);
     prev = m.created_at;
+    for (const a of asks[m.id] || []) rows.push(html`<div class="row" key=${a.id}><${Message} m=${a} list=${list} members=${members} /></div>`);
     rows.push(html`<div class="row" key=${m.id}><${Message} m=${m} list=${list} members=${members} /></div>`);
   }
   const isMain = cid === mainId();
-  return html`<div class="chat">
+  return html`<div class=${'chat' + (S.settings?.paused ? ' paused' : '')}>
+    <${PausedBanner} />
     <div class="scr" ref=${scr} onScroll=${onScroll}>
       ${box?.loading && box?.hasMore && html`<${Spinner} />`}
       ${!box ? html`<${Spinner} />` : !list.length && isMain ? html`<${Welcome} />` : null}

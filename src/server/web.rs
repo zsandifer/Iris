@@ -41,6 +41,7 @@ pub static ASSETS: &[Asset] = assets![
     "js/app.js" => JS,
     "js/cards.js" => JS,
     "js/chat.js" => JS,
+    "js/connect.js" => JS,
     "js/feed.js" => JS,
     "js/h.js" => JS,
     "js/hub.js" => JS,

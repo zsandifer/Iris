@@ -8,7 +8,8 @@ import { Icon, Avatar, Img, Sheet, agentName, promptSheet, confirmSheet, openShe
 import { ChatScreen } from './chat.js';
 import { FeedScreen, StoryViewer } from './feed.js';
 import { IdeasScreen, GoalsScreen, LibraryScreen } from './lists.js';
-import { Hub, Connections, ConnectorForm, Logins, Computer, Files, FileEditor, Folder } from './hub.js';
+import { Hub, Logins, Computer, Files, FileEditor, Folder } from './hub.js';
+import { Connections, AddService, ConnectorPage, ConnectorForm, TrustedPeople } from './connect.js';
 import { Settings, AiEngine, Devices, People, ActivityLog } from './settings.js';
 import { isIOS, standalone } from './push.js';
 
@@ -155,12 +156,13 @@ function TopBar() {
   const busy = Object.keys(S.live).length > 0;
   let line = 'here for you';
   if (!S.online) line = 'reconnecting…';
+  else if (S.settings?.paused) line = 'paused';
   else if (S.route.tab === 'chat' && conv && conv.kind !== 'main') line = title(conv);
   else if (busy) line = 'working on it';
   return html`<header class="top">
     <button class="btn" aria-label="Menu" onClick=${() => set({ drawer: true })}><${Icon} name="menu" /></button>
     <button class="who-btn" onClick=${() => go('iris')} aria-label=${`${agentName()} profile`}><${Avatar} size=${36} /></button>
-    <div class="grow"><div class="nm">${agentName()}</div><div class=${'st' + (!S.online ? ' warn' : '')}>${line}</div></div>
+    <div class="grow"><div class="nm">${agentName()}</div><div class=${'st' + (!S.online || S.settings?.paused ? ' warn' : '')}>${line}</div></div>
     ${S.route.tab === 'chat' && conv && conv.kind !== 'main' && html`<button class="btn" aria-label="Chat options" onClick=${() => chatMenu(conv)}><${Icon} name="more" cls="ic-more" /></button>`}
   </header>`;
 }
@@ -197,7 +199,14 @@ function Screen() {
       const [, sub, a, ...rest] = parts;
       if (!sub) return html`<${Hub} />`;
       if (!owner) return html`<${Settings} />`;
-      if (sub === 'connections') return a ? html`<${ConnectorForm} id=${a} key=${a} />` : html`<${Connections} />`;
+      if (sub === 'connections') {
+        if (!a) return html`<${Connections} />`;
+        if (a === 'add') return html`<${AddService} service=${rest[0]} key=${rest[0]} />`;
+        if (a === 'new') return html`<${ConnectorForm} id="new" key="new" />`;
+        if (a === 'trusted') return html`<${TrustedPeople} />`;
+        if (rest[0] === 'edit') return html`<${ConnectorForm} id=${a} key=${`${a}-edit`} />`;
+        return html`<${ConnectorPage} id=${a} key=${a} />`;
+      }
       if (sub === 'logins') return html`<${Logins} />`;
       if (sub === 'computer') return html`<${Computer} />`;
       if (sub === 'files') {

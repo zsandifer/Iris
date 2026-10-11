@@ -439,10 +439,12 @@ impl AppState {
                     owner can fix it by running `codex login` on the server."
                     .to_string(),
                 "gemini" => "The Gemini engine on the Iris server is signed out. The owner can \
-                    fix it by running `gemini` on the server and signing in."
+                    fix it by adding a Gemini API key in the app (Settings, AI engine), or by \
+                    running `gemini` on the server and signing in."
                     .to_string(),
                 "opencode" => "The OpenCode engine on the Iris server has no usable provider. \
-                    The owner can fix it with `opencode auth login` on the server."
+                    The owner can fix it by adding a provider key in the app (Settings, AI \
+                    engine), or with `opencode auth login` on the server."
                     .to_string(),
                 other => format!("The {other} engine on the Iris server needs to be signed in."),
             })

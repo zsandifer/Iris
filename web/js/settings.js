@@ -7,7 +7,8 @@ import {
   Icon, Row, Group, Page, Spinner, Toggle, LetterTile, Empty,
   agentName, ago, since, stamp, confirmSheet, promptSheet, openSheet, closeSheet,
 } from './ui.js';
-import { SignIn } from './cards.js';
+import { SignIn, ApiKeyForm } from './cards.js';
+import { ServiceActivity } from './connect.js';
 import { pushState, enablePush, disablePush, isIOS } from './push.js';
 import { activityTitle, placeLabel } from './hub.js';
 
@@ -171,13 +172,17 @@ function EngineRow({ e, h }) {
   const act = async (path, what) => {
     try { await post(path); loadEngines(); toast(`${what} started`); } catch (err) { toast(err.message); }
   };
-  const signIn = () => openSheet(() => html`<${SignInSheet} h=${h} label=${e?.label || h.label} />`);
+  const signIn = (ev) => {
+    ev?.stopPropagation();
+    openSheet(() => html`<${SignInSheet} h=${h} label=${e?.label || h.label} />`);
+  };
   let right;
   if (installing) right = html`<span class="rv shimmer">${op.op === 'uninstall' ? 'Removing…' : 'Installing…'}</span>`;
   else if (!h?.installed && !e?.installed) {
-    right = e?.requires ? html`<span class="rv">Needs Node.js</span>` : html`<button class="cn" onClick=${() => act(`/engines/${e.name}/install`, 'Install')}>Set up</button>`;
-  } else if (h?.auth === 'auth_required') right = html`<button class="cn" onClick=${signIn}>Reconnect</button>`;
-  else if (h?.auth === 'ok') right = html`<span class="ok">● signed in</span>`;
+    right = e?.requires ? html`<span class="rv">Needs Node.js</span>` : html`<button class="cn" onClick=${(ev) => { ev.stopPropagation(); act(`/engines/${e.name}/install`, 'Install'); }}>Set up</button>`;
+  } else if (h?.auth === 'auth_required') right = html`<button class="cn" onClick=${signIn}>${usesKeys(h) && !h.keys?.length ? 'Add key' : 'Reconnect'}</button>`;
+  else if (h?.auth === 'ok') right = html`<button class="cn ok" onClick=${signIn}>● ${h.keys?.length ? 'key added' : 'signed in'}</button>`;
+  else if (usesKeys(h) && !h?.keys?.length) right = html`<button class="cn" onClick=${signIn}>Add key</button>`;
   else right = html`<button class="cn" onClick=${signIn}>Check sign-in</button>`;
   const sub = [e?.version || h?.version, e?.managed ? 'installed by Iris' : e?.external ? 'installed on the server' : null,
     op?.state === 'failed' ? `last ${op.op} failed: ${op.error}` : null].filter(Boolean).join(' · ');
@@ -189,13 +194,36 @@ function EngineRow({ e, h }) {
       </div></div>`) : undefined} />`;
 }
 
+/** Engines whose way in from the app is an API key (no headless login). */
+const usesKeys = (h) => h?.login_flow === 'manual' && h?.key_options?.length > 0;
+
+function SavedKeys({ h }) {
+  const remove = async (env) => {
+    if (!(await confirmSheet({ title: 'Remove this key?', body: "I'll stop using it right away.", yes: 'Remove', danger: true }))) return;
+    try {
+      await del(`/harnesses/${h.name}/keys/${env}`);
+      set({ harnesses: (await get('/harnesses')).harnesses });
+    } catch (e) { toast(e.message); }
+  };
+  if (!h.keys?.length) return null;
+  return html`<div class="grp">${h.keys.map((env) => html`<div class="r"><div class="rt">${(h.key_options || []).find((o) => o.env === env)?.label || env} key
+    <small>Saved, encrypted</small></div><button class="cn danger" onClick=${() => remove(env)}>Remove</button></div>`)}</div>`;
+}
+
 function SignInSheet({ h, label }) {
   useStore();
   const live = S.harnesses.find((x) => x.name === h.name) || h;
-  return html`<div class="sheet-body"><h3>Sign in to ${label}</h3>
-    <p class="mu">This runs ${label}'s own sign-in on your server. I never see your password.</p>
-    ${live.auth === 'ok' ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> Signed in</div>`
+  const keys = usesKeys(live);
+  return html`<div class="sheet-body"><h3>${keys ? `Set up ${label}` : `Sign in to ${label}`}</h3>
+    <p class="mu">${keys ? `Add an API key and I'll pass it to ${label} on your server for each request. It never appears in chats.`
+      : `This runs ${label}'s own sign-in on your server. I never see your password.`}</p>
+    ${live.auth === 'ok' && !keys ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> Signed in</div>`
+      : keys ? html`<${SignIn} harness=${h.name} flow="api_key" instructions=${h.login_hint} keyOptions=${live.key_options} />`
       : html`<${SignIn} harness=${h.name} flow=${h.login_flow} instructions=${h.login_hint} />`}
+    <${SavedKeys} h=${live} />
+    ${!keys && live.key_options?.length > 0 && html`<details class="alt"><summary>Use an API key instead</summary>
+      <p class="mu small">Pay-as-you-go billing from ${live.key_options[0].label} instead of your subscription. While a key is saved, ${label} uses it for everything.</p>
+      <${ApiKeyForm} harness=${h.name} options=${live.key_options} /></details>`}
   </div>`;
 }
 
@@ -296,6 +324,7 @@ export function People() {
 export function ActivityLog() {
   const [items, setItems] = useState(null);
   const [more, setMore] = useState(false);
+  const [tab, setTab] = useState('steps');
   const load = async (before) => {
     const r = await get(`/activity?limit=50${before ? `&before=${before}` : ''}`);
     setItems((cur) => (before ? [...(cur || []), ...r.items] : r.items));
@@ -308,8 +337,10 @@ export function ActivityLog() {
       ${a.summary && html`<div class="mono small mu">${a.summary}</div>`}</div>`)}</div>
     ${it.conversation_kind !== 'job' && html`<div class="btns"><button class="b1" onClick=${() => { closeSheet(); go(`chat/${it.conversation_id}`); }}>Open chat</button></div>`}
   </div>`);
-  return html`<${Page} title="Activity log" sub=${`Every step ${agentName()} took with tools, newest first`}>
-    ${!items ? html`<${Spinner} />` : items.length ? html`<${Group}>${items.map((it) => html`<${Row} title=${activityTitle(it)}
+  return html`<${Page} title="Activity log" sub=${`Every step ${agentName()} took, newest first`}>
+    ${isOwner() && html`<div class="seg seg-gap">${[['steps', 'All steps'], ['services', 'Connected services']].map(([k, l]) => html`<button class=${tab === k ? 'on' : ''} onClick=${() => setTab(k)}>${l}</button>`)}</div>`}
+    ${tab === 'services' ? html`<${ServiceActivity} />`
+      : !items ? html`<${Spinner} />` : items.length ? html`<${Group}>${items.map((it) => html`<${Row} title=${activityTitle(it)}
       sub=${`${placeLabel(it)} · ${stamp(it.created_at)}`} onClick=${() => open(it)} />`)}<//>
       ${more && html`<button class="b2 wide" onClick=${() => load(items.at(-1).created_at)}>Show more</button>`}`
       : html`<${Empty} icon="list" title="Nothing yet">When I search, read, or use a connected service, it shows up here.<//>`}

@@ -498,7 +498,8 @@ struct KeyBody {
     value: String,
 }
 
-/// Save an engine API key and check it with one tiny real request.
+/// Save an engine API key and check it with one tiny real request (a
+/// refused key is not kept; `auth` says what happened).
 async fn put_key(
     State(state): State<AppState>,
     user: AuthUser,
@@ -510,7 +511,12 @@ async fn put_key(
     crate::keys::set(&state, &name, &env, &body.value)
         .await
         .map_err(ApiError::bad_request)?;
-    let auth = crate::keys::verify(&state, &name).await;
+    // Engines turned off in config are never run, not even to check.
+    let auth = if state.harness(&name).is_some_and(|e| e.cfg.enabled) {
+        crate::keys::verify(&state, &name, &env).await
+    } else {
+        crate::harness::AuthState::Unknown
+    };
     let mut v = crate::keys::list_json(&state, &name).await;
     v["auth"] = serde_json::to_value(auth).unwrap_or(Value::Null);
     ok(v)
@@ -528,4 +534,640 @@ async fn delete_key(
     let mut v = crate::keys::list_json(&state, &name).await;
     v["removed"] = removed.into();
     ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, Paths};
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    /// A fake remote MCP service with its own OAuth authorization server
+    /// (metadata, dynamic registration, PKCE code exchange, refresh).
+    #[derive(Default)]
+    struct Provider {
+        base: String,
+        challenge: Option<String>,
+        refreshed: bool,
+        last_auth: Option<String>,
+        token_requests: Vec<std::collections::HashMap<String, String>>,
+    }
+
+    async fn fake_provider() -> Arc<Mutex<Provider>> {
+        use axum::extract::State as S;
+        use axum::http::HeaderMap;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let p = Arc::new(Mutex::new(Provider {
+            base: base.clone(),
+            ..Default::default()
+        }));
+        type P = Arc<Mutex<Provider>>;
+        async fn mcp(S(p): S<P>, headers: HeaderMap, body: String) -> Response {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            let base = p.lock().unwrap().base.clone();
+            p.lock().unwrap().last_auth = auth.clone();
+            if !matches!(auth.as_deref(), Some("Bearer at-1" | "Bearer at-2")) {
+                let mut r = (StatusCode::UNAUTHORIZED, "").into_response();
+                r.headers_mut().insert(
+                    "www-authenticate",
+                    HeaderValue::from_str(&format!(
+                        "Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource/mcp\""
+                    ))
+                    .unwrap(),
+                );
+                return r;
+            }
+            let req: Value = serde_json::from_str(&body).unwrap();
+            let Some(id) = req.get("id").cloned() else {
+                return StatusCode::ACCEPTED.into_response();
+            };
+            let result = match req["method"].as_str().unwrap() {
+                "initialize" => {
+                    json!({"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                                       "serverInfo": {"name": "fake-mail", "version": "1"}})
+                }
+                "tools/list" => {
+                    json!({"tools": [{"name": "list_inbox", "inputSchema": {"type": "object"}}]})
+                }
+                _ => json!({"content": [{"type": "text", "text": "3 unread"}]}),
+            };
+            axum::Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response()
+        }
+        let app = Router::new()
+            .route("/mcp", axum::routing::post(mcp))
+            .route(
+                "/.well-known/oauth-protected-resource/mcp",
+                get(|S(p): S<P>| async move {
+                    let b = p.lock().unwrap().base.clone();
+                    axum::Json(json!({"resource": format!("{b}/mcp"),
+                        "authorization_servers": [format!("{b}/auth")],
+                        "scopes_supported": ["mail.read"]}))
+                }),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server/auth",
+                get(|S(p): S<P>| async move {
+                    let b = p.lock().unwrap().base.clone();
+                    axum::Json(json!({"issuer": format!("{b}/auth"),
+                        "authorization_endpoint": format!("{b}/auth/authorize"),
+                        "token_endpoint": format!("{b}/auth/token"),
+                        "registration_endpoint": format!("{b}/auth/register"),
+                        "code_challenge_methods_supported": ["S256"]}))
+                }),
+            )
+            .route(
+                "/auth/register",
+                post(|| async { axum::Json(json!({"client_id": "dyn-client"})) }),
+            )
+            .route(
+                "/auth/token",
+                post(|S(p): S<P>, body: String| async move {
+                    let form = crate::oauth::parse_query(&body);
+                    let mut g = p.lock().unwrap();
+                    g.token_requests.push(form.clone());
+                    match form.get("grant_type").map(String::as_str) {
+                        Some("authorization_code") => {
+                            let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+                            let ok = form.get("code").map(String::as_str) == Some("the-code")
+                                && g.challenge.as_deref()
+                                    == Some(crate::oauth::pkce_challenge(&verifier).as_str());
+                            if ok {
+                                axum::Json(json!({"access_token": "at-1", "refresh_token": "rt-1",
+                                                  "expires_in": 1, "token_type": "Bearer"}))
+                                .into_response()
+                            } else {
+                                (
+                                    StatusCode::BAD_REQUEST,
+                                    axum::Json(json!({"error": "invalid_grant"})),
+                                )
+                                    .into_response()
+                            }
+                        }
+                        Some("refresh_token")
+                            if form.get("refresh_token").map(String::as_str) == Some("rt-1") =>
+                        {
+                            g.refreshed = true;
+                            axum::Json(json!({"access_token": "at-2", "expires_in": 3600}))
+                                .into_response()
+                        }
+                        _ => (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(json!({"error": "invalid_grant"})),
+                        )
+                            .into_response(),
+                    }
+                }),
+            )
+            .with_state(p.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        p
+    }
+
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, String) {
+        let mut req = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"));
+        let req = match body {
+            Some(b) => {
+                req = req.header("content-type", "application/json");
+                req.body(Body::from(b.to_string()))
+            }
+            None => req.body(Body::empty()),
+        }
+        .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_connector_signs_in_with_discovery_dcr_pkce_and_refresh() {
+        let provider = fake_provider().await;
+        let base = provider.lock().unwrap().base.clone();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let db = crate::db::Db::open(&paths.db_file()).unwrap();
+        let mut cfg = Config::default();
+        for h in cfg.harness.values_mut() {
+            h.enabled = false;
+        }
+        cfg.push.enabled = false;
+        let state = AppState::new(cfg, paths, db).unwrap();
+        let app = super::super::router(state.clone());
+        let owner = state.db.with(crate::db::owner_user_id).unwrap().unwrap();
+        let code = state
+            .db
+            .with(|c| Ok(crate::auth::create_pairing_code(c, &owner)))
+            .unwrap()
+            .unwrap()
+            .0;
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/pair")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"code": code}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let token = serde_json::from_slice::<Value>(&bytes).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (s, b) = send(
+            &app,
+            "POST",
+            "/api/connectors",
+            &token,
+            Some(json!({"name": "mail", "transport": "http", "url": format!("{base}/mcp"), "auth": "oauth"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let con: Value = serde_json::from_str(&b).unwrap();
+        let id = con["connector"]["id"].as_str().unwrap().to_string();
+        assert_eq!(con["connector"]["auth_state"], "needs_sign_in");
+
+        let (s, b) = send(
+            &app,
+            "POST",
+            &format!("/api/connectors/{id}/oauth/start"),
+            &token,
+            Some(json!({"origin": "http://127.0.0.1:7999"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let started: Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(started["paste"], false);
+        assert_eq!(
+            started["redirect_uri"],
+            "http://127.0.0.1:7999/api/oauth/callback"
+        );
+        let url = started["authorize_url"].as_str().unwrap();
+        assert!(url.starts_with(&format!("{base}/auth/authorize?")), "{url}");
+        let q = crate::oauth::parse_query(url);
+        assert_eq!(q["client_id"], "dyn-client");
+        assert_eq!(q["code_challenge_method"], "S256");
+        assert_eq!(q["resource"], format!("{base}/mcp"));
+        assert_eq!(q["scope"], "mail.read");
+        provider.lock().unwrap().challenge = Some(q["code_challenge"].clone());
+
+        // A forged state does nothing.
+        let (s, b) = send(
+            &app,
+            "GET",
+            "/api/oauth/callback?state=forged&code=the-code",
+            "",
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(b.contains("didn"), "{b}");
+        // The provider sends the phone's browser back to Iris.
+        let (s, b) = send(
+            &app,
+            "GET",
+            &format!("/api/oauth/callback?state={}&code=the-code", q["state"]),
+            "",
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(b.contains("is connected"), "{b}");
+        // Used once.
+        let (_, b) = send(
+            &app,
+            "GET",
+            &format!("/api/oauth/callback?state={}&code=the-code", q["state"]),
+            "",
+            None,
+        )
+        .await;
+        assert!(b.contains("expired or was already used"));
+        {
+            let p = provider.lock().unwrap();
+            let exchange = &p.token_requests[0];
+            assert_eq!(exchange["resource"], format!("{base}/mcp"));
+            assert_eq!(
+                exchange["redirect_uri"],
+                "http://127.0.0.1:7999/api/oauth/callback"
+            );
+        }
+        let (_, b) = send(&app, "GET", "/api/connectors", &token, None).await;
+        let list: Value = serde_json::from_str(&b).unwrap();
+        let c = &list["connectors"][0];
+        assert_eq!(c["auth_state"], "ok");
+        assert_eq!(c["oauth"]["connected"], true);
+        assert!(
+            !b.contains("at-1") && !b.contains("rt-1"),
+            "tokens never leave the vault"
+        );
+
+        // A turn uses it through the gateway; the short-lived token is
+        // refreshed first and sent as a bearer header.
+        let main = state
+            .db
+            .with(|c| crate::db::ensure_main_conversation(c, &owner))
+            .unwrap();
+        let (servers, _guard) = crate::gateway::grant_for_turn(&state, &owner, &main, "main", "m1")
+            .await
+            .unwrap();
+        let crate::harness::McpTransport::Stdio { env, .. } = &servers[0].transport;
+        let r = crate::gateway::handle(
+            &state,
+            &json!({"token": env[crate::gateway::TOKEN_ENV], "connector": "mail", "request": {
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "list_inbox", "arguments": {}}}}),
+        )
+        .await;
+        assert_eq!(r["result"]["content"][0]["text"], "3 unread", "{r}");
+        let p = provider.lock().unwrap();
+        assert!(p.refreshed);
+        assert_eq!(p.last_auth.as_deref(), Some("Bearer at-2"));
+    }
+
+    struct App {
+        state: AppState,
+        app: Router,
+        token: String,
+        _tmp: tempfile::TempDir,
+    }
+
+    async fn app() -> App {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let db = crate::db::Db::open(&paths.db_file()).unwrap();
+        let mut cfg = Config::default();
+        for h in cfg.harness.values_mut() {
+            h.enabled = false;
+        }
+        cfg.push.enabled = false;
+        cfg.bind = "100.64.0.1:7420".into();
+        let state = AppState::new(cfg, paths, db).unwrap();
+        let app = super::super::router(state.clone());
+        let owner = state.db.with(crate::db::owner_user_id).unwrap().unwrap();
+        let code = state
+            .db
+            .with(|c| Ok(crate::auth::create_pairing_code(c, &owner)))
+            .unwrap()
+            .unwrap()
+            .0;
+        let (_, b) = send(&app, "POST", "/api/pair", "", Some(json!({"code": code}))).await;
+        let token = serde_json::from_str::<Value>(&b).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        App {
+            state,
+            app,
+            token,
+            _tmp: tmp,
+        }
+    }
+
+    async fn call(a: &App, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+        let (s, b) = send(&a.app, method, uri, &a.token, body).await;
+        (s, serde_json::from_str(&b).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn pause_trusted_people_and_disconnect_everything() {
+        let a = app().await;
+        let (s, v) = call(&a, "PUT", "/api/safety", Some(json!({"paused": true}))).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["paused"], true);
+        let (_, settings) = call(&a, "GET", "/api/settings", None).await;
+        assert_eq!(settings["paused"], true);
+        let (s, _) = call(&a, "POST", "/api/jobs/heartbeat/run", None).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        // A message while paused gets a plain "I'm paused" reply, no turn.
+        let (_, main) = call(&a, "GET", "/api/conversations/main", None).await;
+        let cid = main["conversation"]["id"].as_str().unwrap().to_string();
+        let (s, sent) = call(
+            &a,
+            "POST",
+            &format!("/api/conversations/{cid}/messages"),
+            Some(json!({"text": "hi"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::ACCEPTED);
+        let mid = sent["assistant_message"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut reply = Value::Null;
+        for _ in 0..100 {
+            let m = a
+                .state
+                .db
+                .with(|c| crate::db::get_message(c, &mid))
+                .unwrap()
+                .unwrap();
+            if m.status != "streaming" {
+                reply = serde_json::to_value(m).unwrap();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(reply["meta"]["error"]["kind"], "paused", "{reply}");
+        assert!(reply["content"].as_str().unwrap().contains("paused"));
+        let (_, v) = call(&a, "PUT", "/api/safety", Some(json!({"paused": false}))).await;
+        assert_eq!(v["paused"], false);
+
+        let (s, v) = call(
+            &a,
+            "PUT",
+            "/api/safety",
+            Some(json!({"trusted_recipients": ["Sam <SAM@Example.com>", "+1 (555) 010-2000", "sam@example.com"]})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            v["trusted_recipients"],
+            json!(["sam@example.com", "+15550102000"])
+        );
+
+        for name in ["one", "two"] {
+            let (s, _) = call(
+                &a,
+                "POST",
+                "/api/connectors",
+                Some(json!({"name": name, "command": "/bin/true"})),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK);
+        }
+        let (s, v) = call(&a, "POST", "/api/safety/disconnect-all", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["disconnected"], 2);
+        assert!(
+            v["connectors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["enabled"] == false)
+        );
+    }
+
+    #[tokio::test]
+    async fn google_and_github_setup_from_the_catalog() {
+        let a = app().await;
+        let (_, cat) = call(
+            &a,
+            "GET",
+            "/api/connectors/catalog?origin=https%3A%2F%2Firis.example.ts.net",
+            None,
+        )
+        .await;
+        let ids: Vec<&str> = cat["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["google", "github", "custom"]);
+        assert_eq!(
+            cat["services"][0]["redirect_uri"],
+            "https://iris.example.ts.net/api/oauth/callback"
+        );
+        assert_eq!(cat["services"][0]["redirect_direct"], true);
+
+        let (s, _) = call(
+            &a,
+            "POST",
+            "/api/connectors/catalog/google",
+            Some(json!({"client_id": "not-a-google-id", "client_secret": "x"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, v) = call(
+            &a,
+            "POST",
+            "/api/connectors/catalog/google",
+            Some(json!({"client_id": "123-abc.apps.googleusercontent.com", "client_secret": "GOCSPX-test-secret"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["needs_sign_in"], true);
+        let con = &v["connector"];
+        assert_eq!(con["service"], "google");
+        assert_eq!(con["auth_state"], "needs_sign_in");
+        assert_eq!(con["command"], "uvx");
+        assert!(
+            !v.to_string().contains("GOCSPX-test-secret"),
+            "secrets stay hidden"
+        );
+        let id = con["id"].as_str().unwrap().to_string();
+
+        let (s, v) = call(
+            &a,
+            "POST",
+            &format!("/api/connectors/{id}/oauth/start"),
+            Some(json!({"origin": "https://iris.example.ts.net"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let url = v["authorize_url"].as_str().unwrap();
+        assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
+        let q = crate::oauth::parse_query(url);
+        assert_eq!(q["client_id"], "123-abc.apps.googleusercontent.com");
+        assert_eq!(q["access_type"], "offline");
+        assert_eq!(
+            q["redirect_uri"],
+            "https://iris.example.ts.net/api/oauth/callback"
+        );
+        assert!(q["scope"].contains("gmail.modify"));
+        assert!(!q.contains_key("resource"));
+        assert_eq!(v["paste"], false);
+        // Not on https: the owner pastes the address they land on.
+        let (_, v) = call(
+            &a,
+            "POST",
+            &format!("/api/connectors/{id}/oauth/start"),
+            Some(json!({"origin": "http://100.64.0.1:7420"})),
+        )
+        .await;
+        assert_eq!(v["paste"], true);
+        assert_eq!(
+            v["redirect_uri"],
+            "http://127.0.0.1:7420/api/oauth/callback"
+        );
+        let (s, v) = call(
+            &a,
+            "POST",
+            "/api/oauth/complete",
+            Some(json!({"url": "http://127.0.0.1:7420/api/oauth/callback?state=unknown&code=x"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(v["error"]["message"].as_str().unwrap().contains("expired"));
+
+        let (s, v) = call(
+            &a,
+            "POST",
+            "/api/connectors/catalog/github",
+            Some(json!({"token": "github_pat_example"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["needs_sign_in"], false);
+        assert_eq!(v["connector"]["header_keys"], json!(["Authorization"]));
+        assert_eq!(v["connector"]["auth_state"], "ok");
+        assert!(!v.to_string().contains("github_pat_example"));
+    }
+
+    #[tokio::test]
+    async fn rules_and_engine_keys() {
+        let a = app().await;
+        let (_, v) = call(
+            &a,
+            "POST",
+            "/api/connectors",
+            Some(json!({"name": "mail", "command": "/bin/true"})),
+        )
+        .await;
+        let id = v["connector"]["id"].as_str().unwrap().to_string();
+        let (s, v) = call(
+            &a,
+            "PUT",
+            &format!("/api/connectors/{id}/policy"),
+            Some(json!({"mode": "read_only", "tools": {"send": "ask", "list": "allow"}})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["connector"]["policy"]["mode"], "read_only");
+        assert_eq!(
+            v["connector"]["rules"],
+            "Only reads · never changes anything"
+        );
+        let (_, v) = call(
+            &a,
+            "PUT",
+            &format!("/api/connectors/{id}/policy"),
+            Some(json!({"tools": {"send": null}})),
+        )
+        .await;
+        assert_eq!(v["connector"]["policy"]["tools"], json!({"list": "allow"}));
+        let (s, _) = call(
+            &a,
+            "PUT",
+            &format!("/api/connectors/{id}/policy"),
+            Some(json!({"mode": "yolo"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        let (s, _) = call(
+            &a,
+            "PUT",
+            "/api/harnesses/gemini/keys/OPENAI_API_KEY",
+            Some(json!({"value": "x"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, v) = call(
+            &a,
+            "PUT",
+            "/api/harnesses/gemini/keys/GEMINI_API_KEY",
+            Some(json!({"value": "AIza-test-key"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["keys"][0]["env"], "GEMINI_API_KEY");
+        assert_eq!(v["auth"], "unknown", "disabled engines are not run");
+        let (_, h) = call(&a, "GET", "/api/harnesses", None).await;
+        let gemini = h["harnesses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["name"] == "gemini")
+            .unwrap()
+            .clone();
+        assert_eq!(gemini["keys"], json!(["GEMINI_API_KEY"]));
+        assert!(!h.to_string().contains("AIza-test-key"));
+        assert_eq!(
+            crate::keys::env_for(&a.state, "gemini").await,
+            [("GEMINI_API_KEY".to_string(), "AIza-test-key".to_string())]
+        );
+        let (_, v) = call(
+            &a,
+            "DELETE",
+            "/api/harnesses/gemini/keys/GEMINI_API_KEY",
+            None,
+        )
+        .await;
+        assert_eq!(v["removed"], true);
+        assert!(crate::keys::env_for(&a.state, "gemini").await.is_empty());
+    }
 }

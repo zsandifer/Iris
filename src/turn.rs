@@ -778,8 +778,8 @@ fn failure_text(kind: &str, detail: &str) -> String {
                 .filter_map(|h| match h.trim() {
                     "claude" => Some("run `claude` on the Iris server and sign in with /login"),
                     "codex" => Some("run `codex login` on the Iris server"),
-                    "gemini" => Some("run `gemini` on the Iris server and sign in"),
-                    "opencode" => Some("run `opencode auth login` on the Iris server"),
+                    "gemini" => Some("add a Gemini API key in Settings, AI engine"),
+                    "opencode" => Some("add a provider key for OpenCode in Settings, AI engine"),
                     _ => None,
                 })
                 .collect();

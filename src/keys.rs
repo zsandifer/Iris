@@ -20,10 +20,31 @@ pub struct KeyOption {
     pub label: &'static str,
     /// Where the owner creates a key.
     pub url: &'static str,
+    /// OpenCode provider id the key belongs to (model ids `provider/...`).
+    pub provider: &'static str,
 }
 
 const fn k(env: &'static str, label: &'static str, url: &'static str) -> KeyOption {
-    KeyOption { env, label, url }
+    KeyOption {
+        env,
+        label,
+        url,
+        provider: "",
+    }
+}
+
+const fn p(
+    env: &'static str,
+    label: &'static str,
+    url: &'static str,
+    provider: &'static str,
+) -> KeyOption {
+    KeyOption {
+        env,
+        label,
+        url,
+        provider,
+    }
 }
 
 const CLAUDE: &[KeyOption] = &[k(
@@ -42,42 +63,54 @@ const GEMINI: &[KeyOption] = &[k(
     "https://aistudio.google.com/apikey",
 )];
 const OPENCODE: &[KeyOption] = &[
-    k(
+    p(
         "OPENROUTER_API_KEY",
         "OpenRouter",
         "https://openrouter.ai/keys",
+        "openrouter",
     ),
-    k(
+    p(
         "ANTHROPIC_API_KEY",
         "Anthropic",
         "https://console.anthropic.com/settings/keys",
+        "anthropic",
     ),
-    k(
+    p(
         "OPENAI_API_KEY",
         "OpenAI",
         "https://platform.openai.com/api-keys",
+        "openai",
     ),
-    k(
+    p(
         "GOOGLE_GENERATIVE_AI_API_KEY",
         "Google",
         "https://aistudio.google.com/apikey",
+        "google",
     ),
-    k("GROQ_API_KEY", "Groq", "https://console.groq.com/keys"),
-    k(
+    p(
+        "GROQ_API_KEY",
+        "Groq",
+        "https://console.groq.com/keys",
+        "groq",
+    ),
+    p(
         "DEEPSEEK_API_KEY",
         "DeepSeek",
         "https://platform.deepseek.com/api_keys",
+        "deepseek",
     ),
-    k(
+    p(
         "MISTRAL_API_KEY",
         "Mistral",
         "https://console.mistral.ai/api-keys",
+        "mistral",
     ),
-    k("XAI_API_KEY", "xAI", "https://console.x.ai"),
-    k(
+    p("XAI_API_KEY", "xAI", "https://console.x.ai", "xai"),
+    p(
         "OPENCODE_API_KEY",
         "OpenCode Zen",
         "https://opencode.ai/auth",
+        "opencode",
     ),
 ];
 
@@ -177,9 +210,10 @@ pub async fn env_for(state: &AppState, harness: &str) -> Vec<(String, String)> {
 }
 
 /// Check a saved key the only reliable way: one tiny real request through
-/// the engine's own CLI (a one-word reply, no tools, no session). Records
-/// the result like a turn would (signed in, or signed out with a card).
-pub async fn verify(state: &AppState, harness: &str) -> crate::harness::AuthState {
+/// the engine's own CLI (a one-word reply, no tools, no session). A key
+/// that works marks the engine signed in; one the provider refuses is
+/// removed again.
+pub async fn verify(state: &AppState, harness: &str, env: &str) -> crate::harness::AuthState {
     use crate::harness::runner::{self, RunRequest};
     use crate::harness::{AuthState, HarnessEvent, TurnSpec};
     let Some(entry) = state.harness(harness) else {
@@ -192,10 +226,13 @@ pub async fn verify(state: &AppState, harness: &str) -> crate::harness::AuthStat
     // provider once its key is in place.
     let _ = state.probe_auth(harness).await;
     let catalog = state.catalog();
+    // OpenCode: a model of the provider this key is for.
+    let provider = option(harness, env).map(|o| o.provider).unwrap_or("");
     let mine: Vec<&crate::catalog::ModelEntry> = catalog
         .models
         .iter()
         .filter(|m| m.harness == harness)
+        .filter(|m| provider.is_empty() || m.model.starts_with(&format!("{provider}/")))
         .collect();
     // The background slot's ranking puts quick, cheap models first.
     let Some(model) = state
@@ -204,6 +241,9 @@ pub async fn verify(state: &AppState, harness: &str) -> crate::harness::AuthStat
         .first()
         .map(|r| r.entry.model.clone())
     else {
+        if !provider.is_empty() {
+            return AuthState::Unknown;
+        }
         return state
             .harness(harness)
             .map_or(AuthState::Unknown, |e| e.status().auth);
@@ -258,8 +298,15 @@ pub async fn verify(state: &AppState, harness: &str) -> crate::harness::AuthStat
         }
     }
     crate::info!("engine {harness}: key check {result:?}");
-    if result != AuthState::Unknown {
-        state.note_auth(harness, result, None).await;
+    match result {
+        AuthState::Ok => state.note_auth(harness, result, None).await,
+        AuthState::AuthRequired => {
+            // A key the provider refuses is not kept: it would only send
+            // turns to a model that cannot answer.
+            delete(state, harness, env).await;
+            state.recheck_harnesses().await;
+        }
+        AuthState::Unknown => {}
     }
     result
 }

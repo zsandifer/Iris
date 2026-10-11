@@ -13,6 +13,7 @@ export const S = {
   live: {},            // assistant message id -> {text, acts: Activity[], queued}
   logins: {},          // harness -> LoginStatus (owner)
   engines: null,       // GET /api/engines (owner)
+  connectors: null,    // GET /api/connectors (owner)
   slots: null,         // Slot[]
   feed: null,          // {posts, hasMore}
   ideas: null,
@@ -140,6 +141,10 @@ export async function loadLibrary() {
   ]);
   set({ library: { items, photos, saved } });
 }
+export async function loadConnectors() {
+  if (!isOwner()) return;
+  set({ connectors: (await get('/connectors')).connectors });
+}
 export async function loadSlots() { set({ slots: (await get('/models/slots')).slots }); }
 export async function loadEngines() {
   if (!isOwner()) return;
@@ -247,6 +252,9 @@ export function handleEvent(ev) {
     case 'engines.changed':
       if (S.engines) set({ engines: { ...S.engines, engines: ev.engines } });
       break;
+    case 'connectors.changed':
+      if (S.connectors) loadConnectors().catch(() => {});
+      break;
     default:
       break;
   }
@@ -259,6 +267,7 @@ export function refreshAll() {
   for (const k of Object.keys(loaders)) if (S[k]) loaders[k]().catch(() => {});
   if (S.slots) loadSlots().catch(() => {});
   if (S.engines) loadEngines().catch(() => {});
+  if (S.connectors) loadConnectors().catch(() => {});
 }
 
 /** Send a message (text and/or attachment ids) and track the reply. */

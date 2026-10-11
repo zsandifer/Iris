@@ -203,6 +203,8 @@ pub fn harnesses_for(state: &AppState, user: &AuthUser) -> Vec<Value> {
                     None => "manual".into(),
                 };
                 v["login_hint"] = e.harness.manual_login_hint().into();
+                v["key_options"] = serde_json::to_value(crate::keys::options(e.harness.name()))
+                    .unwrap_or_default();
                 v["login"] = serde_json::to_value(state.logins.status(e.harness.name()))
                     .unwrap_or(Value::Null);
             }
@@ -334,14 +336,32 @@ async fn cancel_login(
     ok(json!({"cancelled": crate::login::cancel(&state, &name).await}))
 }
 
+/// Harness list plus, for the owner, which API keys are saved (names
+/// only).
+async fn harnesses_with_keys(state: &AppState, user: &AuthUser) -> Vec<Value> {
+    let mut list = harnesses_for(state, user);
+    if user.user.is_owner {
+        for h in &mut list {
+            let name = h["name"].as_str().unwrap_or("").to_string();
+            let saved = state
+                .db
+                .call(move |c| entities::engine_keys(c, &name))
+                .await
+                .unwrap_or_default();
+            h["keys"] = saved.into_iter().map(|(env, _, _)| env).collect();
+        }
+    }
+    list
+}
+
 async fn list_harnesses(State(state): State<AppState>, user: AuthUser) -> ApiResult {
-    ok(json!({"harnesses": harnesses_for(&state, &user)}))
+    ok(json!({"harnesses": harnesses_with_keys(&state, &user).await}))
 }
 
 async fn refresh_harnesses(State(state): State<AppState>, user: AuthUser) -> ApiResult {
     user.require_owner()?;
     state.recheck_harnesses().await;
-    ok(json!({"harnesses": harnesses_for(&state, &user)}))
+    ok(json!({"harnesses": harnesses_with_keys(&state, &user).await}))
 }
 
 /// Advanced "AI engine" view: every model the CLIs offer, plus slots.

@@ -572,9 +572,14 @@ pub enum CallError {
     Other(String),
 }
 
-impl From<crate::oauth::NeedsSignIn> for CallError {
-    fn from(_: crate::oauth::NeedsSignIn) -> Self {
-        CallError::Auth
+impl From<crate::oauth::TokenError> for CallError {
+    fn from(e: crate::oauth::TokenError) -> Self {
+        match e {
+            crate::oauth::TokenError::NeedsSignIn => CallError::Auth,
+            crate::oauth::TokenError::Unavailable(e) => {
+                CallError::Other(format!("the sign-in service could not be reached ({e})"))
+            }
+        }
     }
 }
 
@@ -662,8 +667,15 @@ pub async fn describe_tools(state: &AppState, con: &Connector) -> Result<Vec<Val
                 "description": truncate_chars(t["description"].as_str().unwrap_or(""), 300),
                 "category": cat,
                 "rule": con.policy.tools.get(name),
-                "effect": match verdict {
-                    Verdict::Allow(_) => if cat == Category::Send { "asks unless trusted" } else { "runs" },
+"effect": match verdict {
+                    Verdict::Ask(_)
+                        if cat == Category::Send
+                            && matches!(con.policy.mode, policy::Mode::Standard | policy::Mode::Careful)
+                            && !con.policy.tools.contains_key(name) =>
+                    {
+                        "asks unless trusted"
+                    }
+                    Verdict::Allow(_) => "runs",
                     Verdict::Ask(_) => "asks",
                     Verdict::Block(_) => "off",
                 },
@@ -1072,6 +1084,10 @@ async fn ask(
     card["category"] = category.name().into();
     card["connector_id"] = con.id.clone().into();
     card["expires_at"] = expires_at.into();
+    if grant.card_conversation_id == grant.conversation_id {
+        // Shown above the reply of the turn that asked.
+        card["turn_message_id"] = grant.message_id.clone().into();
+    }
     let conv = grant.card_conversation_id.clone();
     let inserted = state
         .db

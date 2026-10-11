@@ -34,9 +34,13 @@ const FLOW_TTL_MS: i64 = 15 * 60 * 1000;
 const REFRESH_EARLY_MS: i64 = 60 * 1000;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The connector has no usable token; the owner has to sign in.
 #[derive(Debug)]
-pub struct NeedsSignIn;
+pub enum TokenError {
+    /// The connector has no usable token; the owner has to sign in.
+    NeedsSignIn,
+    /// The sign-in service could not be reached to refresh the token.
+    Unavailable(String),
+}
 
 struct Flow {
     connector_id: String,
@@ -446,7 +450,7 @@ pub fn seal_client_secret(state: &AppState, id: &str, secret: &str) -> Result<St
 pub async fn bearer(
     state: &AppState,
     con: &entities::Connector,
-) -> Result<Option<String>, NeedsSignIn> {
+) -> Result<Option<String>, TokenError> {
     let Some(o) = &con.config.oauth else {
         return Ok(None);
     };
@@ -455,13 +459,13 @@ pub async fn bearer(
     {
         return open(state, &con.id, "access_token", &o.access_token)
             .map(Some)
-            .ok_or(NeedsSignIn);
+            .ok_or(TokenError::NeedsSignIn);
     }
     if o.access_token.is_some() && o.expires_at.is_none() && o.refresh_token.is_none() {
         // A token without expiry (some servers): use it until refused.
         return open(state, &con.id, "access_token", &o.access_token)
             .map(Some)
-            .ok_or(NeedsSignIn);
+            .ok_or(TokenError::NeedsSignIn);
     }
     let _guard = state.oauth.refresh.lock().await;
     // Another call may have refreshed while we waited.
@@ -474,19 +478,20 @@ pub async fn bearer(
         .flatten()
         .and_then(|c| c.config.oauth);
     let Some(o) = fresh else {
-        return Err(NeedsSignIn);
+        return Err(TokenError::NeedsSignIn);
     };
     if let (Some(_), Some(exp)) = (&o.access_token, o.expires_at)
         && exp > now_ms() + REFRESH_EARLY_MS
     {
         return open(state, &con.id, "access_token", &o.access_token)
             .map(Some)
-            .ok_or(NeedsSignIn);
+            .ok_or(TokenError::NeedsSignIn);
     }
-    let refresh = open(state, &con.id, "refresh_token", &o.refresh_token).ok_or(NeedsSignIn)?;
+    let refresh =
+        open(state, &con.id, "refresh_token", &o.refresh_token).ok_or(TokenError::NeedsSignIn)?;
     let (Some(token_endpoint), Some(client_id)) = (o.token_endpoint.clone(), o.client_id.clone())
     else {
-        return Err(NeedsSignIn);
+        return Err(TokenError::NeedsSignIn);
     };
     let secret = open(state, &con.id, "client_secret", &o.client_secret);
     let resource = (o.mode == "discover").then(|| o.resource.clone()).flatten();
@@ -505,14 +510,15 @@ pub async fn bearer(
         post_form(&token_endpoint, &form)
     })
     .await
-    .map_err(|_| NeedsSignIn)?;
+    .map_err(|_| TokenError::NeedsSignIn)?;
     match reply {
         Ok((200, v)) if v["access_token"].is_string() => {
             let token = v["access_token"].as_str().unwrap_or_default().to_string();
-            let updated = apply_tokens(state, &con.id, o, &v).map_err(|_| NeedsSignIn)?;
+            let updated =
+                apply_tokens(state, &con.id, o, &v).map_err(|_| TokenError::NeedsSignIn)?;
             save(state, &con.id, updated)
                 .await
-                .map_err(|_| NeedsSignIn)?;
+                .map_err(|_| TokenError::NeedsSignIn)?;
             crate::info!("connector {}: token refreshed", con.name);
             Ok(Some(token))
         }
@@ -522,13 +528,13 @@ pub async fn bearer(
                 con.name,
                 truncate_chars(v["error"].as_str().unwrap_or("unknown"), 60)
             );
-            Err(NeedsSignIn)
+            Err(TokenError::NeedsSignIn)
         }
         Err(e) => {
             // The sign-in server is unreachable: not the owner's problem
             // yet; fail this call without asking them to sign in again.
             crate::warn!("connector {}: token refresh failed: {e}", con.name);
-            Err(NeedsSignIn)
+            Err(TokenError::Unavailable(e))
         }
     }
 }
