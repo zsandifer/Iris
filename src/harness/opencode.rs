@@ -96,12 +96,17 @@ impl Harness for OpenCode {
         let prompt_file = spec.run_dir.join(format!("{}.prompt.md", spec.turn_id));
         write_private_file(&prompt_file, spec.system_prompt.as_bytes())?;
         inv.temp_files.push(prompt_file.clone());
-        let config = json!({
+        let mut config = json!({
             "$schema": "https://opencode.ai/config.json",
             "instructions": [prompt_file.to_string_lossy()],
             "permission": self.permissions(&spec.writable_dirs),
             "mcp": mcp_config(&spec.mcp_servers),
         });
+        if !spec.tools {
+            // Every tool (built-in and MCP) off, and anything left denied.
+            config["tools"] = json!({"*": false});
+            config["permission"] = json!({"edit": "deny", "bash": "deny", "webfetch": "deny"});
+        }
         // A private file rather than OPENCODE_CONFIG_CONTENT: connector
         // headers must not sit in the process environment.
         let config_file = spec.run_dir.join(format!("{}.opencode.json", spec.turn_id));
@@ -687,6 +692,7 @@ anthropic/claude-haiku-4-5
             writable_dirs: vec!["/data/memory".into()],
             run_dir: tmp.path().into(),
             scope: "c1".into(),
+            tools: true,
         };
         let inv = OpenCode::new(HarnessConfig::opencode_default())
             .build(&spec)

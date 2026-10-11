@@ -285,7 +285,7 @@ CREATE TABLE feed_days (
 CREATE TABLE feed_watches (
     id          TEXT PRIMARY KEY,
     user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    post_id     TEXT REFERENCES feed_posts(id) ON DELETE SET NULL,
+    post_id     TEXT NOT NULL REFERENCES feed_posts(id) ON DELETE CASCADE,
     url         TEXT NOT NULL,
     title       TEXT NOT NULL,
     price       REAL NOT NULL,

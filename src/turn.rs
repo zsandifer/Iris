@@ -429,6 +429,7 @@ async fn run_locked(
             },
             run_dir: state.paths.run_dir(),
             scope: conv_id.to_string(),
+            tools: true,
         };
         let invocation = match entry.harness.build(&spec) {
             Ok(mut i) => {
@@ -690,6 +691,23 @@ pub struct OneShotRequest<'a> {
     pub take_slot: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OneShotError {
+    /// No engine is installed, signed in, and allowed for this slot.
+    NoEngine,
+    /// Engines were tried and failed (signed out, error, timeout).
+    Failed(String),
+}
+
+impl std::fmt::Display for OneShotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OneShotError::NoEngine => write!(f, "no usable engine"),
+            OneShotError::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OneShotReply {
     pub text: String,
@@ -701,7 +719,10 @@ pub struct OneShotReply {
 /// Run one prompt on a slot's model and return the reply text. Used for
 /// small helper calls (effort classification, the feed's daily interests
 /// and summaries).
-pub async fn one_shot(state: &AppState, req: OneShotRequest<'_>) -> Result<OneShotReply, String> {
+pub async fn one_shot(
+    state: &AppState,
+    req: OneShotRequest<'_>,
+) -> Result<OneShotReply, OneShotError> {
     let (res, pin) = state.resolve_slot(req.slot, req.shared).await;
     let allow_shared = state.allow_claude_for_shared().await;
     let catalog = state.catalog();
@@ -752,6 +773,8 @@ pub async fn one_shot(state: &AppState, req: OneShotRequest<'_>) -> Result<OneSh
             writable_dirs: Vec::new(),
             run_dir: state.paths.run_dir(),
             scope: req.scope.to_string(),
+            // Helper calls read untrusted text (feed items): no tools at all.
+            tools: false,
         };
         let invocation = match entry.harness.build(&spec) {
             Ok(i) => i,
@@ -819,7 +842,11 @@ pub async fn one_shot(state: &AppState, req: OneShotRequest<'_>) -> Result<OneSh
             (Err(e), _) => last_error = format!("could not start {}: {e}", m.harness),
         }
     }
-    Err(last_error)
+    Err(if tried_harnesses.is_empty() {
+        OneShotError::NoEngine
+    } else {
+        OneShotError::Failed(last_error)
+    })
 }
 
 /// In a shared conversation where Claude is the only engine, explain once

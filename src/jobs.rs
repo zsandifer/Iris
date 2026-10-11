@@ -203,7 +203,7 @@ pub fn spawn_scheduler(state: AppState) {
             let st = state.clone();
             tokio::spawn(async move { crate::setup::maybe_auto_update(&st).await });
             // Notifications held during quiet hours go out once they end.
-            crate::notify::flush_quiet(&state).await;
+            crate::notify::spawn_flush_quiet(&state);
             for job in Job::ALL {
                 let last = state
                     .setting(job.last_run_key())

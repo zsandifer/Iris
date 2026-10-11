@@ -37,7 +37,7 @@ use crate::db::{self, NewMessage};
 use crate::entities::{self, PipelinePost};
 use crate::ranking::Slot;
 use crate::state::AppState;
-use crate::turn::{OneShotReply, OneShotRequest, one_shot};
+use crate::turn::{OneShotError, OneShotReply, OneShotRequest, one_shot};
 use crate::util::{Result, now_ms, truncate_chars};
 use http::{Fetcher, Mode, Request};
 use parse::Item;
@@ -53,6 +53,8 @@ const DAY_MS: i64 = 86_400_000;
 pub const PAUSE_AFTER_DAYS: i64 = 14;
 const MAX_SOURCES_PER_RUN: usize = 40;
 const MAX_REDDIT_PER_RUN: usize = 4;
+const MAX_ITEMS_PER_SOURCE: usize = 40;
+const MAX_CANDIDATES: usize = 1500;
 const MAX_SUGGESTED_SOURCES: usize = 40;
 const MAX_AGE_DAYS: i64 = 7;
 const WORKERS: usize = 4;
@@ -78,6 +80,22 @@ pub fn next_size(current: u32, days: &[DayStat]) -> u32 {
         current
     };
     next.clamp(store::MIN_DAILY_SIZE, store::MAX_DAILY_SIZE)
+}
+
+/// Whether today's interests call is still to be made: not when today's
+/// interests already came from the model, or the call was already made
+/// today (successful or not).
+pub fn interests_due(st: &FeedState, today: &str) -> bool {
+    let fresh = st
+        .interests
+        .as_ref()
+        .is_some_and(|i| i.by_model && i.generated_day == today);
+    !fresh && st.interests_call_day.as_deref() != Some(today)
+}
+
+/// Whether today's batched summary call is still available.
+pub fn summaries_due(st: &FeedState, today: &str) -> bool {
+    st.summary_call_day.as_deref() != Some(today)
 }
 
 /// The feed has been published for two weeks and not opened since.
@@ -160,6 +178,7 @@ pub async fn status_json(state: &AppState, user_id: &str) -> Value {
         "daily_size": st.daily_size,
         "last_batch_at": st.last_batch_at,
         "last_batch_count": st.last_batch_count,
+        "last_batch_end_id": st.last_batch_end_id,
         "topics": st.interests.as_ref().map(|i| i.topics.iter().map(|t| t.name.clone()).collect::<Vec<_>>()).unwrap_or_default(),
         "sources": sources.iter().filter(|s| s.enabled).count(),
         "last_run": st.last_run,
@@ -177,12 +196,11 @@ pub async fn record_activity(state: &AppState, user_id: &str, event: &str) -> Re
         .db
         .call(move |c| {
             match ev.as_str() {
-                "opened" => {
-                    store::record_opened(c, &uid, &day)?;
-                    store::update_state(c, &uid, |s| s.last_open_at = Some(now_ms()))?;
-                }
+                "opened" => store::record_opened(c, &uid, &day)?,
                 _ => store::record_reached_end(c, &uid, &day)?,
             }
+            // Either one means the feed is in use (it never pauses then).
+            store::update_state(c, &uid, |s| s.last_open_at = Some(now_ms()))?;
             Ok(())
         })
         .await
@@ -339,9 +357,10 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
         }
     }
 
-    // 1. Interests (once a day).
+    // 1. Interests: at most one model call a day, even across manual runs
+    // and failures.
     let interests = match st.interests.clone() {
-        Some(i) if i.generated_day == today && i.by_model => i,
+        prev if !interests_due(&st, &today) => prev.unwrap_or_else(|| fallback_interests(&[])),
         _ => {
             let (i, reply) = refresh_interests(state, user_id, &today, youtube_likes).await?;
             if let Some(r) = reply {
@@ -373,23 +392,7 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
             Ok((all, store::seen_keys(c, &uid)?, store::engagement(c, &uid)?))
         })
         .await?;
-    let mut enabled: Vec<store::Source> = srcs.into_iter().filter(|s| s.enabled).collect();
-    // Reddit allows about a request a minute without OAuth: read at most a
-    // few subreddits per run, least recently read first.
-    enabled.sort_by_key(|s| s.last_fetch_at.unwrap_or(0));
-    let mut reddit = 0;
-    enabled.retain(|s| {
-        reddit += usize::from(s.kind == "reddit");
-        s.kind != "reddit" || reddit <= MAX_REDDIT_PER_RUN
-    });
-    // The user's own first, then the ones that worked most recently.
-    enabled.sort_by_key(|s| {
-        (
-            s.origin != "user",
-            std::cmp::Reverse(s.last_ok_at.unwrap_or(0)),
-        )
-    });
-    enabled.truncate(MAX_SOURCES_PER_RUN);
+    let enabled = plan_sources(srcs.into_iter().filter(|s| s.enabled).collect());
     report.sources_checked = enabled.len() as u32;
 
     let searches: Vec<(String, String, String)> = search_plan(&topics);
@@ -453,35 +456,30 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
     items.extend(search_items);
     report.items_found = items.len() as u32;
 
-    // 3. Clean.
-    let min_time = now - MAX_AGE_DAYS * DAY_MS;
+    // 3. Clean and 4. rank (CPU work, off the async workers), enrich the
+    // finalists from their pages, then pick.
     let lang = interests.language.clone().unwrap_or_else(|| "en".into());
-    items.retain(|i| {
-        i.published_ms
-            .is_none_or(|t| t >= min_time && t <= now + DAY_MS)
-            && i.language
-                .as_deref()
-                .is_none_or(|l| l.starts_with(lang.as_str()))
-            && i.title.chars().count() >= 8
-            && !rank::is_housekeeping(&i.title)
-            && markup::split_url(&i.url).is_some()
-    });
-    let mut items = rank::dedupe(items, &seen);
-    rank::assign_topics(&mut items, &topics);
-
-    // 4. Rank, enrich finalists, pick.
-    let mut scored: Vec<(f64, Item)> = items
-        .into_iter()
-        .map(|i| (rank::score(&i, &topics, &engagement, now), i))
-        .collect();
-    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-    scored.truncate((size as usize * 3).clamp(15, 60));
-    let finalists: Vec<Item> = scored.into_iter().map(|(_, i)| i).collect();
+    let (t2, e2) = (topics.clone(), engagement.clone());
+    let finalists: Vec<Item> = tokio::task::spawn_blocking(move || {
+        let items = rank::dedupe(clean(items, now, &lang), &seen);
+        let mut items = items;
+        rank::assign_topics(&mut items, &t2);
+        let mut scored: Vec<(f64, Item)> = items
+            .into_iter()
+            .map(|i| (rank::score(&i, &t2, &e2, now), i))
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        scored.truncate((size as usize * 3).clamp(15, 60));
+        scored.into_iter().map(|(_, i)| i).collect()
+    })
+    .await?;
     let f = fetcher.clone();
-    let enriched =
+    let mut enriched =
         tokio::task::spawn_blocking(move || parallel(finalists, WORKERS, |it| enrich(&f, it)))
             .await?;
-    let mut enriched = enriched;
+    // Pages can reveal an old publication date.
+    let min_time = now - MAX_AGE_DAYS * DAY_MS;
+    enriched.retain(|i| i.published_ms.is_none_or(|t| t >= min_time));
     rank::assign_topics(&mut enriched, &topics);
     let rescored: Vec<(f64, Item)> = enriched
         .into_iter()
@@ -503,7 +501,8 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
             text: it.description.clone(),
         })
         .collect();
-    if !need.is_empty() {
+    // At most one summary call a day: later runs use the descriptions.
+    if !need.is_empty() && summaries_due(&st, &today) {
         let uid = user_id.to_string();
         let liked: Vec<String> = state
             .db
@@ -534,8 +533,15 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
                 blurbs = model::parse_summaries(&reply.text);
                 report.model_used = true;
                 model_notes.push((reply, "summaries"));
+                mark_call(state, user_id, &today, Call::Summaries).await;
             }
-            Err(e) => crate::warn!("feed: summaries unavailable ({e}); using descriptions"),
+            Err(OneShotError::NoEngine) => {
+                crate::warn!("feed: no engine for summaries; using descriptions")
+            }
+            Err(OneShotError::Failed(e)) => {
+                crate::warn!("feed: summaries failed ({e}); using descriptions");
+                mark_call(state, user_id, &today, Call::Summaries).await;
+            }
         }
     }
 
@@ -551,22 +557,16 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
             )
         })
         .collect();
-    // (original -> cached file, originals that turned out not to be photos)
-    type Cached = (BTreeMap<String, String>, Vec<String>);
-    let cached: Vec<Cached> = tokio::task::spawn_blocking(move || {
+    // Original URL -> cached file.
+    let cached: Vec<BTreeMap<String, String>> = tokio::task::spawn_blocking(move || {
         parallel(to_cache, WORKERS, |(imgs, icon)| {
             let mut map = BTreeMap::new();
-            let mut unusable = Vec::new();
             for u in imgs {
                 if map.len() >= 3 {
                     break;
                 }
-                match images::cache(&f, &data_dir, &u, false) {
-                    Ok(name) => {
-                        map.insert(u, name);
-                    }
-                    Err(images::Miss::Unusable) => unusable.push(u),
-                    Err(images::Miss::Unavailable) => {}
+                if let Ok(name) = images::cache(&f, &data_dir, &u, false) {
+                    map.insert(u, name);
                 }
             }
             if let Some(icon) = icon
@@ -574,16 +574,15 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
             {
                 map.insert(icon, name);
             }
-            (map, unusable)
+            map
         })
     })
     .await?;
 
-    let n = picked.len();
-    let mut posts = Vec::with_capacity(n);
+    let mut posts = Vec::with_capacity(picked.len());
     let mut seen_new = Vec::new();
     let mut urgent_candidates: Vec<(String, parse::Event, Option<String>, bool)> = Vec::new();
-    for (rank_i, ((_, it), (cache, unusable))) in picked.into_iter().zip(cached).enumerate() {
+    for (rank_i, ((_, it), cache)) in picked.into_iter().zip(cached).enumerate() {
         let b = blurbs.remove(&format!("p{rank_i}")).unwrap_or_default();
         let good = rank::description_good_enough(&it);
         let body = if good {
@@ -603,22 +602,17 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
             .why
             .clone()
             .or_else(|| rank::rule_why(&it, &topics, &engagement));
-        // Photos that could not be cached (robots.txt, errors) are dropped
-        // unless none could be: then the originals are shown as-is.
-        let images: Vec<String> = if cache.keys().any(|k| it.images.contains(k)) {
-            it.images
-                .iter()
-                .filter(|u| cache.contains_key(*u))
-                .cloned()
-                .collect()
-        } else {
-            it.images
-                .iter()
-                .filter(|u| u.starts_with("https://") && !unusable.contains(*u))
-                .take(3)
-                .cloned()
-                .collect()
-        };
+        // Only photos Iris could fetch and check itself are shown (the app
+        // never loads a post's image URLs directly): anything refused by
+        // robots.txt, the public-address rule, or the photo checks is left
+        // out.
+        let images: Vec<String> = it
+            .images
+            .iter()
+            .filter(|u| cache.contains_key(*u))
+            .cloned()
+            .collect();
+        let favicon = it.favicon.clone().filter(|f| cache.contains_key(f));
         let mut facts = json!({});
         if let Some(p) = &it.price {
             facts["price"] = json!(p);
@@ -650,11 +644,9 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
             source_kind: it.source_kind.clone(),
             url_key: key,
             images,
-            favicon_url: it.favicon.clone(),
+            favicon_url: favicon,
             cached: cache,
             facts,
-            // Highest ranked shows first (newest).
-            created_at: now + (n - rank_i) as i64,
         });
     }
     report.published = posts.len() as u32;
@@ -662,27 +654,38 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
     let uid = user_id.to_string();
     let t = today.clone();
     let rep = report.clone().with_stats(fetcher.stats());
-    let interests_store = interests.clone();
     state
         .db
         .call(move |c| {
-            for p in &posts {
-                entities::insert_pipeline_post(c, &uid, p)?;
-            }
-            store::add_seen(c, &uid, &seen_new)?;
-            store::record_published(c, &uid, &t, posts.len() as i64)?;
-            store::update_state(c, &uid, |s| {
-                s.last_batch_at = Some(now);
-                s.last_batch_day = Some(t.clone());
-                s.last_batch_count = posts.len() as u32;
-                if s.first_batch_at.is_none() && !posts.is_empty() {
-                    s.first_batch_at = Some(now);
+            crate::db::write_tx(c, |c| {
+                // Lowest ranked first: each insert gets a later unique
+                // timestamp, so the best post is the newest.
+                let mut first: Option<entities::FeedPost> = None;
+                for p in posts.iter().rev() {
+                    let post = entities::insert_pipeline_post(c, &uid, p)?;
+                    first.get_or_insert(post);
                 }
-                s.interests = Some(interests_store);
-                s.last_run = Some(rep);
-            })?;
-            store::prune(c, &uid)?;
-            Ok(())
+                store::add_seen(c, &uid, &seen_new)?;
+                store::update_state(c, &uid, |s| {
+                    s.last_run = Some(rep);
+                    let Some(first) = &first else {
+                        // Nothing new: leave today open so the next
+                        // scheduled check tries again.
+                        return;
+                    };
+                    s.last_batch_at = Some(first.created_at);
+                    s.last_batch_end_id = Some(first.id.clone());
+                    s.last_batch_day = Some(t.clone());
+                    s.last_batch_count = posts.len() as u32;
+                    if s.first_batch_at.is_none() {
+                        s.first_batch_at = Some(first.created_at);
+                    }
+                })?;
+                if !posts.is_empty() {
+                    store::record_published(c, &uid, &t, posts.len() as i64)?;
+                }
+                store::prune(c, &uid)
+            })
         })
         .await?;
     state.hub.to_users(
@@ -750,9 +753,23 @@ fn search_plan(topics: &[Topic]) -> Vec<(String, String, String)> {
 }
 
 /// Fill in a candidate from its page: photos, description, site name,
-/// icon, price, event. Robots.txt decides whether the page may be read.
+/// icon, and the facts urgent alerts need (price, event). Every finalist's
+/// page is read (robots.txt decides whether it may be), except posts that
+/// live on a social platform or video site and carry no such facts.
 fn enrich(f: &Fetcher, mut it: Item) -> Item {
-    if !it.needs_page {
+    let native = markup::host_of(&it.url).is_some_and(|h| {
+        let h = h.trim_start_matches("www.");
+        [
+            "bsky.app",
+            "reddit.com",
+            "news.ycombinator.com",
+            "youtube.com",
+            "youtu.be",
+        ]
+        .iter()
+        .any(|p| h == *p || h.ends_with(&format!(".{p}")))
+    }) || (it.source_kind == "mastodon" && it.url.contains("/@"));
+    if native {
         return it;
     }
     let mut req = Request::new(
@@ -873,6 +890,10 @@ async fn refresh_interests(
         },
     )
     .await;
+    // An engine answered (or failed): today's interests call is used up.
+    if !matches!(reply, Err(OneShotError::NoEngine)) {
+        mark_call(state, user_id, today, Call::Interests).await;
+    }
     let parsed = reply
         .as_ref()
         .ok()
@@ -889,14 +910,10 @@ async fn refresh_interests(
         } else {
             crate::warn!("feed: interests reply was not usable JSON");
         }
-        let fallback = st.interests.clone().unwrap_or_else(|| Interests {
-            topics: topics_from_likes(&liked),
-            location: None,
-            generated_at: now_ms(),
-            generated_day: String::new(),
-            by_model: false,
-            language: None,
-        });
+        let fallback = st
+            .interests
+            .clone()
+            .unwrap_or_else(|| fallback_interests(&liked));
         return Ok((fallback, None));
     };
     let uid = user_id.to_string();
@@ -930,17 +947,101 @@ async fn refresh_interests(
         "feed: interests updated ({} topics, {added} new sources)",
         topics.len()
     );
-    Ok((
-        Interests {
-            topics,
-            location,
-            generated_at: now_ms(),
-            generated_day: today.to_string(),
-            by_model: true,
-            language,
-        },
-        reply.ok(),
-    ))
+    let interests = Interests {
+        topics,
+        location,
+        generated_at: now_ms(),
+        generated_day: today.to_string(),
+        by_model: true,
+        language,
+    };
+    let (uid, keep) = (user_id.to_string(), interests.clone());
+    state
+        .db
+        .call(move |c| store::update_state(c, &uid, |s| s.interests = Some(keep)))
+        .await?;
+    Ok((interests, reply.ok()))
+}
+
+/// Interests without a model: one topic per liked-post topic.
+fn fallback_interests(liked: &[(String, Option<String>)]) -> Interests {
+    Interests {
+        topics: topics_from_likes(liked),
+        location: None,
+        generated_at: now_ms(),
+        generated_day: String::new(),
+        by_model: false,
+        language: None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Call {
+    Interests,
+    Summaries,
+}
+
+/// Record that today's model call of this kind happened.
+async fn mark_call(state: &AppState, user_id: &str, today: &str, call: Call) {
+    let (uid, day) = (user_id.to_string(), today.to_string());
+    let _ = state
+        .db
+        .call(move |c| {
+            store::update_state(c, &uid, |s| match call {
+                Call::Interests => s.interests_call_day = Some(day),
+                Call::Summaries => s.summary_call_day = Some(day),
+            })
+        })
+        .await;
+}
+
+/// Which sources this run reads: the user's own first, then Google, then
+/// suggested; within each, the least recently read first, so a cap never
+/// starves a source. At most a few subreddits (Reddit allows about a
+/// request a minute without OAuth).
+fn plan_sources(mut enabled: Vec<store::Source>) -> Vec<store::Source> {
+    let rank = |o: &str| match o {
+        "user" => 0,
+        "google" => 1,
+        _ => 2,
+    };
+    enabled.sort_by_key(|s| (rank(&s.origin), s.last_fetch_at.unwrap_or(0)));
+    let mut reddit = 0;
+    enabled.retain(|s| {
+        reddit += usize::from(s.kind == "reddit");
+        s.kind != "reddit" || reddit <= MAX_REDDIT_PER_RUN
+    });
+    enabled.truncate(MAX_SOURCES_PER_RUN);
+    enabled
+}
+
+/// Drop old, foreign-language, housekeeping, and malformed items, and cap
+/// how many each source contributes (newest first) before deduplication.
+fn clean(items: Vec<Item>, now: i64, lang: &str) -> Vec<Item> {
+    let min_time = now - MAX_AGE_DAYS * DAY_MS;
+    let mut per_source: HashMap<String, usize> = HashMap::new();
+    let mut items: Vec<Item> = items
+        .into_iter()
+        .filter(|i| {
+            i.published_ms
+                .is_none_or(|t| t >= min_time && t <= now + DAY_MS)
+                && i.language.as_deref().is_none_or(|l| l.starts_with(lang))
+                && i.title.chars().count() >= 8
+                && !rank::is_housekeeping(&i.title)
+                && markup::split_url(&i.url).is_some()
+        })
+        .collect();
+    // Stable: followed sources keep their place ahead of searches.
+    items.sort_by_key(|i| std::cmp::Reverse(i.published_ms.unwrap_or(0)));
+    items.sort_by_key(|i| i.source_id.is_none());
+    items.retain(|i| {
+        let key = i.source_id.clone().unwrap_or_else(|| i.source_name.clone());
+        let n = per_source.entry(key).or_default();
+        *n += 1;
+        *n <= MAX_ITEMS_PER_SOURCE
+    });
+    items.truncate(MAX_CANDIDATES);
+    items
 }
 
 /// Without a model: one topic per liked-post topic.
@@ -1068,7 +1169,6 @@ async fn check_price_watches(state: &AppState, user_id: &str, fetcher: &Arc<Fetc
             favicon_url: meta.favicon.clone(),
             cached: BTreeMap::new(),
             facts: json!({"price": new, "was": old}),
-            created_at: now_ms(),
         };
         let _ = state
             .db
@@ -1212,6 +1312,102 @@ mod tests {
         assert!(!should_pause(&st, now), "just resumed");
         st.paused = true;
         assert!(!should_pause(&st, now), "already paused");
+    }
+
+    #[test]
+    fn model_calls_at_most_once_a_day() {
+        let mut st = FeedState::default();
+        assert!(interests_due(&st, "2026-10-11") && summaries_due(&st, "2026-10-11"));
+        // A failed (or unusable) call still uses up the day.
+        st.interests_call_day = Some("2026-10-11".into());
+        st.summary_call_day = Some("2026-10-11".into());
+        assert!(!interests_due(&st, "2026-10-11") && !summaries_due(&st, "2026-10-11"));
+        assert!(interests_due(&st, "2026-10-12") && summaries_due(&st, "2026-10-12"));
+        // Interests the model wrote today are kept even without the marker.
+        st.interests_call_day = None;
+        st.interests = Some(Interests {
+            by_model: true,
+            generated_day: "2026-10-12".into(),
+            ..Default::default()
+        });
+        assert!(!interests_due(&st, "2026-10-12"));
+    }
+
+    #[test]
+    fn source_plan_rotates_and_limits_reddit() {
+        let src = |id: &str, kind: &str, origin: &str, fetched: Option<i64>| store::Source {
+            id: id.into(),
+            kind: kind.into(),
+            value: id.into(),
+            label: None,
+            topic: None,
+            origin: origin.into(),
+            enabled: true,
+            title: None,
+            state: Value::Null,
+            last_fetch_at: fetched,
+            last_ok_at: fetched,
+            last_error: None,
+            fail_count: 0,
+            created_at: 0,
+        };
+        let mut all = vec![src("new-suggested", "rss", "suggested", None)];
+        for i in 0..45 {
+            all.push(src(&format!("u{i}"), "rss", "user", Some(1000 + i)));
+        }
+        for i in 0..6 {
+            all.push(src(&format!("r{i}"), "reddit", "suggested", Some(i)));
+        }
+        let plan = plan_sources(all);
+        assert_eq!(plan.len(), MAX_SOURCES_PER_RUN);
+        assert_eq!(plan[0].id, "u0", "least recently read first");
+        assert!(
+            !plan.iter().any(|s| s.id == "u44"),
+            "most recent waits for the next run"
+        );
+        let plan2 = plan_sources(
+            (0..6)
+                .map(|i| src(&format!("r{i}"), "reddit", "user", Some(i)))
+                .chain([src("x", "rss", "suggested", None)])
+                .collect(),
+        );
+        assert_eq!(
+            plan2.iter().filter(|s| s.kind == "reddit").count(),
+            MAX_REDDIT_PER_RUN
+        );
+        assert_eq!(plan2.last().unwrap().id, "x");
+    }
+
+    #[test]
+    fn clean_caps_and_filters() {
+        let now = 2_000_000_000_000;
+        let item = |src: &str, title: &str, age_days: i64, lang: Option<&str>| Item {
+            url: format!("https://{src}.example/{}", title.replace(' ', "-")),
+            title: title.into(),
+            source_id: Some(src.into()),
+            source_name: src.into(),
+            published_ms: Some(now - age_days * DAY_MS),
+            language: lang.map(String::from),
+            ..Default::default()
+        };
+        let mut items: Vec<Item> = (0..60)
+            .map(|i| item("big", &format!("Story number {i}"), 1, None))
+            .collect();
+        items.push(item("a", "An old story here", 9, None));
+        items.push(item("a", "Weekly Questions Thread", 1, None));
+        items.push(item("a", "Une histoire en français", 1, Some("fr")));
+        items.push(item("a", "A fresh story here", 1, Some("en")));
+        let out = clean(items, now, "en");
+        assert_eq!(
+            out.iter().filter(|i| i.source_name == "big").count(),
+            MAX_ITEMS_PER_SOURCE
+        );
+        let a: Vec<&str> = out
+            .iter()
+            .filter(|i| i.source_name == "a")
+            .map(|i| i.title.as_str())
+            .collect();
+        assert_eq!(a, vec!["A fresh story here"]);
     }
 
     #[test]

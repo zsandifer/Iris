@@ -76,6 +76,11 @@ pub struct TurnSpec {
     /// Stable key for per-conversation state some CLIs keep on disk
     /// (the conversation id).
     pub scope: String,
+    /// False for helper calls that must not use any tool: every adapter
+    /// then turns off the CLI's built-in tools (as far as the CLI allows),
+    /// ignores MCP servers from the user's own CLI config, and never
+    /// auto-approves edits.
+    pub tools: bool,
 }
 
 /// A fully built command line.
@@ -417,6 +422,78 @@ mod tests {
         assert!(!valid_server_name("a.b"));
         assert!(!valid_server_name(""));
         assert!(!valid_server_name("x y"));
+    }
+
+    #[test]
+    fn tool_less_calls_turn_tools_off_in_every_adapter() {
+        use crate::config::HarnessConfig;
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = TurnSpec {
+            turn_id: "t1".into(),
+            prompt: "summarize".into(),
+            images: Vec::new(),
+            system_prompt: "You write blurbs.".into(),
+            model: "m".into(),
+            effort: None,
+            resume: None,
+            mcp_servers: Vec::new(),
+            cwd: tmp.path().into(),
+            writable_dirs: Vec::new(),
+            run_dir: tmp.path().into(),
+            scope: "feed-summaries".into(),
+            tools: false,
+        };
+        let args = |h: &dyn Harness| h.build(&spec).unwrap();
+
+        let c = args(&claude::Claude::new(HarnessConfig::claude_default()));
+        let pos = c.args.iter().position(|a| a == "--tools").unwrap();
+        assert_eq!(c.args[pos + 1], "");
+        assert!(c.args[pos + 2].starts_with("--"), "variadic flag is closed");
+        assert!(c.args.contains(&"--strict-mcp-config".to_string()));
+        assert!(
+            !c.args
+                .iter()
+                .any(|a| a == "--allowedTools" || a == "--permission-mode")
+        );
+
+        let x = args(&codex::Codex::new(HarnessConfig::codex_default()));
+        for o in [
+            "sandbox_mode=\"read-only\"",
+            "approval_policy=\"never\"",
+            "tools.web_search=false",
+            "mcp_servers={}",
+        ] {
+            assert!(x.args.iter().any(|a| a == o), "{o}");
+        }
+        assert!(!x.args.iter().any(|a| a.contains("workspace-write")));
+
+        let g = args(&gemini::Gemini::new(HarnessConfig::gemini_default()));
+        let pos = g.args.iter().position(|a| a == "--approval-mode").unwrap();
+        assert_eq!(g.args[pos + 1], "default");
+        let settings: Value = serde_json::from_slice(
+            &std::fs::read(g.cwd.as_ref().unwrap().join(".gemini/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            settings["tools"]["exclude"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "run_shell_command")
+        );
+        assert_eq!(settings["mcp"]["allowed"], serde_json::json!([]));
+
+        let o = args(&opencode::OpenCode::new(HarnessConfig::opencode_default()));
+        let file = &o
+            .env
+            .iter()
+            .find(|(k, _)| k == "OPENCODE_CONFIG")
+            .unwrap()
+            .1;
+        let cfg: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(cfg["tools"]["*"], false);
+        assert_eq!(cfg["permission"]["bash"], "deny");
+        assert_eq!(cfg["permission"]["edit"], "deny");
     }
 
     #[test]

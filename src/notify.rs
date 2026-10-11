@@ -110,8 +110,29 @@ pub fn digest(
     }
 }
 
-/// Deliver held notifications for users whose quiet hours are over.
-/// Called by the minute scheduler.
+static FLUSHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Deliver held notifications in the background (called by the minute
+/// scheduler; never delays it, never runs twice at once).
+pub fn spawn_flush_quiet(state: &AppState) {
+    use std::sync::atomic::Ordering;
+    if FLUSHING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        flush_quiet(&state).await;
+        FLUSHING.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Held notifications older than this are dropped if they still cannot be
+/// delivered (the push service keeps failing).
+const MAX_HOLD_MS: i64 = 48 * 3_600_000;
+
+/// Deliver held notifications for users whose quiet hours are over. Rows
+/// are removed only once the digest was delivered (or the user has no
+/// device to deliver to); a failed delivery is retried on the next tick.
 pub async fn flush_quiet(state: &AppState) {
     let users: Vec<String> = state
         .db
@@ -130,12 +151,14 @@ pub async fn flush_quiet(state: &AppState) {
             .db
             .call(move |c| {
                 let mut stmt = c.prepare(
-                    "SELECT payload, created_at FROM push_queue WHERE user_id = ?1 ORDER BY created_at",
+                    "SELECT id, payload, created_at FROM push_queue WHERE user_id = ?1 ORDER BY created_at",
                 )?;
-                let held: Vec<(Value, i64)> = stmt
-                    .query_map([&uid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                let held: Vec<(String, Value, i64)> = stmt
+                    .query_map([&uid], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                    })?
                     .filter_map(|r| r.ok())
-                    .filter_map(|(p, at)| serde_json::from_str(&p).ok().map(|v| (v, at)))
+                    .map(|(id, p, at)| (id, serde_json::from_str(&p).unwrap_or(Value::Null), at))
                     .collect();
                 let mut stmt = c.prepare(
                     "SELECT conversation_id, COALESCE(last_read_at, 0) FROM conversation_members WHERE user_id = ?1",
@@ -144,20 +167,52 @@ pub async fn flush_quiet(state: &AppState) {
                     .query_map([&uid], |r| Ok((r.get(0)?, r.get(1)?)))?
                     .filter_map(|r| r.ok())
                     .collect();
-                c.execute("DELETE FROM push_queue WHERE user_id = ?1", [&uid])?;
                 Ok((held, reads))
             })
             .await
             .unwrap_or_default();
+        if held.is_empty() {
+            continue;
+        }
         let name = state.agent_name().await;
         let read = |conv: &str, at: i64| reads.get(conv).is_some_and(|r| *r >= at);
-        if let Some(payload) = digest(&name, &held, &read) {
-            crate::info!(
-                "delivering {} held notification(s) after quiet hours",
-                held.len()
-            );
-            let _ = push_users_now(state, std::slice::from_ref(&u), &payload).await;
-        }
+        let items: Vec<(Value, i64)> = held
+            .iter()
+            .filter(|(_, p, _)| p.is_object())
+            .map(|(_, p, at)| (p.clone(), *at))
+            .collect();
+        let done = match digest(&name, &items, &read) {
+            None => true,
+            Some(payload) => {
+                let (delivered, failed) =
+                    push_users_now(state, std::slice::from_ref(&u), &payload).await;
+                if delivered > 0 || failed == 0 {
+                    crate::info!(
+                        "delivered {} held notification(s) after quiet hours",
+                        held.len()
+                    );
+                    true
+                } else {
+                    crate::warn!("held notifications not delivered yet; will retry");
+                    false
+                }
+            }
+        };
+        let now = now_ms();
+        let ids: Vec<String> = held
+            .iter()
+            .filter(|(_, _, at)| done || now - at > MAX_HOLD_MS)
+            .map(|(id, _, _)| id.clone())
+            .collect();
+        let _ = state
+            .db
+            .call(move |c| {
+                for id in &ids {
+                    c.execute("DELETE FROM push_queue WHERE id = ?1", [id])?;
+                }
+                Ok(())
+            })
+            .await;
     }
 }
 
@@ -304,5 +359,81 @@ mod tests {
         let d = digest("Iris", &mixed, &none).unwrap();
         assert!(d.get("conversation_id").is_none() && d.get("url").is_none());
         assert_eq!(d["kind"], "digest");
+    }
+
+    fn state_with_push() -> (AppState, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let db = crate::db::Db::open(&paths.db_file()).unwrap();
+        let mut cfg = crate::config::Config::default();
+        for h in cfg.harness.values_mut() {
+            h.enabled = false;
+        }
+        cfg.feed.enabled = false;
+        (AppState::new(cfg, paths, db).unwrap(), tmp)
+    }
+
+    fn queued(state: &AppState) -> i64 {
+        state
+            .db
+            .with(|c| c.query_row("SELECT COUNT(*) FROM push_queue", [], |r| r.get(0)))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn queue_is_kept_until_delivered() {
+        let (state, _tmp) = state_with_push();
+        let owner = state.db.with(crate::db::owner_user_id).unwrap().unwrap();
+        // Quiet now: held, not sent.
+        let now = crate::jobs::local_minutes_now();
+        let hhmm = |m: u32| format!("{:02}:{:02}", (m % 1440) / 60, m % 60);
+        let quiet = json!({"start": hhmm(now + 1440 - 5), "end": hhmm(now + 5)}).to_string();
+        let key = quiet_hours_key(&owner);
+        state
+            .db
+            .with(|c| crate::db::set_setting(c, &key, &quiet))
+            .unwrap();
+        enqueue(
+            &state,
+            &owner,
+            &json!({"title": "Iris", "body": "Hello", "kind": "reply"}),
+        )
+        .await;
+        flush_quiet(&state).await;
+        assert_eq!(queued(&state), 1, "still quiet");
+
+        // Quiet hours over, but the only device's push service is down: kept.
+        state
+            .db
+            .with(|c| crate::db::delete_setting(c, &key))
+            .unwrap();
+        state
+            .db
+            .with(|c| {
+                let d = crate::db::insert_device(c, &owner, "phone", "hash-1")?;
+                entities::upsert_push_subscription(
+                    c,
+                    &owner,
+                    &d.id,
+                    "https://127.0.0.1:9/push",
+                    "bad",
+                    "bad",
+                )
+            })
+            .unwrap();
+        flush_quiet(&state).await;
+        assert_eq!(queued(&state), 1, "retried on the next tick");
+
+        // No device left to deliver to: nothing to wait for.
+        state
+            .db
+            .with(|c| c.execute("DELETE FROM push_subscriptions", []))
+            .unwrap();
+        flush_quiet(&state).await;
+        assert_eq!(queued(&state), 0);
     }
 }

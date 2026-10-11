@@ -72,7 +72,10 @@ function Favicon({ p, size = 30 }) {
   const host = hostOf(p.source_url);
   // Reserved names (RFC 2606/6761) never resolve; skip the request.
   const reserved = /(^|\.)(example|invalid|test|localhost|local)$/.test(host);
-  const candidates = [p.favicon, !reserved && host && `https://${host}/favicon.ico`].filter(shown);
+  // Pipeline posts only ever show the icon Iris cached; posts the agent
+  // wrote may fall back to the site's own favicon.
+  const guess = !p.source_kind && !reserved && host && `https://${host}/favicon.ico`;
+  const candidates = [p.favicon, guess].filter(shown);
   const src = candidates[bad];
   if (!src) return html`<${LetterTile} name=${sourceName(p)} size=${size} radius=${size / 2} />`;
   const style = `width:${size}px;height:${size}px`;
@@ -139,14 +142,14 @@ export function Post({ p }) {
 const report = (event) => apiPost('/feed/activity', { event }).catch(() => {});
 
 function useEndTracking(posts, status) {
-  const ref = useRef(null);
-  // The end of today's batch: the last post published with it.
-  const batchAt = status?.last_batch_at || 0;
-  const lastNew = batchAt ? [...posts].reverse().find((p) => p.created_at >= batchAt) : null;
+  // The end of today's batch is its last (lowest-ranked) post; it may not
+  // be loaded yet, in which case there is nothing to watch.
+  const endId = status?.last_batch_end_id;
+  const loaded = !!endId && posts.some((p) => p.id === endId);
   useEffect(() => {
-    const key = `iris.feedEnd.${batchAt}`;
-    if (!lastNew || sessionStorage.getItem(key) || !('IntersectionObserver' in window)) return undefined;
-    const el = document.querySelector(`.post[data-id="${lastNew.id}"]`);
+    const key = `iris.feedEnd.${endId}`;
+    if (!loaded || sessionStorage.getItem(key) || !('IntersectionObserver' in window)) return undefined;
+    const el = document.querySelector(`.post[data-id="${endId}"]`);
     if (!el) return undefined;
     const io = new IntersectionObserver((entries) => {
       if (entries.some((e) => e.isIntersecting)) {
@@ -156,9 +159,23 @@ function useEndTracking(posts, status) {
       }
     }, { threshold: 0.6 });
     io.observe(el);
-    ref.current = io;
     return () => io.disconnect();
-  }, [lastNew?.id, batchAt]);
+  }, [endId, loaded]);
+}
+
+/** Report an open on mount and whenever the app comes back to the front. */
+function useOpenTracking() {
+  useEffect(() => {
+    let last = 0;
+    const opened = () => {
+      if (document.visibilityState !== 'visible' || Date.now() - last < 30 * 60e3) return;
+      last = Date.now();
+      report('opened');
+    };
+    opened();
+    document.addEventListener('visibilitychange', opened);
+    return () => document.removeEventListener('visibilitychange', opened);
+  }, []);
 }
 
 function PausedCard({ status }) {
@@ -179,10 +196,8 @@ function PausedCard({ status }) {
 export function FeedScreen() {
   useStore();
   const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    if (!S.feed) loadFeed().catch((e) => toast(e.message));
-    report('opened');
-  }, []);
+  useEffect(() => { if (!S.feed) loadFeed().catch((e) => toast(e.message)); }, []);
+  useOpenTracking();
   const posts = S.feed?.posts || [];
   const st = S.feed?.status;
   useEndTracking(posts, st);

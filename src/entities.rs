@@ -125,15 +125,25 @@ pub struct PipelinePost {
     /// Original URL -> cached file name.
     pub cached: BTreeMap<String, String>,
     pub facts: Value,
-    pub created_at: i64,
 }
 
+/// Insert a pipeline post with a unique timestamp after every existing post
+/// (so `before=<created_at>` paging never skips one).
 pub fn insert_pipeline_post(
     conn: &Connection,
     user_id: &str,
     p: &PipelinePost,
 ) -> rusqlite::Result<FeedPost> {
+    crate::db::write_tx(conn, |c| insert_pipeline_post_locked(c, user_id, p))
+}
+
+fn insert_pipeline_post_locked(
+    conn: &Connection,
+    user_id: &str,
+    p: &PipelinePost,
+) -> rusqlite::Result<FeedPost> {
     let id = new_id();
+    let created_at = crate::db::next_timestamp(conn, "feed_posts")?;
     let cut = |s: &str, n: usize| s.chars().take(n).collect::<String>();
     let opt = |v: &Option<String>, n: usize| {
         v.as_deref()
@@ -169,7 +179,7 @@ pub fn insert_pipeline_post(
             p.source_kind,
             p.url_key,
             facts.to_string(),
-            p.created_at
+            created_at
         ],
     )?;
     get_feed_post(conn, user_id, &id).map(|p| p.expect("inserted"))

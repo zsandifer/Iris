@@ -88,6 +88,14 @@ pub struct FeedState {
     pub urgent_day: Option<String>,
     #[serde(default)]
     pub urgent_count: u32,
+    /// Local days on which the daily model calls were used.
+    #[serde(default)]
+    pub interests_call_day: Option<String>,
+    #[serde(default)]
+    pub summary_call_day: Option<String>,
+    /// The last (lowest-ranked) post of the latest batch.
+    #[serde(default)]
+    pub last_batch_end_id: Option<String>,
 }
 
 impl Default for FeedState {
@@ -108,6 +116,9 @@ impl Default for FeedState {
             last_run: None,
             urgent_day: None,
             urgent_count: 0,
+            interests_call_day: None,
+            summary_call_day: None,
+            last_batch_end_id: None,
         }
     }
 }
@@ -282,9 +293,25 @@ pub fn trim_suggested(conn: &Connection, user_id: &str, max: usize) -> rusqlite:
 
 // --------------------------------------------------------------------- seen
 
+/// Links and titles already shown: recorded keys plus every post still in
+/// the feed (including ones the agent wrote or that predate the pipeline).
 pub fn seen_keys(conn: &Connection, user_id: &str) -> rusqlite::Result<HashSet<String>> {
     let mut stmt = conn.prepare("SELECT key FROM feed_seen WHERE user_id = ?1")?;
-    stmt.query_map([user_id], |r| r.get(0))?.collect()
+    let mut keys: HashSet<String> = stmt
+        .query_map([user_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut stmt = conn.prepare("SELECT title, source_url FROM feed_posts WHERE user_id = ?1")?;
+    let rows = stmt.query_map([user_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
+    for row in rows {
+        let (title, url) = row?;
+        keys.insert(super::rank::title_key(&title));
+        if let Some(u) = url.filter(|u| !u.is_empty()) {
+            keys.insert(super::rank::url_key(&u));
+        }
+    }
+    Ok(keys)
 }
 
 pub fn add_seen(conn: &Connection, user_id: &str, keys: &[String]) -> rusqlite::Result<()> {
@@ -297,8 +324,9 @@ pub fn add_seen(conn: &Connection, user_id: &str, keys: &[String]) -> rusqlite::
     Ok(())
 }
 
-/// Forget seen keys after 120 days, and unliked, undiscussed posts after
-/// 90 days (their photos are pruned with them).
+/// Forget seen keys after 120 days, and unliked, undiscussed pipeline
+/// posts after 90 days (their photos are pruned with them). Posts the
+/// agent wrote (no `source_kind`) are never pruned.
 pub fn prune(conn: &Connection, user_id: &str) -> rusqlite::Result<()> {
     let now = now_ms();
     conn.execute(
@@ -306,7 +334,7 @@ pub fn prune(conn: &Connection, user_id: &str) -> rusqlite::Result<()> {
         params![user_id, now - 120 * 86_400_000],
     )?;
     conn.execute(
-        "DELETE FROM feed_posts WHERE user_id = ?1 AND liked = 0
+        "DELETE FROM feed_posts WHERE user_id = ?1 AND liked = 0 AND source_kind IS NOT NULL
              AND discuss_conversation_id IS NULL AND created_at < ?2",
         params![user_id, now - 90 * 86_400_000],
     )?;
@@ -593,9 +621,9 @@ mod tests {
                 get_source(c, u, &mine.id)?.unwrap().enabled,
                 "the user's own stay on"
             );
-            record_fetch(c, &mine.id, Ok(Some(&serde_json::json!({"etag": "x"}))))?;
+            record_fetch(c, &mine.id, Ok(Some(&serde_json::json!({"title": "x"}))))?;
             let ok = get_source(c, u, &mine.id)?.unwrap();
-            assert_eq!((ok.fail_count, ok.state["etag"].as_str()), (0, Some("x")));
+            assert_eq!((ok.fail_count, ok.title.as_deref()), (0, Some("x")));
             for i in 0..5 {
                 add_source(c, u, "reddit", &format!("sub{i}"), None, None, "suggested")?;
             }
@@ -635,7 +663,6 @@ mod tests {
                     facts: serde_json::json!({"price": {"amount": 120.0, "currency": "USD"}}),
                     topic: Some("Running".into()),
                     source_name: "Shop".into(),
-                    created_at: now_ms(),
                     ..Default::default()
                 },
             )?;

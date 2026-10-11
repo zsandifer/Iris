@@ -113,6 +113,15 @@ impl Harness for Claude {
         a.push("--append-system-prompt-file".into());
         a.push(prompt_file.to_string_lossy().into_owned());
         a.extend(["--system-prompt-snapshot", "off"].map(String::from));
+        if !spec.tools {
+            // No built-in tools and no MCP servers from the user's settings.
+            // `--tools` is variadic, so a flag always follows it.
+            a.extend(["--tools", "", "--strict-mcp-config"].map(String::from));
+            a.extend(["--permission-prompts", "none"].map(String::from));
+            a.extend(self.cfg.extra_args.iter().cloned());
+            inv.stdin = user_message_line(spec)?;
+            return Ok(inv);
+        }
         if !self.cfg.permission_mode.is_empty() {
             a.push("--permission-mode".into());
             a.push(self.cfg.permission_mode.clone());
@@ -655,6 +664,7 @@ mod tests {
             writable_dirs: vec![tmp.path().join("memory")],
             run_dir: tmp.path().into(),
             scope: "c1".into(),
+            tools: true,
         };
         let inv = Claude::new(HarnessConfig::claude_default())
             .build(&spec)

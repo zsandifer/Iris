@@ -179,7 +179,20 @@ impl Harness for Codex {
             overrides.push(format!("model_reasoning_effort={}", toml_str(e)));
         }
         overrides.push(developer_instructions_arg(&spec.system_prompt));
-        if !self.cfg.sandbox.is_empty() {
+        if !spec.tools {
+            // Codex cannot remove its shell tool; a read-only sandbox (no
+            // writes, no network), no approvals, no web search, and no MCP
+            // servers from the user's config is as close as it gets.
+            overrides.extend(
+                [
+                    "sandbox_mode=\"read-only\"",
+                    "approval_policy=\"never\"",
+                    "tools.web_search=false",
+                    "mcp_servers={}",
+                ]
+                .map(String::from),
+            );
+        } else if !self.cfg.sandbox.is_empty() {
             overrides.push(format!("sandbox_mode={}", toml_str(&self.cfg.sandbox)));
             if self.cfg.sandbox == "workspace-write" && !spec.writable_dirs.is_empty() {
                 let roots: Vec<String> = spec
@@ -605,6 +618,7 @@ mod tests {
             writable_dirs: vec!["/m".into()],
             run_dir: run.path().into(),
             scope: "c1".into(),
+            tools: true,
         };
         let mut cfg = HarnessConfig::codex_default();
         cfg.sandbox = "workspace-write".into();

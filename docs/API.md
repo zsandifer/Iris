@@ -680,7 +680,8 @@ day's batch the best-ranked post is the newest.
 | `paused_at` | int or null | |
 | `paused_reason` | string or null | `unused` (two weeks without opening the feed) or `user`. |
 | `daily_size` | int | About how many posts a day (5 to 30, adapts; default 10). |
-| `last_batch_at` | int or null | When the latest batch was published. Posts with `created_at >= last_batch_at` are that batch. |
+| `last_batch_at` | int or null | When the latest batch was published (its first post's `created_at`). |
+| `last_batch_end_id` | string or null | The latest batch's last (lowest-ranked) post: scrolling past it is `reached_end`. |
 | `last_batch_count` | int | |
 | `topics` | string[] | Today's topics from the interests call. |
 | `sources` | int | Enabled sources. |
@@ -692,9 +693,10 @@ day's batch the best-ranked post is the newest.
 {"event": "opened"}
 ```
 
-`event` is `opened` (the feed screen was shown) or `reached_end` (the user
-scrolled past the last post of the latest batch); anything else is `400`.
-Counts are kept per local day and drive the adaptive daily size and the
+`event` is `opened` (the feed screen was shown, or the app came back to
+the front on it) or `reached_end` (the user scrolled to
+`last_batch_end_id`); anything else is `400`. Counts are kept per local day
+and drive the adaptive daily size; either event counts as use for the
 two-week pause. Response `{"ok": true}`.
 
 #### `POST /api/feed/pause`, `POST /api/feed/resume`
@@ -1814,17 +1816,28 @@ the last start. Manual runs (`POST /api/jobs/{name}/run`,
 - **feed**: the For you pipeline for the owner. It publishes at most one
   batch per local day; scheduled runs after that (every `interval_mins`,
   default 60, between `active_start` 06:00 and `active_end` 22:00) do
-  nothing. Its last-run time is recorded even when a run fails, so a
-  network outage is retried after `interval_mins`, not every minute.
+  nothing. A run that publishes nothing (for example during a network
+  outage) leaves the day open, so the next check tries again; the last-run
+  time is recorded even when a run fails, so that happens after
+  `interval_mins`, not every minute.
 
 Failed job turns are only logged.
 
 ### For you pipeline
 
-Deterministic code does nearly everything; the model is used at most twice
-per daily run, through the owner's own CLI, as a single prompt with no
-tools, no MCP servers, and no session (the activity log shows each run, in
-the hidden `feed` job conversation, with the engine that wrote the text).
+Deterministic code does nearly everything. The model is used at most twice
+a day, counting manual refreshes and failed calls: once for interests and
+once for summaries (later runs that day use the last interests and the
+posts' own descriptions). Each call goes through the owner's own CLI as a
+single prompt with no session, no Iris persona, and tools turned off with
+the CLI's own controls: Claude Code `--tools "" --strict-mcp-config`;
+Codex `sandbox_mode="read-only"`, `approval_policy="never"`,
+`tools.web_search=false`, `mcp_servers={}` (Codex cannot remove its shell
+tool; the read-only sandbox has no writes or network); Gemini CLI
+workspace settings excluding every built-in tool and all MCP servers, with
+`--approval-mode default`; OpenCode `tools: {"*": false}` and every
+permission denied. The activity log shows each run, in the hidden `feed`
+job conversation, with the engine that wrote the text.
 
 1. **Interests** (once a day, `background` slot): `USER.md`,
    `PROACTIVE_PREFERENCES.md`, the feed prompt, recently liked posts, the
@@ -1841,15 +1854,19 @@ the hidden `feed` job conversation, with the engine that wrote the text).
    subscriptions (`origin: google`).
 3. **Clean**: posts older than 7 days, recurring "weekly thread" posts,
    posts in another language (when the source says), and anything already
-   shown (same canonical link or title, kept 120 days) are dropped;
-   near-duplicate titles across sources are merged.
+   shown (same canonical link or title as any post still in the feed, or
+   recorded for 120 days) are dropped; at most 40 items per source and 1,500
+   overall go on; near-duplicate titles across sources are merged.
 4. **Rank**: likes-weighted topic affinity (a topic's stated weight, raised
    by likes and discussions over 60 days, lowered when its posts are
    ignored), keyword match, recency (36-hour half-life), the source's own
    popularity numbers, photos, and liked sources and words. Topic-search
    results score a little below followed sources. The best 3x the daily
    size are enriched from their pages (OpenGraph, Twitter cards, JSON-LD:
-   title, description, site name, icon, original photos, price, event);
+   title, description, site name, icon, original photos, price, event;
+   every finalist except posts that live on Bluesky, Mastodon, Reddit,
+   Hacker News, or YouTube), dropped if the page shows they are older
+   than 7 days;
    then the day's posts are picked: each competitive topic's best post
    first, then by score with diminishing returns for repeats, at most 3 per
    source, 5 per topic (story groups), and about a third from searches.
@@ -1860,7 +1877,14 @@ the hidden `feed` job conversation, with the engine that wrote the text).
    you're into ...").
 6. **Publish**: up to 3 photos and the icon per post are downloaded and
    stored locally (`<data dir>/feed-images`, images under 200 px wide are
-   skipped); posts are published; seen keys are recorded.
+   skipped). Only these checked copies are shown: a photo Iris could not
+   fetch (robots.txt, a non-public address, an error) is left out rather
+   than loaded by the phone from its original URL. Posts, seen keys, and
+   the batch bookkeeping are written in one transaction, with unique
+   timestamps (the best post newest).
+
+**Retention.** Unliked, undiscussed pipeline posts are removed after 90
+days with their photos; posts the agent wrote are kept.
 
 **Adaptive size.** Default 10 a day, between 5 and 30. Once a day, over
 the last 7 days with a batch (at least 3): if the feed was opened on 3 or
@@ -1886,13 +1910,14 @@ reach 70.
 reader)`. robots.txt is honored for every page
 read for a preview and every photo downloaded (`5xx` or unreachable
 robots.txt means "not this run"). Feeds and documented APIs the user
-subscribed to are read like a feed reader reads them: once a day, with
-`If-None-Match`/`If-Modified-Since`. One request per host per second (more
+subscribed to are read like a feed reader reads them, once a day (in full,
+so items not picked today are still candidates tomorrow). One request per
+host per second (more
 with `Crawl-delay`, up to 10 s; rate-limit headers such as Reddit's
 `x-ratelimit-reset` and `Retry-After` are honored); 8 s connect and 20 s
 overall timeouts; size caps of 4 MB for feeds and JSON, 1.5 MB for pages
 (truncated), and 6 MB for photos. Only http(s) to public addresses:
-hostnames that resolve to loopback, private, link-local, or carrier-grade
+no ambient proxy; hostnames that resolve to loopback, private, link-local, or carrier-grade
 NAT (tailnet) addresses are refused on every redirect hop.
 
 **Google (YouTube).** When the Google connector has stored a token for the
@@ -2552,10 +2577,13 @@ trigger reply pushes.
 Notifications for a user inside their
 [quiet hours](#put-apimequiet-hours) are held in the database (at most 50
 per user; test pushes are sent at once). The minute scheduler delivers them
-as soon as the quiet hours end (or are turned off): one held notification
-is sent as-is; several become one digest, `"While it was quiet: N updates.
-<latest few>"`, opening their chat when they all came from one. Held replies
-from chats the user has read since are left out.
+in the background as soon as the quiet hours end (or are turned off): one
+held notification is sent as-is; several become one digest, `"While it was
+quiet: N updates. <latest few>"`, opening their chat when they all came
+from one. Held replies from chats the user has read since are left out.
+The held rows are removed once the digest reaches at least one device (or
+the user has none); if every device fails, the next tick tries again, and
+notifications still undelivered after 48 hours are dropped.
 
 ### Payload
 

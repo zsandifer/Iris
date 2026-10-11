@@ -1584,7 +1584,6 @@ esac
                         .into(),
                         facts: json!({"price": {"amount": 120.0, "currency": "USD"}}),
                         why: Some("You run trails.".into()),
-                        created_at: crate::util::now_ms(),
                         ..Default::default()
                     },
                 )

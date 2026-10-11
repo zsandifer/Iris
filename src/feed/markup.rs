@@ -70,9 +70,10 @@ pub fn tokenize(src: &str, html: bool) -> Vec<Token> {
             i += end + 1;
             text_start = i;
         } else if rest.len() > 1 && rest.as_bytes()[1].is_ascii_alphabetic() {
+            // An unterminated tag runs to the end of the input: the rest is
+            // text (stopping here keeps malformed input linear).
             let Some((name, attrs, self_closing, len)) = parse_tag(rest) else {
-                i += 1;
-                continue;
+                break;
             };
             flush(&mut out, text_start, i);
             i += len;
@@ -194,7 +195,8 @@ pub struct Node {
     pub name: String,
     pub attrs: Vec<(String, String)>,
     pub children: Vec<Node>,
-    /// Direct text content (concatenated).
+    /// Direct text content (concatenated). The same text also appears,
+    /// in document order, as `#text` children.
     pub text: String,
 }
 
@@ -215,11 +217,23 @@ impl Node {
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
     }
-    /// Text of this node and all descendants, in document order (roughly).
+    /// Whether the node has element children (not just text).
+    pub fn has_elements(&self) -> bool {
+        self.children.iter().any(|c| c.name != "#text")
+    }
+    /// Text of this node and all descendants, in document order. Block
+    /// elements are separated by a space.
     pub fn all_text(&self) -> String {
-        let mut s = self.text.clone();
+        let mut s = String::new();
         for c in &self.children {
-            s.push_str(&c.all_text());
+            if c.name == "#text" {
+                s.push_str(&c.text);
+            } else {
+                s.push_str(&c.all_text());
+                if is_block(&c.name) {
+                    s.push(' ');
+                }
+            }
         }
         s
     }
@@ -261,7 +275,15 @@ pub fn parse_xml(src: &str) -> Node {
                     }
                 }
             }
-            Token::Text(t) => stack.last_mut().expect("root").text.push_str(&t),
+            Token::Text(t) => {
+                let top = stack.last_mut().expect("root");
+                top.text.push_str(&t);
+                top.children.push(Node {
+                    name: "#text".into(),
+                    text: t,
+                    ..Default::default()
+                });
+            }
         }
     }
     while stack.len() > 1 {
@@ -662,6 +684,21 @@ mod tests {
         let items: Vec<_> = ch.children_named("item").collect();
         assert_eq!(items.len(), 2);
         assert_eq!(items[1].child_text("title").as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn mixed_content_keeps_order_and_bad_markup_stays_linear() {
+        let root = parse_xml("<content><p>A <b>bright</b> comet</p><p>tonight</p></content>");
+        assert_eq!(
+            collapse_ws(&root.child("content").unwrap().all_text()),
+            "A bright comet tonight"
+        );
+        // 200k unterminated tags: must not rescan the rest at every `<`.
+        let junk = "<a".repeat(200_000);
+        let t0 = std::time::Instant::now();
+        let toks = tokenize(&junk, true);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(toks.len(), 1);
     }
 
     #[test]

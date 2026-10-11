@@ -309,7 +309,7 @@ fn collect_imgs(node: &Node, base: &str, item: &mut Item) {
 /// HTML of a text construct: escaped HTML arrives decoded as text; XHTML
 /// content arrives as child elements (their text is used).
 fn html_of(node: &Node) -> String {
-    if node.children.is_empty() {
+    if !node.has_elements() {
         node.text.clone()
     } else {
         node.all_text()

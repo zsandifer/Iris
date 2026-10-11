@@ -4,7 +4,7 @@
 //! - robots.txt is honored for crawling: every web page fetched for a
 //!   preview and every image downloaded. Feeds and documented APIs the user
 //!   (or Iris on their behalf) subscribed to are read the way any feed
-//!   reader reads them: once a day, with conditional requests.
+//!   reader reads them: once a day.
 //! - At most one request per host per second (longer when robots.txt asks
 //!   for a crawl delay, and for hosts with strict published limits).
 //! - Connect/overall timeouts and per-request size caps.
@@ -68,14 +68,9 @@ pub struct Response {
     pub final_url: String,
     pub content_type: String,
     pub body: Vec<u8>,
-    pub etag: Option<String>,
-    pub last_modified: Option<String>,
 }
 
 impl Response {
-    pub fn not_modified(&self) -> bool {
-        self.status == 304
-    }
     /// Body as text (UTF-8, or Latin-1 when the bytes are not UTF-8).
     pub fn text(&self) -> String {
         match std::str::from_utf8(&self.body) {
@@ -93,8 +88,6 @@ pub struct Request<'a> {
     pub max_bytes: u64,
     /// Keep the first `max_bytes` instead of failing (HTML heads).
     pub truncate: bool,
-    pub etag: Option<&'a str>,
-    pub last_modified: Option<&'a str>,
     pub bearer: Option<&'a str>,
 }
 
@@ -106,8 +99,6 @@ impl<'a> Request<'a> {
             accept,
             max_bytes,
             truncate: false,
-            etag: None,
-            last_modified: None,
             bearer: None,
         }
     }
@@ -219,6 +210,9 @@ impl Fetcher {
             .timeout_connect(Some(Duration::from_secs(8)))
             .timeout_global(Some(Duration::from_secs(20)))
             .max_redirects(0)
+            // Never through an ambient proxy: the address check must see
+            // the real destination.
+            .proxy(None)
             .http_status_as_error(false)
             .max_idle_connections(8)
             .max_idle_connections_per_host(2)
@@ -357,14 +351,14 @@ impl Fetcher {
                     .raw(&hop)
                     .inspect_err(|_| self.bump(|s| s.errors += 1))?;
             }
-            if (300..400).contains(&res.status) && res.status != 304 {
+            if (300..400).contains(&res.status) {
                 let Some(loc) = res.final_url.strip_prefix("redirect:") else {
                     return Err(FetchError::Status(res.status));
                 };
                 url = markup::resolve(&url, loc).ok_or(FetchError::BadUrl)?;
                 continue;
             }
-            if res.status != 304 && !(200..300).contains(&res.status) {
+            if !(200..300).contains(&res.status) {
                 self.bump(|s| s.errors += 1);
                 return Err(FetchError::Status(res.status));
             }
@@ -380,12 +374,6 @@ impl Fetcher {
         let origin = markup::origin_of(req.url).ok_or(FetchError::BadUrl)?;
         self.wait_turn(&host, &origin);
         let mut r = self.agent.get(req.url).header("Accept", req.accept);
-        if let Some(e) = req.etag {
-            r = r.header("If-None-Match", e);
-        }
-        if let Some(lm) = req.last_modified {
-            r = r.header("If-Modified-Since", lm);
-        }
         if let Some(b) = req.bearer {
             r = r.header("Authorization", &format!("Bearer {b}"));
         }
@@ -399,8 +387,6 @@ impl Fetcher {
                 .map(str::to_string)
         };
         let content_type = header("content-type").unwrap_or_default();
-        let etag = header("etag");
-        let last_modified = header("last-modified");
         // Honor rate-limit headers (Reddit allows a request a minute):
         // the host's next slot moves to when the server says.
         let reset = header("retry-after")
@@ -413,7 +399,8 @@ impl Fetcher {
             })
             .and_then(|s| s.trim().parse::<f64>().ok())
             .filter(|s| s.is_finite() && *s >= 0.0)
-            .map(Duration::from_secs_f64);
+            // Clamp before converting: huge values would panic.
+            .map(|s| Duration::from_secs_f64(s.min(MAX_RATE_WAIT.as_secs_f64() * 2.0)));
         let mut retry = false;
         if let Some(wait) = reset {
             let wait = wait.min(MAX_RATE_WAIT * 2);
@@ -432,7 +419,7 @@ impl Fetcher {
                 ..Default::default()
             });
         }
-        if status == 304 || !(200..300).contains(&status) {
+        if !(200..300).contains(&status) {
             return Ok(Response {
                 status,
                 final_url: if retry {
@@ -468,8 +455,6 @@ impl Fetcher {
             final_url: req.url.to_string(),
             content_type,
             body,
-            etag,
-            last_modified,
         })
     }
 }
@@ -545,7 +530,7 @@ impl Robots {
                             .parse::<f64>()
                             .ok()
                             .filter(|d| d.is_finite() && *d >= 0.0)
-                            .map(Duration::from_secs_f64);
+                            .map(|d| Duration::from_secs_f64(d.min(MAX_CRAWL_DELAY.as_secs_f64())));
                     }
                 }
                 _ => in_agents = false,
@@ -662,6 +647,8 @@ mod tests {
         assert!(!r.allowed("/files/a.pdf"));
         assert!(r.allowed("/files/a.pdf?x=1"));
         assert_eq!(r.crawl_delay, Some(Duration::from_secs(2)));
+        let huge = Robots::parse("User-agent: *\nCrawl-delay: 1e300\n", "irisfeed");
+        assert_eq!(huge.crawl_delay, Some(MAX_CRAWL_DELAY), "clamped, no panic");
 
         let specific = Robots::parse(
             "User-agent: *\nDisallow: /\n\nUser-agent: IrisFeed\nUser-agent: Another\nAllow: /\nDisallow: /search\n",
@@ -727,6 +714,12 @@ mod tests {
                 "x-ratelimit-remaining: 0\r\nx-ratelimit-reset: 1\r\n",
                 "ok".into(),
             ),
+            (
+                "/huge",
+                429,
+                "Retry-After: 99999999999999999999999999\r\n",
+                String::new(),
+            ),
         ]);
         let f = Fetcher::for_tests();
         let url = format!("{base}/a");
@@ -763,6 +756,14 @@ mod tests {
         f.get(&Request::new(&limited, Mode::Feed, "*/*", 1000))
             .unwrap();
         assert!(t0.elapsed() >= Duration::from_secs(1));
+        // An absurd Retry-After is clamped (no panic) and not waited for.
+        let huge = format!("{base}/huge");
+        let t0 = Instant::now();
+        assert!(matches!(
+            f.get(&Request::new(&huge, Mode::Feed, "*/*", 1000)),
+            Err(FetchError::Status(429))
+        ));
+        assert!(t0.elapsed() < Duration::from_secs(5));
         // The real resolver refuses loopback.
         let real = Fetcher::new();
         assert!(

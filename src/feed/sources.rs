@@ -61,19 +61,12 @@ pub fn fetch(f: &Fetcher, src: &Source, now_ms: i64) -> Result<Fetched, String> 
     Ok(out)
 }
 
-fn conditional<'a>(req: &mut Request<'a>, state: &'a Value) {
-    req.etag = state["etag"].as_str();
-    req.last_modified = state["last_modified"].as_str();
-}
-
 fn fetch_rss(f: &Fetcher, url: &str, state: &Value) -> Result<Fetched, String> {
     let feed_url = state["feed_url"].as_str().unwrap_or(url).to_string();
-    let mut req = Request::new(&feed_url, Mode::Feed, FEED_ACCEPT, MAX_FEED_BYTES);
-    conditional(&mut req, state);
+    // Read whole once a day (no conditional request): items not picked
+    // today stay candidates tomorrow.
+    let req = Request::new(&feed_url, Mode::Feed, FEED_ACCEPT, MAX_FEED_BYTES);
     let res = f.get(&req).map_err(|e| e.to_string())?;
-    if res.not_modified() {
-        return Ok(Fetched::default());
-    }
     let text = res.text();
     let (doc, feed_url) = match parse::parse_feed(&text, &res.final_url) {
         Some(doc) => (doc, res.final_url.clone()),
@@ -110,12 +103,6 @@ fn fetch_rss(f: &Fetcher, url: &str, state: &Value) -> Result<Fetched, String> {
         }
     }
     let mut st = json!({});
-    if let Some(e) = &res.etag {
-        st["etag"] = e.clone().into();
-    }
-    if let Some(lm) = &res.last_modified {
-        st["last_modified"] = lm.clone().into();
-    }
     if feed_url != url {
         st["feed_url"] = feed_url.into();
     }

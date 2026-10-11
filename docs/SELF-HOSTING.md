@@ -275,7 +275,8 @@ engines but cannot modify them, and never needs download or install rights.
   pages' own photos. Only two small model calls a day: one on the
   `background` slot turns your notes, likes, and recent chats into topics
   and source suggestions, and one batched call on the `feed` slot writes
-  short summaries for the posts that need them. Add or remove sources in
+  short summaries for the posts that need them (with the CLI's tools
+  turned off, since feed text comes from strangers). Add or remove sources in
   the app (Settings, For you). The size grows toward 30 if you keep
   reaching the end and shrinks if you rarely look; after two weeks unused
   the feed pauses itself and tells you once in chat. It only notifies you

@@ -42,6 +42,22 @@ impl Gemini {
 
 /// Appended to the Iris prompt because GEMINI_SYSTEM_MD replaces the CLI's
 /// own prompt. The `${...}` names are substituted by the CLI.
+/// Gemini CLI's built-in tools (excluded for tool-less helper calls).
+const GEMINI_BUILTIN_TOOLS: &[&str] = &[
+    "run_shell_command",
+    "write_file",
+    "replace",
+    "read_file",
+    "read_many_files",
+    "list_directory",
+    "glob",
+    "search_file_content",
+    "web_fetch",
+    "google_web_search",
+    "save_memory",
+    "write_todos",
+];
+
 const TOOLS_SUFFIX: &str = "
 ## Tools
 
@@ -126,12 +142,24 @@ impl Harness for Gemini {
                 s
             })
             .collect();
-        let body = json!({"mcpServers": mcp_settings(&servers)});
+        let mut body = json!({"mcpServers": mcp_settings(&servers)});
+        if !spec.tools {
+            // Workspace settings: every built-in tool excluded, no MCP
+            // server from the user's settings allowed.
+            body["tools"] = json!({"exclude": GEMINI_BUILTIN_TOOLS});
+            body["excludeTools"] = json!(GEMINI_BUILTIN_TOOLS);
+            body["mcp"] = json!({"allowed": []});
+            body["allowMCPServers"] = json!([]);
+        }
         write_private_file(&settings, &serde_json::to_vec_pretty(&body)?)?;
         inv.temp_files.push(settings);
 
         let prompt_file = spec.run_dir.join(format!("{}.system.md", spec.turn_id));
-        let system = format!("{}\n{TOOLS_SUFFIX}", spec.system_prompt);
+        let system = if spec.tools {
+            format!("{}\n{TOOLS_SUFFIX}", spec.system_prompt)
+        } else {
+            spec.system_prompt.clone()
+        };
         write_private_file(&prompt_file, system.as_bytes())?;
         inv.temp_files.push(prompt_file.clone());
         inv.env.push((
@@ -147,7 +175,9 @@ impl Harness for Gemini {
             a.push("--resume".into());
             a.push(id.clone());
         }
-        if !self.cfg.permission_mode.is_empty() {
+        if !spec.tools {
+            a.extend(["--approval-mode", "default"].map(String::from));
+        } else if !self.cfg.permission_mode.is_empty() {
             a.push("--approval-mode".into());
             a.push(self.cfg.permission_mode.clone());
         }
@@ -537,6 +567,7 @@ mod tests {
             writable_dirs: vec!["/data/memory".into()],
             run_dir: tmp.path().into(),
             scope: "conv/../1".into(),
+            tools: true,
         };
         let inv = Gemini::new(HarnessConfig::gemini_default())
             .build(&spec)
