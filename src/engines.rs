@@ -9,6 +9,11 @@
 //!   (`@openai/codex`, `@google/gemini-cli`, `opencode-ai`); npm verifies
 //!   registry integrity hashes. Install scripts are not run.
 //!
+//! - Iris's browser: Chromium as packaged by Playwright. The official
+//!   `playwright-core` npm package is installed (npm verifies it), then its
+//!   own `install chromium` command downloads Chromium from Playwright's
+//!   download servers into `<root>/browser/browsers`.
+//!
 //! Everything lands in one engines directory (`<root>/<name>/...`, with
 //! launchers in `<root>/bin`) that Iris searches before PATH. Only engines
 //! Iris installed there are ever updated or removed; a CLI the operator
@@ -40,6 +45,8 @@ pub enum Method {
         package: &'static str,
         launcher: Launcher,
     },
+    /// Chromium via `playwright-core install chromium`.
+    PlaywrightChromium,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,8 +101,19 @@ pub const ENGINES: &[EngineSource] = &[
     },
 ];
 
+/// Iris's browser (not an AI engine, but installed and updated the same way).
+pub const BROWSER: EngineSource = EngineSource {
+    name: "browser",
+    label: "Browser (Chromium)",
+    method: Method::PlaywrightChromium,
+    source: "npm: playwright-core, then Chromium from Playwright's official downloads",
+};
+
 pub fn source(name: &str) -> Option<&'static EngineSource> {
-    ENGINES.iter().find(|e| e.name == name)
+    ENGINES
+        .iter()
+        .chain(std::iter::once(&BROWSER))
+        .find(|e| e.name == name)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -337,13 +355,12 @@ fn opencode_binary(prefix: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-fn install_npm(root: &Path, name: &str, package: &str, launcher_kind: Launcher) -> Result<Report> {
+/// `npm install <package>@latest` into `prefix` (no install scripts).
+fn npm_install(root: &Path, prefix: &Path, name: &str, package: &str) -> Result<()> {
     let npm = crate::harness::resolve_command("npm").ok_or_else(|| {
         format!("Node.js (npm) is needed to install {name}; install Node.js on the server first")
     })?;
-    let prefix = root.join(name);
-    std::fs::create_dir_all(&prefix)?;
-    let before = installed_version(root, name);
+    std::fs::create_dir_all(prefix)?;
     let out = std::process::Command::new(&npm)
         .args([
             "install",
@@ -369,6 +386,13 @@ fn install_npm(root: &Path, name: &str, package: &str, launcher_kind: Launcher) 
             .unwrap_or("npm install failed");
         return Err(format!("npm install of {package} failed: {}", line.trim()).into());
     }
+    Ok(())
+}
+
+fn install_npm(root: &Path, name: &str, package: &str, launcher_kind: Launcher) -> Result<Report> {
+    let prefix = root.join(name);
+    let before = installed_version(root, name);
+    npm_install(root, &prefix, name, package)?;
     let pkg_json = prefix
         .join("node_modules")
         .join(package)
@@ -412,6 +436,60 @@ fn install_npm(root: &Path, name: &str, package: &str, launcher_kind: Launcher) 
     })
 }
 
+/// Chromium for Iris's browser: the official `playwright-core` package,
+/// then its own installer, which downloads Chromium from Playwright's
+/// servers into `<root>/browser/browsers` (older builds are removed by
+/// Playwright itself).
+fn install_browser(root: &Path) -> Result<Report> {
+    let prefix = root.join("browser");
+    let before = installed_version(root, "browser");
+    npm_install(root, &prefix, "the browser", "playwright-core")?;
+    let cli = prefix.join("node_modules/playwright-core/cli.js");
+    if !cli.is_file() {
+        return Err("playwright-core did not provide its installer".into());
+    }
+    let node =
+        crate::harness::resolve_command("node").ok_or("Node.js was not found next to npm")?;
+    let browsers = prefix.join("browsers");
+    let out = std::process::Command::new(&node)
+        .arg(&cli)
+        .args(["install", "chromium", "--no-shell"])
+        .env("PLAYWRIGHT_BROWSERS_PATH", &browsers)
+        .env("PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS", "1")
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let line = err
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("Chromium download failed");
+        return Err(format!(
+            "Chromium install failed: {}",
+            crate::util::truncate_chars(line.trim(), 200)
+        )
+        .into());
+    }
+    let bin = crate::browser::launch::newest_in_playwright_cache(&browsers)
+        .ok_or("the Chromium download has no browser for this platform")?;
+    set_launcher_symlink(root, "browser", &bin)?;
+    let version = bin
+        .ancestors()
+        .filter_map(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .find_map(|n| n.strip_prefix("chromium-").map(|r| format!("build {r}")));
+    if let Some(v) = &version {
+        std::fs::write(prefix.join("VERSION"), v)?;
+    }
+    Ok(Report {
+        name: "browser".into(),
+        changed: before != version,
+        version,
+        path: Some(launcher(root, "browser").to_string_lossy().into_owned()),
+    })
+}
+
 /// Install or update an engine (blocking). Idempotent.
 pub fn install(root: &Path, name: &str) -> Result<Report> {
     let src = source(name).ok_or_else(|| format!("unknown engine {name}"))?;
@@ -419,6 +497,7 @@ pub fn install(root: &Path, name: &str) -> Result<Report> {
     match src.method {
         Method::ClaudeNative => install_claude(root),
         Method::Npm { package, launcher } => install_npm(root, name, package, launcher),
+        Method::PlaywrightChromium => install_browser(root),
     }
 }
 
@@ -445,6 +524,7 @@ pub fn cli(args: &[String], root: &Path) -> Result<()> {
         (Some("list"), _) => serde_json::Value::Array(
             ENGINES
                 .iter()
+                .chain(std::iter::once(&BROWSER))
                 .map(|e| {
                     serde_json::json!({
                         "name": e.name,
@@ -456,7 +536,7 @@ pub fn cli(args: &[String], root: &Path) -> Result<()> {
         ),
         _ => {
             return Err(
-                "usage: iris engines <install|update|uninstall> <claude|codex|gemini|opencode> --dir <path> | iris engines list --dir <path>"
+                "usage: iris engines <install|update|uninstall> <claude|codex|gemini|opencode|browser> --dir <path> | iris engines list --dir <path>"
                     .into(),
             );
         }

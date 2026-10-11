@@ -1,0 +1,354 @@
+// Helpers Iris installs in an isolated JavaScript world of the page (the
+// page's own scripts cannot see or change them). They read the page into a
+// compact text snapshot with element refs and locate elements for real
+// input events. Values of password fields and fields Iris filled from the
+// vault are never read out.
+if (!globalThis.__iris) {
+  globalThis.__iris = (() => {
+    const refs = new Map(); // ref -> element
+    const ids = new WeakMap(); // element -> ref
+    const secret = new WeakSet(); // fields filled from the vault
+    let next = 1;
+
+    const refOf = (el) => {
+      let r = ids.get(el);
+      if (!r) {
+        r = 'e' + next++;
+        ids.set(el, r);
+      }
+      refs.set(r, el);
+      return r;
+    };
+
+    const clean = (s, n = 160) => {
+      s = String(s || '').replace(/\s+/g, ' ').trim();
+      return s.length > n ? s.slice(0, n - 1) + '…' : s;
+    };
+    const q = (s) => JSON.stringify(s);
+
+    const visible = (el) => {
+      if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') return false;
+      if (el.checkVisibility) return el.checkVisibility({ visibilityProperty: true });
+      const st = el.ownerDocument.defaultView.getComputedStyle(el);
+      return st.display !== 'none' && st.visibility !== 'hidden';
+    };
+
+    const TEXTY = /^(text|email|tel|url|search|number|password|date|datetime-local|month|week|time|)$/;
+
+    function role(el) {
+      const r = el.getAttribute('role');
+      if (r) return r.split(' ')[0];
+      const t = el.tagName.toLowerCase();
+      if (t === 'a') return el.hasAttribute('href') ? 'link' : null;
+      if (t === 'button' || t === 'summary') return 'button';
+      if (t === 'select') return el.multiple ? 'listbox' : 'combobox';
+      if (t === 'textarea') return 'textbox';
+      if (t === 'input') {
+        const ty = (el.getAttribute('type') || 'text').toLowerCase();
+        if (ty === 'hidden') return null;
+        if (['button', 'submit', 'reset', 'image'].includes(ty)) return 'button';
+        if (ty === 'checkbox' || ty === 'radio') return ty;
+        if (ty === 'range') return 'slider';
+        if (ty === 'file') return 'file upload';
+        if (ty === 'password') return 'password field';
+        return 'textbox';
+      }
+      if (el.isContentEditable && el.getAttribute('contenteditable') !== null) return 'textbox';
+      return null;
+    }
+
+    const INTERACTIVE = new Set(['link', 'button', 'textbox', 'password field', 'checkbox', 'radio',
+      'combobox', 'listbox', 'slider', 'switch', 'tab', 'menuitem', 'menuitemcheckbox',
+      'menuitemradio', 'option', 'searchbox', 'spinbutton', 'file upload', 'treeitem']);
+
+    function name(el) {
+      const doc = el.ownerDocument;
+      const lb = el.getAttribute('aria-labelledby');
+      if (lb) {
+        const s = lb.split(/\s+/).map((id) => doc.getElementById(id)?.innerText || '').join(' ');
+        if (clean(s)) return clean(s);
+      }
+      const al = el.getAttribute('aria-label');
+      if (al && clean(al)) return clean(al);
+      if (el.labels && el.labels.length) {
+        const s = [...el.labels].map((l) => l.innerText).join(' ');
+        if (clean(s)) return clean(s);
+      }
+      const t = el.tagName.toLowerCase();
+      if (t === 'input') {
+        const ty = (el.getAttribute('type') || '').toLowerCase();
+        if (['button', 'submit', 'reset'].includes(ty)) return clean(el.value || ty);
+        if (ty === 'image') return clean(el.alt || 'submit');
+      }
+      if (t === 'img') return clean(el.alt);
+      const ph = el.getAttribute('placeholder');
+      if (['input', 'textarea'].includes(t)) return clean(ph || el.title || el.name || '');
+      if (t === 'select') return clean(el.title || el.name || '');
+      let txt = clean(el.innerText, 120);
+      if (!txt) {
+        const img = el.querySelector && el.querySelector('img[alt]');
+        txt = clean((img && img.alt) || el.title || '');
+      }
+      return txt;
+    }
+
+    function value(el, r) {
+      const t = el.tagName.toLowerCase();
+      if (r === 'checkbox' || r === 'radio' || r === 'switch') {
+        const on = el.checked ?? el.getAttribute('aria-checked') === 'true';
+        return on ? ' [checked]' : '';
+      }
+      if (t === 'select') {
+        const o = el.selectedOptions && el.selectedOptions[0];
+        return o ? ` value=${q(clean(o.text, 60))}` : '';
+      }
+      if (t === 'input' || t === 'textarea') {
+        const v = el.value || '';
+        if (!v) return '';
+        const ty = (el.getAttribute('type') || '').toLowerCase();
+        if (ty === 'password' || secret.has(el)) return ' value="••••"';
+        return ` value=${q(clean(v, 80))}`;
+      }
+      return '';
+    }
+
+    function snapshot(max) {
+      const lines = [];
+      let size = 0;
+      let full = false;
+      let buf = '';
+      const push = (line) => {
+        if (full) return;
+        if (size + line.length > max) {
+          full = true;
+          return;
+        }
+        lines.push(line);
+        size += line.length + 1;
+      };
+      const flush = () => {
+        const t = clean(buf, 400);
+        buf = '';
+        if (t) push('- text: ' + t);
+      };
+      const BLOCK = /^(block|flex|grid|list-item|table|table-row|table-cell|flow-root)$/;
+      const walk = (node, depth, textOk) => {
+        if (full || depth > 200) return;
+        if (node.nodeType === 3) {
+          if (textOk) buf += ' ' + node.nodeValue;
+          return;
+        }
+        if (node.nodeType !== 1 && node.nodeType !== 11) return;
+        const el = node;
+        if (node.nodeType === 1) {
+          const t = el.tagName.toLowerCase();
+          if (['script', 'style', 'noscript', 'template', 'svg', 'head', 'meta', 'link'].includes(t)) return;
+          if (!visible(el)) return;
+          const r = role(el);
+          if (r && INTERACTIVE.has(r)) {
+            flush();
+            let line = `- ${r} ${q(name(el))} [ref=${refOf(el)}]${value(el, r)}`;
+            if (el.disabled || el.getAttribute('aria-disabled') === 'true') line += ' [disabled]';
+            const ex = el.getAttribute('aria-expanded');
+            if (ex) line += ex === 'true' ? ' [expanded]' : ' [collapsed]';
+            if (el === el.ownerDocument.activeElement) line += ' [focused]';
+            if (r === 'link') {
+              const h = el.getAttribute('href') || '';
+              if (h && !h.startsWith('javascript:') && h !== '#') line += ' -> ' + clean(el.href, 120);
+            }
+            if (t === 'select') {
+              const opts = [...el.options].slice(0, 25).map((o) => clean(o.text, 40)).filter(Boolean);
+              if (opts.length) line += ' options: ' + opts.map(q).join(', ') + (el.options.length > 25 ? ', …' : '');
+            }
+            push(line);
+            return;
+          }
+          if (/^h[1-6]$/.test(t) || r === 'heading') {
+            flush();
+            push(`- heading ${q(clean(el.innerText, 200))} [level=${t[1] || el.getAttribute('aria-level') || 2}]`);
+            textOk = false;
+          } else if (t === 'img') {
+            const alt = clean(el.alt, 120);
+            if (alt) {
+              flush();
+              push(`- img ${q(alt)}`);
+            }
+            return;
+          } else if (t === 'iframe' || t === 'frame') {
+            flush();
+            let doc = null;
+            try { doc = el.contentDocument; } catch { doc = null; }
+            if (doc && doc.body) walk(doc.body, depth + 1, true);
+            else push(`- iframe ${q(clean(el.title || el.name || ''))} (contents not readable)`);
+            flush();
+            return;
+          } else if (t === 'br') {
+            buf += ' ';
+            return;
+          }
+          const block = BLOCK.test(el.ownerDocument.defaultView.getComputedStyle(el).display);
+          if (block) flush();
+          let kids;
+          if (el.shadowRoot) kids = el.shadowRoot.childNodes;
+          else if (t === 'slot') kids = el.assignedNodes().length ? el.assignedNodes() : el.childNodes;
+          else kids = el.childNodes;
+          for (const k of kids) walk(k, depth + 1, textOk);
+          if (block || /^h[1-6]$/.test(t)) flush();
+          return;
+        }
+        for (const k of el.childNodes) walk(k, depth + 1, textOk);
+      };
+      refs.clear();
+      walk(document.body || document.documentElement, 0, true);
+      flush();
+      return { text: lines.join('\n'), truncated: full, url: location.href, title: document.title };
+    }
+
+    function el(ref) {
+      const e = refs.get(ref);
+      if (!e || !e.isConnected) return null;
+      return e;
+    }
+
+    // Center of an element in top-level viewport CSS pixels.
+    function point(ref) {
+      let e = el(ref);
+      if (!e) return { error: 'stale' };
+      let rect = e.getBoundingClientRect();
+      if ((rect.width < 1 || rect.height < 1) && e.labels && e.labels[0]) {
+        e = e.labels[0];
+      }
+      e.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      rect = e.getBoundingClientRect();
+      if (rect.width < 1 || rect.height < 1) return { error: 'hidden' };
+      let x = rect.left + rect.width / 2;
+      let y = rect.top + rect.height / 2;
+      let win = e.ownerDocument.defaultView;
+      while (win && win.frameElement) {
+        const fe = win.frameElement;
+        const fr = fe.getBoundingClientRect();
+        x += fr.left + fe.clientLeft;
+        y += fr.top + fe.clientTop;
+        win = fe.ownerDocument.defaultView;
+      }
+      const hit = document.elementFromPoint(x, y);
+      let covered = null;
+      if (hit && e.ownerDocument === document && hit !== e && !e.contains(hit) && !hit.contains(e)) {
+        covered = clean(hit.innerText || hit.getAttribute('aria-label') || hit.tagName.toLowerCase(), 60);
+      }
+      return { x, y, covered };
+    }
+
+    function focus(ref) {
+      const e = el(ref);
+      if (!e) return { error: 'stale' };
+      const t = e.tagName.toLowerCase();
+      if (t === 'select') return { error: 'select' };
+      e.scrollIntoView({ block: 'center', behavior: 'instant' });
+      e.focus();
+      if (t === 'input' || t === 'textarea') {
+        try { e.select(); } catch { /* some input types cannot select */ }
+      } else if (e.isContentEditable) {
+        const r = e.ownerDocument.createRange();
+        r.selectNodeContents(e);
+        const s = e.ownerDocument.defaultView.getSelection();
+        s.removeAllRanges();
+        s.addRange(r);
+      }
+      const active = e.ownerDocument.activeElement;
+      return { ok: active === e || e.contains(active) };
+    }
+
+    function choose(ref, wanted) {
+      const e = el(ref);
+      if (!e) return { error: 'stale' };
+      if (e.tagName.toLowerCase() !== 'select') return { error: 'not a select' };
+      const want = (Array.isArray(wanted) ? wanted : [wanted]).map((w) => String(w).trim().toLowerCase());
+      const o = [...e.options].find((x) => want.includes(x.value.trim().toLowerCase()) || want.includes(clean(x.text).toLowerCase()));
+      if (!o) return { error: 'no such option' };
+      e.value = o.value;
+      e.dispatchEvent(new Event('input', { bubbles: true }));
+      e.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true, chosen: clean(o.text, 60) };
+    }
+
+    // Every same-origin document (main page and readable iframes).
+    function docs() {
+      const out = [document];
+      for (let i = 0; i < out.length && i < 20; i++) {
+        for (const f of out[i].querySelectorAll('iframe,frame')) {
+          try { if (f.contentDocument) out.push(f.contentDocument); } catch { /* cross-origin */ }
+        }
+      }
+      return out;
+    }
+
+    const usable = (e) => visible(e) && !e.disabled && !e.readOnly && e.getBoundingClientRect().width > 0;
+    const attrList = (e) => [e.name, e.id, e.getAttribute('autocomplete'), e.getAttribute('placeholder'),
+      e.getAttribute('aria-label'), e.labels && [...e.labels].map((l) => l.innerText).join(' ')]
+      .filter(Boolean).map((a) => String(a).trim());
+    const attrs = (e) => attrList(e).join(' ');
+    // Some attribute (name, id, placeholder, label...) matches.
+    const any = (e, re) => attrList(e).some((a) => re.test(a));
+
+    function loginFields() {
+      const inputs = docs().flatMap((d) => [...d.querySelectorAll('input')]).filter(usable);
+      const pass = inputs.find((e) => (e.type || '').toLowerCase() === 'password'
+        && !/new-password/.test(e.getAttribute('autocomplete') || ''))
+        || inputs.find((e) => (e.type || '').toLowerCase() === 'password');
+      const userish = (e) => TEXTY.test((e.getAttribute('type') || '').toLowerCase()) && e.type !== 'password';
+      let user = null;
+      const scope = pass ? inputs.filter((e) => (pass.form ? e.form === pass.form : true)) : inputs;
+      const tagged = scope.find((e) => userish(e) && /username|email/.test(e.getAttribute('autocomplete') || ''));
+      if (tagged) user = tagged;
+      else if (pass) {
+        const before = scope.filter((e) => userish(e) && (e.compareDocumentPosition(pass) & Node.DOCUMENT_POSITION_FOLLOWING));
+        user = before.at(-1) || null;
+      } else {
+        user = scope.find((e) => userish(e) && (e.type === 'email' || /user|email|login|account|identifier|phone/i.test(attrs(e)))) || null;
+      }
+      return { user: user && refOf(user), pass: pass && refOf(pass) };
+    }
+
+    function cardFields() {
+      const all = docs().flatMap((d) => [...d.querySelectorAll('input,select')]).filter(usable);
+      const ac = (e, re) => re.test(e.getAttribute('autocomplete') || '');
+      const pick = (list, acRe, re) => list.find((e) => ac(e, acRe)) || list.find((e) => any(e, re));
+      const number = pick(all, /cc-number/, /card.?num|cc.?num|cardnum|card.?no\b/i);
+      const cvc = pick(all, /cc-csc/, /^(cvc|cvv|csc|cvn)\b|security.?code|card.?code|verification/i);
+      const holder = pick(all, /cc-name/, /name.?on.?card|card.?holder/i);
+      const rest = all.filter((e) => e !== number && e !== cvc && e !== holder);
+      // One "MM/YY" field, or separate month and year fields.
+      const exp = rest.find((e) => ac(e, /(^|\s)cc-exp(\s|$)/))
+        || rest.find((e) => any(e, /expir|exp.?date|mm\s*\/\s*yy/i) && !any(e, /month|year/i));
+      const parts = rest.filter((e) => e !== exp);
+      const month = pick(parts, /cc-exp-month/, /exp\w*.?month|^mm$|month/i);
+      const year = pick(parts.filter((e) => e !== month), /cc-exp-year/, /exp\w*.?year|^yy(yy)?$|year/i);
+      const split = !!(month && year);
+      const r = (e) => (e ? refOf(e) : null);
+      const isSelect = (e) => !!e && e.tagName.toLowerCase() === 'select';
+      return {
+        number: r(number), cvc: r(cvc), name: r(holder),
+        exp: split ? null : r(exp),
+        month: split ? r(month) : null, year: split ? r(year) : null,
+        selects: { exp: isSelect(exp), month: isSelect(month), year: isSelect(year) },
+      };
+    }
+
+    function mask(ref) {
+      const e = el(ref);
+      if (!e) return { error: 'stale' };
+      secret.add(e);
+      e.style.setProperty('-webkit-text-security', 'disc', 'important');
+      return { ok: true };
+    }
+
+    function hasText(text) {
+      const want = String(text).toLowerCase();
+      return docs().some((d) => (d.body ? d.body.innerText : '').toLowerCase().includes(want));
+    }
+
+    return { snapshot, point, focus, choose, loginFields, cardFields, mask, hasText,
+      info: () => ({ url: location.href, title: document.title }) };
+  })();
+}

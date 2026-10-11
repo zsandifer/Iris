@@ -12,13 +12,17 @@ use tokio::sync::broadcast;
 pub enum Audience {
     All,
     Users(Vec<String>),
+    /// The owner's devices only (for example Iris's computer).
+    Owner,
 }
 
 impl Audience {
-    pub fn includes(&self, user_id: &str) -> bool {
+    /// Whether a connection of this user (who may be the owner) gets it.
+    pub fn reaches(&self, user_id: &str, is_owner: bool) -> bool {
         match self {
             Audience::All => true,
             Audience::Users(u) => u.iter().any(|x| x == user_id),
+            Audience::Owner => is_owner,
         }
     }
 }
@@ -121,7 +125,8 @@ mod tests {
         let mut rx = hub.subscribe();
         hub.to_users(&["a".into()], json!({"type": "x"}));
         let env = rx.recv().await.unwrap();
-        assert!(env.audience.includes("a") && !env.audience.includes("b"));
+        assert!(env.audience.reaches("a", false) && !env.audience.reaches("b", true));
+        assert!(Audience::Owner.reaches("o", true) && !Audience::Owner.reaches("o", false));
         let v: Value = serde_json::from_str(&env.json).unwrap();
         assert_eq!(v["type"], "x");
         assert!(v["at"].is_i64());

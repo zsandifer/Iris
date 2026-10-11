@@ -1,10 +1,11 @@
-// The Iris hub: Connections, Logins & wallet, Iris's computer, System files.
+// The Iris hub: Connections, Logins & wallet, System files (Iris's computer
+// lives in computer.js).
 import { html, useEffect, useState } from './h.js';
 import { get, post, patch, put, del } from './api.js';
 import { S, set, useStore, go, toast, isOwner, mainId } from './store.js';
 import {
   Icon, Avatar, Row, Group, Page, Empty, Spinner, Toggle, LetterTile,
-  agentName, ago, since, confirmSheet, stamp,
+  agentName, ago, since, confirmSheet,
 } from './ui.js';
 import { describe, visible } from './status.js';
 
@@ -24,6 +25,7 @@ export function Hub() {
   const [cons] = useData(owner ? '/connectors' : '/me');
   const [creds] = useData(owner ? '/credentials' : '/me');
   const working = Object.keys(S.live).length > 0;
+  const computer = S.settings?.paused ? 'paused' : S.browser?.busy ? 'browsing' : working ? 'working' : 'idle';
   const nCon = cons?.connectors?.filter((c) => c.enabled).length;
   const logins = creds?.credentials?.filter((c) => c.kind === 'login').length;
   const cards = creds?.credentials?.filter((c) => c.kind === 'card').length;
@@ -34,7 +36,7 @@ export function Hub() {
       ${owner && html`
       <${Row} icon="plug" title="Connections" sub=${nCon == null ? ' ' : nCon ? `${nCon} connected` : 'Nothing connected yet'} onClick=${() => go('iris/connections')} />
       <${Row} icon="lock" title="Logins & wallet" sub=${creds ? `${logins} login${logins === 1 ? '' : 's'} · ${cards} card${cards === 1 ? '' : 's'}` : ' '} onClick=${() => go('iris/logins')} />
-      <${Row} icon="monitor" title=${`${agentName()}'s computer`} sub=${working ? 'working' : 'idle'} onClick=${() => go('iris/computer')} />
+      <${Row} icon="monitor" title=${`${agentName()}'s computer`} sub=${computer} onClick=${() => go('iris/computer')} />
       <${Row} icon="folder" title="System files" sub="Personality, memory, and notes" onClick=${() => go('iris/files')} />`}
       <${Row} icon="sliders" title="Settings" onClick=${() => go('settings')} />
     <//>
@@ -207,8 +209,7 @@ export function Logins() {
   const logins = list.filter((c) => c.kind === 'login');
   const cards = list.filter((c) => c.kind === 'card');
   return html`<${Page} title="Logins & wallet" sub=${`${agentName()} can use these but never sees them`}>
-    <div class="lock"><${Icon} name="lock" size=${15} /> Stored encrypted on your server, separate from ${agentName()}. When it's switched on, ${agentName()} signs in for you and the password never enters its chat or memory. Cards always ask before paying.
-      ${data?.injection === 'not_implemented' && html`<br /><b>Not switched on yet:</b> ${agentName()} can't use these yet. You can store them now.`}</div>
+    <div class="lock"><${Icon} name="lock" size=${15} /> Stored encrypted on your server, separate from ${agentName()}. ${agentName()} signs in for you in its own browser: the password is typed into the site directly and never enters its chat or memory. Cards always ask you first, every time.</div>
     ${!data ? html`<${Spinner} />` : html`
     <${Group} label="Logins">
       ${logins.map((c) => html`<${Row} icon=${html`<${LetterTile} name=${c.metadata.site || c.label} />`} title=${c.label}
@@ -241,38 +242,6 @@ export function placeLabel(item) {
   if (item.conversation_kind === 'job') return item.conversation_title === 'feed' ? 'Feed' : 'Background check-in';
   if (item.conversation_kind === 'main') return 'Main chat';
   return item.conversation_title || 'Side chat';
-}
-
-export function Computer() {
-  useStore();
-  const [act] = useData('/activity?limit=8');
-  const working = Object.keys(S.live).length > 0;
-  const disconnectAll = async () => {
-    if (!(await confirmSheet({ title: 'Disconnect everything?', body: `${agentName()} will stop using every connected service until you turn them back on in Connections.`, yes: 'Disconnect', danger: true }))) return;
-    try {
-      const { connectors } = await get('/connectors');
-      await Promise.all(connectors.filter((c) => c.enabled).map((c) => post(`/connectors/${c.id}/disconnect`)));
-      toast('All connections are off');
-    } catch (e) { toast(e.message); }
-  };
-  return html`<${Page} title=${`${agentName()}'s computer`} sub=${`${agentName()}'s own space on your server`}>
-    <div class="screen">
-      <${Icon} name="monitor" size=${30} />
-      <b>${working ? `${agentName()} is working` : `${agentName()} is idle`}</b>
-      <small>A live view of ${agentName()}'s browser isn't available yet. When it is, you'll be able to watch and take over here, for example to log in.</small>
-    </div>
-    <div class="big2"><button disabled><${Icon} name="eye" size=${16} /> Watch</button><button class="p" disabled><${Icon} name="hand" size=${16} /> Take over</button></div>
-    <${Group} label="Recently">
-      ${!act ? html`<${Spinner} />` : act.items.length ? act.items.map((it) => html`<${Row} title=${activityTitle(it)} sub=${placeLabel(it)}
-        value=${stamp(it.created_at)} chevron=${false} onClick=${it.conversation_kind === 'job' ? undefined : () => go(`chat/${it.conversation_id}`)} />`)
-        : html`<div class="r"><div class="rt mu">Nothing yet</div></div>`}
-      ${act?.items.length > 0 && html`<${Row} title="See all activity" accent onClick=${() => go('settings/activity')} />`}
-    <//>
-    <${Group} label="Safety" note="Pausing is coming soon. Disconnecting turns off every connection at once.">
-      <${Row} title=${`Pause ${agentName()}`} right=${html`<${Toggle} on=${false} disabled onChange=${() => {}} label="Pause" />`} />
-      <${Row} title="Disconnect everything" danger chevron=${false} onClick=${disconnectAll} />
-    <//>
-  <//>`;
 }
 
 // ------------------------------------------------------------ system files

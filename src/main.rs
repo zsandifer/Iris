@@ -2,6 +2,7 @@
 //! and Codex CLIs you already have installed and signed in.
 
 mod auth;
+mod browser;
 mod catalog;
 mod classifier;
 mod config;
@@ -43,6 +44,9 @@ Usage:
                                    Copy persona/memory files from OpenClaw
   iris mcp --data-dir DIR --user ID [--conversation ID] [--shared]
                                    Iris MCP bridge (launched by harnesses)
+  iris mcp --browser --data-dir DIR
+                                   Browser tools for one turn (launched by
+                                   harnesses; needs IRIS_BROWSER_TOKEN)
   iris engines <install|update|uninstall> <NAME> [--dir PATH]
   iris engines list [--dir PATH]   Install/update the official CLIs (claude,
                                    codex, gemini, opencode) into the engines
@@ -169,6 +173,14 @@ fn run(args: Args) -> Result<()> {
             args.check_flags(&[])?;
             status(paths)
         }
+        ["mcp"] if args.has("--browser") => {
+            args.check_flags(&["--browser"])?;
+            let bridge = mcp::BrowserBridge {
+                socket: browser::socket::path(&paths),
+                token: std::env::var("IRIS_BROWSER_TOKEN").unwrap_or_default(),
+            };
+            mcp::serve_stdio(|req| bridge.handle(req))
+        }
         ["mcp"] => {
             args.check_flags(&["--user", "--conversation", "--shared"])?;
             let user = args.value("--user").ok_or("--user is required")?;
@@ -278,6 +290,9 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
     let rt = runtime(&cfg)?;
     rt.block_on(async move {
         let state = state::AppState::new(cfg, paths, db)?;
+        state
+            .browser
+            .init_paused(state.setting("paused").await.is_some());
         state.set_serving();
         let probe = state.clone();
         tokio::spawn(async move {

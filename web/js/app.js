@@ -8,7 +8,8 @@ import { Icon, Avatar, Img, Sheet, agentName, promptSheet, confirmSheet, openShe
 import { ChatScreen } from './chat.js';
 import { FeedScreen, StoryViewer } from './feed.js';
 import { IdeasScreen, GoalsScreen, LibraryScreen } from './lists.js';
-import { Hub, Connections, ConnectorForm, Logins, Computer, Files, FileEditor, Folder } from './hub.js';
+import { Hub, Connections, ConnectorForm, Logins, Files, FileEditor, Folder } from './hub.js';
+import { Computer } from './computer.js';
 import { Settings, AiEngine, Devices, People, ActivityLog } from './settings.js';
 import { isIOS, standalone } from './push.js';
 

@@ -219,6 +219,11 @@ async fn run_op(state: &AppState, name: &str, op: &'static str) {
         }
     }
     state.engine_ops.set(name, entry);
+    if name == engines::BROWSER.name {
+        // Not an AI engine: nothing to sign in to.
+        crate::server::browser_broadcast(state);
+        return;
+    }
     if result.is_ok() {
         let auth = state.probe_auth(name).await;
         if op == "install" && auth != AuthState::Ok {
@@ -231,6 +236,7 @@ async fn run_op(state: &AppState, name: &str, op: &'static str) {
 }
 
 fn broadcast(state: &AppState) {
+    crate::server::browser_broadcast(state);
     state.hub.send(
         crate::events::Audience::All,
         json!({"type": "engines.changed", "engines": engines_json(state)}),
@@ -244,7 +250,10 @@ pub async fn maybe_auto_update(state: &AppState) {
         return;
     }
     let root = engines_root(state);
-    if !ENGINES.iter().any(|e| engines::is_installed(&root, e.name)) {
+    // AI engines and Iris's browser (a browser that visits arbitrary sites
+    // needs its security updates).
+    let all = || ENGINES.iter().chain(std::iter::once(&engines::BROWSER));
+    if !all().any(|e| engines::is_installed(&root, e.name)) {
         return;
     }
     let last = state
@@ -267,7 +276,11 @@ pub async fn maybe_auto_update(state: &AppState) {
         .db
         .call(move |c| db::set_setting(c, "engines.last_update", &now))
         .await;
-    for e in ENGINES {
+    for e in all() {
+        // Never swap Chromium's files under a running browser.
+        if e.name == engines::BROWSER.name && state.browser.running().is_some() {
+            continue;
+        }
         if engines::is_installed(&root, e.name) && state.engine_ops.try_begin(e.name, "update") {
             run_op(state, e.name, "update").await;
         }

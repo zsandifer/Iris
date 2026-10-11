@@ -3,11 +3,13 @@
 //! requires a device token.
 
 pub(crate) mod admin;
+mod browser;
 mod chat;
 mod content;
 mod web;
 mod ws;
 
+pub use browser::broadcast as browser_broadcast;
 pub use chat::sniff_image;
 
 use crate::auth::{self, PairError};
@@ -175,6 +177,7 @@ pub fn router(state: AppState) -> Router {
         .merge(chat::routes())
         .merge(content::routes())
         .merge(admin::routes())
+        .merge(browser::routes())
         .route("/ws", get(ws::handler))
         .layer(DefaultBodyLimit::max(upload_limit));
     Router::new()
@@ -411,7 +414,7 @@ async fn user_pairing_code(
 // -------------------------------------------------------------- connectors
 
 /// Reserved MCP server names (the built-in bridge).
-pub const RESERVED_CONNECTOR_NAMES: &[&str] = &["iris"];
+pub const RESERVED_CONNECTOR_NAMES: &[&str] = &["iris", "browser"];
 
 fn connector_aad(id: &str, field: &str, key: &str) -> String {
     format!("connector:{id}:{field}:{key}")
@@ -482,6 +485,12 @@ pub async fn serve(state: AppState) -> Result<()> {
             "bound to non-loopback address {addr}; make sure it is a private network (e.g. Tailscale)"
         );
     }
+    let sock = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::browser::socket::serve(sock).await {
+            crate::warn!("browser tools are unavailable: {e}");
+        }
+    });
     axum::serve(listener, router(state.clone()))
         .with_graceful_shutdown(shutdown_signal(state))
         .await?;
@@ -507,6 +516,9 @@ async fn shutdown_signal(state: AppState) {
     {
         let _ = tx.send(true);
     }
+    // Close the browser cleanly so its profile (sign-ins) is saved.
+    let browser = state.browser.clone();
+    tokio::spawn(async move { browser.close().await });
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         std::process::exit(0);

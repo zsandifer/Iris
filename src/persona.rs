@@ -135,6 +135,8 @@ pub struct PromptContext<'a> {
     pub participants: &'a [String],
     /// Whether the `iris` MCP bridge is attached to this turn.
     pub app_tools: bool,
+    /// Whether Iris's browser (the `browser` tools) is attached.
+    pub browser: bool,
     /// More than one person in the conversation: the owner's private
     /// persona (USER.md) and memory are left out of the prompt.
     pub shared: bool,
@@ -199,6 +201,9 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
         out.push_str(SHARED_TOOLS_GUIDE);
     } else if ctx.app_tools {
         out.push_str(APP_TOOLS_GUIDE);
+    }
+    if ctx.browser && !ctx.shared {
+        out.push_str(crate::browser::tools::GUIDE);
     }
 
     if ctx.shared {
@@ -392,6 +397,7 @@ mod tests {
             purpose: Purpose::Chat,
             participants: &[],
             app_tools: true,
+            browser: false,
             shared: false,
             notices: &[],
         }
@@ -449,6 +455,12 @@ mod tests {
         assert!(!prompt.contains("link.md"));
         assert!(prompt.contains("create_goal"));
         assert!(!prompt.contains("## Notices"));
+        assert!(!prompt.contains("## Your browser"));
+        let mut b = ctx("Nova");
+        b.browser = true;
+        assert!(assemble(&p, &b).contains("fill_login"));
+        b.shared = true;
+        assert!(!assemble(&p, &b).contains("## Your browser"));
     }
 
     #[test]

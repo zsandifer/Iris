@@ -11,6 +11,7 @@ const SHELL = [
   '/js/app.js',
   '/js/cards.js',
   '/js/chat.js',
+  '/js/computer.js',
   '/js/feed.js',
   '/js/h.js',
   '/js/hub.js',

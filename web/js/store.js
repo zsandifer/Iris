@@ -24,7 +24,12 @@ export const S = {
   sheet: null,         // bottom sheet render function
   toast: null,
   drafts: {},          // conversation id -> composer text
+  browser: null,       // GET /api/browser (owner): Iris's computer
+  browsing: {},        // assistant message id -> conversation id, while it uses the browser
 };
+
+// Live view frames skip the store (no app-wide re-render per frame).
+export const frames = { subs: new Set(), onReady: new Set() };
 
 const subs = new Set();
 let pending = false;
@@ -141,6 +146,18 @@ export async function loadLibrary() {
   set({ library: { items, photos, saved } });
 }
 export async function loadSlots() { set({ slots: (await get('/models/slots')).slots }); }
+export async function loadBrowser() {
+  if (!isOwner()) return;
+  const { browser } = await get('/browser');
+  setBrowser(browser);
+}
+
+function setBrowser(b) {
+  const browser = { ...(S.browser || {}), ...b };
+  const browsing = b.active ? Object.fromEntries(b.active.map((a) => [a.message_id, a.conversation_id])) : S.browsing;
+  set({ browser, browsing });
+}
+
 export async function loadEngines() {
   if (!isOwner()) return;
   set({ engines: await get('/engines') });
@@ -181,6 +198,25 @@ export function handleEvent(ev) {
     case 'ready':
       set({ settings: ev.settings, harnesses: ev.harnesses });
       refreshAll();
+      frames.onReady.forEach((f) => f());
+      break;
+    case 'browser.frame':
+      frames.subs.forEach((f) => f(ev));
+      break;
+    case 'browser.state':
+      setBrowser(ev.browser);
+      break;
+    case 'browser.active':
+      set({ browsing: { ...S.browsing, [ev.message_id]: ev.conversation_id } });
+      break;
+    case 'browser.done': {
+      const browsing = { ...S.browsing };
+      delete browsing[ev.message_id];
+      set({ browsing });
+      break;
+    }
+    case 'browser.input_error':
+      toast(ev.message);
       break;
     case 'resync':
       refreshAll();
@@ -259,6 +295,7 @@ export function refreshAll() {
   for (const k of Object.keys(loaders)) if (S[k]) loaders[k]().catch(() => {});
   if (S.slots) loadSlots().catch(() => {});
   if (S.engines) loadEngines().catch(() => {});
+  loadBrowser().catch(() => {});
 }
 
 /** Send a message (text and/or attachment ids) and track the reply. */

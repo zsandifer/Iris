@@ -116,6 +116,8 @@ pub struct Inner {
     pub rankings: Rankings,
     pub logins: crate::login::LoginManager,
     pub engine_ops: crate::setup::EngineOps,
+    /// Iris's computer: the agent's browser.
+    pub browser: crate::browser::Browser,
     serving: std::sync::atomic::AtomicBool,
     /// Last broadcast recommendation per slot (to announce changes).
     last_recommended: Mutex<BTreeMap<Slot, Option<String>>>,
@@ -163,8 +165,11 @@ impl AppState {
         let rankings = Rankings::load(
             (!rankings_file.is_empty()).then(|| std::path::Path::new(rankings_file)),
         )?;
+        let hub = Hub::new();
+        let browser = crate::browser::Browser::new(cfg.browser.clone(), &paths, hub.clone());
         Ok(Self(Arc::new(Inner {
             rankings,
+            browser,
             logins: crate::login::LoginManager::default(),
             engine_ops: crate::setup::EngineOps::default(),
             serving: std::sync::atomic::AtomicBool::new(false),
@@ -173,7 +178,7 @@ impl AppState {
             cfg,
             paths,
             db,
-            hub: Hub::new(),
+            hub,
             vault,
             vapid,
             harnesses,
@@ -564,6 +569,7 @@ impl AppState {
             "avatar_custom": avatar.is_some(),
             "allow_claude_for_shared": self.allow_claude_for_shared().await,
             "feed_prompt": self.feed_prompt().await,
+            "paused": self.browser.is_paused(),
             "voice": {"enabled": false, "status": "not_implemented"},
         })
     }

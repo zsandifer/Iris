@@ -172,6 +172,9 @@ pub fn spawn_scheduler(state: AppState) {
             // automatic slots; announce it.
             state.check_recommendations().await;
             crate::setup::maybe_auto_update(&state).await;
+            if state.browser.is_paused() {
+                continue;
+            }
             for job in Job::ALL {
                 let last = state
                     .setting(job.last_run_key())

@@ -21,7 +21,8 @@ js/
 ├── status.js         tool activity to plain-language phrases
 ├── feed.js           For you: story cards, posts, full-screen stories
 ├── lists.js          Ideas, Goals, Library
-├── hub.js            Iris hub: Connections, Logins & wallet, computer, files
+├── hub.js            Iris hub: Connections, Logins & wallet, files
+├── computer.js       Iris's computer: live view, chat peek, Watch / Take over
 ├── settings.js       Settings, AI engine, devices, people, activity log
 ├── push.js           Web Push subscription
 ├── md.js             small, safe Markdown renderer

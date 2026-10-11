@@ -4,6 +4,11 @@
 //! which cannot set headers on WebSocket requests) by sending
 //! `{"type":"auth","token":"..."}` as the first frame within 10 seconds.
 //! The server then sends `{"type":"ready",...}` followed by events.
+//!
+//! The owner's app can also watch Iris's browser on the same socket:
+//! `{"type":"browser.watch","mode":"peek"|"full"|"off"}` starts or stops
+//! `browser.frame` events, and while the owner has taken over,
+//! `{"type":"browser.input",...}` sends taps, scrolls, keys, and text.
 
 use super::{AuthUser, auth_from_token};
 use crate::auth;
@@ -13,8 +18,17 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, header};
 use axum::response::Response;
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
+
+/// A socket watching the browser.
+struct Watching {
+    _guard: crate::browser::WatchGuard,
+    rx: tokio::sync::watch::Receiver<Option<Arc<crate::browser::Frame>>>,
+    mode: crate::browser::Mode,
+    last_sent: Option<Instant>,
+}
 
 pub async fn handler(
     State(state): State<AppState>,
@@ -102,13 +116,37 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
     let mut ping = tokio::time::interval(Duration::from_secs(30));
     ping.tick().await;
     let mut ticks: u32 = 0;
+    let is_owner = user.user.is_owner;
+    let mut watching: Option<Watching> = None;
     loop {
         tokio::select! {
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-                        if v["type"] == "ping" && !send_json(&mut socket, &json!({"type": "pong"})).await {
+                        let reply = match v["type"].as_str().unwrap_or("") {
+                            "ping" => Some(json!({"type": "pong"})),
+                            "browser.watch" | "browser.input" if !is_owner => Some(json!({
+                                "type": "error", "code": "forbidden",
+                                "message": "only the owner can use Iris's computer"})),
+                            "browser.watch" => {
+                                watching = crate::browser::Mode::parse(v["mode"].as_str().unwrap_or(""))
+                                    .map(|mode| {
+                                        // Replaces (and so ends) any earlier watch.
+                                        let (guard, rx) = state.browser.watch(mode);
+                                        let mut rx = rx;
+                                        rx.mark_changed();
+                                        Watching { _guard: guard, rx, mode, last_sent: None }
+                                    });
+                                None
+                            }
+                            "browser.input" => match state.browser.user_input(&user.device.id, &v).await {
+                                Ok(()) => None,
+                                Err(e) => Some(json!({"type": "browser.input_error", "message": e.to_string()})),
+                            },
+                            _ => None,
+                        };
+                        if let Some(r) = reply && !send_json(&mut socket, &r).await {
                             break;
                         }
                     }
@@ -116,10 +154,33 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
                     Some(Ok(_)) => {}
                 }
             }
+            changed = async {
+                match watching.as_mut() {
+                    Some(w) => w.rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed.is_err() {
+                    watching = None;
+                    continue;
+                }
+                let Some(w) = watching.as_mut() else { continue };
+                let frame = w.rx.borrow_and_update().clone();
+                let Some(frame) = frame else { continue };
+                // Peek watchers get about one frame a second even when
+                // someone else watches full screen.
+                if w.last_sent.is_some_and(|t| t.elapsed() < w.mode.min_interval()) {
+                    continue;
+                }
+                w.last_sent = Some(Instant::now());
+                if socket.send(Message::Text(frame.json.clone().into())).await.is_err() {
+                    break;
+                }
+            }
             ev = rx.recv() => {
                 match ev {
                     Ok(env) => {
-                        if env.audience.includes(&uid)
+                        if env.audience.reaches(&uid, is_owner)
                             && socket.send(Message::Text(env.json.clone().into())).await.is_err()
                         {
                             break;

@@ -155,6 +155,20 @@ async fn run_locked(
         ctx.members.clone()
     };
     let shared = ctx.members.len() > 1;
+    if state.browser.is_paused() {
+        return finish(
+            state,
+            input,
+            &audience,
+            &Acc::default(),
+            json!(null),
+            Outcome::Failed {
+                kind: "paused",
+                detail: "the owner paused Iris".into(),
+            },
+        )
+        .await;
+    }
 
     if state.limiter.saturated() {
         state.hub.to_users(
@@ -186,6 +200,17 @@ async fn run_locked(
     let mut outcome = Outcome::Failed {
         kind: "no_engine",
         detail: "no engine available".into(),
+    };
+    // Iris's browser: only in the owner's own conversations (its profile
+    // holds the owner's sign-ins). Dropping the guard ends the browser peek.
+    let browser_turn = if browser_allowed(state, &input.owner_user_id, shared).await {
+        Some(
+            state
+                .browser
+                .begin_turn(&input.owner_user_id, conv_id, msg_id, &audience),
+        )
+    } else {
+        None
     };
 
     for _attempt in 0..MAX_ATTEMPTS {
@@ -289,11 +314,15 @@ async fn run_locked(
                     .into(),
             );
         }
+        let browser_token = browser_turn.as_ref().map(|g| g.token());
         let mcp_servers = if caps.mcp {
-            mcp_servers(state, &input.owner_user_id, conv_id, shared).await
+            mcp_servers(state, &input.owner_user_id, conv_id, shared, browser_token).await
         } else {
             Vec::new()
         };
+        let browser = mcp_servers
+            .iter()
+            .any(|s| s.name == crate::browser::tools::SERVER);
         let participants: Vec<String> = ctx.names.values().cloned().collect();
         let system_prompt = persona::assemble(
             &state.paths,
@@ -303,6 +332,7 @@ async fn run_locked(
                 purpose: input.purpose,
                 participants: &participants,
                 app_tools: !mcp_servers.is_empty(),
+                browser,
                 shared,
                 notices: &notices,
             },
@@ -765,6 +795,9 @@ fn failure_text(kind: &str, detail: &str) -> String {
             shared conversations unless the owner turns that on."
             .into(),
         "timeout" => "That took too long, so I stopped. Want me to try again?".into(),
+        "paused" => "I'm paused right now, so I'm not doing anything. You can turn me back on \
+            in my computer settings whenever you want me again."
+            .into(),
         "no_engine" => "I can't reach any AI engine on the server right now. One of Claude, \
             Codex, Gemini, or OpenCode needs to be installed and signed in; I can walk you \
             through it in Settings."
@@ -858,7 +891,7 @@ async fn finish(
     }
     // A failed turn tells offline members Iris got stuck, so nobody is left
     // waiting; the app offers a retry on the message.
-    let stuck = matches!(outcome, Outcome::Failed { .. });
+    let stuck = matches!(outcome, Outcome::Failed { kind, .. } if kind != "paused");
     if (ok || stuck) && input.purpose == Purpose::Chat && state.cfg.push.notify_replies_when_offline
     {
         let offline: Vec<String> = audience
@@ -993,6 +1026,7 @@ async fn mcp_servers(
     user_id: &str,
     conv_id: &str,
     shared: bool,
+    browser_token: Option<&str>,
 ) -> Vec<McpServer> {
     let mut args = vec![
         "mcp".into(),
@@ -1017,18 +1051,49 @@ async fn mcp_servers(
     if shared {
         return servers;
     }
+    if let Some(token) = browser_token {
+        servers.push(McpServer {
+            name: crate::browser::tools::SERVER.into(),
+            transport: McpTransport::Stdio {
+                command: state.exe.to_string_lossy().into_owned(),
+                args: vec![
+                    "mcp".into(),
+                    "--browser".into(),
+                    "--data-dir".into(),
+                    state.paths.data_dir.to_string_lossy().into_owned(),
+                ],
+                // Identifies this turn to the server; not a secret of the
+                // user's (it stops working when the turn ends).
+                env: BTreeMap::from([("IRIS_BROWSER_TOKEN".to_string(), token.to_string())]),
+            },
+        });
+    }
     let connectors = state
         .db
         .call(|c| crate::entities::list_connectors(c, true))
         .await
         .unwrap_or_default();
     for con in connectors {
+        if servers.iter().any(|s| s.name == con.name) {
+            crate::warn!("connector {} skipped: the name is taken by Iris", con.name);
+            continue;
+        }
         match crate::server::connector_to_mcp(state, &con) {
             Ok(s) => servers.push(s),
             Err(e) => crate::warn!("connector {} skipped: {e}", con.name),
         }
     }
     servers
+}
+
+/// Whether this turn gets the browser tools: enabled, not paused, a
+/// browser is installed, and the conversation is the owner's alone.
+async fn browser_allowed(state: &AppState, user_id: &str, shared: bool) -> bool {
+    if shared || !state.browser.enabled() || state.browser.is_paused() {
+        return false;
+    }
+    let owner = state.db.call(db::owner_user_id).await.ok().flatten();
+    owner.as_deref() == Some(user_id) && state.browser.executable().is_some()
 }
 
 /// Store a user message and an assistant placeholder, broadcast both, and

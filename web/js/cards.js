@@ -228,11 +228,13 @@ function ApprovalCard({ c, m }) {
     setBusy(false);
   };
   const p = c.preview || {};
+  // Wallet approvals name a site and page; messages a recipient and subject.
+  const [toL, subL] = c.service === 'wallet' ? ['Site', 'Page'] : ['To', 'Subject'];
   return html`<div class=${'ap' + (c.state !== 'pending' ? ' decided' : '')}>
-    <div class="ap-h"><${Icon} name="lock" size=${14} /> Needs your OK</div>
+    <div class="ap-h"><${Icon} name=${c.service === 'wallet' ? 'card' : 'lock'} size=${14} /> Needs your OK</div>
     <div class="ap-em"><b>${c.title}</b>
-      ${p.to && html`<div><span class="mu">To</span> ${p.to}</div>`}
-      ${p.subject && html`<div><span class="mu">Subject</span> ${p.subject}</div>`}
+      ${p.to && html`<div><span class="mu">${toL}</span> ${p.to}</div>`}
+      ${p.subject && html`<div><span class="mu">${subL}</span> ${p.subject}</div>`}
       ${p.body && html`<div class="ap-body">${p.body}</div>`}</div>
     ${c.state === 'approved' ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> You approved this</div>`
       : c.state === 'denied' ? html`<div class="mu small">You said no, so I won't do it.</div>`

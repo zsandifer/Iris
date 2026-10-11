@@ -82,6 +82,8 @@ struct SettingsBody {
     agent_name: Option<String>,
     feed_prompt: Option<String>,
     allow_claude_for_shared: Option<bool>,
+    /// "Pause Iris": stop what it is doing and start nothing new.
+    paused: Option<bool>,
 }
 
 async fn put_settings(
@@ -103,6 +105,9 @@ async fn put_settings(
     if let Some(allow) = body.allow_claude_for_shared {
         writes.push(("allow_claude_for_shared", allow.then(|| "true".to_string())));
     }
+    if let Some(p) = body.paused {
+        writes.push(("paused", p.then(|| "true".to_string())));
+    }
     if let Some(p) = &body.feed_prompt {
         check_text("feed_prompt", p, 4000, false)?;
         writes.push((
@@ -122,6 +127,23 @@ async fn put_settings(
             Ok(())
         })
         .await?;
+    if let Some(p) = body.paused
+        && p != state.browser.is_paused()
+    {
+        crate::info!("owner {} Iris", if p { "paused" } else { "resumed" });
+        if p {
+            // Stop running turns (their CLI process groups are killed).
+            for tx in state
+                .running
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+            {
+                let _ = tx.send(true);
+            }
+        }
+        state.browser.set_paused(p).await;
+    }
     let settings = state.settings_json().await;
     state.hub.send(
         Audience::All,
@@ -511,7 +533,7 @@ async fn create_connector(
     let name = body.name.clone().unwrap_or_default();
     if !valid_server_name(&name) || RESERVED_CONNECTOR_NAMES.contains(&name.as_str()) {
         return Err(ApiError::bad_request(
-            "name must be 1-48 characters of A-Z, a-z, 0-9, _ or - (and not 'iris')",
+            "name must be 1-48 characters of A-Z, a-z, 0-9, _ or - (and not 'iris' or 'browser')",
         ));
     }
     let description = body.description.clone().unwrap_or_default();
@@ -752,7 +774,7 @@ async fn list_credentials(State(state): State<AppState>, user: AuthUser) -> ApiR
         .db
         .call(move |c| entities::list_credentials(c, &uid))
         .await?;
-    ok(json!({"credentials": list, "injection": "not_implemented"}))
+    ok(json!({"credentials": list}))
 }
 
 async fn create_credential(

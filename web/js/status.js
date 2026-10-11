@@ -37,6 +37,19 @@ const IRIS_TOOLS = {
   list_connectors: ['Checking your connections', 'Checked your connections'],
 };
 
+// Iris's own browser (the `browser` MCP server).
+function browserPhrase(tool, sum) {
+  const h = host(sum);
+  switch (tool) {
+    case 'navigate': return h ? [`Opening ${h}`, `Opened ${h}`] : ['Opening a page', 'Opened a page'];
+    case 'fill_login': return ['Signing you in', 'Signed you in'];
+    case 'fill_card': return ['Filling in your card', 'Filled in your card'];
+    case 'screenshot': return ['Looking at the page', 'Looked at the page'];
+    case 'type': return ['Filling in a form', 'Filled in a form'];
+    default: return ['Browsing the web', 'Browsed the web'];
+  }
+}
+
 const SERVICES = [
   [/mail|inbox|imap/, (t) => (/send|draft|reply|compose/.test(t) ? ['Getting an email ready', 'Got an email ready'] : ['Reading your email', 'Read your email'])],
   [/calendar|gcal|event/, (t) => (/create|add|insert|update/.test(t) ? ['Updating your calendar', 'Updated your calendar'] : ['Checking your calendar', 'Checked your calendar'])],
@@ -68,6 +81,7 @@ export function describe(a) {
   if (a.kind === 'mcp' || name.includes('/')) {
     const [server, tool = ''] = name.split('/');
     if (server === 'iris') return IRIS_TOOLS[tool] || ['Updating the app', 'Updated the app'];
+    if (server === 'browser') return browserPhrase(tool, sum);
     const key = `${server} ${tool}`.toLowerCase();
     for (const [re, f] of SERVICES) if (re.test(key)) return f(tool.toLowerCase());
     return [`Checking ${title(server)}`, `Checked ${title(server)}`];
