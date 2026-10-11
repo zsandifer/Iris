@@ -143,7 +143,8 @@ an HTTPS front on your private network. With [Tailscale](https://tailscale.com):
    This prints an address such as `https://<machine>.<tailnet>.ts.net/`
    with a valid certificate, reachable only from your own devices.
 3. Set `public_url` in `config.toml` to that address so `iris pair` prints
-   it, then restart Iris.
+   it (it also serves as the contact push services require, unless you set
+   `[push] vapid_subject`), then restart Iris.
 4. On your phone (signed in to the same tailnet), open the address, enter
    the pairing code, and add Iris to your home screen.
 
@@ -169,7 +170,7 @@ Iris to the open internet.
 | `[router]` | | Shared-chat opt-in, rankings override, optional model classifier (below). |
 | `[engines]` | | Engines directory, privileged install helper, daily auto-update. |
 | `[heartbeat]`, `[feed]` | disabled | Scheduled jobs with active hours. |
-| `[push]` | enabled | Web Push (VAPID); set `vapid_subject` to a `mailto:` URL. |
+| `[push]` | enabled | Web Push (VAPID). Needs `vapid_subject` (a `mailto:` URL) unless `public_url` is `https:`. |
 
 Paths follow XDG: `$XDG_CONFIG_HOME/iris/config.toml` and
 `$XDG_DATA_HOME/iris/`. Override with `--config`, `--data-dir`, or

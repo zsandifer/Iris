@@ -1286,9 +1286,11 @@ See [section 9](#9-push-notifications) for behavior.
 #### `GET /api/push/vapid-public-key`
 
 ```json
-{"enabled": true, "public_key": "<base64url uncompressed P-256 point>"}
+{"enabled": true, "public_key": "<base64url uncompressed P-256 point>", "reason": null}
 ```
 
+`enabled` is `false` (with a human-readable `reason`) when push is turned
+off or has no contact for push services ([section 9](#9-push-notifications));
 `public_key` is `null` when push is disabled in config. Pass it as
 `applicationServerKey` to `pushManager.subscribe()`.
 
@@ -2342,9 +2344,12 @@ conversation events.
 ## 9. Push notifications
 
 Iris sends Web Push (RFC 8030) with VAPID (RFC 8292) and `aes128gcm`
-encryption (RFC 8291). Push is enabled by default (`[push] enabled`); set
-`vapid_subject` to a `mailto:` or `https:` URL. The VAPID key pair is
-generated on first use.
+encryption (RFC 8291). Push is enabled by default (`[push] enabled`) but
+needs a contact for push services: `vapid_subject` (a `mailto:` or
+`https:` URL), or else an `https:` `public_url`. Without one,
+`GET /api/push/vapid-public-key` reports `enabled: false` with a `reason`
+and subscribing fails with 400. The VAPID key pair is generated on first
+use.
 
 ### Subscribing (browser)
 

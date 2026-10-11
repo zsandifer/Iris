@@ -404,6 +404,23 @@ impl Config {
         }
     }
 
+    /// The VAPID contact sent to push services: `push.vapid_subject` (a
+    /// `mailto:` or `https:` URL), else an `https:` `public_url`. Apple
+    /// rejects pushes without one, so without it push is unavailable.
+    pub fn push_subject(&self) -> Option<String> {
+        let valid = |s: &str| {
+            s.starts_with("mailto:") && s.len() > 7 || s.starts_with("https://") && s.len() > 8
+        };
+        let subject = self.push.vapid_subject.trim();
+        if valid(subject) {
+            return Some(subject.to_string());
+        }
+        let url = self.public_url.trim().trim_end_matches('/');
+        url.starts_with("https://")
+            .then(|| url.to_string())
+            .filter(|u| valid(u))
+    }
+
     /// URL printed by `iris pair`.
     pub fn base_url(&self) -> String {
         if !self.public_url.trim().is_empty() {
@@ -580,6 +597,29 @@ mod tests {
         assert_eq!(parse_hhmm("23:59"), Some(1439));
         assert_eq!(parse_hhmm("24:00"), None);
         assert_eq!(parse_hhmm("8"), None);
+    }
+
+    #[test]
+    fn push_needs_a_contact() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.push_subject(), None, "default config has none");
+        cfg.public_url = "http://100.64.0.2:7420".into();
+        assert_eq!(cfg.push_subject(), None);
+        cfg.public_url = "https://iris.example.ts.net/".into();
+        assert_eq!(
+            cfg.push_subject().as_deref(),
+            Some("https://iris.example.ts.net")
+        );
+        cfg.push.vapid_subject = "mailto:admin@example.com".into();
+        assert_eq!(
+            cfg.push_subject().as_deref(),
+            Some("mailto:admin@example.com")
+        );
+        cfg.push.vapid_subject = "admin@example.com".into();
+        assert_eq!(
+            cfg.push_subject().as_deref(),
+            Some("https://iris.example.ts.net")
+        );
     }
 
     #[test]

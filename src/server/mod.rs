@@ -483,9 +483,26 @@ pub async fn serve(state: AppState) -> Result<()> {
         );
     }
     axum::serve(listener, router(state.clone()))
-        .with_graceful_shutdown(shutdown_signal(state))
+        .with_graceful_shutdown(shutdown_signal(state.clone()))
         .await?;
+    // Cancelled turns are still stopping their CLIs' process groups (TERM,
+    // grace, KILL); the runtime must outlive that cleanup.
+    wait_for_turns(&state, std::time::Duration::from_secs(9)).await;
     Ok(())
+}
+
+/// Wait until no turn is running, at most `limit`.
+async fn wait_for_turns(state: &AppState, limit: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < deadline
+        && !state
+            .running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 async fn shutdown_signal(state: AppState) {
@@ -507,8 +524,10 @@ async fn shutdown_signal(state: AppState) {
     {
         let _ = tx.send(true);
     }
+    // Last resort if something still hangs (turn cleanup takes at most
+    // about five seconds).
     tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         std::process::exit(0);
     });
 }
@@ -1184,6 +1203,93 @@ esac
         let status = state.harness("gemini").unwrap().status();
         assert_eq!(status.auth, crate::harness::AuthState::AuthRequired);
         assert_eq!(status.version.as_deref(), Some("0.0.1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_older_auth_probe_never_overwrites_a_newer_report() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let db = crate::db::Db::open(&paths.db_file()).unwrap();
+        let mut cfg = Config::default();
+        for h in cfg.harness.values_mut() {
+            h.enabled = false;
+        }
+        // `auth status` saw a signed-out CLI, but answers slowly.
+        let script = tmp.path().join("fake-claude");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$1 $2\" in\n  \"--version \"*) echo 9.9.9;;\n  \"auth status\") sleep 0.5; echo '{\"loggedIn\": false}'; exit 1;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let claude = cfg.harness.get_mut("claude").unwrap();
+        claude.enabled = true;
+        claude.command = script.to_string_lossy().into_owned();
+        let state = AppState::new(cfg, paths, db).unwrap();
+        let st = state.clone();
+        let probe = tokio::spawn(async move { st.refresh_harnesses().await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Meanwhile a turn (or the in-app sign-in) found it signed in.
+        state
+            .note_auth("claude", crate::harness::AuthState::Ok, None)
+            .await;
+        probe.await.unwrap();
+        assert_eq!(
+            state.harness("claude").unwrap().status().auth,
+            crate::harness::AuthState::Ok
+        );
+        // A probe that starts afterwards is applied as usual.
+        state.refresh_harnesses().await;
+        assert_eq!(
+            state.harness("claude").unwrap().status().auth,
+            crate::harness::AuthState::AuthRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn push_is_unavailable_without_a_contact() {
+        let h = setup();
+        let t = pair_as(&h, None).await;
+        let (_, b) = send(&h.app, "GET", "/api/push/vapid-public-key", Some(&t), None).await;
+        assert_eq!(b["enabled"], false, "{b}");
+        assert!(b["reason"].as_str().unwrap().contains("vapid_subject"));
+        let sub = json!({"endpoint": "https://fcm.googleapis.com/fcm/send/x",
+                         "keys": {"p256dh": "x", "auth": "y"}});
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            "/api/push/subscriptions",
+            Some(&t),
+            Some(sub),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_turns_to_stop() {
+        let h = setup();
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        h.state.running.lock().unwrap().insert("c1".into(), tx);
+        let st = h.state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            st.running.lock().unwrap().remove("c1");
+        });
+        let start = std::time::Instant::now();
+        wait_for_turns(&h.state, std::time::Duration::from_secs(5)).await;
+        let waited = start.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(150),
+            "{waited:?}"
+        );
+        assert!(waited < std::time::Duration::from_secs(2));
+        assert!(h.state.running.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

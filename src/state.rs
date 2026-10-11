@@ -46,6 +46,13 @@ pub struct HarnessEntry {
     pub status: RwLock<HarnessStatus>,
     /// Models the CLI listed at the last probe (OpenCode).
     pub models: RwLock<Vec<DiscoveredModel>>,
+    /// Counts sign-in reports from turns and logins, so a probe that
+    /// started before one never overwrites it.
+    auth_reports: AtomicU64,
+    /// Orders concurrent probes: only a probe newer than the last applied
+    /// one may set the sign-in state.
+    probe_seq: AtomicU64,
+    last_probe_applied: AtomicU64,
 }
 
 impl HarnessEntry {
@@ -65,6 +72,9 @@ impl HarnessEntry {
             cfg,
             status: RwLock::new(status),
             models: RwLock::default(),
+            auth_reports: AtomicU64::new(0),
+            probe_seq: AtomicU64::new(0),
+            last_probe_applied: AtomicU64::new(0),
         }
     }
 
@@ -87,6 +97,7 @@ impl HarnessEntry {
 
     pub fn set_auth(&self, auth: AuthState, message: Option<String>) -> bool {
         let mut s = self.status.write().unwrap_or_else(|p| p.into_inner());
+        self.auth_reports.fetch_add(1, Ordering::SeqCst);
         let changed = s.auth != auth;
         s.auth = auth;
         s.auth_message = message;
@@ -272,6 +283,8 @@ impl AppState {
         // status as it is by then: a turn may report a sign-in change (the
         // only source for Gemini) while a probe runs.
         let program = entry.program();
+        let reports = entry.auth_reports.load(Ordering::SeqCst);
+        let seq = entry.probe_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let mut version: Option<Option<String>> = None;
         let mut auth: Option<(AuthState, Option<String>)> = None;
         if let (true, Some(program)) = (entry.cfg.enabled, &program) {
@@ -313,9 +326,15 @@ impl AppState {
             if let Some(v) = version {
                 status.version = v;
             }
-            if let Some((state, message)) = auth {
+            // Only if nothing newer arrived while probing: a turn or login
+            // report, or a later probe that already finished.
+            if let Some((state, message)) = auth
+                && entry.auth_reports.load(Ordering::SeqCst) == reports
+                && entry.last_probe_applied.load(Ordering::SeqCst) < seq
+            {
                 status.auth = state;
                 status.auth_message = message;
+                entry.last_probe_applied.store(seq, Ordering::SeqCst);
             }
             (before, status.clone())
         };

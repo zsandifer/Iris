@@ -880,9 +880,16 @@ async fn delete_credential(
 // --------------------------------------------------------------------- push
 
 async fn vapid_key(State(state): State<AppState>, _user: AuthUser) -> ApiResult {
+    let ready =
+        state.cfg.push.enabled && state.vapid.is_some() && state.cfg.push_subject().is_some();
     ok(json!({
-        "enabled": state.cfg.push.enabled,
+        "enabled": ready,
         "public_key": state.vapid.as_ref().map(|k| k.public_key_b64.clone()),
+        "reason": (!ready).then_some(if state.cfg.push.enabled {
+            "push needs a contact: set [push] vapid_subject (mailto: or https:) or an https public_url"
+        } else {
+            "push is turned off on the server"
+        }),
     }))
 }
 
@@ -912,6 +919,11 @@ async fn subscribe_push(
     user: AuthUser,
     JsonBody(body): JsonBody<SubscribeBody>,
 ) -> ApiResult {
+    if !state.cfg.push.enabled || state.cfg.push_subject().is_none() {
+        return Err(ApiError::bad_request(
+            "notifications are not set up on this server",
+        ));
+    }
     if body.endpoint.len() > 2000 || !crate::push::endpoint_allowed(&body.endpoint) {
         return Err(ApiError::bad_request(
             "endpoint must be an https URL of a browser push service",

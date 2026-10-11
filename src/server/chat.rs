@@ -507,12 +507,14 @@ pub async fn store_upload(
     })?;
     let id = new_id();
     let file_name = format!("{id}.{ext}");
-    crate::config::write_private_file(&state.paths.uploads_dir().join(&file_name), bytes)?;
-    let (uid, sha, size) = (
-        user_id.to_string(),
-        sha256_hex_bytes(bytes),
-        bytes.len() as i64,
-    );
+    // Hashing and writing up to the upload limit is blocking work.
+    let (path, data) = (state.paths.uploads_dir().join(&file_name), bytes.to_vec());
+    let sha = tokio::task::spawn_blocking(move || {
+        crate::config::write_private_file(&path, &data).map(|_| sha256_hex_bytes(&data))
+    })
+    .await
+    .map_err(|e| ApiError::from(crate::util::BoxError::from(e.to_string())))??;
+    let (uid, size) = (user_id.to_string(), bytes.len() as i64);
     let att = state
         .db
         .call(move |c| db::insert_attachment(c, &id, &uid, mime, size, &sha, &file_name))
