@@ -188,6 +188,17 @@ export function ChatScreen({ cid }) {
     }
   };
 
+  // Like native chat apps: tapping the conversation or dragging it puts
+  // the keyboard away. Taps on controls still do their own thing first.
+  const typing = () => {
+    const a = document.activeElement;
+    return a && a !== document.body && a.closest?.('.composer') ? a : null;
+  };
+  const dismissOnTap = (e) => {
+    if (!e.target.closest?.('a, button, input, textarea, select, [role="button"]')) typing()?.blur();
+  };
+  const dismissOnDrag = () => typing()?.blur();
+
   const running = list.some((m) => m.status === 'streaming');
   // Approval cards belong before the reply of the turn that asked.
   const asks = {};
@@ -208,7 +219,7 @@ export function ChatScreen({ cid }) {
   const isMain = cid === mainId();
   return html`<div class=${'chat' + (S.settings?.paused ? ' paused' : '')}>
     <${PausedBanner} />
-    <div class="scr" ref=${scr} onScroll=${onScroll}>
+    <div class="scr" ref=${scr} onScroll=${onScroll} onClick=${dismissOnTap} onTouchMove=${dismissOnDrag}>
       ${box?.loading && box?.hasMore && html`<${Spinner} />`}
       ${!box ? html`<${Spinner} />` : !list.length && isMain ? html`<${Welcome} />` : null}
       ${isMain && box && !box.hasMore && html`<${NotifyPrompt} />`}
