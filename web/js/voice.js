@@ -31,13 +31,13 @@ function player() {
     audio = new Audio();
     audio.preload = 'auto';
     audio.addEventListener('timeupdate', () => tick(audio.currentTime * 1000));
-    audio.addEventListener('ended', () => { if (audio.dataset.mid && audio.dataset.mid === S.voice?.id) stopped(); });
+    audio.addEventListener('ended', () => { if (audio.dataset.mid && audio.dataset.mid === S.voice?.id && audio.ended) stopped(); });
     // Paused outside the app (lock screen, headphones). Only the note this
     // element is playing counts: a pause from a note being switched away
     // from must not stop the next one while it loads.
     audio.addEventListener('pause', () => {
       const v = S.voice;
-      if (v?.mode === 'server' && v.playing && !v.loading && audio.dataset.mid === v.id) setVoice({ playing: false });
+      if (v?.mode === 'server' && v.playing && !v.loading && audio.dataset.mid === v.id && audio.paused) setVoice({ playing: false });
     });
     audio.addEventListener('loadedmetadata', () => {
       if (Number.isFinite(audio.duration)) setVoice({ dur: Math.round(audio.duration * 1000) });
@@ -76,6 +76,7 @@ function stopped() { setVoice({ playing: false, t: 0, id: null }); }
 const KEEP_NOTES = 6;
 const notes = new Map(); // message id -> Promise<{url, dur}>
 const durs = new Map();  // message id -> length in ms, once known
+const evicted = new Set(); // evicted URLs still in the player
 function serverNote(id) {
   if (notes.has(id)) {
     const p = notes.get(id);
@@ -94,7 +95,11 @@ function serverNote(id) {
     while (notes.size > KEEP_NOTES) {
       const [oldId, old] = notes.entries().next().value;
       notes.delete(oldId);
-      old.then((n) => { if (!audio || audio.src !== n.url) URL.revokeObjectURL(n.url); }).catch(() => {});
+      old.then((n) => {
+        // The one playing is let go when the player moves on (see play).
+        if (audio && audio.src === n.url) evicted.add(n.url);
+        else URL.revokeObjectURL(n.url);
+      }).catch(() => {});
     }
   }
   return notes.get(id);
@@ -107,7 +112,8 @@ export function prefetch(m) { if (serverVoice() && m?.id) serverNote(m.id).catch
 export function speechText(md) {
   let code = false;
   const out = [];
-  for (const raw of String(md || '').split('\n')) {
+  // Only as much input as could be read out (keeps this fast on any text).
+  for (const raw of String(md || '').slice(0, 6000).split('\n')) {
     const l = raw.trim();
     if (/^(```|~~~)/.test(l)) { if (!code) out.push('I put the code in the text.'); code = !code; continue; }
     if (code || !l || /^\|[\s|:-]+\|?$/.test(l)) continue;
@@ -152,7 +158,10 @@ export async function play(m) {
       const n = await serverNote(m.id);
       if (playGen !== my || S.voice?.id !== m.id || !S.voice.playing) return;
       const a = player();
-      if (a.src !== n.url) a.src = n.url;
+      if (a.src !== n.url) {
+        if (evicted.delete(a.src)) URL.revokeObjectURL(a.src);
+        a.src = n.url;
+      }
       a.dataset.mid = m.id;
       setVoice({ loading: false, dur: n.dur });
       await a.play();

@@ -110,10 +110,11 @@ pub async fn voice_note(state: &AppState, msg: &Message) -> Result<(Vec<u8>, u64
         return Ok(hit);
     }
     crate::config::ensure_private_dir(&state.paths.voice_dir())?;
+    // Named after the message so removing its person also finds it.
     let tmp = state
         .paths
         .voice_dir()
-        .join(format!(".{}.tmp.wav", new_id()));
+        .join(format!(".{}-{}.tmp.wav", msg.id, new_id()));
     let root = state.cfg.engines_dir(&state.paths);
     let started = std::time::Instant::now();
     let res = voice::synthesize(&root, &text, &tmp).await;
@@ -129,6 +130,20 @@ pub async fn voice_note(state: &AppState, msg: &Message) -> Result<(Vec<u8>, u64
     tokio::fs::rename(&tmp, &path)
         .await
         .map_err(|e| ApiError::from(crate::util::BoxError::from(format!("voice cache: {e}"))))?;
+    // The message may have been deleted (its person removed) while this
+    // note was being made: then the note must not stay behind.
+    let id = msg.id.clone();
+    let still_there = state
+        .db
+        .call(move |c| db::get_message(c, &id))
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    if !still_there {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(ApiError::not_found("message"));
+    }
     let out = read(path)
         .await
         .ok_or_else(|| ApiError::from(crate::util::BoxError::from("voice note unreadable")))?;
@@ -154,7 +169,11 @@ pub async fn forget_notes(state: &AppState, message_ids: &[String]) {
     };
     while let Ok(Some(e)) = rd.next_entry().await {
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.split_once('-').is_some_and(|(id, _)| ids.contains(id)) {
+        if name
+            .trim_start_matches('.')
+            .split_once('-')
+            .is_some_and(|(id, _)| ids.contains(id))
+        {
             let _ = tokio::fs::remove_file(e.path()).await;
         }
     }
@@ -185,6 +204,15 @@ pub fn prepare_for(state: &AppState, members: &[String], msg: &Message) {
             let _ = voice_note(&st, &msg).await;
         }
     });
+}
+
+/// A file deleted when dropped.
+struct TempFile(PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Voice input: a WAV recording (16-bit PCM, any rate; the app records
@@ -219,19 +247,22 @@ async fn transcribe(
             "voice messages can be up to 5 minutes",
         ));
     }
-    let file = state
-        .paths
-        .run_dir()
-        .join(format!("{}.voice.wav", new_id()));
-    crate::config::write_private_file(&file, &body)?;
-    let res = {
-        let _permit =
-            state.voice_jobs.acquire().await.map_err(|_| {
-                ApiError::from(crate::util::BoxError::from("voice is shutting down"))
-            })?;
-        voice::transcribe(&root, &file).await
-    };
-    let _ = tokio::fs::remove_file(&file).await;
+    // Wait for a free slot before writing anything, and delete the
+    // recording however the request ends (including a dropped connection).
+    let _permit = state
+        .voice_jobs
+        .acquire()
+        .await
+        .map_err(|_| ApiError::from(crate::util::BoxError::from("voice is shutting down")))?;
+    let file = TempFile(
+        state
+            .paths
+            .run_dir()
+            .join(format!("{}.voice.wav", new_id())),
+    );
+    crate::config::write_private_file(&file.0, &body)?;
+    let res = voice::transcribe(&root, &file.0).await;
+    drop(file);
     match res {
         Ok(text) => {
             crate::info!(

@@ -295,7 +295,7 @@ async fn each_person_has_their_own_iris() {
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
-    send(
+    let (s, b) = send(
         &h,
         "PUT",
         "/api/feed/prompt",
@@ -303,6 +303,9 @@ async fn each_person_has_their_own_iris() {
         Some(json!({"feed_prompt": "Bread baking"})),
     )
     .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (_, p) = send(&h, "GET", "/api/feed/prompt", &sam, None).await;
+    assert_eq!(p["feed_prompt"], "Bread baking");
     let (_, p) = send(&h, "GET", "/api/feed/prompt", &owner, None).await;
     assert_ne!(p["feed_prompt"], "Bread baking");
 
@@ -811,4 +814,60 @@ async fn owner_is_asked_about_claude_for_groups_they_are_not_in() {
             .unwrap()
             .contains("Movie night")
     );
+}
+
+#[tokio::test]
+async fn a_group_that_gains_a_member_starts_a_fresh_session() {
+    let h = setup(true).await;
+    let (owner, sam_id, _sam) = owner_and_sam(&h).await;
+    std::fs::write(
+        h.state.paths.memory_dir().join("MEMORY.md"),
+        "owner-secret-fact",
+    )
+    .unwrap();
+    send(
+        &h,
+        "PUT",
+        "/api/settings",
+        &owner,
+        Some(json!({"allow_claude_for_shared": true})),
+    )
+    .await;
+    // A group with only its creator is personal: private memory, resumable.
+    let (_, g) = send(
+        &h,
+        "POST",
+        "/api/conversations",
+        &owner,
+        Some(json!({"kind": "group", "title": "Plans"})),
+    )
+    .await;
+    let gid = g["conversation"]["id"].as_str().unwrap().to_string();
+    turn(&h, &owner, &gid, "one").await;
+    let (_, _, prompt, _) = last_turn(&h);
+    assert!(prompt.contains("owner-secret-fact"));
+    turn(&h, &owner, &gid, "two").await;
+    let (args, _, _, _) = last_turn(&h);
+    assert!(
+        args.contains("--resume\nfake-session"),
+        "personal sessions resume"
+    );
+    // Sam joins: the session that saw the private prompt is not resumed.
+    let (s, _) = send(
+        &h,
+        "POST",
+        &format!("/api/conversations/{gid}/members"),
+        &owner,
+        Some(json!({"user_id": sam_id})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    turn(&h, &owner, &gid, "three").await;
+    let (args, cwd, prompt, _) = last_turn(&h);
+    assert!(
+        !args.contains("--resume"),
+        "fresh session once shared: {args}"
+    );
+    assert!(!prompt.contains("owner-secret-fact"));
+    assert_eq!(cwd, h.state.paths.together_dir(&gid).display().to_string());
 }

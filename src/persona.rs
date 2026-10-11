@@ -103,7 +103,15 @@ pub const MAX_PROMPT_CHARS: usize = 100_000;
 /// files. Returns the files that were created.
 pub fn seed(paths: &Paths) -> Result<Vec<String>> {
     ensure_private_dir(&paths.data_dir)?;
-    for dir in [paths.uploads_dir(), paths.library_dir(), paths.run_dir()] {
+    // Folders that turns keep the agent out of must exist before any turn
+    // builds its rules (a sandbox cannot protect a path that is not there).
+    for dir in [
+        paths.uploads_dir(),
+        paths.library_dir(),
+        paths.run_dir(),
+        paths.voice_dir(),
+        paths.data_dir.join("together"),
+    ] {
         ensure_private_dir(&dir)?;
     }
     seed_person(&paths.owner_dirs())

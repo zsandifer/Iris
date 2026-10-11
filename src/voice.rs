@@ -586,11 +586,17 @@ pub fn wav_info(bytes: &[u8]) -> Option<WavInfo> {
 /// pipes, or formatting marks; capped at [`MAX_SPEECH_CHARS`] at a
 /// sentence boundary.
 pub fn speech_text(md: &str) -> String {
+    // Spoken notes are short; never spend time on more input than could
+    // possibly be read out (this also bounds the work for any input).
+    let md: String = md.chars().take(MAX_SPEECH_CHARS * 4).collect();
     let mut out: Vec<String> = Vec::new();
     let mut in_code = false;
     let mut said_code = false;
     for raw in md.lines() {
         let line = raw.trim();
+        if out.iter().map(String::len).sum::<usize>() > MAX_SPEECH_CHARS * 2 {
+            break;
+        }
         if line.starts_with("```") || line.starts_with("~~~") {
             if !in_code && !said_code {
                 out.push("I put the code in the text.".into());
@@ -692,11 +698,14 @@ fn word_edge(chars: &[char], i: usize) -> bool {
 /// `[label](target)` starting at `start` (which holds '['): the label and
 /// the index after ')'.
 fn link_at(chars: &[char], start: usize) -> Option<(String, usize)> {
-    let close = (start + 1..chars.len()).find(|&j| chars[j] == ']')?;
+    // Labels and URLs are short; looking only a little way ahead keeps this
+    // linear even for text full of unmatched brackets.
+    const LOOK: usize = 300;
+    let close = (start + 1..chars.len().min(start + LOOK)).find(|&j| chars[j] == ']')?;
     if chars.get(close + 1) != Some(&'(') {
         return None;
     }
-    let end = (close + 2..chars.len()).find(|&j| chars[j] == ')')?;
+    let end = (close + 2..chars.len().min(close + 2 + LOOK)).find(|&j| chars[j] == ')')?;
     Some((chars[start + 1..close].iter().collect(), end + 1))
 }
 
@@ -762,6 +771,11 @@ mod tests {
             "I put the code in the text."
         );
         assert_eq!(speech_text(""), "");
+        // Pathological input stays fast and capped.
+        let t = std::time::Instant::now();
+        let s = speech_text(&"[a ".repeat(200_000));
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        assert!(s.chars().count() <= MAX_SPEECH_CHARS + 40);
     }
 
     fn wav(channels: u16, rate: u32, bits: u16, data: usize) -> Vec<u8> {

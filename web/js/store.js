@@ -243,10 +243,13 @@ export function handleEvent(ev) {
     case 'conversation.deleted': {
       const cid = ev.conversation_id;
       const msgs = { ...S.msgs };
+      // Replies that were streaming or queued there will never finish.
+      const live = { ...S.live };
+      for (const m of S.msgs[cid]?.list || []) delete live[m.id];
       delete msgs[cid];
       const members = { ...S.members };
       delete members[cid];
-      set({ convs: (S.convs || []).filter((c) => c.id !== cid), msgs, members });
+      set({ convs: (S.convs || []).filter((c) => c.id !== cid), msgs, members, live });
       if (S.route.tab === 'chat' && S.route.parts[1] === cid) go('chat');
       break;
     }

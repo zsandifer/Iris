@@ -10,6 +10,7 @@ mod demo;
 mod engines;
 mod entities;
 mod events;
+mod fsafe;
 mod harness;
 mod import;
 mod jobs;
@@ -270,7 +271,11 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
     // Leftover per-turn files from a crash.
     if let Ok(rd) = std::fs::read_dir(paths.run_dir()) {
         for e in rd.flatten() {
-            let _ = std::fs::remove_file(e.path());
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                let _ = std::fs::remove_dir_all(e.path());
+            } else {
+                let _ = std::fs::remove_file(e.path());
+            }
         }
     }
     let db = db::Db::open(&paths.db_file())?;

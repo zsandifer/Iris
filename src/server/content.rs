@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::json;
-use std::path::{Component, PathBuf};
+use std::path::PathBuf;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -619,35 +619,28 @@ fn area_root(state: &AppState, user: &AuthUser, area: &str) -> Result<PathBuf, A
     }
 }
 
-/// Resolve `rel` inside `root`, rejecting traversal, hidden names, and
-/// symlinks anywhere along the path.
-pub fn safe_join(root: &std::path::Path, rel: &str) -> Result<PathBuf, String> {
-    let mut out = root.to_path_buf();
-    for comp in std::path::Path::new(rel).components() {
-        match comp {
-            Component::Normal(name) => {
-                let name = name.to_string_lossy();
-                if name.starts_with('.') {
-                    return Err("hidden files are not accessible".into());
-                }
-                out.push(name.as_ref());
-                if let Ok(meta) = std::fs::symlink_metadata(&out)
-                    && meta.file_type().is_symlink()
-                {
-                    return Err("symlinks are not accessible".into());
-                }
-            }
-            Component::CurDir => {}
-            _ => return Err("invalid path".into()),
-        }
-    }
-    Ok(out)
-}
-
 #[derive(Deserialize)]
 struct PathQuery {
     #[serde(default)]
     path: String,
+}
+
+fn file_error(e: std::io::Error, what: &str) -> ApiError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => ApiError::not_found(what),
+        _ => ApiError::bad_request(format!(
+            "{what} is not accessible: only plain files and folders"
+        )),
+    }
+}
+
+/// Run a blocking `fsafe` call off the async workers.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> Result<std::io::Result<T>, ApiError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ApiError::from(crate::util::BoxError::from(e.to_string())))
 }
 
 async fn browse(
@@ -656,30 +649,22 @@ async fn browse(
     Path(area): Path<String>,
     Query(q): Query<PathQuery>,
 ) -> ApiResult {
-    let dir = safe_join(&area_root(&state, &user, &area)?, &q.path)?;
-    let mut entries = Vec::new();
-    let mut rd = tokio::fs::read_dir(&dir)
-        .await
-        .map_err(|_| ApiError::not_found("folder"))?;
-    while let Ok(Some(e)) = rd.next_entry().await {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        let Ok(ft) = e.file_type().await else {
-            continue;
-        };
-        if ft.is_symlink() {
-            continue;
-        }
-        let meta = e.metadata().await.ok();
-        entries.push(json!({
-            "name": name,
-            "type": if ft.is_dir() { "dir" } else { "file" },
-            "size": meta.as_ref().filter(|_| ft.is_file()).map(|m| m.len()),
-            "updated_at": meta.as_ref().and_then(modified_ms),
-        }));
-    }
+    let root = area_root(&state, &user, &area)?;
+    let comps = crate::fsafe::components(&q.path)?;
+    let list = blocking(move || crate::fsafe::list(&root, &comps))
+        .await?
+        .map_err(|e| file_error(e, "folder"))?;
+    let mut entries: Vec<serde_json::Value> = list
+        .into_iter()
+        .map(|e| {
+            json!({
+                "name": e.name,
+                "type": if e.is_dir { "dir" } else { "file" },
+                "size": (!e.is_dir).then_some(e.size),
+                "updated_at": e.modified_ms,
+            })
+        })
+        .collect();
     entries.sort_by(|a, b| {
         (a["type"] != "dir", a["name"].as_str()).cmp(&(b["type"] != "dir", b["name"].as_str()))
     });
@@ -692,20 +677,14 @@ async fn read_file(
     Path(area): Path<String>,
     Query(q): Query<PathQuery>,
 ) -> ApiResult {
-    let path = safe_join(&area_root(&state, &user, &area)?, &q.path)?;
-    let meta = tokio::fs::metadata(&path)
-        .await
-        .map_err(|_| ApiError::not_found("file"))?;
-    if !meta.is_file() {
-        return Err(ApiError::bad_request("not a file"));
-    }
-    if meta.len() as usize > MAX_TEXT_FILE {
-        return Err(ApiError::bad_request("file is too large to edit here"));
-    }
-    let content = tokio::task::spawn_blocking(move || crate::config::read_own_text(&path))
-        .await
-        .map_err(|_| ApiError::not_found("file"))?
-        .map_err(|_| ApiError::bad_request("not a plain text file"))?;
+    let root = area_root(&state, &user, &area)?;
+    let comps = crate::fsafe::components(&q.path)?;
+    let content = blocking(move || crate::fsafe::read_text(&root, &comps, MAX_TEXT_FILE as u64))
+        .await?
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => ApiError::not_found("file"),
+            _ => ApiError::bad_request("not a plain text file (or too large to edit here)"),
+        })?;
     ok(json!({"area": area, "path": q.path, "content": content}))
 }
 
@@ -722,11 +701,11 @@ async fn write_file(
     if body.content.len() > MAX_TEXT_FILE {
         return Err(ApiError::bad_request("file is too large"));
     }
-    let path = safe_join(&area_root(&state, &user, &area)?, &q.path)?;
-    if let Some(parent) = path.parent() {
-        crate::config::ensure_private_dir(parent)?;
-    }
-    crate::config::write_private_file(&path, body.content.as_bytes())?;
+    let root = area_root(&state, &user, &area)?;
+    let comps = crate::fsafe::components(&q.path)?;
+    blocking(move || crate::fsafe::write(&root, &comps, body.content.as_bytes()))
+        .await?
+        .map_err(|e| file_error(e, "path"))?;
     ok(json!({"ok": true}))
 }
 
@@ -739,41 +718,15 @@ async fn delete_file(
     if q.path.trim().is_empty() {
         return Err(ApiError::bad_request("path is required"));
     }
-    let path = safe_join(&area_root(&state, &user, &area)?, &q.path)?;
-    let meta = tokio::fs::symlink_metadata(&path)
-        .await
-        .map_err(|_| ApiError::not_found("file"))?;
-    if meta.is_dir() {
-        tokio::fs::remove_dir(&path)
-            .await
-            .map_err(|_| ApiError::bad_request("folder is not empty"))?;
-    } else {
-        tokio::fs::remove_file(&path)
-            .await
-            .map_err(|_| ApiError::not_found("file"))?;
-    }
+    let root = area_root(&state, &user, &area)?;
+    let comps = crate::fsafe::components(&q.path)?;
+    blocking(move || crate::fsafe::remove(&root, &comps))
+        .await?
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ENOTEMPTY) | Some(libc::EEXIST) => {
+                ApiError::bad_request("folder is not empty")
+            }
+            _ => file_error(e, "file"),
+        })?;
     ok(json!({"ok": true}))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn safe_join_blocks_escapes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir(root.join("notes")).unwrap();
-        std::os::unix::fs::symlink("/etc", root.join("link")).unwrap();
-        assert_eq!(
-            safe_join(root, "notes/a.md").unwrap(),
-            root.join("notes/a.md")
-        );
-        assert_eq!(safe_join(root, "").unwrap(), root.to_path_buf());
-        assert!(safe_join(root, "../etc/passwd").is_err());
-        assert!(safe_join(root, "/etc/passwd").is_err());
-        assert!(safe_join(root, "notes/../../x").is_err());
-        assert!(safe_join(root, ".git/config").is_err());
-        assert!(safe_join(root, "link/passwd").is_err());
-    }
 }

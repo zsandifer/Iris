@@ -108,6 +108,27 @@ case "$OUT" in
     *) fail "the helper failed: $OUT" ;;
 esac
 if as_agent sudo -n -u "$ADMIN_USER" /bin/true 2>/dev/null; then fail "$AGENT_USER can run arbitrary commands as $ADMIN_USER"; else pass "$AGENT_USER cannot run other commands as $ADMIN_USER"; fi
+# Every effective grant (from any sudoers file) must be one of the exact
+# engine commands: take what sudo lists, remove the allowed commands and
+# the expected decorations, and nothing may be left.
+case "$LIST" in
+    *"may run the following commands"*)
+        REST=${LIST#*may run the following commands}
+        REST=${REST#*:}
+        for op in install update uninstall; do
+            for name in claude codex gemini opencode tts stt; do
+                REST=$(printf '%s' "$REST" | sed "s#$IRIS_BIN engines $op $name --dir $ENGINES_DIR##g")
+            done
+        done
+        REST=$(printf '%s' "$REST" | sed "s#$IRIS_BIN engines list --dir $ENGINES_DIR##g; s#IRIS_ENGINES##g; s#($ADMIN_USER)##g; s#NOPASSWD:##g; s#[ ,]##g")
+        if [ -z "$REST" ]; then
+            pass "$AGENT_USER's effective sudo rights are exactly the engine commands"
+        else
+            fail "$AGENT_USER has other sudo rights: $(printf '%s' "$REST" | cut -c1-120)"
+        fi
+        ;;
+    *) fail "could not read the output of sudo -l -U $AGENT_USER" ;;
+esac
 # Every allowed command must be an exact `iris engines ... --dir <engines dir>`
 # (checked from the rule list, without running anything).
 CMDS=$(sed -n '/^Cmnd_Alias IRIS_ENGINES/,/[^\\]$/p' "$SUDOERS" | sed 's/^Cmnd_Alias IRIS_ENGINES = //; s/\\$//' \
@@ -163,9 +184,12 @@ if [ "$AGENT_USER" = "iris-agent" ] || systemctl cat iris >/dev/null 2>&1; then
         done
         RW=$(systemctl show iris -p ReadWritePaths --value 2>/dev/null)
         FILTER=$(systemctl show iris -p SystemCallFilter --value 2>/dev/null)
-        [ -n "$FILTER" ] && warn "iris.service has a SystemCallFilter; it can block sudo for the engine helper"
+        # The service's syscall filter goes into the probe too (it can block
+        # sudo); an empty value means none.
+        set -- -p ReadWritePaths="$RW"
+        [ -n "$FILTER" ] && set -- "$@" -p SystemCallFilter="$FILTER"
         # shellcheck disable=SC2086
-        if systemd-run --wait --quiet --collect --pipe $PROPS -p ReadWritePaths="$RW" \
+        if systemd-run --wait --quiet --collect --pipe $PROPS "$@" \
             sudo -n -u "$ADMIN_USER" "$IRIS_BIN" engines list --dir "$ENGINES_DIR" 2>/dev/null | grep -q '^\['; then
             pass "the helper works inside the service's sandbox"
         else

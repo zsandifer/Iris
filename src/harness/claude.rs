@@ -46,15 +46,16 @@ pub fn mcp_config_json(servers: &[super::McpServer]) -> Value {
 }
 
 /// Permission deny rules for paths the agent must not touch. Claude Code
-/// writes absolute paths as `//abs/path`; folders get `/**`. Paths with
-/// characters the rule syntax cannot carry (commas, parentheses) are
-/// skipped rather than mangled.
-pub fn deny_rules(paths: &[std::path::PathBuf]) -> Vec<String> {
+/// writes absolute paths as `//abs/path`; folders get `/**`. The rules go
+/// in a JSON settings file, so commas and parentheses in paths are fine
+/// (checked with Claude Code). A path that cannot be expressed is an
+/// error: a turn never runs with a protection silently dropped.
+pub fn deny_rules(paths: &[std::path::PathBuf]) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for p in paths {
         let s = p.to_string_lossy();
-        if !s.starts_with('/') || s.contains([',', '(', ')', '\n']) {
-            continue;
+        if !s.starts_with('/') || s.contains(['\n', '\r']) {
+            return Err(format!("cannot protect the path {s:?} in Claude Code's rules").into());
         }
         let s = s.trim_end_matches('/');
         // Folders get `/**`; a path that does not exist yet gets both forms.
@@ -70,7 +71,7 @@ pub fn deny_rules(paths: &[std::path::PathBuf]) -> Vec<String> {
             out.push(format!("Edit({t})"));
         }
     }
-    out
+    Ok(out)
 }
 
 /// One `--input-format stream-json` user message.
@@ -164,7 +165,7 @@ impl Harness for Claude {
             a.push("--allowedTools".into());
             a.push(allowed.join(","));
         }
-        let denied = deny_rules(&spec.private_paths);
+        let denied = deny_rules(&spec.private_paths)?;
         if !denied.is_empty() {
             // Permission deny rules in a per-turn settings file (layered over
             // the user's own settings, which are never edited); a file keeps
@@ -708,9 +709,13 @@ mod tests {
                 format!("Edit(/{key})")
             ])
         );
-        assert!(deny_rules(&["/a,b".into(), "rel".into()]).is_empty());
+        assert!(deny_rules(&["rel".into()]).is_err(), "fails closed");
         assert_eq!(
-            deny_rules(&["/no/such/dir".into()]),
+            deny_rules(&["/a(b),c".into()]).unwrap()[0],
+            "Read(//a(b),c)"
+        );
+        assert_eq!(
+            deny_rules(&["/no/such/dir".into()]).unwrap(),
             [
                 "Read(//no/such/dir)",
                 "Edit(//no/such/dir)",

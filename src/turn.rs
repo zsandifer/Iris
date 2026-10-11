@@ -234,6 +234,7 @@ async fn run_locked(
         detail: "no engine available".into(),
     };
 
+    let image_dir = state.paths.run_dir().join(format!("{msg_id}-images"));
     for _attempt in 0..MAX_ATTEMPTS {
         // Routing borrows non-Send closures; keep them out of any await.
         let routed = {
@@ -344,7 +345,7 @@ async fn run_locked(
         let caps = entry.harness.capabilities();
         let sees_images =
             caps.images && catalog.get(&d.model).and_then(|m| m.images).unwrap_or(true);
-        let mut images = load_images(state, &input.user_message).await;
+        let mut images = load_images(state, &input.user_message, &image_dir).await;
         if !images.is_empty() && !sees_images {
             images.clear();
             routing_notes.push(format!("{} cannot see images; image left out", d.model));
@@ -544,6 +545,7 @@ async fn run_locked(
         }
     }
 
+    let _ = tokio::fs::remove_dir_all(&image_dir).await;
     let routing = decision
         .as_ref()
         .map(|d| routing_json(d, &routing_notes))
@@ -842,13 +844,17 @@ fn cli_data_paths() -> Vec<std::path::PathBuf> {
     let Some(home) = env_dir("HOME") else {
         return Vec::new();
     };
+    let data = env_dir("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share"));
+    let config = env_dir("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
+    let state = env_dir("XDG_STATE_HOME").unwrap_or_else(|| home.join(".local/state"));
     vec![
         env_dir("CLAUDE_CONFIG_DIR").unwrap_or_else(|| home.join(".claude")),
         home.join(".claude.json"),
         env_dir("CODEX_HOME").unwrap_or_else(|| home.join(".codex")),
         home.join(".gemini"),
-        home.join(".local/share/opencode"),
-        home.join(".config/opencode"),
+        data.join("opencode"),
+        config.join("opencode"),
+        state.join("opencode"),
     ]
 }
 
@@ -1193,10 +1199,13 @@ fn render_prompt(ctx: &Ctx, agent_name: &str, replay: &[Message], current: &Mess
     out
 }
 
-async fn load_images(state: &AppState, m: &Message) -> Vec<ImageInput> {
+/// The message's images, copied into a private per-turn folder: CLIs that
+/// open a folder to read an image (Gemini adds the image's folder to its
+/// workspace) then see only this turn's images, never everyone's uploads.
+async fn load_images(state: &AppState, m: &Message, dir: &std::path::Path) -> Vec<ImageInput> {
     let ids = m.attachments.clone();
     let uploads = state.paths.uploads_dir();
-    state
+    let found = state
         .db
         .call(move |c| {
             let mut out = Vec::new();
@@ -1204,16 +1213,30 @@ async fn load_images(state: &AppState, m: &Message) -> Vec<ImageInput> {
                 if let Some(a) = db::get_attachment(c, id)?
                     && a.mime.starts_with("image/")
                 {
-                    out.push(ImageInput {
-                        path: uploads.join(&a.file_name),
-                        mime: a.mime,
-                    });
+                    out.push(a);
                 }
             }
             Ok(out)
         })
         .await
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if found.is_empty() || crate::config::ensure_private_dir(dir).is_err() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for a in found {
+        let to = dir.join(&a.file_name);
+        if tokio::fs::copy(uploads.join(&a.file_name), &to)
+            .await
+            .is_ok()
+        {
+            out.push(ImageInput {
+                path: to,
+                mime: a.mime,
+            });
+        }
+    }
+    out
 }
 
 /// The Iris MCP bridge plus every enabled connector (secrets unsealed).

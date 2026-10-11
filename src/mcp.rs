@@ -422,8 +422,8 @@ impl Bridge {
                 (mime.to_string(), content.len() as i64, file_name)
             }
             (None, Some(path)) => {
-                let src = self.resolve_agent_file(path)?;
-                let meta = std::fs::metadata(&src).map_err(|_| "file not found")?;
+                let (src, mut file) = self.open_agent_file(path)?;
+                let meta = file.metadata().map_err(|_| "file not found")?;
                 if meta.len() > MAX_LIBRARY_BYTES {
                     return Err("file is larger than 20 MB".into());
                 }
@@ -436,7 +436,8 @@ impl Bridge {
                     .map(String::from)
                     .unwrap_or_else(|| mime_for_ext(&ext).to_string());
                 let file_name = format!("{id}.{}", sanitize_ext(&ext));
-                let bytes = std::fs::read(&src).map_err(|e| e.to_string())?;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|e| e.to_string())?;
                 write_private_file(&lib.join(&file_name), &bytes).map_err(|e| e.to_string())?;
                 (mime, bytes.len() as i64, file_name)
             }
@@ -479,7 +480,10 @@ impl Bridge {
 
     /// Only files inside the agent's workspace or memory folders can be
     /// saved, and never through symlinks.
-    fn resolve_agent_file(&self, path: &str) -> std::result::Result<PathBuf, String> {
+    fn resolve_agent_file(
+        &self,
+        path: &str,
+    ) -> std::result::Result<(PathBuf, Vec<PathBuf>), String> {
         // The person's own Iris folders (the owner's are the top-level ones).
         let is_owner = self
             .db
@@ -497,10 +501,11 @@ impl Bridge {
         let real = candidate
             .canonicalize()
             .map_err(|_| "file not found".to_string())?;
-        let allowed = [workspace, dirs.memory]
+        let allowed_dirs: Vec<PathBuf> = [workspace, dirs.memory]
             .iter()
             .filter_map(|d| d.canonicalize().ok())
-            .any(|d| real.starts_with(d));
+            .collect();
+        let allowed = allowed_dirs.iter().any(|d| real.starts_with(d));
         let is_link = std::fs::symlink_metadata(&candidate)
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(true);
@@ -509,7 +514,29 @@ impl Bridge {
                 "only regular files in the working folder or memory folder can be saved".into(),
             );
         }
-        Ok(real)
+        Ok((real, allowed_dirs))
+    }
+
+    /// Open a file the agent asked to save, and check what was actually
+    /// opened (the agent could swap a folder for a link after the path
+    /// check): a plain file with one link, inside the person's folders.
+    fn open_agent_file(&self, path: &str) -> std::result::Result<(PathBuf, std::fs::File), String> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let refuse = || "only regular files in the working folder or memory folder can be saved";
+        let (real, allowed) = self.resolve_agent_file(path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&real)
+            .map_err(|_| refuse().to_string())?;
+        let opened = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .map_err(|_| refuse().to_string())?;
+        let meta = file.metadata().map_err(|_| refuse().to_string())?;
+        if !allowed.iter().any(|d| opened.starts_with(d)) || !meta.is_file() || meta.nlink() != 1 {
+            return Err(refuse().into());
+        }
+        Ok((real, file))
     }
 }
 
