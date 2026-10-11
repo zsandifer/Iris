@@ -33,7 +33,7 @@ code { font-family: var(--mono); font-size: .88em; background: var(--sf2); borde
 :focus-visible { outline: 2px solid var(--ac); outline-offset: 2px; }
 .ic { flex: none; display: block; }
 .ic-more path { stroke-width: 3.2; }
-#app { position: fixed; top: var(--app-offset, 0px); left: 0; right: 0; height: var(--app-height, 100dvh);
+#app { position: fixed; top: 0; transform: translate3d(0, var(--app-offset, 0px), 0); left: 0; right: 0; height: var(--app-height, 100dvh);
   display: flex; flex-direction: column; max-width: 520px; margin: 0 auto; padding: 0 var(--sar) 0 var(--sal); overflow: hidden; }
 #app.keyboard-open { --sab: 0px; --nav-h: 0px; }
 .keyboard-open .nav { display: none; }
@@ -46,8 +46,7 @@ code { font-family: var(--mono); font-size: .88em; background: var(--sf2); borde
 .top { position: relative; flex: none; height: var(--top-h); z-index: 4; display: flex; align-items: center; gap: 10px;
   padding: calc(var(--sat) + 10px) 12px 12px; background: var(--bg); }
 .top::after { content: ""; position: absolute; top: 100%; left: 0; right: 0; height: 12px; pointer-events: none;
-  background: linear-gradient(var(--bg), transparent); -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
-  -webkit-mask-image: linear-gradient(#000, transparent); mask-image: linear-gradient(#000, transparent); }
+  background: linear-gradient(var(--bg), transparent); }
 .btn { width: 38px; height: 38px; border-radius: 12px; background: var(--sf2); display: grid; place-items: center; border: 0; color: var(--ink); flex: none; }
 .who-btn { border: 0; background: none; padding: 0; border-radius: 50%; }
 .nm { font-weight: 700; font-size: 16.5px; line-height: 1.15; }

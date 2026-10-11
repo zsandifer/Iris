@@ -118,7 +118,7 @@ export function Avatar({ size = 36 }) {
   const custom = S.settings?.avatar_custom;
   const src = custom ? S.settings.avatar_url : null;
   return html`<div class="avatar" style=${`width:${size}px;height:${size}px`}>
-    ${src ? html`<${Img} src=${src} alt="" />` : html`<div class="orb" />`}
+    ${src ? html`<${Img} src=${src} alt="" width=${size} height=${size} />` : html`<div class="orb" />`}
   </div>`;
 }
 

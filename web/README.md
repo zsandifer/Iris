@@ -49,3 +49,19 @@ a quick look with content, seed a fresh data directory with fake demo data:
 iris init --config $T/config.toml --data-dir $T/data
 iris demo-seed --config $T/config.toml --data-dir $T/data --assets scripts/demo/images
 ```
+
+The standalone iPhone keyboard regression uses an external Playwright
+install with its WebKit browser; it adds no app dependencies:
+
+```sh
+NODE_PATH=/path/to/node_modules node scripts/e2e/keyboard.mjs /tmp/keyboard-frames.json
+```
+
+It checks synchronous composer pre-shrink on pointerdown/touchstart using
+an orientation-specific remembered keyboard height, reconciliation when
+the real resize arrives, and restoration on blur or the 700ms deadline.
+It also resizes the viewport and injects document scrolling and visual viewport
+pans, recording every animation frame. The header stays at zero in visible
+viewport coordinates (its layout `getBoundingClientRect().top` minus
+`visualViewport.offsetTop`), with stable height and avatar. Native iPhone
+keyboard animation still needs a device check.
