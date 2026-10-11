@@ -335,7 +335,8 @@ pub async fn connector_notices(state: &AppState, user_id: &str) -> Vec<String> {
             // The current state, so an earlier pause or sign-out in the
             // conversation is not mistaken for the present.
             out.push(format!(
-                "{label} (the `{}` tools) is available now.",
+                "{label} (the `{}` tools) is connected and working now; if earlier messages said it \
+                 was paused, off, or signed out, that is over, so use it when asked.",
                 con.name
             ));
         }

@@ -153,7 +153,9 @@ await page.locator('.card-x', { hasText: 'I paused' }).last().locator('button').
 await page.waitForSelector('.card-x .ok-line');
 
 // ---------------------------------------------------- approval times out
-await say('Use the messenger delete_message tool to delete message m2. Do not ask me first.');
+// Haiku sometimes trusts the earlier pause in the chat over the current
+// state, so say it was resumed (the Resume tap above did that for real).
+await say('I resumed messenger. Use the messenger delete_message tool to delete message m2. Do not ask me first.');
 card = await pendingCard();
 check('delete asks first', (await card.innerText()).includes('Delete'));
 r = await reply(240000);
