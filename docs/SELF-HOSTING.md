@@ -293,7 +293,9 @@ out each tool call the CLI makes, nothing more.
   Chromium package).
 - **Sign-ins persist.** The profile lives in `<data dir>/browser/profile`,
   so sites you or Iris signed in to stay signed in. Chrome's own password
-  manager and autofill are turned off there.
+  manager and autofill are turned off there. Chrome's session files
+  (open tabs with what was typed into their forms) are deleted before each
+  start and after each close.
 - **Memory.** The browser starts on first use and closes after
   `browser.idle_mins` (default 10) without use, so it costs nothing while
   idle. A running browser with one tab takes roughly 200 to 400 MB.

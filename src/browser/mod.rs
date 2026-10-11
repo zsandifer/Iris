@@ -1128,6 +1128,7 @@ impl Browser {
         };
         crate::info!("browser: closing");
         Self::shut(&run).await;
+        launch::clear_session_files(&self.profile_dir);
         self.control.send_replace(Control::Agent);
         self.frames.send_replace(None);
         self.broadcast_state();
@@ -1157,6 +1158,7 @@ impl Browser {
         crate::info!("browser: idle; closing to free memory");
         lock(&self.running).take();
         Self::shut(run).await;
+        launch::clear_session_files(&self.profile_dir);
         self.frames.send_replace(None);
         self.broadcast_state();
         true

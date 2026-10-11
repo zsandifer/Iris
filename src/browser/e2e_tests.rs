@@ -477,6 +477,14 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
     );
     state.browser.close().await;
     assert!(state.browser.running().is_none());
+    // Chrome's session files (which hold typed form data) are gone.
+    assert!(
+        !state
+            .paths
+            .browser_dir()
+            .join("profile/Default/Sessions")
+            .exists()
+    );
 
     // After a restart of Iris (same data directory): the site Iris filled
     // stays off-limits for screenshots even on a clean page, and a CVC the

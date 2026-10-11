@@ -202,6 +202,7 @@ pub async fn launch(opts: &LaunchOptions<'_>) -> Result<Launched> {
     /// Learned once per run: this system cannot start Chrome's sandbox.
     static NO_SANDBOX: AtomicBool = AtomicBool::new(false);
     release_stale_profile_lock(opts.profile_dir);
+    clear_session_files(opts.profile_dir);
     if let Err(e) = set_profile_prefs(opts.profile_dir) {
         crate::warn!("browser: could not set profile preferences: {e}");
     }
@@ -375,6 +376,23 @@ pub fn set_profile_prefs(profile: &Path) -> Result<()> {
     crate::config::ensure_private_dir(&profile.join("Default"))?;
     crate::config::write_private_file(&file, prefs.to_string().as_bytes())?;
     Ok(())
+}
+
+/// Chrome keeps the open tabs, with what was typed into their forms, in
+/// session files for crash recovery. Iris's browser never restores a
+/// session, and filled card numbers must not stay on disk: remove them
+/// before each start and after each close.
+pub fn clear_session_files(profile: &Path) {
+    let d = profile.join("Default");
+    let _ = std::fs::remove_dir_all(d.join("Sessions"));
+    for f in [
+        "Current Session",
+        "Current Tabs",
+        "Last Session",
+        "Last Tabs",
+    ] {
+        let _ = std::fs::remove_file(d.join(f));
+    }
 }
 
 /// Chrome refuses to share a profile: if a previous Iris run left a browser
