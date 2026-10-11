@@ -169,18 +169,24 @@ pub struct LaunchOptions<'a> {
     pub tmp_dir: &'a Path,
     pub width: u32,
     pub height: u32,
+    pub scale: f64,
 }
 
 /// Start the browser. Tries with Chrome's sandbox first and retries
 /// without it only if the sandbox itself cannot start on this machine.
 pub async fn launch(opts: &LaunchOptions<'_>) -> Result<Launched> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    /// Learned once per run: this system cannot start Chrome's sandbox.
+    static NO_SANDBOX: AtomicBool = AtomicBool::new(false);
     release_stale_profile_lock(opts.profile_dir);
-    match spawn(opts, false).await {
+    let known = NO_SANDBOX.load(Ordering::Relaxed);
+    match spawn(opts, known).await {
         Ok(l) => Ok(l),
         Err(SpawnError::Sandbox) => {
             crate::warn!(
                 "browser: Chrome's sandbox is unavailable on this system; running without it"
             );
+            NO_SANDBOX.store(true, Ordering::Relaxed);
             spawn(opts, true).await.map_err(|e| e.into_message().into())
         }
         Err(e) => Err(e.into_message().into()),
@@ -236,7 +242,8 @@ async fn spawn(
         "--hide-scrollbars",
     ])
     .arg(format!("--user-data-dir={}", opts.profile_dir.display()))
-    .arg(format!("--window-size={},{}", opts.width, opts.height));
+    .arg(format!("--window-size={},{}", opts.width, opts.height))
+    .arg(format!("--force-device-scale-factor={}", opts.scale));
     if no_sandbox {
         cmd.arg("--no-sandbox");
     }

@@ -19,8 +19,9 @@ use axum::http::{HeaderMap, header};
 use axum::response::Response;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::time::Instant;
 
 /// A socket watching the browser.
 struct Watching {
@@ -28,6 +29,17 @@ struct Watching {
     rx: tokio::sync::watch::Receiver<Option<Arc<crate::browser::Frame>>>,
     mode: crate::browser::Mode,
     last_sent: Option<Instant>,
+    /// A newer frame is waiting for its turn (throttling never drops the
+    /// latest frame, so a still page always ends up on screen).
+    pending: bool,
+}
+
+impl Watching {
+    fn due(&self) -> Instant {
+        self.last_sent
+            .map(|t| t + self.mode.min_interval())
+            .unwrap_or_else(Instant::now)
+    }
 }
 
 pub async fn handler(
@@ -119,6 +131,7 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
     let is_owner = user.user.is_owner;
     let mut watching: Option<Watching> = None;
     loop {
+        let due = watching.as_ref().filter(|w| w.pending).map(Watching::due);
         tokio::select! {
             incoming = socket.recv() => {
                 match incoming {
@@ -136,7 +149,7 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
                                         let (guard, rx) = state.browser.watch(mode);
                                         let mut rx = rx;
                                         rx.mark_changed();
-                                        Watching { _guard: guard, rx, mode, last_sent: None }
+                                        Watching { _guard: guard, rx, mode, last_sent: None, pending: false }
                                     });
                                 None
                             }
@@ -156,24 +169,30 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
             }
             changed = async {
                 match watching.as_mut() {
-                    Some(w) => w.rx.changed().await,
+                    Some(w) if !w.pending => w.rx.changed().await,
+                    _ => std::future::pending().await,
+                }
+            } => {
+                match (changed, watching.as_mut()) {
+                    (Ok(()), Some(w)) => w.pending = true,
+                    _ => watching = None,
+                }
+            }
+            _ = async {
+                match due {
+                    Some(at) => tokio::time::sleep_until(at).await,
                     None => std::future::pending().await,
                 }
             } => {
-                if changed.is_err() {
-                    watching = None;
-                    continue;
-                }
+                // Peek watchers get about one frame a second (full screen
+                // more), always ending on the newest frame.
                 let Some(w) = watching.as_mut() else { continue };
-                let frame = w.rx.borrow_and_update().clone();
-                let Some(frame) = frame else { continue };
-                // Peek watchers get about one frame a second even when
-                // someone else watches full screen.
-                if w.last_sent.is_some_and(|t| t.elapsed() < w.mode.min_interval()) {
-                    continue;
-                }
+                w.pending = false;
                 w.last_sent = Some(Instant::now());
-                if socket.send(Message::Text(frame.json.clone().into())).await.is_err() {
+                let frame = w.rx.borrow_and_update().clone();
+                if let Some(frame) = frame
+                    && socket.send(Message::Text(frame.json.clone().into())).await.is_err()
+                {
                     break;
                 }
             }

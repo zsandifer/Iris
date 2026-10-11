@@ -185,6 +185,21 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
     assert!(!out.is_error, "{}", out.text);
     assert!(out.text.contains("heading \"Sign in\""), "{}", out.text);
     assert!(out.text.contains("Test Shop sign in"));
+    {
+        let run = state.browser.running().unwrap();
+        let v = run
+            .cdp
+            .call(
+                "Runtime.evaluate",
+                json!({"expression": "[innerWidth, innerHeight, devicePixelRatio].join(' ')", "returnByValue": true}),
+                Some(&run.page().session_id),
+            )
+            .await
+            .unwrap();
+        // A phone-shaped window at 2x, kept across navigations.
+        let dims = v["result"]["value"].as_str().unwrap().to_string();
+        assert!(dims.starts_with("500 ") && dims.ends_with(" 2"), "{dims}");
+    }
     outputs.push(out.text.clone());
     let snap = out.text;
 

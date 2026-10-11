@@ -173,7 +173,7 @@ function Viewer({ control }) {
 
   let status;
   if (!b.running) status = 'The browser is off';
-  else if (driving) status = `You're in control. ${agentName()} waits until you hand it back.`;
+  else if (driving) status = `You're in control · ${agentName()} is waiting`;
   else if (b.controller === 'user') status = 'Someone else has taken over';
   else if (b.busy) status = `${agentName()} is using it`;
   else status = 'Watching live';

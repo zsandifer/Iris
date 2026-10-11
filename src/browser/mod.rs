@@ -39,11 +39,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
-/// Viewport of Iris's browser: phone-shaped, so the live view fills a phone
-/// screen and responsive sites show their mobile layout.
-pub const VIEW_W: u32 = 412;
-pub const VIEW_H: u32 = 860;
-const SCALE: f64 = 2.0;
+/// Window of Iris's browser: phone-shaped, so the live view fills a phone
+/// screen and responsive sites show their mobile layout. (500 is Chrome's
+/// narrowest window; a real window size and scale factor, rather than
+/// emulation, keep every frame the same size across navigations.)
+pub const VIEW_W: u32 = 500;
+pub const VIEW_H: u32 = 1000;
+/// Device scale factor (sharp text in the live view on phones).
+pub const SCALE: f64 = 2.0;
 /// How long a tool call waits while the owner has taken over.
 const CONTROL_WAIT: Duration = Duration::from_secs(50);
 /// Take-over without any input for this long hands control back.
@@ -379,7 +382,6 @@ impl Browser {
             "sandbox": run.as_ref().map(|r| !r.no_sandbox),
             "version": run.as_ref().map(|r| r.version.clone()),
             "error": v.error,
-            "viewport": {"width": VIEW_W, "height": VIEW_H},
         })
     }
 
@@ -441,6 +443,7 @@ impl Browser {
             tmp_dir: &self.tmp_dir,
             width: VIEW_W,
             height: VIEW_H,
+            scale: SCALE,
         })
         .await;
         let launched = match launched {
@@ -524,12 +527,6 @@ impl Browser {
             .to_string();
         let s = Some(session.as_str());
         cdp.call("Page.enable", json!({}), s).await?;
-        cdp.call(
-            "Emulation.setDeviceMetricsOverride",
-            json!({"width": VIEW_W, "height": VIEW_H, "deviceScaleFactor": SCALE, "mobile": false}),
-            s,
-        )
-        .await?;
         let ua = cdp
             .call("Browser.getVersion", json!({}), None)
             .await
@@ -762,31 +759,60 @@ impl Browser {
         *lock(&run.last_meta) = (w, h);
         let mode = *lock(&run.screencast);
         if let (Some(mode), Some(data)) = (mode, p["data"].as_str()) {
-            let seq = self.frame_seq.fetch_add(1, Ordering::SeqCst) + 1;
-            let json = json!({
-                "type": "browser.frame",
-                "seq": seq,
-                "mode": if mode == Mode::Full { "full" } else { "peek" },
-                "width": w,
-                "height": h,
-                "data": data,
-            })
-            .to_string();
-            self.frames.send_replace(Some(Arc::new(Frame { json })));
+            self.publish_frame(mode, w, h, data);
         }
-        // The browser sends the next frame only after this ack, so delaying
-        // it throttles the stream.
-        let interval = mode.unwrap_or(Mode::Peek).min_interval();
-        let cdp = run.cdp.clone();
-        let session = page.session_id.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(interval).await;
-            cdp.send(
-                "Page.screencastFrameAck",
-                json!({"sessionId": ack_id}),
-                Some(&session),
-            );
-        });
+        // Acknowledge at once: the browser drops frames while acks are
+        // outstanding, which could leave a stale picture once the page goes
+        // still. Each app socket is throttled instead (ws.rs), always
+        // ending on the newest frame.
+        run.cdp.send(
+            "Page.screencastFrameAck",
+            json!({"sessionId": ack_id}),
+            Some(&page.session_id),
+        );
+    }
+
+    fn publish_frame(&self, mode: Mode, w: f64, h: f64, data: &str) {
+        let seq = self.frame_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let json = json!({
+            "type": "browser.frame",
+            "seq": seq,
+            "mode": if mode == Mode::Full { "full" } else { "peek" },
+            "width": w,
+            "height": h,
+            "data": data,
+        })
+        .to_string();
+        self.frames.send_replace(Some(Arc::new(Frame { json })));
+    }
+
+    /// The screencast only sends frames when the page changes, so a new
+    /// watcher of a still page gets one picture taken right away.
+    async fn publish_still(&self, run: &Running, mode: Mode) -> Result<()> {
+        let page = run.page();
+        let s = Some(page.session_id.as_str());
+        let m = run.cdp.call("Page.getLayoutMetrics", json!({}), s).await?;
+        let vv = &m["cssVisualViewport"];
+        let (w, h) = (
+            vv["clientWidth"].as_f64().unwrap_or(VIEW_W as f64),
+            vv["clientHeight"].as_f64().unwrap_or(VIEW_H as f64),
+        );
+        let scale = (mode.max_width() as f64 / (w * SCALE)).min(1.0);
+        let shot = run
+            .cdp
+            .call(
+                "Page.captureScreenshot",
+                json!({"format": "jpeg", "quality": mode.quality(), "clip": {
+                    "x": vv["pageX"].as_f64().unwrap_or(0.0),
+                    "y": vv["pageY"].as_f64().unwrap_or(0.0),
+                    "width": w, "height": h, "scale": scale}}),
+                s,
+            )
+            .await?;
+        if let Some(data) = shot["data"].as_str() {
+            self.publish_frame(mode, w, h, data);
+        }
+        Ok(())
     }
 
     // ----------------------------------------------------------- watching
@@ -825,8 +851,9 @@ impl Browser {
         if page.session_id.is_empty() {
             return;
         }
-        let cdp = run.cdp.clone();
+        let b = self.clone();
         tokio::spawn(async move {
+            let cdp = &run.cdp;
             let s = Some(page.session_id.as_str());
             if have.is_some() {
                 let _ = cdp.call("Page.stopScreencast", json!({}), s).await;
@@ -837,11 +864,12 @@ impl Browser {
                     .call(
                         "Page.startScreencast",
                         json!({"format": "jpeg", "quality": m.quality(), "maxWidth": w,
-                               "maxHeight": (w as f64 * VIEW_H as f64 / VIEW_W as f64) as u32,
+                               "maxHeight": w * 2,
                                "everyNthFrame": 1}),
                         s,
                     )
                     .await;
+                let _ = b.publish_still(&run, m).await;
             }
         });
     }
