@@ -118,7 +118,8 @@ export function speechText(md) {
     if (/^(```|~~~)/.test(l)) { if (!code) out.push('I put the code in the text.'); code = !code; continue; }
     if (code || !l || /^\|[\s|:-]+\|?$/.test(l)) continue;
     let s = l.replace(/^#+\s*|^>\s*|^[-*+]\s+(\[[ x]\]\s+)?|^\d{1,3}[.)]\s+/g, '')
-      .replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+      // Bounded lengths keep these linear on text full of stray brackets.
+      .replace(/!\[[^\]\n]{0,300}\]\([^)\s]{0,300}\)/g, '').replace(/\[([^\]\n]{1,300})\]\([^)\s]{0,300}\)/g, '$1')
       .replace(/https?:\/\/\S+/g, '(link)').replace(/[`*~]|(^|\W)_|_(\W|$)/g, '$1$2');
     if (l.startsWith('|')) s = s.split('|').map((c) => c.trim()).filter(Boolean).join(', ');
     s = s.trim();
@@ -132,10 +133,20 @@ export function speechText(md) {
 }
 
 const estimate = (text) => Math.max(1500, Math.round(text.split(/\s+/).length / 2.6 * 1000));
+// Estimated length per message (computing it reads the whole reply).
+const estimates = new Map();
+function estimateFor(m) {
+  if (!estimates.has(m.id)) {
+    if (estimates.size > 200) estimates.clear();
+    estimates.set(m.id, estimate(speechText(m.content)));
+  }
+  return estimates.get(m.id);
+}
 
 function stopAll() {
   if (audio && !audio.paused) audio.pause();
-  if (synth?.speaking) synth.cancel();
+  device.gen = -1;
+  if (synth && (synth.speaking || synth.paused)) synth.cancel();
 }
 
 // Bumped by every play or pause, so a note that finishes loading after the
@@ -146,6 +157,23 @@ let playGen = 0;
 export async function play(m) {
   const v = S.voice || {};
   const my = ++playGen;
+  // The device voice can pause and resume in place.
+  if (v.mode === 'device' && v.id === m.id && synth) {
+    if (v.playing) {
+      synth.pause();
+      device.pausedAt = Date.now();
+      setVoice({ playing: false });
+      return;
+    }
+    if (synth.paused && device.id === m.id) {
+      device.started += Date.now() - (device.pausedAt || Date.now());
+      device.gen = my;
+      synth.resume();
+      setVoice({ playing: true });
+      tickDevice(m.id, my);
+      return;
+    }
+  }
   if (v.id === m.id && v.playing) {
     stopAll();
     setVoice({ playing: false, loading: false });
@@ -177,15 +205,23 @@ export async function play(m) {
   const u = new SpeechSynthesisUtterance(text);
   u.lang = navigator.language || 'en-US';
   const dur = estimate(text);
-  const started = Date.now();
-  const timer = setInterval(() => {
-    if (S.voice?.id !== m.id || !S.voice.playing) { clearInterval(timer); return; }
-    setVoice({ t: Math.min(dur, Date.now() - started) });
-  }, 250);
-  u.onend = () => { clearInterval(timer); if (S.voice?.id === m.id) stopped(); };
-  u.onerror = () => { clearInterval(timer); if (S.voice?.id === m.id) stopped(); };
+  Object.assign(device, { id: m.id, started: Date.now(), pausedAt: 0, gen: my, dur });
+  // Callbacks of an utterance that was replaced or restarted do nothing.
+  const done = () => { if (device.gen === my && S.voice?.id === m.id) stopped(); };
+  u.onend = done;
+  u.onerror = done;
   setVoice({ id: m.id, playing: true, loading: false, t: 0, dur, mode: 'device' });
   synth.speak(u);
+  tickDevice(m.id, my);
+}
+
+// The device utterance being spoken (for pause, resume, and progress).
+const device = { id: null, started: 0, pausedAt: 0, gen: 0, dur: 0 };
+function tickDevice(id, gen) {
+  const timer = setInterval(() => {
+    if (device.gen !== gen || S.voice?.id !== id || !S.voice.playing) { clearInterval(timer); return; }
+    setVoice({ t: Math.min(device.dur, Date.now() - device.started) });
+  }, 250);
 }
 
 const fmtTime = (ms) => {
@@ -215,7 +251,7 @@ export function VoiceNote({ m }) {
   // are made when played, so opening a long chat costs the server nothing.
   // Until a note's real length is known, show an estimate from the text.
   const known = device ? null : durs.get(m.id);
-  const total = (active && v.dur) || known || estimate(speechText(m.content));
+  const total = (active && v.dur) || known || estimateFor(m);
   const progress = active && total ? Math.min(1, (v.t || 0) / total) : 0;
   const shape = bars(m.id);
   return html`<div class=${'vn' + (playing ? ' on' : '')}>

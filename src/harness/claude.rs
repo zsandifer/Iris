@@ -57,7 +57,8 @@ pub fn deny_rules(paths: &[std::path::PathBuf]) -> Result<Vec<String>> {
         if !s.starts_with('/') || s.contains(['\n', '\r']) {
             return Err(format!("cannot protect the path {s:?} in Claude Code's rules").into());
         }
-        let s = s.trim_end_matches('/');
+        // Rules are gitignore-style patterns: the path itself is literal.
+        let s = glob_escape(s.trim_end_matches('/'));
         // Folders get `/**`; a path that does not exist yet gets both forms.
         let mut targets = Vec::new();
         if !p.is_dir() {
@@ -72,6 +73,19 @@ pub fn deny_rules(paths: &[std::path::PathBuf]) -> Result<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+/// Escape gitignore pattern characters so a path matches only itself
+/// (checked with Claude Code: `iris\[prod\]` matches the folder `iris[prod]`).
+fn glob_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '*' | '?' | '[' | ']') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// One `--input-format stream-json` user message.
@@ -710,6 +724,10 @@ mod tests {
             ])
         );
         assert!(deny_rules(&["rel".into()]).is_err(), "fails closed");
+        assert_eq!(
+            deny_rules(&["/srv/iris[prod]/x*".into()]).unwrap()[0],
+            r"Read(//srv/iris\[prod\]/x\*)"
+        );
         assert_eq!(
             deny_rules(&["/a(b),c".into()]).unwrap()[0],
             "Read(//a(b),c)"

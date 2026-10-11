@@ -128,6 +128,19 @@ impl AuthUser {
     pub fn id(&self) -> &str {
         &self.user.id
     }
+    /// For writes to the caller's own data: wait out any removal in
+    /// progress and confirm the person still exists (a request that started
+    /// before their removal must not recreate their files or settings).
+    pub async fn still_here<'a>(
+        &self,
+        state: &'a AppState,
+    ) -> std::result::Result<tokio::sync::RwLockReadGuard<'a, ()>, ApiError> {
+        let guard = state.people_lock.read().await;
+        if state.user(self.id()).await.is_none() {
+            return Err(ApiError::unauthorized());
+        }
+        Ok(guard)
+    }
     pub fn require_owner(&self) -> std::result::Result<(), ApiError> {
         if self.user.is_owner {
             Ok(())
@@ -412,6 +425,7 @@ async fn delete_user(
     Path(id): Path<String>,
 ) -> ApiResult {
     user.require_owner()?;
+    let _removing = state.people_lock.write().await;
     let target = state
         .user(&id)
         .await

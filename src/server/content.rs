@@ -227,6 +227,7 @@ async fn put_feed_prompt(
     user: AuthUser,
     JsonBody(body): JsonBody<FeedPrompt>,
 ) -> ApiResult {
+    let _here = user.still_here(&state).await?;
     check_text("feed_prompt", &body.feed_prompt, 4000, false)?;
     let v = body.feed_prompt.trim().to_string();
     let key = crate::state::person_key(user.id(), user.user.is_owner, "feed_prompt");
@@ -596,6 +597,7 @@ async fn write_system_file(
     Path(name): Path<String>,
     JsonBody(body): JsonBody<FileContent>,
 ) -> ApiResult {
+    let _here = user.still_here(&state).await?;
     let f = system_file(&name).ok_or_else(|| ApiError::not_found("system file"))?;
     if body.content.len() > MAX_TEXT_FILE {
         return Err(ApiError::bad_request("file is too large"));
@@ -695,6 +697,7 @@ async fn write_file(
     Query(q): Query<PathQuery>,
     JsonBody(body): JsonBody<FileContent>,
 ) -> ApiResult {
+    let _here = user.still_here(&state).await?;
     if q.path.trim().is_empty() {
         return Err(ApiError::bad_request("path is required"));
     }
@@ -715,6 +718,7 @@ async fn delete_file(
     Path(area): Path<String>,
     Query(q): Query<PathQuery>,
 ) -> ApiResult {
+    let _here = user.still_here(&state).await?;
     if q.path.trim().is_empty() {
         return Err(ApiError::bad_request("path is required"));
     }

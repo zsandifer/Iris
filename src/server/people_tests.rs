@@ -69,6 +69,12 @@ fn fake_voice(root: &Path) {
         std::fs::create_dir_all(root.join(c)).unwrap();
         std::fs::write(root.join(c).join("VERSION"), v).unwrap();
     }
+    // Both programs wait a second while `<root>/slow` exists and fail while
+    // `<root>/fail` exists, for lifecycle tests.
+    let gate = format!(
+        "[ -f '{r}/slow' ] && sleep 1\n[ -f '{r}/fail' ] && exit 1\n",
+        r = root.display()
+    );
     // Writes one second of 16 kHz silence to --output-filename.
     let tts = r#"#!/bin/sh
 for a in "$@"; do case "$a" in --output-filename=*) out="${a#--output-filename=}";; esac; done
@@ -83,6 +89,7 @@ echo '{"lang": "", "text": " What is the capital of France?", "tokens": []}'
         ("sherpa-onnx-offline-tts", tts),
         ("sherpa-onnx-offline", stt),
     ] {
+        let body = body.replacen("#!/bin/sh\n", &format!("#!/bin/sh\n{gate}"), 1);
         std::fs::write(bin.join(name), body).unwrap();
         std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -870,4 +877,85 @@ async fn a_group_that_gains_a_member_starts_a_fresh_session() {
     );
     assert!(!prompt.contains("owner-secret-fact"));
     assert_eq!(cwd, h.state.paths.together_dir(&gid).display().to_string());
+}
+
+#[tokio::test]
+async fn voice_work_leaves_nothing_behind() {
+    let h = setup(false).await;
+    let (owner, sam_id, sam) = owner_and_sam(&h).await;
+    let root = h.state.cfg.engines_dir(&h.state.paths);
+    fake_voice(&root);
+    let run_files = || std::fs::read_dir(h.state.paths.run_dir()).unwrap().count();
+    let voice_files = || {
+        std::fs::read_dir(h.state.paths.voice_dir())
+            .unwrap()
+            .count()
+    };
+    let wav = crate::voice::tests_support::silence_wav();
+
+    // A failed transcription deletes the recording.
+    std::fs::write(root.join("fail"), "").unwrap();
+    let (s, _) = send_raw(&h, "POST", "/api/voice/transcribe", &sam, wav.clone()).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    assert_eq!(run_files(), 0);
+    std::fs::remove_file(root.join("fail")).unwrap();
+
+    // A request dropped while transcribing deletes it too, and frees the slot.
+    std::fs::write(root.join("slow"), "").unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/voice/transcribe")
+        .header("authorization", format!("Bearer {sam}"))
+        .body(Body::from(wav.clone()))
+        .unwrap();
+    let app = h.app.clone();
+    let pending = tokio::spawn(async move { app.oneshot(req).await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    pending.abort();
+    let _ = pending.await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(run_files(), 0, "recording deleted on cancel");
+    std::fs::remove_file(root.join("slow")).unwrap();
+    let (s, _) = send_raw(&h, "POST", "/api/voice/transcribe", &sam, wav).await;
+    assert_eq!(s, StatusCode::OK, "the voice slot was released");
+
+    // Removing a person while their reply's note is being made leaves no note.
+    let sam_main = main_of(&h, &sam).await;
+    let reply = h
+        .state
+        .db
+        .with(|c| {
+            db::insert_message(
+                c,
+                &db::NewMessage {
+                    conversation_id: &sam_main,
+                    role: "assistant",
+                    content: "Sam's private reply.",
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    std::fs::write(root.join("slow"), "").unwrap();
+    let speak = json!({"message_id": reply.id}).to_string().into_bytes();
+    let (h2, sam2) = (h.app.clone(), sam.clone());
+    let making = tokio::spawn(async move {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/voice/speak")
+            .header("authorization", format!("Bearer {sam2}"))
+            .header("content-type", "application/json")
+            .body(Body::from(speak))
+            .unwrap();
+        h2.oneshot(req).await.unwrap().status()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let (s, _) = send(&h, "DELETE", &format!("/api/users/{sam_id}"), &owner, None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_ne!(making.await.unwrap(), StatusCode::OK);
+    assert_eq!(
+        voice_files(),
+        0,
+        "no voice note of a removed person's reply"
+    );
 }

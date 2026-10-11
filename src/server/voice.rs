@@ -9,7 +9,6 @@ use crate::state::AppState;
 use crate::util::new_id;
 use crate::voice::{self, Component};
 use axum::Router;
-use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -206,6 +205,39 @@ pub fn prepare_for(state: &AppState, members: &[String], msg: &Message) {
     });
 }
 
+/// Recordings allowed to wait for the voice program, and for how long.
+const MAX_WAITING: usize = 3;
+const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+fn busy() -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "voice_busy",
+        "I'm still busy with other voice messages. Try again in a moment.",
+    )
+}
+
+/// A place in the bounded queue of waiting recordings.
+struct Waiting<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn enter(state: &'a AppState) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let n = &state.voice_waiting;
+        n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+            (v < MAX_WAITING).then_some(v + 1)
+        })
+        .ok()
+        .map(|_| Self(n))
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// A file deleted when dropped.
 struct TempFile(PathBuf);
 
@@ -220,19 +252,25 @@ impl Drop for TempFile {
 async fn transcribe(
     State(state): State<AppState>,
     _user: AuthUser,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Result<Response, ApiError> {
     let root = state.cfg.engines_dir(&state.paths);
     if !voice::installed(&root, Component::Stt) {
         return Err(unavailable("voice input"));
     }
-    if body.len() > state.cfg.max_upload_bytes {
-        return Err(ApiError::new(
+    // Admission before the upload is read: only a few recordings may wait
+    // for the voice program, so memory stays bounded.
+    let _slot = Waiting::enter(&state).ok_or_else(busy)?;
+    let too_long = || {
+        ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "too_large",
             "that recording is too long",
-        ));
-    }
+        )
+    };
+    let body = axum::body::to_bytes(body, state.cfg.max_upload_bytes)
+        .await
+        .map_err(|_| too_long())?;
     let info = voice::wav_info(&body).ok_or_else(|| {
         ApiError::new(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -249,11 +287,10 @@ async fn transcribe(
     }
     // Wait for a free slot before writing anything, and delete the
     // recording however the request ends (including a dropped connection).
-    let _permit = state
-        .voice_jobs
-        .acquire()
+    let _permit = tokio::time::timeout(MAX_WAIT, state.voice_jobs.acquire())
         .await
-        .map_err(|_| ApiError::from(crate::util::BoxError::from("voice is shutting down")))?;
+        .map_err(|_| busy())?
+        .map_err(|_| busy())?;
     let file = TempFile(
         state
             .paths

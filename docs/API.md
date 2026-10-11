@@ -80,6 +80,7 @@ Errors produced by Iris use this shape:
 | `invalid_code` | 401 | `POST /api/pair` with a wrong, used, or expired code. |
 | `forbidden` | 403 | Owner-only route called by a non-owner (`only the owner can do this`), or a creator-only group action by another member (`only the person who created this group can do that`). |
 | `voice_failed` | 502 | The local voice program could not make a voice note or transcribe a recording. The message is first-person and friendly. |
+| `voice_busy` | 503 | `POST /api/voice/transcribe` while three recordings already wait for the voice program (or one waited 90 s). Try again shortly. |
 | `voice_unavailable` | 503 | `POST /api/voice/speak` or `/api/voice/transcribe` while that voice component is not installed on the server. |
 | `not_found` | 404 | Unknown resource (message is `<thing> not found`), or an unknown route (`route not found`). |
 | `conflict` | 409 | Creating a connector whose name already exists. |
@@ -1435,8 +1436,10 @@ Response `200`:
 {"text": "What is the capital of France?", "duration_ms": 2400}
 ```
 
-`text` may be empty when nothing was heard. The recording is written to a
-private temporary file, transcribed, and deleted; it is never stored or
+`text` may be empty when nothing was heard. At most three recordings wait
+for the voice program at a time (checked before the upload is read); more
+get `503 voice_busy`. The recording is written to a private temporary file,
+transcribed, and deleted however the request ends; it is never stored or
 logged.
 
 Only the canonical 44-byte WAV layout is accepted (one 16-byte PCM `fmt `

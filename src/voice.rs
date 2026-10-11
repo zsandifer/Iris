@@ -743,6 +743,29 @@ pub fn prune_cache(dir: &Path, max_age: Duration) {
 }
 
 #[cfg(test)]
+pub mod tests_support {
+    /// One second of 16 kHz mono silence as a canonical WAV.
+    pub fn silence_wav() -> Vec<u8> {
+        let data = 32000u32;
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + data).to_le_bytes());
+        v.extend_from_slice(b"WAVEfmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&16000u32.to_le_bytes());
+        v.extend_from_slice(&32000u32.to_le_bytes());
+        v.extend_from_slice(&2u16.to_le_bytes());
+        v.extend_from_slice(&16u16.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&data.to_le_bytes());
+        v.resize(v.len() + data as usize, 0);
+        v
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

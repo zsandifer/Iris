@@ -159,7 +159,13 @@ pub fn list(root: &Path, comps: &[String]) -> io::Result<Vec<Entry>> {
 pub fn read_text(root: &Path, comps: &[String], max: u64) -> io::Result<String> {
     let (parents, last) = split(comps)?;
     let dir = walk(root, parents, false)?;
-    let n = cstr(last.as_bytes())?;
+    read_text_in(&dir, last, max)
+}
+
+/// Open a plain file (no link, one hard link) in an opened folder.
+fn open_file_in(dir: &OwnedFd, name: &str) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::MetadataExt;
+    let n = cstr(name.as_bytes())?;
     // SAFETY: valid descriptor and C string.
     let fd = check(unsafe {
         libc::openat(
@@ -169,16 +175,20 @@ pub fn read_text(root: &Path, comps: &[String], max: u64) -> io::Result<String> 
         )
     })?;
     // SAFETY: freshly opened descriptor.
-    let mut f = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let f = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
     let meta = f.metadata()?;
-    use std::os::unix::fs::MetadataExt;
     if !meta.is_file() || meta.nlink() != 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "not a plain file",
         ));
     }
-    if meta.len() > max {
+    Ok(f)
+}
+
+fn read_text_in(dir: &OwnedFd, name: &str, max: u64) -> io::Result<String> {
+    let mut f = open_file_in(dir, name)?;
+    if f.metadata()?.len() > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "file is too large",
@@ -194,6 +204,10 @@ pub fn read_text(root: &Path, comps: &[String], max: u64) -> io::Result<String> 
 pub fn write(root: &Path, comps: &[String], bytes: &[u8]) -> io::Result<()> {
     let (parents, last) = split(comps)?;
     let dir = walk(root, parents, true)?;
+    write_in(&dir, last, bytes)
+}
+
+fn write_in(dir: &OwnedFd, last: &str, bytes: &[u8]) -> io::Result<()> {
     let tmp = format!(".{last}.{}.tmp", crate::util::new_id());
     let (t, n) = (cstr(tmp.as_bytes())?, cstr(last.as_bytes())?);
     // SAFETY: valid descriptor and C strings; O_EXCL creates a new file.
@@ -220,6 +234,77 @@ pub fn write(root: &Path, comps: &[String], bytes: &[u8]) -> io::Result<()> {
         unsafe { libc::unlinkat(dir.as_raw_fd(), t.as_ptr(), 0) };
     }
     renamed
+}
+
+/// A plain file found by [`notes`].
+#[derive(Debug, Clone)]
+pub struct Note {
+    /// Path relative to the root, `/`-separated.
+    pub rel: String,
+    pub size: u64,
+    /// The first bytes of the file (up to `head` bytes).
+    pub head: String,
+}
+
+/// Plain files under `root` whose names pass `keep`, at most `max_depth`
+/// folders deep, each opened through its folder's descriptor without
+/// following links (the agent can rearrange its own memory folder while
+/// this runs). Hidden names are skipped.
+pub fn notes(root: &Path, max_depth: usize, keep: &dyn Fn(&str) -> bool, head: usize) -> Vec<Note> {
+    let mut out = Vec::new();
+    if let Ok(dir) = open_root(root) {
+        notes_in(&dir, "", 0, max_depth, keep, head, &mut out);
+    }
+    out
+}
+
+fn notes_in(
+    dir: &OwnedFd,
+    prefix: &str,
+    depth: usize,
+    max_depth: usize,
+    keep: &dyn Fn(&str) -> bool,
+    head: usize,
+    out: &mut Vec<Note>,
+) {
+    let Ok(rd) = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())) else {
+        return;
+    };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.starts_with('.'))
+        .collect();
+    names.sort();
+    for name in names {
+        let rel = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let Ok(st) = stat_at(dir, &name) else {
+            continue;
+        };
+        if is_type(&st, libc::S_IFDIR) {
+            if depth < max_depth
+                && let Ok(sub) = open_dir_at(dir, &name, false)
+            {
+                notes_in(&sub, &rel, depth + 1, max_depth, keep, head, out);
+            }
+        } else if is_type(&st, libc::S_IFREG)
+            && keep(&name)
+            && let Ok(f) = open_file_in(dir, &name)
+        {
+            let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+            let mut buf = Vec::new();
+            let _ = f.take(head as u64).read_to_end(&mut buf);
+            out.push(Note {
+                rel,
+                size,
+                head: String::from_utf8_lossy(&buf).into_owned(),
+            });
+        }
+    }
 }
 
 /// Delete a file, or a folder if it is empty. Returns whether it was a
@@ -280,6 +365,38 @@ mod tests {
         assert!(!remove(&root, &c("notes/a.md")).unwrap());
         assert!(remove(&root, &c("notes")).unwrap());
         assert!(components("../x").is_err() && components("/etc").is_err());
+        assert!(components(".git/config").is_err());
+    }
+
+    /// The race itself: the folder is opened, then swapped for a link to
+    /// someone else's folder, then the read or write happens. The opened
+    /// descriptor still names the original folder.
+    #[test]
+    fn a_folder_swapped_mid_operation_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("me");
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(root.join("notes/a.md"), "mine").unwrap();
+        std::fs::write(other.join("a.md"), "theirs").unwrap();
+        let comps = components("notes").unwrap();
+        let dir = walk(&root, &comps, false).unwrap();
+        std::fs::rename(root.join("notes"), root.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&other, root.join("notes")).unwrap();
+        assert_eq!(read_text_in(&dir, "a.md", 100).unwrap(), "mine");
+        write_in(&dir, "b.md", b"new").unwrap();
+        assert!(root.join("moved/b.md").exists() && !other.join("b.md").exists());
+        // And a later walk refuses the link outright.
+        assert!(read_text(&root, &components("notes/a.md").unwrap(), 100).is_err());
+        // The memory index walks the same way.
+        std::fs::create_dir_all(root.join("moved/deep")).unwrap();
+        std::fs::write(root.join("moved/deep/c.md"), "# C").unwrap();
+        let found: Vec<String> = notes(&root, 4, &|n| n.ends_with(".md"), 10)
+            .into_iter()
+            .map(|n| n.rel)
+            .collect();
+        assert_eq!(found, ["moved/a.md", "moved/b.md", "moved/deep/c.md"]);
         assert!(components(".git/config").is_err());
     }
 }

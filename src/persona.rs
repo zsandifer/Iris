@@ -244,7 +244,7 @@ pub fn assemble(dirs: &PersonDirs, ctx: &PromptContext) -> String {
     } else {
         let memory_dir = dirs.memory.clone();
         let mut entries = Vec::new();
-        collect_memory(&memory_dir, &memory_dir, 0, &mut entries);
+        collect_memory(&memory_dir, &mut entries);
         entries.retain(|(rel, _, _)| rel != "MEMORY.md");
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         out.push_str(&format!(
@@ -360,33 +360,12 @@ pub fn persona_hash(dirs: &PersonDirs, agent_name: &str, conversation_kind: &str
     crate::util::hex(&h.finalize()[..12])
 }
 
-fn collect_memory(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, String, u64)>) {
-    if depth > MAX_MEMORY_DEPTH {
-        return;
-    }
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in read.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with('.') {
-            continue;
-        }
-        // file_type() does not follow symlinks; skip them entirely.
-        let Ok(ft) = entry.file_type() else { continue };
-        let path = entry.path();
-        if ft.is_dir() {
-            collect_memory(root, &path, depth + 1, out);
-        } else if ft.is_file() && is_text_note(&path) {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            out.push((rel, note_title(&path), size));
-        }
+/// Memory notes (relative path, title, size), read through folder
+/// descriptors so a folder swapped for a link is never followed.
+fn collect_memory(root: &Path, out: &mut Vec<(String, String, u64)>) {
+    let keep = |name: &str| is_text_note(Path::new(name));
+    for n in crate::fsafe::notes(root, MAX_MEMORY_DEPTH, &keep, 4096) {
+        out.push((n.rel, note_title(&n.head), n.size));
     }
 }
 
@@ -398,23 +377,8 @@ pub fn is_text_note(path: &Path) -> bool {
 }
 
 /// First Markdown heading or first non-empty line, truncated.
-fn note_title(path: &Path) -> String {
-    use std::io::{BufRead, BufReader};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let Ok(f) = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    else {
-        return String::new();
-    };
-    // Same rule as `read_own_text`: no links to other people's files.
-    if f.metadata()
-        .map_or(true, |m| !m.is_file() || m.nlink() != 1)
-    {
-        return String::new();
-    }
-    for line in BufReader::new(f).lines().take(20).map_while(|l| l.ok()) {
+fn note_title(head: &str) -> String {
+    for line in head.lines().take(20) {
         let t = line.trim().trim_start_matches('#').trim();
         if !t.is_empty() && !t.starts_with("<!--") && t != "---" {
             return format!("— {}", truncate_chars(t, 80));

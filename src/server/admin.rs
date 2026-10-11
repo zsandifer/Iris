@@ -91,6 +91,7 @@ async fn put_settings(
     user: AuthUser,
     JsonBody(body): JsonBody<SettingsBody>,
 ) -> ApiResult {
+    let _here = user.still_here(&state).await?;
     let me = &user.user;
     let key = |k: &str| person_key(&me.id, me.is_owner, k);
     let mut writes: Vec<(String, Option<String>)> = Vec::new();
@@ -149,6 +150,7 @@ async fn put_settings(
 
 /// Upload a picture for the caller's own Iris.
 async fn put_avatar(State(state): State<AppState>, user: AuthUser, body: Bytes) -> ApiResult {
+    let _here = user.still_here(&state).await?;
     let att = store_upload(&state, user.id(), &body).await?;
     let me = user.user.clone();
     let (k_avatar, k_updated) = (
@@ -174,6 +176,7 @@ async fn put_avatar(State(state): State<AppState>, user: AuthUser, body: Bytes) 
 
 /// Back to the built-in picture.
 async fn delete_avatar(State(state): State<AppState>, user: AuthUser) -> ApiResult {
+    let _here = user.still_here(&state).await?;
     let me = user.user.clone();
     let old = state.person_setting(&me, "agent_avatar").await;
     let k = person_key(&me.id, me.is_owner, "agent_avatar");
