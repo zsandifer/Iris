@@ -141,9 +141,9 @@ let m = await reply(owner, ownerMe.main_conversation_id, await typeAndSend(owner
 check(m.status === 'complete', `owner's own chat answered (engine: ${m.harness})`);
 await owner.waitForSelector('.vn');
 check(await owner.isVisible('text=Read aloud by this device'), 'fallback voice note is labeled as this device\'s voice');
-await owner.click('.vn-play');
+// It plays by itself (the reply answers what this phone just sent).
 await owner.waitForSelector('.vn.on');
-check((await owner.evaluate(() => window.__spoken.at(-1))) === 'Good morning to you.', 'the device voice speaks the reply');
+check((await owner.evaluate(() => window.__spoken.at(-1))) === 'Good morning to you.', 'the device voice speaks the reply by itself');
 await shot(owner, '03-owner-device-voice-note');
 await owner.click('.vn-play'); // pause
 await owner.waitForSelector('.vn:not(.on)');
