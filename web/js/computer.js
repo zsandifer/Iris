@@ -87,6 +87,13 @@ function Viewer({ control }) {
   const mine = b.controller === 'user' && b.controller_device_id === S.me?.device?.id;
   const driving = control && mine;
   const host = hostOf(b.url);
+  // Leaving the view any way (back button too) hands control back, so the
+  // agent is never left waiting on a screen nobody looks at.
+  const drivingRef = useRef(false);
+  drivingRef.current = mine;
+  useEffect(() => () => {
+    if (drivingRef.current) post('/browser/handback').catch(() => {});
+  }, []);
 
   const takeOver = async () => {
     try { setBrowserState((await post('/browser/takeover')).browser); go('iris/computer?view=control'); } catch (e) { toast(e.message); }
