@@ -76,6 +76,13 @@ pub struct TurnSpec {
     /// Stable key for per-conversation state some CLIs keep on disk
     /// (the conversation id).
     pub scope: String,
+    /// Not the owner's own chat: the CLI may use only `mcp_servers`, none
+    /// of the MCP servers, memory, or account integrations configured in
+    /// the CLI itself (those are the owner's).
+    pub isolated: bool,
+    /// MCP servers configured in the CLI itself, for CLIs that can only
+    /// switch them off by name (see `Harness::own_mcp_servers_args`).
+    pub own_mcp_servers: Vec<String>,
 }
 
 /// A fully built command line.
@@ -85,8 +92,10 @@ pub struct Invocation {
     pub stdin: Vec<u8>,
     /// Private files to delete when the turn ends.
     pub temp_files: Vec<PathBuf>,
-    /// Extra environment variables (paths to private per-turn files; never
-    /// secrets).
+    /// Extra environment variables for the CLI process: paths to private
+    /// per-turn files, or connector header values a CLI can only read by
+    /// variable name (Codex `env_http_headers`). Unlike argv, a process's
+    /// environment is readable only by its own user. Never logged.
     pub env: Vec<(String, String)>,
     /// Working directory override (defaults to `TurnSpec::cwd`).
     pub cwd: Option<PathBuf>,
@@ -269,6 +278,23 @@ pub trait Harness: Send + Sync {
     }
     fn parse_models(&self, _stdout: &str) -> Vec<DiscoveredModel> {
         Vec::new()
+    }
+    /// Whether isolated turns are possible right now; Err says what of the
+    /// CLI's own configuration cannot be switched off (the turn then uses
+    /// another engine).
+    fn can_isolate(&self) -> std::result::Result<(), String> {
+        Ok(())
+    }
+    /// For CLIs that can only switch off their own MCP servers by name: a
+    /// cheap local command listing them (run before isolated turns).
+    fn own_mcp_servers_args(&self) -> Option<Vec<String>> {
+        None
+    }
+    /// Names from that command's output (nothing else of it is kept), or
+    /// None if it cannot be read, so the CLI is not used rather than
+    /// leaving the owner's servers on.
+    fn parse_own_mcp_servers(&self, _stdout: &str) -> Option<Vec<String>> {
+        Some(Vec::new())
     }
     /// The CLI's own login command when it can run without a terminal, so
     /// Iris can relay it to the app. None: sign-in needs the server.

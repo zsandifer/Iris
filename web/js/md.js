@@ -9,7 +9,9 @@ const LINK = (url, label) => `<a href="${url}" target="_blank" rel="noopener nor
 
 function fmt(t) {
   // t is already escaped.
-  t = t.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => LINK(url, label));
+  // Labels and URLs stop at the next '[', so text with many unclosed
+  // brackets stays linear instead of backtracking quadratically.
+  t = t.replace(/\[([^[\]\n]+)\]\((https?:\/\/[^\s)[]+)\)/g, (_, label, url) => LINK(url, label));
   t = t.replace(/(^|[\s(])(https?:\/\/[^\s<]*[^\s<.,;:!?)'"])/g, (_, pre, url) => pre + LINK(url, url));
   t = t.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
   t = t.replace(/__([^_\n]+)__/g, '<strong>$1</strong>');
@@ -35,8 +37,15 @@ function table(rows) {
     rest.map((r) => `<tr>${cells(r).map((c) => `<td>${inline(c)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
 }
 
+// Deeper quote markers render as plain text (no unbounded recursion).
+const MAX_QUOTE_DEPTH = 8;
+
 /** Markdown to an HTML string (safe to inject). */
 export function md(src) {
+  return render(src, 0);
+}
+
+function render(src, depth) {
   const lines = String(src || '').replace(/\r\n?/g, '\n').split('\n');
   const out = [];
   let para = [];
@@ -72,12 +81,12 @@ export function md(src) {
       out.push(table(rows));
       continue;
     }
-    if (/^\s*>/.test(line)) {
+    if (depth < MAX_QUOTE_DEPTH && /^\s*>/.test(line)) {
       flush();
       const q = [];
       while (i < lines.length && /^\s*>/.test(lines[i])) q.push(lines[i++].replace(/^\s*>\s?/, ''));
       i--;
-      out.push(`<blockquote>${md(q.join('\n'))}</blockquote>`);
+      out.push(`<blockquote>${render(q.join('\n'), depth + 1)}</blockquote>`);
       continue;
     }
     const li = line.match(/^\s*([-*+]|\d+[.)])\s+(.*)$/);
@@ -107,8 +116,8 @@ export function md(src) {
 export function plain(src, max = 0) {
   let t = String(src || '')
     .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/!\[[^[\]]*\]\([^)[]*\)/g, '')
+    .replace(/\[([^[\]]+)\]\([^)[]*\)/g, '$1')
     .replace(/[#*_`>~|]/g, '')
     .replace(/\s+/g, ' ')
     .trim();

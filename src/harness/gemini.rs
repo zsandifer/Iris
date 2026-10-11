@@ -111,7 +111,22 @@ impl Harness for Gemini {
         let dir = scope_dir(&spec.cwd, &spec.scope);
         ensure_private_dir(&dir.join(".gemini"))?;
         let settings = dir.join(".gemini").join("settings.json");
-        let body = json!({"mcpServers": mcp_settings(&spec.mcp_servers)});
+        // The Iris bridge resolves Library paths against this folder.
+        let servers: Vec<super::McpServer> = spec
+            .mcp_servers
+            .iter()
+            .cloned()
+            .map(|mut s| {
+                if let (true, McpTransport::Stdio { args, .. }) =
+                    (s.name == "iris", &mut s.transport)
+                {
+                    args.push("--workdir".into());
+                    args.push(dir.to_string_lossy().into_owned());
+                }
+                s
+            })
+            .collect();
+        let body = json!({"mcpServers": mcp_settings(&servers)});
         write_private_file(&settings, &serde_json::to_vec_pretty(&body)?)?;
         inv.temp_files.push(settings);
 
@@ -126,6 +141,16 @@ impl Harness for Gemini {
         inv.cwd = Some(dir);
 
         let a = &mut inv.args;
+        if spec.isolated {
+            // Someone else's chat: only Iris's MCP servers, no extensions
+            // (both may carry the owner's accounts).
+            a.push("--allowed-mcp-server-names".into());
+            if spec.mcp_servers.is_empty() {
+                a.push("iris".into());
+            }
+            a.extend(spec.mcp_servers.iter().map(|s| s.name.clone()));
+            a.extend(["-e", "none"].map(String::from));
+        }
         a.extend(["--skip-trust", "-o", "stream-json", "-m"].map(String::from));
         a.push(spec.model.clone());
         if let Some(id) = &spec.resume {
@@ -522,6 +547,8 @@ mod tests {
             writable_dirs: vec!["/data/memory".into()],
             run_dir: tmp.path().into(),
             scope: "conv/../1".into(),
+            isolated: false,
+            own_mcp_servers: Vec::new(),
         };
         let inv = Gemini::new(HarnessConfig::gemini_default())
             .build(&spec)
@@ -543,6 +570,10 @@ mod tests {
             serde_json::from_slice(&std::fs::read(cwd.join(".gemini/settings.json")).unwrap())
                 .unwrap();
         assert_eq!(settings["mcpServers"]["iris"]["trust"], true);
+        assert_eq!(
+            settings["mcpServers"]["iris"]["args"],
+            json!(["mcp", "--workdir", cwd.to_string_lossy()])
+        );
         assert_eq!(inv.env[0].0, "GEMINI_SYSTEM_MD");
         let system = std::fs::read_to_string(&inv.env[0].1).unwrap();
         assert!(system.starts_with("You are Iris") && system.contains("${AvailableTools}"));
@@ -550,5 +581,25 @@ mod tests {
         assert!(stdin.starts_with("what is in \\@this\n@"));
         assert!(stdin.ends_with("a\\ b.png"));
         assert_eq!(inv.temp_files.len(), 2);
+        // Someone else's chat: only Iris's MCP servers, no extensions.
+        let mut iso = spec.clone();
+        iso.isolated = true;
+        let inv = Gemini::new(HarnessConfig::gemini_default())
+            .build(&iso)
+            .unwrap();
+        let args = inv.args.join(" ");
+        assert!(
+            args.starts_with("--allowed-mcp-server-names iris -e none --skip-trust"),
+            "{args}"
+        );
+        let plain = Gemini::new(HarnessConfig::gemini_default())
+            .build(&spec)
+            .unwrap();
+        assert!(
+            !plain
+                .args
+                .iter()
+                .any(|a| a == "--allowed-mcp-server-names" || a == "-e")
+        );
     }
 }

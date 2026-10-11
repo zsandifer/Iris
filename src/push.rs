@@ -6,7 +6,6 @@
 //! `<data_dir>/vapid.json` (0600). Payloads are small JSON objects:
 //! `{"title", "body", "conversation_id", "message_id", "kind"}`.
 
-use crate::config::write_private_file;
 use crate::util::{Result, random_bytes};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes128Gcm, Nonce};
@@ -72,7 +71,13 @@ impl VapidKeys {
                     private_key: B64URL.encode(keys.secret.to_bytes()),
                     public_key: keys.public_key_b64.clone(),
                 };
-                write_private_file(path, serde_json::to_string_pretty(&file)?.as_bytes())?;
+                // Only the first of two concurrent creators wins.
+                if !crate::config::create_private_file_once(
+                    path,
+                    serde_json::to_string_pretty(&file)?.as_bytes(),
+                )? {
+                    return Self::load_or_create(path);
+                }
                 Ok(keys)
             }
             Err(e) => Err(e.into()),
@@ -195,6 +200,51 @@ pub enum SendResult {
     Failed(u16),
 }
 
+/// The browsers' push services (Chrome and other Chromium browsers,
+/// Firefox, Safari, Edge). Endpoints come from users' browsers, so Iris only
+/// ever sends to these hosts, never to an address on its own network.
+const PUSH_SERVICE_DOMAINS: &[&str] = &[
+    "fcm.googleapis.com",
+    "android.googleapis.com",
+    "push.services.mozilla.com",
+    "push.apple.com",
+    "notify.windows.com",
+];
+
+/// Whether `endpoint` is an `https://` URL on a known browser push service
+/// (default port, no credentials in the URL).
+pub fn endpoint_allowed(endpoint: &str) -> bool {
+    let Some(rest) = endpoint.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.split_once(':') {
+        Some((h, "443")) => h,
+        Some(_) => return false,
+        None => authority,
+    }
+    .to_ascii_lowercase();
+    PUSH_SERVICE_DOMAINS
+        .iter()
+        .any(|d| host == *d || host.strip_suffix(d).is_some_and(|p| p.ends_with('.')))
+}
+
+/// HTTP client for push services. Endpoints come from users' browsers, so
+/// it never follows redirects and never speaks plain HTTP: a hostile
+/// endpoint cannot bounce the request into the server's own network.
+fn push_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .https_only(true)
+        .max_redirects(0)
+        .timeout_global(Some(std::time::Duration::from_secs(15)))
+        .build()
+        .into()
+}
+
 /// Deliver one encrypted notification (blocking; call from spawn_blocking).
 pub fn send_blocking(
     keys: &VapidKeys,
@@ -204,14 +254,12 @@ pub fn send_blocking(
     auth: &str,
     payload: &serde_json::Value,
 ) -> Result<SendResult> {
+    if !endpoint_allowed(endpoint) {
+        return Err("not a browser push service endpoint".into());
+    }
     let body = encrypt(payload.to_string().as_bytes(), p256dh, auth)?;
     let authorization = keys.authorization(endpoint, subject, crate::util::now_ms() / 1000)?;
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(std::time::Duration::from_secs(15)))
-        .build()
-        .into();
-    let resp = agent
+    let resp = push_agent()
         .post(endpoint)
         .header("TTL", "86400")
         .header("Urgency", "normal")
@@ -269,6 +317,60 @@ mod tests {
         assert_eq!(decrypt(&body, &ua, &auth), br#"{"title":"hi"}"#);
         assert!(encrypt(b"x", &p256dh, &B64URL.encode([0u8; 3])).is_err());
         assert!(encrypt(&[b'a'; 5000], &p256dh, &B64URL.encode(auth)).is_err());
+    }
+
+    #[test]
+    fn push_requests_never_leave_https_or_follow_redirects() {
+        let cfg = push_agent();
+        assert_eq!(cfg.config().max_redirects(), 0);
+        assert!(cfg.config().https_only());
+        // A plain-HTTP endpoint (e.g. a redirect target on the local
+        // network) is refused before any connection is made.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let tmp = tempfile::tempdir().unwrap();
+        let keys = VapidKeys::load_or_create(&tmp.path().join("vapid")).unwrap();
+        let ua = random_secret_key();
+        let p256dh = B64URL.encode(public_bytes(&ua));
+        let auth = B64URL.encode(random_bytes::<16>());
+        let sent = send_blocking(
+            &keys,
+            "mailto:admin@example.com",
+            &format!("http://127.0.0.1:{port}/push"),
+            &p256dh,
+            &auth,
+            &serde_json::json!({"title": "x"}),
+        );
+        assert!(sent.is_err());
+        assert!(listener.accept().is_err(), "no connection was made");
+    }
+
+    #[test]
+    fn only_browser_push_services_are_reachable() {
+        for ok in [
+            "https://fcm.googleapis.com/fcm/send/abc",
+            "https://updates.push.services.mozilla.com/wpush/v2/abc",
+            "https://web.push.apple.com/abc",
+            "https://wns2-par02p.notify.windows.com/w/?token=abc",
+            "https://FCM.googleapis.com:443/x",
+        ] {
+            assert!(endpoint_allowed(ok), "{ok}");
+        }
+        for bad in [
+            "http://fcm.googleapis.com/x",
+            "https://192.168.1.10/push",
+            "https://100.64.0.1/push",
+            "https://localhost/push",
+            "https://nas.example.ts.net/push",
+            "https://evilfcm.googleapis.com.example.com/x",
+            "https://notfcm.googleapis.com/x",
+            "https://fcm.googleapis.com:8443/x",
+            "https://user@fcm.googleapis.com/x",
+            "https://fcm.googleapis.com.evil.example/x",
+        ] {
+            assert!(!endpoint_allowed(bad), "{bad}");
+        }
     }
 
     /// RFC 8291 Appendix A test vector.

@@ -143,7 +143,8 @@ code { font-family: var(--mono); font-size: .88em; background: var(--sf2); borde
 .lk { background: var(--sf); border: 1px solid var(--ln); border-radius: 18px; padding: 10px; display: flex; gap: 10px; align-items: center;
   max-width: 88%; color: var(--ink); text-decoration: none; }
 .lk b { display: block; font-size: 14px; } .lk small { color: var(--mu); font-size: 12.5px; display: block; }
-.go, .cn { background: var(--ac); color: #fff; border: 0; border-radius: 999px; padding: 6px 13px; font-size: 13px; font-weight: 600; flex: none; white-space: nowrap; }
+.lk-m { background: none; border: 0; padding: 3px 0 0; color: var(--ac); font-size: 12.5px; font-weight: 600; }
+.go, .cn { background: var(--ac); color: #fff; border: 0; border-radius: 999px; padding: 6px 13px; font-size: 13px; font-weight: 600; flex: none; white-space: nowrap; text-decoration: none; }
 .cn { background: none; color: var(--ac); padding: 4px 2px; margin-left: auto; }
 .cn.danger { color: var(--bad); }
 .tile { display: grid; place-items: center; color: #fff; font-weight: 700; font-size: 14px; flex: none; }
@@ -225,6 +226,7 @@ code { font-family: var(--mono); font-size: .88em; background: var(--sf2); borde
 .why .ic { color: var(--ac); }
 .why.light { color: rgba(255,255,255,.85); } .why.light .ic { color: #fff; }
 .end { text-align: center; font-size: 13px; padding: 10px 0 20px; }
+.end .b2 { margin-top: 10px; }
 
 .viewer { position: absolute; inset: 0; z-index: 20; background: #000; color: #fff; touch-action: none; user-select: none; -webkit-user-select: none; }
 .viewer-im, .viewer .img-ph { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }

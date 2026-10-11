@@ -84,6 +84,20 @@ impl LoginManager {
         f(&mut s.status);
         Some(s.status.clone())
     }
+
+    /// Update only if `id` is still this harness's session, so a finished
+    /// attempt's last steps never touch a newer one.
+    fn update_session(
+        &self,
+        harness: &str,
+        id: &str,
+        f: impl FnOnce(&mut LoginStatus),
+    ) -> Option<LoginStatus> {
+        let mut map = self.lock();
+        let s = map.get_mut(harness).filter(|s| s.status.id == id)?;
+        f(&mut s.status);
+        Some(s.status.clone())
+    }
 }
 
 /// Remove ANSI escape sequences (colors, cursor moves, OSC titles).
@@ -158,11 +172,6 @@ fn rejected_code(line: &str) -> bool {
 
 /// Start (or return the running) login for a harness.
 pub async fn start(state: &AppState, harness: &str) -> Result<LoginStatus> {
-    if let Some(s) = state.logins.status(harness)
-        && !s.finished()
-    {
-        return Ok(s);
-    }
     let entry = state
         .harness(harness)
         .ok_or_else(|| format!("unknown engine {harness}"))?;
@@ -173,6 +182,36 @@ pub async fn start(state: &AppState, harness: &str) -> Result<LoginStatus> {
     let program = entry
         .program()
         .ok_or_else(|| format!("{harness} is not installed"))?;
+    // Reserve the session before spawning, under one lock, so two requests
+    // at once cannot both start the CLI's login.
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    let status = LoginStatus {
+        id: new_id(),
+        harness: harness.to_string(),
+        flow: spec.flow,
+        state: "starting",
+        url: None,
+        user_code: None,
+        error: None,
+        started_at: now_ms(),
+    };
+    {
+        let mut map = state.logins.lock();
+        if let Some(s) = map.get(harness)
+            && !s.status.finished()
+        {
+            return Ok(s.status.clone());
+        }
+        map.insert(
+            harness.to_string(),
+            Session {
+                status: status.clone(),
+                stdin: None,
+                cancel: cancel_tx,
+            },
+        );
+    }
+    let session_id = status.id.clone();
     let mut cmd = Command::new(&program);
     cmd.args(&spec.args)
         .current_dir(state.paths.workspace_dir())
@@ -189,11 +228,29 @@ pub async fn start(state: &AppState, harness: &str) -> Result<LoginStatus> {
     for k in state.strip_env(entry) {
         cmd.env_remove(k);
     }
-    let mut child = cmd.spawn()?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            state.logins.update_session(harness, &session_id, |s| {
+                s.state = "failed";
+                s.error = Some("I couldn't start the sign-in. Try again.".into());
+            });
+            publish(state, harness).await;
+            return Err(e.into());
+        }
+    };
     let stdin = child
         .stdin
         .take()
         .map(|s| Arc::new(tokio::sync::Mutex::new(s)));
+    if let Some(s) = state
+        .logins
+        .lock()
+        .get_mut(harness)
+        .filter(|s| s.status.id == session_id)
+    {
+        s.stdin = stdin;
+    }
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     for out in [
         child
@@ -226,25 +283,6 @@ pub async fn start(state: &AppState, harness: &str) -> Result<LoginStatus> {
         });
     }
     drop(tx);
-    let (cancel_tx, mut cancel_rx) = watch::channel(false);
-    let status = LoginStatus {
-        id: new_id(),
-        harness: harness.to_string(),
-        flow: spec.flow,
-        state: "starting",
-        url: None,
-        user_code: None,
-        error: None,
-        started_at: now_ms(),
-    };
-    state.logins.lock().insert(
-        harness.to_string(),
-        Session {
-            status: status.clone(),
-            stdin,
-            cancel: cancel_tx,
-        },
-    );
     crate::info!("login {harness}: started");
     publish(state, harness).await;
 
@@ -269,7 +307,7 @@ pub async fn start(state: &AppState, harness: &str) -> Result<LoginStatus> {
                             .is_some_and(|s| s.success());
                         break;
                     };
-                    on_line(&st, &name, spec.flow, &line).await;
+                    on_line(&st, &name, &session_id, spec.flow, &line).await;
                     let l = line.to_lowercase();
                     if l.contains("error") || l.contains("failed") {
                         reason = Some(crate::util::truncate_chars(line.trim(), 160));
@@ -288,12 +326,12 @@ pub async fn start(state: &AppState, harness: &str) -> Result<LoginStatus> {
             }
         }
         let _ = child.kill().await;
-        finish(&st, &name, outcome, exit_ok, reason).await;
+        finish(&st, &name, &session_id, outcome, exit_ok, reason).await;
     });
     Ok(status)
 }
 
-async fn on_line(state: &AppState, harness: &str, flow: LoginFlow, line: &str) {
+async fn on_line(state: &AppState, harness: &str, id: &str, flow: LoginFlow, line: &str) {
     let url = find_url(line);
     let code = (flow == LoginFlow::DeviceCode)
         .then(|| find_device_code(line))
@@ -302,7 +340,7 @@ async fn on_line(state: &AppState, harness: &str, flow: LoginFlow, line: &str) {
     if url.is_none() && code.is_none() && !rejected {
         return;
     }
-    let changed = state.logins.update(harness, |s| {
+    let changed = state.logins.update_session(harness, id, |s| {
         if let Some(u) = url
             && s.url.is_none()
         {
@@ -330,12 +368,13 @@ async fn on_line(state: &AppState, harness: &str, flow: LoginFlow, line: &str) {
 async fn finish(
     state: &AppState,
     harness: &str,
+    id: &str,
     outcome: &str,
     exit_ok: bool,
     reason: Option<String>,
 ) {
     if outcome == "cancelled" {
-        state.logins.update(harness, |s| {
+        state.logins.update_session(harness, id, |s| {
             s.state = "cancelled";
             s.url = None;
             s.user_code = None;
@@ -343,13 +382,15 @@ async fn finish(
         publish(state, harness).await;
         return;
     }
-    state.logins.update(harness, |s| s.state = "verifying");
+    state
+        .logins
+        .update_session(harness, id, |s| s.state = "verifying");
     publish(state, harness).await;
     // Judge success only by the CLI's own status command.
     let auth = state.probe_auth(harness).await;
     let connected = auth == AuthState::Ok;
     crate::info!("login {harness}: {outcome}, exit_ok={exit_ok}, signed_in={connected}");
-    state.logins.update(harness, |s| {
+    state.logins.update_session(harness, id, |s| {
         s.url = None;
         s.user_code = None;
         if connected {

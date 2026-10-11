@@ -128,6 +128,7 @@ own personality. It is not a clone.
 
 ## People
 
-- Each person (for example a partner) gets **their own Iris** with separate
-  memory, plus shared "Together" chats.
+- Each person (for example a partner) gets **their own chats with Iris**,
+  plus shared "Together" chats. The owner's memory, persona notes, files,
+  and connectors stay private to the owner; per-person memory is on the way.
 - Pairing: one-time code → long-lived per-device key, revocable per device.

@@ -10,7 +10,7 @@ use crate::entities::{self, ConnectorConfig, check_text};
 use crate::events::Audience;
 use crate::harness::valid_server_name;
 use crate::ranking::{Pin, Slot};
-use crate::state::{AppState, slot_pins_json};
+use crate::state::{AppState, slot_pins_json, stored_slot_pins};
 use crate::util::{new_id, now_ms};
 use axum::Router;
 use axum::body::Bytes;
@@ -73,8 +73,8 @@ pub fn routes() -> Router<AppState> {
 
 // ----------------------------------------------------------------- settings
 
-async fn get_settings(State(state): State<AppState>, _user: AuthUser) -> ApiResult {
-    ok(state.settings_json().await)
+async fn get_settings(State(state): State<AppState>, user: AuthUser) -> ApiResult {
+    ok(state.settings_json(user.user.is_owner).await)
 }
 
 #[derive(Deserialize)]
@@ -154,12 +154,7 @@ async fn put_settings(
         }
         state.browser.set_paused(p).await;
     }
-    let settings = state.settings_json().await;
-    state.hub.send(
-        Audience::All,
-        json!({"type": "settings.changed", "settings": settings}),
-    );
-    ok(settings)
+    ok(state.broadcast_settings().await)
 }
 
 async fn put_avatar(State(state): State<AppState>, user: AuthUser, body: Bytes) -> ApiResult {
@@ -173,12 +168,7 @@ async fn put_avatar(State(state): State<AppState>, user: AuthUser, body: Bytes) 
             db::set_setting(c, "agent_avatar_updated", &now_ms().to_string())
         })
         .await?;
-    let settings = state.settings_json().await;
-    state.hub.send(
-        Audience::All,
-        json!({"type": "settings.changed", "settings": settings}),
-    );
-    ok(settings)
+    ok(state.broadcast_settings().await)
 }
 
 async fn delete_avatar(State(state): State<AppState>, user: AuthUser) -> ApiResult {
@@ -187,12 +177,7 @@ async fn delete_avatar(State(state): State<AppState>, user: AuthUser) -> ApiResu
         .db
         .call(|c| db::delete_setting(c, "agent_avatar"))
         .await?;
-    let settings = state.settings_json().await;
-    state.hub.send(
-        Audience::All,
-        json!({"type": "settings.changed", "settings": settings}),
-    );
-    ok(settings)
+    ok(state.broadcast_settings().await)
 }
 
 const DEFAULT_AVATAR: &str = include_str!("avatar.svg");
@@ -322,7 +307,7 @@ async fn start_login(
     if entry.harness.login().is_none() {
         // No headless login: re-check (the owner may have signed in on the
         // server) and return the manual step.
-        let auth = state.probe_auth(&name).await;
+        let auth = state.recheck_auth(&name).await;
         return ok(json!({
             "login": null,
             "manual": entry.harness.manual_login_hint(),
@@ -415,11 +400,8 @@ async fn put_slot(
 ) -> ApiResult {
     user.require_owner()?;
     let slot = Slot::parse(&slot).ok_or_else(|| ApiError::not_found("slot"))?;
-    let mut pins = state.slot_pins().await;
-    match body.mode.as_str() {
-        "automatic" => {
-            pins.remove(&slot);
-        }
+    let pin = match body.mode.as_str() {
+        "automatic" => None,
         "pinned" => {
             let model = body
                 .model
@@ -435,20 +417,25 @@ async fn put_slot(
                 )));
             }
             catalog.check_effort(&model, body.effort.as_deref())?;
-            pins.insert(
-                slot,
-                Pin {
-                    model,
-                    effort: body.effort.clone(),
-                },
-            );
+            Some(Pin {
+                model,
+                effort: body.effort.clone(),
+            })
         }
         _ => return Err(ApiError::bad_request("mode must be automatic or pinned")),
-    }
-    let raw = slot_pins_json(&pins);
+    };
+    // Read, change one slot, and write in one database call, so concurrent
+    // changes to other slots are kept.
     state
         .db
-        .call(move |c| db::set_setting(c, "slots", &raw))
+        .call(move |c| {
+            let mut pins = stored_slot_pins(c)?;
+            match pin {
+                Some(p) => pins.insert(slot, p),
+                None => pins.remove(&slot),
+            };
+            db::set_setting(c, "slots", &slot_pins_json(&pins))
+        })
         .await?;
     let slots = state.slots_json().await;
     state.hub.send(
@@ -576,12 +563,6 @@ async fn update_connector(
     JsonBody(body): JsonBody<ConnectorBody>,
 ) -> ApiResult {
     user.require_owner()?;
-    let cid = id.clone();
-    let existing = state
-        .db
-        .call(move |c| entities::get_connector(c, &cid))
-        .await?
-        .ok_or_else(|| ApiError::not_found("connector"))?;
     if let Some(d) = &body.description {
         check_text("description", d, 500, false)?;
     }
@@ -590,24 +571,33 @@ async fn update_connector(
         || body.env.is_some()
         || body.url.is_some()
         || body.headers.is_some();
-    let cfg = if touches_config {
-        Some(build_config(
-            &state,
-            &id,
-            &existing.transport,
-            &body,
-            Some(&existing.config),
-        )?)
-    } else {
-        None
-    };
-    let (desc, enabled) = (body.description.clone(), body.enabled);
-    let cid = id.clone();
+    let (st, cid) = (state.clone(), id.clone());
+    // Read, merge, and write in one database call, so concurrent patches
+    // to different fields cannot undo each other.
     let con = state
         .db
-        .call(move |c| entities::update_connector(c, &id, desc.as_deref(), cfg.as_ref(), enabled))
-        .await?
-        .ok_or_else(|| ApiError::not_found("connector"))?;
+        .call(move |c| {
+            let Some(existing) = entities::get_connector(c, &id)? else {
+                return Ok(Err(ApiError::not_found("connector")));
+            };
+            let cfg = if touches_config {
+                match build_config(&st, &id, &existing.transport, &body, Some(&existing.config)) {
+                    Ok(cfg) => Some(cfg),
+                    Err(e) => return Ok(Err(e)),
+                }
+            } else {
+                None
+            };
+            Ok(entities::update_connector(
+                c,
+                &id,
+                body.description.as_deref(),
+                cfg.as_ref(),
+                body.enabled,
+            )?
+            .ok_or_else(|| ApiError::not_found("connector")))
+        })
+        .await??;
     if touches_config {
         crate::login::on_connector_updated(&state, &cid).await;
     }
@@ -706,7 +696,7 @@ pub fn luhn_ok(digits: &str) -> bool {
             }
         })
         .sum();
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 /// Secret fields supplied in a request (only those present).
@@ -838,53 +828,64 @@ async fn update_credential(
     JsonBody(body): JsonBody<CredentialBody>,
 ) -> ApiResult {
     user.require_owner()?;
-    let (uid, cid) = (user.id().to_string(), id.clone());
-    let existing = state
-        .db
-        .call(move |c| entities::get_credential(c, &uid, &cid))
-        .await?
-        .ok_or_else(|| ApiError::not_found("credential"))?;
     if let Some(l) = &body.label {
         check_text("label", l, 200, true)?;
     }
-    let (mut meta, secret) = credential_parts(&existing.kind, &body)?;
-    // Keep metadata fields that were not supplied.
-    if let (Some(new), Some(old)) = (meta.as_object_mut(), existing.metadata.as_object()) {
-        for (k, v) in old {
-            if new.get(k).is_none_or(Value::is_null) {
-                new.insert(k.clone(), v.clone());
-            }
-        }
-    }
-    // Merge supplied secret fields into the stored secret so a partial
-    // update (e.g. only notes) keeps the rest. Decrypted only in memory.
-    let ct = if secret.is_empty() {
-        None
-    } else {
-        let (uid, cid) = (user.id().to_string(), id.clone());
-        let stored = state
-            .db
-            .call(move |c| entities::get_credential_ciphertext(c, &uid, &cid))
-            .await?
-            .ok_or_else(|| ApiError::not_found("credential"))?;
-        let plain = state.vault.decrypt(&stored, &id)?;
-        let mut merged: SecretFields = serde_json::from_slice(&plain).unwrap_or_default();
-        merged.extend(secret);
-        state.browser.learn_secrets(&fillable_secrets(&merged));
-        Some(
-            state
-                .vault
-                .encrypt(Value::Object(merged).to_string().as_bytes(), &id)?,
-        )
-    };
-    let (uid, label) = (user.id().to_string(), body.label.clone());
+    let (uid, st) = (user.id().to_string(), state.clone());
+    // Read, merge, and write in one database call (one connection, one
+    // lock), so concurrent partial updates cannot overwrite each other.
     let cred = state
         .db
         .call(move |c| {
-            entities::update_credential(c, &uid, &id, label.as_deref(), Some(&meta), ct.as_deref())
+            let Some(existing) = entities::get_credential(c, &uid, &id)? else {
+                return Ok(Err(ApiError::not_found("credential")));
+            };
+            let (mut meta, secret) = match credential_parts(&existing.kind, &body) {
+                Ok(parts) => parts,
+                Err(e) => return Ok(Err(e)),
+            };
+            // Keep metadata fields that were not supplied.
+            if let (Some(new), Some(old)) = (meta.as_object_mut(), existing.metadata.as_object()) {
+                for (k, v) in old {
+                    if new.get(k).is_none_or(Value::is_null) {
+                        new.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            // Merge supplied secret fields into the stored secret so a
+            // partial update (e.g. only notes) keeps the rest. Decrypted
+            // only in memory.
+            let ct = if secret.is_empty() {
+                None
+            } else {
+                let Some(stored) = entities::get_credential_ciphertext(c, &uid, &id)? else {
+                    return Ok(Err(ApiError::not_found("credential")));
+                };
+                let sealed = st.vault.decrypt(&stored, &id).and_then(|plain| {
+                    let mut merged: SecretFields =
+                        serde_json::from_slice(&plain).unwrap_or_default();
+                    merged.extend(secret);
+                    // A browser session already open must hide it too.
+                    st.browser.learn_secrets(&fillable_secrets(&merged));
+                    st.vault
+                        .encrypt(Value::Object(merged).to_string().as_bytes(), &id)
+                });
+                match sealed {
+                    Ok(ct) => Some(ct),
+                    Err(e) => return Ok(Err(e.into())),
+                }
+            };
+            Ok(entities::update_credential(
+                c,
+                &uid,
+                &id,
+                body.label.as_deref(),
+                Some(&meta),
+                ct.as_deref(),
+            )?
+            .ok_or_else(|| ApiError::not_found("credential")))
         })
-        .await?
-        .ok_or_else(|| ApiError::not_found("credential"))?;
+        .await??;
     ok(json!({"credential": cred}))
 }
 
@@ -908,9 +909,16 @@ async fn delete_credential(
 // --------------------------------------------------------------------- push
 
 async fn vapid_key(State(state): State<AppState>, _user: AuthUser) -> ApiResult {
+    let ready =
+        state.cfg.push.enabled && state.vapid.is_some() && state.cfg.push_subject().is_some();
     ok(json!({
-        "enabled": state.cfg.push.enabled,
+        "enabled": ready,
         "public_key": state.vapid.as_ref().map(|k| k.public_key_b64.clone()),
+        "reason": (!ready).then_some(if state.cfg.push.enabled {
+            "push needs a contact: set [push] vapid_subject (mailto: or https:) or an https public_url"
+        } else {
+            "push is turned off on the server"
+        }),
     }))
 }
 
@@ -940,8 +948,15 @@ async fn subscribe_push(
     user: AuthUser,
     JsonBody(body): JsonBody<SubscribeBody>,
 ) -> ApiResult {
-    if !body.endpoint.starts_with("https://") || body.endpoint.len() > 2000 {
-        return Err(ApiError::bad_request("endpoint must be an https URL"));
+    if !state.cfg.push.enabled || state.cfg.push_subject().is_none() {
+        return Err(ApiError::bad_request(
+            "notifications are not set up on this server",
+        ));
+    }
+    if body.endpoint.len() > 2000 || !crate::push::endpoint_allowed(&body.endpoint) {
+        return Err(ApiError::bad_request(
+            "endpoint must be an https URL of a browser push service",
+        ));
     }
     // Validate the keys now rather than failing at send time.
     crate::push::encrypt(b"{}", &body.keys.p256dh, &body.keys.auth)

@@ -2,8 +2,10 @@
 // feed_post) and server cards (action, engine_signin, engine_setup,
 // connector_reconnect, approval).
 import { html, useState } from './h.js';
-import { api, post, patch } from './api.js';
-import { S, set, go, isOwner, toast, loadGoals, loadEngines } from './store.js';
+import { api, post, patch, seg, isId } from './api.js';
+import {
+  S, set, go, isOwner, toast, loadGoals, loadEngines, loginMark, applyLoginResponse,
+} from './store.js';
 import { Icon, Img, LetterTile, hostOf, safeUrl } from './ui.js';
 import { plain } from './md.js';
 
@@ -39,10 +41,17 @@ function ResultCard({ c }) {
 
 function ConnectCard({ c }) {
   const service = c.service || c.title;
+  const url = safeUrl(c.url);
+  const label = c.action_label || 'Connect';
+  const manage = () => go(`iris/connections?service=${encodeURIComponent(service)}`);
+  // The card's url is the service's own connection page; Connections stays
+  // one tap away for the owner.
   return html`<div class="lk">
     <${LetterTile} name=${service} size=${36} radius=${11} />
-    <div class="grow"><b>${c.title}</b><small>${c.body ? plain(c.body, 90) : 'Connect it so I can help with it'}</small></div>
-    <button class="go" onClick=${() => go(`iris/connections?service=${encodeURIComponent(service)}`)}>${c.action_label || 'Connect'}</button>
+    <div class="grow"><b>${c.title}</b><small>${c.body ? plain(c.body, 90) : url ? hostOf(url) : 'Connect it so I can help with it'}</small>
+      ${url && isOwner() && html`<button class="lk-m" onClick=${manage}>Connections ›</button>`}</div>
+    ${url ? html`<a class="go" href=${url} target="_blank" rel="noopener noreferrer">${label}</a>`
+      : html`<button class="go" onClick=${manage}>${label}</button>`}
   </div>`;
 }
 
@@ -54,10 +63,10 @@ function InfoCard({ c }) {
 function IdeaCard({ c }) {
   const [busy, setBusy] = useState(false);
   const start = async () => {
-    if (!c.ref_id) return go('ideas');
+    if (!isId(c.ref_id)) return go('ideas');
     setBusy(true);
     try {
-      const r = await post(`/ideas/${c.ref_id}/start`);
+      const r = await post(`/ideas/${seg(c.ref_id)}/start`);
       go(`chat/${r.conversation.id}`);
     } catch (e) { toast(e.message); setBusy(false); }
   };
@@ -70,7 +79,7 @@ function IdeaCard({ c }) {
 function GoalCard({ c }) {
   const goal = (S.goals || []).find((g) => g.id === c.ref_id);
   const confirm = async () => {
-    try { await patch(`/goals/${c.ref_id}`, { suggested: false }); await loadGoals(); toast('Added to your goals'); } catch (e) { toast(e.message); }
+    try { await patch(`/goals/${seg(c.ref_id)}`, { suggested: false }); await loadGoals(); toast('Added to your goals'); } catch (e) { toast(e.message); }
   };
   return html`<div class="card-x"><span class="tag">${goal?.suggested ? 'Suggested goal' : 'Goal'}</span><b>${c.title}</b>
     ${c.body && html`<p>${c.body}</p>`}
@@ -117,8 +126,9 @@ export function SignIn({ card, harness, flow, instructions }) {
   const start = async () => {
     setBusy(true);
     try {
-      const r = await post(`/harnesses/${harness}/login`);
-      if (r.login) set({ logins: { ...S.logins, [harness]: r.login } });
+      const mark = loginMark(harness);
+      const r = await post(`/harnesses/${seg(harness)}/login`);
+      if (r.login) applyLoginResponse(harness, r.login, mark);
       else if (r.manual) toast(r.auth === 'ok' ? 'Signed in. Thanks!' : 'Still signed out. Follow the step above, then check again.');
     } catch (e) { toast(e.message); }
     setBusy(false);
@@ -128,8 +138,9 @@ export function SignIn({ card, harness, flow, instructions }) {
     if (!code.trim()) return;
     setBusy(true);
     try {
-      const r = await post(`/harnesses/${harness}/login/code`, { code: code.trim() });
-      set({ logins: { ...S.logins, [harness]: r.login } });
+      const mark = loginMark(harness);
+      const r = await post(`/harnesses/${seg(harness)}/login/code`, { code: code.trim() });
+      applyLoginResponse(harness, r.login, mark);
       setCode('');
     } catch (err) { toast(err.message); }
     setBusy(false);
@@ -226,7 +237,7 @@ function ApprovalCard({ c, m }) {
     setBusy(true);
     // (A card OK that comes after Iris stopped waiting is picked up by the
     // server, which continues the chat.)
-    try { await post(`/messages/${m.id}/decision`, { approve }); } catch (e) { toast(e.message); }
+    try { await post(`/messages/${seg(m.id)}/decision`, { approve }); } catch (e) { toast(e.message); }
     setBusy(false);
   };
   const p = c.preview || {};

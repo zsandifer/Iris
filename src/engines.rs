@@ -366,28 +366,145 @@ fn opencode_binary(prefix: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// `npm install <package>@latest` into `prefix` (no install scripts).
-fn npm_install(root: &Path, prefix: &Path, name: &str, package: &str) -> Result<()> {
+/// How long one `npm install` may take before it is stopped.
+const NPM_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// Run a command to completion within `limit`, capturing its output. On
+/// timeout the whole process group is killed.
+fn output_with_timeout(
+    mut cmd: std::process::Command,
+    limit: Duration,
+) -> Result<std::process::Output> {
+    use std::os::unix::process::CommandExt;
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0);
+    let mut child = cmd.spawn()?;
+    let drain = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        if let Some(s) = child.try_wait()? {
+            break s;
+        }
+        if std::time::Instant::now() >= deadline {
+            if let Ok(pid) = i32::try_from(child.id()) {
+                // SAFETY: plain syscall on the process group created above.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+            let _ = child.wait();
+            return Err(format!("timed out after {} seconds", limit.as_secs()).into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// npm installs go into a fresh `<root>/<name>/pkg-<id>` folder; the
+/// launcher switches to it only once it is complete, and older folders are
+/// removed after that. A failed or stopped update leaves the working
+/// engine untouched.
+fn install_npm(root: &Path, name: &str, package: &str, launcher_kind: Launcher) -> Result<Report> {
     let npm = crate::harness::resolve_command("npm").ok_or_else(|| {
         format!("Node.js (npm) is needed to install {name}; install Node.js on the server first")
     })?;
-    std::fs::create_dir_all(prefix)?;
-    let out = std::process::Command::new(&npm)
-        .args([
-            "install",
-            "--prefix",
-            &prefix.to_string_lossy(),
-            &format!("{package}@latest"),
-            "--no-fund",
-            "--no-audit",
-            "--ignore-scripts",
-            "--omit=dev",
-            "--no-update-notifier",
-        ])
-        .env("npm_config_cache", root.join(".npm-cache"))
-        .env("npm_config_update_notifier", "false")
-        .stdin(std::process::Stdio::null())
-        .output()?;
+    install_npm_with(root, name, package, launcher_kind, &npm)
+}
+
+fn install_npm_with(
+    root: &Path,
+    name: &str,
+    package: &str,
+    launcher_kind: Launcher,
+    npm: &Path,
+) -> Result<Report> {
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir)?;
+    let before = installed_version(root, name);
+    let prefix = dir.join(format!("pkg-{}", crate::util::new_id()));
+    std::fs::create_dir_all(&prefix)?;
+    let version = match npm_install_into(root, name, package, launcher_kind, npm, &prefix) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&prefix);
+            return Err(e);
+        }
+    };
+    if let Some(v) = &version {
+        std::fs::write(dir.join("VERSION"), v)?;
+    }
+    // The launcher points into the new folder now; drop older installs.
+    for entry in std::fs::read_dir(&dir)?.flatten() {
+        let path = entry.path();
+        if path == prefix || entry.file_name() == "VERSION" {
+            continue;
+        }
+        let _ = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+    Ok(Report {
+        name: name.into(),
+        changed: before != version,
+        version,
+        path: Some(launcher(root, name).to_string_lossy().into_owned()),
+    })
+}
+
+/// Install `package` into `prefix` and point the launcher at it. Returns
+/// the installed version.
+fn npm_install_into(
+    root: &Path,
+    name: &str,
+    package: &str,
+    launcher_kind: Launcher,
+    npm: &Path,
+    prefix: &Path,
+) -> Result<Option<String>> {
+    let mut cmd = std::process::Command::new(npm);
+    cmd.args([
+        "install",
+        "--prefix",
+        &prefix.to_string_lossy(),
+        &format!("{package}@latest"),
+        "--no-fund",
+        "--no-audit",
+        "--ignore-scripts",
+        "--omit=dev",
+        "--no-update-notifier",
+    ])
+    .env("npm_config_cache", root.join(".npm-cache"))
+    .env("npm_config_update_notifier", "false")
+    .stdin(std::process::Stdio::null());
+    let out = output_with_timeout(cmd, NPM_TIMEOUT)
+        .map_err(|e| format!("npm install of {package} failed: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let line = err
@@ -397,13 +514,6 @@ fn npm_install(root: &Path, prefix: &Path, name: &str, package: &str) -> Result<
             .unwrap_or("npm install failed");
         return Err(format!("npm install of {package} failed: {}", line.trim()).into());
     }
-    Ok(())
-}
-
-fn install_npm(root: &Path, name: &str, package: &str, launcher_kind: Launcher) -> Result<Report> {
-    let prefix = root.join(name);
-    let before = installed_version(root, name);
-    npm_install(root, &prefix, name, package)?;
     let pkg_json = prefix
         .join("node_modules")
         .join(package)
@@ -431,20 +541,12 @@ fn install_npm(root: &Path, name: &str, package: &str, launcher_kind: Launcher) 
             )?;
         }
         Launcher::OpenCodeNative => {
-            let bin = opencode_binary(&prefix)
+            let bin = opencode_binary(prefix)
                 .ok_or("the OpenCode package has no binary for this platform")?;
             set_launcher_symlink(root, name, &bin)?;
         }
     }
-    if let Some(v) = &version {
-        std::fs::write(prefix.join("VERSION"), v)?;
-    }
-    Ok(Report {
-        name: name.into(),
-        changed: before != version,
-        version,
-        path: Some(launcher(root, name).to_string_lossy().into_owned()),
-    })
+    Ok(version)
 }
 
 /// Chromium for Iris's browser: the official `playwright-core` package,
@@ -452,9 +554,38 @@ fn install_npm(root: &Path, name: &str, package: &str, launcher_kind: Launcher) 
 /// servers into `<root>/chromium/browsers` (older builds are removed by
 /// Playwright itself).
 fn install_browser(root: &Path) -> Result<Report> {
+    let npm = crate::harness::resolve_command("npm").ok_or(
+        "Node.js (npm) is needed to install the browser; install Node.js on the server first",
+    )?;
     let prefix = install_dir(root, "browser");
+    std::fs::create_dir_all(&prefix)?;
     let before = installed_version(root, "browser");
-    npm_install(root, &prefix, "the browser", "playwright-core")?;
+    let mut cmd = std::process::Command::new(&npm);
+    cmd.args([
+        "install",
+        "--prefix",
+        &prefix.to_string_lossy(),
+        "playwright-core@latest",
+        "--no-fund",
+        "--no-audit",
+        "--ignore-scripts",
+        "--omit=dev",
+        "--no-update-notifier",
+    ])
+    .env("npm_config_cache", root.join(".npm-cache"))
+    .env("npm_config_update_notifier", "false")
+    .stdin(std::process::Stdio::null());
+    let out = output_with_timeout(cmd, NPM_TIMEOUT)
+        .map_err(|e| format!("npm install of playwright-core failed: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let line = err
+            .lines()
+            .rev()
+            .find(|l| l.contains("ERR"))
+            .unwrap_or("npm install failed");
+        return Err(format!("npm install of playwright-core failed: {}", line.trim()).into());
+    }
     let cli = prefix.join("node_modules/playwright-core/cli.js");
     if !cli.is_file() {
         return Err("playwright-core did not provide its installer".into());
@@ -462,13 +593,14 @@ fn install_browser(root: &Path) -> Result<Report> {
     let node =
         crate::harness::resolve_command("node").ok_or("Node.js was not found next to npm")?;
     let browsers = prefix.join("browsers");
-    let out = std::process::Command::new(&node)
-        .arg(&cli)
+    let mut cmd = std::process::Command::new(&node);
+    cmd.arg(&cli)
         .args(["install", "chromium", "--no-shell"])
         .env("PLAYWRIGHT_BROWSERS_PATH", &browsers)
         .env("PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS", "1")
-        .stdin(std::process::Stdio::null())
-        .output()?;
+        .stdin(std::process::Stdio::null());
+    let out = output_with_timeout(cmd, NPM_TIMEOUT)
+        .map_err(|e| format!("Chromium install failed: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let line = err
@@ -523,9 +655,60 @@ pub fn uninstall(root: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The helper writes as a separate, privileged user, so it refuses an
+/// engines directory that anyone else could swap out or plant symlinks in:
+/// the directory and every ancestor must be real directories owned by root
+/// or the current user and not writable by others (sticky ancestors such
+/// as /tmp excepted). Otherwise the agent user could point `--dir` at a
+/// tree it controls whose `bin` links into the protected engines directory.
+pub fn check_trusted_root(root: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if !root.is_absolute() || root.canonicalize()? != root {
+        return Err(format!(
+            "{} must be an absolute path without symlinks",
+            root.display()
+        )
+        .into());
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let mut dir = Some(root);
+    while let Some(d) = dir {
+        let m = std::fs::symlink_metadata(d)?;
+        let shared_write = m.mode() & 0o022 != 0;
+        let sticky = m.mode() & 0o1000 != 0;
+        if !m.is_dir()
+            || (m.uid() != 0 && m.uid() != euid)
+            || (shared_write && (d == root || !sticky))
+        {
+            return Err(format!(
+                "refusing engines directory {}: {} must be owned by root or this user and not writable by others",
+                root.display(),
+                d.display()
+            )
+            .into());
+        }
+        dir = d.parent();
+    }
+    Ok(())
+}
+
 /// `iris engines <install|update|uninstall|list> [name] --dir <root>`:
 /// the privileged helper entry point. Prints one JSON object.
 pub fn cli(args: &[String], root: &Path) -> Result<()> {
+    if matches!(
+        args.first().map(String::as_str),
+        Some("install" | "update" | "uninstall")
+    ) {
+        // The helper may inherit the service's UMask=0077 through sudo, but
+        // the agent user must be able to read and run what it installs.
+        // SAFETY: umask has no preconditions and cannot fail.
+        unsafe {
+            libc::umask(0o022);
+        }
+        std::fs::create_dir_all(root)?;
+        check_trusted_root(root)?;
+    }
     let out = match (args.first().map(String::as_str), args.get(1)) {
         (Some("install" | "update"), Some(name)) => serde_json::to_value(install(root, name)?)?,
         (Some("uninstall"), Some(name)) => {
@@ -616,5 +799,106 @@ mod tests {
         assert!(root.join("browser/profile").exists() && !root.join("chromium").exists());
         assert!(install(root, "../etc").is_err());
         assert_eq!(sh_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn commands_are_stopped_at_their_time_limit() {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "echo out; echo err >&2"]);
+        let out = output_with_timeout(cmd, Duration::from_secs(10)).unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            (&out.stdout[..], &out.stderr[..]),
+            (&b"out\n"[..], &b"err\n"[..])
+        );
+        let start = std::time::Instant::now();
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30 & sleep 30"]);
+        let err = output_with_timeout(cmd, Duration::from_millis(300)).unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_failed_npm_update_keeps_the_working_engine() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::harness::resolve_command("node").is_none() {
+            eprintln!("skipped: node not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("engines");
+        // A stand-in for npm (`npm install --prefix <dir> ...`): installs
+        // the version in npm.ver, or fails halfway when npm.fail exists.
+        let npm = tmp.path().join("npm");
+        std::fs::write(
+            &npm,
+            r#"#!/bin/sh
+prefix="$3"
+mkdir -p "$prefix/node_modules/pkg" "$prefix/node_modules/.bin"
+[ -f "$0.fail" ] && { echo 'npm ERR! network' >&2; exit 1; }
+v=$(cat "$0.ver")
+printf '{"version": "%s"}\n' "$v" > "$prefix/node_modules/pkg/package.json"
+echo 'console.log(1)' > "$prefix/node_modules/.bin/tool"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let install =
+            || install_npm_with(&root, "codex", "pkg", Launcher::NodeScript("tool"), &npm);
+        std::fs::write(tmp.path().join("npm.ver"), "1.0.0").unwrap();
+        let first = install().unwrap();
+        assert_eq!(first.version.as_deref(), Some("1.0.0"));
+        let launcher_v1 = std::fs::read_to_string(launcher(&root, "codex")).unwrap();
+        let script = launcher_v1.split('\'').nth(3).unwrap().to_string();
+        assert!(Path::new(&script).is_file(), "{launcher_v1}");
+        // The update fails partway: the working engine is untouched.
+        std::fs::write(tmp.path().join("npm.fail"), "").unwrap();
+        assert!(install().is_err());
+        assert_eq!(
+            std::fs::read_to_string(launcher(&root, "codex")).unwrap(),
+            launcher_v1
+        );
+        assert_eq!(installed_version(&root, "codex").as_deref(), Some("1.0.0"));
+        assert!(Path::new(&script).is_file(), "v1 files are still there");
+        let entries = || std::fs::read_dir(root.join("codex")).unwrap().count();
+        assert_eq!(entries(), 2, "one install folder plus VERSION");
+        // A good update switches over and removes the old install.
+        std::fs::remove_file(tmp.path().join("npm.fail")).unwrap();
+        std::fs::write(tmp.path().join("npm.ver"), "2.0.0").unwrap();
+        let second = install().unwrap();
+        assert_eq!(second.version.as_deref(), Some("2.0.0"));
+        assert!(second.changed);
+        assert!(!Path::new(&script).exists(), "old install removed");
+        assert_eq!(entries(), 2);
+    }
+
+    #[test]
+    fn helper_only_writes_into_a_trusted_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("engines");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        check_trusted_root(&root).unwrap();
+        // Writable by others: anyone could plant a `bin` symlink.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check_trusted_root(&root).is_err());
+        let args = ["uninstall".to_string(), "codex".to_string()];
+        assert!(cli(&args, &root).is_err());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A writable, non-sticky ancestor could swap the whole tree.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check_trusted_root(&root).is_err());
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        check_trusted_root(&root).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Paths through symlinks are refused.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        assert!(check_trusted_root(&link).is_err());
+        assert!(check_trusted_root(Path::new("relative")).is_err());
     }
 }

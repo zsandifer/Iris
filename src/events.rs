@@ -17,6 +17,11 @@ pub enum Audience {
 }
 
 impl Audience {
+    #[cfg(test)]
+    pub fn includes(&self, user_id: &str) -> bool {
+        self.reaches(user_id, false)
+    }
+
     /// Whether a connection of this user (who may be the owner) gets it.
     pub fn reaches(&self, user_id: &str, is_owner: bool) -> bool {
         match self {

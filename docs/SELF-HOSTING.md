@@ -24,14 +24,16 @@ The CLI does all reasoning and tool use. Iris assembles the persona and
 context, picks a model, streams the reply to your devices, and keeps the app
 state (conversations, goals, feed, and so on) in SQLite.
 
-> Status: early. The backend and API are usable; the real phone app is being
-> designed separately. A bare test console is built in so you can try it.
+> Status: early. The phone app (an installable web app) is served at `/`;
+> shared chats with more than one person are a preview. A bare API test
+> console is also built in at `/console`.
 
 ## Contents
 
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
+- [Using Iris from your phone](#using-iris-from-your-phone)
 - [Configuration](#configuration)
 - [Engines and models](#engines-and-models)
 - [Engines from the app](#engines-from-the-app)
@@ -65,8 +67,10 @@ phone / browser ──HTTPS (Tailscale) or loopback──▶ iris serve (axum, S
   your data directory and are editable from the app. They are assembled into
   a system prompt for every turn and injected through each CLI's own
   mechanism (`--append-system-prompt-file` for Claude Code,
-  `developer_instructions` for Codex, `GEMINI_SYSTEM_MD` for Gemini CLI, an
-  `instructions` file for OpenCode), before your message.
+  `GEMINI_SYSTEM_MD` for Gemini CLI, an `instructions` file for OpenCode),
+  before your message. Codex only accepts developer instructions on its
+  command line, which other local users can read, so for Codex the prompt
+  is sent on stdin at the start of each new session instead.
 - **Sessions**: each conversation keeps a CLI session per harness and resumes
   it (`--resume`, `codex exec resume`, `-s`). If a conversation switches harness,
   Iris replays the messages that harness has not seen.
@@ -86,7 +90,7 @@ See [docs/API.md](API.md) for every route, event, and data type.
 ## Requirements
 
 - Linux (macOS should work but is untested)
-- Rust 1.85 or newer to build
+- Rust 1.88 or newer to build
 - Any one of these CLIs, or none yet (you can install them from the app):
   - Claude Code 2.1 or newer
   - Codex CLI 0.162 or newer
@@ -126,6 +130,34 @@ API test console is still available at `/console`.
 Edit the persona files in `~/.local/share/iris/persona/` (or through
 `GET/PUT /api/files/system/{name}`), especially `USER.md`.
 
+## Using Iris from your phone
+
+The phone app needs HTTPS: browsers only allow installing it, its offline
+support, and push notifications on a secure origin (`localhost` is the
+only exception). Iris itself serves plain HTTP on a private address, so put
+an HTTPS front on your private network. With [Tailscale](https://tailscale.com):
+
+1. In the Tailscale admin console, turn on MagicDNS and HTTPS certificates.
+2. Keep Iris on loopback (the default `bind = "127.0.0.1:7420"`) and let
+   Tailscale serve it to your tailnet only:
+
+   ```sh
+   tailscale serve --bg 7420
+   ```
+
+   This prints an address such as `https://<machine>.<tailnet>.ts.net/`
+   with a valid certificate, reachable only from your own devices.
+3. Set `public_url` in `config.toml` to that address so `iris pair` prints
+   it (it also serves as the contact push services require, unless you set
+   `[push] vapid_subject`), then restart Iris.
+4. On your phone (signed in to the same tailnet), open the address, enter
+   the pairing code, and add Iris to your home screen.
+
+Any other HTTPS reverse proxy on a private network works the same way.
+Binding Iris to a Tailscale IP directly gives you plain HTTP: chat works in
+the browser, but installing the app and notifications do not. Never expose
+Iris to the open internet.
+
 ## Configuration
 
 `iris init` writes a fully commented `config.toml` containing the defaults
@@ -133,8 +165,8 @@ Edit the persona files in `~/.local/share/iris/persona/` (or through
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `bind` | `127.0.0.1:7420` | Listen address. Use your Tailscale IP to reach it from your phone. |
-| `public_url` | `""` | URL printed by `iris pair` (e.g. your MagicDNS name). |
+| `bind` | `127.0.0.1:7420` | Listen address. Keep it on loopback behind an HTTPS front such as `tailscale serve` ([phone setup](#using-iris-from-your-phone)). |
+| `public_url` | `""` | HTTPS URL printed by `iris pair` (e.g. your `ts.net` name). |
 | `agent_name` | `Iris` | Default name; renaming in the app overrides it immediately. |
 | `max_concurrent_turns` | `2` | Cap on CLI subprocesses; extra turns queue. |
 | `turn_timeout_secs` | `600` | A turn running longer is killed with its process group. |
@@ -143,7 +175,7 @@ Edit the persona files in `~/.local/share/iris/persona/` (or through
 | `[router]` | | Shared-chat opt-in, rankings override, optional model classifier (below). |
 | `[engines]` | | Engines directory, privileged install helper, daily auto-update. |
 | `[heartbeat]`, `[feed]` | disabled | Scheduled jobs with active hours. |
-| `[push]` | enabled | Web Push (VAPID); set `vapid_subject` to a `mailto:` URL. |
+| `[push]` | enabled | Web Push (VAPID). Needs `vapid_subject` (a `mailto:` URL) unless `public_url` is `https:`. |
 
 Paths follow XDG: `$XDG_CONFIG_HOME/iris/config.toml` and
 `$XDG_DATA_HOME/iris/`. Override with `--config`, `--data-dir`, or
@@ -162,7 +194,8 @@ Data directory layout:
 ├── run/             # per-turn private files (prompt, MCP config)
 ├── engines/         # CLIs installed from the app (single-user mode)
 ├── vault.key        # 32-byte key for encrypted secrets, 0600
-└── vapid.json       # Web Push key pair, 0600
+├── vapid.json       # Web Push key pair, 0600
+└── serve.lock       # held by the running `iris serve`
 ```
 
 ## Engines and models
@@ -314,8 +347,10 @@ Both are off by default, respect active hours, and can be triggered manually
 
 ## Security model
 
-- Binds to loopback by default. To use it from your phone, bind to a private
-  interface such as your Tailscale IP. Do not expose it to the internet.
+- Binds to loopback by default. To use it from your phone, put a private
+  HTTPS front on it such as `tailscale serve`
+  ([phone setup](#using-iris-from-your-phone)). Do not expose it to the
+  internet.
 - Every route except the static console page, `/api/health`, and
   `/api/pair` requires a device token. Devices pair with a one-time code from
   `iris pair`; only SHA-256 hashes of codes and tokens are stored. Five bad
@@ -395,7 +430,19 @@ Contributor notes, architecture, and invariants are in
 ## Not done yet
 
 - **Voice replies**: `POST /api/voice/speak` is a placeholder (returns 501).
-- **Group chat UI**.
+- **Per-person memory**: people you add chat with Iris in their own chats
+  and in shared chats, but only the owner has long-term memory, persona
+  notes, and connectors.
+- **Full engine isolation in other people's chats**: there Iris switches
+  off what the engines have configured themselves: Claude Code's MCP
+  servers (including claude.ai connectors), CLAUDE.md files, and auto
+  memory; Codex's MCP servers, ChatGPT apps, plugins, and memories; Gemini
+  CLI's MCP servers and extensions; OpenCode's plugins and Claude Code
+  files. Codex always loads a global `AGENTS.md` (or `AGENTS.override.md`)
+  from its home folder and cannot be told not to, so while one exists Iris
+  does not use Codex for other people's chats. Gemini CLI's global
+  `GEMINI.md` context and MCP servers in OpenCode's own global config still
+  apply, so keep personal details out of those if you add people.
 - **Logins and cards inside cross-origin frames** (for example embedded
   payment widgets) cannot be filled; take over and type them yourself.
 - **Gemini CLI and OpenCode sign-in from the app**: both need one step on

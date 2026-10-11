@@ -224,7 +224,39 @@ CREATE INDEX feed_posts_liked ON feed_posts(user_id, liked);
 -- Goals the agent suggested and the user has not confirmed yet.
 ALTER TABLE goals ADD COLUMN suggested INTEGER NOT NULL DEFAULT 0;
 "#,
+    r#"
+-- Message timestamps are unique across conversations (they are the
+-- activity log's page cursor); this keeps finding the newest one cheap.
+CREATE INDEX messages_created ON messages(created_at);
+"#,
 ];
+
+/// Run `f` in a write transaction taken up front (`BEGIN IMMEDIATE`), so a
+/// read-then-insert cannot interleave with another connection (the server
+/// and `iris mcp` both write). Inside a caller's transaction, `f` just runs.
+pub fn write_tx<R>(
+    conn: &Connection,
+    f: impl FnOnce(&Connection) -> rusqlite::Result<R>,
+) -> rusqlite::Result<R> {
+    if !conn.is_autocommit() {
+        return f(conn);
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let out = f(&tx)?;
+    tx.commit()?;
+    Ok(out)
+}
+
+/// A creation time for a new row of `table`: now, or just after the newest
+/// existing row, so timestamps stay unique and usable as page cursors even
+/// within one millisecond. Call inside [`write_tx`].
+pub fn next_timestamp(conn: &Connection, table: &str) -> rusqlite::Result<i64> {
+    let last: Option<i64> =
+        conn.query_row(&format!("SELECT MAX(created_at) FROM {table}"), [], |r| {
+            r.get(0)
+        })?;
+    Ok(now_ms().max(last.map_or(0, |l| l + 1)))
+}
 
 #[derive(Clone)]
 pub struct Db {
@@ -295,8 +327,72 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
+        if i + 1 == UNIQUE_TIMESTAMPS_VERSION {
+            spread_message_timestamps(&tx)?;
+            spread_timestamps(&tx, "feed_posts")?;
+        }
         tx.pragma_update(None, "user_version", (i + 1) as i64)?;
         tx.commit()?;
+    }
+    Ok(())
+}
+
+/// Schema version from which message and feed timestamps are unique.
+const UNIQUE_TIMESTAMPS_VERSION: usize = 3;
+
+/// Spread message timestamps, moving each harness session's watermark with
+/// the newest message it had seen, so nothing it already has is replayed.
+fn spread_message_timestamps(conn: &Connection) -> rusqlite::Result<()> {
+    let sessions: Vec<(String, String, i64)> = conn
+        .prepare("SELECT conversation_id, harness, synced_at FROM harness_sessions")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut anchors = Vec::new();
+    for (conv, harness, synced) in sessions {
+        let anchor: Option<i64> = conn
+            .query_row(
+                "SELECT rowid FROM messages WHERE conversation_id = ?1 AND created_at <= ?2
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![conv, synced],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(rowid) = anchor {
+            anchors.push((conv, harness, rowid));
+        }
+    }
+    spread_timestamps(conn, "messages")?;
+    for (conv, harness, rowid) in anchors {
+        conn.execute(
+            "UPDATE harness_sessions SET synced_at = (SELECT created_at FROM messages WHERE rowid = ?3)
+             WHERE conversation_id = ?1 AND harness = ?2",
+            params![conv, harness, rowid],
+        )?;
+    }
+    Ok(())
+}
+
+/// Make `created_at` unique across `table`: rows written in the same
+/// millisecond before timestamps were allocated uniquely move forward a
+/// millisecond at a time, keeping their order, so timestamp page cursors
+/// are exact for old rows too.
+fn spread_timestamps(conn: &Connection, table: &str) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, i64)> = conn
+        .prepare(&format!(
+            "SELECT rowid, created_at FROM {table} ORDER BY created_at, rowid"
+        ))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut update = conn.prepare(&format!(
+        "UPDATE {table} SET created_at = ?2 WHERE rowid = ?1"
+    ))?;
+    let mut last = i64::MIN;
+    for (rowid, at) in rows {
+        let next = at.max(last.saturating_add(1));
+        if next != at {
+            update.execute(params![rowid, next])?;
+        }
+        last = next;
     }
     Ok(())
 }
@@ -737,15 +833,14 @@ pub struct NewMessage<'a> {
 }
 
 pub fn insert_message(conn: &Connection, m: &NewMessage) -> rusqlite::Result<Message> {
+    write_tx(conn, |conn| insert_message_locked(conn, m))
+}
+
+fn insert_message_locked(conn: &Connection, m: &NewMessage) -> rusqlite::Result<Message> {
     let id = new_id();
-    // Strictly increasing timestamps within a conversation keep ordering
-    // stable even when two rows land in the same millisecond.
-    let last: Option<i64> = conn.query_row(
-        "SELECT MAX(created_at) FROM messages WHERE conversation_id = ?1",
-        [m.conversation_id],
-        |r| r.get(0),
-    )?;
-    let now = now_ms().max(last.map_or(0, |l| l + 1));
+    // Strictly increasing, unique timestamps keep ordering stable and page
+    // cursors exact even when two rows land in the same millisecond.
+    let now = next_timestamp(conn, "messages")?;
     let kind = if m.kind.is_empty() { "text" } else { m.kind };
     let status = if m.status.is_empty() {
         "complete"
@@ -843,6 +938,7 @@ pub fn list_messages(
     let mut stmt = conn.prepare(
         "SELECT * FROM (
              SELECT * FROM messages WHERE conversation_id = ?1 AND created_at < ?2
+               AND status != 'pending'
              ORDER BY created_at DESC LIMIT ?3
          ) ORDER BY created_at",
     )?;
@@ -868,8 +964,61 @@ pub fn messages_between(
         .collect()
 }
 
+/// The newest `limit` finished, non-empty messages strictly between `after`
+/// and `before`, oldest first: the replay for a harness session. Limited in
+/// SQL so a long unsynced history is never loaded whole.
+pub fn replay_messages(
+    conn: &Connection,
+    conversation_id: &str,
+    after: i64,
+    before: i64,
+    limit: usize,
+) -> rusqlite::Result<Vec<Message>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM (
+             SELECT * FROM messages
+             WHERE conversation_id = ?1 AND created_at > ?2 AND created_at < ?3
+               AND status NOT IN ('streaming', 'pending') AND trim(content) != ''
+             ORDER BY created_at DESC LIMIT ?4
+         ) ORDER BY created_at",
+    )?;
+    stmt.query_map(
+        params![conversation_id, after, before, limit as i64],
+        message_from_row,
+    )?
+    .collect()
+}
+
+/// The newest message a harness session has seen once the turn whose reply
+/// placeholder was created at `placeholder` is done: the placeholder, plus
+/// the cards the agent created right after it, but never past the first
+/// message the session did not see (a queued user message, a heartbeat
+/// post), so that one is still replayed later.
+pub fn synced_watermark(
+    conn: &Connection,
+    conversation_id: &str,
+    placeholder: i64,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(created_at), ?2) FROM messages
+         WHERE conversation_id = ?1 AND kind = 'card' AND created_at > ?2
+           AND created_at < COALESCE(
+               (SELECT MIN(created_at) FROM messages
+                WHERE conversation_id = ?1 AND created_at > ?2 AND kind != 'card'),
+               9223372036854775807)",
+        params![conversation_id, placeholder],
+        |r| r.get(0),
+    )
+}
+
 /// Mark turns that were streaming when the daemon stopped.
+/// Cards still held back by a private turn that never finished are dropped
+/// (nothing decided whether they may be shown).
 pub fn mark_interrupted(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM messages WHERE kind = 'card' AND status = 'pending'",
+        [],
+    )?;
     conn.execute(
         "UPDATE messages SET status = 'interrupted', updated_at = ?1 WHERE status = 'streaming'",
         [now_ms()],
@@ -943,15 +1092,21 @@ pub struct SentPhoto {
     pub attachment: Attachment,
     pub conversation_id: String,
     pub message_id: String,
+    /// When it was last sent; with `id`, the page cursor.
+    pub used_at: i64,
 }
 
 /// Images the user attached to their own messages, newest first (each
-/// attachment once, at its latest use).
+/// attachment once, at its latest use). `before` is the last item of the
+/// previous page as `(used_at, id)`: one message can carry several photos
+/// with the same `used_at`, so the id breaks ties.
 pub fn sent_photos(
     conn: &Connection,
     user_id: &str,
+    before: Option<(i64, &str)>,
     limit: usize,
 ) -> rusqlite::Result<Vec<SentPhoto>> {
+    let (before_at, before_id) = before.unwrap_or((i64::MAX, ""));
     let mut stmt = conn.prepare(
         "SELECT a.id, a.user_id, a.mime, a.size, a.sha256, a.file_name, a.created_at,
                 m.conversation_id, m.id, MAX(m.created_at) AS used_at
@@ -961,10 +1116,11 @@ pub fn sent_photos(
          JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ?1
          WHERE m.author_user_id = ?1 AND m.attachments != '[]'
          GROUP BY a.id
-         ORDER BY used_at DESC
+         HAVING used_at < ?3 OR (used_at = ?3 AND (?4 = '' OR a.id < ?4))
+         ORDER BY used_at DESC, a.id DESC
          LIMIT ?2",
     )?;
-    stmt.query_map(params![user_id, limit as i64], |r| {
+    stmt.query_map(params![user_id, limit as i64, before_at, before_id], |r| {
         Ok(SentPhoto {
             attachment: Attachment {
                 id: r.get(0)?,
@@ -977,6 +1133,7 @@ pub fn sent_photos(
             },
             conversation_id: r.get(7)?,
             message_id: r.get(8)?,
+            used_at: r.get(9)?,
         })
     })?
     .collect()
@@ -1196,6 +1353,258 @@ mod tests {
             assert!(delete_conversation(c, &conv.id)?);
             assert!(list_messages(c, &conv.id, None, 10)?.is_empty());
             assert!(get_harness_session(c, &conv.id, "claude")?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn watermark_stops_at_the_first_unseen_message() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            let owner = owner_user_id(c)?.unwrap();
+            let conv = create_conversation(c, &owner, "side", "", None)?.id;
+            let card = |c: &Connection| {
+                crate::entities::insert_card(
+                    c,
+                    &conv,
+                    &serde_json::json!({"type": "info", "title": "x"}),
+                    "assistant",
+                )
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))
+            };
+            let placeholder = insert_message(c, &text(&conv, &owner, "reply"))?.created_at;
+            assert_eq!(synced_watermark(c, &conv, placeholder)?, placeholder);
+            let c1 = card(c)?.created_at;
+            assert_eq!(
+                synced_watermark(c, &conv, placeholder)?,
+                c1,
+                "the turn's card"
+            );
+            // A heartbeat post lands, then the turn creates another card.
+            let heartbeat = insert_message(c, &text(&conv, &owner, "heartbeat"))?.created_at;
+            card(c)?;
+            assert_eq!(synced_watermark(c, &conv, placeholder)?, c1);
+            assert!(c1 < heartbeat);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn replay_is_limited_in_sql() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            let owner = owner_user_id(c)?.unwrap();
+            let conv = create_conversation(c, &owner, "side", "", None)?.id;
+            for i in 0..100 {
+                insert_message(c, &text(&conv, &owner, &format!("m{i}")))?;
+            }
+            insert_message(c, &text(&conv, &owner, "   "))?;
+            let got = replay_messages(c, &conv, 0, i64::MAX, 40)?;
+            assert_eq!(got.len(), 40);
+            assert_eq!(got[0].content, "m60");
+            assert_eq!(got[39].content, "m99");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn timestamps_are_unique_across_connections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        let first = Db::open(&path).unwrap();
+        let (owner, convs) = first
+            .with(|c| {
+                let owner = owner_user_id(c)?.unwrap();
+                let a = create_conversation(c, &owner, "side", "", None)?.id;
+                let b = create_conversation(c, &owner, "side", "", None)?.id;
+                Ok((owner, [a, b]))
+            })
+            .unwrap();
+        let workers: Vec<_> = (0..4)
+            .map(|w| {
+                let (path, owner, conv) = (path.clone(), owner.clone(), convs[w % 2].clone());
+                std::thread::spawn(move || {
+                    let db = Db::open(&path).unwrap();
+                    for i in 0..50 {
+                        db.with(|c| {
+                            insert_message(c, &text(&conv, &owner, &format!("{w}-{i}")))?;
+                            crate::entities::create_feed_post(
+                                c,
+                                &owner,
+                                &crate::entities::NewFeedPost {
+                                    title: format!("{w}-{i}"),
+                                    body: "b".into(),
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        first
+            .with(|c| {
+                for table in ["messages", "feed_posts"] {
+                    let dupes: i64 = c.query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM (SELECT created_at FROM {table}
+                             GROUP BY created_at HAVING COUNT(*) > 1)"
+                        ),
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    assert_eq!(dupes, 0, "{table}");
+                }
+                // Paging by timestamp walks every post exactly once.
+                let mut before = None;
+                let mut seen = 0;
+                loop {
+                    let page = crate::entities::list_feed(c, &owner, before, 7)?;
+                    if page.is_empty() {
+                        break;
+                    }
+                    seen += page.len();
+                    before = page.last().map(|p| p.created_at);
+                }
+                assert_eq!(seen, 200);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn upgrading_spreads_existing_timestamp_ties() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        {
+            // A schema-2 database written before timestamps were unique.
+            let mut conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..2] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 2).unwrap();
+            let owner = ensure_owner(&conn).unwrap();
+            let main = ensure_main_conversation(&conn, &owner).unwrap();
+            let side = create_conversation(&conn, &owner, "side", "", None)
+                .unwrap()
+                .id;
+            let tx = conn.transaction().unwrap();
+            for (i, conv) in [&main, &side, &main, &side].iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO messages (id, conversation_id, role, kind, content, attachments,
+                         status, meta, created_at, updated_at)
+                     VALUES (?1, ?2, 'assistant', 'text', ?3, '[]', 'complete',
+                         '{\"activity\":[{\"id\":\"a\"}]}', 5000, 5000)",
+                    params![format!("m{i}"), conv, format!("reply {i}")],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO feed_posts (id, user_id, title, body, created_at, updated_at)
+                     VALUES (?1, ?2, 't', 'b', 7000, 7000)",
+                    params![format!("p{i}"), owner],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        // A session that had seen everything up to the ties.
+        {
+            let conn = Connection::open(&path).unwrap();
+            let main: String = conn
+                .query_row(
+                    "SELECT conversation_id FROM messages WHERE id = 'm0'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO harness_sessions (conversation_id, harness, session_id, synced_at, updated_at)
+                 VALUES (?1, 'codex', 's1', 5000, 0)",
+                params![main],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            let owner = owner_user_id(c)?.unwrap();
+            let main: String = c.query_row(
+                "SELECT conversation_id FROM messages WHERE id = 'm0'",
+                [],
+                |r| r.get(0),
+            )?;
+            let session = get_harness_session(c, &main, "codex")?.unwrap();
+            assert!(
+                replay_messages(c, &main, session.synced_at, i64::MAX, 40)?.is_empty(),
+                "nothing the session saw is replayed"
+            );
+            // Two per page: every tied row still shows up exactly once.
+            let (mut seen, mut before) = (Vec::new(), None);
+            loop {
+                let page = recent_activity(c, &owner, false, before, 2)?;
+                if page.is_empty() {
+                    break;
+                }
+                before = page.last().map(|e| e.created_at);
+                seen.extend(page.into_iter().map(|e| e.message_id));
+            }
+            seen.sort();
+            assert_eq!(seen, ["m0", "m1", "m2", "m3"]);
+            let (mut posts, mut before) = (0, None);
+            loop {
+                let page = crate::entities::list_feed(c, &owner, before, 2)?;
+                if page.is_empty() {
+                    break;
+                }
+                before = page.last().map(|p| p.created_at);
+                posts += page.len();
+            }
+            assert_eq!(posts, 4);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn sent_photos_page_through_photos_of_one_message() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            let owner = owner_user_id(c)?.unwrap();
+            let conv = ensure_main_conversation(c, &owner)?;
+            let ids: Vec<String> = (0..5).map(|_| new_id()).collect();
+            for id in &ids {
+                insert_attachment(c, id, &owner, "image/png", 1, "00", &format!("{id}.png"))?;
+            }
+            for chunk in [&ids[..3], &ids[3..]] {
+                insert_message(
+                    c,
+                    &NewMessage {
+                        attachments: chunk,
+                        ..text(&conv, &owner, "photos")
+                    },
+                )?;
+            }
+            let (mut seen, mut before) = (Vec::new(), None::<(i64, String)>);
+            loop {
+                let page =
+                    sent_photos(c, &owner, before.as_ref().map(|(a, i)| (*a, i.as_str())), 2)?;
+                if page.is_empty() {
+                    break;
+                }
+                let last = page.last().unwrap();
+                before = Some((last.used_at, last.attachment.id.clone()));
+                seen.extend(page.into_iter().map(|p| p.attachment.id));
+            }
+            let mut want = ids.clone();
+            want.sort();
+            seen.sort();
+            assert_eq!(seen, want);
             Ok(())
         })
         .unwrap();

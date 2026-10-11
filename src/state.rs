@@ -46,6 +46,13 @@ pub struct HarnessEntry {
     pub status: RwLock<HarnessStatus>,
     /// Models the CLI listed at the last probe (OpenCode).
     pub models: RwLock<Vec<DiscoveredModel>>,
+    /// Counts sign-in reports from turns and logins, so a probe that
+    /// started before one never overwrites it.
+    auth_reports: AtomicU64,
+    /// Orders concurrent probes: only a probe newer than the last applied
+    /// one may set the sign-in state.
+    probe_seq: AtomicU64,
+    last_probe_applied: AtomicU64,
 }
 
 impl HarnessEntry {
@@ -65,6 +72,9 @@ impl HarnessEntry {
             cfg,
             status: RwLock::new(status),
             models: RwLock::default(),
+            auth_reports: AtomicU64::new(0),
+            probe_seq: AtomicU64::new(0),
+            last_probe_applied: AtomicU64::new(0),
         }
     }
 
@@ -87,6 +97,7 @@ impl HarnessEntry {
 
     pub fn set_auth(&self, auth: AuthState, message: Option<String>) -> bool {
         let mut s = self.status.write().unwrap_or_else(|p| p.into_inner());
+        self.auth_reports.fetch_add(1, Ordering::SeqCst);
         let changed = s.auth != auth;
         s.auth = auth;
         s.auth_message = message;
@@ -106,8 +117,14 @@ pub struct Inner {
     pub pair_limiter: PairLimiter,
     /// Cancel handles of running turns, by conversation id.
     pub running: Mutex<HashMap<String, watch::Sender<bool>>>,
+    /// Set once shutdown begins: turns that start afterwards (queued behind
+    /// another in the same chat) are cancelled before running a CLI.
+    pub stopping: std::sync::atomic::AtomicBool,
     /// Serializes turns within one conversation.
     pub conv_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Bumped after anyone joins or leaves a conversation (or it is
+    /// deleted), so running turns re-check who may see them.
+    pub membership_generation: AtomicU64,
     catalog: Mutex<(Option<CatalogKey>, Arc<Catalog>)>,
     /// Bumped whenever a CLI reports a different model list.
     models_generation: AtomicU64,
@@ -195,6 +212,8 @@ impl AppState {
             pair_limiter: PairLimiter::default(),
             running: Mutex::default(),
             conv_locks: Mutex::default(),
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            membership_generation: AtomicU64::new(0),
             catalog: Mutex::new((None, Arc::new(Catalog::default()))),
             models_generation: AtomicU64::new(0),
             exe,
@@ -266,58 +285,87 @@ impl AppState {
         }
     }
 
-    async fn refresh_one(&self, entry: &HarnessEntry) {
+    /// The owner asked to check again (Reconnect, or after an install). A
+    /// CLI without a sign-in status command (Gemini) cannot be probed, so
+    /// its last turn's sign-in failure is forgotten and the next turn tells.
+    pub async fn recheck_auth(&self, name: &str) -> AuthState {
+        if let Some(e) = self.harness(name)
+            && e.harness.auth_probe_args().is_none()
         {
-            let before = entry.status();
-            let mut next = before.clone();
-            next.checked_at = Some(now_ms());
-            match (entry.cfg.enabled, entry.program()) {
-                (false, _) => {
-                    next.installed = entry.program().is_some();
-                }
-                (true, None) => {
-                    next.installed = false;
-                    next.path = None;
-                    next.version = None;
-                    next.auth = AuthState::Unknown;
-                }
-                (true, Some(program)) => {
-                    next.installed = true;
-                    next.path = Some(program.to_string_lossy().into_owned());
-                    let cwd = self.paths.workspace_dir();
-                    let strip = self.strip_env(entry);
-                    if let Ok((_, out, _)) =
-                        runner::probe(&program, &["--version".into()], &cwd, &strip).await
-                    {
-                        let v = out.lines().next().unwrap_or("").trim();
-                        next.version = (!v.is_empty()).then(|| v.chars().take(80).collect());
+            e.set_auth(AuthState::Unknown, None);
+        }
+        self.probe_auth(name).await
+    }
+
+    async fn refresh_one(&self, entry: &HarnessEntry) {
+        // Probe first, then apply only what the probes found onto the
+        // status as it is by then: a turn may report a sign-in change (the
+        // only source for Gemini) while a probe runs.
+        let program = entry.program();
+        let reports = entry.auth_reports.load(Ordering::SeqCst);
+        let seq = entry.probe_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut version: Option<Option<String>> = None;
+        let mut auth: Option<(AuthState, Option<String>)> = None;
+        if let (true, Some(program)) = (entry.cfg.enabled, &program) {
+            let cwd = self.paths.workspace_dir();
+            let strip = self.strip_env(entry);
+            if let Ok((_, out, _)) =
+                runner::probe(program, &["--version".into()], &cwd, &strip).await
+            {
+                let v = out.lines().next().unwrap_or("").trim();
+                version = Some((!v.is_empty()).then(|| v.chars().take(80).collect()));
+            }
+            if let Some(args) = entry.harness.auth_probe_args() {
+                auth = Some(match runner::probe(program, &args, &cwd, &strip).await {
+                    Ok((ok, out, err)) => {
+                        let state = entry.harness.parse_auth_probe(ok, &out, &err);
+                        let message = (state == AuthState::AuthRequired)
+                            .then(|| "The CLI reports it is not signed in".to_string());
+                        (state, message)
                     }
-                    if let Some(args) = entry.harness.auth_probe_args() {
-                        match runner::probe(&program, &args, &cwd, &strip).await {
-                            Ok((ok, out, err)) => {
-                                next.auth = entry.harness.parse_auth_probe(ok, &out, &err);
-                                next.auth_message = (next.auth == AuthState::AuthRequired)
-                                    .then(|| "The CLI reports it is not signed in".to_string());
-                            }
-                            Err(_) => next.auth = AuthState::Unknown,
-                        }
-                    }
-                    // Without a status command the state comes from turns
-                    // and is kept (see `recheck_harnesses`).
-                    self.probe_models(entry, &program).await;
+                    Err(_) => (AuthState::Unknown, None),
+                });
+            }
+            // Without a status command the state comes from turns and is
+            // kept (see `recheck_auth`).
+            self.probe_models(entry, program).await;
+        }
+        let (before, next) = {
+            let mut status = entry.status.write().unwrap_or_else(|p| p.into_inner());
+            let before = status.clone();
+            status.checked_at = Some(now_ms());
+            status.installed = program.is_some();
+            if entry.cfg.enabled {
+                status.path = program.as_ref().map(|p| p.to_string_lossy().into_owned());
+                if program.is_none() {
+                    status.version = None;
+                    status.auth = AuthState::Unknown;
                 }
             }
-            let changed = before.installed != next.installed
-                || before.auth != next.auth
-                || before.version != next.version;
-            *entry.status.write().unwrap_or_else(|p| p.into_inner()) = next.clone();
-            if changed {
-                self.broadcast_harness(&next);
+            if let Some(v) = version {
+                status.version = v;
             }
-            if before.auth != next.auth {
-                self.auth_transition(entry.harness.name(), before.auth, next.auth)
-                    .await;
+            // Only if nothing newer arrived while probing: a turn or login
+            // report, or a later probe that already finished.
+            if let Some((state, message)) = auth
+                && entry.auth_reports.load(Ordering::SeqCst) == reports
+                && entry.last_probe_applied.load(Ordering::SeqCst) < seq
+            {
+                status.auth = state;
+                status.auth_message = message;
+                entry.last_probe_applied.store(seq, Ordering::SeqCst);
             }
+            (before, status.clone())
+        };
+        let changed = before.installed != next.installed
+            || before.auth != next.auth
+            || before.version != next.version;
+        if changed {
+            self.broadcast_harness(&next);
+        }
+        if before.auth != next.auth {
+            self.auth_transition(entry.harness.name(), before.auth, next.auth)
+                .await;
         }
     }
 
@@ -457,12 +505,7 @@ impl AppState {
     }
 
     pub async fn slot_pins(&self) -> BTreeMap<Slot, Pin> {
-        match self.setting("slots").await {
-            Some(raw) => parse_slot_pins(&raw),
-            // Earlier versions stored one pinned engine; it becomes the
-            // chat slot's pin.
-            None => legacy_engine_pin(&self.setting("engine").await.unwrap_or_default()),
-        }
+        self.db.call(stored_slot_pins).await.unwrap_or_default()
     }
 
     /// Owner opt-in (config or app setting) to use Claude in conversations
@@ -567,7 +610,9 @@ impl AppState {
     }
 
     /// Settings as exposed to clients.
-    pub async fn settings_json(&self) -> Value {
+    /// App settings as the API shows them. The feed instructions describe
+    /// the owner's interests, so only the owner sees them.
+    pub async fn settings_json(&self, owner: bool) -> Value {
         let avatar = self.setting("agent_avatar").await;
         let updated = self
             .setting("agent_avatar_updated")
@@ -578,10 +623,28 @@ impl AppState {
             "avatar_url": format!("/api/avatar?v={}", if avatar.is_some() { updated } else { "default".into() }),
             "avatar_custom": avatar.is_some(),
             "allow_claude_for_shared": self.allow_claude_for_shared().await,
-            "feed_prompt": self.feed_prompt().await,
+            "feed_prompt": if owner { Some(self.feed_prompt().await) } else { None },
             "paused": self.browser.is_paused(),
             "voice": {"enabled": false, "status": "not_implemented"},
         })
+    }
+
+    /// Tell every app about changed settings (the owner's with the private
+    /// parts) and return the owner's view.
+    pub async fn broadcast_settings(&self) -> Value {
+        let public = self.settings_json(false).await;
+        self.hub.send(
+            crate::events::Audience::All,
+            json!({"type": "settings.changed", "settings": public}),
+        );
+        let full = self.settings_json(true).await;
+        if let Ok(Some(owner)) = self.db.call(db::owner_user_id).await {
+            self.hub.to_users(
+                &[owner],
+                json!({"type": "settings.changed", "settings": full}),
+            );
+        }
+        full
     }
 
     /// Per-conversation turn lock.
@@ -604,6 +667,15 @@ pub fn parse_slot_pins(raw: &str) -> BTreeMap<Slot, Pin> {
 pub fn slot_pins_json(pins: &BTreeMap<Slot, Pin>) -> String {
     let m: BTreeMap<&str, &Pin> = pins.iter().map(|(s, p)| (s.name(), p)).collect();
     serde_json::to_string(&m).unwrap_or_else(|_| "{}".into())
+}
+
+/// The slot pins as stored. Earlier versions stored one pinned engine; it
+/// becomes the chat slot's pin.
+pub fn stored_slot_pins(c: &rusqlite::Connection) -> rusqlite::Result<BTreeMap<Slot, Pin>> {
+    Ok(match crate::db::get_setting(c, "slots")? {
+        Some(raw) => parse_slot_pins(&raw),
+        None => legacy_engine_pin(&crate::db::get_setting(c, "engine")?.unwrap_or_default()),
+    })
 }
 
 fn legacy_engine_pin(raw: &str) -> BTreeMap<Slot, Pin> {

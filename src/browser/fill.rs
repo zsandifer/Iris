@@ -647,10 +647,10 @@ async fn fill_card_fields(
         return Ok(None);
     }
     let mut missing = Vec::new();
-    if let Some(r) = fields["cvc"].as_str() {
-        if cvc.is_empty() || !type_into(state, ctx, run, pin, r, cvc, true).await? {
-            missing.push("security code");
-        }
+    if let Some(r) = fields["cvc"].as_str()
+        && (cvc.is_empty() || !type_into(state, ctx, run, pin, r, cvc, true).await?)
+    {
+        missing.push("security code");
     }
     let month = m["exp_month"].as_u64().map(|v| format!("{v:02}"));
     let year = m["exp_year"].as_u64().map(|v| v.to_string());

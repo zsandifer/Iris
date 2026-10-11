@@ -2,7 +2,7 @@
 // computer screen, full-screen Watch), Take over / Hand back with taps,
 // scrolling and typing forwarded to the page, browser setup, and Pause.
 import { html, useEffect, useRef, useState } from './h.js';
-import { get, post, put, wsSend } from './api.js';
+import { get, post, put, wsSend, seg } from './api.js';
 import { S, set, useStore, go, toast, frames, loadBrowser } from './store.js';
 import { Icon, Row, Group, Page, Spinner, Toggle, agentName, confirmSheet, stamp, hostOf } from './ui.js';
 import { activityTitle, placeLabel } from './hub.js';
@@ -306,7 +306,7 @@ export function Computer() {
     if (!(await confirmSheet({ title: 'Disconnect everything?', body: `${agentName()} will stop using every connected service until you turn them back on in Connections.`, yes: 'Disconnect', danger: true }))) return;
     try {
       const { connectors } = await get('/connectors');
-      await Promise.all(connectors.filter((c) => c.enabled).map((c) => post(`/connectors/${c.id}/disconnect`)));
+      await Promise.all(connectors.filter((c) => c.enabled).map((c) => post(`/connectors/${seg(c.id)}/disconnect`)));
       toast('All connections are off');
     } catch (e) { toast(e.message); }
   };

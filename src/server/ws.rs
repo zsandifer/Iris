@@ -60,11 +60,29 @@ pub async fn handler(
         .on_upgrade(move |socket| run(state, socket, pre))
 }
 
+/// How often the server pings, and how long a client may stay silent
+/// (no pong or other frame) before its socket is dropped. A phone that
+/// vanished without closing must not keep counting as online, since that
+/// suppresses reply notifications.
+const PING_EVERY: Duration = Duration::from_secs(30);
+const SILENCE_LIMIT: Duration = Duration::from_secs(75);
+/// A send that cannot complete (the peer stopped reading) ends the socket.
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn send(socket: &mut WebSocket, msg: Message) -> bool {
+    matches!(
+        tokio::time::timeout(SEND_TIMEOUT, socket.send(msg)).await,
+        Ok(Ok(()))
+    )
+}
+
 async fn send_json(socket: &mut WebSocket, v: &Value) -> bool {
-    socket
-        .send(Message::Text(v.to_string().into()))
-        .await
-        .is_ok()
+    send(socket, Message::Text(v.to_string().into())).await
+}
+
+/// The client has been silent too long (it answers pings automatically).
+fn gone_quiet(last_heard: tokio::time::Instant, now: tokio::time::Instant) -> bool {
+    now.duration_since(last_heard) > SILENCE_LIMIT
 }
 
 async fn first_frame_auth(state: &AppState, socket: &mut WebSocket) -> Option<AuthUser> {
@@ -108,7 +126,7 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
             &json!({"type": "error", "code": "unauthorized", "message": "authenticate first"}),
         )
         .await;
-        let _ = socket.send(Message::Close(None)).await;
+        let _ = send(&mut socket, Message::Close(None)).await;
         return;
     };
     let uid = user.id().to_string();
@@ -119,13 +137,13 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
         "type": "ready",
         "user_id": uid,
         "device_id": user.device.id,
-        "settings": state.settings_json().await,
+        "settings": state.settings_json(user.user.is_owner).await,
         "harnesses": super::admin::harnesses_for(&state, &user),
     });
     if !send_json(&mut socket, &ready).await {
         return;
     }
-    let mut ping = tokio::time::interval(Duration::from_secs(30));
+    let mut ping = tokio::time::interval(PING_EVERY);
     ping.tick().await;
     let mut ticks: u32 = 0;
     let is_owner = user.user.is_owner;
@@ -137,10 +155,12 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
     // Aborted with the socket: queued input never outlives it.
     let mut input_worker: Option<tokio::task::JoinHandle<()>> = None;
     let mut revoked = false;
+    let mut last_heard = tokio::time::Instant::now();
     loop {
         let due = watching.as_ref().filter(|w| w.pending).map(Watching::due);
         tokio::select! {
             incoming = socket.recv() => {
+                last_heard = tokio::time::Instant::now();
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
@@ -218,7 +238,7 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
                 w.last_sent = Some(Instant::now());
                 let frame = w.rx.borrow_and_update().clone();
                 if let Some(frame) = frame
-                    && socket.send(Message::Text(frame.json.clone().into())).await.is_err()
+                    && !send(&mut socket, Message::Text(frame.json.clone().into())).await
                 {
                     break;
                 }
@@ -227,7 +247,7 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
                 match ev {
                     Ok(env) => {
                         if env.audience.reaches(&uid, is_owner)
-                            && socket.send(Message::Text(env.json.clone().into())).await.is_err()
+                            && !send(&mut socket, Message::Text(env.json.clone().into())).await
                         {
                             break;
                         }
@@ -243,11 +263,13 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
             }
             _ = ping.tick() => {
                 ticks += 1;
-                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                if gone_quiet(last_heard, tokio::time::Instant::now())
+                    || !send(&mut socket, Message::Ping(Vec::new().into())).await
+                {
                     break;
                 }
                 // Drop sockets of revoked devices within about a minute.
-                if ticks % 2 == 0 && !device_active(&state, &user.device.id).await {
+                if ticks.is_multiple_of(2) && !device_active(&state, &user.device.id).await {
                     let _ = send_json(&mut socket, &json!({"type": "error", "code": "unauthorized", "message": "device revoked"})).await;
                     revoked = true;
                     break;
@@ -264,5 +286,20 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
     {
         state.browser.hand_back();
     }
-    let _ = socket.send(Message::Close(None)).await;
+    let _ = send(&mut socket, Message::Close(None)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn silent_clients_are_dropped_after_missed_pings() {
+        let start = tokio::time::Instant::now();
+        assert!(!gone_quiet(start, start + PING_EVERY * 2));
+        assert!(gone_quiet(start, start + PING_EVERY * 3));
+        // Pings go out more often than the limit, so a live client (whose
+        // browser answers every ping) is never dropped.
+        assert!(PING_EVERY * 2 < SILENCE_LIMIT);
+    }
 }

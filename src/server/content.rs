@@ -212,7 +212,8 @@ async fn refresh_feed(State(state): State<AppState>, user: AuthUser) -> Result<R
         .into_response())
 }
 
-async fn get_feed_prompt(State(state): State<AppState>, _user: AuthUser) -> ApiResult {
+async fn get_feed_prompt(State(state): State<AppState>, user: AuthUser) -> ApiResult {
+    user.require_owner()?;
     ok(json!({"feed_prompt": state.feed_prompt().await}))
 }
 
@@ -239,11 +240,7 @@ async fn put_feed_prompt(
             }
         })
         .await?;
-    let settings = state.settings_json().await;
-    state.hub.send(
-        crate::events::Audience::All,
-        json!({"type": "settings.changed", "settings": settings}),
-    );
+    state.broadcast_settings().await;
     ok(json!({"feed_prompt": state.feed_prompt().await}))
 }
 
@@ -262,9 +259,11 @@ async fn list_ideas(
     let uid = user.id().to_string();
     let ideas = state
         .db
-        .call(move |c| entities::list_ideas(c, &uid, q.status.as_deref()))
+        .call(move |c| entities::list_ideas_limited(c, &uid, q.status.as_deref(), 201))
         .await?;
-    ok(json!({"ideas": ideas}))
+    let has_more = ideas.len() > 200;
+    let ideas = &ideas[..ideas.len().min(200)];
+    ok(json!({"ideas": ideas, "has_more": has_more}))
 }
 
 #[derive(Deserialize)]
@@ -473,6 +472,9 @@ async fn delete_goal(
 #[derive(Deserialize)]
 struct LibraryQuery {
     kind: Option<String>,
+    limit: Option<usize>,
+    before: Option<i64>,
+    before_id: Option<String>,
 }
 
 async fn list_library(
@@ -483,9 +485,19 @@ async fn list_library(
     let uid = user.id().to_string();
     let items = state
         .db
-        .call(move |c| entities::list_library(c, &uid, q.kind.as_deref()))
+        .call(move |c| {
+            let limit = q.limit.unwrap_or(100).clamp(1, 500);
+            let before = q
+                .before
+                .map(|at| (at, q.before_id.as_deref().unwrap_or("")));
+            entities::list_library_page(c, &uid, q.kind.as_deref(), before, limit + 1)
+                .map(|items| (items, limit))
+        })
         .await?;
-    ok(json!({"items": items}))
+    let (mut items, limit) = items;
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    ok(json!({"items": items, "has_more": has_more}))
 }
 
 async fn get_library_item(

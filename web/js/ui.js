@@ -1,6 +1,6 @@
 // Shared UI pieces: icons, avatar, images, rows, toggles, sheets, time.
 import { html, useEffect, useState, useRef } from './h.js';
-import { blobUrl } from './api.js';
+import { holdBlob } from './api.js';
 import { S, set, back } from './store.js';
 
 // Line icons (24px grid, drawn for Iris).
@@ -50,6 +50,7 @@ const P = {
   stop: 'M8 7h8a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1z',
   download: 'M12 4v11M7 10.5l5 5 5-5M5 20h14',
   keyboard: 'M4 6h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1zM7 10h.01M11 10h.01M15 10h.01M18 10h.01M8 14h8',
+  archive: 'M4 5h16v4H4zM5.5 9v10h13V9M10 13h4',
 };
 
 export function Icon({ name, size = 22, fill = false, cls = '' }) {
@@ -58,20 +59,57 @@ export function Icon({ name, size = 22, fill = false, cls = '' }) {
     stroke-linecap="round" stroke-linejoin="round"><path d=${P[name] || P.more} /></svg>`;
 }
 
-/** Image from a URL; `/api/...` paths are fetched with the device token. */
-export function Img({ src, alt = '', cls = '', onLoad, onError, ...rest }) {
-  const [url, setUrl] = useState(src && !src.startsWith('/api/') ? src : null);
+/**
+ * Object URL for an authenticated `/api/...` path, held while the caller is
+ * mounted (and `enabled`). Returns [url, failed].
+ */
+export function useBlob(src, enabled = true) {
+  const [url, setUrl] = useState(null);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
-    let live = true;
+    setUrl(null);
     setFailed(false);
-    if (!src) setUrl(null);
-    else if (src.startsWith('/api/')) blobUrl(src).then((u) => live && setUrl(u)).catch(() => live && setFailed(true));
-    else setUrl(src);
-    return () => { live = false; };
-  }, [src]);
-  if (!url || failed) return html`<div class=${'img-ph ' + cls} />`;
-  return html`<img class=${cls} src=${url} alt=${alt} loading="lazy" decoding="async"
+    if (!src || !enabled) return undefined;
+    let live = true;
+    const h = holdBlob(src);
+    h.url.then((u) => live && setUrl(u)).catch(() => live && setFailed(true));
+    return () => { live = false; h.release(); };
+  }, [src, enabled]);
+  return [url, failed];
+}
+
+const canObserve = typeof IntersectionObserver === 'function';
+// Fetch when within NEAR of the viewport; let go of the image (so the
+// cache may evict it) once it is more than FAR away. The gap keeps images
+// near the edge from flickering.
+const NEAR = '400px';
+const FAR = '1600px';
+
+/**
+ * Image from a URL. `/api/...` paths are fetched with the device token while
+ * the image is near the viewport, and released when it scrolls far away.
+ */
+export function Img({ src, alt = '', cls = '', onLoad, onError, ...rest }) {
+  const authed = !!src && src.startsWith('/api/');
+  const [el, setEl] = useState(null);
+  const [near, setNear] = useState(!canObserve);
+  const [blob, blobFailed] = useBlob(authed ? src : null, near);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => { setFailed(false); }, [src]);
+  useEffect(() => {
+    if (!canObserve || !authed || !el) return undefined;
+    const watch = (margin, fn) => {
+      const io = new IntersectionObserver((es) => fn(es.at(-1).isIntersecting), { rootMargin: margin, scrollMargin: margin });
+      io.observe(el);
+      return io;
+    };
+    const near = watch(NEAR, (yes) => yes && setNear(true));
+    const far = watch(FAR, (yes) => !yes && setNear(false));
+    return () => { near.disconnect(); far.disconnect(); };
+  }, [el, authed]);
+  const url = authed ? blob : src;
+  if (!url || failed || blobFailed) return html`<div ref=${setEl} class=${'img-ph ' + cls} />`;
+  return html`<img ref=${setEl} class=${cls} src=${url} alt=${alt} loading="lazy" decoding="async"
     referrerpolicy="no-referrer" onLoad=${onLoad}
     onError=${() => { setFailed(true); onError?.(); }} ...${rest} />`;
 }
@@ -98,8 +136,15 @@ export function Toggle({ on, onChange, disabled = false, label }) {
 /** A settings-style row. */
 export function Row({ icon, iconBg, title, sub, value, onClick, right, danger = false, accent = false, chevron }) {
   const showChev = chevron ?? !!onClick;
+  // A button or link inside the row (e.g. in `right`) does its own thing;
+  // the click must not also run the row's action.
+  const tap = onClick && ((e) => {
+    const inner = e.target.closest?.('button, a, input, select, textarea, label');
+    if (inner && inner !== e.currentTarget && e.currentTarget.contains(inner)) return;
+    onClick(e);
+  });
   return html`<div class=${'r' + (onClick ? ' tap' : '') + (danger ? ' danger' : '') + (accent ? ' accent' : '')}
-    onClick=${onClick} role=${onClick ? 'button' : undefined} tabindex=${onClick ? 0 : undefined}>
+    onClick=${tap} role=${onClick ? 'button' : undefined} tabindex=${onClick ? 0 : undefined}>
     ${icon && html`<div class="ri" style=${iconBg ? `background:${iconBg}` : ''}>${typeof icon === 'string' ? html`<${Icon} name=${icon} size=${17} />` : icon}</div>`}
     <div class="rt">${title}${sub && html`<small>${sub}</small>`}</div>
     ${value != null && html`<span class="rv">${value}</span>`}

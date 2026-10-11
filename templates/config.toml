@@ -147,8 +147,9 @@ active_end = "22:00"
 # Web Push notifications (VAPID). Keys are generated on first run.
 [push]
 enabled = true
-# Contact URL for push services, e.g. "mailto:you@example.com". Some push
-# services reject subscriptions without one.
+# Contact URL for push services, e.g. "mailto:you@example.com". Required
+# (Apple rejects pushes without one) unless public_url is an https URL,
+# which is then used. Without either, notifications are unavailable.
 vapid_subject = ""
 # Also push assistant replies when no app window is connected.
 notify_replies_when_offline = true

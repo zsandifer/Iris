@@ -3,7 +3,8 @@
 //! The prompt is rebuilt for every turn from `persona/*.md`, `memory/MEMORY.md`
 //! and an index of `memory/`, so edits and agent renames apply immediately.
 //! It is injected through the harness's own system-prompt mechanism
-//! (`--append-system-prompt-file` / `developer_instructions`), before the
+//! (`--append-system-prompt-file`, `GEMINI_SYSTEM_MD`, ...; for Codex, on
+//! stdin at the start of a session), before the
 //! user's message.
 
 use crate::config::{Paths, ensure_private_dir, write_private_file};
@@ -95,9 +96,31 @@ const MAX_PERSONA_FILE_CHARS: usize = 24_000;
 const MAX_MEMORY_INLINE_CHARS: usize = 12_000;
 const MAX_MEMORY_INDEX_ENTRIES: usize = 200;
 const MAX_MEMORY_DEPTH: usize = 4;
-/// Keeps the prompt under Linux's 128 KiB per-argument limit, which matters
-/// for codex where it travels as a `-c developer_instructions=...` value.
-pub const MAX_PROMPT_CHARS: usize = 100_000;
+/// Bounds the prompt (counted in UTF-8 bytes) so it stays a modest share
+/// of every engine's context.
+pub const MAX_PROMPT_BYTES: usize = 100_000;
+
+/// Whose private context a conversation may see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Only the owner: their USER.md, memory, and connectors are available.
+    Private,
+    /// One person who is not the owner: none of the owner's private files.
+    Personal,
+    /// More than one person: none of the owner's private files, and the
+    /// app bridge only offers cards.
+    Shared,
+}
+
+impl Scope {
+    pub fn name(self) -> &'static str {
+        match self {
+            Scope::Private => "private",
+            Scope::Personal => "personal",
+            Scope::Shared => "shared",
+        }
+    }
+}
 
 /// Create the data directory layout and seed missing persona files.
 /// Returns the files that were created.
@@ -137,9 +160,9 @@ pub struct PromptContext<'a> {
     pub app_tools: bool,
     /// Name of Iris's browser MCP server when it is attached.
     pub browser: Option<&'a str>,
-    /// More than one person in the conversation: the owner's private
-    /// persona (USER.md) and memory are left out of the prompt.
-    pub shared: bool,
+    /// Who is in the conversation. The owner's private persona (USER.md)
+    /// and memory are only included when it is `Private`.
+    pub scope: Scope,
     /// Short notes such as "the Claude engine needs the owner to sign in".
     pub notices: &'a [String],
 }
@@ -147,6 +170,7 @@ pub struct PromptContext<'a> {
 /// Assemble the system prompt appended to the harness's own system prompt.
 pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
     let name = ctx.agent_name;
+    let private = ctx.scope == Scope::Private;
     let mut out = String::new();
     out.push_str(&format!(
         "# You are {name}\n\n\
@@ -180,7 +204,7 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
 
     for f in SYSTEM_FILES
         .iter()
-        .filter(|f| f.in_prompt && !(ctx.shared && f.name == "USER.md"))
+        .filter(|f| f.in_prompt && (private || shared_with_others(f.name)))
     {
         let Ok(body) = std::fs::read_to_string(system_file_path(paths, f)) else {
             continue;
@@ -197,20 +221,26 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
         ));
     }
 
-    if ctx.app_tools && ctx.shared {
+    if ctx.app_tools && ctx.scope == Scope::Shared {
         out.push_str(SHARED_TOOLS_GUIDE);
     } else if ctx.app_tools {
         out.push_str(APP_TOOLS_GUIDE);
     }
-    if let Some(server) = ctx.browser.filter(|_| !ctx.shared) {
+    if let Some(server) = ctx.browser.filter(|_| ctx.scope == Scope::Private) {
         out.push_str(&crate::browser::tools::guide(server));
     }
 
-    if ctx.shared {
+    if ctx.scope == Scope::Shared {
         out.push_str(
             "\n## Memory\n\nThe owner's personal memory is not available in shared \
              conversations. Do not look for it or reveal personal details about anyone \
              that were not shared in this conversation.\n",
+        );
+    } else if !private {
+        out.push_str(
+            "\n## Memory\n\nLong-term memory is not available in this conversation. Do \
+             not look for memory or personal files on the server, and do not reveal \
+             details about other people who use this server.\n",
         );
     } else {
         let memory_dir = paths.memory_dir();
@@ -263,7 +293,19 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
              with them.\n",
         );
     }
-    truncate_chars(&out, MAX_PROMPT_CHARS)
+    truncate_bytes(&out, MAX_PROMPT_BYTES)
+}
+
+/// Truncate to at most `max` UTF-8 bytes, on a character boundary.
+pub fn truncate_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 const SHARED_TOOLS_GUIDE: &str = "
@@ -301,22 +343,46 @@ when it genuinely helps, and never mention tool names to the user.
 ";
 
 /// Hash of the inputs that define who the agent is (name, conversation
-/// kind, persona files, MEMORY.md). The memory index and notices are left
+/// kind, privacy scope, persona files, MEMORY.md), prefixed with the scope
+/// name (`private-1a2b...`) so a scope change can be told apart from a
+/// persona edit (see [`hash_scope`]). The memory index and notices are left
 /// out so routine memory writes do not invalidate sessions.
-pub fn persona_hash(paths: &Paths, agent_name: &str, conversation_kind: &str) -> String {
+pub fn persona_hash(
+    paths: &Paths,
+    agent_name: &str,
+    conversation_kind: &str,
+    scope: Scope,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(agent_name.as_bytes());
     h.update([0]);
     h.update(conversation_kind.as_bytes());
+    h.update([0]);
+    h.update(scope.name().as_bytes());
+    let private = scope == Scope::Private;
     for f in SYSTEM_FILES
         .iter()
         .filter(|f| f.in_prompt || f.name == "MEMORY.md")
+        .filter(|f| private || shared_with_others(f.name))
     {
         h.update([0]);
         h.update(std::fs::read(system_file_path(paths, f)).unwrap_or_default());
     }
-    crate::util::hex(&h.finalize()[..12])
+    format!("{}-{}", scope.name(), crate::util::hex(&h.finalize()[..12]))
+}
+
+/// Persona files other people's chats also get: only the agent's own
+/// character. USER.md, TOOLS.md (accounts, devices), PROACTIVE_PREFERENCES.md
+/// (the owner's interests), and memory stay in the owner's chats.
+fn shared_with_others(name: &str) -> bool {
+    matches!(name, "IDENTITY.md" | "SOUL.md")
+}
+
+/// The scope a stored persona hash was made for (None for hashes stored
+/// before scopes existed).
+pub fn hash_scope(hash: &str) -> Option<&str> {
+    hash.split_once('-').map(|(scope, _)| scope)
 }
 
 fn collect_memory(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, String, u64)>) {
@@ -398,7 +464,7 @@ mod tests {
             participants: &[],
             app_tools: true,
             browser: None,
-            shared: false,
+            scope: Scope::Private,
             notices: &[],
         }
     }
@@ -459,7 +525,7 @@ mod tests {
         let mut b = ctx("Nova");
         b.browser = Some("browser");
         assert!(assemble(&p, &b).contains("fill_login"));
-        b.shared = true;
+        b.scope = Scope::Shared;
         assert!(!assemble(&p, &b).contains("## Your browser"));
     }
 
@@ -478,12 +544,40 @@ mod tests {
         let prompt = assemble(&p, &c);
         assert!(prompt.contains("group conversation with: Sam, Riley"));
         let mut g = ctx("Iris");
-        g.shared = true;
+        g.scope = Scope::Shared;
         std::fs::write(p.persona_dir().join("USER.md"), "secret-user-fact").unwrap();
+        std::fs::write(p.persona_dir().join("TOOLS.md"), "secret-account-note").unwrap();
+        std::fs::write(
+            p.persona_dir().join("PROACTIVE_PREFERENCES.md"),
+            "secret-interest",
+        )
+        .unwrap();
+        std::fs::write(p.persona_dir().join("SOUL.md"), "calm-and-kind").unwrap();
         std::fs::write(p.memory_dir().join("MEMORY.md"), "secret-memory-fact").unwrap();
+        std::fs::write(p.memory_dir().join("diary.md"), "# Secret diary").unwrap();
         let shared = assemble(&p, &g);
         assert!(!shared.contains("secret-user-fact") && !shared.contains("secret-memory-fact"));
+        assert!(!shared.contains("Secret diary"));
+        assert!(!shared.contains("secret-account-note") && !shared.contains("secret-interest"));
+        assert!(
+            shared.contains("calm-and-kind"),
+            "the agent's character is shared"
+        );
         assert!(shared.contains("only offers `create_card`"));
+        // Another person's own chat: no owner files, but the full app tools.
+        g.scope = Scope::Personal;
+        let personal = assemble(&p, &g);
+        assert!(!personal.contains("secret-user-fact") && !personal.contains("secret-memory-fact"));
+        assert!(!personal.contains("Secret diary"));
+        assert!(!personal.contains("secret-account-note") && !personal.contains("secret-interest"));
+        assert!(!personal.contains(&p.memory_dir().display().to_string()));
+        assert!(personal.contains("not available in this conversation"));
+        assert!(personal.contains("create_goal"));
+        let private = assemble(&p, &ctx("Iris"));
+        assert!(private.contains("secret-user-fact") && private.contains("secret-memory-fact"));
+        assert!(private.contains("secret-account-note") && private.contains("secret-interest"));
+        assert!(private.contains("Secret diary"));
+        std::fs::remove_file(p.memory_dir().join("diary.md")).unwrap();
         assert!(prompt.contains("## Notices\n\n- The Claude engine"));
         assert!(!prompt.contains("create_goal"));
         let mut c = ctx("Iris");
@@ -497,18 +591,27 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = paths(tmp.path());
         seed(&p).unwrap();
-        let base = persona_hash(&p, "Iris", "main");
-        assert_eq!(base, persona_hash(&p, "Iris", "main"));
-        assert_ne!(base, persona_hash(&p, "Nova", "main"));
-        assert_ne!(base, persona_hash(&p, "Iris", "group"));
+        let hash = |name: &str, kind: &str, scope: Scope| persona_hash(&p, name, kind, scope);
+        let base = hash("Iris", "main", Scope::Private);
+        assert_eq!(base, hash("Iris", "main", Scope::Private));
+        assert_ne!(base, hash("Nova", "main", Scope::Private));
+        assert_ne!(base, hash("Iris", "group", Scope::Private));
         std::fs::write(p.memory_dir().join("trip.md"), "# Trip").unwrap();
         assert_eq!(
             base,
-            persona_hash(&p, "Iris", "main"),
+            hash("Iris", "main", Scope::Private),
             "memory index ignored"
         );
+        let shared = hash("Iris", "group", Scope::Shared);
+        let group_private = hash("Iris", "group", Scope::Private);
+        assert_ne!(shared, group_private, "becoming shared changes the hash");
+        assert_eq!(hash_scope(&shared), Some("shared"));
+        assert_eq!(hash_scope(&group_private), Some("private"));
+        assert_eq!(hash_scope("0123abcd"), None);
         std::fs::write(p.memory_dir().join("MEMORY.md"), "new fact").unwrap();
-        assert_ne!(base, persona_hash(&p, "Iris", "main"));
+        assert_ne!(base, hash("Iris", "main", Scope::Private));
+        // Owner-only files do not affect sessions that never see them.
+        assert_eq!(shared, hash("Iris", "group", Scope::Shared));
     }
 
     #[test]
@@ -526,6 +629,14 @@ mod tests {
             std::fs::write(p.persona_dir().join(f), "x".repeat(30_000)).unwrap();
         }
         let prompt = assemble(&p, &ctx("Iris"));
-        assert!(prompt.chars().count() <= MAX_PROMPT_CHARS + 1);
+        assert!(prompt.len() <= MAX_PROMPT_BYTES);
+        // Multi-byte text is capped in bytes, not characters.
+        for f in ["IDENTITY.md", "SOUL.md", "USER.md", "TOOLS.md"] {
+            std::fs::write(p.persona_dir().join(f), "漢".repeat(24_000)).unwrap();
+        }
+        let prompt = assemble(&p, &ctx("Iris"));
+        assert!(prompt.len() <= MAX_PROMPT_BYTES, "{}", prompt.len());
+        assert_eq!(truncate_bytes("a漢b", 2), "a");
+        assert_eq!(truncate_bytes("a漢b", 4), "a漢");
     }
 }

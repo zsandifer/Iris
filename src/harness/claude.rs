@@ -87,6 +87,14 @@ impl Harness for Claude {
         write_private_file(&prompt_file, spec.system_prompt.as_bytes())?;
         inv.temp_files.push(prompt_file.clone());
 
+        if spec.isolated {
+            for var in [
+                "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+                "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+            ] {
+                inv.env.push((var.into(), "1".into()));
+            }
+        }
         let a = &mut inv.args;
         a.extend(
             [
@@ -113,6 +121,12 @@ impl Harness for Claude {
         a.push("--append-system-prompt-file".into());
         a.push(prompt_file.to_string_lossy().into_owned());
         a.extend(["--system-prompt-snapshot", "off"].map(String::from));
+        if spec.isolated {
+            // Someone else's chat: only Iris's MCP servers (not the owner's
+            // user, project, or claude.ai ones), and none of the owner's
+            // CLAUDE.md files or auto memory.
+            a.push("--strict-mcp-config".into());
+        }
         if !self.cfg.permission_mode.is_empty() {
             a.push("--permission-mode".into());
             a.push(self.cfg.permission_mode.clone());
@@ -284,7 +298,9 @@ impl StreamParser for ClaudeParser {
             return out;
         };
         // Ignore subagent traffic; only the top-level conversation is shown.
-        if v.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
+        // After a terminal event nothing else counts: a run reports exactly
+        // one (a signed-out run sends an auth error and then an error result).
+        if self.finished || v.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
             return out;
         }
         match v.get("type").and_then(Value::as_str) {
@@ -574,13 +590,20 @@ mod tests {
             json!({"type": "result", "subtype": "success", "is_error": true, "result": "Not logged in · Please run /login"}),
         ];
         let ev = run(&lines);
+        let terminals: Vec<_> = ev
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    HarnessEvent::Done
+                        | HarnessEvent::Error { .. }
+                        | HarnessEvent::AuthRequired { .. }
+                )
+            })
+            .collect();
         assert!(
-            ev.iter()
-                .any(|e| matches!(e, HarnessEvent::AuthRequired { .. }))
-        );
-        assert!(
-            !ev.iter()
-                .any(|e| matches!(e, HarnessEvent::Done | HarnessEvent::Error { .. }))
+            matches!(terminals[..], [HarnessEvent::AuthRequired { .. }]),
+            "exactly one terminal event: {terminals:?}"
         );
     }
 
@@ -646,6 +669,8 @@ mod tests {
             writable_dirs: vec![tmp.path().join("memory")],
             run_dir: tmp.path().into(),
             scope: "c1".into(),
+            isolated: false,
+            own_mcp_servers: Vec::new(),
         };
         let inv = Claude::new(HarnessConfig::claude_default())
             .build(&spec)
@@ -669,5 +694,26 @@ mod tests {
         assert_eq!(stdin["message"]["content"][1]["source"]["data"], "UE5H");
         // The prompt never appears on the command line.
         assert!(!inv.args.iter().any(|a| a == "hi"));
+        // Someone else's chat: none of the CLI's own MCP servers or memory.
+        let plain = Claude::new(HarnessConfig::claude_default())
+            .build(&spec)
+            .unwrap();
+        assert!(!plain.args.contains(&"--strict-mcp-config".to_string()));
+        assert!(!plain.env.iter().any(|(k, _)| k.contains("MEMORY")));
+        let mut iso = spec.clone();
+        iso.isolated = true;
+        let inv = Claude::new(HarnessConfig::claude_default())
+            .build(&iso)
+            .unwrap();
+        assert!(inv.args.contains(&"--strict-mcp-config".to_string()));
+        for var in [
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+        ] {
+            assert!(
+                inv.env.contains(&(var.to_string(), "1".to_string())),
+                "{var}"
+            );
+        }
     }
 }

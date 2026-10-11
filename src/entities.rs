@@ -143,8 +143,17 @@ pub fn create_feed_post(
     user_id: &str,
     p: &NewFeedPost,
 ) -> rusqlite::Result<FeedPost> {
+    crate::db::write_tx(conn, |conn| create_feed_post_locked(conn, user_id, p))
+}
+
+fn create_feed_post_locked(
+    conn: &Connection,
+    user_id: &str,
+    p: &NewFeedPost,
+) -> rusqlite::Result<FeedPost> {
     let id = new_id();
-    let now = now_ms();
+    // Unique, so `before=<created_at>` paging never skips a post.
+    let now = crate::db::next_timestamp(conn, "feed_posts")?;
     let images = p.all_images();
     conn.execute(
         "INSERT INTO feed_posts (id, user_id, title, body, topic, source_url, image_url, images,
@@ -320,11 +329,23 @@ pub fn list_ideas(
     user_id: &str,
     status: Option<&str>,
 ) -> rusqlite::Result<Vec<Idea>> {
+    list_ideas_limited(conn, user_id, status, 200)
+}
+
+/// `status` may list several, comma-separated (`open,started`), so done
+/// and dismissed ideas never crowd out the ones still to act on.
+pub fn list_ideas_limited(
+    conn: &Connection,
+    user_id: &str,
+    status: Option<&str>,
+    limit: usize,
+) -> rusqlite::Result<Vec<Idea>> {
     let mut stmt = conn.prepare(
-        "SELECT * FROM ideas WHERE user_id = ?1 AND (?2 IS NULL OR status = ?2)
-         ORDER BY created_at DESC LIMIT 200",
+        "SELECT * FROM ideas WHERE user_id = ?1
+           AND (?2 IS NULL OR instr(',' || ?2 || ',', ',' || status || ',') > 0)
+         ORDER BY created_at DESC LIMIT ?3",
     )?;
-    stmt.query_map(params![user_id, status], idea_from_row)?
+    stmt.query_map(params![user_id, status, limit as i64], idea_from_row)?
         .collect()
 }
 
@@ -492,6 +513,13 @@ pub struct LibraryItem {
     pub updated_at: i64,
 }
 
+/// Library columns. Items saved during a background job keep no chat link:
+/// job conversations are hidden, so there is nothing to open.
+const LIBRARY_SELECT: &str = "SELECT l.id, l.kind, l.title, l.description, l.mime, l.file_name,
+        l.size, CASE WHEN c.kind = 'job' THEN NULL ELSE l.conversation_id END AS conversation_id,
+        l.created_at, l.updated_at
+    FROM library_items l LEFT JOIN conversations c ON c.id = l.conversation_id";
+
 fn library_from_row(r: &rusqlite::Row) -> rusqlite::Result<LibraryItem> {
     Ok(LibraryItem {
         id: r.get("id")?,
@@ -550,7 +578,7 @@ pub fn get_library_item(
     id: &str,
 ) -> rusqlite::Result<Option<LibraryItem>> {
     conn.query_row(
-        "SELECT * FROM library_items WHERE id = ?1 AND user_id = ?2",
+        &format!("{LIBRARY_SELECT} WHERE l.id = ?1 AND l.user_id = ?2"),
         params![id, user_id],
         library_from_row,
     )
@@ -562,12 +590,29 @@ pub fn list_library(
     user_id: &str,
     kind: Option<&str>,
 ) -> rusqlite::Result<Vec<LibraryItem>> {
-    let mut stmt = conn.prepare(
-        "SELECT * FROM library_items WHERE user_id = ?1 AND (?2 IS NULL OR kind = ?2)
-         ORDER BY created_at DESC LIMIT 500",
-    )?;
-    stmt.query_map(params![user_id, kind], library_from_row)?
-        .collect()
+    list_library_page(conn, user_id, kind, None, 500)
+}
+
+/// Newest first by (created_at, id); `before` is the previous page's last
+/// item as `(created_at, id)`.
+pub fn list_library_page(
+    conn: &Connection,
+    user_id: &str,
+    kind: Option<&str>,
+    before: Option<(i64, &str)>,
+    limit: usize,
+) -> rusqlite::Result<Vec<LibraryItem>> {
+    let (before_at, before_id) = before.unwrap_or((i64::MAX, ""));
+    let mut stmt = conn.prepare(&format!(
+        "{LIBRARY_SELECT} WHERE l.user_id = ?1 AND (?2 IS NULL OR l.kind = ?2)
+           AND (l.created_at < ?3 OR (l.created_at = ?3 AND (?4 = '' OR l.id < ?4)))
+         ORDER BY l.created_at DESC, l.id DESC LIMIT ?5"
+    ))?;
+    stmt.query_map(
+        params![user_id, kind, before_at, before_id, limit as i64],
+        library_from_row,
+    )?
+    .collect()
 }
 
 /// Returns the deleted item's file name so the caller can remove the file.
@@ -644,6 +689,18 @@ pub fn insert_card(
     card: &Value,
     role: &str,
 ) -> rusqlite::Result<Message> {
+    insert_card_with_status(conn, conversation_id, card, role, "complete")
+}
+
+/// `pending` cards (made during a turn with the owner's private context)
+/// are hidden until the turn is saved, which publishes or deletes them.
+pub fn insert_card_with_status(
+    conn: &Connection,
+    conversation_id: &str,
+    card: &Value,
+    role: &str,
+    status: &str,
+) -> rusqlite::Result<Message> {
     let fallback = card["title"].as_str().unwrap_or("").to_string();
     insert_message(
         conn,
@@ -653,6 +710,7 @@ pub fn insert_card(
             kind: "card",
             content: &fallback,
             card: Some(card),
+            status,
             ..Default::default()
         },
     )
@@ -1075,6 +1133,80 @@ mod tests {
         db.with(|c| {
             let owner = owner_user_id(c)?.unwrap();
             f(c, &owner)
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn open_ideas_are_never_crowded_out_by_dismissed_ones() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            let owner = owner_user_id(c)?.unwrap();
+            let old = create_idea(c, &owner, "Old but open", "", None)?;
+            for i in 0..250 {
+                let idea = create_idea(c, &owner, &format!("dismissed {i}"), "", None)?;
+                update_idea(c, &owner, &idea.id, Some("dismissed"), None)?;
+            }
+            let all = list_ideas(c, &owner, None)?;
+            assert!(
+                all.iter().all(|i| i.id != old.id),
+                "the cap hides it in the full list"
+            );
+            let active = list_ideas(c, &owner, Some("open,started"))?;
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].id, old.id);
+            assert_eq!(list_ideas(c, &owner, Some("dismissed"))?.len(), 200);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn job_artifacts_have_no_chat_link() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            let owner = owner_user_id(c)?.unwrap();
+            let main = crate::db::ensure_main_conversation(c, &owner)?;
+            let job = crate::db::ensure_job_conversation(c, &owner, "heartbeat")?;
+            for (id, conv) in [("a1", &main), ("a2", &job)] {
+                insert_library_item(
+                    c,
+                    &owner,
+                    &NewLibraryItem {
+                        id,
+                        kind: "artifact",
+                        title: id,
+                        description: "",
+                        mime: "text/markdown",
+                        file_name: &format!("{id}.md"),
+                        size: 1,
+                        conversation_id: Some(conv),
+                    },
+                )?;
+            }
+            let items = list_library(c, &owner, None)?;
+            let link = |id: &str| {
+                items
+                    .iter()
+                    .find(|i| i.id == id)
+                    .unwrap()
+                    .conversation_id
+                    .clone()
+            };
+            assert_eq!(link("a1").as_deref(), Some(main.as_str()));
+            assert_eq!(link("a2"), None);
+            assert_eq!(
+                get_library_item(c, &owner, "a2")?.unwrap().conversation_id,
+                None
+            );
+            // Paging by (created_at, id) walks every item once, ties included.
+            c.execute("UPDATE library_items SET created_at = 42", [])?;
+            let first = list_library_page(c, &owner, None, None, 1)?;
+            let last = first.last().unwrap();
+            let second = list_library_page(c, &owner, None, Some((last.created_at, &last.id)), 1)?;
+            assert_eq!(first.len() + second.len(), 2);
+            assert_ne!(first[0].id, second[0].id);
+            Ok(())
         })
         .unwrap();
     }

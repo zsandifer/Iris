@@ -1,7 +1,7 @@
 // Chat: messages, live status phrases, receipts, cards, and the composer.
 import { html, useEffect, useLayoutEffect, useRef, useState } from './h.js';
-import { post, api } from './api.js';
-import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId } from './store.js';
+import { post, api, seg, isId } from './api.js';
+import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId, convFor, lookUpConv } from './store.js';
 import { Icon, Img, Avatar, agentName, stamp, Spinner } from './ui.js';
 import { md } from './md.js';
 import { Card } from './cards.js';
@@ -31,8 +31,8 @@ function Receipt({ meta }) {
 
 function Photos({ ids, mine }) {
   return html`<div class=${'photos' + (mine ? ' mine' : '')}>
-    ${ids.map((id) => html`<button class="photo" onClick=${() => set({ lightbox: `/api/attachments/${id}` })}>
-      <${Img} src=${`/api/attachments/${id}`} alt="Photo" /></button>`)}
+    ${ids.map((id) => html`<button class="photo" onClick=${() => set({ lightbox: `/api/attachments/${seg(id)}` })}>
+      <${Img} src=${`/api/attachments/${seg(id)}`} alt="Photo" /></button>`)}
   </div>`;
 }
 
@@ -115,20 +115,25 @@ export function ChatScreen({ cid }) {
   const scr = useRef();
   const stick = useRef(true);
   const prevHeight = useRef(0);
-  const conv = (S.convs || []).find((c) => c.id === cid);
+  const conv = convFor(cid);
   const box = S.msgs[cid];
   const list = box?.list || [];
   const [members, setMembers] = useState(null);
 
   useEffect(() => {
     stick.current = true;
+    if (!isId(cid)) return;
     if (!S.msgs[cid]) loadMessages(cid);
-    post(`/conversations/${cid}/read`).catch(() => {});
+    post(`/conversations/${seg(cid)}/read`).catch(() => {});
   }, [cid]);
+
+  // Opened by URL but not in the list: it may be archived (for the menu).
+  const known = !!conv;
+  useEffect(() => { if (isId(cid) && !known) lookUpConv(cid); }, [cid, known, !!S.convs]);
 
   useEffect(() => {
     if (conv && conv.member_count > 1) {
-      api('GET', `/conversations/${cid}/members`).then((r) => {
+      api('GET', `/conversations/${seg(cid)}/members`).then((r) => {
         setMembers(Object.fromEntries(r.members.map((x) => [x.user_id, x.display_name])));
       }).catch(() => {});
     } else setMembers(null);
@@ -148,7 +153,7 @@ export function ChatScreen({ cid }) {
 
   const lastId = list.at(-1)?.id;
   useEffect(() => {
-    if (lastId && document.visibilityState === 'visible') post(`/conversations/${cid}/read`).catch(() => {});
+    if (lastId && isId(cid) && document.visibilityState === 'visible') post(`/conversations/${seg(cid)}/read`).catch(() => {});
   }, [lastId]);
 
   const onScroll = (e) => {
@@ -201,12 +206,23 @@ async function shrink(file) {
   }
 }
 
+const MAX_PHOTOS = 4; // per message (server limit)
+const unpreview = (list) => list.forEach((a) => a.preview && URL.revokeObjectURL(a.preview));
+
 function Composer({ cid, running }) {
   const [text, setText] = useState('');
   const [atts, setAtts] = useState([]);
   const [rec, setRec] = useState(null);
   const ta = useRef();
   const file = useRef();
+  // Photo previews are object URLs: revoke each when its photo is sent,
+  // removed, fails to upload, or the composer goes away.
+  const mine = useRef({ atts: [], mounted: true });
+  mine.current.atts = atts;
+  useEffect(() => () => {
+    mine.current.mounted = false;
+    unpreview(mine.current.atts);
+  }, []);
 
   useEffect(() => {
     const d = S.drafts[cid];
@@ -225,19 +241,26 @@ function Composer({ cid, running }) {
   }, [text]);
 
   const pick = async (e) => {
-    const files = [...e.target.files].slice(0, 4 - atts.length);
+    const files = [...e.target.files].slice(0, MAX_PHOTOS - atts.length);
     e.target.value = '';
+    // The loop awaits; stop once the composer is gone (its cleanup already
+    // ran, so revoke what this iteration made itself).
     for (const f of files) {
+      if (!mine.current.mounted) break;
       const key = Math.random().toString(36).slice(2);
       const preview = URL.createObjectURL(f);
       setAtts((a) => [...a, { key, preview, uploading: true }]);
       try {
         const blob = await shrink(f);
+        if (!mine.current.mounted) { URL.revokeObjectURL(preview); break; }
         const r = await api('POST', '/attachments', blob);
+        if (!mine.current.mounted) { URL.revokeObjectURL(preview); break; }
         setAtts((a) => a.map((x) => (x.key === key ? { ...x, id: r.attachment.id, uploading: false } : x)));
       } catch (err) {
+        if (!mine.current.mounted) { URL.revokeObjectURL(preview); break; }
         toast(err.status === 415 ? 'I can only take photos (JPEG, PNG, GIF, or WebP).' : err.message);
         setAtts((a) => a.filter((x) => x.key !== key));
+        URL.revokeObjectURL(preview);
       }
     }
   };
@@ -248,11 +271,24 @@ function Composer({ cid, running }) {
   const send = async () => {
     if (!canSend) return;
     const t = text.trim();
-    const ids = atts.map((a) => a.id);
+    const sent = atts;
     rec?.stop();
     setText('');
     setAtts([]);
-    try { await sendMessage(cid, t, ids); } catch (e) { toast(e.message); setText(t); }
+    try {
+      await sendMessage(cid, t, sent.map((a) => a.id));
+      unpreview(sent);
+    } catch (e) {
+      toast(e.message);
+      if (!mine.current.mounted) { unpreview(sent); return; }
+      // Put the text and photos back (ahead of any added meanwhile).
+      setText(t);
+      setAtts((cur) => {
+        const all = [...sent, ...cur];
+        unpreview(all.slice(MAX_PHOTOS));
+        return all.slice(0, MAX_PHOTOS);
+      });
+    }
   };
 
   const mic = () => {
@@ -272,7 +308,7 @@ function Composer({ cid, running }) {
     try { r.start(); setRec(r); } catch { toast("Voice input isn't available here."); }
   };
 
-  const stop = () => post(`/conversations/${cid}/cancel`).catch((e) => toast(e.message));
+  const stop = () => post(`/conversations/${seg(cid)}/cancel`).catch((e) => toast(e.message));
 
   let action;
   if (canSend) action = html`<button class="send" aria-label="Send" onClick=${send}><${Icon} name="send" size=${20} /></button>`;
@@ -284,10 +320,10 @@ function Composer({ cid, running }) {
   return html`<div class="composer">
     ${atts.length > 0 && html`<div class="att-row">${atts.map((a) => html`<div class="att" key=${a.key}>
       <img src=${a.preview} alt="" />${a.uploading && html`<div class="att-busy"><${Spinner} /></div>`}
-      <button class="att-x" aria-label="Remove photo" onClick=${() => setAtts(atts.filter((x) => x.key !== a.key))}><${Icon} name="x" size=${12} /></button>
+      <button class="att-x" aria-label="Remove photo" onClick=${() => { URL.revokeObjectURL(a.preview); setAtts((cur) => cur.filter((x) => x.key !== a.key)); }}><${Icon} name="x" size=${12} /></button>
     </div>`)}</div>`}
     <div class=${'inp' + (rec ? ' listening' : '')}>
-      <button class="pl" aria-label="Add photos" onClick=${() => file.current.click()} disabled=${atts.length >= 4}><${Icon} name="plus" size=${20} /></button>
+      <button class="pl" aria-label="Add photos" onClick=${() => file.current.click()} disabled=${atts.length >= MAX_PHOTOS}><${Icon} name="plus" size=${20} /></button>
       <input ref=${file} type="file" accept="image/*" multiple hidden onChange=${pick} />
       <textarea ref=${ta} rows="1" value=${text} placeholder=${rec ? 'Listening…' : `Talk to ${agentName()}…`}
         aria-label="Message" enterkeyhint=${touch ? 'enter' : 'send'}

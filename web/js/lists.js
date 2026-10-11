@@ -1,10 +1,12 @@
 // Ideas, Goals, and Library tabs.
 import { html, useEffect, useState } from './h.js';
-import { post, patch, del, api, blobUrl } from './api.js';
-import { S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary } from './store.js';
-import { Icon, Img, Empty, Spinner, ago, since, openSheet, closeSheet, confirmSheet, hostOf } from './ui.js';
+import { get, post, patch, del, api, seg, isId } from './api.js';
+import {
+  S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary, loadMoreSaved, loadMorePhotos, loadMoreItems, convFor, touchList,
+} from './store.js';
+import { Icon, Img, Empty, Spinner, ago, since, openSheet, closeSheet, confirmSheet, hostOf, useBlob } from './ui.js';
 import { md } from './md.js';
-import { Post } from './feed.js';
+import { Post, findPost } from './feed.js';
 
 function Head({ title, sub }) {
   return html`<h1 class="ttl">${title}</h1>${sub && html`<div class="sub">${sub}</div>`}`;
@@ -22,15 +24,16 @@ export function IdeasScreen() {
   const start = async (i) => {
     setBusy(i.id);
     try {
-      const r = await post(`/ideas/${i.id}/start`);
+      const r = await post(`/ideas/${seg(i.id)}/start`);
       await loadIdeas();
       go(`chat/${r.conversation.id}`);
     } catch (e) { toast(e.message); }
     setBusy(null);
   };
   const later = async (i) => {
+    touchList('ideas');
     set({ ideas: S.ideas.map((x) => (x.id === i.id ? { ...x, status: 'dismissed' } : x)) });
-    try { await patch(`/ideas/${i.id}`, { status: 'dismissed' }); } catch (e) { toast(e.message); loadIdeas(); }
+    try { await patch(`/ideas/${seg(i.id)}`, { status: 'dismissed' }); } catch (e) { toast(e.message); loadIdeas(); }
   };
   return html`<div class="scr tabscr">
     <${Head} title="Ideas" sub="Things I could do for you. Tap Do it and I'll get started." />
@@ -60,13 +63,15 @@ export function GoalsScreen() {
   const active = S.goals.filter((g) => !g.suggested && !g.done);
   const done = S.goals.filter((g) => g.done);
   const update = async (g, body) => {
+    touchList('goals');
     set({ goals: S.goals.map((x) => (x.id === g.id ? { ...x, ...body } : x)) });
-    try { await patch(`/goals/${g.id}`, body); } catch (e) { toast(e.message); }
+    try { await patch(`/goals/${seg(g.id)}`, body); } catch (e) { toast(e.message); }
     loadGoals().catch(() => {});
   };
   const remove = async (g) => {
+    touchList('goals');
     set({ goals: S.goals.filter((x) => x.id !== g.id) });
-    try { await del(`/goals/${g.id}`); } catch (e) { toast(e.message); loadGoals(); }
+    try { await del(`/goals/${seg(g.id)}`); } catch (e) { toast(e.message); loadGoals(); }
   };
   const add = async (e) => {
     e.preventDefault();
@@ -106,24 +111,43 @@ export function GoalsScreen() {
 
 const KIND_ICON = (mime) => (mime.startsWith('image/') ? 'image' : mime.includes('html') ? 'globe' : 'file');
 
+function Download({ src, name }) {
+  const [url, failed] = useBlob(src);
+  if (failed) return html`<button class="b1" disabled>Download</button>`;
+  return html`<a class="b1" href=${url || undefined} download=${name} aria-disabled=${url ? undefined : 'true'}>Download</a>`;
+}
+
+/** `cid` if it is a chat this user can open (not a background job's), else null. */
+async function openableChat(cid) {
+  if (!isId(cid)) return null;
+  if (convFor(cid)) return cid;
+  try {
+    const { conversation: c } = await get(`/conversations/${seg(cid)}`);
+    return c && c.kind !== 'job' ? cid : null;
+  } catch {
+    return null;
+  }
+}
+
 async function openItem(it) {
   openSheet(() => html`<div class="sheet-body"><${Spinner} /></div>`);
+  const chat = openableChat(it.conversation_id);
   try {
-    const path = `/library/${it.id}/content`;
+    const path = `/library/${seg(it.id)}/content`;
     let view;
     if (it.mime.startsWith('image/')) view = html`<${Img} src=${`/api${path}`} cls="lib-full" alt=${it.title} />`;
     else if (it.mime.startsWith('text/') || it.mime === 'application/json') {
-      const text = await api('GET', path, undefined, { raw: true }).then((r) => r.text());
+      const text = await api('GET', path, undefined, { as: 'text' });
       view = it.mime === 'text/markdown' ? html`<div class="md doc" dangerouslySetInnerHTML=${{ __html: md(text) }} />`
         : html`<pre class="doc">${text}</pre>`;
     } else view = html`<p class="mu">I can't show this kind of file here, but you can download it.</p>`;
-    const url = await blobUrl(`/api${path}`);
+    const cid = await chat;
     openSheet(() => html`<div class="sheet-body tall">
       <h3>${it.title}</h3>${it.description && html`<p class="mu">${it.description}</p>`}
       ${view}
       <div class="btns">
-        ${it.conversation_id && html`<button class="b2" onClick=${() => { closeSheet(); go(`chat/${it.conversation_id}`); }}>Open chat</button>`}
-        <a class="b1" href=${url} download=${it.title}>Download</a>
+        ${cid && html`<button class="b2" onClick=${() => { closeSheet(); go(`chat/${cid}`); }}>Open chat</button>`}
+        <${Download} src=${`/api${path}`} name=${it.title} />
       </div></div>`);
   } catch (e) { closeSheet(); toast(e.message); }
 }
@@ -133,7 +157,7 @@ function MadeByIris({ items, limit }) {
   const docs = items.filter((i) => !i.mime.startsWith('image/'));
   const shown = limit ? docs.slice(0, limit) : docs;
   return html`${media.length > 0 && html`<div class="grid">${(limit ? media.slice(0, 6) : media).map((it) => html`
-      <button class="gi" onClick=${() => openItem(it)}><${Img} src=${`/api/library/${it.id}/content`} alt=${it.title} /></button>`)}</div>`}
+      <button class="gi" onClick=${() => openItem(it)}><${Img} src=${`/api/library/${seg(it.id)}/content`} alt=${it.title} /></button>`)}</div>`}
     ${shown.length > 0 && html`<div class="grp">${shown.map((it) => html`<div class="r tap" onClick=${() => openItem(it)}>
       <div class="ri"><${Icon} name=${KIND_ICON(it.mime)} size=${17} /></div>
       <div class="rt">${it.title}<small>${it.description || it.mime} · ${ago(it.created_at)}</small></div>
@@ -142,17 +166,34 @@ function MadeByIris({ items, limit }) {
 
 function PhotoGrid({ photos, limit }) {
   const list = limit ? photos.slice(0, limit) : photos;
-  return html`<div class="grid">${list.map((p) => html`<button class="gi" onClick=${() => set({ lightbox: `/api/attachments/${p.id}`, lightboxChat: p.conversation_id })}>
-    <${Img} src=${`/api/attachments/${p.id}`} alt="Photo you sent" /></button>`)}</div>`;
+  return html`<div class="grid">${list.map((p) => html`<button class="gi" onClick=${() => set({ lightbox: `/api/attachments/${seg(p.id)}`, lightboxChat: p.conversation_id })}>
+    <${Img} src=${`/api/attachments/${seg(p.id)}`} alt="Photo you sent" /></button>`)}</div>`;
 }
 
 function Saved({ posts, limit }) {
   const list = limit ? posts.slice(0, limit) : posts;
-  const show = (p) => openSheet(() => html`<div class="sheet-body tall flush"><${Post} p=${p} /></div>`);
+  const show = (p) => {
+    // Follow the post's live state (like/unlike) while the sheet is open.
+    let cur = p;
+    openSheet(() => {
+      cur = findPost(p.id) || cur;
+      return html`<div class="sheet-body tall flush"><${Post} p=${cur} /></div>`;
+    });
+  };
   return html`<div class="grp">${list.map((p) => html`<div class="r tap" onClick=${() => show(p)}>
     <div class="ri thumb">${(p.images?.[0] || p.image_url) ? html`<${Img} src=${p.images?.[0] || p.image_url} alt="" />` : html`<${Icon} name="heart" size=${16} />`}</div>
     <div class="rt">${p.title}<small>${p.source_name || hostOf(p.source_url) || p.topic || 'Saved post'}</small></div>
     <${Icon} name="chev" size=${16} cls="rc" /></div>`)}</div>`;
+}
+
+function ShowMore({ load }) {
+  const [busy, setBusy] = useState(false);
+  const more = async () => {
+    setBusy(true);
+    try { await load(); } catch (e) { toast(e.message); }
+    setBusy(false);
+  };
+  return html`<button class="b2 wide" disabled=${busy} onClick=${more}>${busy ? 'Loading…' : 'Show more'}</button>`;
 }
 
 export function LibraryScreen() {
@@ -160,18 +201,21 @@ export function LibraryScreen() {
   const [tab, setTab] = useState('all');
   useEffect(() => { loadLibrary().catch((e) => toast(e.message)); }, []);
   const lib = S.library;
+  // Unliked posts stay loaded (so an open post and the paging cursor keep
+  // working) but leave the Saved views at once.
+  const saved = (lib?.saved || []).filter((p) => p.liked !== false);
   const tabs = [['all', 'All'], ['made', 'Made by me'], ['photos', 'Photos'], ['saved', 'Saved']];
   let body;
   if (!lib) body = html`<${Spinner} />`;
-  else if (tab === 'made') body = lib.items.length ? html`<${MadeByIris} items=${lib.items} />` : html`<${Empty} icon="file" title="Nothing yet">Reports, drafts, and images I make for you land here.<//>`;
-  else if (tab === 'photos') body = lib.photos.length ? html`<${PhotoGrid} photos=${lib.photos} />` : html`<${Empty} icon="image" title="No photos yet">Photos you send me show up here.<//>`;
-  else if (tab === 'saved') body = lib.saved.length ? html`<${Saved} posts=${lib.saved} />` : html`<${Empty} icon="heart" title="Nothing saved">Tap ♡ on a post in For you to keep it here.<//>`;
+  else if (tab === 'made') body = lib.items.length ? html`<${MadeByIris} items=${lib.items} />${lib.itemsMore && html`<${ShowMore} load=${loadMoreItems} />`}` : html`<${Empty} icon="file" title="Nothing yet">Reports, drafts, and images I make for you land here.<//>`;
+  else if (tab === 'photos') body = lib.photos.length ? html`<${PhotoGrid} photos=${lib.photos} />${lib.photosMore && html`<${ShowMore} load=${loadMorePhotos} />`}` : html`<${Empty} icon="image" title="No photos yet">Photos you send me show up here.<//>`;
+  else if (tab === 'saved') body = saved.length || lib.savedMore ? html`<${Saved} posts=${saved} />${lib.savedMore && html`<${ShowMore} load=${loadMoreSaved} />`}` : html`<${Empty} icon="heart" title="Nothing saved">Tap ♡ on a post in For you to keep it here.<//>`;
   else {
-    const any = lib.items.length || lib.photos.length || lib.saved.length;
+    const any = lib.items.length || lib.photos.length || saved.length;
     body = any ? html`
       ${lib.items.length > 0 && html`<div class="gl">Made by me</div><${MadeByIris} items=${lib.items} limit=${4} />`}
       ${lib.photos.length > 0 && html`<div class="gl">Photos you sent</div><${PhotoGrid} photos=${lib.photos} limit=${6} />`}
-      ${lib.saved.length > 0 && html`<div class="gl">Saved posts</div><${Saved} posts=${lib.saved} limit=${4} />`}`
+      ${saved.length > 0 && html`<div class="gl">Saved posts</div><${Saved} posts=${saved} limit=${4} />`}`
       : html`<${Empty} icon="library" title="Your library is empty">Things I make for you, photos you send, and posts you save all collect here.<//>`;
   }
   return html`<div class="scr tabscr">

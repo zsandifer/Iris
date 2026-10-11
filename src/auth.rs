@@ -63,9 +63,17 @@ pub fn create_pairing_code(conn: &rusqlite::Connection, user_id: &str) -> Result
 
 /// Throttles pairing attempts: after `MAX_FAILURES` bad codes within the
 /// window, every outstanding code is burned and new attempts are refused
-/// for the rest of the window.
+/// for the rest of the window. Attempts still being checked count against
+/// the limit too, so concurrent requests cannot queue more guesses.
 pub struct PairLimiter {
-    state: Mutex<(u32, Option<Instant>)>,
+    state: Mutex<Limits>,
+}
+
+#[derive(Default)]
+struct Limits {
+    failures: u32,
+    in_flight: u32,
+    window_start: Option<Instant>,
 }
 
 const MAX_FAILURES: u32 = 5;
@@ -74,34 +82,80 @@ const WINDOW: Duration = Duration::from_secs(15 * 60);
 impl Default for PairLimiter {
     fn default() -> Self {
         Self {
-            state: Mutex::new((0, None)),
+            state: Mutex::new(Limits::default()),
+        }
+    }
+}
+
+/// One pairing attempt holding its place under the limit until resolved.
+pub struct Attempt<'a> {
+    limiter: &'a PairLimiter,
+    done: bool,
+}
+
+impl Attempt<'_> {
+    pub fn succeeded(mut self) {
+        self.done = true;
+        let mut s = self.limiter.lock();
+        s.in_flight -= 1;
+        s.failures = 0;
+        s.window_start = None;
+    }
+
+    /// Returns true if this failure tripped the lock.
+    pub fn failed(mut self) -> bool {
+        self.done = true;
+        let mut s = self.limiter.lock();
+        s.in_flight -= 1;
+        if s.window_start.is_none() {
+            s.window_start = Some(Instant::now());
+        }
+        s.failures += 1;
+        s.failures == MAX_FAILURES
+    }
+}
+
+impl Drop for Attempt<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.limiter.lock().in_flight -= 1;
         }
     }
 }
 
 impl PairLimiter {
-    pub fn locked(&self) -> bool {
-        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(start) = s.1
-            && start.elapsed() > WINDOW
-        {
-            *s = (0, None);
-        }
-        s.0 >= MAX_FAILURES
+    fn lock(&self) -> std::sync::MutexGuard<'_, Limits> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Returns true if this failure tripped the lock.
-    pub fn record_failure(&self) -> bool {
-        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if s.1.is_none_or(|t| t.elapsed() > WINDOW) {
-            *s = (0, Some(Instant::now()));
+    /// Start an attempt, or None while locked (or while enough attempts
+    /// are already being checked to reach the limit).
+    pub fn begin(&self) -> Option<Attempt<'_>> {
+        let mut s = self.lock();
+        if s.window_start.is_some_and(|t| t.elapsed() > WINDOW) {
+            s.failures = 0;
+            s.window_start = None;
         }
-        s.0 += 1;
-        s.0 == MAX_FAILURES
+        if s.failures + s.in_flight >= MAX_FAILURES {
+            return None;
+        }
+        s.in_flight += 1;
+        Some(Attempt {
+            limiter: self,
+            done: false,
+        })
     }
 
-    pub fn record_success(&self) {
-        *self.state.lock().unwrap_or_else(|p| p.into_inner()) = (0, None);
+    #[cfg(test)]
+    fn locked(&self) -> bool {
+        self.begin().is_none()
+    }
+
+    #[cfg(test)]
+    fn record_success(&self) {
+        let mut s = self.lock();
+        s.failures = 0;
+        s.window_start = None;
     }
 }
 
@@ -118,9 +172,9 @@ pub async fn pair_device(
     code: &str,
     device_name: &str,
 ) -> std::result::Result<(String, Device), PairError> {
-    if limiter.locked() {
+    let Some(attempt) = limiter.begin() else {
         return Err(PairError::Locked);
-    }
+    };
     let code_hash = hash_code(code);
     let name = device_name.trim().chars().take(80).collect::<String>();
     let name = if name.is_empty() {
@@ -140,11 +194,11 @@ pub async fn pair_device(
         .await;
     match res {
         Ok(Some(device)) => {
-            limiter.record_success();
+            attempt.succeeded();
             Ok((token, device))
         }
         Ok(None) => {
-            if limiter.record_failure() {
+            if attempt.failed() {
                 let _ = db.call(db::burn_pairing_codes).await;
                 crate::warn!("too many failed pairing attempts; outstanding codes revoked");
             }
@@ -278,5 +332,55 @@ mod tests {
             pair_device(&db, &limiter, &code, "x").await,
             Err(PairError::Invalid)
         ));
+    }
+
+    #[test]
+    fn attempts_being_checked_count_against_the_limit() {
+        let limiter = PairLimiter::default();
+        // Many requests at once: only MAX_FAILURES get to guess.
+        let attempts: Vec<_> = (0..20).filter_map(|_| limiter.begin()).collect();
+        assert_eq!(attempts.len(), MAX_FAILURES as usize);
+        assert!(limiter.locked());
+        let tripped: Vec<bool> = attempts.into_iter().map(|a| a.failed()).collect();
+        assert_eq!(tripped.iter().filter(|t| **t).count(), 1);
+        assert!(limiter.locked());
+        // An attempt that ends without a verdict (an internal error) frees
+        // its place; a success clears the count.
+        let limiter = PairLimiter::default();
+        drop(limiter.begin());
+        let a = limiter.begin().unwrap();
+        let b = limiter.begin().unwrap();
+        b.failed();
+        a.succeeded();
+        assert_eq!(limiter.lock().failures, 0);
+        assert_eq!(limiter.lock().in_flight, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_guesses_stop_at_the_limit() {
+        let db = Db::open_in_memory().unwrap();
+        let limiter = std::sync::Arc::new(PairLimiter::default());
+        let guesses: Vec<_> = (0..30)
+            .map(|i| {
+                let (db, limiter) = (db.clone(), limiter.clone());
+                tokio::spawn(async move {
+                    pair_device(&db, &limiter, &format!("ZZZZ-{i:04}"), "x").await
+                })
+            })
+            .collect();
+        let (mut invalid, mut locked) = (0, 0);
+        for g in guesses {
+            match g.await.unwrap() {
+                Err(PairError::Invalid) => invalid += 1,
+                Err(PairError::Locked) => locked += 1,
+                Ok(_) => panic!("a wrong code paired a device"),
+                Err(PairError::Internal(e)) => panic!("internal error: {e}"),
+            }
+        }
+        assert_eq!(
+            invalid, MAX_FAILURES,
+            "exactly the allowed guesses were checked"
+        );
+        assert_eq!(locked, 30 - MAX_FAILURES);
     }
 }

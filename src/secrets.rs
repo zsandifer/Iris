@@ -7,7 +7,6 @@
 //! rows. Secrets are decrypted only in memory, only when needed, and are
 //! never returned by the HTTP API or logged.
 
-use crate::config::write_private_file;
 use crate::util::{Result, random_bytes};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -48,7 +47,11 @@ impl Vault {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let key = random_bytes::<32>();
-                write_private_file(key_file, &key)?;
+                // Another process may be creating it at the same moment:
+                // whichever key lands first is the only one ever used.
+                if !crate::config::create_private_file_once(key_file, &key)? {
+                    return Self::open(key_file);
+                }
                 key
             }
             Err(e) => return Err(e.into()),
@@ -116,6 +119,32 @@ impl Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_first_opens_share_one_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_file = tmp.path().join("vault.key");
+        for _ in 0..20 {
+            let _ = std::fs::remove_file(&key_file);
+            let vaults: Vec<Vault> = (0..8)
+                .map(|_| {
+                    let path = key_file.clone();
+                    std::thread::spawn(move || Vault::open(&path).unwrap())
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .collect();
+            // Whatever any of them sealed, all of them (and a restart) open.
+            let restarted = Vault::open(&key_file).unwrap();
+            for v in &vaults {
+                let ct = v.encrypt(b"secret", "id").unwrap();
+                assert_eq!(restarted.decrypt(&ct, "id").unwrap(), b"secret");
+            }
+        }
+        let leftovers = std::fs::read_dir(tmp.path()).unwrap().count();
+        assert_eq!(leftovers, 1, "no temp files left behind");
+    }
 
     #[test]
     fn round_trip_and_tamper_detection() {

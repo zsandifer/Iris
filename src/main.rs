@@ -42,11 +42,15 @@ Usage:
   iris status                      Show harness versions and sign-in state
   iris import openclaw <PATH> [--dry-run] [--force]
                                    Copy persona/memory files from OpenClaw
-  iris mcp --data-dir DIR --user ID [--conversation ID] [--shared]
+  iris mcp --data-dir DIR --user ID [--conversation ID] [--shared] [--workdir DIR]
                                    Iris MCP bridge (launched by harnesses)
   iris mcp --browser --data-dir DIR
                                    Browser tools for one turn (launched by
                                    harnesses; needs IRIS_BROWSER_TOKEN)
+  iris mcp-exec ENV_FILE COMMAND [ARGS...]
+                                   Run an MCP server with the environment in
+                                   ENV_FILE (launched by harnesses, so
+                                   connector secrets stay off command lines)
   iris engines <install|update|uninstall> <NAME> [--dir PATH]
   iris engines list [--dir PATH]   Install/update the official CLIs (claude,
                                    codex, gemini, opencode) into the engines
@@ -76,6 +80,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--conversation",
     "--dir",
     "--assets",
+    "--workdir",
 ];
 
 impl Args {
@@ -121,7 +126,15 @@ impl Args {
 }
 
 fn main() {
-    let args = match Args::parse(std::env::args().skip(1)) {
+    // `mcp-exec` passes the server's own arguments through untouched, so it
+    // bypasses the option parser.
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("mcp-exec") {
+        let err = mcp_exec(&raw[1..]);
+        eprintln!("iris mcp-exec: {err}");
+        std::process::exit(127);
+    }
+    let args = match Args::parse(raw.into_iter()) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}\n\n{USAGE}");
@@ -182,7 +195,7 @@ fn run(args: Args) -> Result<()> {
             mcp::serve_stdio(|req| bridge.handle(req))
         }
         ["mcp"] => {
-            args.check_flags(&["--user", "--conversation", "--shared"])?;
+            args.check_flags(&["--user", "--conversation", "--shared", "--workdir"])?;
             let user = args.value("--user").ok_or("--user is required")?;
             // The harness launches this with the server's data dir; never
             // create a new data dir from here.
@@ -196,6 +209,7 @@ fn run(args: Args) -> Result<()> {
                 user_id: user.to_string(),
                 conversation_id: args.value("--conversation").map(String::from),
                 shared: args.has("--shared"),
+                workdir: args.value("--workdir").map(PathBuf::from),
             })
         }
         ["engines", rest @ ..] => {
@@ -233,6 +247,27 @@ fn run(args: Args) -> Result<()> {
         ["import", ..] => Err("usage: iris import openclaw <PATH> [--dry-run] [--force]".into()),
         other => Err(format!("unknown command '{}'\n\n{USAGE}", other.join(" ")).into()),
     }
+}
+
+/// Replace this process with `COMMAND ARGS...`, adding the variables from
+/// the private JSON file `ENV_FILE`. Returns only on failure.
+fn mcp_exec(raw: &[String]) -> String {
+    use std::os::unix::process::CommandExt;
+    let [env_file, command, rest @ ..] = raw else {
+        return "usage: iris mcp-exec ENV_FILE COMMAND [ARGS...]".into();
+    };
+    let env: std::collections::BTreeMap<String, String> = match std::fs::read(env_file)
+        .map_err(|e| e.to_string())
+        .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
+    {
+        Ok(env) => env,
+        Err(e) => return format!("cannot read environment file: {e}"),
+    };
+    let err = std::process::Command::new(command)
+        .args(rest)
+        .envs(env)
+        .exec();
+    format!("cannot run {command}: {err}")
 }
 
 fn init(paths: &Paths) -> Result<()> {
@@ -274,7 +309,32 @@ fn runtime(cfg: &Config) -> Result<tokio::runtime::Runtime> {
         .build()?)
 }
 
+/// Hold an exclusive lock on the data directory for this process's
+/// lifetime, so a second `iris serve` cannot clean up the first one's
+/// per-turn files or mark its replies interrupted.
+fn lock_data_dir(paths: &Paths) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    config::ensure_private_dir(&paths.data_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(paths.data_dir.join("serve.lock"))?;
+    // SAFETY: flock on a descriptor this function owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!(
+            "another `iris serve` is already using {}",
+            paths.data_dir.display()
+        )
+        .into());
+    }
+    Ok(file)
+}
+
 fn serve(cfg: Config, paths: Paths) -> Result<()> {
+    let _lock = lock_data_dir(&paths)?;
     persona::seed(&paths)?;
     // Leftover per-turn files from a crash.
     if let Ok(rd) = std::fs::read_dir(paths.run_dir()) {
@@ -302,8 +362,10 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
             probe.refresh_harnesses().await;
             probe.check_recommendations().await;
             setup::post_setup_card_if_needed(&probe).await;
+            // Jobs start once engines are known; before the first probe
+            // every engine looks missing and a due job would fail.
+            jobs::spawn_scheduler(probe);
         });
-        jobs::spawn_scheduler(state.clone());
         server::serve(state).await
     })
 }
@@ -396,6 +458,20 @@ mod tests {
 
     fn parse(s: &str) -> Args {
         Args::parse(s.split_whitespace().map(String::from)).unwrap()
+    }
+
+    #[test]
+    fn one_server_per_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        let first = lock_data_dir(&paths).unwrap();
+        let err = lock_data_dir(&paths).unwrap_err().to_string();
+        assert!(err.contains("already using"), "{err}");
+        drop(first);
+        assert!(lock_data_dir(&paths).is_ok(), "released with the process");
     }
 
     #[test]

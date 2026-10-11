@@ -151,7 +151,10 @@ iris serve    # starts Iris
 iris pair     # prints a one-time code for your phone
 ```
 
-Open Iris on your phone, enter the code, and tap **Add to Home Screen**.
+To reach Iris from your phone, share it on your private network over HTTPS
+(with Tailscale that's one command, `tailscale serve --bg 7420`; see
+[using Iris from your phone](docs/SELF-HOSTING.md#using-iris-from-your-phone)).
+Then open Iris on your phone, enter the code, and tap **Add to Home Screen**.
 That's the last time you need the terminal.
 
 Moving from OpenClaw? `iris import openclaw <workspace>` brings your agent's

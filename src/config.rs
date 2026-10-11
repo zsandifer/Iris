@@ -434,6 +434,23 @@ impl Config {
         }
     }
 
+    /// The VAPID contact sent to push services: `push.vapid_subject` (a
+    /// `mailto:` or `https:` URL), else an `https:` `public_url`. Apple
+    /// rejects pushes without one, so without it push is unavailable.
+    pub fn push_subject(&self) -> Option<String> {
+        let valid = |s: &str| {
+            s.starts_with("mailto:") && s.len() > 7 || s.starts_with("https://") && s.len() > 8
+        };
+        let subject = self.push.vapid_subject.trim();
+        if valid(subject) {
+            return Some(subject.to_string());
+        }
+        let url = self.public_url.trim().trim_end_matches('/');
+        url.starts_with("https://")
+            .then(|| url.to_string())
+            .filter(|u| valid(u))
+    }
+
     /// URL printed by `iris pair`.
     pub fn base_url(&self) -> String {
         if !self.public_url.trim().is_empty() {
@@ -539,6 +556,34 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
 }
 
 /// Atomically write a file readable only by the owner.
+/// Create `path` (0600) with `contents` only if it does not exist yet, as
+/// one atomic step: a complete private file is hard-linked into place, which
+/// fails if another process created it first. Returns false if it existed.
+/// For keys: two processes starting at once must not each write their own.
+pub fn create_private_file_once(path: &Path, contents: &[u8]) -> Result<bool> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".{}.tmp", crate::util::new_id()));
+    let tmp = path.with_file_name(tmp_name);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -614,6 +659,29 @@ mod tests {
         assert_eq!(parse_hhmm("23:59"), Some(1439));
         assert_eq!(parse_hhmm("24:00"), None);
         assert_eq!(parse_hhmm("8"), None);
+    }
+
+    #[test]
+    fn push_needs_a_contact() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.push_subject(), None, "default config has none");
+        cfg.public_url = "http://100.64.0.2:7420".into();
+        assert_eq!(cfg.push_subject(), None);
+        cfg.public_url = "https://iris.example.ts.net/".into();
+        assert_eq!(
+            cfg.push_subject().as_deref(),
+            Some("https://iris.example.ts.net")
+        );
+        cfg.push.vapid_subject = "mailto:admin@example.com".into();
+        assert_eq!(
+            cfg.push_subject().as_deref(),
+            Some("mailto:admin@example.com")
+        );
+        cfg.push.vapid_subject = "admin@example.com".into();
+        assert_eq!(
+            cfg.push_subject().as_deref(),
+            Some("https://iris.example.ts.net")
+        );
     }
 
     #[test]
