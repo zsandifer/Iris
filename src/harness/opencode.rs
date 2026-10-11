@@ -112,8 +112,17 @@ impl Harness for OpenCode {
             config_file.to_string_lossy().into_owned(),
         ));
 
+        if spec.isolated {
+            inv.env
+                .push(("OPENCODE_DISABLE_CLAUDE_CODE".into(), "1".into()));
+        }
         let a = &mut inv.args;
         a.push("run".into());
+        if spec.isolated {
+            // Someone else's chat: no external plugins, and none of the
+            // owner's Claude Code files OpenCode would otherwise load.
+            a.push("--pure".into());
+        }
         // `-f` is an array option: keep it first and follow it with flags.
         for img in &spec.images {
             a.push("-f".into());
@@ -687,6 +696,8 @@ anthropic/claude-haiku-4-5
             writable_dirs: vec!["/data/memory".into()],
             run_dir: tmp.path().into(),
             scope: "c1".into(),
+            isolated: false,
+            own_mcp_servers: Vec::new(),
         };
         let inv = OpenCode::new(HarnessConfig::opencode_default())
             .build(&spec)
@@ -725,6 +736,21 @@ anthropic/claude-haiku-4-5
         let prompt = cfg["instructions"][0].as_str().unwrap();
         assert_eq!(std::fs::read_to_string(prompt).unwrap(), "You are Iris");
         assert_eq!(inv.temp_files.len(), 2);
+        // Someone else's chat: no external plugins or Claude Code files.
+        let mut iso = spec.clone();
+        iso.isolated = true;
+        let inv = OpenCode::new(HarnessConfig::opencode_default())
+            .build(&iso)
+            .unwrap();
+        assert_eq!(&inv.args[..2], ["run", "--pure"]);
+        assert!(
+            inv.env
+                .contains(&("OPENCODE_DISABLE_CLAUDE_CODE".to_string(), "1".to_string()))
+        );
+        let plain = OpenCode::new(HarnessConfig::opencode_default())
+            .build(&spec)
+            .unwrap();
+        assert!(!plain.args.contains(&"--pure".to_string()));
     }
 
     #[test]

@@ -448,7 +448,7 @@ async fn run_locked(
             .await
             .unwrap_or_default()
         };
-        let spec = TurnSpec {
+        let mut spec = TurnSpec {
             turn_id: new_id(),
             prompt,
             images,
@@ -466,8 +466,23 @@ async fn run_locked(
             },
             run_dir: state.paths.run_dir(),
             scope: conv_id.to_string(),
+            isolated: scope != Scope::Private,
+            own_mcp_servers: Vec::new(),
         };
-        let invocation = match entry.harness.build(&spec) {
+        if spec.isolated {
+            match own_mcp_servers(state, entry, &program).await {
+                Some(names) => spec.own_mcp_servers = names,
+                None => {
+                    // Cannot tell which of the CLI's own tools to switch
+                    // off: do not use it for someone else's chat.
+                    crate::warn!("turn {msg_id}: could not list {harness_name}'s own MCP servers");
+                    routing_notes.push(format!("{} could not be isolated", d.model));
+                    excluded.push(harness_name);
+                    continue;
+                }
+            }
+        }
+        let invocation = match build_invocation(state, &harness_name, &spec).await {
             Ok(mut i) => {
                 if harness_name == "claude" && crate::harness::is_managed(&program) {
                     // Iris updates the engines it installed; the CLI's own
@@ -712,8 +727,11 @@ async fn refine_with_model(state: &AppState, text: &str, shared: bool) -> Option
         writable_dirs: Vec::new(),
         run_dir: state.paths.run_dir(),
         scope: "classifier".into(),
+        // A one-word answer needs none of the CLI's own tools or memory.
+        isolated: true,
+        own_mcp_servers: own_mcp_servers(state, entry, &program).await?,
     };
-    let invocation = entry.harness.build(&spec).ok()?;
+    let invocation = build_invocation(state, &m.harness, &spec).await.ok()?;
     let strip = state.strip_env(entry);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -741,6 +759,40 @@ async fn refine_with_model(state: &AppState, text: &str, shared: bool) -> Option
         }
     }
     classifier::parse_model_reply(&reply)
+}
+
+/// Build the command line off the async workers: adapters read and encode
+/// images and write private files.
+async fn build_invocation(
+    state: &AppState,
+    harness: &str,
+    spec: &TurnSpec,
+) -> crate::util::Result<crate::harness::Invocation> {
+    let (st, name, spec) = (state.clone(), harness.to_string(), spec.clone());
+    tokio::task::spawn_blocking(move || match st.harness(&name) {
+        Some(e) => e.harness.build(&spec),
+        None => Err(format!("unknown harness {name}").into()),
+    })
+    .await
+    .map_err(|e| format!("build task failed: {e}"))?
+}
+
+/// MCP servers configured in the CLI itself, for CLIs that switch them off
+/// by name in isolated turns (empty for the others). None if the CLI could
+/// not be asked.
+async fn own_mcp_servers(
+    state: &AppState,
+    entry: &crate::state::HarnessEntry,
+    program: &std::path::Path,
+) -> Option<Vec<String>> {
+    let Some(args) = entry.harness.own_mcp_servers_args() else {
+        return Some(Vec::new());
+    };
+    let strip = state.strip_env(entry);
+    match runner::probe(program, &args, &state.paths.workspace_dir(), &strip).await {
+        Ok((true, out, _)) => entry.harness.parse_own_mcp_servers(&out),
+        _ => None,
+    }
 }
 
 /// In a shared conversation where Claude is the only engine, explain once

@@ -1954,6 +1954,10 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert!(!system.contains("owner-user-fact") && !system.contains("owner-memory-fact"));
         assert!(!system.contains(&memory));
         assert!(!t.read(0, "args").contains(&memory), "memory not writable");
+        assert!(
+            t.read(0, "args").contains("--strict-mcp-config"),
+            "no CLI-level MCP"
+        );
         let mcp: Value = serde_json::from_str(&t.read(0, "mcp.json")).unwrap();
         let servers: Vec<&String> = mcp["mcpServers"].as_object().unwrap().keys().collect();
         assert_eq!(servers, ["iris"]);
@@ -1963,6 +1967,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let system = t.read(1, "system.md");
         assert!(system.contains("owner-user-fact") && system.contains("owner-memory-fact"));
         assert!(t.read(1, "args").contains(&memory));
+        assert!(!t.read(1, "args").contains("--strict-mcp-config"));
         let mcp: Value = serde_json::from_str(&t.read(1, "mcp.json")).unwrap();
         assert!(mcp["mcpServers"]["notes"].is_object());
     }

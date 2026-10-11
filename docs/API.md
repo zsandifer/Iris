@@ -426,7 +426,10 @@ act on the creator's data.
 The Iris owner's **private context** (`USER.md`, `MEMORY.md` and the memory
 notes, write access to `memory/`, and connectors) is only given to turns in
 a conversation whose single member is the Iris owner, and to scheduled jobs.
-Other people's own chats and all shared conversations get none of it. When
+Other people's own chats and all shared conversations get none of it, and
+there the CLI also runs without the MCP servers, memory, and account
+integrations configured in the CLI itself (see the self-hosting guide's
+"Not done yet" for what each CLI allows). When
 the people in a conversation change (for example a group gets its second
 member), the CLI session is restarted rather than resumed, so nothing from
 a private session carries over; a member who leaves stops receiving a
