@@ -233,6 +233,9 @@ function Composer({ cid, running }) {
   const [text, setText] = useState('');
   const [atts, setAtts] = useState([]);
   const [rec, setRec] = useState(null);
+  const [unsent, setUnsent] = useState([]);
+  const textNow = useRef('');
+  textNow.current = text;
   const ta = useRef();
   const file = useRef();
   // Photo previews are object URLs: revoke each when its photo is sent,
@@ -301,8 +304,11 @@ function Composer({ cid, running }) {
     } catch (e) {
       toast(e.message);
       if (!mine.current.mounted) { unpreview(sent); return; }
-      // Put the text and photos back (ahead of any added meanwhile).
-      setText(t);
+      // Put the text back only if the composer is still empty (or still
+      // holds it); a newer draft stays, and the failed one waits for a tap.
+      const cur = textNow.current.trim();
+      if (!cur || cur === t) setText(t);
+      else if (t || sent.length) { unpreview(sent); setUnsent((u) => [...u, { t, ids: sent.map((a) => a.id) }]); return; }
       setAtts((cur) => {
         const all = [...sent, ...cur];
         unpreview(all.slice(MAX_PHOTOS));
@@ -337,7 +343,16 @@ function Composer({ cid, running }) {
   else if (Speech && !text.trim()) action = html`<button class="send" aria-label="Talk" onClick=${mic}><${Icon} name="mic" size=${20} /></button>`;
   else action = html`<button class="send" aria-label="Send" disabled><${Icon} name="send" size=${20} /></button>`;
 
+  const retry = async (u) => {
+    setUnsent((l) => l.filter((x) => x !== u));
+    try { await sendMessage(cid, u.t, u.ids); } catch (e) {
+      toast(e.message);
+      if (mine.current.mounted) setUnsent((l) => [...l, u]);
+    }
+  };
+
   return html`<div class="composer">
+    ${unsent.map((u) => html`<button class="note" onClick=${() => retry(u)}>Not sent, tap to retry: ${u.t || 'photo'}</button>`)}
     ${atts.length > 0 && html`<div class="att-row">${atts.map((a) => html`<div class="att" key=${a.key}>
       <img src=${a.preview} alt="" />${a.uploading && html`<div class="att-busy"><${Spinner} /></div>`}
       <button class="att-x" aria-label="Remove photo" onClick=${() => { URL.revokeObjectURL(a.preview); setAtts((cur) => cur.filter((x) => x.key !== a.key)); }}><${Icon} name="x" size=${12} /></button>

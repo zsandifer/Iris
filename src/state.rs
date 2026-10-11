@@ -633,7 +633,9 @@ impl AppState {
     }
 
     /// Settings as exposed to clients.
-    pub async fn settings_json(&self) -> Value {
+    /// App settings as the API shows them. The feed instructions describe
+    /// the owner's interests, so only the owner sees them.
+    pub async fn settings_json(&self, owner: bool) -> Value {
         let avatar = self.setting("agent_avatar").await;
         let updated = self
             .setting("agent_avatar_updated")
@@ -644,10 +646,28 @@ impl AppState {
             "avatar_url": format!("/api/avatar?v={}", if avatar.is_some() { updated } else { "default".into() }),
             "avatar_custom": avatar.is_some(),
             "allow_claude_for_shared": self.allow_claude_for_shared().await,
-            "feed_prompt": self.feed_prompt().await,
+            "feed_prompt": if owner { Some(self.feed_prompt().await) } else { None },
             "voice": {"enabled": false, "status": "not_implemented"},
             "paused": self.is_paused().await,
         })
+    }
+
+    /// Tell every app about changed settings (the owner's with the private
+    /// parts) and return the owner's view.
+    pub async fn broadcast_settings(&self) -> Value {
+        let public = self.settings_json(false).await;
+        self.hub.send(
+            crate::events::Audience::All,
+            json!({"type": "settings.changed", "settings": public}),
+        );
+        let full = self.settings_json(true).await;
+        if let Ok(Some(owner)) = self.db.call(db::owner_user_id).await {
+            self.hub.to_users(
+                &[owner],
+                json!({"type": "settings.changed", "settings": full}),
+            );
+        }
+        full
     }
 
     /// Per-conversation turn lock.

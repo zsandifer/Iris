@@ -703,7 +703,8 @@ disabled in config.
 {"feed_prompt": "Write a few short, genuinely interesting posts ..."}
 ```
 
-Returns the built-in default when none is set.
+Returns the built-in default when none is set. **Owner only**: the feed
+instructions describe the owner's interests.
 
 #### `PUT /api/feed/prompt` (Owner)
 
@@ -763,13 +764,13 @@ Ideas are tasks the agent proposes (`create_idea` bridge tool). Statuses:
 
 | Query | Type | Notes |
 |---|---|---|
-| `status` | string | Optional exact filter (not validated; an unknown value returns `[]`). |
+| `status` | string | Optional filter: one status or several comma-separated (`open,started`); not validated, unknown values match nothing. |
 
 ```json
-{"ideas": [{Idea}]}
+{"ideas": [{Idea}], "has_more": false}
 ```
 
-Newest first, at most 200.
+Newest first, at most 200; `has_more` says more matched.
 
 #### `PATCH /api/ideas/{id}`
 
@@ -2431,7 +2432,7 @@ Stored as `meta.routing` (plus `notes`).
 | `avatar_url` | string | `/api/avatar?v=<n>`; `v` changes when the avatar does (`default` when none is set). |
 | `avatar_custom` | bool | A custom avatar is set. |
 | `allow_claude_for_shared` | bool | Effective opt-in (config or app setting) for Claude in shared conversations. |
-| `feed_prompt` | string | Effective feed prompt (default if unset). |
+| `feed_prompt` | string \| null | Effective feed prompt (default if unset); `null` for everyone but the owner, who also gets it in `settings.changed` events. |
 | `voice` | object | Always `{"enabled": false, "status": "not_implemented"}`. |
 | `paused` | bool | The owner paused Iris. |
 

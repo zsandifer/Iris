@@ -1,8 +1,8 @@
 // Ideas, Goals, and Library tabs.
 import { html, useEffect, useState } from './h.js';
-import { get, post, patch, del, api, seg, isId } from './api.js';
+import { get, post, patch, del, api, seg, isId, sessionGen } from './api.js';
 import {
-  S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary, loadMoreSaved, loadMorePhotos, loadMoreItems, convFor,
+  S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary, loadMoreSaved, loadMorePhotos, loadMoreItems, convFor, touchList,
 } from './store.js';
 import { Icon, Img, Empty, Spinner, ago, since, openSheet, closeSheet, confirmSheet, hostOf, useBlob } from './ui.js';
 import { md } from './md.js';
@@ -31,6 +31,7 @@ export function IdeasScreen() {
     setBusy(null);
   };
   const later = async (i) => {
+    touchList('ideas');
     set({ ideas: S.ideas.map((x) => (x.id === i.id ? { ...x, status: 'dismissed' } : x)) });
     try { await patch(`/ideas/${seg(i.id)}`, { status: 'dismissed' }); } catch (e) { toast(e.message); loadIdeas(); }
   };
@@ -62,11 +63,13 @@ export function GoalsScreen() {
   const active = S.goals.filter((g) => !g.suggested && !g.done);
   const done = S.goals.filter((g) => g.done);
   const update = async (g, body) => {
+    touchList('goals');
     set({ goals: S.goals.map((x) => (x.id === g.id ? { ...x, ...body } : x)) });
     try { await patch(`/goals/${seg(g.id)}`, body); } catch (e) { toast(e.message); }
     loadGoals().catch(() => {});
   };
   const remove = async (g) => {
+    touchList('goals');
     set({ goals: S.goals.filter((x) => x.id !== g.id) });
     try { await del(`/goals/${seg(g.id)}`); } catch (e) { toast(e.message); loadGoals(); }
   };
@@ -126,8 +129,9 @@ async function openableChat(cid) {
   }
 }
 
-async function openItem(it) {
+export async function openItem(it) {
   openSheet(() => html`<div class="sheet-body"><${Spinner} /></div>`);
+  const gen = sessionGen();
   const chat = openableChat(it.conversation_id);
   try {
     const path = `/library/${seg(it.id)}/content`;
@@ -139,6 +143,8 @@ async function openItem(it) {
         : html`<pre class="doc">${text}</pre>`;
     } else view = html`<p class="mu">I can't show this kind of file here, but you can download it.</p>`;
     const cid = await chat;
+    // Signed out or re-paired meanwhile: this belongs to the previous user.
+    if (gen !== sessionGen()) return;
     openSheet(() => html`<div class="sheet-body tall">
       <h3>${it.title}</h3>${it.description && html`<p class="mu">${it.description}</p>`}
       ${view}

@@ -368,12 +368,19 @@ mod tests {
                 })
             })
             .collect();
-        let mut invalid = 0;
+        let (mut invalid, mut locked) = (0, 0);
         for g in guesses {
-            if matches!(g.await.unwrap(), Err(PairError::Invalid)) {
-                invalid += 1;
+            match g.await.unwrap() {
+                Err(PairError::Invalid) => invalid += 1,
+                Err(PairError::Locked) => locked += 1,
+                Ok(_) => panic!("a wrong code paired a device"),
+                Err(PairError::Internal(e)) => panic!("internal error: {e}"),
             }
         }
-        assert!(invalid <= MAX_FAILURES, "{invalid} guesses were checked");
+        assert_eq!(
+            invalid, MAX_FAILURES,
+            "exactly the allowed guesses were checked"
+        );
+        assert_eq!(locked, 30 - MAX_FAILURES);
     }
 }

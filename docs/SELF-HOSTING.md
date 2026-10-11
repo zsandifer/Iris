@@ -484,8 +484,11 @@ Contributor notes, architecture, and invariants are in
   off in every Iris turn; in other people's chats Iris also switches off
   Claude Code's CLAUDE.md files and auto memory, Codex's ChatGPT apps,
   plugins, and memories, Gemini CLI's extensions, and OpenCode's plugins
-  and Claude Code files. Gemini CLI's global `GEMINI.md` context still
-  applies, so keep personal details out of it if you add people.
+  and Claude Code files. Codex always loads a global `AGENTS.md` (or
+  `AGENTS.override.md`) from its home folder and cannot be told not to, so
+  while one exists Iris does not use Codex for other people's chats.
+  Gemini CLI's global `GEMINI.md` context still applies, so keep personal
+  details out of it if you add people.
 - **Gemini CLI and OpenCode sign-in from the app**: both need one step on
   the server (see above).
 

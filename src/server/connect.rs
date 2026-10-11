@@ -467,11 +467,7 @@ pub async fn set_paused(state: &AppState, paused: bool) -> Result<(), ApiError> 
             if paused { "paused" } else { "resumed" }
         );
     }
-    let settings = state.settings_json().await;
-    state.hub.send(
-        crate::events::Audience::All,
-        json!({"type": "settings.changed", "settings": settings}),
-    );
+    state.broadcast_settings().await;
     Ok(())
 }
 

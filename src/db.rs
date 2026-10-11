@@ -1533,6 +1533,38 @@ mod tests {
     }
 
     #[test]
+    fn a_database_at_the_release_schema_upgrades_with_connectors_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..3] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 3).unwrap();
+            conn.execute(
+                "INSERT INTO connectors (id, name, transport, config, created_at, updated_at)
+                 VALUES ('c1', 'old', 'stdio', '{}', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            let v: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            assert_eq!(v as usize, MIGRATIONS.len());
+            let (cwd, policy): (i64, String) = c.query_row(
+                "SELECT workspace_cwd, policy FROM connectors WHERE id = 'c1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!((cwd, policy.as_str()), (1, "{}"));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn upgrading_spreads_existing_timestamp_ties() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("iris.db");

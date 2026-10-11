@@ -219,7 +219,8 @@ async fn refresh_feed(State(state): State<AppState>, user: AuthUser) -> Result<R
         .into_response())
 }
 
-async fn get_feed_prompt(State(state): State<AppState>, _user: AuthUser) -> ApiResult {
+async fn get_feed_prompt(State(state): State<AppState>, user: AuthUser) -> ApiResult {
+    user.require_owner()?;
     ok(json!({"feed_prompt": state.feed_prompt().await}))
 }
 
@@ -246,11 +247,7 @@ async fn put_feed_prompt(
             }
         })
         .await?;
-    let settings = state.settings_json().await;
-    state.hub.send(
-        crate::events::Audience::All,
-        json!({"type": "settings.changed", "settings": settings}),
-    );
+    state.broadcast_settings().await;
     ok(json!({"feed_prompt": state.feed_prompt().await}))
 }
 
@@ -269,9 +266,11 @@ async fn list_ideas(
     let uid = user.id().to_string();
     let ideas = state
         .db
-        .call(move |c| entities::list_ideas(c, &uid, q.status.as_deref()))
+        .call(move |c| entities::list_ideas_limited(c, &uid, q.status.as_deref(), 201))
         .await?;
-    ok(json!({"ideas": ideas}))
+    let has_more = ideas.len() > 200;
+    let ideas = &ideas[..ideas.len().min(200)];
+    ok(json!({"ideas": ideas, "has_more": has_more}))
 }
 
 #[derive(Deserialize)]

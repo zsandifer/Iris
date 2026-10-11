@@ -295,6 +295,12 @@ pub trait Harness: Send + Sync {
     fn parse_models(&self, _stdout: &str) -> Vec<DiscoveredModel> {
         Vec::new()
     }
+    /// Whether isolated turns are possible right now; Err says what of the
+    /// CLI's own configuration cannot be switched off (the turn then uses
+    /// another engine).
+    fn can_isolate(&self) -> std::result::Result<(), String> {
+        Ok(())
+    }
     /// For CLIs that can only switch off their own MCP servers by name: a
     /// cheap local command listing them (run before isolated turns).
     fn own_mcp_servers_args(&self) -> Option<Vec<String>> {
