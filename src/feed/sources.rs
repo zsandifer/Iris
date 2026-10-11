@@ -68,7 +68,7 @@ fn fetch_rss(f: &Fetcher, url: &str, state: &Value) -> Result<Fetched, String> {
     // confirmed feed is read like a feed reader reads it. Read whole once a
     // day (no conditional request): items not picked today stay candidates
     // tomorrow.
-    let mode = if state["confirmed"].as_bool() == Some(true) {
+    let mode = if state["confirmed"].as_bool() == Some(true) || looks_like_feed_url(&feed_url) {
         Mode::Feed
     } else {
         Mode::Crawl
@@ -121,6 +121,24 @@ fn fetch_rss(f: &Fetcher, url: &str, state: &Value) -> Result<Fetched, String> {
         items,
         state: Some(st),
     })
+}
+
+/// An address that names a feed (`/feed`, `/rss`, `.xml`, ...) rather than
+/// a web page to search for one.
+pub fn looks_like_feed_url(url: &str) -> bool {
+    let Some((_, _, rest)) = markup::split_url(url) else {
+        return false;
+    };
+    let l = rest.to_ascii_lowercase();
+    let path = l.split(['?', '#']).next().unwrap_or("");
+    path.ends_with(".xml")
+        || path.ends_with(".rss")
+        || path.ends_with(".atom")
+        || path
+            .split('/')
+            .any(|seg| matches!(seg, "feed" | "feeds" | "rss" | "atom" | "rss2"))
+        || l.contains("format=rss")
+        || l.contains("feed=rss")
 }
 
 /// `<link rel="alternate" type="application/rss+xml" href="...">` in a page.
@@ -682,6 +700,20 @@ mod tests {
         );
         assert!(s(json!({"type": "rss", "url": "ftp://x"})).is_none());
         assert!(s(json!({"type": "telegram", "name": "x"})).is_none());
+    }
+
+    #[test]
+    fn feed_like_addresses() {
+        assert!(looks_like_feed_url("https://blog.example.com/feed"));
+        assert!(looks_like_feed_url("https://blog.example.com/feed/"));
+        assert!(looks_like_feed_url(
+            "https://news.example.com/rss/space.xml"
+        ));
+        assert!(looks_like_feed_url(
+            "https://x.example/index.php?format=rss"
+        ));
+        assert!(!looks_like_feed_url("https://blog.example.com/"));
+        assert!(!looks_like_feed_url("https://blog.example.com/feedback"));
     }
 
     #[test]

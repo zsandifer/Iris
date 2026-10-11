@@ -1937,8 +1937,9 @@ reach 70.
 
 **Polite fetching.** `User-Agent: IrisFeed/<version> (self-hosted personal feed
 reader)`. robots.txt (redirects followed) is honored for every page read for a
-preview, every photo downloaded, and a website address until it has proven
-to be a feed (finding a site's feed is crawling); `5xx` or unreachable
+preview, every photo downloaded, and a website address (not a feed
+address like `/feed` or `.xml`) until it has proven to be a feed (finding a
+site's feed is crawling); `5xx` or unreachable
 robots.txt means "not this run". Confirmed feeds and the documented
 platform feeds and APIs (YouTube channel feeds, Reddit, Hacker News,
 Bluesky, Mastodon, the YouTube Data API) are read like a feed reader reads
