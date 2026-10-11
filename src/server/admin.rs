@@ -777,6 +777,14 @@ fn credential_parts(kind: &str, b: &CredentialBody) -> Result<(Value, SecretFiel
     }
 }
 
+/// The secret values Iris can fill into pages (not free-form notes).
+fn fillable_secrets(secret: &SecretFields) -> Vec<String> {
+    ["password", "number", "cvc"]
+        .iter()
+        .filter_map(|k| secret.get(*k).and_then(Value::as_str).map(String::from))
+        .collect()
+}
+
 async fn list_credentials(State(state): State<AppState>, user: AuthUser) -> ApiResult {
     user.require_owner()?;
     let uid = user.id().to_string();
@@ -810,6 +818,8 @@ async fn create_credential(
         }));
     }
     let id = new_id();
+    // A browser session already open must hide the new secret too.
+    state.browser.learn_secrets(&fillable_secrets(&secret));
     let ct = state
         .vault
         .encrypt(Value::Object(secret).to_string().as_bytes(), &id)?;
@@ -860,6 +870,7 @@ async fn update_credential(
         let plain = state.vault.decrypt(&stored, &id)?;
         let mut merged: SecretFields = serde_json::from_slice(&plain).unwrap_or_default();
         merged.extend(secret);
+        state.browser.learn_secrets(&fillable_secrets(&merged));
         Some(
             state
                 .vault

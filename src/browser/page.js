@@ -18,7 +18,11 @@ if (!globalThis.__iris) {
     const refOf = (el) => {
       let r = ids.get(el);
       if (!r) {
-        r = prefix + next++;
+        // Letters only, so redacting a numeric secret never mangles a ref.
+        let n = next++;
+        let tail = '';
+        do { tail = 'abcdefghijklmnopqrstuvwxyz'[n % 26] + tail; n = Math.floor(n / 26); } while (n > 0);
+        r = prefix + tail;
         ids.set(el, r);
       }
       refs.set(r, el);
@@ -44,25 +48,32 @@ if (!globalThis.__iris) {
     };
     // Percent-decoding that never throws: runs of escapes are decoded
     // together (multi-byte UTF-8, any letter case); bad runs byte by byte.
-    // Pages in legacy encodings escape bytes as Latin-1 (ä as %E4).
-    const decodeLoose = (s) => s.replace(/\+/g, ' ').replace(/(%[0-9a-f]{2})+/gi, (run) => {
-      try { return decodeURIComponent(run); } catch {
-        return run.replace(/%([0-9a-f]{2})/gi, (m, h) => String.fromCharCode(parseInt(h, 16)));
-      }
+    // Percent-decoded readings of a string: with '+' kept and as a space;
+    // UTF-8, or (pages in legacy encodings) Windows-1252 bytes.
+    const CP1252 = '€\u0081‚ƒ„…†‡ˆ‰Š‹Œ\u008dŽ\u008f\u0090‘’“”•–—˜™š›œ\u009džŸ';
+    const byte = (h) => {
+      const c = parseInt(h, 16);
+      return c >= 0x80 && c < 0xa0 ? CP1252[c - 0x80] : String.fromCharCode(c);
+    };
+    const pct = (s, legacy) => s.replace(/(%[0-9a-f]{2})+/gi, (run) => {
+      if (!legacy) { try { return decodeURIComponent(run); } catch { /* not UTF-8 */ } }
+      return run.replace(/%([0-9a-f]{2})/gi, (m, h) => byte(h));
     });
+    const decodings = (s) => [pct(s, false), pct(s.replace(/\+/g, ' '), false), pct(s, true), pct(s.replace(/\+/g, ' '), true)];
     // Card numbers in any grouping ("3782 822463 10005", "4242-4242-...").
     const digitRes = () => secrets.filter((x) => /^\d{12,19}$/.test(x))
       .map((x) => new RegExp(x.split('').join('[\\s.\\u00a0-]*'), 'g'));
-    const leaks = (t) => secrets.some((x) => t.includes(x)) || digitRes().some((r) => { r.lastIndex = 0; return r.test(t); });
+    const leaksRaw = (t) => secrets.some((x) => t.includes(x)) || digitRes().some((r) => { r.lastIndex = 0; return r.test(t); });
+    const leaks = (t) => decodings(t).some(leaksRaw);
     const redact = (s) => {
       let out = String(s ?? '');
       for (const x of secrets) if (out.includes(x)) out = out.split(x).join('••••');
       for (const r of digitRes()) out = out.replace(r, '••••');
       // Still there once percent-decoded (an address in another escaping):
       // drop the query, or the whole piece if the rest still shows it.
-      if (secrets.length && leaks(decodeLoose(out))) {
+      if (secrets.length && leaks(out)) {
         const q = out.indexOf('?');
-        out = q >= 0 && !leaks(decodeLoose(out.slice(0, q))) ? out.slice(0, q) + '?••••' : '••••';
+        out = q >= 0 && !leaks(out.slice(0, q)) ? out.slice(0, q) + '?••••' : '••••';
       }
       return out;
     };
@@ -109,6 +120,7 @@ if (!globalThis.__iris) {
       'menuitemradio', 'option', 'searchbox', 'spinbutton', 'file upload', 'treeitem']);
 
     function name(el) {
+      if (holdsSplit(el)) return '••••';
       const doc = el.ownerDocument;
       const lb = el.getAttribute('aria-labelledby');
       if (lb) {
@@ -160,6 +172,65 @@ if (!globalThis.__iris) {
       return '';
     }
 
+    // Text nodes that hold a piece of a secret split across elements (even
+    // across rows of the snapshot): found on the page's whole text, in
+    // document order, before anything is formatted.
+    let split = new WeakSet();
+    function markSplitSecrets(root) {
+      split = new WeakSet();
+      if (!secrets.length) return;
+      const nodes = [];
+      const collect = (n, depth) => {
+        if (depth > 200) return;
+        if (n.nodeType === 3) { nodes.push(n); return; }
+        if (n.nodeType !== 1 && n.nodeType !== 11) return;
+        if (n.nodeType === 1) {
+          const t = n.tagName.toLowerCase();
+          if (['script', 'style', 'noscript', 'template'].includes(t)) return;
+          if (t === 'iframe' || t === 'frame') {
+            let d = null;
+            try { d = n.contentDocument; } catch { d = null; }
+            if (d && d.body) collect(d.body, depth + 1);
+            return;
+          }
+          if (n.shadowRoot) { for (const k of n.shadowRoot.childNodes) collect(k, depth + 1); return; }
+        }
+        for (const k of n.childNodes) collect(k, depth + 1);
+      };
+      collect(root, 0);
+      // Whitespace removed, so line breaks and spacing between pieces do
+      // not hide a match; map each character back to its node.
+      let all = '';
+      const owner = [];
+      nodes.forEach((n, i) => {
+        for (const ch of n.nodeValue) {
+          if (/\s/.test(ch)) continue;
+          all += ch;
+          owner.push(i);
+        }
+      });
+      for (const x of secrets) {
+        const want = x.replace(/\s+/g, '');
+        if (want.length < 3) continue;
+        let at = all.indexOf(want);
+        while (at >= 0) {
+          // Whole inside one text node: redact() handles it in place.
+          if (owner[at] !== owner[at + want.length - 1]) {
+            for (let k = at; k < at + want.length; k++) split.add(nodes[owner[k]]);
+          }
+          at = all.indexOf(want, at + 1);
+        }
+      }
+    }
+
+    // Accessible names and headings come from innerText: if any of their
+    // text holds a piece of a split secret, the whole name is hidden.
+    const holdsSplit = (el) => {
+      const w = el.ownerDocument.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+      for (let n = w.nextNode(); n; n = w.nextNode()) if (split.has(n)) return true;
+      return false;
+    };
+
     function snapshot(max) {
       const lines = [];
       let size = 0;
@@ -184,8 +255,9 @@ if (!globalThis.__iris) {
         if (full || depth > 200) return;
         if (node.nodeType === 3) {
           // Exactly as written: adjacent inline pieces stay together, so a
-          // secret split across elements is still recognized.
-          if (textOk) buf += node.nodeValue;
+          // secret split across elements is still recognized. Pieces of a
+          // secret split across rows were marked beforehand.
+          if (textOk) buf += split.has(node) ? '••••' : node.nodeValue;
           return;
         }
         if (node.nodeType !== 1 && node.nodeType !== 11) return;
@@ -215,7 +287,7 @@ if (!globalThis.__iris) {
           }
           if (/^h[1-6]$/.test(t) || r === 'heading') {
             flush();
-            push(`- heading ${q(clean(el.innerText, 200))} [level=${t[1] || el.getAttribute('aria-level') || 2}]`);
+            push(`- heading ${q(holdsSplit(el) ? '••••' : clean(el.innerText, 200))} [level=${t[1] || el.getAttribute('aria-level') || 2}]`);
             textOk = false;
           } else if (t === 'img') {
             const alt = clean(el.alt, 120);
@@ -249,6 +321,7 @@ if (!globalThis.__iris) {
         for (const k of el.childNodes) walk(k, depth + 1, textOk);
       };
       refs.clear();
+      markSplitSecrets(document.body || document.documentElement);
       walk(document.body || document.documentElement, 0, true);
       flush();
       return { text: lines.join('\n'), truncated: full, url: redact(location.href), title: clean(document.title, 300) };
@@ -374,7 +447,9 @@ if (!globalThis.__iris) {
         setter.call(e, value);
         e.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
         e.dispatchEvent(new Event('change', { bubbles: true }));
-        return { ok: true, set: true };
+        // The page may reformat (same characters, other spacing) or refuse.
+        const same = e.value === value || e.value.replace(/[\s-]/g, '') === value.replace(/[\s-]/g, '');
+        return same ? { ok: true, set: true } : { error: 'rejected' };
       }
       const f = focus(ref);
       return f.error ? f : { ok: f.ok, set: false };
@@ -489,9 +564,10 @@ if (!globalThis.__iris) {
       };
     }
 
+    // On the redacted text only: no way to guess a secret piece by piece.
     function hasText(text) {
       const want = String(text).toLowerCase();
-      return docs().some((d) => (d.body ? d.body.innerText : '').toLowerCase().includes(want));
+      return docs().some((d) => redact(d.body ? d.body.innerText : '').toLowerCase().includes(want));
     }
 
     return { snapshot, point, focus, hasFocus, setText, choose, loginFields, cardFields, fillField, pageText, hasText, setSecrets,

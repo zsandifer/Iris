@@ -172,10 +172,12 @@ function Viewer({ control }) {
     if (e.data) input({ kind: 'text', text: e.data });
     reset(e.target);
   };
-  const go2 = async (e) => {
+  // Through the same ordered input stream as taps and typing.
+  const go2 = (e) => {
     e.preventDefault();
     if (!url.trim()) return;
-    try { await post('/browser/navigate', { url: url.trim() }); setUrl(''); } catch (err) { toast(err.message); }
+    input({ kind: 'navigate', url: url.trim() });
+    setUrl('');
   };
 
   let status;

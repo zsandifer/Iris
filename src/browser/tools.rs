@@ -234,7 +234,12 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Ou
     if let Err(e) = b.check_agent(&ctx) {
         return Output::error(e.to_string());
     }
-    let run = match b.ensure().await {
+    // Starting is cancelled too if the turn ends meanwhile.
+    let started = tokio::select! {
+        r = b.ensure() => r,
+        _ = ctx.wait_ended() => return Output::error(super::TURN_ENDED),
+    };
+    let run = match started {
         Ok(r) => r,
         Err(e) => return Output::error(format!("The browser could not start: {e}")),
     };
@@ -242,10 +247,7 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Ou
     if let Err(e) = b.check_agent(&ctx) {
         return Output::error(e.to_string());
     }
-    // Pages may show a secret kept from an earlier session: know them all.
-    if !run.seeded.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        super::fill::seed_secrets(state, &ctx.user_id, &run).await;
-    }
+
     b.set_busy(true);
     let started = std::time::Instant::now();
     // An ended turn stops its tool at once (and frees the page).
@@ -572,6 +574,7 @@ fn collect_origins(node: &Value, out: &mut Vec<String>) {
 
 fn stale_message(e: &str) -> String {
     match e {
+        "rejected" => "The page did not accept that text (it changed or cleared it).".into(),
         "hidden" => "That element is not visible right now; take a new snapshot.".into(),
         _ => "That ref is not on the page anymore; take a new snapshot.".into(),
     }
@@ -617,13 +620,19 @@ async fn tabs(state: &AppState, ctx: &TurnCtx, run: &Arc<Running>, a: &Value) ->
                 .call("Target.createTarget", json!({"url": url}), None)
                 .await?;
             let id = t["targetId"].as_str().unwrap_or_default().to_string();
-            state.browser.attach(run, &id).await?;
+            state
+                .browser
+                .attach_guarded(run, &id, &|| state.browser.check_agent(ctx))
+                .await?;
             tokio::time::sleep(Duration::from_millis(800)).await;
             snapshot(run).await
         }
         "select" => {
             let id = pick(index)?;
-            state.browser.attach(run, &id).await?;
+            state
+                .browser
+                .attach_guarded(run, &id, &|| state.browser.check_agent(ctx))
+                .await?;
             snapshot(run).await
         }
         "close" => {
@@ -958,6 +967,54 @@ pub(crate) mod tests {
             h.enabled = false;
         }
         AppState::new(cfg, paths, db).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn card_approval_follow_up_respects_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let (owner, conv) = state
+            .db
+            .with(|c| {
+                let u = crate::db::owner_user_id(c)?.unwrap();
+                let m = crate::db::ensure_main_conversation(c, &u)?;
+                Ok((u, m))
+            })
+            .unwrap();
+        let approved = || {
+            let mut card = crate::entities::approval_card(&crate::entities::ApprovalRequest {
+                title: "Use your card",
+                service: "wallet",
+                approver_user_id: &owner,
+                ..Default::default()
+            });
+            card["state"] = "approved".into();
+            card["wallet"] = json!({"credential_id": "c", "origin": "https://s.test", "revision": 1, "used_at": null});
+            state
+                .db
+                .with(|c| crate::entities::insert_card(c, &conv, &card, "assistant"))
+                .unwrap()
+        };
+        let follow_ups = || {
+            state
+                .db
+                .with(|c| crate::db::list_messages(c, &conv, None, 50))
+                .unwrap()
+                .iter()
+                .filter(|m| m.content == "I approved the card. Go ahead.")
+                .count()
+        };
+        // Stop pressed after approving: no follow-up.
+        let m = approved();
+        super::super::fill::resume_after_approval(state.clone(), m.id, conv.clone(), owner.clone());
+        crate::turn::cancel(&state, &conv);
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        assert_eq!(follow_ups(), 0);
+        // Otherwise the chat carries on once nothing runs.
+        let m = approved();
+        super::super::fill::resume_after_approval(state.clone(), m.id, conv.clone(), owner.clone());
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        assert_eq!(follow_ups(), 1);
     }
 
     #[tokio::test]

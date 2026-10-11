@@ -55,10 +55,12 @@ const REFLECT_PAGE: &str = r#"<!doctype html><html><head><title>Echo sign in</ti
 <input id="pw" name="password" type="password" aria-label="Password"
   oninput="document.getElementById('echo').textContent = 'You typed ' + this.value;
            document.getElementById('copy').value = this.value; alert('Got ' + this.value);
-           document.getElementById('split').innerHTML = '<span>' + this.value.slice(0, 6) + '</span><span>' + this.value.slice(6) + '</span>'">
+           const v = this.value, a = v.slice(0, 6), b = v.slice(6);
+           document.getElementById('split').innerHTML = 'Split: <span>' + a + '</span><span>' + b + '</span>';
+           document.getElementById('blocks').innerHTML = '<p>' + a + '</p><p>' + b + '</p><span>' + a + '</span><button>' + b + '</button>'">
 <input id="copy" aria-label="Copy">
 <button type="button" onclick="pw.type = 'text'">Show password</button>
-</form><p id="echo"></p><p id="split"></p></body></html>"#;
+</form><p id="echo"></p><p id="split"></p><div id="blocks"></div></body></html>"#;
 
 /// A saved password shown in a masked field (never filled by Iris), one
 /// in an open shadow root, and what the page kept from an earlier fill.
@@ -480,6 +482,12 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
     // stays off-limits for screenshots even on a clean page, and a CVC the
     // page kept is still redacted.
     let paths = state.paths.clone();
+    // The card is deleted: its CVC now lives only in the encrypted history.
+    let owner3 = owner.clone();
+    state
+        .db
+        .with(|c| crate::entities::delete_credential(c, &owner3, "cred-card"))
+        .unwrap();
     drop(state);
     let db = crate::db::Db::open(&paths.db_file()).unwrap();
     let mut cfg = Config::default();
@@ -506,6 +514,13 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
         "{}",
         out.text
     );
+    // No guessing it digit by digit through `wait` either.
+    let out = call(
+        "wait",
+        json!({"text": format!("Kept: {}", &CVC[..1]), "seconds": 1}),
+    )
+    .await;
+    assert!(out.text.contains("did not appear"), "{}", out.text);
     let shot = call("screenshot", json!({})).await;
     assert!(shot.is_error && shot.image.is_none(), "{}", shot.text);
     call(
@@ -548,6 +563,13 @@ async fn reflected_secrets_pending_and_denied_cards_and_stale_refs() {
     outputs.push(out.text);
     let snap = call("snapshot", json!({})).await;
     assert!(snap.text.contains("You typed ••••"), "{}", snap.text);
+    // Split across inline elements, blocks, and a button: every piece hidden.
+    assert!(snap.text.contains("Split: ••••"), "{}", snap.text);
+    assert!(
+        !snap.text.contains("S3cret-") && !snap.text.contains("Pa55-xyz"),
+        "{}",
+        snap.text
+    );
     outputs.push(snap.text.clone());
     // Revealed as plain text: still masked in what the agent reads.
     let show = ref_of(&snap.text, "button \"Show password\"");

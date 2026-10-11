@@ -2485,7 +2485,9 @@ fields Iris filled from the vault are shown as `••••` in snapshots and
 masked on screen. JavaScript dialogs are answered (alerts and confirms
 accepted, prompts dismissed) and reported at the top of the next result.
 Text is read exactly as written (adjacent inline elements are not split
-apart). Every secret Iris filled in the current browser session is replaced with
+apart), and a secret split across elements, blocks, or controls is found on
+the page's whole text first, hiding every piece. `wait` matches only the
+redacted text. Every secret Iris filled in the current browser session is replaced with
 `••••` anywhere in a tool result (a page could echo it in a dialog, title,
 or other field). The page helpers do this on the raw text, before folding
 whitespace, cutting long values, or quoting, so no escaped or partial copy
@@ -2497,8 +2499,11 @@ are redacted the same way; card numbers are found in any grouping
 The owner's saved passwords, card numbers, and CVCs, and every secret Iris
 ever filled (kept encrypted with the vault in
 `<data dir>/browser/redaction.enc`, so edited or deleted ones too), are
-known to the redactor from the start: a page may show one it kept from an
-earlier session. (So the same three digits as a saved CVC are hidden on
+known to the redactor before a browser session shows or reads anything
+(also when it is started from the app), and credentials saved or edited
+while it runs are added at once: a page may show one it kept from an
+earlier session. If that history cannot be read, the browser does not
+start. (So the same three digits as a saved CVC are hidden on
 pages too.) `screenshot` never shows a page that is, or embeds a frame
 from, a site (origin) Iris ever filled a secret into (stored hashed in
 `<data dir>/browser/tainted-origins.json`; if that file cannot be read,
@@ -2537,7 +2542,8 @@ after that it answers `waiting for approval`, and calling it again on the
 same site later picks up the decision. When the owner approves after
 `fill_card` stopped waiting, the server waits until no turn runs in that
 chat and, if the approval is still unused, continues with a message from
-the owner ("I approved the card. Go ahead."), which leads to that call. An approval is for the card as it was: editing the card asks again.
+the owner ("I approved the card. Go ahead."), which leads to that call
+(not after the owner pressed Stop in that chat). An approval is for the card as it was: editing the card asks again.
 After approval (still unexpired and unused when it is consumed), Iris fills
 the card number, expiry, CVC, and name itself the same way, on the approved
 page only; each approval fills once and is bound to the browser's exact

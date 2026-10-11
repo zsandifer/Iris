@@ -226,52 +226,61 @@ fn not_found_for(e: crate::util::BoxError) -> Result<Output> {
     }
 }
 
-/// Load every saved secret of the user for redaction (never filled or
-/// returned from here).
-pub async fn seed_secrets(state: &AppState, user_id: &str, run: &Running) {
-    if let Ok(ct) = std::fs::read(history_file(state))
-        && let Ok(plain) = state.vault.decrypt(&ct, HISTORY_AAD)
-    {
-        let list: Vec<String> = serde_json::from_slice(&plain).unwrap_or_default();
-        for s in list {
-            run.remember_secret(&s);
-        }
-    }
-    let uid = user_id.to_string();
-    let rows = state
-        .db
-        .call(move |c| {
-            let list = entities::list_credentials(c, &uid)?;
-            let mut out = Vec::new();
-            for cred in list {
-                if let Some(ct) = entities::get_credential_ciphertext(c, &uid, &cred.id)? {
-                    out.push((cred.id, ct));
-                }
-            }
-            Ok(out)
-        })
-        .await
-        .unwrap_or_default();
-    for (id, ct) in rows {
-        let Ok(plain) = state.vault.decrypt(&ct, &id) else {
-            continue;
+/// Every secret the redactor must know: the owner's saved passwords,
+/// card numbers, and CVCs, and the encrypted history of every secret ever
+/// filled (so edited or deleted ones too). Blocking. An unreadable history
+/// is an error: the browser then stays off rather than read pages blind.
+pub fn load_secrets_blocking(
+    db: &crate::db::Db,
+    vault: &crate::secrets::Vault,
+    history: &std::path::Path,
+) -> Result<Vec<String>> {
+    let rows = db.with(|c| {
+        let Some(owner) = db::owner_user_id(c)? else {
+            return Ok(Vec::new());
         };
+        let mut out = Vec::new();
+        for cred in entities::list_credentials(c, &owner)? {
+            if let Some(ct) = entities::get_credential_ciphertext(c, &owner, &cred.id)? {
+                out.push((cred.id, ct));
+            }
+        }
+        Ok(out)
+    })?;
+    let mut secrets = Vec::new();
+    for (id, ct) in rows {
+        let plain = vault.decrypt(&ct, &id)?;
         let fields: serde_json::Map<String, Value> =
             serde_json::from_slice(&plain).unwrap_or_default();
         // CVCs too: a page may show one it kept, even after a restart (the
         // cost is that the same three digits elsewhere are hidden as well).
         for k in ["password", "number", "cvc"] {
             if let Some(v) = fields.get(k).and_then(Value::as_str) {
-                run.remember_secret(v);
+                secrets.push(v.to_string());
             }
         }
     }
+    match std::fs::read(history) {
+        Ok(ct) => {
+            let plain = vault.decrypt(&ct, HISTORY_AAD)?;
+            let list: Vec<String> = serde_json::from_slice(&plain)?;
+            secrets.extend(list);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(secrets)
 }
 
-const HISTORY_AAD: &str = "browser-redaction-history";
+/// File of the encrypted history (see `load_secrets_blocking`).
+pub fn history_path(paths: &crate::config::Paths) -> std::path::PathBuf {
+    paths.browser_dir().join("redaction.enc")
+}
+
+pub const HISTORY_AAD: &str = "browser-redaction-history";
 
 fn history_file(state: &AppState) -> std::path::PathBuf {
-    state.paths.browser_dir().join("redaction.enc")
+    history_path(&state.paths)
 }
 
 /// Every secret Iris ever filled (also ones since edited or deleted),
@@ -796,6 +805,8 @@ async fn wait_decision(state: &AppState, ctx: &TurnCtx, message_id: &str) -> Opt
 /// still unused, continue with a short message from the owner, so Iris
 /// picks it up (`fill_card` then finds the approval).
 pub fn resume_after_approval(state: AppState, message_id: String, conv: String, approver: String) {
+    // Pressing Stop after approving means: do not carry on.
+    let stops = state.browser.stop_count(&conv);
     tokio::spawn(async move {
         // Give a waiting fill_card its chance to take it first.
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -828,7 +839,7 @@ pub fn resume_after_approval(state: AppState, message_id: String, conv: String, 
                     && now_ms() - m.created_at < APPROVAL_TTL_MS
             })
         });
-        if !still_open {
+        if !still_open || state.browser.stop_count(&conv) != stops {
             return;
         }
         if let Err(e) = crate::turn::start_chat_turn(
@@ -850,6 +861,27 @@ pub fn resume_after_approval(state: AppState, message_id: String, conv: String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redaction_history_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::browser::tools::tests::test_state(tmp.path());
+        let file = history_path(&state.paths);
+        // No history yet: fine.
+        assert!(load_secrets_blocking(&state.db, &state.vault, &file).is_ok());
+        // A history that cannot be read: the browser must not start blind.
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"garbage").unwrap();
+        assert!(load_secrets_blocking(&state.db, &state.vault, &file).is_err());
+        // A good one round-trips.
+        let ct = state
+            .vault
+            .encrypt(br#"["old-password-1"]"#, HISTORY_AAD)
+            .unwrap();
+        std::fs::write(&file, ct).unwrap();
+        let list = load_secrets_blocking(&state.db, &state.vault, &file).unwrap();
+        assert!(list.contains(&"old-password-1".to_string()));
+    }
 
     #[test]
     fn approvals_are_bound_to_revision_age_and_single_use() {

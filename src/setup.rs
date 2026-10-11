@@ -258,17 +258,22 @@ pub async fn maybe_auto_update(state: &AppState) {
         return;
     }
     let root = engines_root(state);
-    // AI engines and Iris's browser (a browser that visits arbitrary sites
-    // needs its security updates).
-    let all = || ENGINES.iter().chain(std::iter::once(&engines::BROWSER));
-    if !all().any(|e| engines::is_installed(&root, e.name)) {
-        return;
-    }
-    let last = state
-        .setting("engines.last_update")
-        .await
-        .and_then(|s| s.parse::<i64>().ok());
-    if last.is_some_and(|l| now_ms() - l < DAY_MS) {
+    let due = |key: &'static str| async move {
+        state
+            .setting(key)
+            .await
+            .and_then(|s| s.parse::<i64>().ok())
+            .is_none_or(|l| now_ms() - l >= DAY_MS)
+    };
+    let engines_due = ENGINES.iter().any(|e| engines::is_installed(&root, e.name))
+        && due("engines.last_update").await;
+    // Iris's browser has its own clock: it is only updated while closed
+    // (never swapping Chromium's files under it), so it may be due later
+    // than the CLIs. A browser visiting arbitrary sites needs its updates.
+    let browser_due = engines::is_installed(&root, engines::BROWSER.name)
+        && state.browser.running().is_none()
+        && due("engines.browser_last_update").await;
+    if !engines_due && !browser_due {
         return;
     }
     let busy = !state
@@ -279,19 +284,22 @@ pub async fn maybe_auto_update(state: &AppState) {
     if busy {
         return;
     }
-    let now = now_ms().to_string();
-    let _ = state
-        .db
-        .call(move |c| db::set_setting(c, "engines.last_update", &now))
-        .await;
-    for e in all() {
-        // Never swap Chromium's files under a running browser.
-        if e.name == engines::BROWSER.name && state.browser.running().is_some() {
-            continue;
+    let mark = |key: &'static str| async move {
+        let now = now_ms().to_string();
+        let _ = state.db.call(move |c| db::set_setting(c, key, &now)).await;
+    };
+    if engines_due {
+        mark("engines.last_update").await;
+        for e in ENGINES {
+            if engines::is_installed(&root, e.name) && state.engine_ops.try_begin(e.name, "update")
+            {
+                run_op(state, e.name, "update").await;
+            }
         }
-        if engines::is_installed(&root, e.name) && state.engine_ops.try_begin(e.name, "update") {
-            run_op(state, e.name, "update").await;
-        }
+    }
+    if browser_due && state.engine_ops.try_begin(engines::BROWSER.name, "update") {
+        mark("engines.browser_last_update").await;
+        run_op(state, engines::BROWSER.name, "update").await;
     }
 }
 

@@ -98,8 +98,10 @@ pub async fn run_turn(state: &AppState, input: TurnInput) -> TurnResult {
 
 /// Request cancellation of the running turn in a conversation.
 pub fn cancel(state: &AppState, conversation_id: &str) -> bool {
-    // Browser work of this turn stops now, not when the CLI has exited.
+    // Browser work of this turn stops now, not when the CLI has exited, and
+    // nothing queued before the Stop (a card approval's follow-up) resumes.
     state.browser.end_turns(Some(conversation_id));
+    state.browser.note_stop(conversation_id);
     state
         .running
         .lock()

@@ -99,6 +99,10 @@ impl Mode {
     }
 }
 
+/// Loads every secret the redactor must know (the owner's saved ones and
+/// the encrypted history of filled ones). Blocking; runs off the runtime.
+pub type SecretSource = Arc<dyn Fn() -> Result<Vec<String>> + Send + Sync>;
+
 /// One encoded frame, serialized once for every watcher.
 pub struct Frame {
     pub json: String,
@@ -253,15 +257,16 @@ fn redact_digit_run(text: &str, digits: &str) -> (String, bool) {
     (out, hit)
 }
 
-/// Percent-decoding that never fails (`+` as space; bad escapes kept).
-fn decode_loose(s: &str) -> String {
+/// Percent-decoding that never fails (bad escapes kept), as UTF-8 or,
+/// for pages in legacy encodings, Windows-1252.
+fn decode_pct(s: &str, plus_space: bool, legacy: bool) -> String {
     let b = s.as_bytes();
     let hex = |c: u8| (c as char).to_digit(16);
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         match b[i] {
-            b'+' => out.push(b' '),
+            b'+' if plus_space => out.push(b' '),
             b'%' if i + 2 < b.len() => match (hex(b[i + 1]), hex(b[i + 2])) {
                 (Some(h), Some(l)) => {
                     out.push((h * 16 + l) as u8);
@@ -274,11 +279,39 @@ fn decode_loose(s: &str) -> String {
         }
         i += 1;
     }
-    match String::from_utf8(out) {
-        Ok(s) => s,
-        // Pages in legacy encodings escape bytes as Latin-1 (ä as %E4).
-        Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
+    if !legacy && let Ok(s) = String::from_utf8(out.clone()) {
+        return s;
     }
+    const CP1252: [char; 32] = [
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž',
+        '\u{8f}', '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}',
+        'ž', 'Ÿ',
+    ];
+    out.iter()
+        .map(|&b| {
+            if (0x80..0xa0).contains(&b) {
+                CP1252[(b - 0x80) as usize]
+            } else {
+                b as char
+            }
+        })
+        .collect()
+}
+
+/// Every reading of a possibly escaped string: `+` kept or as a space,
+/// UTF-8 or Windows-1252.
+fn decodings(s: &str) -> [String; 4] {
+    [
+        decode_pct(s, false, false),
+        decode_pct(s, true, false),
+        decode_pct(s, false, true),
+        decode_pct(s, true, true),
+    ]
+}
+
+#[cfg(test)]
+fn decode_loose(s: &str) -> String {
+    decode_pct(s, true, false)
 }
 
 /// Percent-encoding as JavaScript's `encodeURIComponent`.
@@ -359,10 +392,11 @@ impl Running {
             out = redact_digit_run(&out, s).0;
         }
         let leaks = |t: &str| {
-            let d = decode_loose(t);
-            secrets
-                .iter()
-                .any(|s| d.contains(s.as_str()) || (is_card_number(s) && redact_digit_run(&d, s).1))
+            decodings(t).iter().any(|d| {
+                secrets.iter().any(|s| {
+                    d.contains(s.as_str()) || (is_card_number(s) && redact_digit_run(d, s).1)
+                })
+            })
         };
         if !out.lines().any(leaks) {
             return out;
@@ -405,10 +439,10 @@ impl Running {
     /// Whether text contains a remembered secret (also percent-encoded).
     pub fn shows_secret(&self, text: &str) -> bool {
         let secrets = lock(&self.secrets);
-        let decoded = decode_loose(text);
+        let all = decodings(text);
         secrets.iter().any(|s| {
-            [text, decoded.as_str()]
-                .iter()
+            std::iter::once(text)
+                .chain(all.iter().map(String::as_str))
                 .any(|t| t.contains(s.as_str()) || (is_card_number(s) && redact_digit_run(t, s).1))
         })
     }
@@ -458,6 +492,10 @@ pub struct Shared {
     tainted_file: PathBuf,
     /// Orders changes of the saved safety switches (pause, sandbox).
     pub switch_lock: tokio::sync::Mutex<()>,
+    secret_source: Mutex<Option<SecretSource>>,
+    /// Bumped by Stop per conversation: work queued before it (a card
+    /// approval's continuation) is dropped.
+    stops: Mutex<HashMap<String, u64>>,
 }
 
 #[derive(Clone)]
@@ -509,7 +547,49 @@ impl Browser {
             tainted: Mutex::new(load_tainted(&dir.join("tainted-origins.json"))),
             tainted_file: dir.join("tainted-origins.json"),
             switch_lock: tokio::sync::Mutex::new(()),
+            secret_source: Mutex::new(None),
+            stops: Mutex::default(),
         }))
+    }
+
+    pub fn set_secret_source(&self, source: SecretSource) {
+        *lock(&self.secret_source) = Some(source);
+    }
+
+    /// Know every saved and earlier filled secret before a session shows
+    /// anything (fails closed if they cannot be read).
+    async fn seed(&self, run: &Running) -> Result<()> {
+        let source = lock(&self.secret_source).clone();
+        if let Some(source) = source {
+            let list = tokio::task::spawn_blocking(move || source())
+                .await
+                .map_err(|e| e.to_string())??;
+            for s in list {
+                run.remember_secret(&s);
+            }
+        }
+        run.seeded.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// A credential was saved or edited: a running session learns it now.
+    pub fn learn_secrets(&self, secrets: &[String]) {
+        if let Some(run) = self.running() {
+            for s in secrets {
+                run.remember_secret(s);
+            }
+        }
+    }
+
+    /// Stop was pressed in a conversation.
+    pub fn note_stop(&self, conversation_id: &str) {
+        *lock(&self.stops)
+            .entry(conversation_id.to_string())
+            .or_default() += 1;
+    }
+
+    pub fn stop_count(&self, conversation_id: &str) -> u64 {
+        lock(&self.stops).get(conversation_id).copied().unwrap_or(0)
     }
 
     /// Remember (on disk, before anything is filled) that Iris fills a
@@ -807,6 +887,10 @@ impl Browser {
         if self.maintenance.load(Ordering::SeqCst) {
             return Err("the browser is being updated; try again in a minute".into());
         }
+        // Pause may have come while waiting for the lock.
+        if self.is_paused() {
+            return Err("Iris is paused".into());
+        }
         if let Some(r) = self.running() {
             return Ok(r);
         }
@@ -882,6 +966,13 @@ impl Browser {
                 .unwrap_or_default()
                 .to_string(),
         };
+        // Secrets first: nothing from a page is read or shown before the
+        // redactor knows them all.
+        if let Err(e) = self.seed(&run).await {
+            crate::warn!("browser: could not load its safety data: {e}");
+            Self::shut(&run).await;
+            return Err("the browser's safety data could not be read".into());
+        }
         if let Err(e) = self.attach(&run, &target).await {
             Self::shut(&run).await;
             return Err(e);
@@ -919,12 +1010,28 @@ impl Browser {
 
     /// Attach to a page target and make it the current tab.
     pub async fn attach(&self, run: &Running, target_id: &str) -> Result<()> {
-        self.attach_if(run, target_id, None).await
+        self.attach_if(run, target_id, None, &|| Ok(())).await
+    }
+
+    /// Tab switch by the agent: abandoned if it lost control meanwhile.
+    pub async fn attach_guarded(
+        &self,
+        run: &Running,
+        target_id: &str,
+        guard: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
+        self.attach_if(run, target_id, None, guard).await
     }
 
     /// Attach, but only if the current tab is still `expect` (when given):
     /// another path may already have switched tabs.
-    async fn attach_if(&self, run: &Running, target_id: &str, expect: Option<&str>) -> Result<()> {
+    async fn attach_if(
+        &self,
+        run: &Running,
+        target_id: &str,
+        expect: Option<&str>,
+        guard: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
         let _g = run.attach_lock.lock().await;
         let current = run.page().target_id;
         if current == target_id || expect.is_some_and(|e| e != current) {
@@ -968,6 +1075,16 @@ impl Browser {
                     s,
                 )
                 .await;
+        }
+        if let Err(e) = guard() {
+            let _ = cdp
+                .call(
+                    "Target.detachFromTarget",
+                    json!({"sessionId": session}),
+                    None,
+                )
+                .await;
+            return Err(e);
         }
         let old = std::mem::replace(
             &mut *lock(&run.page),
@@ -1016,6 +1133,35 @@ impl Browser {
         self.broadcast_state();
     }
 
+    /// Close `run` only if it is still the browser and still idle, checked
+    /// under the lifecycle lock (activity may have resumed meanwhile).
+    async fn close_if_idle(&self, run: &Arc<Running>, idle_ms: i64) -> bool {
+        let _g = self.launch_lock.lock().await;
+        let current = lock(&self.running)
+            .as_ref()
+            .is_some_and(|r| Arc::ptr_eq(r, run));
+        let busy = lock(&self.turns)
+            .values()
+            .any(|t| t.used.load(Ordering::SeqCst))
+            || !lock(&self.watchers).is_empty()
+            || self.control() != Control::Agent
+            || now_ms()
+                - self
+                    .last_used
+                    .load(Ordering::SeqCst)
+                    .max(self.last_input.load(Ordering::SeqCst))
+                <= idle_ms;
+        if !current || busy {
+            return !current;
+        }
+        crate::info!("browser: idle; closing to free memory");
+        lock(&self.running).take();
+        Self::shut(run).await;
+        self.frames.send_replace(None);
+        self.broadcast_state();
+        true
+    }
+
     async fn shut(run: &Running) {
         let _ = run
             .cdp
@@ -1055,9 +1201,12 @@ impl Browser {
                 .last_used
                 .load(Ordering::SeqCst)
                 .max(self.last_input.load(Ordering::SeqCst));
-            if !in_turn && !watched && !user && now - last > idle_ms {
-                crate::info!("browser: idle; closing to free memory");
-                self.close().await;
+            if !in_turn
+                && !watched
+                && !user
+                && now - last > idle_ms
+                && self.close_if_idle(&run, idle_ms).await
+            {
                 break;
             }
         }
@@ -1191,7 +1340,7 @@ impl Browser {
                 .unwrap_or_default()
                 .to_string(),
         };
-        self.attach_if(run, &target, Some(gone)).await
+        self.attach_if(run, &target, Some(gone), &|| Ok(())).await
     }
 
     fn on_frame(&self, run: &Arc<Running>, p: &Value, page: &PageRef) {
@@ -1548,6 +1697,11 @@ mod tests {
         assert_eq!(run.redact("https://shop.test/pa%2fss%3fword?x=1"), "••••");
         assert_eq!(decode_loose("p%c3%A4ss"), "päss");
         assert_eq!(decode_loose("p%E4ss"), "päss");
+        // '+' as written, and Windows-1252 bytes.
+        run.remember_secret("päss+word");
+        assert_eq!(run.redact("https://s.test/p%C3%A4ss+word"), "••••");
+        run.remember_secret("p€ssword-long");
+        assert_eq!(run.redact("x?q=p%80ssword-long"), "x?••••");
         assert_eq!(decode_loose("%41+%zz"), "A %zz");
         // Shorter than MIN_SECRET is never remembered: such secrets are
         // never filled (fill.rs refuses them).
