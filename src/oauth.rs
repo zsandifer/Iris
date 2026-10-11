@@ -692,30 +692,16 @@ pub async fn credentials_lock(state: &AppState) -> tokio::sync::MutexGuard<'_, (
     state.oauth.refresh.lock().await
 }
 
-pub async fn bearer(
+/// Read/refresh credentials and update a session under the same lock, so
+/// a superseded snapshot can never install its token in a newer session.
+pub(crate) async fn bearer(
     state: &AppState,
     con: &entities::Connector,
+    _credentials: &tokio::sync::MutexGuard<'_, ()>,
 ) -> Result<Option<String>, TokenError> {
     crate::connectors::check_transport_security(&con.transport, &con.config)
         .map_err(TokenError::Unavailable)?;
-    let Some(o) = &con.config.oauth else {
-        return Ok(None);
-    };
-    if let (Some(_), Some(exp)) = (&o.access_token, o.expires_at)
-        && exp > now_ms() + REFRESH_EARLY_MS
-    {
-        return open(state, &con.id, "access_token", &o.access_token)
-            .map(Some)
-            .ok_or(TokenError::NeedsSignIn);
-    }
-    if o.access_token.is_some() && o.expires_at.is_none() && o.refresh_token.is_none() {
-        // A token without expiry (some servers): use it until refused.
-        return open(state, &con.id, "access_token", &o.access_token)
-            .map(Some)
-            .ok_or(TokenError::NeedsSignIn);
-    }
-    let _guard = state.oauth.refresh.lock().await;
-    // Another call may have refreshed while we waited.
+    // Another call may have refreshed or signed in while we waited.
     let id = con.id.clone();
     let fresh = state
         .db
@@ -728,9 +714,12 @@ pub async fn bearer(
     };
     crate::connectors::check_transport_security(&fresh.transport, &fresh.config)
         .map_err(TokenError::Unavailable)?;
+    if con.config.oauth.is_none() && fresh.config.oauth.is_none() {
+        return Ok(None);
+    }
     if crate::gateway::target(&fresh) != crate::gateway::target(con) {
         return Err(TokenError::Unavailable(
-            "This connection changed while I was refreshing its sign-in. Try again.".into(),
+            "This connection changed while I was checking its sign-in. Try again.".into(),
         ));
     }
     let Some(o) = fresh.config.oauth else {
@@ -739,6 +728,11 @@ pub async fn bearer(
     if let (Some(_), Some(exp)) = (&o.access_token, o.expires_at)
         && exp > now_ms() + REFRESH_EARLY_MS
     {
+        return open(state, &con.id, "access_token", &o.access_token)
+            .map(Some)
+            .ok_or(TokenError::NeedsSignIn);
+    }
+    if o.access_token.is_some() && o.expires_at.is_none() && o.refresh_token.is_none() {
         return open(state, &con.id, "access_token", &o.access_token)
             .map(Some)
             .ok_or(TokenError::NeedsSignIn);
@@ -1173,7 +1167,7 @@ pub async fn finish(
     o.refresh_token = None;
     o.account = None;
     let mut updated = apply_tokens(state, &con.id, o, &v)?;
-    updated.connected_at = Some(now_ms());
+    updated.connected_at = Some(now_ms().max(updated.connected_at.unwrap_or(0).saturating_add(1)));
     if let Some(email) = v["id_token"].as_str().and_then(id_token_email) {
         updated.account = Some(email);
     }

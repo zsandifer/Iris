@@ -797,7 +797,7 @@ async fn dispatch_checks_the_target_again_after_startup() {
         target: target(&con),
     };
     assert!(
-        gate_refusal(&t.state, &grant, &con.id, &gate, true)
+        gate_refusal(&t.state, &grant, &con.id, &gate, &gate.target, true)
             .await
             .is_none()
     );
@@ -851,7 +851,15 @@ async fn credentials_are_never_attached_to_nonlocal_http() {
     .unwrap();
     assert!(launch_for(&t.state, &con, None).is_err());
     con.config.oauth = Some(entities::OAuthConfig::default());
-    assert!(crate::oauth::bearer(&t.state, &con).await.is_err());
+    assert!(
+        crate::oauth::bearer(
+            &t.state,
+            &con,
+            &crate::oauth::credentials_lock(&t.state).await
+        )
+        .await
+        .is_err()
+    );
     for url in [
         "https://connector.example.com/mcp",
         "http://127.0.0.1:7999/mcp",
@@ -1399,4 +1407,299 @@ async fn an_unverified_tool_is_denied_on_a_read_only_connection() {
     assert!(events.try_recv().is_err());
     assert!(t.calls_log().is_empty());
     assert_eq!(t.calls()[0].decision, "blocked");
+}
+
+/// HTTP connector that echoes credentials in RPC errors, status bodies, or
+/// auth challenges, and otherwise completes a normal MCP handshake.
+async fn fake_http_connector(t: &T, token: &str) -> (Connector, tokio::task::JoinHandle<()>) {
+    use axum::response::IntoResponse;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let app = axum::Router::new().route(
+        "/mcp",
+        axum::routing::post(
+            |headers: axum::http::HeaderMap, axum::Json(req): axum::Json<Value>| async move {
+                let auth = headers["authorization"].to_str().unwrap();
+                let token = auth.strip_prefix("Bearer ").unwrap();
+                let result = match req["method"].as_str().unwrap() {
+                    "initialize" => json!({"protocolVersion": upstream::PROTOCOL_VERSION}),
+                    "notifications/initialized" => {
+                        return axum::http::StatusCode::ACCEPTED.into_response();
+                    }
+                    "tools/list" => json!({"tools": [{"name": "search_messages"}]}),
+                    "tools/call" => match req["params"]["arguments"]["error"].as_str() {
+                        Some("rpc") => {
+                            return axum::Json(json!({"jsonrpc": "2.0", "id": req["id"],
+                                "error": {"code": -32000, "message": format!("failed: {token}")}}))
+                            .into_response();
+                        }
+                        Some("status") => {
+                            return (
+                                axum::http::StatusCode::BAD_GATEWAY,
+                                format!("failed: {token}"),
+                            )
+                                .into_response();
+                        }
+                        Some("challenge") => {
+                            return (
+                                axum::http::StatusCode::UNAUTHORIZED,
+                                [("www-authenticate", format!("Bearer error=\"{token}\""))],
+                            )
+                                .into_response();
+                        }
+                        _ => json!({"content": [{"type": "text", "text": auth}]}),
+                    },
+                    _ => unreachable!(),
+                };
+                axum::Json(json!({"jsonrpc": "2.0", "id": req["id"], "result": result}))
+                    .into_response()
+            },
+        ),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut con = t.connector();
+    con.transport = "http".into();
+    con.config = entities::ConnectorConfig {
+        url: Some(url),
+        oauth: Some(entities::OAuthConfig {
+            connected_at: Some(1),
+            access_token: Some(
+                t.state
+                    .vault
+                    .seal_str(token, &format!("connector:{}:oauth:access_token", con.id))
+                    .unwrap(),
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    t.state
+        .db
+        .with(|c| {
+            c.execute(
+                "UPDATE connectors SET transport = 'http', config = ?2 WHERE id = ?1",
+                rusqlite::params![con.id, serde_json::to_string(&con.config).unwrap()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    (con, server)
+}
+
+#[tokio::test]
+async fn security_regression_old_account_cannot_replace_a_new_session_token() {
+    for expiry in [None, Some(now_ms() + 3_600_000)] {
+        let t = setup(|_| {});
+        let (mut old, server) = fake_http_connector(&t, "old-account-token").await;
+        old.config.oauth.as_mut().unwrap().expires_at = expiry;
+        t.state
+            .db
+            .with(|c| entities::update_connector(c, &old.id, None, Some(&old.config), None))
+            .unwrap();
+        let old_session = session(&t.state, &old).await.unwrap();
+        let mut new = old.clone();
+        let o = new.config.oauth.as_mut().unwrap();
+        o.connected_at = Some(2);
+        o.access_token = Some(
+            t.state
+                .vault
+                .seal_str(
+                    "new-account-token",
+                    &format!("connector:{}:oauth:access_token", new.id),
+                )
+                .unwrap(),
+        );
+        let waiting;
+        {
+            let _credentials = crate::oauth::credentials_lock(&t.state).await;
+            let state = t.state.clone();
+            let snapshot = old.clone();
+            let (started, ready) = oneshot::channel();
+            waiting = tokio::spawn(async move {
+                started.send(()).unwrap();
+                session(&state, &snapshot).await
+            });
+            ready.await.unwrap();
+            // This sign-in wins while the old request waits for credentials.
+            t.state
+                .db
+                .with(|c| entities::update_connector(c, &new.id, None, Some(&new.config), None))
+                .unwrap();
+        }
+        assert!(waiting.await.unwrap().is_err());
+        let new_session = session(&t.state, &new).await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&old_session, &new_session),
+            "new account needs a new MCP session"
+        );
+        // A delayed request still holding the old connector must not put
+        // that account's token back into the current HTTP session.
+        assert!(session(&t.state, &old).await.is_err());
+        assert!(
+            crate::oauth::bearer(
+                &t.state,
+                &old,
+                &crate::oauth::credentials_lock(&t.state).await
+            )
+            .await
+            .is_err()
+        );
+        assert!(Arc::ptr_eq(
+            &new_session,
+            &session(&t.state, &new).await.unwrap()
+        ));
+        let reply = new_session
+            .upstream
+            .call_tool("search_messages", &json!({}), CALL_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(text(&reply), "Bearer new-account-token");
+        // Refreshing within the same account keeps the session, but a
+        // snapshot with the pre-refresh token must use the current token.
+        let mut refreshed = new.config.clone();
+        refreshed.oauth.as_mut().unwrap().access_token = Some(
+            t.state
+                .vault
+                .seal_str(
+                    "refreshed-account-token",
+                    &format!("connector:{}:oauth:access_token", new.id),
+                )
+                .unwrap(),
+        );
+        {
+            let _credentials = crate::oauth::credentials_lock(&t.state).await;
+            t.state
+                .db
+                .with(|c| entities::update_connector(c, &new.id, None, Some(&refreshed), None))
+                .unwrap();
+        }
+        assert!(Arc::ptr_eq(
+            &new_session,
+            &session(&t.state, &new).await.unwrap()
+        ));
+        let reply = new_session
+            .upstream
+            .call_tool("search_messages", &json!({}), CALL_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(text(&reply), "Bearer refreshed-account-token");
+        let (token, _guard, _) = t.grant().await;
+        let grant = t.state.gateway.grant(&token).unwrap();
+        let gate = Gate {
+            tool: "search_messages",
+            category: Category::Read,
+            recipients: &[],
+            decided_by: "auto",
+            target: target(&new),
+        };
+        assert!(
+            gate_refusal(&t.state, &grant, &new.id, &gate, &old_session.target, false)
+                .await
+                .is_some(),
+            "the gate must check the actual session's generation"
+        );
+        stop(&t.state, &new.id).await;
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn security_regression_cancelled_card_has_no_private_details_for_new_members() {
+    let t = setup(|c| c.safety.approval_timeout_secs = 60);
+    let (token, _guard, _) = t.grant().await;
+    let mut events = t.state.hub.subscribe();
+    let (call, pending) = held_send(&t, &token).await;
+    let private_card = pending.card.as_ref().unwrap();
+    assert!(private_card["details"].is_string());
+    // The original card was sent only to its original audience.
+    let created = events.recv().await.unwrap();
+    assert!(created.audience.includes(&t.owner));
+    assert!(!created.audience.includes("guest"));
+    t.state
+        .db
+        .with(|c| {
+            c.execute(
+                "INSERT INTO users (id, display_name, created_at) VALUES ('guest', 'Guest', 0)",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO conversation_members (conversation_id, user_id, role, joined_at)
+            VALUES (?1, 'guest', 'member', 0)",
+                [&t.main],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    cancel_conversation_grants(&t.state, &t.main);
+    call.await.unwrap();
+    let closed = t
+        .state
+        .db
+        .with(|c| db::get_message(c, &pending.id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(closed.content, "Request cancelled");
+    let card = closed.card.as_ref().unwrap();
+    assert_eq!(card["state"], "cancelled");
+    assert_eq!(
+        card.as_object().unwrap().len(),
+        4,
+        "only generic cancellation fields persist"
+    );
+    while let Ok(event) = events.try_recv() {
+        if event.audience.includes("guest") {
+            let v: Value = serde_json::from_str(&event.json).unwrap();
+            if v["type"] == "message.updated" {
+                assert_eq!(v["message"]["card"], *card);
+                assert_eq!(v["message"]["content"], "Request cancelled");
+            }
+            assert!(
+                !event
+                    .json
+                    .contains(private_card["details"].as_str().unwrap())
+            );
+        }
+    }
+    assert!(t.calls_log().is_empty());
+}
+
+#[tokio::test]
+async fn security_regression_long_upstream_secrets_are_scrubbed_before_truncation() {
+    // Longer than the RPC (500), HTTP (300), and old body-read (2000) caps.
+    let secret = "synthetic-secret-".repeat(200);
+    let t = setup(|_| {});
+    let (con, server) = fake_http_connector(&t, &secret).await;
+    let s = session(&t.state, &con).await.unwrap();
+    let (token, _guard, _) = t.grant().await;
+    let grant = t.state.gateway.grant(&token).unwrap();
+    let gate = Gate {
+        tool: "search_messages",
+        category: Category::Read,
+        recipients: &[],
+        decided_by: "auto",
+        target: target(&con),
+    };
+    for kind in ["rpc", "status", "challenge"] {
+        let error = s
+            .upstream
+            .call_tool("search_messages", &json!({"error": kind}), CALL_TIMEOUT)
+            .await
+            .unwrap_err();
+        let diagnostic = truncate_chars(&s.scrub(&error.to_string()), 300);
+        assert!(diagnostic.contains("[hidden]"), "{kind}: {diagnostic}");
+        assert!(
+            !diagnostic.contains("synthetic-secret"),
+            "{kind}: {diagnostic}"
+        );
+        if kind != "challenge" {
+            let result = forward(&t.state, &grant, &con.id, &gate, &json!({"error": kind})).await;
+            let Err(CallError::Other(message)) = result else {
+                panic!("expected scrubbed error")
+            };
+            assert!(message.contains("[hidden]"), "{kind}: {message}");
+            assert!(!message.contains("synthetic-secret"), "{kind}: {message}");
+        }
+    }
+    stop(&t.state, &con.id).await;
+    server.abort();
 }

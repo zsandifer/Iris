@@ -327,7 +327,7 @@ async fn serve(
                 if last.is_empty() {
                     String::new()
                 } else {
-                    format!(": {}", crate::util::truncate_chars(last.trim(), 200))
+                    format!(": {}", last.trim())
                 }
             )));
         }
@@ -507,11 +507,13 @@ impl Upstream {
     }
 }
 
+// Keep upstream diagnostic text intact within the transport's size cap.
+// The gateway knows the secrets and scrubs them before display truncation.
 fn rpc_result(msg: Value) -> Result<Value, UpstreamError> {
     if let Some(err) = msg.get("error") {
         return Err(UpstreamError::Rpc {
             code: err["code"].as_i64().unwrap_or(-32000),
-            message: crate::util::truncate_chars(err["message"].as_str().unwrap_or("error"), 500),
+            message: err["message"].as_str().unwrap_or("error").to_string(),
         });
     }
     Ok(msg.get("result").cloned().unwrap_or(Value::Null))
@@ -790,21 +792,18 @@ fn exchange(x: Exchange) -> Result<(HttpReply, Option<String>), UpstreamError> {
         return Err(UpstreamError::Auth(if www_auth.is_empty() {
             format!("HTTP {status}")
         } else {
-            crate::util::truncate_chars(&www_auth, 300)
+            www_auth
         }));
     }
     if status == 202 || (x.want_id.is_none() && (200..300).contains(&status)) {
         return Ok((HttpReply::Accepted, session));
     }
     let mut body = resp.into_body();
-    let reader = body.as_reader().take(MAX_MESSAGE_BYTES as u64);
+    let mut reader = body.as_reader().take(MAX_MESSAGE_BYTES as u64);
     if !(200..300).contains(&status) {
         let mut text = String::new();
-        let _ = reader.take(2000).read_to_string(&mut text);
-        return Ok((
-            HttpReply::Status(status, crate::util::truncate_chars(text.trim(), 300)),
-            session,
-        ));
+        let _ = reader.read_to_string(&mut text);
+        return Ok((HttpReply::Status(status, text.trim().to_string()), session));
     }
     if ctype.starts_with("text/event-stream") {
         let msg = read_sse(BufReader::new(reader), x.want_id)?;

@@ -949,7 +949,8 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(matches!(
-                crate::oauth::bearer(&state, &con).await,
+                crate::oauth::bearer(&state, &con, &crate::oauth::credentials_lock(&state).await)
+                    .await,
                 Err(crate::oauth::TokenError::NeedsSignIn)
             ));
             // Callback errors are untrusted too; reflect only fixed text.

@@ -96,6 +96,8 @@ struct Session {
     upstream: Upstream,
     /// Fingerprint of the launch settings it was started with.
     fingerprint: String,
+    /// Account/connection generation, including OAuth settings.
+    target: String,
     /// Bearer token it currently uses (OAuth connectors).
     bearer: Mutex<Option<String>>,
     last_used: AtomicI64,
@@ -466,7 +468,9 @@ fn fingerprint(con: &Connector) -> String {
             c.env,
             c.url,
             c.headers,
-            c.oauth.as_ref().map(|o| (&o.token_env, &o.client_id))
+            c.oauth
+                .as_ref()
+                .map(|o| (&o.token_env, &o.client_id, &o.connected_at))
         ])
         .to_string(),
     )
@@ -601,12 +605,14 @@ enum Started {
 }
 
 async fn session_once(state: &AppState, con: &Connector) -> Result<Arc<Session>, Started> {
-    let bearer = crate::oauth::bearer(state, con)
+    let slot = state.gateway.slot(&con.id);
+    let mut guard = slot.lock().await;
+    let mut credentials = crate::oauth::credentials_lock(state).await;
+    let mut bearer = crate::oauth::bearer(state, con, &credentials)
         .await
         .map_err(|e| Started::Failed(e.into()))?;
     let fp = fingerprint(con);
-    let slot = state.gateway.slot(&con.id);
-    let mut guard = slot.lock().await;
+    let bound_target = target(con);
     if let Some(s) = guard.as_ref() {
         let token_env = con
             .config
@@ -627,7 +633,11 @@ async fn session_once(state: &AppState, con: &Connector) -> Result<Arc<Session>,
                     .insert(con.id.clone(), truncate_chars(&s.scrub(last.trim()), 300));
             }
         }
-        if s.upstream.alive() && s.fingerprint == fp && (same_bearer || !token_env) {
+        if s.upstream.alive()
+            && s.fingerprint == fp
+            && s.target == bound_target
+            && (same_bearer || !token_env)
+        {
             if !same_bearer {
                 if let Some(t) = &bearer {
                     s.secrets
@@ -642,11 +652,19 @@ async fn session_once(state: &AppState, con: &Connector) -> Result<Arc<Session>,
             s.last_used.store(now_ms(), Ordering::SeqCst);
             return Ok(s.clone());
         }
-        s.upstream.close().await;
-        *guard = None;
+        // Closing can wait on the network. Recheck credentials afterwards
+        // before launching a replacement, while retaining the session slot.
+        let old = guard.take().expect("session exists");
+        drop(credentials);
+        old.upstream.close().await;
+        credentials = crate::oauth::credentials_lock(state).await;
+        bearer = crate::oauth::bearer(state, con, &credentials)
+            .await
+            .map_err(|e| Started::Failed(e.into()))?;
     }
     let (launch, secrets) = launch_for(state, con, bearer.as_deref())
         .map_err(|e| Started::Failed(CallError::Other(e)))?;
+    drop(credentials);
     crate::info!("connector {}: starting", con.name);
     let stopper = state.gateway.stopper(&con.id);
     let started = tokio::select! {
@@ -677,6 +695,17 @@ async fn session_once(state: &AppState, con: &Connector) -> Result<Arc<Session>,
             });
         }
     };
+    // A sign-in may have completed during the handshake. Never publish
+    // that older session into the slot after the new generation exists.
+    let credentials = crate::oauth::credentials_lock(state).await;
+    let fresh_bearer = crate::oauth::bearer(state, con, &credentials).await;
+    if !matches!(fresh_bearer, Ok(ref fresh) if *fresh == bearer) {
+        drop(credentials);
+        upstream.close().await;
+        return Err(Started::Failed(CallError::Other(
+            "This connection changed while it was starting. Try again.".into(),
+        )));
+    }
     state
         .gateway
         .errors
@@ -686,6 +715,7 @@ async fn session_once(state: &AppState, con: &Connector) -> Result<Arc<Session>,
     let s = Arc::new(Session {
         upstream,
         fingerprint: fp,
+        target: bound_target,
         bearer: Mutex::new(bearer),
         last_used: AtomicI64::new(now_ms()),
         inflight: Default::default(),
@@ -1031,6 +1061,7 @@ async fn gate_refusal(
     grant: &Grant,
     connector_id: &str,
     gate: &Gate<'_>,
+    used_target: &str,
     check_paused: bool,
 ) -> Option<String> {
     let Some(now) = current(state, connector_id).await else {
@@ -1047,7 +1078,7 @@ async fn gate_refusal(
     if let Some(r) = refusal(state, grant, &probe).await {
         return Some(r);
     }
-    if target(&now) != gate.target {
+    if target(&now) != gate.target || used_target != gate.target {
         return Some(
             "This connection was changed or signed in again after this action was checked, so \
              nothing was done. Try again if it is still wanted."
@@ -1247,7 +1278,7 @@ pub async fn call_tool(
         decided_by,
         target: bound_target,
     };
-    if let Some(r) = gate_refusal(state, grant, &con.id, &gate, true).await {
+    if let Some(r) = gate_refusal(state, grant, &con.id, &gate, &gate.target, true).await {
         set_decision(state, &call.id, "cancelled").await;
         return tool_error(&r);
     }
@@ -1348,14 +1379,14 @@ async fn forward(
             ));
         }
         let s = session(state, &con).await?;
-        if s.fingerprint != fingerprint(&con) {
+        if s.target != gate.target {
             return Err(CallError::Other(
                 "This connection changed while it was starting. Try again.".into(),
             ));
         }
         // A tripwire pause by another call does not stop one already
         // admitted within the limits.
-        if let Some(r) = gate_refusal(state, grant, connector_id, gate, false).await {
+        if let Some(r) = gate_refusal(state, grant, connector_id, gate, &s.target, false).await {
             return Err(CallError::Other(r));
         }
         let used = s.bearer.lock().unwrap_or_else(|p| p.into_inner()).clone();
@@ -1397,7 +1428,12 @@ async fn forward(
             Err(UpstreamError::Timeout) => {
                 return Err(CallError::Other("it did not answer in time".into()));
             }
-            Err(e) => return Err(CallError::Other(s.scrub(&e.to_string()))),
+            Err(e) => {
+                return Err(CallError::Other(truncate_chars(
+                    &s.scrub(&e.to_string()),
+                    500,
+                )));
+            }
         }
     }
     Err(CallError::Auth)
@@ -1800,6 +1836,11 @@ async fn close_card(state: &AppState, card_id: &str, to: &'static str) -> String
             let mut card = m.card.clone().unwrap_or_default();
             if card["state"] != "pending" {
                 return Ok((card["state"].as_str().unwrap_or(to).to_string(), None));
+            }
+            // Closed requests can be seen by members who joined after
+            // creation. Persist and broadcast only a generic cancellation.
+            if to == "cancelled" {
+                card = json!({"type": "approval", "title": "Request cancelled"});
             }
             card["state"] = to.into();
             card["decided_at"] = now_ms().into();
