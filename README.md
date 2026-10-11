@@ -28,7 +28,7 @@ Iris gives you that experience without the trade:
 - **No lock-in.** Iris works with the AI tools you already have: **Claude
   Code**, **Codex**, **Gemini CLI**, or **OpenCode** with open-source models
   running entirely on your own hardware. Use one, or mix them.
-- **Dead simple.** No model names, token counts or settings soup. You talk to
+- **Dead simple.** No model names, token counts or set up overwhelm. You talk to
   Iris and she gets things done. Everything technical is there if you go
   looking, and invisible if you don't.
 - **Never touch your server again.** Once your phone is paired, you handle
