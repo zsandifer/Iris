@@ -52,18 +52,18 @@ pub fn mcp_overrides(servers: &[McpServer]) -> Vec<String> {
         // Iris (its own bridge and connectors the owner enabled) are
         // pre-approved, matching `--allowedTools mcp__<name>` for Claude.
         out.push(format!("{p}.default_tools_approval_mode=\"approve\""));
+        if let Some(t) = s.timeout_secs {
+            // Connector calls can wait for the owner's approval; the first
+            // start of a connector may download its server.
+            out.push(format!("{p}.tool_timeout_sec={t}"));
+            out.push(format!("{p}.startup_timeout_sec=120"));
+        }
         match &s.transport {
             McpTransport::Stdio { command, args, env } => {
                 out.push(format!("{p}.command={}", toml_str(command)));
                 out.push(format!("{p}.args={}", toml_str_array(args)));
                 for (k, v) in env.iter().filter(|(k, _)| bare_key(k)) {
                     out.push(format!("{p}.env.{k}={}", toml_str(v)));
-                }
-            }
-            McpTransport::Http { url, headers } => {
-                out.push(format!("{p}.url={}", toml_str(url)));
-                for (k, v) in headers.iter().filter(|(k, _)| bare_key(k)) {
-                    out.push(format!("{p}.http_headers.{k}={}", toml_str(v)));
                 }
             }
         }
@@ -500,11 +500,13 @@ mod tests {
                     args: vec!["mcp".into(), "--conversation".into(), "c1".into()],
                     env,
                 },
+                timeout_secs: Some(420),
             }],
             cwd: "/w".into(),
             writable_dirs: vec!["/m".into()],
             run_dir: "/r".into(),
             scope: "c1".into(),
+            key_env: vec![],
         };
         let mut cfg = HarnessConfig::codex_default();
         cfg.sandbox = "workspace-write".into();
@@ -542,6 +544,10 @@ mod tests {
                 .contains(&r#"mcp_servers.iris.env.IRIS_DATA_DIR="/d""#.to_string())
         );
         assert!(!inv.args.iter().any(|a| a.contains("bad key")));
+        assert!(
+            inv.args
+                .contains(&"mcp_servers.iris.tool_timeout_sec=420".to_string())
+        );
         assert!(
             inv.args
                 .contains(&r#"mcp_servers.iris.default_tools_approval_mode="approve""#.to_string())

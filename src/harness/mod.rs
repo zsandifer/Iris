@@ -35,8 +35,15 @@ pub struct McpServer {
     /// `[A-Za-z0-9_-]+`; also the tool prefix (`mcp__<name>__<tool>`).
     pub name: String,
     pub transport: McpTransport,
+    /// How long one tool call may take (connector calls can wait for the
+    /// owner's approval). None: the CLI's default.
+    pub timeout_secs: Option<u64>,
 }
 
+/// How the CLI starts an MCP server. Everything Iris passes is a local
+/// stdio program: its own bridge (`iris mcp`) and one connector gateway
+/// proxy per connector (`iris mcp-gateway`); remote connectors are reached
+/// by the gateway, never by the CLI.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 pub enum McpTransport {
@@ -44,10 +51,6 @@ pub enum McpTransport {
         command: String,
         args: Vec<String>,
         env: BTreeMap<String, String>,
-    },
-    Http {
-        url: String,
-        headers: BTreeMap<String, String>,
     },
 }
 
@@ -76,6 +79,9 @@ pub struct TurnSpec {
     /// Stable key for per-conversation state some CLIs keep on disk
     /// (the conversation id).
     pub scope: String,
+    /// Names of API-key variables Iris passes to this run (keys the owner
+    /// added in the app; values are added to the environment by the turn).
+    pub key_env: Vec<String>,
 }
 
 /// A fully built command line.
@@ -85,8 +91,8 @@ pub struct Invocation {
     pub stdin: Vec<u8>,
     /// Private files to delete when the turn ends.
     pub temp_files: Vec<PathBuf>,
-    /// Extra environment variables (paths to private per-turn files; never
-    /// secrets).
+    /// Extra environment variables (paths to private per-turn files and
+    /// settings). The turn adds the owner's engine API keys, if any.
     pub env: Vec<(String, String)>,
     /// Working directory override (defaults to `TurnSpec::cwd`).
     pub cwd: Option<PathBuf>,

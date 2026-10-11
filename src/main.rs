@@ -5,17 +5,21 @@ mod auth;
 mod catalog;
 mod classifier;
 mod config;
+mod connectors;
 mod db;
 mod demo;
 mod engines;
 mod entities;
 mod events;
+mod gateway;
 mod harness;
 mod import;
 mod jobs;
+mod keys;
 mod login;
 mod mcp;
 mod notify;
+mod oauth;
 mod persona;
 mod push;
 mod ranking;
@@ -43,6 +47,9 @@ Usage:
                                    Copy persona/memory files from OpenClaw
   iris mcp --data-dir DIR --user ID [--conversation ID] [--shared]
                                    Iris MCP bridge (launched by harnesses)
+  iris mcp-gateway --data-dir DIR --connector NAME
+                                   Connector gateway proxy (launched by
+                                   harnesses; token in IRIS_GATEWAY_TOKEN)
   iris engines <install|update|uninstall> <NAME> [--dir PATH]
   iris engines list [--dir PATH]   Install/update the official CLIs (claude,
                                    codex, gemini, opencode) into the engines
@@ -72,6 +79,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--conversation",
     "--dir",
     "--assets",
+    "--connector",
 ];
 
 impl Args {
@@ -186,6 +194,17 @@ fn run(args: Args) -> Result<()> {
                 shared: args.has("--shared"),
             })
         }
+        ["mcp-gateway"] => {
+            args.check_flags(&["--connector"])?;
+            let connector = args.value("--connector").ok_or("--connector is required")?;
+            let token = std::env::var(gateway::TOKEN_ENV)
+                .map_err(|_| format!("{} is not set", gateway::TOKEN_ENV))?;
+            gateway::proxy::run(gateway::proxy::Proxy {
+                socket: gateway::socket_path(&paths),
+                connector: connector.to_string(),
+                token,
+            })
+        }
         ["engines", rest @ ..] => {
             args.check_flags(&["--dir"])?;
             let root = match args.value("--dir") {
@@ -279,6 +298,8 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
     rt.block_on(async move {
         let state = state::AppState::new(cfg, paths, db)?;
         state.set_serving();
+        gateway::expire_stale_approvals(&state).await;
+        gateway::listen(state.clone())?;
         let probe = state.clone();
         tokio::spawn(async move {
             probe.refresh_harnesses().await;

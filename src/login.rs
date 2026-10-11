@@ -634,18 +634,27 @@ pub async fn on_connector_auth_error(state: &AppState, server: &str) {
             {
                 return Ok(None);
             }
+            let label = crate::gateway::service_label(&con);
+            let oauth = con.config.oauth.is_some();
             let card = json!({
                 "type": "connector_reconnect",
-                "title": format!("Reconnect {}", con.name),
-                "body": format!(
-                    "{} refused my request, so its sign-in has probably expired or been \
-                     revoked. Update its credentials and I'll keep using it.",
-                    con.name
-                ),
+                "title": format!("Reconnect {label}"),
+                "body": if oauth {
+                    format!(
+                        "{label}'s sign-in expired or was revoked, so I can't use it right now. \
+                         Sign in again and I'll pick up where I left off."
+                    )
+                } else {
+                    format!(
+                        "{label} refused my request, so its sign-in has probably expired or been \
+                         revoked. Update its credentials and I'll keep using it."
+                    )
+                },
                 "connector_id": con.id,
-                "service": con.name,
+                "service": con.service,
+                "auth": if oauth { "oauth" } else { "secrets" },
                 "state": "needs_reconnect",
-                "action_label": "Update",
+                "action_label": if oauth { "Sign in again" } else { "Update" },
                 "owner_only": true,
             });
             let main = db::ensure_main_conversation(c, &owner)?;
@@ -694,7 +703,7 @@ pub async fn on_connector_updated(state: &AppState, connector_id: &str) {
                 return Ok(None);
             }
             card["state"] = "connected".into();
-            card["body"] = "Updated. I'll try it again next time.".into();
+            card["body"] = "Connected again. I'll use it from now on.".into();
             db::update_message_card(c, &id, &card).map(Some)
         })
         .await

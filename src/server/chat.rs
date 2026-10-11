@@ -696,8 +696,14 @@ async fn decide_approval(
         })
         .await?
         .ok_or_else(|| {
-            ApiError::new(StatusCode::CONFLICT, "conflict", "this was already decided")
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "conflict",
+                "this was already decided or has expired",
+            )
         })?;
+    // Release the held connector call, if one is waiting.
+    crate::gateway::decided(&state, &id, body.approve);
     crate::login::broadcast_updated(&state, &updated).await;
     ok(json!({"message": updated}))
 }

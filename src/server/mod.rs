@@ -4,6 +4,7 @@
 
 pub(crate) mod admin;
 mod chat;
+mod connect;
 mod content;
 mod web;
 mod ws;
@@ -12,8 +13,6 @@ pub use chat::sniff_image;
 
 use crate::auth::{self, PairError};
 use crate::db::{self, Device, User};
-use crate::entities::Connector;
-use crate::harness::{McpServer, McpTransport};
 use crate::state::AppState;
 use crate::util::Result;
 use axum::Router;
@@ -175,6 +174,7 @@ pub fn router(state: AppState) -> Router {
         .merge(chat::routes())
         .merge(content::routes())
         .merge(admin::routes())
+        .merge(connect::routes())
         .route("/ws", get(ws::handler))
         .layer(DefaultBodyLimit::max(upload_limit));
     Router::new()
@@ -413,7 +413,7 @@ async fn user_pairing_code(
 /// Reserved MCP server names (the built-in bridge).
 pub const RESERVED_CONNECTOR_NAMES: &[&str] = &["iris"];
 
-fn connector_aad(id: &str, field: &str, key: &str) -> String {
+pub(crate) fn connector_aad(id: &str, field: &str, key: &str) -> String {
     format!("connector:{id}:{field}:{key}")
 }
 
@@ -433,40 +433,6 @@ pub fn seal_connector_secrets(
             ))
         })
         .collect()
-}
-
-/// Build the per-turn MCP server definition, unsealing secrets in memory.
-pub fn connector_to_mcp(state: &AppState, con: &Connector) -> Result<McpServer> {
-    let open = |field: &str, m: &BTreeMap<String, String>| -> Result<BTreeMap<String, String>> {
-        m.iter()
-            .map(|(k, v)| {
-                Ok((
-                    k.clone(),
-                    state.vault.open_str(v, &connector_aad(&con.id, field, k))?,
-                ))
-            })
-            .collect()
-    };
-    let transport = match con.transport.as_str() {
-        "stdio" => McpTransport::Stdio {
-            command: con
-                .config
-                .command
-                .clone()
-                .ok_or("stdio connector without command")?,
-            args: con.config.args.clone(),
-            env: open("env", &con.config.env)?,
-        },
-        "http" => McpTransport::Http {
-            url: con.config.url.clone().ok_or("http connector without url")?,
-            headers: open("headers", &con.config.headers)?,
-        },
-        other => return Err(format!("unknown transport {other}").into()),
-    };
-    Ok(McpServer {
-        name: con.name.clone(),
-        transport,
-    })
 }
 
 // ------------------------------------------------------------------- serve

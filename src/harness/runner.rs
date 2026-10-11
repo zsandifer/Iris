@@ -198,14 +198,19 @@ pub async fn run(
 }
 
 /// Run a short command (`--version`, `auth status`) and capture its output.
+/// `env_add` carries the owner's engine API keys, if any.
 pub async fn probe(
     program: &Path,
     args: &[String],
     cwd: &Path,
     env_remove: &[&str],
+    env_add: &[(String, String)],
 ) -> Result<(bool, String, String)> {
     let mut cmd = base_command(program, cwd, env_remove);
     cmd.args(args).stdin(Stdio::null());
+    for (k, v) in env_add {
+        cmd.env(k, v);
+    }
     let child = cmd.spawn()?;
     let pid = child.id();
     match tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await {

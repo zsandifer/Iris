@@ -439,6 +439,9 @@ struct ConnectorBody {
     url: Option<String>,
     headers: Option<BTreeMap<String, String>>,
     enabled: Option<bool>,
+    /// http connectors: `"oauth"` signs in with the MCP authorization spec
+    /// (`POST /api/connectors/{id}/oauth/start`).
+    auth: Option<String>,
 }
 
 fn check_keys(field: &str, m: &BTreeMap<String, String>) -> Result<(), ApiError> {
@@ -518,16 +521,47 @@ async fn create_connector(
     check_text("description", &description, 500, false)?;
     let transport = body.transport.clone().unwrap_or_else(|| "stdio".into());
     let id = new_id();
-    let cfg = build_config(&state, &id, &transport, &body, None)?;
+    let mut cfg = build_config(&state, &id, &transport, &body, None)?;
+    let oauth = match body.auth.as_deref() {
+        None | Some("") | Some("none") | Some("secrets") => false,
+        Some("oauth") if transport == "http" => true,
+        Some("oauth") => {
+            return Err(ApiError::bad_request(
+                "sign-in (OAuth) is for connections with a web address",
+            ));
+        }
+        Some(_) => return Err(ApiError::bad_request("auth must be oauth or none")),
+    };
+    if oauth {
+        cfg.oauth = Some(entities::OAuthConfig {
+            mode: "discover".into(),
+            ..Default::default()
+        });
+    }
     let enabled = body.enabled.unwrap_or(true);
     let res = state
         .db
         .call(move |c| {
-            entities::insert_connector(c, &id, &name, &description, &transport, &cfg, enabled)
+            let con =
+                entities::insert_connector(c, &id, &name, &description, &transport, &cfg, enabled)?;
+            if oauth {
+                entities::set_connector_state(
+                    c,
+                    &con.id,
+                    &entities::ConnectorState {
+                        auth_state: Some("needs_sign_in"),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            entities::get_connector(c, &con.id).map(|c| c.expect("inserted"))
         })
         .await;
     match res {
-        Ok(con) => ok(json!({"connector": con.public_json()})),
+        Ok(con) => {
+            crate::connectors::broadcast_changed(&state).await;
+            ok(json!({"connector": con.public_json()}))
+        }
         Err(e) if e.to_string().contains("UNIQUE") => Err(ApiError::new(
             StatusCode::CONFLICT,
             "conflict",
@@ -576,18 +610,27 @@ async fn update_connector(
         .call(move |c| entities::update_connector(c, &id, desc.as_deref(), cfg.as_ref(), enabled))
         .await?
         .ok_or_else(|| ApiError::not_found("connector"))?;
+    if touches_config || enabled == Some(false) {
+        crate::gateway::stop(&state, &cid).await;
+    }
     if touches_config {
         crate::login::on_connector_updated(&state, &cid).await;
     }
+    crate::connectors::broadcast_changed(&state).await;
     ok(json!({"connector": con.public_json()}))
 }
 
 async fn set_enabled(state: &AppState, id: String, enabled: bool) -> ApiResult {
+    let cid = id.clone();
     let con = state
         .db
         .call(move |c| entities::update_connector(c, &id, None, None, Some(enabled)))
         .await?
         .ok_or_else(|| ApiError::not_found("connector"))?;
+    if !enabled {
+        crate::gateway::stop(state, &cid).await;
+    }
+    crate::connectors::broadcast_changed(state).await;
     ok(json!({"connector": con.public_json()}))
 }
 
@@ -615,6 +658,7 @@ async fn delete_connector(
     Path(id): Path<String>,
 ) -> ApiResult {
     user.require_owner()?;
+    let cid = id.clone();
     if !state
         .db
         .call(move |c| entities::delete_connector(c, &id))
@@ -622,6 +666,9 @@ async fn delete_connector(
     {
         return Err(ApiError::not_found("connector"));
     }
+    crate::gateway::stop(&state, &cid).await;
+    let _ = std::fs::remove_dir_all(crate::gateway::connector_dir(&state, &cid));
+    crate::connectors::broadcast_changed(&state).await;
     ok(json!({"ok": true}))
 }
 
@@ -961,6 +1008,13 @@ async fn run_job(
 ) -> Result<Response, ApiError> {
     user.require_owner()?;
     let job = crate::jobs::Job::parse(&name).ok_or_else(|| ApiError::not_found("job"))?;
+    if state.is_paused().await {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "paused",
+            "Iris is paused; resume it first",
+        ));
+    }
     let started = crate::jobs::trigger(&state, job);
     Ok((
         StatusCode::ACCEPTED,

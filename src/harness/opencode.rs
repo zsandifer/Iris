@@ -13,6 +13,8 @@
 //!   which some hosted providers reject).
 //! - Model/effort: `-m provider/model` and `--variant <effort>`.
 //! - Resume: `-s <session id>`. Images: `-f <file>`. Prompt on stdin.
+//! - Provider keys the owner added in the app arrive as the providers'
+//!   usual environment variables (`OPENROUTER_API_KEY`, ...).
 //! - Models: `opencode models --verbose` (provider/model header lines, each
 //!   followed by a pretty-printed JSON object with capabilities).
 
@@ -62,16 +64,17 @@ impl OpenCode {
 pub fn mcp_config(servers: &[super::McpServer]) -> Value {
     let mut map = Map::new();
     for s in servers {
-        let v = match &s.transport {
+        let mut v = match &s.transport {
             McpTransport::Stdio { command, args, env } => {
                 let mut cmd = vec![command.clone()];
                 cmd.extend(args.iter().cloned());
                 json!({"type": "local", "command": cmd, "environment": env, "enabled": true})
             }
-            McpTransport::Http { url, headers } => {
-                json!({"type": "remote", "url": url, "headers": headers, "enabled": true})
-            }
         };
+        if let Some(t) = s.timeout_secs {
+            // OpenCode 1.19 uses this for connecting, listing, and calls.
+            v["timeout"] = (t * 1000).into();
+        }
         map.insert(s.name.clone(), v);
     }
     Value::Object(map)
@@ -653,8 +656,8 @@ anthropic/claude-haiku-4-5
     #[test]
     fn builds_invocation_with_private_config() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut headers = BTreeMap::new();
-        headers.insert("Authorization".to_string(), "Bearer s3cret".to_string());
+        let mut env = BTreeMap::new();
+        env.insert(crate::gateway::TOKEN_ENV.to_string(), "s3cret".to_string());
         let spec = TurnSpec {
             turn_id: "t1".into(),
             prompt: "--help me".into(),
@@ -674,19 +677,23 @@ anthropic/claude-haiku-4-5
                         args: vec!["mcp".into()],
                         env: BTreeMap::new(),
                     },
+                    timeout_secs: Some(420),
                 },
                 McpServer {
                     name: "web".into(),
-                    transport: McpTransport::Http {
-                        url: "https://mcp.example.com".into(),
-                        headers,
+                    transport: McpTransport::Stdio {
+                        command: "/bin/iris".into(),
+                        args: vec!["mcp-gateway".into()],
+                        env,
                     },
+                    timeout_secs: None,
                 },
             ],
             cwd: tmp.path().into(),
             writable_dirs: vec!["/data/memory".into()],
             run_dir: tmp.path().into(),
             scope: "c1".into(),
+            key_env: vec![],
         };
         let inv = OpenCode::new(HarnessConfig::opencode_default())
             .build(&spec)
@@ -715,7 +722,9 @@ anthropic/claude-haiku-4-5
         assert!(!inv.env.iter().any(|(_, v)| v.contains("s3cret")));
         let cfg: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(cfg["mcp"]["iris"]["command"], json!(["/bin/iris", "mcp"]));
-        assert_eq!(cfg["mcp"]["web"]["type"], "remote");
+        assert_eq!(cfg["mcp"]["iris"]["timeout"], 420_000);
+        assert!(cfg["mcp"]["web"].get("timeout").is_none());
+        assert_eq!(cfg["mcp"]["web"]["type"], "local");
         assert_eq!(cfg["permission"]["bash"], "ask");
         assert_eq!(cfg["permission"]["edit"], "allow");
         assert_eq!(

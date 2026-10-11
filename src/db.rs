@@ -224,6 +224,53 @@ CREATE INDEX feed_posts_liked ON feed_posts(user_id, liked);
 -- Goals the agent suggested and the user has not confirmed yet.
 ALTER TABLE goals ADD COLUMN suggested INTEGER NOT NULL DEFAULT 0;
 "#,
+    r#"
+-- Connector gateway: per-connector approval rules, catalog service, the
+-- tripwire pause, and sign-in state for OAuth connectors.
+ALTER TABLE connectors ADD COLUMN policy TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE connectors ADD COLUMN service TEXT NOT NULL DEFAULT 'custom';
+ALTER TABLE connectors ADD COLUMN paused_reason TEXT;
+ALTER TABLE connectors ADD COLUMN paused_at INTEGER;
+ALTER TABLE connectors ADD COLUMN auth_state TEXT NOT NULL DEFAULT 'ok';
+
+-- Every connector tool call that went through the gateway (activity log,
+-- rate limits). `summary` is a short preview (recipients, subject).
+CREATE TABLE connector_calls (
+    id              TEXT PRIMARY KEY,
+    connector_id    TEXT,
+    connector_name  TEXT NOT NULL,
+    tool            TEXT NOT NULL,
+    category        TEXT NOT NULL,
+    decision        TEXT NOT NULL,
+    outcome         TEXT,
+    reason          TEXT NOT NULL DEFAULT '',
+    summary         TEXT NOT NULL DEFAULT '',
+    conversation_id TEXT,
+    message_id      TEXT,
+    card_message_id TEXT,
+    result_bytes    INTEGER NOT NULL DEFAULT 0,
+    created_at      INTEGER NOT NULL,
+    finished_at     INTEGER
+);
+CREATE INDEX connector_calls_recent ON connector_calls(connector_id, created_at);
+CREATE INDEX connector_calls_time ON connector_calls(created_at);
+
+-- Recipients the owner approved a message or invite to.
+CREATE TABLE known_recipients (
+    address    TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
+
+-- API keys for engines (Gemini CLI, OpenCode providers, optionally Claude
+-- Code or Codex), sealed with the vault; passed to the CLI per turn.
+CREATE TABLE engine_keys (
+    harness    TEXT NOT NULL,
+    env        TEXT NOT NULL,
+    ciphertext TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (harness, env)
+);
+"#,
 ];
 
 #[derive(Clone)]

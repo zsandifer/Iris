@@ -6,7 +6,12 @@
 //! - Input: `--input-format stream-json` on stdin, which also carries images
 //!   as base64 content blocks.
 //! - Resume: `--resume <session_id>` (sessions are scoped by cwd).
-//! - MCP: `--mcp-config <private json file>`.
+//! - MCP: `--mcp-config <private json file>`. Servers with a tool timeout
+//!   (Iris's connector gateway, whose calls can wait for the owner's
+//!   approval) get a per-server `timeout` (ms), and automatic
+//!   backgrounding of long MCP calls is turned off
+//!   (`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0`) so the turn waits for the
+//!   answer.
 
 use super::{
     Activity, AuthState, Capabilities, Harness, HarnessEvent, Invocation, McpTransport,
@@ -32,14 +37,14 @@ impl Claude {
 pub fn mcp_config_json(servers: &[super::McpServer]) -> Value {
     let mut map = serde_json::Map::new();
     for s in servers {
-        let v = match &s.transport {
+        let mut v = match &s.transport {
             McpTransport::Stdio { command, args, env } => {
                 json!({"type": "stdio", "command": command, "args": args, "env": env})
             }
-            McpTransport::Http { url, headers } => {
-                json!({"type": "http", "url": url, "headers": headers})
-            }
         };
+        if let Some(t) = s.timeout_secs {
+            v["timeout"] = (t * 1000).into();
+        }
         map.insert(s.name.clone(), v);
     }
     json!({ "mcpServers": map })
@@ -128,6 +133,10 @@ impl Harness for Claude {
             inv.temp_files.push(file.clone());
             a.push("--mcp-config".into());
             a.push(file.to_string_lossy().into_owned());
+            if spec.mcp_servers.iter().any(|s| s.timeout_secs.is_some()) {
+                inv.env
+                    .push(("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS".into(), "0".into()));
+            }
             allowed.extend(spec.mcp_servers.iter().map(|s| format!("mcp__{}", s.name)));
         }
         if !allowed.is_empty() {
@@ -641,11 +650,13 @@ mod tests {
                     args: vec!["mcp".into()],
                     env: BTreeMap::new(),
                 },
+                timeout_secs: Some(420),
             }],
             cwd: tmp.path().into(),
             writable_dirs: vec![tmp.path().join("memory")],
             run_dir: tmp.path().into(),
             scope: "c1".into(),
+            key_env: vec![],
         };
         let inv = Claude::new(HarnessConfig::claude_default())
             .build(&spec)
@@ -659,6 +670,11 @@ mod tests {
         assert_eq!(inv.temp_files.len(), 2);
         let mcp: Value =
             serde_json::from_slice(&std::fs::read(&inv.temp_files[1]).unwrap()).unwrap();
+        assert_eq!(mcp["mcpServers"]["iris"]["timeout"], 420_000);
+        assert!(
+            inv.env
+                .contains(&("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS".into(), "0".into()))
+        );
         assert_eq!(mcp["mcpServers"]["iris"]["command"], "/usr/bin/iris");
         assert_eq!(
             std::fs::read_to_string(&inv.temp_files[0]).unwrap(),

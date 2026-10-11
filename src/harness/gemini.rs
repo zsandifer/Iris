@@ -14,6 +14,10 @@
 //!   is removed after the turn. Sessions are scoped by directory, which also
 //!   keeps `--resume <session id>` per conversation.
 //! - `--skip-trust` trusts Iris's own workspace for headless runs.
+//! - API key: when the owner added one in the app, `GEMINI_API_KEY` is set
+//!   and the workspace settings select `gemini-api-key` auth.
+//! - Connector servers get a per-server `timeout` (ms) so a call waiting
+//!   for the owner's approval is not cut off.
 //! - Model: `-m` (aliases `flash`, `pro`, `flash-lite` resolve to the
 //!   newest version). No effort flag.
 //! - Images: `@<path>` references (the image directory is added with
@@ -69,14 +73,14 @@ fn scope_dir(cwd: &Path, scope: &str) -> PathBuf {
 pub fn mcp_settings(servers: &[super::McpServer]) -> Value {
     let mut map = Map::new();
     for s in servers {
-        let v = match &s.transport {
+        let mut v = match &s.transport {
             McpTransport::Stdio { command, args, env } => {
                 json!({"command": command, "args": args, "env": env, "trust": true})
             }
-            McpTransport::Http { url, headers } => {
-                json!({"httpUrl": url, "headers": headers, "trust": true})
-            }
         };
+        if let Some(t) = s.timeout_secs {
+            v["timeout"] = (t * 1000).into();
+        }
         map.insert(s.name.clone(), v);
     }
     Value::Object(map)
@@ -111,7 +115,13 @@ impl Harness for Gemini {
         let dir = scope_dir(&spec.cwd, &spec.scope);
         ensure_private_dir(&dir.join(".gemini"))?;
         let settings = dir.join(".gemini").join("settings.json");
-        let body = json!({"mcpServers": mcp_settings(&spec.mcp_servers)});
+        let mut body = json!({"mcpServers": mcp_settings(&spec.mcp_servers)});
+        if spec.key_env.iter().any(|k| k == "GEMINI_API_KEY") {
+            // An API key the owner added in the app: use it even if a
+            // Google sign-in was saved before (a saved auth type would
+            // otherwise win over the environment).
+            body["security"] = json!({"auth": {"selectedType": "gemini-api-key"}});
+        }
         write_private_file(&settings, &serde_json::to_vec_pretty(&body)?)?;
         inv.temp_files.push(settings);
 
@@ -517,11 +527,13 @@ mod tests {
                     args: vec!["mcp".into()],
                     env: BTreeMap::new(),
                 },
+                timeout_secs: Some(420),
             }],
             cwd: tmp.path().into(),
             writable_dirs: vec!["/data/memory".into()],
             run_dir: tmp.path().into(),
             scope: "conv/../1".into(),
+            key_env: vec!["GEMINI_API_KEY".into()],
         };
         let inv = Gemini::new(HarnessConfig::gemini_default())
             .build(&spec)
@@ -543,6 +555,11 @@ mod tests {
             serde_json::from_slice(&std::fs::read(cwd.join(".gemini/settings.json")).unwrap())
                 .unwrap();
         assert_eq!(settings["mcpServers"]["iris"]["trust"], true);
+        assert_eq!(settings["mcpServers"]["iris"]["timeout"], 420_000);
+        assert_eq!(
+            settings["security"]["auth"]["selectedType"],
+            "gemini-api-key"
+        );
         assert_eq!(inv.env[0].0, "GEMINI_SYSTEM_MD");
         let system = std::fs::read_to_string(&inv.env[0].1).unwrap();
         assert!(system.starts_with("You are Iris") && system.contains("${AvailableTools}"));

@@ -156,6 +156,20 @@ async fn run_locked(
     };
     let shared = ctx.members.len() > 1;
 
+    if state.is_paused().await {
+        return finish(
+            state,
+            input,
+            &audience,
+            &Acc::default(),
+            json!(null),
+            Outcome::Failed {
+                kind: "paused",
+                detail: "the owner paused Iris".into(),
+            },
+        )
+        .await;
+    }
     if state.limiter.saturated() {
         state.hub.to_users(
             &audience,
@@ -289,11 +303,23 @@ async fn run_locked(
                     .into(),
             );
         }
-        let mcp_servers = if caps.mcp {
-            mcp_servers(state, &input.owner_user_id, conv_id, shared).await
+        let (mcp_servers, _grant) = if caps.mcp {
+            mcp_servers(
+                state,
+                &input.owner_user_id,
+                conv_id,
+                &ctx.kind,
+                msg_id,
+                shared,
+            )
+            .await
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
+        if !shared {
+            notices.extend(crate::gateway::connector_notices(state, &input.owner_user_id).await);
+        }
+        let keys = crate::keys::env_for(state, &harness_name).await;
         let participants: Vec<String> = ctx.names.values().cloned().collect();
         let system_prompt = persona::assemble(
             &state.paths,
@@ -325,6 +351,7 @@ async fn run_locked(
             },
             run_dir: state.paths.run_dir(),
             scope: conv_id.to_string(),
+            key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
         };
         let invocation = match entry.harness.build(&spec) {
             Ok(mut i) => {
@@ -333,6 +360,9 @@ async fn run_locked(
                     // updater could not write there anyway.
                     i.env.push(("DISABLE_AUTOUPDATER".into(), "1".into()));
                 }
+                // API keys the owner added in the app (after inherited
+                // ones were stripped).
+                i.env.extend(keys);
                 i
             }
             Err(e) => {
@@ -556,6 +586,7 @@ async fn refine_with_model(state: &AppState, text: &str) -> Option<Effort> {
     let effort = pin
         .and_then(|p| p.effort)
         .or_else(|| crate::ranking::default_effort(m));
+    let keys = crate::keys::env_for(state, &m.harness).await;
     let spec = TurnSpec {
         turn_id: new_id(),
         prompt: classifier::model_prompt(text),
@@ -569,8 +600,10 @@ async fn refine_with_model(state: &AppState, text: &str) -> Option<Effort> {
         writable_dirs: Vec::new(),
         run_dir: state.paths.run_dir(),
         scope: "classifier".into(),
+        key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
     };
-    let invocation = entry.harness.build(&spec).ok()?;
+    let mut invocation = entry.harness.build(&spec).ok()?;
+    invocation.env.extend(keys);
     let strip = state.strip_env(entry);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -765,6 +798,9 @@ fn failure_text(kind: &str, detail: &str) -> String {
             shared conversations unless the owner turns that on."
             .into(),
         "timeout" => "That took too long, so I stopped. Want me to try again?".into(),
+        "paused" => "I'm paused right now, so I didn't do anything. You can resume me from \
+            my computer screen in the app whenever you're ready."
+            .into(),
         "no_engine" => "I can't reach any AI engine on the server right now. One of Claude, \
             Codex, Gemini, or OpenCode needs to be installed and signed in; I can walk you \
             through it in Settings."
@@ -831,7 +867,17 @@ async fn finish(
         .call(move |db| db::messages_between(db, &c, after, i64::MAX))
         .await
     {
-        for m in new.into_iter().filter(|m| m.kind == "card") {
+        // Agent cards only: server cards (approvals, notices) were sent
+        // live when they were posted.
+        let agent_card = |m: &Message| {
+            m.card.as_ref().is_some_and(|c| {
+                crate::entities::CARD_TYPES.contains(&c["type"].as_str().unwrap_or(""))
+            })
+        };
+        for m in new
+            .into_iter()
+            .filter(|m| m.kind == "card" && agent_card(m))
+        {
             state.hub.to_users(
                 audience,
                 json!({"type": "message.created", "conversation_id": conv_id, "message": m}),
@@ -858,7 +904,7 @@ async fn finish(
     }
     // A failed turn tells offline members Iris got stuck, so nobody is left
     // waiting; the app offers a retry on the message.
-    let stuck = matches!(outcome, Outcome::Failed { .. });
+    let stuck = matches!(outcome, Outcome::Failed { kind, .. } if kind != "paused");
     if (ok || stuck) && input.purpose == Purpose::Chat && state.cfg.push.notify_replies_when_offline
     {
         let offline: Vec<String> = audience
@@ -983,17 +1029,21 @@ async fn load_images(state: &AppState, m: &Message) -> Vec<ImageInput> {
         .unwrap_or_default()
 }
 
-/// The Iris MCP bridge plus every enabled connector (secrets unsealed).
+/// The Iris MCP bridge plus one gateway proxy per connector the turn may
+/// use (with the guard that ends that access when the attempt ends).
 ///
-/// In shared conversations (more than one person) the owner's connectors
-/// are withheld and the bridge only offers cards, so other members cannot
-/// reach the owner's accounts, goals, feed, or library through the agent.
+/// Connectors belong to the owner: only the owner's personal
+/// conversations and jobs get them. In shared conversations (more than one
+/// person) the bridge only offers cards, so other members cannot reach the
+/// owner's accounts, goals, feed, or library through the agent.
 async fn mcp_servers(
     state: &AppState,
     user_id: &str,
     conv_id: &str,
+    conv_kind: &str,
+    message_id: &str,
     shared: bool,
-) -> Vec<McpServer> {
+) -> (Vec<McpServer>, Option<crate::gateway::GrantGuard>) {
     let mut args = vec![
         "mcp".into(),
         "--data-dir".into(),
@@ -1013,22 +1063,18 @@ async fn mcp_servers(
             args,
             env: BTreeMap::new(),
         },
+        timeout_secs: None,
     }];
     if shared {
-        return servers;
+        return (servers, None);
     }
-    let connectors = state
-        .db
-        .call(|c| crate::entities::list_connectors(c, true))
-        .await
-        .unwrap_or_default();
-    for con in connectors {
-        match crate::server::connector_to_mcp(state, &con) {
-            Ok(s) => servers.push(s),
-            Err(e) => crate::warn!("connector {} skipped: {e}", con.name),
+    match crate::gateway::grant_for_turn(state, user_id, conv_id, conv_kind, message_id).await {
+        Some((connectors, guard)) => {
+            servers.extend(connectors);
+            (servers, Some(guard))
         }
+        None => (servers, None),
     }
-    servers
 }
 
 /// Store a user message and an assistant placeholder, broadcast both, and

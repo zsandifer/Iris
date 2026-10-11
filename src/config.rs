@@ -33,6 +33,38 @@ pub struct Config {
     pub feed: JobConfig,
     pub push: PushConfig,
     pub engines: EnginesConfig,
+    pub safety: SafetyConfig,
+}
+
+/// The connector gateway's approval gate and tripwires.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SafetyConfig {
+    /// How long an approval card waits for the owner before the action is
+    /// dropped (and the agent told).
+    pub approval_timeout_secs: u64,
+    /// Tripwire: a connector that sends more than this many messages in an
+    /// hour is paused and the owner notified.
+    pub max_sends_per_hour: u32,
+    /// Tripwire: more calls than this through one connector in an hour.
+    pub max_calls_per_hour: u32,
+    /// Tripwire: more data than this (MB) read through one connector in an
+    /// hour looks like a bulk export.
+    pub max_read_mb_per_hour: u32,
+    /// Stop a connector's program after this many idle minutes.
+    pub idle_minutes: u64,
+}
+
+impl Default for SafetyConfig {
+    fn default() -> Self {
+        Self {
+            approval_timeout_secs: 300,
+            max_sends_per_hour: 5,
+            max_calls_per_hour: 200,
+            max_read_mb_per_hour: 25,
+            idle_minutes: 5,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -282,6 +314,7 @@ impl Default for Config {
             feed: JobConfig::feed_default(),
             push: PushConfig::default(),
             engines: EnginesConfig::default(),
+            safety: SafetyConfig::default(),
         }
     }
 }
@@ -376,6 +409,18 @@ impl Config {
             if h.command.trim().is_empty() {
                 return Err(format!("harness.{name}.command is empty").into());
             }
+        }
+        if self.safety.approval_timeout_secs < 30 {
+            return Err("safety.approval_timeout_secs must be at least 30".into());
+        }
+        if self.safety.approval_timeout_secs + 60 > self.turn_timeout_secs {
+            return Err(
+                "turn_timeout_secs must be at least a minute longer than safety.approval_timeout_secs"
+                    .into(),
+            );
+        }
+        if self.safety.idle_minutes == 0 {
+            return Err("safety.idle_minutes must be at least 1".into());
         }
         if !self.engines.helper.is_empty() && self.engines.dir.trim().is_empty() {
             return Err("engines.helper needs engines.dir (a directory the helper owns)".into());
