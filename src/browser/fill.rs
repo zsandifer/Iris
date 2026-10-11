@@ -154,7 +154,7 @@ async fn load(
 /// nothing is filled then. Secrets are masked first and remembered for
 /// redaction.
 async fn type_into(
-    b: &Browser,
+    state: &AppState,
     ctx: &TurnCtx,
     run: &Running,
     pin: &Pin,
@@ -165,13 +165,18 @@ async fn type_into(
     if run.page().target_id != pin.target {
         return Err(PAGE_CHANGED.into());
     }
+    let b = &state.browser;
     if secret {
         if text.chars().count() < super::MIN_SECRET {
             return Err(TOO_SHORT.into());
         }
+        // Recorded (on disk, encrypted where secret) before the page gets
+        // it, or not filled at all: redaction and the screenshot block
+        // must survive restarts.
         run.remember_secret(text);
         run.remember_secret_doc(&pin.doc);
-        b.taint_origin(&pin.origin);
+        save_history(state, run)?;
+        b.taint_origin(&pin.origin)?;
     }
     // Checked again right before the single command that fills.
     let p = eval_mut(
@@ -224,6 +229,14 @@ fn not_found_for(e: crate::util::BoxError) -> Result<Output> {
 /// Load every saved secret of the user for redaction (never filled or
 /// returned from here).
 pub async fn seed_secrets(state: &AppState, user_id: &str, run: &Running) {
+    if let Ok(ct) = std::fs::read(history_file(state))
+        && let Ok(plain) = state.vault.decrypt(&ct, HISTORY_AAD)
+    {
+        let list: Vec<String> = serde_json::from_slice(&plain).unwrap_or_default();
+        for s in list {
+            run.remember_secret(&s);
+        }
+    }
     let uid = user_id.to_string();
     let rows = state
         .db
@@ -245,14 +258,32 @@ pub async fn seed_secrets(state: &AppState, user_id: &str, run: &Running) {
         };
         let fields: serde_json::Map<String, Value> =
             serde_json::from_slice(&plain).unwrap_or_default();
-        // Not CVCs: three digits are too common in ordinary text to hide on
-        // every page; a CVC is redacted once Iris fills it.
-        for k in ["password", "number"] {
+        // CVCs too: a page may show one it kept, even after a restart (the
+        // cost is that the same three digits elsewhere are hidden as well).
+        for k in ["password", "number", "cvc"] {
             if let Some(v) = fields.get(k).and_then(Value::as_str) {
                 run.remember_secret(v);
             }
         }
     }
+}
+
+const HISTORY_AAD: &str = "browser-redaction-history";
+
+fn history_file(state: &AppState) -> std::path::PathBuf {
+    state.paths.browser_dir().join("redaction.enc")
+}
+
+/// Every secret Iris ever filled (also ones since edited or deleted),
+/// encrypted with the vault: pages may show them in later sessions.
+fn save_history(state: &AppState, run: &Running) -> Result<()> {
+    let body = serde_json::to_vec(&run.originals())?;
+    let ct = state.vault.encrypt(&body, HISTORY_AAD)?;
+    let file = history_file(state);
+    if let Some(dir) = file.parent() {
+        crate::config::ensure_private_dir(dir)?;
+    }
+    crate::config::write_private_file(&file, &ct)
 }
 
 /// `fill_login`: answers "filled" or "not found (...)".
@@ -262,7 +293,6 @@ pub async fn login(
     run: &Running,
     site: Option<&str>,
 ) -> Result<Output> {
-    let b = &state.browser;
     let page = page_info(run).await?;
     let pinned_target = run.page().target_id;
     let host = page.host.clone();
@@ -320,18 +350,26 @@ pub async fn login(
     if let Some(r) = user_ref
         && !username.is_empty()
     {
-        match type_into(b, ctx, run, &pin, r, &username, false).await {
+        match type_into(state, ctx, run, &pin, r, &username, false).await {
             Ok(f) => filled |= f,
             Err(e) => return not_found_for(e),
         }
     }
-    if let Some(r) = pass_ref
-        && !password.is_empty()
-    {
-        match type_into(b, ctx, run, &pin, r, &password, true).await {
-            Ok(f) => filled |= f,
-            Err(e) => return not_found_for(e),
+    if let Some(r) = pass_ref {
+        // A password box is there: the sign-in is only filled if it is.
+        let ok = !password.is_empty()
+            && match type_into(state, ctx, run, &pin, r, &password, true).await {
+                Ok(f) => f,
+                Err(e) => return not_found_for(e),
+            };
+        if !ok {
+            return Ok(Output::text(if password.is_empty() {
+                "not found (no password is saved for this site)"
+            } else {
+                "not found (the password field would not take it; ask the user to take over)"
+            }));
         }
+        filled = true;
     }
     drop(password);
     if !filled {
@@ -546,7 +584,7 @@ pub async fn card(
         .unwrap_or("")
         .to_string();
     drop(secret);
-    let result = fill_card_fields(b, ctx, run, &pin, &fields, &card, &number, &cvc).await;
+    let result = fill_card_fields(state, ctx, run, &pin, &fields, &card, &number, &cvc).await;
     drop((number, cvc));
     let missing = match result {
         Ok(Some(missing)) => missing,
@@ -582,7 +620,7 @@ pub async fn card(
 /// nothing else is); otherwise the parts that could not be filled.
 #[allow(clippy::too_many_arguments)]
 async fn fill_card_fields(
-    b: &Browser,
+    state: &AppState,
     ctx: &TurnCtx,
     run: &Running,
     pin: &Pin,
@@ -591,16 +629,17 @@ async fn fill_card_fields(
     number: &str,
     cvc: &str,
 ) -> Result<Option<Vec<&'static str>>> {
+    let b = &state.browser;
     let m = &card.metadata;
     let Some(r) = fields["number"].as_str() else {
         return Ok(None);
     };
-    if !type_into(b, ctx, run, pin, r, number, true).await? {
+    if !type_into(state, ctx, run, pin, r, number, true).await? {
         return Ok(None);
     }
     let mut missing = Vec::new();
     if let Some(r) = fields["cvc"].as_str() {
-        if cvc.is_empty() || !type_into(b, ctx, run, pin, r, cvc, true).await? {
+        if cvc.is_empty() || !type_into(state, ctx, run, pin, r, cvc, true).await? {
             missing.push("security code");
         }
     }
@@ -617,7 +656,7 @@ async fn fill_card_fields(
                 let opts = json!([format!("{mm}/{yy}"), format!("{mm}/{yyyy}")]);
                 choose(b, ctx, run, pin, r, opts).await?
             } else {
-                type_into(b, ctx, run, pin, r, &format!("{mm}/{yy}"), false).await?
+                type_into(state, ctx, run, pin, r, &format!("{mm}/{yy}"), false).await?
             };
         }
         if let (Some(rm), Some(ry)) = (fields["month"].as_str(), fields["year"].as_str()) {
@@ -625,12 +664,17 @@ async fn fill_card_fields(
                 let n = mm.trim_start_matches('0');
                 choose(b, ctx, run, pin, rm, json!([mm, n])).await?
             } else {
-                type_into(b, ctx, run, pin, rm, mm, false).await?
+                type_into(state, ctx, run, pin, rm, mm, false).await?
             };
             ok &= if selects["year"].as_bool() == Some(true) {
                 choose(b, ctx, run, pin, ry, json!([yyyy, yy])).await?
             } else {
-                type_into(b, ctx, run, pin, ry, yyyy, false).await?
+                let year = if fields["shortYear"] == true {
+                    yy
+                } else {
+                    yyyy
+                };
+                type_into(state, ctx, run, pin, ry, year, false).await?
             };
         }
         if has_exp_field && !ok {
@@ -642,7 +686,7 @@ async fn fill_card_fields(
     if let Some(r) = fields["name"].as_str() {
         match m["cardholder"].as_str().filter(|n| !n.is_empty()) {
             Some(name) => {
-                if !type_into(b, ctx, run, pin, r, name, false).await? {
+                if !type_into(state, ctx, run, pin, r, name, false).await? {
                     missing.push("name on the card");
                 }
             }
@@ -811,4 +855,60 @@ mod tests {
         assert!(secure_enough("http", "::1"));
         assert!(secure_enough("http", "app.localhost"));
     }
+}
+
+/// The owner approved a card after `fill_card` stopped waiting (the turn
+/// may even be over). Once no turn runs in that chat and the approval is
+/// still unused, continue with a short message from the owner, so Iris
+/// picks it up (`fill_card` then finds the approval).
+pub fn resume_after_approval(state: AppState, message_id: String, conv: String, approver: String) {
+    tokio::spawn(async move {
+        // Give a waiting fill_card its chance to take it first.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
+        loop {
+            let busy = state
+                .running
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&conv);
+            if !busy {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let id = message_id.clone();
+        let card = state
+            .db
+            .call(move |c| db::get_message(c, &id))
+            .await
+            .ok()
+            .flatten();
+        let still_open = card.is_some_and(|m| {
+            m.card.as_ref().is_some_and(|c| {
+                c["state"] == "approved"
+                    && c["wallet"]["used_at"].is_null()
+                    && now_ms() - m.created_at < APPROVAL_TTL_MS
+            })
+        });
+        if !still_open {
+            return;
+        }
+        if let Err(e) = crate::turn::start_chat_turn(
+            &state,
+            &conv,
+            Some(&approver),
+            "I approved the card. Go ahead.",
+            &[],
+            crate::router::Purpose::Chat,
+            &approver,
+        )
+        .await
+        {
+            crate::warn!("browser: could not continue after card approval {message_id}: {e}");
+        }
+    });
 }

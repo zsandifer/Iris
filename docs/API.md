@@ -1694,8 +1694,10 @@ image:
 Input from a device that does not have control, or a failed input, gets
 `{"type": "browser.input_error", "message": "..."}`. Input is carried out in
 order on its own task, so a slow page never holds up the socket's frames or
-events (at most 64 inputs wait; more are refused with that error). Typed
-text is never logged.
+events (at most 64 inputs wait; more are refused with that error). Each
+input step re-checks that this device still has control; input still
+queued when the socket closes is dropped, and a revoked device loses
+control at once. Typed text is never logged.
 
 ### Keepalive and revocation
 
@@ -2482,7 +2484,8 @@ asking for a new snapshot. Values of password fields, card fields, and
 fields Iris filled from the vault are shown as `••••` in snapshots and
 masked on screen. JavaScript dialogs are answered (alerts and confirms
 accepted, prompts dismissed) and reported at the top of the next result.
-Every secret Iris filled in the current browser session is replaced with
+Text is read exactly as written (adjacent inline elements are not split
+apart). Every secret Iris filled in the current browser session is replaced with
 `••••` anywhere in a tool result (a page could echo it in a dialog, title,
 or other field). The page helpers do this on the raw text, before folding
 whitespace, cutting long values, or quoting, so no escaped or partial copy
@@ -2491,13 +2494,18 @@ holds a secret once percent-decoded (an address in some other escaping)
 loses its query. Dialogs, the live title and address, and approval cards
 are redacted the same way; card numbers are found in any grouping
 ("3782 822463 10005"), and escapes in UTF-8 or Latin-1, in any letter case.
-The owner's saved passwords and card numbers are known to the redactor
-from the start (a page may show one it kept from an earlier session).
-`screenshot` never shows a site (origin) Iris ever filled a secret into
-(the list is kept on disk in `<data dir>/browser/tainted-origins.json`;
-a page could keep the value and paint it where no text check sees), and
-refuses on any other page whose text or unmasked fields (open shadow roots
-too) show a secret. Saved secrets shorter than 3 characters are not filled (they
+The owner's saved passwords, card numbers, and CVCs, and every secret Iris
+ever filled (kept encrypted with the vault in
+`<data dir>/browser/redaction.enc`, so edited or deleted ones too), are
+known to the redactor from the start: a page may show one it kept from an
+earlier session. (So the same three digits as a saved CVC are hidden on
+pages too.) `screenshot` never shows a page that is, or embeds a frame
+from, a site (origin) Iris ever filled a secret into (stored hashed in
+`<data dir>/browser/tainted-origins.json`; if that file cannot be read,
+no screenshots at all), and refuses on any other page whose text or
+unmasked fields (open shadow roots too) show a secret. The page is checked
+again after capture and the picture is dropped if it changed. A fill does
+not happen unless both files could be written first. Saved secrets shorter than 3 characters are not filled (they
 could not be told apart from ordinary text).
 
 Each call waits while the owner has taken over, and checks again once it
@@ -2511,7 +2519,8 @@ timeout for this server (its default is 60 s); OpenCode gets the same
 `fill_login` takes the saved login whose `site` matches the current page's
 host (a subdomain matches too; the most recently used wins), finds the
 sign-in fields (also in same-origin frames), and fills the username and
-password itself. Each value is set on that exact element in one step from
+password itself (when the page has a password box, the password must go in,
+or the answer is `not found`). Each value is set on that exact element in one step from
 Iris's isolated script world (masked first, through the native value
 setter, with the input and change events a typing user causes), and only
 while the same tab shows the same document whose address was checked; focus
@@ -2525,15 +2534,17 @@ page has a card number field, and posts an [approval card](#server-cards)
 in the conversation (with a push to the owner if no app is open), built
 from the real page and card. It waits up to 45 seconds for the decision;
 after that it answers `waiting for approval`, and calling it again on the
-same site later picks up the decision (the app sends "I approved the card.
-Go ahead." when the owner approves after the turn ended, which starts that
-call). An approval is for the card as it was: editing the card asks again.
+same site later picks up the decision. When the owner approves after
+`fill_card` stopped waiting, the server waits until no turn runs in that
+chat and, if the approval is still unused, continues with a message from
+the owner ("I approved the card. Go ahead."), which leads to that call. An approval is for the card as it was: editing the card asks again.
 After approval (still unexpired and unused when it is consumed), Iris fills
 the card number, expiry, CVC, and name itself the same way, on the approved
 page only; each approval fills once and is bound to the browser's exact
 origin (scheme, host, and port). If some part could not be filled (for
 example the expiry dropdown has no matching option) the answer is
-`filled (but the ... could not be filled in; ...)`. Page titles and
+`filled (but the ... could not be filled in; ...)`. A two-digit year box gets
+"31", not "2031". Page titles and
 addresses in the approval card are redacted like tool results. Cards are
 never used in jobs (nobody could approve).
 

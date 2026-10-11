@@ -42,7 +42,7 @@ const CHECKOUT_PAGE: &str = r#"<!doctype html><html><head><title>Checkout</title
 <form method="post" action="/pay">
 <input name="cardnumber" autocomplete="cc-number" placeholder="Card number">
 <input name="exp" autocomplete="cc-exp" placeholder="MM / YY">
-<input name="cvc" autocomplete="cc-csc" placeholder="CVC">
+<input name="cvc" autocomplete="cc-csc" placeholder="CVC" oninput="localStorage.setItem('cvc', this.value)">
 <input name="holder" autocomplete="cc-name" placeholder="Name on card">
 <button>Pay now</button>
 </form></body></html>"#;
@@ -54,10 +54,25 @@ const REFLECT_PAGE: &str = r#"<!doctype html><html><head><title>Echo sign in</ti
 <input name="email" type="email" autocomplete="username" aria-label="Email">
 <input id="pw" name="password" type="password" aria-label="Password"
   oninput="document.getElementById('echo').textContent = 'You typed ' + this.value;
-           document.getElementById('copy').value = this.value; alert('Got ' + this.value)">
+           document.getElementById('copy').value = this.value; alert('Got ' + this.value);
+           document.getElementById('split').innerHTML = '<span>' + this.value.slice(0, 6) + '</span><span>' + this.value.slice(6) + '</span>'">
 <input id="copy" aria-label="Copy">
 <button type="button" onclick="pw.type = 'text'">Show password</button>
-</form><p id="echo"></p></body></html>"#;
+</form><p id="echo"></p><p id="split"></p></body></html>"#;
+
+/// A saved password shown in a masked field (never filled by Iris), one
+/// in an open shadow root, and what the page kept from an earlier fill.
+const SAVED_PAGE: &str = r#"<!doctype html><html><head><title>Saved</title></head><body>
+<h1>Saved</h1>
+<input id="m" type="password" value="S3cret-Pa55-xyz!" aria-label="Saved">
+<button type="button" onclick="m.type = 'text'">Reveal</button>
+<p id="kept"></p><div id="host"></div>
+<script>
+document.getElementById('kept').textContent = 'Kept: ' + (localStorage.getItem('cvc') || '');
+if (location.hash === '#shadow') {
+  document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML = '<input value="S3cret-Pa55-xyz!">';
+}
+</script></body></html>"#;
 
 /// A password field the page later reveals and unmasks, with no other copy;
 /// a focus handler that tries to move focus elsewhere; the password
@@ -135,6 +150,8 @@ async fn test_site() -> (u16, Arc<Mutex<Vec<String>>>) {
                                 PLAIN_CHECKOUT.to_string()
                             } else if line.starts_with("GET /tricky") {
                                 TRICKY_PAGE.to_string()
+                            } else if line.starts_with("GET /saved") {
+                                SAVED_PAGE.to_string()
                             } else if line.starts_with("GET /reflect") {
                                 REFLECT_PAGE.to_string()
                             } else if line.starts_with("GET / ") {
@@ -458,6 +475,48 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
     );
     state.browser.close().await;
     assert!(state.browser.running().is_none());
+
+    // After a restart of Iris (same data directory): the site Iris filled
+    // stays off-limits for screenshots even on a clean page, and a CVC the
+    // page kept is still redacted.
+    let paths = state.paths.clone();
+    drop(state);
+    let db = crate::db::Db::open(&paths.db_file()).unwrap();
+    let mut cfg = Config::default();
+    for h in cfg.harness.values_mut() {
+        h.enabled = false;
+    }
+    let state = AppState::new(cfg, paths, db).unwrap();
+    state.browser.init_allow_no_sandbox(true);
+    let guard = state
+        .browser
+        .begin_turn(&owner, &conv, "msg-9", std::slice::from_ref(&owner));
+    let token = guard.token().to_string();
+    let call = |name: &'static str, args: Value| {
+        let (st, tk) = (state.clone(), token.clone());
+        async move { tools::call(&st, &tk, name, &args).await }
+    };
+    let out = call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/saved")}),
+    )
+    .await;
+    assert!(
+        out.text.contains("Kept: ••••") && !out.text.contains(CVC),
+        "{}",
+        out.text
+    );
+    let shot = call("screenshot", json!({})).await;
+    assert!(shot.is_error && shot.image.is_none(), "{}", shot.text);
+    call(
+        "navigate",
+        json!({"url": format!("http://localhost:{port}/about")}),
+    )
+    .await;
+    let shot = call("screenshot", json!({})).await;
+    assert!(shot.image.is_some(), "{}", shot.text);
+    drop(guard);
+    state.browser.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -599,6 +658,34 @@ async fn reflected_secrets_pending_and_denied_cards_and_stale_refs() {
     assert!(snap.text.contains("value=\"08/31\""), "{}", snap.text);
     outputs.push(snap.text);
 
+    // The text check on its own, on a site Iris never filled: a saved
+    // password masked is fine; revealed (or in a shadow root) it is not.
+    let saved = format!("http://127.0.0.1:{port_b}/saved");
+    let out = call("navigate", json!({"url": saved})).await;
+    outputs.push(out.text.clone());
+    let shot = call("screenshot", json!({})).await;
+    assert!(shot.image.is_some(), "{}", shot.text);
+    let reveal = ref_of(&out.text, "button \"Reveal\"");
+    outputs.push(call("click", json!({"ref": reveal})).await.text);
+    let shot = call("screenshot", json!({})).await;
+    assert!(
+        shot.is_error && shot.text.contains("shows saved"),
+        "{}",
+        shot.text
+    );
+    let out = call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port_b}/saved?x#shadow")}),
+    )
+    .await;
+    outputs.push(out.text);
+    let shot = call("screenshot", json!({})).await;
+    assert!(
+        shot.is_error && shot.text.contains("shows saved"),
+        "{}",
+        shot.text
+    );
+
     for o in &outputs {
         assert!(!o.contains(PASSWORD) && !o.contains(CARD), "{o}");
     }
@@ -706,6 +793,13 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
     let pw = ref_of(&snap.text, "password field \"Password\"");
     let out = call("type", json!({"ref": pw, "text": "hello"})).await;
     assert_eq!(out.text, "Typed it.");
+    // Enter is not pressed when the page moved the focus away.
+    let out = call("type", json!({"ref": pw, "text": "hello", "submit": true})).await;
+    assert!(
+        out.is_error && out.text.contains("did not press Enter"),
+        "{}",
+        out.text
+    );
     let run = state.browser.running().unwrap();
     let other = run
         .cdp

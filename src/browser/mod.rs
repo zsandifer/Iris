@@ -187,6 +187,7 @@ pub struct Running {
     /// page reflects (a dialog, another field, the title) is redacted from
     /// what the agent reads. Memory only; gone when the browser closes.
     secrets: Mutex<Vec<String>>,
+    originals: Mutex<Vec<String>>,
     /// Documents Iris filled a secret into: never screenshotted (a page can
     /// paint a value it was given in ways no text check sees).
     secret_docs: Mutex<std::collections::HashSet<String>>,
@@ -201,6 +202,21 @@ pub struct Running {
 /// ordinary text when redacting, so Iris will not fill them.
 pub const MIN_SECRET: usize = 3;
 
+fn origin_hash(origin: &str) -> String {
+    use sha2::Digest;
+    crate::util::hex(&sha2::Sha256::digest(origin.as_bytes()))
+}
+
+/// The saved list of filled origins: empty if there is none yet, None if
+/// it exists but cannot be read.
+fn load_tainted(file: &std::path::Path) -> Option<std::collections::HashSet<String>> {
+    match std::fs::read(file) {
+        Ok(b) => serde_json::from_slice(&b).ok(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Default::default()),
+        Err(_) => None,
+    }
+}
+
 fn is_card_number(s: &str) -> bool {
     (12..=19).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
 }
@@ -210,7 +226,7 @@ fn is_card_number(s: &str) -> bool {
 fn redact_digit_run(text: &str, digits: &str) -> (String, bool) {
     let want: Vec<char> = digits.chars().collect();
     let chars: Vec<char> = text.chars().collect();
-    let sep = |c: char| matches!(c, ' ' | '-' | '.' | '\u{a0}');
+    let sep = |c: char| c.is_whitespace() || matches!(c, '-' | '.');
     let mut out = String::with_capacity(text.len());
     let (mut i, mut hit) = (0, false);
     while i < chars.len() {
@@ -299,6 +315,12 @@ impl Running {
         if secret.chars().count() < MIN_SECRET {
             return;
         }
+        {
+            let mut o = lock(&self.originals);
+            if !o.iter().any(|x| x == secret) {
+                o.push(secret.to_string());
+            }
+        }
         let mut forms = vec![secret.to_string()];
         // As it appears in addresses and submitted forms.
         let enc = uri_encode(secret);
@@ -369,6 +391,12 @@ impl Running {
         lock(&self.secret_docs).contains(doc)
     }
 
+    /// The secrets themselves (not their encoded forms), for the encrypted
+    /// redaction history.
+    pub fn originals(&self) -> Vec<String> {
+        lock(&self.originals).clone()
+    }
+
     /// The remembered secrets (to hand to the page helpers' isolated world).
     pub fn secrets(&self) -> Vec<String> {
         lock(&self.secrets).clone()
@@ -425,7 +453,8 @@ pub struct Shared {
     /// Origins Iris ever filled a secret into (kept on disk; not secret).
     /// The agent never gets screenshots of them: a page can keep a value
     /// and paint it later, even after a restart.
-    tainted: Mutex<std::collections::HashSet<String>>,
+    /// None: the list on disk exists but could not be read.
+    tainted: Mutex<Option<std::collections::HashSet<String>>>,
     tainted_file: PathBuf,
     /// Orders changes of the saved safety switches (pause, sandbox).
     pub switch_lock: tokio::sync::Mutex<()>,
@@ -477,35 +506,40 @@ impl Browser {
             paused: AtomicBool::new(false),
             allow_no_sandbox: AtomicBool::new(false),
             maintenance: AtomicBool::new(false),
-            tainted: Mutex::new(
-                std::fs::read(dir.join("tainted-origins.json"))
-                    .ok()
-                    .and_then(|b| serde_json::from_slice(&b).ok())
-                    .unwrap_or_default(),
-            ),
+            tainted: Mutex::new(load_tainted(&dir.join("tainted-origins.json"))),
             tainted_file: dir.join("tainted-origins.json"),
             switch_lock: tokio::sync::Mutex::new(()),
         }))
     }
 
-    /// Remember that Iris filled a secret into `origin`.
-    pub fn taint_origin(&self, origin: &str) {
-        let list = {
-            let mut t = lock(&self.tainted);
-            if !t.insert(origin.to_string()) {
-                return;
-            }
-            serde_json::to_vec(&*t).unwrap_or_default()
+    /// Remember (on disk, before anything is filled) that Iris fills a
+    /// secret into `origin`. Origins are stored hashed. An error means the
+    /// fill must not happen.
+    pub fn taint_origin(&self, origin: &str) -> Result<()> {
+        let h = origin_hash(origin);
+        let mut t = lock(&self.tainted);
+        let Some(set) = t.as_mut() else {
+            return Err("the browser's safety list could not be read".into());
         };
-        if let Some(dir) = self.tainted_file.parent()
-            && crate::config::ensure_private_dir(dir).is_ok()
-        {
-            let _ = crate::config::write_private_file(&self.tainted_file, &list);
+        if set.contains(&h) {
+            return Ok(());
         }
+        let mut next = set.clone();
+        next.insert(h);
+        if let Some(dir) = self.tainted_file.parent() {
+            crate::config::ensure_private_dir(dir)?;
+        }
+        crate::config::write_private_file(&self.tainted_file, &serde_json::to_vec(&next)?)?;
+        *set = next;
+        Ok(())
     }
 
+    /// True for origins Iris filled a secret into, and for everything when
+    /// the saved list could not be read (fail closed).
     pub fn is_tainted(&self, origin: &str) -> bool {
-        lock(&self.tainted).contains(origin)
+        lock(&self.tainted)
+            .as_ref()
+            .is_none_or(|set| set.contains(&origin_hash(origin)))
     }
 
     /// Stop/Pause: the turns of a conversation (or all) end now for the
@@ -825,6 +859,7 @@ impl Browser {
             dialogs: Mutex::default(),
             last_meta: Mutex::new((VIEW_W as f64, VIEW_H as f64)),
             secrets: Mutex::default(),
+            originals: Mutex::default(),
             secret_docs: Mutex::default(),
             recover_lock: tokio::sync::Mutex::new(()),
             seeded: AtomicBool::new(false),
@@ -909,6 +944,15 @@ impl Browser {
             .to_string();
         let s = Some(session.as_str());
         cdp.call("Page.enable", json!({}), s).await?;
+        // Behave like the focused window it is to the user: pages get focus
+        // events (headless pages otherwise never do).
+        let _ = cdp
+            .call(
+                "Emulation.setFocusEmulationEnabled",
+                json!({"enabled": true}),
+                s,
+            )
+            .await;
         let ua = cdp
             .call("Browser.getVersion", json!({}), None)
             .await
@@ -1062,10 +1106,17 @@ impl Browser {
                     // Alerts and confirms follow from what was just clicked;
                     // prompts would need text, so they are dismissed.
                     let accept = kind != "prompt";
-                    lock(&run.dialogs).push(format!(
-                        "{kind} \"{msg}\" was {}",
-                        if accept { "accepted" } else { "dismissed" }
-                    ));
+                    {
+                        // A page can open dialogs endlessly: keep a few.
+                        let mut d = lock(&run.dialogs);
+                        if d.len() >= 5 {
+                            d.remove(0);
+                        }
+                        d.push(format!(
+                            "{kind} \"{msg}\" was {}",
+                            if accept { "accepted" } else { "dismissed" }
+                        ));
+                    }
                     let cdp = run.cdp.clone();
                     let s = page.session_id.clone();
                     tokio::spawn(async move {
@@ -1319,13 +1370,19 @@ impl Browser {
                 .map(|v| v.clamp(0.0, 1.0))
         };
         let cdp = &run.cdp;
+        // Control may change while an input is under way: check before
+        // every step.
+        let still = || match self.control() {
+            Control::User { device_id: d, .. } if d == device_id => Ok(()),
+            _ => Err::<(), crate::util::BoxError>("take over first".into()),
+        };
         match ev["kind"].as_str().unwrap_or("") {
             "tap" => {
                 let (x, y) = (
                     frac("x").ok_or("x is required")? * w,
                     frac("y").ok_or("y is required")? * h,
                 );
-                tools::click_at(cdp, s, x, y, &|| Ok(())).await?;
+                tools::click_at(cdp, s, x, y, &still).await?;
             }
             "scroll" => {
                 let x = frac("x").unwrap_or(0.5) * w;
@@ -1351,10 +1408,10 @@ impl Browser {
             }
             "key" => {
                 let key = ev["key"].as_str().unwrap_or("");
-                tools::press_key(cdp, s, key, &|| Ok(())).await?;
+                tools::press_key(cdp, s, key, &still).await?;
             }
             "back" => {
-                tools::history_step(cdp, s, -1, || Ok(())).await?;
+                tools::history_step(cdp, s, -1, still).await?;
             }
             "navigate" => {
                 let url = tools::normalize_url(ev["url"].as_str().unwrap_or(""))?;
@@ -1464,6 +1521,7 @@ mod tests {
             dialogs: Mutex::default(),
             last_meta: Mutex::new((0.0, 0.0)),
             secrets: Mutex::default(),
+            originals: Mutex::default(),
             secret_docs: Mutex::default(),
             recover_lock: tokio::sync::Mutex::new(()),
             seeded: AtomicBool::new(false),
@@ -1485,6 +1543,7 @@ mod tests {
         // Any card grouping, and a secret in an address path.
         run.remember_secret("378282246310005");
         assert_eq!(run.redact("Amex 3782 822463 10005."), "Amex ••••.");
+        assert_eq!(run.redact("t\t3782\t8224\n6310005"), "t\t••••");
         run.remember_secret("pa/ss?word");
         assert_eq!(run.redact("https://shop.test/pa%2fss%3fword?x=1"), "••••");
         assert_eq!(decode_loose("p%c3%A4ss"), "päss");

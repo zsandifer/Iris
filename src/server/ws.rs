@@ -134,6 +134,9 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
     // stalls this socket's live view or events.
     let (input_err_tx, mut input_err) = tokio::sync::mpsc::unbounded_channel::<String>();
     let mut input_tx: Option<tokio::sync::mpsc::Sender<Value>> = None;
+    // Aborted with the socket: queued input never outlives it.
+    let mut input_worker: Option<tokio::task::JoinHandle<()>> = None;
+    let mut revoked = false;
     loop {
         let due = watching.as_ref().filter(|w| w.pending).map(Watching::due);
         tokio::select! {
@@ -161,13 +164,13 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
                                 let tx = input_tx.get_or_insert_with(|| {
                                     let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(64);
                                     let (st, dev, errs) = (state.clone(), user.device.id.clone(), input_err_tx.clone());
-                                    tokio::spawn(async move {
+                                    input_worker = Some(tokio::spawn(async move {
                                         while let Some(ev) = rx.recv().await {
                                             if let Err(e) = st.browser.user_input(&dev, &ev).await {
                                                 let _ = errs.send(e.to_string());
                                             }
                                         }
-                                    });
+                                    }));
                                     tx
                                 });
                                 match tx.try_send(v) {
@@ -246,10 +249,20 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
                 // Drop sockets of revoked devices within about a minute.
                 if ticks % 2 == 0 && !device_active(&state, &user.device.id).await {
                     let _ = send_json(&mut socket, &json!({"type": "error", "code": "unauthorized", "message": "device revoked"})).await;
+                    revoked = true;
                     break;
                 }
             }
         }
+    }
+    if let Some(w) = input_worker {
+        w.abort();
+    }
+    // A revoked device loses control of Iris's browser at once.
+    if revoked
+        && matches!(state.browser.control(), crate::browser::Control::User { device_id, .. } if device_id == user.device.id)
+    {
+        state.browser.hand_back();
     }
     let _ = socket.send(Message::Close(None)).await;
 }

@@ -183,7 +183,9 @@ if (!globalThis.__iris) {
       const walk = (node, depth, textOk) => {
         if (full || depth > 200) return;
         if (node.nodeType === 3) {
-          if (textOk) buf += ' ' + node.nodeValue;
+          // Exactly as written: adjacent inline pieces stay together, so a
+          // secret split across elements is still recognized.
+          if (textOk) buf += node.nodeValue;
           return;
         }
         if (node.nodeType !== 1 && node.nodeType !== 11) return;
@@ -349,6 +351,12 @@ if (!globalThis.__iris) {
       return { ok: e.value === value || digits };
     }
 
+    // Whether the element still has the focus (before pressing Enter).
+    function hasFocus(ref) {
+      const e = el(ref);
+      return { ok: !!e && focused(e) };
+    }
+
     // The type tool: replace an input's or textarea's text on that exact
     // element in one step (no ambient focus a page could redirect).
     // Rich editors (contenteditable) are focused and typed into instead.
@@ -476,6 +484,8 @@ if (!globalThis.__iris) {
         exp: split ? null : r(exp),
         month: split ? r(month) : null, year: split ? r(year) : null,
         selects: { exp: isSelect(exp), month: isSelect(month), year: isSelect(year) },
+        // A two-digit year box wants "31", not "2031".
+        shortYear: !!year && !isSelect(year) && (year.maxLength === 2 || any(year, /^yy$|\byy\b/i) && !any(year, /yyyy/i)),
       };
     }
 
@@ -484,7 +494,7 @@ if (!globalThis.__iris) {
       return docs().some((d) => (d.body ? d.body.innerText : '').toLowerCase().includes(want));
     }
 
-    return { snapshot, point, focus, setText, choose, loginFields, cardFields, fillField, pageText, hasText, setSecrets,
+    return { snapshot, point, focus, hasFocus, setText, choose, loginFields, cardFields, fillField, pageText, hasText, setSecrets,
       info: () => ({ url: location.href, title: document.title, origin: location.origin, doc }) };
   })();
 }

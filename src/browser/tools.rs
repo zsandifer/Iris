@@ -289,6 +289,7 @@ async fn run_tool(
         "navigate" => {
             let url = normalize_url(arg("url"))?;
             let events = cdp.subscribe();
+            b.check_agent(ctx)?;
             let r = cdp.call("Page.navigate", json!({"url": url}), s).await?;
             if let Some(err) = r["errorText"].as_str().filter(|e| !e.is_empty()) {
                 return Ok(Output::error(format!("Could not open {url}: {err}")));
@@ -355,6 +356,15 @@ async fn run_tool(
                     .await?;
             }
             if a["submit"].as_bool().unwrap_or(false) {
+                // Enter goes to whatever has focus: only if it is still
+                // the field that was typed into.
+                let f = eval_mut(run, b, ctx, &format!("hasFocus({})", json!(arg("ref")))).await?;
+                if f["ok"] != true {
+                    return Ok(Output::error(
+                        "Typed it, but the page moved the focus elsewhere, so I did not press \
+                         Enter. Take a new snapshot and click the submit button instead.",
+                    ));
+                }
                 let events = cdp.subscribe();
                 press_key(cdp, s, "Enter", &|| b.check_agent(ctx)).await?;
                 settle(events, &page, Duration::from_millis(800)).await;
@@ -416,23 +426,13 @@ async fn run_tool(
             snapshot(run).await
         }
         "screenshot" => {
-            // Text can be redacted, pixels cannot: no picture while the page
-            // shows a secret Iris filled (outside the masked fields).
-            let info = eval(run, "info()").await?;
-            if run.has_secret_doc(info["doc"].as_str().unwrap_or(""))
-                || b.is_tainted(info["origin"].as_str().unwrap_or(""))
-            {
-                return Ok(Output::error(
-                    "No screenshots of this site: Iris has filled saved sign-in or card details \
-                     on it. Use snapshot instead.",
-                ));
-            }
-            let shown = eval(run, "pageText()").await?;
-            if run.shows_secret(shown.as_str().unwrap_or("")) {
-                return Ok(Output::error(
-                    "No screenshot right now: this page shows saved sign-in or card details. \
-                     Use snapshot instead.",
-                ));
+            // Text can be redacted, pixels cannot: check the page (and every
+            // frame in it) before, and make sure it is still the same page
+            // after, or the picture is thrown away.
+            let before = eval(run, "info()").await?;
+            let safe = screenshot_safe(b, run, &before).await?;
+            if let Some(why) = safe {
+                return Ok(Output::error(why));
             }
             let m = cdp.call("Page.getLayoutMetrics", json!({}), s).await?;
             let vv = &m["cssVisualViewport"];
@@ -450,12 +450,18 @@ async fn run_tool(
                     s,
                 )
                 .await?;
-            let info = eval(run, "info()").await.unwrap_or_default();
+            let after = eval(run, "info()").await?;
+            let same = after["doc"] == before["doc"] && run.page().target_id == page.target_id;
+            if !same || screenshot_safe(b, run, &after).await?.is_some() {
+                return Ok(Output::error(
+                    "The page changed while taking the screenshot; try again.",
+                ));
+            }
             Ok(Output {
                 text: format!(
                     "Screenshot of {} ({}).",
-                    info["url"].as_str().unwrap_or(""),
-                    info["title"].as_str().unwrap_or("")
+                    after["url"].as_str().unwrap_or(""),
+                    after["title"].as_str().unwrap_or("")
                 ),
                 image: shot["data"].as_str().map(String::from),
                 is_error: false,
@@ -494,6 +500,73 @@ async fn run_tool(
             super::fill::card(state, ctx, run, a.get("card").and_then(Value::as_str)).await
         }
         other => Ok(Output::error(format!("unknown tool {other}"))),
+    }
+}
+
+/// Why a screenshot of the current page must not be taken, if so: the page
+/// or any frame in it belongs to a site Iris filled a secret into, Iris
+/// filled one into this very document, or the page shows a secret.
+async fn screenshot_safe(
+    b: &super::Browser,
+    run: &Running,
+    info: &Value,
+) -> Result<Option<&'static str>> {
+    const TAINTED: &str = "No screenshots of this page: it shows a site where Iris has filled saved \
+        sign-in or card details. Use snapshot instead.";
+    if run.has_secret_doc(info["doc"].as_str().unwrap_or("")) {
+        return Ok(Some(TAINTED));
+    }
+    let page = run.page();
+    let tree = run
+        .cdp
+        .call("Page.getFrameTree", json!({}), Some(&page.session_id))
+        .await?;
+    let mut origins = Vec::new();
+    collect_origins(&tree["frameTree"], &mut origins);
+    origins.push(info["origin"].as_str().unwrap_or("").to_string());
+    // Frames from other sites may run in their own process (and target).
+    if let Ok(t) = run.cdp.call("Target.getTargets", json!({}), None).await {
+        for f in t["targetInfos"].as_array().into_iter().flatten() {
+            if f["type"] == "iframe"
+                && let Some(o) = f["url"].as_str().and_then(url_origin)
+            {
+                origins.push(o);
+            }
+        }
+    }
+    if origins.iter().any(|o| b.is_tainted(o)) {
+        return Ok(Some(TAINTED));
+    }
+    let shown = eval(run, "pageText()").await?;
+    if run.shows_secret(shown.as_str().unwrap_or("")) {
+        return Ok(Some(
+            "No screenshot right now: this page shows saved sign-in or card details. Use \
+             snapshot instead.",
+        ));
+    }
+    Ok(None)
+}
+
+/// `scheme://host[:port]` of an http(s) URL, as browsers write origins.
+fn url_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let hostport = authority.rsplit('@').next()?.to_ascii_lowercase();
+    let default = if scheme == "https" { ":443" } else { ":80" };
+    let hostport = hostport.strip_suffix(default).unwrap_or(&hostport);
+    Some(format!("{scheme}://{hostport}"))
+}
+
+fn collect_origins(node: &Value, out: &mut Vec<String>) {
+    if let Some(o) = node["frame"]["securityOrigin"].as_str() {
+        out.push(o.to_string());
+    }
+    for c in node["childFrames"].as_array().into_iter().flatten() {
+        collect_origins(c, out);
     }
 }
 
@@ -716,14 +789,12 @@ pub async fn click_at(
     )
     .await?;
     guard()?;
-    for t in ["mousePressed", "mouseReleased"] {
-        cdp.call(
-            "Input.dispatchMouseEvent",
-            json!({"type": t, "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1}),
-            s,
-        )
+    // Press and release are queued together (no await in between), so a
+    // cancelled call never leaves the button held down.
+    let ev = |t: &str| json!({"type": t, "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1});
+    cdp.send("Input.dispatchMouseEvent", ev("mousePressed"), s);
+    cdp.call("Input.dispatchMouseEvent", ev("mouseReleased"), s)
         .await?;
-    }
     Ok(())
 }
 
@@ -762,7 +833,8 @@ pub async fn press_key(
             down["text"] = text.into();
             down["unmodifiedText"] = text.into();
         }
-        cdp.call("Input.dispatchKeyEvent", down, s).await?;
+        // Down and up are queued together (see click_at).
+        cdp.send("Input.dispatchKeyEvent", down, s);
         cdp.call(
             "Input.dispatchKeyEvent",
             json!({"type": "keyUp", "key": k, "code": code, "windowsVirtualKeyCode": vk,
@@ -776,12 +848,11 @@ pub async fn press_key(
     match (chars.next(), chars.next()) {
         (Some(c), None) => {
             let t = c.to_string();
-            cdp.call(
+            cdp.send(
                 "Input.dispatchKeyEvent",
                 json!({"type": "keyDown", "key": t, "text": t, "unmodifiedText": t}),
                 s,
-            )
-            .await?;
+            );
             cdp.call(
                 "Input.dispatchKeyEvent",
                 json!({"type": "keyUp", "key": t}),
@@ -928,6 +999,26 @@ pub(crate) mod tests {
         // Unknown and expired tokens are refused.
         assert!(call(&state, &token, "snapshot", &json!({})).await.is_error);
         assert!(call(&state, "", "snapshot", &json!({})).await.is_error);
+    }
+
+    #[test]
+    fn origins_of_urls() {
+        assert_eq!(
+            url_origin("https://Shop.Test:443/a?b").unwrap(),
+            "https://shop.test"
+        );
+        assert_eq!(
+            url_origin("http://u@127.0.0.1:8080/x").unwrap(),
+            "http://127.0.0.1:8080"
+        );
+        assert!(url_origin("about:blank").is_none());
+        let mut v = Vec::new();
+        collect_origins(
+            &json!({"frame": {"securityOrigin": "https://a.test"},
+                    "childFrames": [{"frame": {"securityOrigin": "https://b.test"}}]}),
+            &mut v,
+        );
+        assert_eq!(v, ["https://a.test", "https://b.test"]);
     }
 
     #[test]

@@ -699,6 +699,20 @@ async fn decide_approval(
             ApiError::new(StatusCode::CONFLICT, "conflict", "this was already decided")
         })?;
     crate::login::broadcast_updated(&state, &updated).await;
+    // A card OK can arrive after Iris stopped waiting for it: carry on.
+    if body.approve
+        && updated
+            .card
+            .as_ref()
+            .is_some_and(|c| c["service"] == "wallet")
+    {
+        crate::browser::fill::resume_after_approval(
+            state.clone(),
+            updated.id.clone(),
+            updated.conversation_id.clone(),
+            user.id().to_string(),
+        );
+    }
     ok(json!({"message": updated}))
 }
 
