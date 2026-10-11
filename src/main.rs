@@ -41,7 +41,7 @@ Usage:
   iris status                      Show harness versions and sign-in state
   iris import openclaw <PATH> [--dry-run] [--force]
                                    Copy persona/memory files from OpenClaw
-  iris mcp --data-dir DIR --user ID [--conversation ID] [--shared]
+  iris mcp --data-dir DIR --user ID [--conversation ID] [--shared] [--workdir DIR]
                                    Iris MCP bridge (launched by harnesses)
   iris mcp-exec ENV_FILE COMMAND [ARGS...]
                                    Run an MCP server with the environment in
@@ -76,6 +76,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--conversation",
     "--dir",
     "--assets",
+    "--workdir",
 ];
 
 impl Args {
@@ -182,7 +183,7 @@ fn run(args: Args) -> Result<()> {
             status(paths)
         }
         ["mcp"] => {
-            args.check_flags(&["--user", "--conversation", "--shared"])?;
+            args.check_flags(&["--user", "--conversation", "--shared", "--workdir"])?;
             let user = args.value("--user").ok_or("--user is required")?;
             // The harness launches this with the server's data dir; never
             // create a new data dir from here.
@@ -196,6 +197,7 @@ fn run(args: Args) -> Result<()> {
                 user_id: user.to_string(),
                 conversation_id: args.value("--conversation").map(String::from),
                 shared: args.has("--shared"),
+                workdir: args.value("--workdir").map(PathBuf::from),
             })
         }
         ["engines", rest @ ..] => {

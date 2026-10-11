@@ -272,7 +272,7 @@ export function People() {
     } catch (e) { toast(e.message); }
   };
   const add = async () => {
-    const name = await promptSheet({ title: 'Add a person', body: `They get their own ${agentName()} with separate memory, and you can chat together.`, placeholder: 'Their name', yes: 'Add' });
+    const name = await promptSheet({ title: 'Add a person', body: `They get their own chats with ${agentName()}, and you can chat together. Your memory, files, and connections stay yours.`, placeholder: 'Their name', yes: 'Add' });
     if (!name?.trim()) return;
     try { const r = await post('/users', { display_name: name.trim() }); await load(); code(r.user); } catch (e) { toast(e.message); }
   };

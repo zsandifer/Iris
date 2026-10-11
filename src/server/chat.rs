@@ -237,6 +237,7 @@ async fn delete_conversation(
         .db
         .call(move |c| db::delete_conversation(c, &id))
         .await?;
+    turn::membership_changed(&state);
     ok(json!({"ok": true}))
 }
 
@@ -437,6 +438,7 @@ async fn remove_member(
     if removed == 0 {
         return Err(ApiError::bad_request("not a removable member"));
     }
+    turn::membership_changed(&state);
     ok(json!({"ok": true}))
 }
 

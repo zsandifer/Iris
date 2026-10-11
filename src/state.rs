@@ -108,6 +108,9 @@ pub struct Inner {
     pub running: Mutex<HashMap<String, watch::Sender<bool>>>,
     /// Serializes turns within one conversation.
     pub conv_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Bumped after anyone leaves a conversation (or it is deleted), so
+    /// running turns stop streaming to people who lost access.
+    pub membership_generation: AtomicU64,
     catalog: Mutex<(Option<CatalogKey>, Arc<Catalog>)>,
     /// Bumped whenever a CLI reports a different model list.
     models_generation: AtomicU64,
@@ -180,6 +183,7 @@ impl AppState {
             pair_limiter: PairLimiter::default(),
             running: Mutex::default(),
             conv_locks: Mutex::default(),
+            membership_generation: AtomicU64::new(0),
             catalog: Mutex::new((None, Arc::new(Catalog::default()))),
             models_generation: AtomicU64::new(0),
             exe,

@@ -419,10 +419,18 @@ A conversation is **shared** when it has more than one member
 (`member_count > 1`). A group whose only member is its creator is treated as
 personal. Shared conversations change how turns run: the individual-use
 policy keeps Claude out unless the owner opts in
-([section 7](#7-engine-selection)), no connectors
-are passed to the CLI, and the Iris bridge only offers cards
+([section 7](#7-engine-selection)), and the Iris bridge only offers cards
 ([section 8](#8-the-iris-mcp-bridge)). In all conversations, bridge tools
 act on the creator's data.
+
+The Iris owner's **private context** (`USER.md`, `MEMORY.md` and the memory
+notes, write access to `memory/`, and connectors) is only given to turns in
+a conversation whose single member is the Iris owner, and to scheduled jobs.
+Other people's own chats and all shared conversations get none of it. When
+the people in a conversation change (for example a group gets its second
+member), the CLI session is restarted rather than resumed, so nothing from
+a private session carries over; a member who leaves stops receiving a
+running turn's events at once.
 
 #### `GET /api/conversations`
 
@@ -1133,9 +1141,12 @@ as `router: "fallback"`) and the slot shows `pin_unavailable: true`.
 ### 3.12 Connectors
 
 Connectors are MCP servers passed to the harness CLI on every turn while
-enabled (chat turns of any user, and scheduled jobs), **except turns in
-shared conversations** (more than one member), which get no connectors. All
-routes are **owner-only**.
+enabled, **but only in the owner's own conversations** (the Iris owner is
+the only member) and scheduled jobs; other people's chats and shared
+conversations get no connectors. All routes are **owner-only**. Secrets
+never appear on a CLI's command line (Codex gets stdio environments through
+a private file and `iris mcp-exec`, and header values through its own
+environment).
 
 Secret values (`env` values and `headers` values) are encrypted at rest and
 **never returned**; responses list only their key names. See
@@ -1576,8 +1587,9 @@ After `POST /api/conversations/{id}/messages` (or `POST
    replaying messages the session has not seen (up to 40 messages / 24,000
    characters), wires in the [iris-mcp bridge](#8-the-iris-mcp-bridge) and
    enabled connectors, and starts the CLI. In shared conversations (more than
-   one member) the bridge runs in cards-only mode and no connectors are
-   passed.
+   one member) the bridge runs in cards-only mode; connectors and the
+   owner's private files are only passed in the owner's own conversations
+   (see [section 3.3](#33-conversations-and-messages)).
 5. While the CLI runs, Iris emits `message.delta` and `message.activity`.
 6. On a "not signed in" error with no text yet, the harness is marked
    `auth_required` (a `harness.status` event, plus a reconnect card if the
@@ -2189,7 +2201,7 @@ Every turn passes this MCP server to the CLI under the server name **`iris`**
 (none in shared conversations):
 
 ```
-<path to iris binary> mcp --data-dir <DATA_DIR> --user <USER_ID> --conversation <CONVERSATION_ID> [--shared]
+<path to iris binary> mcp --data-dir <DATA_DIR> --user <USER_ID> --conversation <CONVERSATION_ID> [--shared] [--workdir <DIR>]
 ```
 
 - `--user` is whose data the tools operate on: the conversation's creator for
@@ -2201,6 +2213,13 @@ Every turn passes this MCP server to the CLI under the server name **`iris`**
   returns `isError: true` with `Error: <tool> is not available in shared
   conversations`. This keeps other members from reading or changing the
   creator's goals, ideas, feed, library, or connector list through the agent.
+- `--workdir` is the CLI's working folder when it is not the workspace
+  itself (Gemini runs in `workspace/gemini/<conversation>`); relative
+  `save_to_library` paths resolve against it. It is ignored unless it lies
+  inside the workspace.
+- `list_connectors` returns an empty list, and `save_to_library` cannot read
+  the memory folder, unless `--user` is the Iris owner and the conversation
+  is not shared: connectors and memory are the owner's.
 - The command refuses to start if there is no Iris database in `DATA_DIR`.
 
 Claude Code receives it through `--mcp-config` (and `mcp__iris` is
@@ -2280,9 +2299,10 @@ it as `message.created` right after the turn's `message.completed`.
 - **`content`** (text, up to 1,000,000 characters): `mime` defaults to
   `text/markdown` and must be `text/*` or `application/json`. The file
   extension is `md`, `html`, `csv`, `json`, or `txt` based on `mime`.
-- **`path`**: a relative path (resolved against the agent's workspace
-  folder) or an absolute path. After resolving symlinks, the file must be
-  inside the **workspace** or **memory** folder, must not itself be a
+- **`path`**: a relative path (resolved against the CLI's working folder:
+  `--workdir`, else the workspace) or an absolute path. After resolving
+  symlinks, the file must be inside the **workspace** folder (or, in the
+  owner's own conversations, the **memory** folder), must not itself be a
   symlink, must be a regular file, and must be at most 20 MiB. Otherwise:
   `only regular files in the working folder or memory folder can be saved`
   (or `file not
