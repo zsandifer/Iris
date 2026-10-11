@@ -2,7 +2,7 @@
 // and the feed's sources screen. Posts come from the server's daily
 // pipeline (docs/API.md, "For you pipeline").
 import { html, useEffect, useRef, useState } from './h.js';
-import { get, post as apiPost, patch, del } from './api.js';
+import { get, post as apiPost, patch, del, seg } from './api.js';
 import { S, set, useStore, loadFeed, go, toast, isOwner } from './store.js';
 import { Icon, Img, LetterTile, Empty, Spinner, Page, Group, Row, Toggle, ago, since, hostOf, safeUrl, agentName, confirmSheet } from './ui.js';
 import { md, plain } from './md.js';
@@ -28,19 +28,38 @@ export function topics(posts) {
   return [...map.entries()].map(([name, stories]) => ({ name, stories: stories.sort(byPhoto) }));
 }
 
+/** Show `liked` on the post wherever it is loaded (feed, Library's Saved). */
+function markLiked(p, liked) {
+  const swap = (x) => (x.id === p.id ? { ...x, liked } : x);
+  const patch = {};
+  if (S.feed) patch.feed = { ...S.feed, posts: S.feed.posts.map(swap) };
+  if (S.library) {
+    const saved = S.library.saved;
+    patch.library = {
+      ...S.library,
+      saved: saved.some((x) => x.id === p.id) ? saved.map(swap) : liked ? [{ ...p, liked }, ...saved] : saved,
+    };
+  }
+  set(patch);
+}
+
+/** The freshest loaded copy of a post. */
+export function findPost(id) {
+  return S.library?.saved.find((x) => x.id === id) || S.feed?.posts.find((x) => x.id === id);
+}
+
 async function like(p) {
   const liked = !p.liked;
-  const swap = (x) => (x.id === p.id ? { ...x, liked } : x);
-  set({ feed: { ...S.feed, posts: S.feed.posts.map(swap) } });
-  try { await apiPost(`/feed/${p.id}/like`, { liked }); } catch (e) {
+  markLiked(p, liked);
+  try { await apiPost(`/feed/${seg(p.id)}/like`, { liked }); } catch (e) {
     toast(e.message);
-    set({ feed: { ...S.feed, posts: S.feed.posts.map((x) => (x.id === p.id ? { ...x, liked: !liked } : x)) } });
+    markLiked(p, !liked);
   }
 }
 
 export async function discuss(p) {
   try {
-    const r = await apiPost(`/feed/${p.id}/discuss`);
+    const r = await apiPost(`/feed/${seg(p.id)}/discuss`);
     set({ story: null });
     go(`chat/${r.conversation.id}`);
   } catch (e) { toast(e.message); }
@@ -330,11 +349,11 @@ export function FeedSettings() {
     setBusy(false);
   };
   const toggle = async (s, on) => {
-    try { await patch(`/feed/sources/${s.id}`, { enabled: on }); await load(); } catch (e) { toast(e.message); }
+    try { await patch(`/feed/sources/${seg(s.id)}`, { enabled: on }); await load(); } catch (e) { toast(e.message); }
   };
   const remove = async (s) => {
     if (!(await confirmSheet({ title: 'Remove this source?', body: sourceTitle(s), yes: 'Remove', danger: true }))) return;
-    try { await del(`/feed/sources/${s.id}`); await load(); } catch (e) { toast(e.message); }
+    try { await del(`/feed/sources/${seg(s.id)}`); await load(); } catch (e) { toast(e.message); }
   };
   const pauseToggle = async (on) => {
     try { await apiPost(on ? '/feed/resume' : '/feed/pause'); await loadFeed(); } catch (e) { toast(e.message); }

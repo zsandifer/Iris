@@ -111,7 +111,22 @@ impl Harness for Gemini {
         let dir = scope_dir(&spec.cwd, &spec.scope);
         ensure_private_dir(&dir.join(".gemini"))?;
         let settings = dir.join(".gemini").join("settings.json");
-        let body = json!({"mcpServers": mcp_settings(&spec.mcp_servers)});
+        // The Iris bridge resolves Library paths against this folder.
+        let servers: Vec<super::McpServer> = spec
+            .mcp_servers
+            .iter()
+            .cloned()
+            .map(|mut s| {
+                if let (true, McpTransport::Stdio { args, .. }) =
+                    (s.name == "iris", &mut s.transport)
+                {
+                    args.push("--workdir".into());
+                    args.push(dir.to_string_lossy().into_owned());
+                }
+                s
+            })
+            .collect();
+        let body = json!({"mcpServers": mcp_settings(&servers)});
         write_private_file(&settings, &serde_json::to_vec_pretty(&body)?)?;
         inv.temp_files.push(settings);
 
@@ -543,6 +558,10 @@ mod tests {
             serde_json::from_slice(&std::fs::read(cwd.join(".gemini/settings.json")).unwrap())
                 .unwrap();
         assert_eq!(settings["mcpServers"]["iris"]["trust"], true);
+        assert_eq!(
+            settings["mcpServers"]["iris"]["args"],
+            json!(["mcp", "--workdir", cwd.to_string_lossy()])
+        );
         assert_eq!(inv.env[0].0, "GEMINI_SYSTEM_MD");
         let system = std::fs::read_to_string(&inv.env[0].1).unwrap();
         assert!(system.starts_with("You are Iris") && system.contains("${AvailableTools}"));

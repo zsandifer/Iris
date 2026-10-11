@@ -246,8 +246,17 @@ pub fn create_feed_post(
     user_id: &str,
     p: &NewFeedPost,
 ) -> rusqlite::Result<FeedPost> {
+    crate::db::write_tx(conn, |conn| create_feed_post_locked(conn, user_id, p))
+}
+
+fn create_feed_post_locked(
+    conn: &Connection,
+    user_id: &str,
+    p: &NewFeedPost,
+) -> rusqlite::Result<FeedPost> {
     let id = new_id();
-    let now = now_ms();
+    // Unique, so `before=<created_at>` paging never skips a post.
+    let now = crate::db::next_timestamp(conn, "feed_posts")?;
     let images = p.all_images();
     conn.execute(
         "INSERT INTO feed_posts (id, user_id, title, body, topic, source_url, image_url, images,

@@ -1,6 +1,6 @@
 // Shared UI pieces: icons, avatar, images, rows, toggles, sheets, time.
 import { html, useEffect, useState, useRef } from './h.js';
-import { blobUrl } from './api.js';
+import { holdBlob } from './api.js';
 import { S, set, back } from './store.js';
 
 // Line icons (24px grid, drawn for Iris).
@@ -57,19 +57,45 @@ export function Icon({ name, size = 22, fill = false, cls = '' }) {
     stroke-linecap="round" stroke-linejoin="round"><path d=${P[name] || P.more} /></svg>`;
 }
 
-/** Image from a URL; `/api/...` paths are fetched with the device token. */
-export function Img({ src, alt = '', cls = '', onLoad, onError, ...rest }) {
-  const [url, setUrl] = useState(src && !src.startsWith('/api/') ? src : null);
+/**
+ * Object URL for an authenticated `/api/...` path, held while the caller is
+ * mounted (and `enabled`). Returns [url, failed].
+ */
+export function useBlob(src, enabled = true) {
+  const [url, setUrl] = useState(null);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
-    let live = true;
+    setUrl(null);
     setFailed(false);
-    if (!src) setUrl(null);
-    else if (src.startsWith('/api/')) blobUrl(src).then((u) => live && setUrl(u)).catch(() => live && setFailed(true));
-    else setUrl(src);
-    return () => { live = false; };
-  }, [src]);
-  if (!url || failed) return html`<div class=${'img-ph ' + cls} />`;
+    if (!src || !enabled) return undefined;
+    let live = true;
+    const h = holdBlob(src);
+    h.url.then((u) => live && setUrl(u)).catch(() => live && setFailed(true));
+    return () => { live = false; h.release(); };
+  }, [src, enabled]);
+  return [url, failed];
+}
+
+const canObserve = typeof IntersectionObserver === 'function';
+
+/** Image from a URL; `/api/...` paths are fetched with the device token once near the viewport. */
+export function Img({ src, alt = '', cls = '', onLoad, onError, ...rest }) {
+  const authed = !!src && src.startsWith('/api/');
+  const ph = useRef();
+  const [near, setNear] = useState(!canObserve);
+  const [blob, blobFailed] = useBlob(authed ? src : null, near);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => { setFailed(false); }, [src]);
+  useEffect(() => {
+    if (near || !authed || !ph.current) return undefined;
+    const io = new IntersectionObserver((es) => {
+      if (es.some((e) => e.isIntersecting)) { io.disconnect(); setNear(true); }
+    }, { rootMargin: '400px', scrollMargin: '400px' });
+    io.observe(ph.current);
+    return () => io.disconnect();
+  }, [near, authed]);
+  const url = authed ? blob : src;
+  if (!url || failed || blobFailed) return html`<div ref=${ph} class=${'img-ph ' + cls} />`;
   return html`<img class=${cls} src=${url} alt=${alt} loading="lazy" decoding="async"
     referrerpolicy="no-referrer" onLoad=${onLoad}
     onError=${() => { setFailed(true); onError?.(); }} ...${rest} />`;

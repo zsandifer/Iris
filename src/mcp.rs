@@ -25,6 +25,10 @@ pub struct Bridge {
     /// Conversation with more than one person: only cards are offered, so
     /// nothing reads or changes the owner's personal data.
     pub shared: bool,
+    /// The harness's working directory when it is not the workspace itself
+    /// (Gemini runs in a per-conversation folder); relative library paths
+    /// resolve against it.
+    pub workdir: Option<PathBuf>,
 }
 
 /// Tools available in shared (group) conversations.
@@ -248,6 +252,18 @@ impl Bridge {
         Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
     }
 
+    /// The owner's own chat: the only place the owner's connectors and
+    /// memory folder are reachable.
+    fn owner_context(&self) -> bool {
+        !self.shared
+            && self
+                .db
+                .with(crate::db::owner_user_id)
+                .ok()
+                .flatten()
+                .is_some_and(|o| o == self.user_id)
+    }
+
     fn call(&self, name: &str, a: &Value) -> std::result::Result<Value, String> {
         if self.shared && !SHARED_TOOLS.contains(&name) {
             return Err(format!("{name} is not available in shared conversations"));
@@ -383,6 +399,10 @@ impl Bridge {
                 Ok(json!({"card_message_id": m.id, "shown": true}))
             }
             "list_connectors" => {
+                if !self.owner_context() {
+                    // Connectors are the owner's accounts.
+                    return Ok(json!({"connectors": []}));
+                }
                 let list = self
                     .db
                     .with(|c| entities::list_connectors(c, false))
@@ -477,19 +497,33 @@ impl Bridge {
         Ok(json!({"item": item}))
     }
 
-    /// Only files inside the agent's workspace or memory folders can be
-    /// saved, and never through symlinks.
+    /// Only files inside the agent's workspace (or, in the owner's own
+    /// chats, memory) folder can be saved, and never through symlinks.
+    /// Relative paths resolve against the harness's working directory.
     fn resolve_agent_file(&self, path: &str) -> std::result::Result<PathBuf, String> {
         let workspace = self.paths.workspace_dir();
+        let base = self
+            .workdir
+            .as_ref()
+            .filter(|w| match (w.canonicalize(), workspace.canonicalize()) {
+                (Ok(w), Ok(ws)) => w.starts_with(ws),
+                _ => false,
+            })
+            .cloned()
+            .unwrap_or_else(|| workspace.clone());
         let candidate = if Path::new(path).is_absolute() {
             PathBuf::from(path)
         } else {
-            workspace.join(path)
+            base.join(path)
         };
         let real = candidate
             .canonicalize()
             .map_err(|_| "file not found".to_string())?;
-        let allowed = [workspace, self.paths.memory_dir()]
+        let mut roots = vec![workspace];
+        if self.owner_context() {
+            roots.push(self.paths.memory_dir());
+        }
+        let allowed = roots
             .iter()
             .filter_map(|d| d.canonicalize().ok())
             .any(|d| real.starts_with(d));
@@ -569,6 +603,7 @@ mod tests {
             user_id,
             conversation_id: Some(conv),
             shared: false,
+            workdir: None,
         }
     }
 
@@ -743,6 +778,81 @@ mod tests {
         assert_eq!(r["isError"], true);
         let r = call(&b, "list_library", json!({}));
         assert_eq!(r["structuredContent"]["items"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn library_paths_follow_the_harness_working_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = bridge(tmp.path());
+        let ws = b.paths.workspace_dir();
+        let gem = ws.join("gemini/c1");
+        std::fs::create_dir_all(&gem).unwrap();
+        std::fs::write(gem.join("report.md"), "# From Gemini").unwrap();
+        std::fs::write(ws.join("report.md"), "# Unrelated").unwrap();
+        b.workdir = Some(gem.clone());
+        let r = call(
+            &b,
+            "save_to_library",
+            json!({"title": "Report", "path": "report.md"}),
+        );
+        assert_eq!(r["isError"], false, "{r}");
+        assert_eq!(
+            r["structuredContent"]["item"]["size"],
+            "# From Gemini".len()
+        );
+        // A working folder outside the workspace is ignored.
+        b.workdir = Some(tmp.path().to_path_buf());
+        std::fs::write(tmp.path().join("report.md"), "# Outside").unwrap();
+        let r = call(
+            &b,
+            "save_to_library",
+            json!({"title": "Report", "path": "report.md"}),
+        );
+        assert_eq!(r["structuredContent"]["item"]["size"], "# Unrelated".len());
+    }
+
+    #[test]
+    fn other_people_cannot_reach_owner_memory_or_connectors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = bridge(tmp.path());
+        std::fs::write(b.paths.memory_dir().join("diary.md"), "private").unwrap();
+        let diary = b.paths.memory_dir().join("diary.md");
+        let diary = diary.to_string_lossy();
+        b.db.with(|c| {
+            c.execute(
+                "INSERT INTO connectors (id, name, description, transport, config, enabled, created_at, updated_at)
+                 VALUES ('k1', 'notes', '', 'stdio', '{}', 1, 0, 0)",
+                [],
+            )
+        })
+        .unwrap();
+        // The owner, alone: both reachable.
+        let r = call(&b, "list_connectors", json!({}));
+        assert_eq!(
+            r["structuredContent"]["connectors"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let r = call(&b, "save_to_library", json!({"title": "d", "path": diary}));
+        assert_eq!(r["isError"], false, "{r}");
+        // Another person's own chat: neither.
+        let guest = b
+            .db
+            .with(|c| {
+                c.execute(
+                    "INSERT INTO users (id, display_name, is_owner, created_at) VALUES ('g1', 'Guest', 0, 0)",
+                    [],
+                )
+            })
+            .map(|_| "g1".to_string())
+            .unwrap();
+        b.user_id = guest;
+        let r = call(&b, "list_connectors", json!({}));
+        assert_eq!(r["structuredContent"]["connectors"], json!([]));
+        let r = call(&b, "save_to_library", json!({"title": "d", "path": diary}));
+        assert_eq!(r["isError"], true);
     }
 
     #[test]

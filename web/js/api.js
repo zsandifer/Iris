@@ -65,18 +65,62 @@ export const put = (p, b) => api('PUT', p, b);
 export const patch = (p, b) => api('PATCH', p, b);
 export const del = (p) => api('DELETE', p);
 
+/** Server ids: 32 lowercase hex characters (`util::new_id`). */
+export const isId = (s) => typeof s === 'string' && /^[0-9a-f]{32}$/.test(s);
+
+/**
+ * One URL path segment for an API path. Encodes `/`, `?`, `#`, and `%`, and
+ * refuses empty and dot segments (fetch would resolve them as `..`).
+ */
+export function seg(s) {
+  const v = String(s ?? '');
+  if (!v || v === '.' || v === '..') throw new ApiError(400, 'bad_path', "That link doesn't look right.");
+  return encodeURIComponent(v);
+}
+
 // Binary routes need the Authorization header, so images are fetched and
-// shown through object URLs (cached per `/api/...` path).
-const blobs = new Map();
-export function blobUrl(path) {
-  if (!blobs.has(path)) {
-    const p = api('GET', path.replace(/^\/api(?=\/)/, ''), undefined, { raw: true })
+// shown through object URLs. Entries in use (held) are never revoked; up to
+// BLOB_CACHE unused ones stay around for quick re-display, oldest evicted
+// and revoked first.
+const BLOB_CACHE = 40;
+const blobs = new Map(); // `/api/...` path -> {p: Promise<object URL>, refs}
+
+function trimBlobs() {
+  for (const [k, e] of blobs) {
+    if (blobs.size <= BLOB_CACHE) break;
+    if (e.refs > 0) continue;
+    blobs.delete(k);
+    e.p.then((u) => URL.revokeObjectURL(u), () => {});
+  }
+}
+
+/**
+ * Hold an object URL for an authenticated `/api/...` path. The URL stays
+ * valid until `release()` is called.
+ */
+export function holdBlob(path) {
+  let e = blobs.get(path);
+  if (e) blobs.delete(path); // re-insert as most recently used
+  else {
+    e = { refs: 0 };
+    e.p = api('GET', path.replace(/^\/api(?=\/)/, ''), undefined, { raw: true })
       .then((r) => r.blob())
       .then((b) => URL.createObjectURL(b));
-    p.catch(() => blobs.delete(path));
-    blobs.set(path, p);
+    e.p.catch(() => { if (blobs.get(path) === e) blobs.delete(path); });
   }
-  return blobs.get(path);
+  blobs.set(path, e);
+  e.refs++;
+  trimBlobs();
+  let held = true;
+  return {
+    url: e.p,
+    release() {
+      if (!held) return;
+      held = false;
+      e.refs--;
+      trimBlobs();
+    },
+  };
 }
 
 /** Open the event stream; reconnects with backoff until `close()`. */

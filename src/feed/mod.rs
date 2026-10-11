@@ -519,6 +519,7 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
             state,
             OneShotRequest {
                 slot: Slot::Feed,
+                shared: false,
                 system_prompt: model::SUMMARY_SYSTEM,
                 prompt: &prompt,
                 timeout: Duration::from_secs(300),
@@ -855,6 +856,7 @@ async fn refresh_interests(
         state,
         OneShotRequest {
             slot: Slot::Background,
+            shared: false,
             system_prompt: model::INTERESTS_SYSTEM,
             prompt: &prompt,
             timeout: Duration::from_secs(180),

@@ -220,7 +220,7 @@ async fn run_op(state: &AppState, name: &str, op: &'static str) {
     }
     state.engine_ops.set(name, entry);
     if result.is_ok() {
-        let auth = state.probe_auth(name).await;
+        let auth = state.recheck_auth(name).await;
         if op == "install" && auth != AuthState::Ok {
             crate::login::post_signin_card(state, name, true).await;
         }

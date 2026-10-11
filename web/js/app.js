@@ -1,8 +1,8 @@
 // Iris app shell: pairing, top bar, drawer, bottom tabs, routing, overlays.
 import { html, render, useEffect, useRef, useState } from './h.js';
-import { api, get, post, patch, del, setToken, hasToken, onUnauthorized, connectEvents, ApiError } from './api.js';
+import { api, get, post, patch, del, setToken, hasToken, onUnauthorized, connectEvents, ApiError, seg, isId } from './api.js';
 import {
-  S, set, useStore, go, toast, handleEvent, loadConvs, mainId, isOwner,
+  S, set, useStore, go, toast, handleEvent, loadConvs, mainId, isOwner, parseRoute,
 } from './store.js';
 import { Icon, Avatar, Img, Sheet, agentName, promptSheet, confirmSheet, openSheet, closeSheet, LetterTile } from './ui.js';
 import { ChatScreen } from './chat.js';
@@ -120,10 +120,13 @@ function Drawer() {
 
 const title = (c) => (c.kind === 'main' ? 'Main chat' : c.title || (c.kind === 'group' ? 'Together' : 'New chat'));
 
+// Route ids go into API paths: anything but a server id opens the main chat.
 function currentChat() {
   const r = S.route;
-  return r.tab === 'chat' && r.parts[1] ? r.parts[1] : mainId();
+  return r.tab === 'chat' && isId(r.parts[1]) ? r.parts[1] : mainId();
 }
+
+const okSeg = (s) => !!s && s !== '.' && s !== '..';
 
 // ------------------------------------------------------------------ top bar
 
@@ -132,16 +135,16 @@ function chatMenu(c) {
     closeSheet();
     const t = await promptSheet({ title: 'Rename chat', value: c.title });
     if (t == null) return;
-    try { await patch(`/conversations/${c.id}`, { title: t.trim() }); loadConvs(); } catch (e) { toast(e.message); }
+    try { await patch(`/conversations/${seg(c.id)}`, { title: t.trim() }); loadConvs(); } catch (e) { toast(e.message); }
   };
   const archive = async () => {
     closeSheet();
-    try { await patch(`/conversations/${c.id}`, { archived: true }); await loadConvs(); go('chat'); } catch (e) { toast(e.message); }
+    try { await patch(`/conversations/${seg(c.id)}`, { archived: true }); await loadConvs(); go('chat'); } catch (e) { toast(e.message); }
   };
   const remove = async () => {
     closeSheet();
     if (!(await confirmSheet({ title: 'Delete this chat?', body: 'It is deleted for everyone in it.', yes: 'Delete', danger: true }))) return;
-    try { await del(`/conversations/${c.id}`); await loadConvs(); go('chat'); } catch (e) { toast(e.message); }
+    try { await del(`/conversations/${seg(c.id)}`); await loadConvs(); go('chat'); } catch (e) { toast(e.message); }
   };
   openSheet(() => html`<div class="sheet-body"><h3>${title(c)}</h3><div class="grp">
     <div class="r tap" onClick=${rename}><div class="rt">Rename</div></div>
@@ -188,7 +191,10 @@ function Screen() {
   const { parts, tab } = S.route;
   const owner = isOwner();
   switch (tab) {
-    case 'chat': return html`<${ChatScreen} cid=${parts[1] || mainId()} key=${parts[1] || mainId()} />`;
+    case 'chat': {
+      const cid = currentChat();
+      return html`<${ChatScreen} cid=${cid} key=${cid} />`;
+    }
     case 'foryou': return html`<${FeedScreen} />`;
     case 'ideas': return html`<${IdeasScreen} />`;
     case 'goals': return html`<${GoalsScreen} />`;
@@ -197,11 +203,11 @@ function Screen() {
       const [, sub, a, ...rest] = parts;
       if (!sub) return html`<${Hub} />`;
       if (!owner) return html`<${Settings} />`;
-      if (sub === 'connections') return a ? html`<${ConnectorForm} id=${a} key=${a} />` : html`<${Connections} />`;
+      if (sub === 'connections') return a === 'new' || isId(a) ? html`<${ConnectorForm} id=${a} key=${a} />` : html`<${Connections} />`;
       if (sub === 'logins') return html`<${Logins} />`;
       if (sub === 'computer') return html`<${Computer} />`;
       if (sub === 'files') {
-        if (!a) return html`<${Files} />`;
+        if (!okSeg(a) || (a === 'system' && !okSeg(rest.join('/')))) return html`<${Files} />`;
         if (a === 'system') return html`<${FileEditor} area="system" path=${rest.join('/')} key=${rest.join('/')} />`;
         if (S.route.query.get('edit')) return html`<${FileEditor} area=${a} path=${rest.join('/')} key=${rest.join('/')} />`;
         return html`<${Folder} area=${a} path=${rest.join('/')} key=${a + rest.join('/')} />`;
@@ -255,18 +261,11 @@ async function boot() {
     events?.close();
     events = connectEvents(handleEvent, (online) => set({ online }));
     if (!location.hash || location.hash === '#/' || location.hash === '#') history.replaceState(null, '', `#/chat/${me.main_conversation_id}`);
-    set({ route: { ...S.route, ...parseRouteSafe() } });
+    set({ route: { ...S.route, ...parseRoute() } });
   } catch (e) {
     if (e instanceof ApiError && e.status === 401) return;
     set({ bootError: e.message });
   }
-}
-
-function parseRouteSafe() {
-  const raw = location.hash.replace(/^#\/?/, '');
-  const [path, query = ''] = raw.split('?');
-  const parts = path.split('/').filter(Boolean).map(decodeURIComponent);
-  return { parts, query: new URLSearchParams(query), tab: parts[0] || 'chat' };
 }
 
 window.addEventListener('online', () => { if (!S.me && hasToken()) boot(); });

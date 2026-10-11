@@ -140,7 +140,7 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
                     break;
                 }
                 // Drop sockets of revoked devices within about a minute.
-                if ticks % 2 == 0 && !device_active(&state, &user.device.id).await {
+                if ticks.is_multiple_of(2) && !device_active(&state, &user.device.id).await {
                     let _ = send_json(&mut socket, &json!({"type": "error", "code": "unauthorized", "message": "device revoked"})).await;
                     break;
                 }

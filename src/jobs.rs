@@ -192,13 +192,16 @@ pub fn spawn_scheduler(state: AppState) {
         loop {
             tick.tick().await;
             n += 1;
-            if n % 15 == 0 {
+            if n.is_multiple_of(15) {
                 state.refresh_harnesses().await;
             }
             // New models (codex cache, CLI lists) and sign-in changes move
             // automatic slots; announce it.
             state.check_recommendations().await;
-            crate::setup::maybe_auto_update(&state).await;
+            // Updates download for minutes; never hold up jobs or the next
+            // tick (at most one runs a day, and each engine only once).
+            let st = state.clone();
+            tokio::spawn(async move { crate::setup::maybe_auto_update(&st).await });
             // Notifications held during quiet hours go out once they end.
             crate::notify::flush_quiet(&state).await;
             for job in Job::ALL {
