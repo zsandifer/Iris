@@ -9,7 +9,9 @@ const LINK = (url, label) => `<a href="${url}" target="_blank" rel="noopener nor
 
 function fmt(t) {
   // t is already escaped.
-  t = t.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => LINK(url, label));
+  // Labels and URLs stop at the next '[', so text with many unclosed
+  // brackets stays linear instead of backtracking quadratically.
+  t = t.replace(/\[([^[\]\n]+)\]\((https?:\/\/[^\s)[]+)\)/g, (_, label, url) => LINK(url, label));
   t = t.replace(/(^|[\s(])(https?:\/\/[^\s<]*[^\s<.,;:!?)'"])/g, (_, pre, url) => pre + LINK(url, url));
   t = t.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
   t = t.replace(/__([^_\n]+)__/g, '<strong>$1</strong>');
@@ -107,8 +109,8 @@ export function md(src) {
 export function plain(src, max = 0) {
   let t = String(src || '')
     .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/!\[[^[\]]*\]\([^)[]*\)/g, '')
+    .replace(/\[([^[\]]+)\]\([^)[]*\)/g, '$1')
     .replace(/[#*_`>~|]/g, '')
     .replace(/\s+/g, ' ')
     .trim();

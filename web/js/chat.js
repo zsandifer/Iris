@@ -1,6 +1,6 @@
 // Chat: messages, live status phrases, receipts, cards, and the composer.
 import { html, useEffect, useLayoutEffect, useRef, useState } from './h.js';
-import { post, api } from './api.js';
+import { post, api, seg, isId } from './api.js';
 import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId } from './store.js';
 import { Icon, Img, Avatar, agentName, stamp, Spinner } from './ui.js';
 import { md } from './md.js';
@@ -30,8 +30,8 @@ function Receipt({ meta }) {
 
 function Photos({ ids, mine }) {
   return html`<div class=${'photos' + (mine ? ' mine' : '')}>
-    ${ids.map((id) => html`<button class="photo" onClick=${() => set({ lightbox: `/api/attachments/${id}` })}>
-      <${Img} src=${`/api/attachments/${id}`} alt="Photo" /></button>`)}
+    ${ids.map((id) => html`<button class="photo" onClick=${() => set({ lightbox: `/api/attachments/${seg(id)}` })}>
+      <${Img} src=${`/api/attachments/${seg(id)}`} alt="Photo" /></button>`)}
   </div>`;
 }
 
@@ -119,13 +119,14 @@ export function ChatScreen({ cid }) {
 
   useEffect(() => {
     stick.current = true;
+    if (!isId(cid)) return;
     if (!S.msgs[cid]) loadMessages(cid);
-    post(`/conversations/${cid}/read`).catch(() => {});
+    post(`/conversations/${seg(cid)}/read`).catch(() => {});
   }, [cid]);
 
   useEffect(() => {
     if (conv && conv.member_count > 1) {
-      api('GET', `/conversations/${cid}/members`).then((r) => {
+      api('GET', `/conversations/${seg(cid)}/members`).then((r) => {
         setMembers(Object.fromEntries(r.members.map((x) => [x.user_id, x.display_name])));
       }).catch(() => {});
     } else setMembers(null);
@@ -145,7 +146,7 @@ export function ChatScreen({ cid }) {
 
   const lastId = list.at(-1)?.id;
   useEffect(() => {
-    if (lastId && document.visibilityState === 'visible') post(`/conversations/${cid}/read`).catch(() => {});
+    if (lastId && isId(cid) && document.visibilityState === 'visible') post(`/conversations/${seg(cid)}/read`).catch(() => {});
   }, [lastId]);
 
   const onScroll = (e) => {
@@ -269,7 +270,7 @@ function Composer({ cid, running }) {
     try { r.start(); setRec(r); } catch { toast("Voice input isn't available here."); }
   };
 
-  const stop = () => post(`/conversations/${cid}/cancel`).catch((e) => toast(e.message));
+  const stop = () => post(`/conversations/${seg(cid)}/cancel`).catch((e) => toast(e.message));
 
   let action;
   if (canSend) action = html`<button class="send" aria-label="Send" onClick=${send}><${Icon} name="send" size=${20} /></button>`;

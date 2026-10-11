@@ -1,6 +1,6 @@
 // For you: story cards per topic, Instagram-like posts, full-screen stories.
 import { html, useEffect, useRef, useState } from './h.js';
-import { post as apiPost } from './api.js';
+import { post as apiPost, seg } from './api.js';
 import { S, set, useStore, loadFeed, go, toast, isOwner } from './store.js';
 import { Icon, Img, LetterTile, Empty, Spinner, ago, hostOf, safeUrl } from './ui.js';
 import { md, plain } from './md.js';
@@ -21,19 +21,38 @@ export function topics(posts) {
   return [...map.entries()].map(([name, stories]) => ({ name, stories }));
 }
 
+/** Show `liked` on the post wherever it is loaded (feed, Library's Saved). */
+function markLiked(p, liked) {
+  const swap = (x) => (x.id === p.id ? { ...x, liked } : x);
+  const patch = {};
+  if (S.feed) patch.feed = { ...S.feed, posts: S.feed.posts.map(swap) };
+  if (S.library) {
+    const saved = S.library.saved;
+    patch.library = {
+      ...S.library,
+      saved: saved.some((x) => x.id === p.id) ? saved.map(swap) : liked ? [{ ...p, liked }, ...saved] : saved,
+    };
+  }
+  set(patch);
+}
+
+/** The freshest loaded copy of a post. */
+export function findPost(id) {
+  return S.library?.saved.find((x) => x.id === id) || S.feed?.posts.find((x) => x.id === id);
+}
+
 async function like(p) {
   const liked = !p.liked;
-  const swap = (x) => (x.id === p.id ? { ...x, liked } : x);
-  set({ feed: { ...S.feed, posts: S.feed.posts.map(swap) } });
-  try { await apiPost(`/feed/${p.id}/like`, { liked }); } catch (e) {
+  markLiked(p, liked);
+  try { await apiPost(`/feed/${seg(p.id)}/like`, { liked }); } catch (e) {
     toast(e.message);
-    set({ feed: { ...S.feed, posts: S.feed.posts.map((x) => (x.id === p.id ? { ...x, liked: !liked } : x)) } });
+    markLiked(p, !liked);
   }
 }
 
 export async function discuss(p) {
   try {
-    const r = await apiPost(`/feed/${p.id}/discuss`);
+    const r = await apiPost(`/feed/${seg(p.id)}/discuss`);
     set({ story: null });
     go(`chat/${r.conversation.id}`);
   } catch (e) { toast(e.message); }
