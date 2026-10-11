@@ -61,7 +61,7 @@ async fn in_quiet_hours(state: &AppState, user_id: &str) -> bool {
 
 /// Push and wait; returns (delivered, failed) counts.
 pub async fn push_users_now(state: &AppState, users: &[String], payload: &Value) -> (usize, usize) {
-    let Some(keys) = state.vapid.clone() else {
+    let (Some(keys), Some(subject)) = (state.vapid.clone(), state.cfg.push_subject()) else {
         return (0, 0);
     };
     let users_q = users.to_vec();
@@ -78,11 +78,7 @@ pub async fn push_users_now(state: &AppState, users: &[String], payload: &Value)
         .unwrap_or_default();
     let (mut delivered, mut failed) = (0, 0);
     for sub in subs {
-        let (keys, subject, payload) = (
-            keys.clone(),
-            state.cfg.push.vapid_subject.clone(),
-            payload.clone(),
-        );
+        let (keys, subject, payload) = (keys.clone(), subject.clone(), payload.clone());
         let (endpoint, p256dh, auth) = (sub.endpoint.clone(), sub.p256dh.clone(), sub.auth.clone());
         let res = tokio::task::spawn_blocking(move || {
             send_blocking(&keys, &subject, &endpoint, &p256dh, &auth, &payload)

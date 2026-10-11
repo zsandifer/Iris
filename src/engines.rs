@@ -396,14 +396,70 @@ fn output_with_timeout(
     })
 }
 
+/// npm installs go into a fresh `<root>/<name>/pkg-<id>` folder; the
+/// launcher switches to it only once it is complete, and older folders are
+/// removed after that. A failed or stopped update leaves the working
+/// engine untouched.
 fn install_npm(root: &Path, name: &str, package: &str, launcher_kind: Launcher) -> Result<Report> {
     let npm = crate::harness::resolve_command("npm").ok_or_else(|| {
         format!("Node.js (npm) is needed to install {name}; install Node.js on the server first")
     })?;
-    let prefix = root.join(name);
-    std::fs::create_dir_all(&prefix)?;
+    install_npm_with(root, name, package, launcher_kind, &npm)
+}
+
+fn install_npm_with(
+    root: &Path,
+    name: &str,
+    package: &str,
+    launcher_kind: Launcher,
+    npm: &Path,
+) -> Result<Report> {
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir)?;
     let before = installed_version(root, name);
-    let mut cmd = std::process::Command::new(&npm);
+    let prefix = dir.join(format!("pkg-{}", crate::util::new_id()));
+    std::fs::create_dir_all(&prefix)?;
+    let version = match npm_install_into(root, name, package, launcher_kind, npm, &prefix) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&prefix);
+            return Err(e);
+        }
+    };
+    if let Some(v) = &version {
+        std::fs::write(dir.join("VERSION"), v)?;
+    }
+    // The launcher points into the new folder now; drop older installs.
+    for entry in std::fs::read_dir(&dir)?.flatten() {
+        let path = entry.path();
+        if path == prefix || entry.file_name() == "VERSION" {
+            continue;
+        }
+        let _ = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+    Ok(Report {
+        name: name.into(),
+        changed: before != version,
+        version,
+        path: Some(launcher(root, name).to_string_lossy().into_owned()),
+    })
+}
+
+/// Install `package` into `prefix` and point the launcher at it. Returns
+/// the installed version.
+fn npm_install_into(
+    root: &Path,
+    name: &str,
+    package: &str,
+    launcher_kind: Launcher,
+    npm: &Path,
+    prefix: &Path,
+) -> Result<Option<String>> {
+    let mut cmd = std::process::Command::new(npm);
     cmd.args([
         "install",
         "--prefix",
@@ -456,20 +512,12 @@ fn install_npm(root: &Path, name: &str, package: &str, launcher_kind: Launcher) 
             )?;
         }
         Launcher::OpenCodeNative => {
-            let bin = opencode_binary(&prefix)
+            let bin = opencode_binary(prefix)
                 .ok_or("the OpenCode package has no binary for this platform")?;
             set_launcher_symlink(root, name, &bin)?;
         }
     }
-    if let Some(v) = &version {
-        std::fs::write(prefix.join("VERSION"), v)?;
-    }
-    Ok(Report {
-        name: name.into(),
-        changed: before != version,
-        version,
-        path: Some(launcher(root, name).to_string_lossy().into_owned()),
-    })
+    Ok(version)
 }
 
 /// Install or update an engine (blocking). Idempotent.
@@ -538,6 +586,12 @@ pub fn cli(args: &[String], root: &Path) -> Result<()> {
         args.first().map(String::as_str),
         Some("install" | "update" | "uninstall")
     ) {
+        // The helper may inherit the service's UMask=0077 through sudo, but
+        // the agent user must be able to read and run what it installs.
+        // SAFETY: umask has no preconditions and cannot fail.
+        unsafe {
+            libc::umask(0o022);
+        }
         std::fs::create_dir_all(root)?;
         check_trusted_root(root)?;
     }
@@ -642,6 +696,60 @@ mod tests {
         let err = output_with_timeout(cmd, Duration::from_millis(300)).unwrap_err();
         assert!(err.to_string().contains("timed out"));
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_failed_npm_update_keeps_the_working_engine() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::harness::resolve_command("node").is_none() {
+            eprintln!("skipped: node not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("engines");
+        // A stand-in for npm (`npm install --prefix <dir> ...`): installs
+        // the version in npm.ver, or fails halfway when npm.fail exists.
+        let npm = tmp.path().join("npm");
+        std::fs::write(
+            &npm,
+            r#"#!/bin/sh
+prefix="$3"
+mkdir -p "$prefix/node_modules/pkg" "$prefix/node_modules/.bin"
+[ -f "$0.fail" ] && { echo 'npm ERR! network' >&2; exit 1; }
+v=$(cat "$0.ver")
+printf '{"version": "%s"}\n' "$v" > "$prefix/node_modules/pkg/package.json"
+echo 'console.log(1)' > "$prefix/node_modules/.bin/tool"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let install =
+            || install_npm_with(&root, "codex", "pkg", Launcher::NodeScript("tool"), &npm);
+        std::fs::write(tmp.path().join("npm.ver"), "1.0.0").unwrap();
+        let first = install().unwrap();
+        assert_eq!(first.version.as_deref(), Some("1.0.0"));
+        let launcher_v1 = std::fs::read_to_string(launcher(&root, "codex")).unwrap();
+        let script = launcher_v1.split('\'').nth(3).unwrap().to_string();
+        assert!(Path::new(&script).is_file(), "{launcher_v1}");
+        // The update fails partway: the working engine is untouched.
+        std::fs::write(tmp.path().join("npm.fail"), "").unwrap();
+        assert!(install().is_err());
+        assert_eq!(
+            std::fs::read_to_string(launcher(&root, "codex")).unwrap(),
+            launcher_v1
+        );
+        assert_eq!(installed_version(&root, "codex").as_deref(), Some("1.0.0"));
+        assert!(Path::new(&script).is_file(), "v1 files are still there");
+        let entries = || std::fs::read_dir(root.join("codex")).unwrap().count();
+        assert_eq!(entries(), 2, "one install folder plus VERSION");
+        // A good update switches over and removes the old install.
+        std::fs::remove_file(tmp.path().join("npm.fail")).unwrap();
+        std::fs::write(tmp.path().join("npm.ver"), "2.0.0").unwrap();
+        let second = install().unwrap();
+        assert_eq!(second.version.as_deref(), Some("2.0.0"));
+        assert!(second.changed);
+        assert!(!Path::new(&script).exists(), "old install removed");
+        assert_eq!(entries(), 2);
     }
 
     #[test]

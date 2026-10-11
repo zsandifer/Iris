@@ -3,7 +3,8 @@
 //! The prompt is rebuilt for every turn from `persona/*.md`, `memory/MEMORY.md`
 //! and an index of `memory/`, so edits and agent renames apply immediately.
 //! It is injected through the harness's own system-prompt mechanism
-//! (`--append-system-prompt-file` / `developer_instructions`), before the
+//! (`--append-system-prompt-file`, `GEMINI_SYSTEM_MD`, ...; for Codex, on
+//! stdin at the start of a session), before the
 //! user's message.
 
 use crate::config::{Paths, ensure_private_dir, write_private_file};
@@ -95,9 +96,8 @@ const MAX_PERSONA_FILE_CHARS: usize = 24_000;
 const MAX_MEMORY_INLINE_CHARS: usize = 12_000;
 const MAX_MEMORY_INDEX_ENTRIES: usize = 200;
 const MAX_MEMORY_DEPTH: usize = 4;
-/// Keeps the prompt under Linux's 128 KiB per-argument limit, which matters
-/// for codex where it travels as a `-c developer_instructions=...` value.
-/// Counted in UTF-8 bytes, which is what the kernel limits.
+/// Bounds the prompt (counted in UTF-8 bytes) so it stays a modest share
+/// of every engine's context.
 pub const MAX_PROMPT_BYTES: usize = 100_000;
 
 /// Whose private context a conversation may see.

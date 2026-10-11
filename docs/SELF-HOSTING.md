@@ -24,8 +24,9 @@ The CLI does all reasoning and tool use. Iris assembles the persona and
 context, picks a model, streams the reply to your devices, and keeps the app
 state (conversations, goals, feed, and so on) in SQLite.
 
-> Status: early. The backend and API are usable; the real phone app is being
-> designed separately. A bare test console is built in so you can try it.
+> Status: early. The phone app (an installable web app) is served at `/`;
+> shared chats with more than one person are a preview. A bare API test
+> console is also built in at `/console`.
 
 ## Contents
 
@@ -73,8 +74,10 @@ phone / browser ──HTTPS (Tailscale) or loopback──▶ iris serve (axum, S
   your data directory and are editable from the app. They are assembled into
   a system prompt for every turn and injected through each CLI's own
   mechanism (`--append-system-prompt-file` for Claude Code,
-  `developer_instructions` for Codex, `GEMINI_SYSTEM_MD` for Gemini CLI, an
-  `instructions` file for OpenCode), before your message.
+  `GEMINI_SYSTEM_MD` for Gemini CLI, an `instructions` file for OpenCode),
+  before your message. Codex only accepts developer instructions on its
+  command line, which other local users can read, so for Codex the prompt
+  is sent on stdin at the start of each new session instead.
 - **Sessions**: each conversation keeps a CLI session per harness and resumes
   it (`--resume`, `codex exec resume`, `-s`). If a conversation switches harness,
   Iris replays the messages that harness has not seen.
@@ -154,7 +157,8 @@ an HTTPS front on your private network. With [Tailscale](https://tailscale.com):
    This prints an address such as `https://<machine>.<tailnet>.ts.net/`
    with a valid certificate, reachable only from your own devices.
 3. Set `public_url` in `config.toml` to that address so `iris pair` prints
-   it, then restart Iris.
+   it (it also serves as the contact push services require, unless you set
+   `[push] vapid_subject`), then restart Iris.
 4. On your phone (signed in to the same tailnet), open the address, enter
    the pairing code, and add Iris to your home screen.
 
@@ -180,7 +184,7 @@ Iris to the open internet.
 | `[router]` | | Shared-chat opt-in, rankings override, optional model classifier (below). |
 | `[engines]` | | Engines directory, privileged install helper, daily auto-update. |
 | `[heartbeat]`, `[feed]` | disabled | Scheduled jobs with active hours. |
-| `[push]` | enabled | Web Push (VAPID); set `vapid_subject` to a `mailto:` URL. |
+| `[push]` | enabled | Web Push (VAPID). Needs `vapid_subject` (a `mailto:` URL) unless `public_url` is `https:`. |
 | `[safety]` | | Approval timeout (300 s) and tripwires: sends (5), calls (200), and data read (25 MB) per connector per hour. |
 
 Paths follow XDG: `$XDG_CONFIG_HOME/iris/config.toml` and
@@ -470,7 +474,19 @@ Contributor notes, architecture, and invariants are in
   browsing yet. Planned design: the agent requests a credential by id
   through a tool and Iris fills it into a browser session without the
   model ever seeing the secret.
-- **Live view of the agent's browser**, group chat UI.
+- **Live view of the agent's browser.**
+- **Per-person memory**: people you add chat with Iris in their own chats
+  and in shared chats, but only the owner has long-term memory, persona
+  notes, and connectors.
+- **Full engine isolation in other people's chats**: MCP servers the
+  engines have configured themselves (including claude.ai connectors) are
+  off in every Iris turn; in other people's chats Iris also switches off
+  Claude Code's CLAUDE.md files and auto memory, Codex's ChatGPT apps,
+  plugins, and memories, Gemini CLI's extensions, and OpenCode's plugins
+  and Claude Code files. Gemini CLI's global `GEMINI.md` context still
+  applies, so keep personal details out of it if you add people.
+- **Gemini CLI and OpenCode sign-in from the app**: both need one step on
+  the server (see above).
 
 ## License
 

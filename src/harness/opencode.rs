@@ -124,7 +124,7 @@ impl Harness for OpenCode {
         inv.temp_files.push(prompt_file.clone());
         let mut mcp = mcp_config(&spec.mcp_servers);
         // Servers configured in OpenCode itself would bypass Iris's gateway.
-        for name in &spec.foreign_mcp {
+        for name in &spec.own_mcp_servers {
             if !mcp.as_object().is_some_and(|m| m.contains_key(name)) {
                 mcp[name] = json!({"enabled": false});
             }
@@ -149,8 +149,17 @@ impl Harness for OpenCode {
             config_file.to_string_lossy().into_owned(),
         ));
 
+        if spec.isolated {
+            inv.env
+                .push(("OPENCODE_DISABLE_CLAUDE_CODE".into(), "1".into()));
+        }
         let a = &mut inv.args;
         a.push("run".into());
+        if spec.isolated {
+            // Someone else's chat: no external plugins, and none of the
+            // owner's Claude Code files OpenCode would otherwise load.
+            a.push("--pure".into());
+        }
         // `-f` is an array option: keep it first and follow it with flags.
         for img in &spec.images {
             a.push("-f".into());
@@ -211,16 +220,17 @@ impl Harness for OpenCode {
 
     /// Names of servers configured in OpenCode itself, from its resolved
     /// configuration (`opencode debug config`); the rest is discarded.
-    fn foreign_mcp_probe_args(&self) -> Option<Vec<String>> {
+    fn own_mcp_servers_args(&self) -> Option<Vec<String>> {
         Some(vec!["debug".into(), "config".into()])
     }
 
-    fn parse_foreign_mcp(&self, stdout: &str) -> Vec<String> {
-        let start = stdout.find('{').unwrap_or(0);
-        serde_json::from_str::<Value>(&stdout[start..])
-            .ok()
-            .and_then(|v| v["mcp"].as_object().map(|m| m.keys().cloned().collect()))
-            .unwrap_or_default()
+    fn parse_own_mcp_servers(&self, stdout: &str) -> Option<Vec<String>> {
+        let start = stdout.find('{')?;
+        let v: Value = serde_json::from_str(&stdout[start..]).ok()?;
+        match v.get("mcp") {
+            None | Some(Value::Null) => Some(Vec::new()),
+            Some(m) => Some(m.as_object()?.keys().cloned().collect()),
+        }
     }
 
     fn models_probe_args(&self) -> Option<Vec<String>> {
@@ -742,7 +752,8 @@ anthropic/claude-haiku-4-5
             run_dir: tmp.path().into(),
             scope: "c1".into(),
             key_env: vec!["OPENROUTER_API_KEY".into()],
-            foreign_mcp: vec!["mine".into()],
+            isolated: false,
+            own_mcp_servers: vec!["mine".into()],
         };
         let inv = OpenCode::new(HarnessConfig::opencode_default())
             .build(&spec)
@@ -775,11 +786,13 @@ anthropic/claude-haiku-4-5
         assert!(cfg["mcp"]["web"].get("timeout").is_none());
         assert_eq!(cfg["mcp"]["web"]["type"], "local");
         assert_eq!(cfg["mcp"]["mine"], json!({"enabled": false}));
+        let oc = OpenCode::new(HarnessConfig::opencode_default());
         assert_eq!(
-            OpenCode::new(HarnessConfig::opencode_default())
-                .parse_foreign_mcp("{\n  \"mcp\": {\"mine\": {\"type\": \"local\"}}\n}"),
-            ["mine"]
+            oc.parse_own_mcp_servers("{\n  \"mcp\": {\"mine\": {\"type\": \"local\"}}\n}"),
+            Some(vec!["mine".to_string()])
         );
+        assert_eq!(oc.parse_own_mcp_servers("{\"model\": \"x\"}"), Some(vec![]));
+        assert_eq!(oc.parse_own_mcp_servers("Error: no config"), None);
         assert_eq!(
             cfg["provider"]["openrouter"]["options"]["apiKey"],
             "{env:OPENROUTER_API_KEY}"
@@ -793,6 +806,21 @@ anthropic/claude-haiku-4-5
         let prompt = cfg["instructions"][0].as_str().unwrap();
         assert_eq!(std::fs::read_to_string(prompt).unwrap(), "You are Iris");
         assert_eq!(inv.temp_files.len(), 2);
+        // Someone else's chat: no external plugins or Claude Code files.
+        let mut iso = spec.clone();
+        iso.isolated = true;
+        let inv = OpenCode::new(HarnessConfig::opencode_default())
+            .build(&iso)
+            .unwrap();
+        assert_eq!(&inv.args[..2], ["run", "--pure"]);
+        assert!(
+            inv.env
+                .contains(&("OPENCODE_DISABLE_CLAUDE_CODE".to_string(), "1".to_string()))
+        );
+        let plain = OpenCode::new(HarnessConfig::opencode_default())
+            .build(&spec)
+            .unwrap();
+        assert!(!plain.args.contains(&"--pure".to_string()));
     }
 
     #[test]

@@ -390,6 +390,18 @@ mod tests {
         false
     }
 
+    /// A child that ignores SIGTERM and writes its pid only once it does.
+    fn stubborn_child(pidfile: &Path) -> String {
+        format!(
+            "sh -c 'trap \"\" TERM; echo $$ > {}.tmp; mv {0}.tmp {0}; exec sleep 30'",
+            pidfile.display()
+        )
+    }
+
+    fn wait_for(pidfile: &Path) -> String {
+        format!("while [ ! -s {} ]; do sleep 0.01; done", pidfile.display())
+    }
+
     fn read_pid(path: &Path) -> i32 {
         std::fs::read_to_string(path)
             .unwrap()
@@ -404,8 +416,9 @@ mod tests {
         let pidfile = tmp.path().join("pid");
         // The CLI exits right away; its child ignores SIGTERM.
         let script = format!(
-            "(trap '' TERM; exec sleep 30) >/dev/null 2>&1 </dev/null & echo $! > {}; echo hi",
-            pidfile.display()
+            "{} >/dev/null 2>&1 </dev/null & {}; echo hi",
+            stubborn_child(&pidfile),
+            wait_for(&pidfile)
         );
         let start = std::time::Instant::now();
         let (out, evs) = sh(&script, b"", 10_000).await;
@@ -464,8 +477,9 @@ mod tests {
         let pidfile = tmp.path().join("pid");
         let start = std::time::Instant::now();
         let script = format!(
-            "(trap '' TERM; exec sleep 30) & echo $! > {}; sleep 30; echo never",
-            pidfile.display()
+            "{} & {}; sleep 30; echo never",
+            stubborn_child(&pidfile),
+            wait_for(&pidfile)
         );
         let (out, evs) = sh(&script, b"", 300).await;
         assert!(out.timed_out);

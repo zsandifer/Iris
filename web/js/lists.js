@@ -1,7 +1,9 @@
 // Ideas, Goals, and Library tabs.
 import { html, useEffect, useState } from './h.js';
-import { post, patch, del, api, seg } from './api.js';
-import { S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary } from './store.js';
+import { get, post, patch, del, api, seg, isId } from './api.js';
+import {
+  S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary, loadMoreSaved, loadMorePhotos, convFor,
+} from './store.js';
 import { Icon, Img, Empty, Spinner, ago, since, openSheet, closeSheet, confirmSheet, hostOf, useBlob } from './ui.js';
 import { md } from './md.js';
 import { Post, findPost } from './feed.js';
@@ -112,22 +114,36 @@ function Download({ src, name }) {
   return html`<a class="b1" href=${url || undefined} download=${name} aria-disabled=${url ? undefined : 'true'}>Download</a>`;
 }
 
+/** `cid` if it is a chat this user can open (not a background job's), else null. */
+async function openableChat(cid) {
+  if (!isId(cid)) return null;
+  if (convFor(cid)) return cid;
+  try {
+    const { conversation: c } = await get(`/conversations/${seg(cid)}`);
+    return c && c.kind !== 'job' ? cid : null;
+  } catch {
+    return null;
+  }
+}
+
 async function openItem(it) {
   openSheet(() => html`<div class="sheet-body"><${Spinner} /></div>`);
+  const chat = openableChat(it.conversation_id);
   try {
     const path = `/library/${seg(it.id)}/content`;
     let view;
     if (it.mime.startsWith('image/')) view = html`<${Img} src=${`/api${path}`} cls="lib-full" alt=${it.title} />`;
     else if (it.mime.startsWith('text/') || it.mime === 'application/json') {
-      const text = await api('GET', path, undefined, { raw: true }).then((r) => r.text());
+      const text = await api('GET', path, undefined, { as: 'text' });
       view = it.mime === 'text/markdown' ? html`<div class="md doc" dangerouslySetInnerHTML=${{ __html: md(text) }} />`
         : html`<pre class="doc">${text}</pre>`;
     } else view = html`<p class="mu">I can't show this kind of file here, but you can download it.</p>`;
+    const cid = await chat;
     openSheet(() => html`<div class="sheet-body tall">
       <h3>${it.title}</h3>${it.description && html`<p class="mu">${it.description}</p>`}
       ${view}
       <div class="btns">
-        ${it.conversation_id && html`<button class="b2" onClick=${() => { closeSheet(); go(`chat/${it.conversation_id}`); }}>Open chat</button>`}
+        ${cid && html`<button class="b2" onClick=${() => { closeSheet(); go(`chat/${cid}`); }}>Open chat</button>`}
         <${Download} src=${`/api${path}`} name=${it.title} />
       </div></div>`);
   } catch (e) { closeSheet(); toast(e.message); }
@@ -167,23 +183,36 @@ function Saved({ posts, limit }) {
     <${Icon} name="chev" size=${16} cls="rc" /></div>`)}</div>`;
 }
 
+function ShowMore({ load }) {
+  const [busy, setBusy] = useState(false);
+  const more = async () => {
+    setBusy(true);
+    try { await load(); } catch (e) { toast(e.message); }
+    setBusy(false);
+  };
+  return html`<button class="b2 wide" disabled=${busy} onClick=${more}>${busy ? 'Loading…' : 'Show more'}</button>`;
+}
+
 export function LibraryScreen() {
   useStore();
   const [tab, setTab] = useState('all');
   useEffect(() => { loadLibrary().catch((e) => toast(e.message)); }, []);
   const lib = S.library;
+  // Unliked posts stay loaded (so an open post and the paging cursor keep
+  // working) but leave the Saved views at once.
+  const saved = (lib?.saved || []).filter((p) => p.liked !== false);
   const tabs = [['all', 'All'], ['made', 'Made by me'], ['photos', 'Photos'], ['saved', 'Saved']];
   let body;
   if (!lib) body = html`<${Spinner} />`;
   else if (tab === 'made') body = lib.items.length ? html`<${MadeByIris} items=${lib.items} />` : html`<${Empty} icon="file" title="Nothing yet">Reports, drafts, and images I make for you land here.<//>`;
-  else if (tab === 'photos') body = lib.photos.length ? html`<${PhotoGrid} photos=${lib.photos} />` : html`<${Empty} icon="image" title="No photos yet">Photos you send me show up here.<//>`;
-  else if (tab === 'saved') body = lib.saved.length ? html`<${Saved} posts=${lib.saved} />` : html`<${Empty} icon="heart" title="Nothing saved">Tap ♡ on a post in For you to keep it here.<//>`;
+  else if (tab === 'photos') body = lib.photos.length ? html`<${PhotoGrid} photos=${lib.photos} />${lib.photosMore && html`<${ShowMore} load=${loadMorePhotos} />`}` : html`<${Empty} icon="image" title="No photos yet">Photos you send me show up here.<//>`;
+  else if (tab === 'saved') body = saved.length || lib.savedMore ? html`<${Saved} posts=${saved} />${lib.savedMore && html`<${ShowMore} load=${loadMoreSaved} />`}` : html`<${Empty} icon="heart" title="Nothing saved">Tap ♡ on a post in For you to keep it here.<//>`;
   else {
-    const any = lib.items.length || lib.photos.length || lib.saved.length;
+    const any = lib.items.length || lib.photos.length || saved.length;
     body = any ? html`
       ${lib.items.length > 0 && html`<div class="gl">Made by me</div><${MadeByIris} items=${lib.items} limit=${4} />`}
       ${lib.photos.length > 0 && html`<div class="gl">Photos you sent</div><${PhotoGrid} photos=${lib.photos} limit=${6} />`}
-      ${lib.saved.length > 0 && html`<div class="gl">Saved posts</div><${Saved} posts=${lib.saved} limit=${4} />`}`
+      ${saved.length > 0 && html`<div class="gl">Saved posts</div><${Saved} posts=${saved} limit=${4} />`}`
       : html`<${Empty} icon="library" title="Your library is empty">Things I make for you, photos you send, and posts you save all collect here.<//>`;
   }
   return html`<div class="scr tabscr">

@@ -46,9 +46,13 @@ pub struct HarnessEntry {
     pub status: RwLock<HarnessStatus>,
     /// Models the CLI listed at the last probe (OpenCode).
     pub models: RwLock<Vec<DiscoveredModel>>,
-    /// MCP servers configured in the CLI itself (names only), turned off in
-    /// Iris's turns.
-    pub foreign_mcp: RwLock<Vec<String>>,
+    /// Counts sign-in reports from turns and logins, so a probe that
+    /// started before one never overwrites it.
+    auth_reports: AtomicU64,
+    /// Orders concurrent probes: only a probe newer than the last applied
+    /// one may set the sign-in state.
+    probe_seq: AtomicU64,
+    last_probe_applied: AtomicU64,
 }
 
 impl HarnessEntry {
@@ -68,7 +72,9 @@ impl HarnessEntry {
             cfg,
             status: RwLock::new(status),
             models: RwLock::default(),
-            foreign_mcp: RwLock::default(),
+            auth_reports: AtomicU64::new(0),
+            probe_seq: AtomicU64::new(0),
+            last_probe_applied: AtomicU64::new(0),
         }
     }
 
@@ -91,6 +97,7 @@ impl HarnessEntry {
 
     pub fn set_auth(&self, auth: AuthState, message: Option<String>) -> bool {
         let mut s = self.status.write().unwrap_or_else(|p| p.into_inner());
+        self.auth_reports.fetch_add(1, Ordering::SeqCst);
         let changed = s.auth != auth;
         s.auth = auth;
         s.auth_message = message;
@@ -112,8 +119,8 @@ pub struct Inner {
     pub running: Mutex<HashMap<String, watch::Sender<bool>>>,
     /// Serializes turns within one conversation.
     pub conv_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Bumped after anyone leaves a conversation (or it is deleted), so
-    /// running turns stop streaming to people who lost access.
+    /// Bumped after anyone joins or leaves a conversation (or it is
+    /// deleted), so running turns re-check who may see them.
     pub membership_generation: AtomicU64,
     catalog: Mutex<(Option<CatalogKey>, Arc<Catalog>)>,
     /// Bumped whenever a CLI reports a different model list.
@@ -278,76 +285,89 @@ impl AppState {
     }
 
     async fn refresh_one(&self, entry: &HarnessEntry) {
-        {
-            let before = entry.status();
-            let mut next = before.clone();
-            next.checked_at = Some(now_ms());
-            match (entry.cfg.enabled, entry.program()) {
-                (false, _) => {
-                    next.installed = entry.program().is_some();
-                }
-                (true, None) => {
-                    next.installed = false;
-                    next.path = None;
-                    next.version = None;
-                    next.auth = AuthState::Unknown;
-                }
-                (true, Some(program)) => {
-                    next.installed = true;
-                    next.path = Some(program.to_string_lossy().into_owned());
-                    let cwd = self.paths.workspace_dir();
-                    let strip = self.strip_env(entry);
-                    let keys = crate::keys::env_for(self, entry.harness.name()).await;
-                    if let Ok((_, out, _)) =
-                        runner::probe(&program, &["--version".into()], &cwd, &strip, &[]).await
-                    {
-                        let v = out.lines().next().unwrap_or("").trim();
-                        next.version = (!v.is_empty()).then(|| v.chars().take(80).collect());
-                    }
-                    if let Some(args) = entry.harness.auth_probe_args() {
-                        match runner::probe(&program, &args, &cwd, &strip, &keys).await {
-                            Ok((ok, out, err)) => {
-                                next.auth = entry.harness.parse_auth_probe(ok, &out, &err);
-                                next.auth_message = (next.auth == AuthState::AuthRequired)
-                                    .then(|| "The CLI reports it is not signed in".to_string());
-                            }
-                            Err(_) => next.auth = AuthState::Unknown,
+        // Probe first, then apply only what the probes found onto the
+        // status as it is by then: a turn may report a sign-in change (the
+        // only source for Gemini) while a probe runs.
+        let program = entry.program();
+        let reports = entry.auth_reports.load(Ordering::SeqCst);
+        let seq = entry.probe_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut version: Option<Option<String>> = None;
+        let mut auth: Option<(AuthState, Option<String>)> = None;
+        let mut has_keys = false;
+        if let (true, Some(program)) = (entry.cfg.enabled, &program) {
+            let cwd = self.paths.workspace_dir();
+            let strip = self.strip_env(entry);
+            let keys = crate::keys::env_for(self, entry.harness.name()).await;
+            has_keys = !keys.is_empty();
+            if let Ok((_, out, _)) =
+                runner::probe(program, &["--version".into()], &cwd, &strip, &[]).await
+            {
+                let v = out.lines().next().unwrap_or("").trim();
+                version = Some((!v.is_empty()).then(|| v.chars().take(80).collect()));
+            }
+            if let Some(args) = entry.harness.auth_probe_args() {
+                auth = Some(
+                    match runner::probe(program, &args, &cwd, &strip, &keys).await {
+                        Ok((ok, out, err)) => {
+                            let state = entry.harness.parse_auth_probe(ok, &out, &err);
+                            let message = (state == AuthState::AuthRequired)
+                                .then(|| "The CLI reports it is not signed in".to_string());
+                            (state, message)
                         }
-                    }
-                    if !keys.is_empty() && next.auth == AuthState::AuthRequired {
-                        // The owner added an API key; some status commands
-                        // only know about the subscription sign-in. Keep
-                        // what the key check or turns learned instead.
-                        next.auth = if before.auth == AuthState::Ok {
-                            AuthState::Ok
-                        } else {
-                            AuthState::Unknown
-                        };
-                        next.auth_message = None;
-                    }
-                    // Without a status command the state comes from turns
-                    // and is kept (see `recheck_harnesses`).
-                    self.probe_models(entry, &program).await;
-                    if let Some(args) = entry.harness.foreign_mcp_probe_args()
-                        && let Ok((true, out, _)) =
-                            runner::probe(&program, &args, &cwd, &strip, &keys).await
-                    {
-                        *entry.foreign_mcp.write().unwrap_or_else(|p| p.into_inner()) =
-                            entry.harness.parse_foreign_mcp(&out);
-                    }
+                        Err(_) => (AuthState::Unknown, None),
+                    },
+                );
+            }
+            // Without a status command the state comes from turns and is
+            // kept (see `recheck_auth`).
+            self.probe_models(entry, program).await;
+        }
+        let (before, next) = {
+            let mut status = entry.status.write().unwrap_or_else(|p| p.into_inner());
+            let before = status.clone();
+            status.checked_at = Some(now_ms());
+            status.installed = program.is_some();
+            if entry.cfg.enabled {
+                status.path = program.as_ref().map(|p| p.to_string_lossy().into_owned());
+                if program.is_none() {
+                    status.version = None;
+                    status.auth = AuthState::Unknown;
                 }
             }
-            let changed = before.installed != next.installed
-                || before.auth != next.auth
-                || before.version != next.version;
-            *entry.status.write().unwrap_or_else(|p| p.into_inner()) = next.clone();
-            if changed {
-                self.broadcast_harness(&next);
+            if let Some(v) = version {
+                status.version = v;
             }
-            if before.auth != next.auth {
-                self.auth_transition(entry.harness.name(), before.auth, next.auth)
-                    .await;
+            // Only if nothing newer arrived while probing: a turn or login
+            // report, or a later probe that already finished.
+            if let Some((state, message)) = auth
+                && entry.auth_reports.load(Ordering::SeqCst) == reports
+                && entry.last_probe_applied.load(Ordering::SeqCst) < seq
+            {
+                if has_keys && state == AuthState::AuthRequired {
+                    // The owner added an API key; some status commands
+                    // only know about the subscription sign-in. Keep what
+                    // the key check or turns learned instead.
+                    if status.auth != AuthState::Ok {
+                        status.auth = AuthState::Unknown;
+                    }
+                    status.auth_message = None;
+                } else {
+                    status.auth = state;
+                    status.auth_message = message;
+                }
+                entry.last_probe_applied.store(seq, Ordering::SeqCst);
             }
+            (before, status.clone())
+        };
+        let changed = before.installed != next.installed
+            || before.auth != next.auth
+            || before.version != next.version;
+        if changed {
+            self.broadcast_harness(&next);
+        }
+        if before.auth != next.auth {
+            self.auth_transition(entry.harness.name(), before.auth, next.auth)
+                .await;
         }
     }
 
@@ -490,12 +510,7 @@ impl AppState {
     }
 
     pub async fn slot_pins(&self) -> BTreeMap<Slot, Pin> {
-        match self.setting("slots").await {
-            Some(raw) => parse_slot_pins(&raw),
-            // Earlier versions stored one pinned engine; it becomes the
-            // chat slot's pin.
-            None => legacy_engine_pin(&self.setting("engine").await.unwrap_or_default()),
-        }
+        self.db.call(stored_slot_pins).await.unwrap_or_default()
     }
 
     /// Owner opt-in (config or app setting) to use Claude in conversations
@@ -651,6 +666,15 @@ pub fn parse_slot_pins(raw: &str) -> BTreeMap<Slot, Pin> {
 pub fn slot_pins_json(pins: &BTreeMap<Slot, Pin>) -> String {
     let m: BTreeMap<&str, &Pin> = pins.iter().map(|(s, p)| (s.name(), p)).collect();
     serde_json::to_string(&m).unwrap_or_else(|_| "{}".into())
+}
+
+/// The slot pins as stored. Earlier versions stored one pinned engine; it
+/// becomes the chat slot's pin.
+pub fn stored_slot_pins(c: &rusqlite::Connection) -> rusqlite::Result<BTreeMap<Slot, Pin>> {
+    Ok(match crate::db::get_setting(c, "slots")? {
+        Some(raw) => parse_slot_pins(&raw),
+        None => legacy_engine_pin(&crate::db::get_setting(c, "engine")?.unwrap_or_default()),
+    })
 }
 
 fn legacy_engine_pin(raw: &str) -> BTreeMap<Slot, Pin> {

@@ -49,6 +49,7 @@ const P = {
   hand: 'M8 13V5.5a1.5 1.5 0 0 1 3 0V11M11 10V4.5a1.5 1.5 0 0 1 3 0V11M14 10.5V6a1.5 1.5 0 0 1 3 0v8a7 7 0 0 1-7 7h-.5A5.5 5.5 0 0 1 5 18.2L3.3 14.6a1.5 1.5 0 0 1 2.6-1.5L8 16',
   stop: 'M8 7h8a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1z',
   download: 'M12 4v11M7 10.5l5 5 5-5M5 20h14',
+  archive: 'M4 5h16v4H4zM5.5 9v10h13V9M10 13h4',
 };
 
 export function Icon({ name, size = 22, fill = false, cls = '' }) {
@@ -77,26 +78,37 @@ export function useBlob(src, enabled = true) {
 }
 
 const canObserve = typeof IntersectionObserver === 'function';
+// Fetch when within NEAR of the viewport; let go of the image (so the
+// cache may evict it) once it is more than FAR away. The gap keeps images
+// near the edge from flickering.
+const NEAR = '400px';
+const FAR = '1600px';
 
-/** Image from a URL; `/api/...` paths are fetched with the device token once near the viewport. */
+/**
+ * Image from a URL. `/api/...` paths are fetched with the device token while
+ * the image is near the viewport, and released when it scrolls far away.
+ */
 export function Img({ src, alt = '', cls = '', onLoad, onError, ...rest }) {
   const authed = !!src && src.startsWith('/api/');
-  const ph = useRef();
+  const [el, setEl] = useState(null);
   const [near, setNear] = useState(!canObserve);
   const [blob, blobFailed] = useBlob(authed ? src : null, near);
   const [failed, setFailed] = useState(false);
   useEffect(() => { setFailed(false); }, [src]);
   useEffect(() => {
-    if (near || !authed || !ph.current) return undefined;
-    const io = new IntersectionObserver((es) => {
-      if (es.some((e) => e.isIntersecting)) { io.disconnect(); setNear(true); }
-    }, { rootMargin: '400px', scrollMargin: '400px' });
-    io.observe(ph.current);
-    return () => io.disconnect();
-  }, [near, authed]);
+    if (!canObserve || !authed || !el) return undefined;
+    const watch = (margin, fn) => {
+      const io = new IntersectionObserver((es) => fn(es.at(-1).isIntersecting), { rootMargin: margin, scrollMargin: margin });
+      io.observe(el);
+      return io;
+    };
+    const near = watch(NEAR, (yes) => yes && setNear(true));
+    const far = watch(FAR, (yes) => !yes && setNear(false));
+    return () => { near.disconnect(); far.disconnect(); };
+  }, [el, authed]);
   const url = authed ? blob : src;
-  if (!url || failed || blobFailed) return html`<div ref=${ph} class=${'img-ph ' + cls} />`;
-  return html`<img class=${cls} src=${url} alt=${alt} loading="lazy" decoding="async"
+  if (!url || failed || blobFailed) return html`<div ref=${setEl} class=${'img-ph ' + cls} />`;
+  return html`<img ref=${setEl} class=${cls} src=${url} alt=${alt} loading="lazy" decoding="async"
     referrerpolicy="no-referrer" onLoad=${onLoad}
     onError=${() => { setFailed(true); onError?.(); }} ...${rest} />`;
 }
@@ -123,8 +135,15 @@ export function Toggle({ on, onChange, disabled = false, label }) {
 /** A settings-style row. */
 export function Row({ icon, iconBg, title, sub, value, onClick, right, danger = false, accent = false, chevron }) {
   const showChev = chevron ?? !!onClick;
+  // A button or link inside the row (e.g. in `right`) does its own thing;
+  // the click must not also run the row's action.
+  const tap = onClick && ((e) => {
+    const inner = e.target.closest?.('button, a, input, select, textarea, label');
+    if (inner && inner !== e.currentTarget && e.currentTarget.contains(inner)) return;
+    onClick(e);
+  });
   return html`<div class=${'r' + (onClick ? ' tap' : '') + (danger ? ' danger' : '') + (accent ? ' accent' : '')}
-    onClick=${onClick} role=${onClick ? 'button' : undefined} tabindex=${onClick ? 0 : undefined}>
+    onClick=${tap} role=${onClick ? 'button' : undefined} tabindex=${onClick ? 0 : undefined}>
     ${icon && html`<div class="ri" style=${iconBg ? `background:${iconBg}` : ''}>${typeof icon === 'string' ? html`<${Icon} name=${icon} size=${17} />` : icon}</div>`}
     <div class="rt">${title}${sub && html`<small>${sub}</small>`}</div>
     ${value != null && html`<span class="rv">${value}</span>`}

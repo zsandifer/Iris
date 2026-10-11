@@ -156,6 +156,9 @@ fn due(cfg: &JobConfig, last_run: Option<i64>, now: i64, local_minutes: u32) -> 
         && last_run.is_none_or(|l| now - l >= cfg.interval_mins as i64 * 60_000)
 }
 
+/// A periodic engine probe is running.
+static PROBING: AtomicBool = AtomicBool::new(false);
+
 /// Background loop: checks jobs every minute and re-probes harness sign-in
 /// state every 15 minutes.
 pub fn spawn_scheduler(state: AppState) {
@@ -165,8 +168,14 @@ pub fn spawn_scheduler(state: AppState) {
         loop {
             tick.tick().await;
             n += 1;
-            if n.is_multiple_of(15) {
-                state.refresh_harnesses().await;
+            if n.is_multiple_of(15) && !PROBING.swap(true, Ordering::SeqCst) {
+                // Probes can take a while (each command has its own
+                // timeout); never hold up due jobs for them.
+                let st = state.clone();
+                tokio::spawn(async move {
+                    st.refresh_harnesses().await;
+                    PROBING.store(false, Ordering::SeqCst);
+                });
             }
             // New models (codex cache, CLI lists) and sign-in changes move
             // automatic slots; announce it.

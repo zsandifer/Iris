@@ -151,6 +151,18 @@ impl Harness for Gemini {
         inv.cwd = Some(dir);
 
         let a = &mut inv.args;
+        // Only Iris's MCP servers in every turn (not ones configured in
+        // Gemini CLI itself or its extensions, which would bypass Iris's
+        // gateway). Someone else's chat also gets no extensions (they may
+        // carry the owner's accounts).
+        a.push("--allowed-mcp-server-names".into());
+        if spec.mcp_servers.is_empty() {
+            a.push("iris".into());
+        }
+        a.extend(spec.mcp_servers.iter().map(|s| s.name.clone()));
+        if spec.isolated {
+            a.extend(["-e", "none"].map(String::from));
+        }
         a.extend(["--skip-trust", "-o", "stream-json", "-m"].map(String::from));
         a.push(spec.model.clone());
         if let Some(id) = &spec.resume {
@@ -160,14 +172,6 @@ impl Harness for Gemini {
         if !self.cfg.permission_mode.is_empty() {
             a.push("--approval-mode".into());
             a.push(self.cfg.permission_mode.clone());
-        }
-        // Only Iris's servers (not ones configured in Gemini CLI itself or
-        // its extensions, which would bypass Iris's gateway).
-        a.push("--allowed-mcp-server-names".into());
-        if spec.mcp_servers.is_empty() {
-            a.push("iris".into());
-        } else {
-            a.extend(spec.mcp_servers.iter().map(|s| s.name.clone()));
         }
         let mut include: Vec<String> = spec
             .writable_dirs
@@ -557,18 +561,20 @@ mod tests {
             run_dir: tmp.path().into(),
             scope: "conv/../1".into(),
             key_env: vec!["GEMINI_API_KEY".into()],
-            foreign_mcp: vec![],
+            isolated: false,
+            own_mcp_servers: Vec::new(),
         };
         let inv = Gemini::new(HarnessConfig::gemini_default())
             .build(&spec)
             .unwrap();
         let args = inv.args.join(" ");
         assert!(
-            args.starts_with("--skip-trust -o stream-json -m flash --resume sess-1"),
+            args.starts_with(
+                "--allowed-mcp-server-names iris --skip-trust -o stream-json -m flash --resume sess-1"
+            ),
             "{args}"
         );
         assert!(args.contains("--approval-mode auto_edit"));
-        assert!(args.contains("--allowed-mcp-server-names iris"));
         assert!(args.contains(&format!(
             "--include-directories /data/memory,{}",
             tmp.path().join("uploads").display()
@@ -596,5 +602,20 @@ mod tests {
         assert!(stdin.starts_with("what is in \\@this\n@"));
         assert!(stdin.ends_with("a\\ b.png"));
         assert_eq!(inv.temp_files.len(), 2);
+        // Someone else's chat: only Iris's MCP servers, no extensions.
+        let mut iso = spec.clone();
+        iso.isolated = true;
+        let inv = Gemini::new(HarnessConfig::gemini_default())
+            .build(&iso)
+            .unwrap();
+        let args = inv.args.join(" ");
+        assert!(
+            args.starts_with("--allowed-mcp-server-names iris -e none --skip-trust"),
+            "{args}"
+        );
+        let plain = Gemini::new(HarnessConfig::gemini_default())
+            .build(&spec)
+            .unwrap();
+        assert!(!plain.args.iter().any(|a| a == "-e"));
     }
 }

@@ -127,9 +127,17 @@ pub struct Gateway {
     errors: Mutex<HashMap<String, String>>,
     /// Wakes a connector start that `stop` wants abandoned.
     stops: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+    /// Counts `cancel_approvals` (all, and per connector id), so a card
+    /// posted while its approvals were being cancelled is cancelled too.
+    cancel_epochs: Mutex<(u64, HashMap<String, u64>)>,
 }
 
 impl Gateway {
+    fn cancel_epoch(&self, connector_id: &str) -> (u64, u64) {
+        let e = self.cancel_epochs.lock().unwrap_or_else(|p| p.into_inner());
+        (e.0, e.1.get(connector_id).copied().unwrap_or(0))
+    }
+
     fn slot(&self, id: &str) -> Slot {
         self.slots
             .lock()
@@ -1520,6 +1528,7 @@ async fn ask(
         card["turn_message_id"] = grant.message_id.clone().into();
     }
     let conv = grant.card_conversation_id.clone();
+    let epoch = state.gateway.cancel_epoch(&con.id);
     let inserted = state
         .db
         .call(move |c| {
@@ -1540,6 +1549,20 @@ async fn ask(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(msg.id.clone(), (con.id.clone(), tx));
+    // Between posting the card and waiting on it, the owner may already
+    // have decided it, or its approvals may have been cancelled.
+    let id = msg.id.clone();
+    let early = match state
+        .db
+        .call(move |c| Ok(db::get_message(c, &id)?.and_then(|m| m.card)))
+        .await
+    {
+        Ok(Some(card)) if card["state"] == "approved" => Some(Answer::Approved),
+        Ok(Some(card)) if card["state"] == "denied" => Some(Answer::Denied),
+        Ok(Some(card)) if card["state"] == "pending" => None,
+        _ => Some(Answer::Cancelled),
+    }
+    .or_else(|| (state.gateway.cancel_epoch(&con.id) != epoch).then_some(Answer::Cancelled));
     let mut c = call.clone();
     c.card_message_id = Some(msg.id.clone());
     record(state, &c).await;
@@ -1560,14 +1583,17 @@ async fn ask(
     );
     crate::info!("connector {}: {} waiting for approval", con.name, call.tool);
     let mut cancel = grant.cancel.subscribe();
-    let answer = tokio::select! {
-        r = rx => match r {
-            Ok(true) => Answer::Approved,
-            Ok(false) => Answer::Denied,
-            Err(_) => Answer::Cancelled,
+    let answer = match early {
+        Some(a) => a,
+        None => tokio::select! {
+            r = rx => match r {
+                Ok(true) => Answer::Approved,
+                Ok(false) => Answer::Denied,
+                Err(_) => Answer::Cancelled,
+            },
+            _ = tokio::time::sleep(timeout) => Answer::Expired,
+            _ = cancel.wait_for(|c| *c) => Answer::Cancelled,
         },
-        _ = tokio::time::sleep(timeout) => Answer::Expired,
-        _ = cancel.wait_for(|c| *c) => Answer::Cancelled,
     };
     state
         .gateway
@@ -1648,6 +1674,17 @@ pub fn decided(state: &AppState, card_id: &str, approve: bool) {
 /// Cancel approvals waiting on one connector (or all): their cards become
 /// `cancelled` and the calls never run.
 pub fn cancel_approvals(state: &AppState, connector_id: Option<&str>) {
+    {
+        let mut e = state
+            .gateway
+            .cancel_epochs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match connector_id {
+            None => e.0 += 1,
+            Some(id) => *e.1.entry(id.to_string()).or_default() += 1,
+        }
+    }
     let mut pending = state
         .gateway
         .pending

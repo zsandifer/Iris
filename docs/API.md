@@ -446,11 +446,16 @@ act on the creator's data.
 The Iris owner's **private context** (`USER.md`, `MEMORY.md` and the memory
 notes, write access to `memory/`, and connectors) is only given to turns in
 a conversation whose single member is the Iris owner, and to scheduled jobs.
-Other people's own chats and all shared conversations get none of it. When
+Other people's own chats and all shared conversations get none of it, and
+there the CLI also runs without the MCP servers, memory, and account
+integrations configured in the CLI itself (see the self-hosting guide's
+"Not done yet" for what each CLI allows). When
 the people in a conversation change (for example a group gets its second
 member), the CLI session is restarted rather than resumed, so nothing from
 a private session carries over; a member who leaves stops receiving a
-running turn's events at once.
+running turn's events at once. Membership is read when a turn actually
+starts (after any wait for a CLI slot), and a queued message whose sender
+has left by then is not answered (its reply ends `cancelled`).
 
 #### `GET /api/conversations`
 
@@ -625,10 +630,17 @@ newest use first, each image once. An upload that was never sent in a chat
 | Query | Type | Default | Notes |
 |---|---|---|---|
 | `limit` | int | 100 | Clamped to 1..500. |
+| `before` | int | none | Next page: the previous page's last `used_at`. |
+| `before_id` | string | none | With `before`: the previous page's last `id` (photos sent together share `used_at`). |
+
+Ordered by `used_at` (when the photo was last sent), then `id`, newest
+first.
 
 ```json
 {"attachments": [{"id": "...", "mime": "image/jpeg", "size": 48213, "sha256": "<64 hex>",
-                  "created_at": 1760000000000, "conversation_id": "...", "message_id": "..."}]}
+                  "created_at": 1760000000000, "conversation_id": "...", "message_id": "...",
+                  "used_at": 1760000005000}],
+ "has_more": false}
 ```
 
 #### `POST /api/attachments`
@@ -1230,16 +1242,21 @@ CLI's calls and enforces the owner's rules on them.
 
 Who gets them: turns in the **owner's** own conversations (the owner is the
 only member) and the owner's scheduled jobs, for connectors that are on,
-not paused, and signed in. All routes are **owner-only**. MCP servers
-configured in a CLI itself (outside Iris) are turned off in Iris's turns so
-nothing bypasses the gateway: Claude Code runs with `--strict-mcp-config`,
-Gemini CLI with `--allowed-mcp-server-names`, and Codex and OpenCode get
-`enabled = false` for the servers their own listings report (`codex mcp
-list --json`, `opencode debug config`; names only). Connectors saved before
-the gateway existed keep running in the workspace folder (they may use
-paths relative to it); new ones run in a private folder. Shared conversations (more than one member) and other people's
-conversations get none. Programs stop after `safety.idle_minutes` without
-use and start again on the next call.
+not paused, and signed in. All routes are **owner-only**. Shared
+conversations (more than one member) and other people's conversations get
+none. Programs stop after `safety.idle_minutes` without use and start again
+on the next call. Connectors saved before the gateway existed keep running
+in the workspace folder (they may use paths relative to it); new ones run
+in a private folder.
+
+MCP servers configured in a CLI itself (outside Iris) are turned off in
+every Iris turn, the owner's included, so nothing bypasses the gateway:
+Claude Code runs with `--strict-mcp-config`, Gemini CLI with
+`--allowed-mcp-server-names`, and Codex and OpenCode get `enabled = false`
+for the servers their own listings report (`codex mcp list --json`,
+`opencode debug config`; names only, read before each turn). If that
+listing fails, the engine is skipped for the turn rather than run with
+those servers on. Add such services as connectors instead.
 
 **The approval gate.** Every call is classified from the real tool name,
 the server's own annotations (`readOnlyHint`, `destructiveHint`; risky words
@@ -1551,9 +1568,11 @@ See [section 9](#9-push-notifications) for behavior.
 #### `GET /api/push/vapid-public-key`
 
 ```json
-{"enabled": true, "public_key": "<base64url uncompressed P-256 point>"}
+{"enabled": true, "public_key": "<base64url uncompressed P-256 point>", "reason": null}
 ```
 
+`enabled` is `false` (with a human-readable `reason`) when push is turned
+off or has no contact for push services ([section 9](#9-push-notifications));
 `public_key` is `null` when push is disabled in config. Pass it as
 `applicationServerKey` to `pushManager.subscribe()`.
 
@@ -1568,12 +1587,12 @@ Body: the browser's `PushSubscription.toJSON()`. Extra fields such as
 
 | Field | Type | Notes |
 |---|---|---|
-| `endpoint` | string | Required, must start with `https://`, max 2,000. |
+| `endpoint` | string | Required, max 2,000. Must be an `https://` URL on a browser push service (`fcm.googleapis.com`, `android.googleapis.com`, `*.push.services.mozilla.com`, `*.push.apple.com`, `*.notify.windows.com`; default port, no credentials), so Iris never sends to addresses on its own network. Iris also follows no redirects when delivering. |
 | `keys.p256dh` | string | Required, base64url P-256 public key. |
 | `keys.auth` | string | Required, base64url 16-byte auth secret. |
 
 ```json
-{"endpoint": "https://push.example.com/send/abc", "expirationTime": null,
+{"endpoint": "https://fcm.googleapis.com/fcm/send/abc", "expirationTime": null,
  "keys": {"p256dh": "B...", "auth": "..."}}
 ```
 
@@ -2531,7 +2550,7 @@ in.
 | Harness | System prompt | MCP | Effort | Images | Resume |
 |---|---|---|---|---|---|
 | `claude` | `--append-system-prompt-file` (+ `--system-prompt-snapshot off`) | `--mcp-config` file | `--effort` | stream-json content blocks | `--resume` |
-| `codex` | `-c developer_instructions=...` | `-c mcp_servers.*` | `-c model_reasoning_effort` | `-i` | `exec resume` (new session when the persona changes) |
+| `codex` | on stdin in `<iris_instructions>` before the first message of each thread (`-c developer_instructions` only points to it, so private files stay off argv) | `-c mcp_servers.*` | `-c model_reasoning_effort` | `-i` | `exec resume` (new session when the persona changes) |
 | `gemini` | `GEMINI_SYSTEM_MD` file (replaces Gemini's coding prompt; lists tools) | per-conversation `.gemini/settings.json`, servers trusted | none | `@path` references | `--resume <session id>` |
 | `opencode` | `instructions` in a private `OPENCODE_CONFIG` file | same file (`mcp`) | `--variant` | `-f` (per-model support from `opencode models --verbose`) | `-s <session id>` |
 
@@ -2691,9 +2710,12 @@ conversation events.
 ## 9. Push notifications
 
 Iris sends Web Push (RFC 8030) with VAPID (RFC 8292) and `aes128gcm`
-encryption (RFC 8291). Push is enabled by default (`[push] enabled`); set
-`vapid_subject` to a `mailto:` or `https:` URL. The VAPID key pair is
-generated on first use.
+encryption (RFC 8291). Push is enabled by default (`[push] enabled`) but
+needs a contact for push services: `vapid_subject` (a `mailto:` or
+`https:` URL), or else an `https:` `public_url`. Without one,
+`GET /api/push/vapid-public-key` reports `enabled: false` with a `reason`
+and subscribing fails with 400. The VAPID key pair is generated on first
+use.
 
 ### Subscribing (browser)
 

@@ -402,6 +402,9 @@ async fn add_member(
     if !added {
         return Err(ApiError::not_found("user"));
     }
+    // A running turn re-checks who is in the chat: one that started with
+    // the owner's private context stops and withholds its reply.
+    turn::membership_changed(&state);
     let conv = member_conversation(&state, &user, &conv.id).await?;
     state.hub.to_users(
         &[new_member],
@@ -504,12 +507,14 @@ pub async fn store_upload(
     })?;
     let id = new_id();
     let file_name = format!("{id}.{ext}");
-    crate::config::write_private_file(&state.paths.uploads_dir().join(&file_name), bytes)?;
-    let (uid, sha, size) = (
-        user_id.to_string(),
-        sha256_hex_bytes(bytes),
-        bytes.len() as i64,
-    );
+    // Hashing and writing up to the upload limit is blocking work.
+    let (path, data) = (state.paths.uploads_dir().join(&file_name), bytes.to_vec());
+    let sha = tokio::task::spawn_blocking(move || {
+        crate::config::write_private_file(&path, &data).map(|_| sha256_hex_bytes(&data))
+    })
+    .await
+    .map_err(|e| ApiError::from(crate::util::BoxError::from(e.to_string())))??;
+    let (uid, size) = (user_id.to_string(), bytes.len() as i64);
     let att = state
         .db
         .call(move |c| db::insert_attachment(c, &id, &uid, mime, size, &sha, &file_name))
@@ -608,6 +613,8 @@ pub fn file_response(mime: &str, bytes: Vec<u8>) -> Response {
 struct LimitQuery {
     limit: Option<usize>,
     before: Option<i64>,
+    /// Photos only: id of the previous page's last item (ties on `before`).
+    before_id: Option<String>,
 }
 
 /// Photos the caller sent in chats (the Library's "Photos" section).
@@ -618,11 +625,18 @@ async fn list_sent_photos(
 ) -> ApiResult {
     let uid = user.id().to_string();
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
-    let photos = state
+    let mut photos = state
         .db
-        .call(move |c| db::sent_photos(c, &uid, limit))
+        .call(move |c| {
+            let before = q
+                .before
+                .map(|at| (at, q.before_id.as_deref().unwrap_or("")));
+            db::sent_photos(c, &uid, before, limit + 1)
+        })
         .await?;
-    ok(json!({"attachments": photos}))
+    let has_more = photos.len() > limit;
+    photos.truncate(limit);
+    ok(json!({"attachments": photos, "has_more": has_more}))
 }
 
 // --------------------------------------------------------------- activity

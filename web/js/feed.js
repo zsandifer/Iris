@@ -136,7 +136,8 @@ export function FeedScreen() {
       I'll add a few things a day that fit what you like. Tap ♡ on what you enjoy and I'll learn.
       ${isOwner() && html`<div><button class="b1 sm" disabled=${busy} onClick=${refresh}>Find something now</button></div>`}
     <//>`}
-    ${posts.length > 0 && !S.feed.hasMore && html`<div class="end mu">You're all caught up.</div>`}
+    ${posts.length > 0 && !S.feed.hasMore && html`<div class="end mu">You're all caught up.
+      ${isOwner() && html`<div><button class="b2 sm" disabled=${busy} onClick=${refresh}>Find more</button></div>`}</div>`}
   </div>`;
 }
 

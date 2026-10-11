@@ -37,8 +37,15 @@ function table(rows) {
     rest.map((r) => `<tr>${cells(r).map((c) => `<td>${inline(c)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
 }
 
+// Deeper quote markers render as plain text (no unbounded recursion).
+const MAX_QUOTE_DEPTH = 8;
+
 /** Markdown to an HTML string (safe to inject). */
 export function md(src) {
+  return render(src, 0);
+}
+
+function render(src, depth) {
   const lines = String(src || '').replace(/\r\n?/g, '\n').split('\n');
   const out = [];
   let para = [];
@@ -74,12 +81,12 @@ export function md(src) {
       out.push(table(rows));
       continue;
     }
-    if (/^\s*>/.test(line)) {
+    if (depth < MAX_QUOTE_DEPTH && /^\s*>/.test(line)) {
       flush();
       const q = [];
       while (i < lines.length && /^\s*>/.test(lines[i])) q.push(lines[i++].replace(/^\s*>\s?/, ''));
       i--;
-      out.push(`<blockquote>${md(q.join('\n'))}</blockquote>`);
+      out.push(`<blockquote>${render(q.join('\n'), depth + 1)}</blockquote>`);
       continue;
     }
     const li = line.match(/^\s*([-*+]|\d+[.)])\s+(.*)$/);

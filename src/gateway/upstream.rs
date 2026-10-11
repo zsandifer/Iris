@@ -196,12 +196,37 @@ fn terminate_group(pid: Option<u32>) {
     unsafe {
         libc::kill(-pid, libc::SIGTERM);
     }
+    REAPING.fetch_add(1, Ordering::SeqCst);
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(3));
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
+        // KILL only a group that is still there after the grace period.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && group_alive(pid) {
+            std::thread::sleep(Duration::from_millis(100));
         }
+        if group_alive(pid) {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        REAPING.fetch_sub(1, Ordering::SeqCst);
     });
+}
+
+/// Process groups asked to stop and not yet gone.
+static REAPING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn group_alive(pgid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the group exists.
+    unsafe { libc::kill(-pgid, 0) == 0 }
+}
+
+/// Wait (at most `limit`) until stopped connector programs are gone, so
+/// the daemon does not exit before escalating to KILL.
+pub async fn wait_for_reaping(limit: Duration) {
+    let deadline = tokio::time::Instant::now() + limit;
+    while REAPING.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Start a `Serve` program and wait until its port accepts connections.

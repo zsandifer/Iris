@@ -286,7 +286,12 @@ pub async fn verify(
         run_dir: state.paths.run_dir(),
         scope: "keycheck".into(),
         key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
-        foreign_mcp: vec![],
+        // A one-word check needs none of the CLI's own tools or memory.
+        isolated: true,
+        own_mcp_servers: match crate::turn::own_mcp_servers(state, entry, &program).await {
+            Some(names) => names,
+            None => return AuthState::Unknown,
+        },
     };
     let Ok(mut invocation) = entry.harness.build(&spec) else {
         return AuthState::Unknown;

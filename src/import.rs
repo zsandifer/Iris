@@ -113,6 +113,10 @@ pub fn import_openclaw(source: &Path, paths: &Paths, opts: &Options) -> Result<V
     }
     let mut found = Vec::new();
     walk(&source, &source, 0, &mut found);
+    // Shallower files first, so when two sources map to the same place
+    // (MEMORY.md and memory/MEMORY.md) the workspace's own file wins.
+    found.sort_by(|(a, _), (b, _)| (a.components().count(), a).cmp(&(b.components().count(), b)));
+    let mut planned = std::collections::HashSet::new();
     let mut items = Vec::new();
     for (rel, skip) in found {
         let src = source.join(&rel);
@@ -145,6 +149,14 @@ pub fn import_openclaw(source: &Path, paths: &Paths, opts: &Options) -> Result<V
                 src,
                 dest: None,
                 action: Action::Skip("larger than 2 MB"),
+            });
+            continue;
+        }
+        if !planned.insert(dest.clone()) {
+            items.push(Item {
+                src,
+                dest: Some(dest),
+                action: Action::Skip("another file is imported to the same place"),
             });
             continue;
         }
@@ -386,6 +398,37 @@ mod tests {
             read(paths.persona_dir().join("USER.md")),
             "# User\nLikes tea."
         );
+    }
+
+    #[test]
+    fn two_sources_never_share_a_destination() {
+        let (_t, src, paths) = setup();
+        std::fs::write(src.join("memory/MEMORY.md"), "Older memory copy").unwrap();
+        let items = import_openclaw(
+            &src,
+            &paths,
+            &Options {
+                dry_run: false,
+                force: false,
+            },
+        )
+        .unwrap();
+        let dest = paths.memory_dir().join("MEMORY.md");
+        let to_dest: Vec<&Item> = items
+            .iter()
+            .filter(|i| i.dest.as_ref() == Some(&dest))
+            .collect();
+        assert_eq!(to_dest.len(), 2);
+        assert!(matches!(to_dest[0].action, Action::Create));
+        assert!(
+            to_dest[0].src.ends_with("MEMORY.md") && !to_dest[0].src.ends_with("memory/MEMORY.md")
+        );
+        assert!(matches!(to_dest[1].action, Action::Skip(_)));
+        assert_eq!(
+            std::fs::read_to_string(dest).unwrap(),
+            "Remember the garden."
+        );
+        assert!(report(&items, false).contains("same place"));
     }
 
     #[test]

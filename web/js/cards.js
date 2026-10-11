@@ -3,7 +3,9 @@
 // connector_reconnect, approval).
 import { html, useEffect, useState } from './h.js';
 import { api, get, post, put, patch, seg, isId } from './api.js';
-import { S, set, go, isOwner, toast, loadGoals, loadEngines, ensureConnectors } from './store.js';
+import {
+  S, set, go, isOwner, toast, loadGoals, loadEngines, loginMark, applyLoginResponse, ensureConnectors,
+} from './store.js';
 import { Icon, Img, LetterTile, hostOf, safeUrl } from './ui.js';
 import { plain } from './md.js';
 import { ServiceSignIn, ServiceTile, labelOf } from './connect.js';
@@ -46,17 +48,23 @@ function ConnectCard({ c }) {
   useEffect(() => { if (known) ensureConnectors(); }, [known]);
   const con = known && known !== 'custom' && (S.connectors || []).find((x) => x.service === known);
   const ready = con && con.enabled && con.auth_state === 'ok';
+  const url = !known && safeUrl(c.url);
+  const label = c.action_label || 'Connect';
   const open = () => {
     if (con) go(`iris/connections/${con.id}`);
     else if (known) go(known === 'custom' ? 'iris/connections/new' : `iris/connections/add/${known}`);
     else go('iris/connections');
   };
+  // A service Iris knows opens its setup here; for others the card's url
+  // is the service's own connection page, with Connections one tap away
+  // for the owner.
   return html`<div class="lk">
     ${known && known !== 'custom' ? html`<${ServiceTile} c=${{ service: known }} size=${36} />` : html`<${LetterTile} name=${service} size=${36} radius=${11} />`}
-    <div class="grow"><b>${c.title}</b><small>${ready ? 'Connected' : c.body ? plain(c.body, 90) : 'Connect it so I can help with it'}</small></div>
+    <div class="grow"><b>${c.title}</b><small>${ready ? 'Connected' : c.body ? plain(c.body, 90) : url ? hostOf(url) : 'Connect it so I can help with it'}</small>
+      ${url && isOwner() && html`<button class="lk-m" onClick=${open}>Connections ›</button>`}</div>
     ${ready ? html`<span class="ok">${'\u2713'}</span>`
-      : !known && safeUrl(c.url) ? html`<a class="go" href=${safeUrl(c.url)} target="_blank" rel="noopener noreferrer">${c.action_label || 'Connect'}</a>`
-      : html`<button class="go" onClick=${open}>${c.action_label || 'Connect'}</button>`}
+      : url ? html`<a class="go" href=${url} target="_blank" rel="noopener noreferrer">${label}</a>`
+      : html`<button class="go" onClick=${open}>${label}</button>`}
   </div>`;
 }
 
@@ -131,8 +139,9 @@ export function SignIn({ card, harness, flow, instructions, keyOptions }) {
   const start = async () => {
     setBusy(true);
     try {
+      const mark = loginMark(harness);
       const r = await post(`/harnesses/${seg(harness)}/login`);
-      if (r.login) set({ logins: { ...S.logins, [harness]: r.login } });
+      if (r.login) applyLoginResponse(harness, r.login, mark);
       else if (r.manual) toast(r.auth === 'ok' ? 'Signed in. Thanks!' : 'Still signed out. Follow the step above, then check again.');
     } catch (e) { toast(e.message); }
     setBusy(false);
@@ -142,8 +151,9 @@ export function SignIn({ card, harness, flow, instructions, keyOptions }) {
     if (!code.trim()) return;
     setBusy(true);
     try {
+      const mark = loginMark(harness);
       const r = await post(`/harnesses/${seg(harness)}/login/code`, { code: code.trim() });
-      set({ logins: { ...S.logins, [harness]: r.login } });
+      applyLoginResponse(harness, r.login, mark);
       setCode('');
     } catch (err) { toast(err.message); }
     setBusy(false);

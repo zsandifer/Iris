@@ -4,10 +4,18 @@
 const TOKEN_KEY = 'iris.token';
 let token = localStorage.getItem(TOKEN_KEY) || '';
 let unauthorizedHandler = () => {};
+// Bumped whenever the token changes. Responses to requests made under an
+// earlier token are dropped, so one user's data never reaches the next.
+let generation = 0;
 
 export const hasToken = () => !!token;
 export function setToken(t) {
-  token = t || '';
+  const next = t || '';
+  if (next !== token) {
+    generation++;
+    clearBlobs();
+  }
+  token = next;
   if (token) localStorage.setItem(TOKEN_KEY, token);
   else localStorage.removeItem(TOKEN_KEY);
 }
@@ -21,8 +29,20 @@ export class ApiError extends Error {
   }
 }
 
-/** Call `/api<path>`. JSON bodies are serialized; Blobs are sent raw. */
-export async function api(method, path, body, { raw = false, timeout } = {}) {
+// Thrown for a response that belongs to an earlier sign-in. No message, so
+// a caller that toasts errors shows nothing.
+const stale = () => new ApiError(0, 'stale', '');
+
+const offline = () => new ApiError(0, 'offline', "I can't reach your Iris server right now.");
+
+/**
+ * Call `/api<path>`. JSON bodies are serialized; Blobs are sent raw. The
+ * response body is read here, as `as` ('blob' or 'text'; by default JSON
+ * or text from the content type), so the deadline covers the whole body
+ * and a body that finishes after the signed-in user changed is dropped.
+ */
+export async function api(method, path, body, { as, timeout } = {}) {
+  const gen = generation;
   const headers = {};
   if (token) headers.Authorization = 'Bearer ' + token;
   let payload;
@@ -31,32 +51,44 @@ export async function api(method, path, body, { raw = false, timeout } = {}) {
     headers['Content-Type'] = 'application/json';
     payload = JSON.stringify(body);
   }
-  // Uploads may take a while on cellular; everything else should be quick.
-  const ms = timeout ?? (payload instanceof Blob ? 120000 : 20000);
+  // Uploads and downloads may take a while on cellular; the rest is quick.
+  const ms = timeout ?? (payload instanceof Blob || as ? 120000 : 20000);
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), ms);
-  let res;
   try {
-    res = await fetch('/api' + path, { method, headers, body: payload, signal: ctl.signal });
-  } catch {
-    throw new ApiError(0, 'offline', "I can't reach your Iris server right now.");
+    let res;
+    try {
+      res = await fetch('/api' + path, { method, headers, body: payload, signal: ctl.signal });
+    } catch {
+      throw offline();
+    }
+    if (gen !== generation) throw stale();
+    if (res.status === 401 && path !== '/pair') unauthorizedHandler();
+    if (!res.ok) {
+      let code = 'error';
+      let message = res.statusText || 'Something went wrong';
+      try {
+        const j = await res.json();
+        code = j.error?.code || code;
+        message = j.error?.message || message;
+      } catch { /* not JSON, or the body stalled */ }
+      if (gen !== generation) throw stale();
+      throw new ApiError(res.status, code, message);
+    }
+    const kind = as || ((res.headers.get('content-type') || '').includes('json') ? 'json' : 'text');
+    let data;
+    try {
+      data = await res[kind]();
+    } catch (e) {
+      if (gen !== generation) throw stale();
+      if (ctl.signal.aborted || e?.name === 'AbortError' || e?.name === 'TypeError') throw offline();
+      throw e;
+    }
+    if (gen !== generation) throw stale();
+    return data;
   } finally {
     clearTimeout(timer);
   }
-  if (res.status === 401 && path !== '/pair') unauthorizedHandler();
-  if (!res.ok) {
-    let code = 'error';
-    let message = res.statusText || 'Something went wrong';
-    try {
-      const j = await res.json();
-      code = j.error?.code || code;
-      message = j.error?.message || message;
-    } catch { /* not JSON */ }
-    throw new ApiError(res.status, code, message);
-  }
-  if (raw) return res;
-  const ct = res.headers.get('content-type') || '';
-  return ct.includes('json') ? res.json() : res.text();
 }
 
 export const get = (p) => api('GET', p);
@@ -94,6 +126,12 @@ function trimBlobs() {
   }
 }
 
+/** Revoke and forget every cached image (the signed-in user changed). */
+function clearBlobs() {
+  for (const e of blobs.values()) e.p.then((u) => URL.revokeObjectURL(u), () => {});
+  blobs.clear();
+}
+
 /**
  * Hold an object URL for an authenticated `/api/...` path. The URL stays
  * valid until `release()` is called.
@@ -103,9 +141,12 @@ export function holdBlob(path) {
   if (e) blobs.delete(path); // re-insert as most recently used
   else {
     e = { refs: 0 };
-    e.p = api('GET', path.replace(/^\/api(?=\/)/, ''), undefined, { raw: true })
-      .then((r) => r.blob())
-      .then((b) => URL.createObjectURL(b));
+    const gen = generation;
+    e.p = api('GET', path.replace(/^\/api(?=\/)/, ''), undefined, { as: 'blob' })
+      .then((b) => {
+        if (gen !== generation) throw stale();
+        return URL.createObjectURL(b);
+      });
     e.p.catch(() => { if (blobs.get(path) === e) blobs.delete(path); });
   }
   blobs.set(path, e);
