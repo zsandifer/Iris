@@ -955,6 +955,7 @@ case "$1 $2" in
   "--version "*) echo "9.9.9 (Fake Claude)";;
   "auth status") if [ -f "{m}" ]; then echo '{{"loggedIn": true}}'; else echo '{{"loggedIn": false}}'; exit 1; fi;;
   "auth login")
+    echo started >> "{starts}"
     echo "Opening browser to sign in..."
     echo "If the browser didn't open, visit: https://login.example.com/oauth/authorize?code=true&state=s1"
     printf "Paste code here if prompted > "
@@ -965,7 +966,8 @@ case "$1 $2" in
     exit 1;;
 esac
 "#,
-                m = marker.display()
+                m = marker.display(),
+                starts = dir.join("login-starts").display()
             ),
         )
         .unwrap();
@@ -1139,6 +1141,120 @@ esac
         // Non-owners cannot drive sign-in.
         let (s, _) = send(&h.app, "POST", "/api/harnesses/claude/login", None, None).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn reconnect_clears_a_stale_gemini_sign_in_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let db = crate::db::Db::open(&paths.db_file()).unwrap();
+        let mut cfg = Config::default();
+        for h in cfg.harness.values_mut() {
+            h.enabled = false;
+        }
+        let script = tmp.path().join("fake-gemini");
+        std::fs::write(&script, "#!/bin/sh\necho 0.0.1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let gemini = cfg.harness.get_mut("gemini").unwrap();
+        gemini.enabled = true;
+        gemini.command = script.to_string_lossy().into_owned();
+        let state = AppState::new(cfg, paths, db).unwrap();
+        let h = Harness {
+            app: router(state.clone()),
+            state,
+            _tmp: tmp,
+        };
+        let t = pair_as(&h, None).await;
+        // A turn found Gemini signed out; the owner then signed in on the
+        // server. Periodic probes cannot tell (Gemini has no status
+        // command), so the failure sticks...
+        h.state
+            .note_auth("gemini", crate::harness::AuthState::AuthRequired, None)
+            .await;
+        h.state.refresh_harnesses().await;
+        assert_eq!(
+            h.state.harness("gemini").unwrap().status().auth,
+            crate::harness::AuthState::AuthRequired
+        );
+        // ...until the owner presses Reconnect.
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            "/api/harnesses/gemini/login",
+            Some(&t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["auth"], "unknown");
+        assert!(b["manual"].is_string());
+        assert_eq!(
+            h.state.harness("gemini").unwrap().status().auth,
+            crate::harness::AuthState::Unknown
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_login_requests_share_one_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let db = crate::db::Db::open(&paths.db_file()).unwrap();
+        let mut cfg = Config::default();
+        for h in cfg.harness.values_mut() {
+            h.enabled = false;
+        }
+        let claude = cfg.harness.get_mut("claude").unwrap();
+        claude.enabled = true;
+        claude.command = fake_claude(tmp.path()).to_string_lossy().into_owned();
+        let state = AppState::new(cfg, paths, db).unwrap();
+        let starts = tmp.path().join("login-starts");
+        // Truly parallel requests (two worker threads).
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(4));
+        let tasks: Vec<_> = (0..4)
+            .map(|_| {
+                let (st, barrier) = (state.clone(), barrier.clone());
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    crate::login::start(&st, "claude").await.unwrap().id
+                })
+            })
+            .collect();
+        let mut ids = Vec::new();
+        for t in tasks {
+            ids.push(t.await.unwrap());
+        }
+        assert!(ids.iter().all(|i| *i == ids[0]), "{ids:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let n = std::fs::read_to_string(&starts)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(n, 1, "the CLI's login ran once");
+        assert!(crate::login::cancel(&state, "claude").await);
+        for _ in 0..100 {
+            if state.logins.status("claude").unwrap().state == "cancelled" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let first = state.logins.status("claude").unwrap();
+        assert_eq!(first.state, "cancelled");
+        // A new attempt gets a fresh session the old one cannot touch.
+        let next = crate::login::start(&state, "claude").await.unwrap();
+        assert_ne!(next.id, first.id);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(state.logins.status("claude").unwrap().id, next.id);
+        assert!(!state.logins.status("claude").unwrap().finished());
+        crate::login::cancel(&state, "claude").await;
     }
 
     #[tokio::test]

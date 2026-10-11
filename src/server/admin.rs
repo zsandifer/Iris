@@ -290,7 +290,7 @@ async fn start_login(
     if entry.harness.login().is_none() {
         // No headless login: re-check (the owner may have signed in on the
         // server) and return the manual step.
-        let auth = state.probe_auth(&name).await;
+        let auth = state.recheck_auth(&name).await;
         return ok(json!({
             "login": null,
             "manual": entry.harness.manual_login_hint(),
