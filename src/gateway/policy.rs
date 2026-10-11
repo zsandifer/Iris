@@ -55,8 +55,9 @@ impl Category {
             Category::Draft => 1,
             Category::Write => 2,
             Category::Unclear => 3,
-            Category::Export => 4,
-            Category::Send => 5,
+            Category::Send => 4,
+            // Exports always ask, even when recipients are trusted.
+            Category::Export => 5,
             Category::Delete => 6,
             Category::Purchase => 7,
         }
@@ -337,11 +338,25 @@ fn classify_words(w: &[String]) -> Option<Category> {
     let lead = |set: &[&str]| set.contains(&first);
     let read_first = lead(READ_VERBS);
 
-    if has(PURCHASE_WORDS) && !(read_first && !has(&["pay", "buy", "purchase", "checkout"])) {
-        return Some(Category::Purchase);
+    // These actions always ask. Consider all of them before email and
+    // draft words, which must never hide a destructive or bulk operation.
+    let mut risky = Category::Read;
+    if (has(PURCHASE_WORDS) && !(read_first && !has(&["pay", "buy", "purchase", "checkout"])))
+        || lead(PURCHASE_LEADING)
+        || (!read_first && has(PURCHASE_NOUNS))
+    {
+        risky = risky.riskier(Category::Purchase);
     }
-    if lead(PURCHASE_LEADING) || (!read_first && has(PURCHASE_NOUNS)) {
-        return Some(Category::Purchase);
+    if has(&["delete", "trash", "destroy", "erase", "purge", "wipe"])
+        || (!read_first && has(DELETE_WORDS))
+    {
+        risky = risky.riskier(Category::Delete);
+    }
+    if has(EXPORT_WORDS) || (has(&["download"]) && has(&["all", "everything"])) {
+        risky = risky.riskier(Category::Export);
+    }
+    if risky != Category::Read {
+        return Some(risky);
     }
     if has(&["send", "reply", "forward", "publish", "invite", "tweet"])
         || (!read_first && (has(SEND_WORDS) || lead(SEND_LEADING)))
@@ -352,14 +367,6 @@ fn classify_words(w: &[String]) -> Option<Category> {
             return Some(Category::Draft);
         }
         return Some(Category::Send);
-    }
-    if has(&["delete", "trash", "destroy", "erase", "purge", "wipe"])
-        || (!read_first && has(DELETE_WORDS))
-    {
-        return Some(Category::Delete);
-    }
-    if has(EXPORT_WORDS) || (has(&["download"]) && has(&["all", "everything"])) {
-        return Some(Category::Export);
     }
     if has(DRAFT_WORDS) {
         return Some(Category::Draft);
@@ -378,21 +385,24 @@ fn classify_words(w: &[String]) -> Option<Category> {
 }
 
 /// Classify a tool by its name and the MCP server's annotations
-/// (`readOnlyHint`, `destructiveHint`). Explicitly risky words in the name
-/// win over annotations, so a mislabeled tool still asks.
+/// (`readOnlyHint`, `destructiveHint`). Annotations may raise a name's risk,
+/// but never lower it; only an unrecognized name can rely on a read hint.
 pub fn classify(tool: &str, annotations: &Value) -> Category {
-    match classify_words(&words(tool)) {
-        Some(Category::Write) | None => {
-            if annotations["readOnlyHint"] == true {
-                Category::Read
-            } else if annotations["destructiveHint"] == true {
-                Category::Delete
-            } else {
-                Category::Write
-            }
+    let mut category = classify_words(&words(tool)).unwrap_or_else(|| {
+        if annotations["readOnlyHint"] == true {
+            Category::Read
+        } else {
+            Category::Write
         }
-        Some(c) => c,
+    });
+    if annotations["destructiveHint"] == true {
+        category = category.riskier(Category::Delete);
     }
+    if category == Category::Read && annotations["readOnlyHint"] == false {
+        // The name and annotation disagree: approval must settle it.
+        category = category.riskier(Category::Unclear);
+    }
+    category
 }
 
 /// Classify one call: the tool, plus any operation argument that chooses
@@ -746,6 +756,7 @@ pub fn normalize_recipient(raw: &str) -> Option<String> {
 }
 
 fn push_recipients(v: &Value, out: &mut Vec<String>) {
+    let before = out.len();
     match v {
         Value::String(s) => match parse_recipients(s) {
             Some(recipients) => out.extend(recipients),
@@ -765,6 +776,9 @@ fn push_recipients(v: &Value, out: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+    if out.len() == before {
+        out.push(UNREADABLE_RECIPIENTS.into());
     }
 }
 
@@ -1201,6 +1215,121 @@ mod tests {
         assert_eq!(c("export_all_contacts"), Category::Export);
         assert_eq!(c("share_file"), Category::Send);
         assert_eq!(c("frobnicate"), Category::Write);
+    }
+
+    #[test]
+    fn security_regression_risky_verbs_win_over_email_and_drafts() {
+        for (tool, expected) in [
+            ("delete_email_draft", Category::Delete),
+            ("trash_mail_draft", Category::Delete),
+            ("export_email_drafts", Category::Export),
+            ("delete_email", Category::Delete),
+            ("export_email", Category::Export),
+            ("remove_email_draft", Category::Delete),
+            ("purge_mail_drafts", Category::Delete),
+            ("send_export_email", Category::Export),
+            ("delete_export_email_drafts", Category::Delete),
+            ("delete_payment", Category::Purchase),
+        ] {
+            let category = c(tool);
+            assert_eq!(category, expected, "{tool}");
+            assert!(
+                matches!(
+                    decide(
+                        &Policy::default(),
+                        tool,
+                        category,
+                        &["sam@example.com".into()],
+                        &|_| true,
+                        &|_| true,
+                    ),
+                    Verdict::Ask(_)
+                ),
+                "{tool} must ask even with trusted recipients"
+            );
+        }
+        assert_eq!(
+            classify_call("send_email", &Value::Null, &json!({"action": "export"})),
+            Category::Export
+        );
+    }
+
+    #[test]
+    fn security_regression_annotations_can_only_raise_named_risk() {
+        for hints in [
+            json!({"readOnlyHint": false, "destructiveHint": true}),
+            json!({"readOnlyHint": true, "destructiveHint": true}),
+            json!({"destructiveHint": true}),
+            json!({"readOnlyHint": false}),
+        ] {
+            let category = classify("query", &hints);
+            if hints["destructiveHint"] == true {
+                assert_eq!(category, Category::Delete);
+            }
+            assert!(matches!(
+                decide(
+                    &Policy::default(),
+                    "query",
+                    category,
+                    &[],
+                    &|_| false,
+                    &|_| false
+                ),
+                Verdict::Ask(_)
+            ));
+            let read_only = Policy {
+                mode: Mode::ReadOnly,
+                ..Policy::default()
+            };
+            assert!(matches!(
+                decide(&read_only, "query", category, &[], &|_| false, &|_| false),
+                Verdict::Block(_)
+            ));
+        }
+        let ro = json!({"readOnlyHint": true});
+        for (tool, expected) in [
+            ("create_event", Category::Write),
+            ("create_draft", Category::Draft),
+            ("export_email", Category::Export),
+            ("delete_email", Category::Delete),
+            ("send_email", Category::Send),
+            ("buy_item", Category::Purchase),
+        ] {
+            assert_eq!(classify(tool, &ro), expected, "{tool}");
+        }
+        assert_eq!(
+            classify("buy_item", &json!({"destructiveHint": true})),
+            Category::Purchase
+        );
+    }
+
+    #[test]
+    fn security_regression_unreadable_recipient_elements_require_approval() {
+        for element in [
+            json!({"recipient_id": "new-person"}),
+            json!({"displayName": "New person"}),
+            json!({}),
+            json!({"email": []}),
+            json!(true),
+            Value::Null,
+            json!(""),
+            json!([]),
+        ] {
+            let out = recipients(&json!({"to": [{"email": "sam@example.com"}, element]}));
+            assert_eq!(out, ["sam@example.com", UNREADABLE_RECIPIENTS], "{element}");
+            assert!(is_placeholder(&out[1]));
+            assert!(matches!(
+                decide(
+                    &Policy::default(),
+                    "send_email",
+                    Category::Send,
+                    &out,
+                    &|_| true,
+                    &|_| true
+                ),
+                Verdict::Ask(_)
+            ));
+        }
     }
 
     #[test]

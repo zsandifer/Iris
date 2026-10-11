@@ -30,6 +30,7 @@ use crate::entities::{self, Connector, ConnectorCall, ConnectorState};
 use crate::harness::{McpServer, McpTransport};
 use crate::state::AppState;
 use crate::util::{new_id, now_ms, truncate_chars};
+use base64::Engine;
 use policy::{AllowedBy, Category, Verdict};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -487,6 +488,32 @@ fn launch_for(
     let mut env = open_secrets(state, con, "env", &con.config.env)?;
     let mut headers = open_secrets(state, con, "headers", &con.config.headers)?;
     let mut secrets: Vec<String> = env.values().chain(headers.values()).cloned().collect();
+    for (name, value) in &headers {
+        if !name.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        let Some((scheme, credential)) = value.trim().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let credential = credential.trim();
+        if !["bearer", "basic", "token"]
+            .iter()
+            .any(|s| scheme.eq_ignore_ascii_case(s))
+        {
+            continue;
+        }
+        if credential.len() >= 8 {
+            secrets.push(credential.to_string());
+        }
+        if scheme.eq_ignore_ascii_case("basic")
+            && let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(credential)
+            && let Ok(decoded) = String::from_utf8(decoded)
+            && let Some((_, password)) = decoded.split_once(':')
+            && password.len() >= 8
+        {
+            secrets.push(password.to_string());
+        }
+    }
     secrets.extend(bearer.map(String::from));
     if let Some(o) = &con.config.oauth
         && let Some(cs) = &o.client_secret
@@ -766,7 +793,10 @@ async fn upstream_tools(
     for attempt in 0..2 {
         let s = session(state, &con).await?;
         match s.upstream.list_tools(START_TIMEOUT).await {
-            Ok(tools) => {
+            Ok(mut tools) => {
+                for tool in &mut tools {
+                    s.scrub_value(tool);
+                }
                 state
                     .gateway
                     .tools

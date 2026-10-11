@@ -184,6 +184,118 @@ fn text(result: &Value) -> String {
 }
 
 #[tokio::test]
+async fn security_regression_discovery_is_scrubbed_before_caching() {
+    for owner_first in [false, true] {
+        let t = setup(|_| {});
+        let mut con = t.connector();
+        con.config.args[1] = FAKE_SERVER.replace(
+            "*'\"method\":\"tools/list\"'*)",
+            r#"*'"method":"tools/list"'*)
+              printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"search_%s","description":"secret %s","inputSchema":{"type":"object","properties":{"key":{"enum":["%s"]}}},"annotations":{"readOnlyHint":true,"title":"%s"}}]}}\n' "$id" "$FAKE_SECRET" "$FAKE_SECRET" "$FAKE_SECRET" "$FAKE_SECRET"
+              continue;"#,
+        );
+        let cli_tools;
+        let owner_tools;
+        if owner_first {
+            owner_tools = describe_tools(&t.state, &con).await.unwrap();
+            cli_tools = list_tools(&t.state, &con).await.unwrap();
+        } else {
+            cli_tools = list_tools(&t.state, &con).await.unwrap();
+            owner_tools = describe_tools(&t.state, &con).await.unwrap();
+        }
+        let cached = cached_tools(&t.state, &con).unwrap();
+        assert_eq!(cached[0]["name"], "search_[hidden]");
+        assert_eq!(cached[0]["description"], "secret [hidden]");
+        assert_eq!(
+            cached[0]["inputSchema"]["properties"]["key"]["enum"][0],
+            "[hidden]"
+        );
+        assert_eq!(cached[0]["annotations"]["title"], "[hidden]");
+        for tools in [cli_tools, owner_tools, cached] {
+            let encoded = serde_json::to_string(&tools).unwrap();
+            assert!(!encoded.contains("vaultsecret42"), "{encoded}");
+            assert!(encoded.contains("[hidden]"), "{encoded}");
+        }
+        stop(&t.state, &con.id).await;
+    }
+}
+
+#[test]
+fn security_regression_header_credentials_are_redacted_separately() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    let t = setup(|_| {});
+    for (header, value, fragments) in [
+        (
+            "Authorization",
+            "Bearer github_pat_synthetic42".to_string(),
+            vec!["github_pat_synthetic42"],
+        ),
+        (
+            "authorization",
+            "bEaReR github_pat_synthetic42".to_string(),
+            vec!["github_pat_synthetic42"],
+        ),
+        (
+            "AUTHORIZATION",
+            "tOkEn synthetic_token42".to_string(),
+            vec!["synthetic_token42"],
+        ),
+        (
+            "Authorization",
+            format!("bAsIc {}", STANDARD.encode("user:synthetic:password42")),
+            vec!["synthetic:password42"],
+        ),
+        (
+            "Authorization",
+            "Basic invalid_base64!".to_string(),
+            vec!["invalid_base64!"],
+        ),
+    ] {
+        let mut con = t.connector();
+        con.transport = "http".into();
+        con.config.command = None;
+        con.config.url = Some("https://connector.example.com/mcp".into());
+        con.config.headers = crate::server::seal_connector_secrets(
+            &t.state,
+            &con.id,
+            "headers",
+            &BTreeMap::from([(header.into(), value.clone())]),
+        )
+        .unwrap();
+        let (launch, secrets) = launch_for(&t.state, &con, None).unwrap();
+        let Launch::Http { headers, .. } = launch else {
+            panic!("expected HTTP launch")
+        };
+        assert_eq!(headers[header], value);
+        assert_eq!(redact(&value, &secrets), "[hidden]");
+        let credential = value.split_once(' ').unwrap().1;
+        assert_eq!(redact(credential, &secrets), "[hidden]");
+        for fragment in fragments {
+            assert_eq!(redact(fragment, &secrets), "[hidden]", "{header}");
+        }
+    }
+    // Short pieces must not redact unrelated text, but full headers stay hidden.
+    for value in [
+        "Bearer short42".to_string(),
+        format!("Basic {}", STANDARD.encode("user:short42")),
+    ] {
+        let mut con = t.connector();
+        con.config.headers = crate::server::seal_connector_secrets(
+            &t.state,
+            &con.id,
+            "headers",
+            &BTreeMap::from([("Authorization".into(), value.clone())]),
+        )
+        .unwrap();
+        let (_, secrets) = launch_for(&t.state, &con, None).unwrap();
+        assert_eq!(redact("short42", &secrets), "short42");
+        assert_eq!(redact(&value, &secrets), "[hidden]");
+    }
+}
+
+#[tokio::test]
 async fn secrets_stay_on_irises_side_and_reads_run_freely() {
     let t = setup(|_| {});
     let (token, _guard, servers) = t.grant().await;
