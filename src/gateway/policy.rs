@@ -62,7 +62,7 @@ impl Category {
         }
     }
 
-    fn riskier(self, other: Category) -> Category {
+    pub(super) fn riskier(self, other: Category) -> Category {
         if other.risk() > self.risk() {
             other
         } else {
@@ -482,7 +482,7 @@ pub const PUBLIC_AUDIENCE: &str = "everyone who can see it";
 
 /// Placeholders for audiences Iris cannot list (never trusted or known).
 pub fn is_placeholder(r: &str) -> bool {
-    r == IMPLICIT_RECIPIENTS || r == PUBLIC_AUDIENCE
+    r == IMPLICIT_RECIPIENTS || r == PUBLIC_AUDIENCE || r == UNREADABLE_RECIPIENTS
 }
 
 /// The call publishes something to an audience beyond the people its
@@ -533,43 +533,224 @@ fn norm_key(k: &str) -> String {
         .collect()
 }
 
-/// Canonical form of one recipient: the address inside `Name <addr>`,
-/// lowercased; phone numbers without punctuation.
-pub fn normalize_recipient(raw: &str) -> Option<String> {
-    let mut s = raw.trim();
-    if let (Some(a), Some(b)) = (s.rfind('<'), s.rfind('>'))
-        && a < b
-    {
-        s = &s[a + 1..b];
+/// An unparseable audience is never trusted or remembered after approval.
+const UNREADABLE_RECIPIENTS: &str = "recipients Iris cannot read unambiguously";
+
+fn atext(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&c)
+}
+
+/// RFC 5322 tokens: comments are CFWS, not display names or addresses.
+/// Keep quoted strings intact, including escapes and punctuation. Reject
+/// malformed input rather than recovering a possibly different audience.
+fn address_tokens(raw: &str) -> Option<Vec<&str>> {
+    let bytes = raw.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        match bytes[i] {
+            b' ' | b'\t' => i += 1,
+            b'\r'
+                if bytes.get(i + 1) == Some(&b'\n')
+                    && bytes.get(i + 2).is_some_and(|c| matches!(c, b' ' | b'\t')) =>
+            {
+                i += 2;
+            }
+            b'(' => {
+                let mut depth = 1;
+                i += 1;
+                while depth > 0 {
+                    match *bytes.get(i)? {
+                        b'\\' => {
+                            i += 1;
+                            if !matches!(*bytes.get(i)?, b' '..=b'~' | b'\t') {
+                                return None;
+                            }
+                        }
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        b' '..=b'~' | b'\t' => {}
+                        _ => return None,
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                loop {
+                    match *bytes.get(i)? {
+                        b'"' => break,
+                        b'\\' => {
+                            i += 1;
+                            if !matches!(*bytes.get(i)?, b' '..=b'~' | b'\t') {
+                                return None;
+                            }
+                        }
+                        b' '..=b'~' | b'\t' => {}
+                        _ => return None,
+                    }
+                    i += 1;
+                }
+                i += 1;
+                tokens.push(&raw[start..i]);
+            }
+            b'@' | b'.' | b'<' | b'>' | b',' | b':' | b';' => {
+                i += 1;
+                tokens.push(&raw[start..i]);
+            }
+            c if atext(c) => {
+                i += 1;
+                while bytes.get(i).is_some_and(|c| atext(*c)) {
+                    i += 1;
+                }
+                tokens.push(&raw[start..i]);
+            }
+            // Domain literals, obsolete syntax, and internationalized
+            // addresses need approval until Iris can parse them safely.
+            _ => return None,
+        }
     }
-    let s = s.trim().trim_start_matches("mailto:").trim();
-    if s.is_empty() || s.len() > 320 {
+    Some(tokens)
+}
+
+fn atom(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(atext)
+}
+
+fn phrase(tokens: &[&str]) -> bool {
+    !tokens.is_empty() && tokens.iter().all(|s| atom(s) || s.starts_with('"'))
+}
+
+fn dot_atom(tokens: &[&str]) -> bool {
+    !tokens.is_empty()
+        && tokens.len() % 2 == 1
+        && tokens
+            .iter()
+            .enumerate()
+            .all(|(i, s)| if i % 2 == 0 { atom(s) } else { *s == "." })
+}
+
+fn mailbox(tokens: &[&str]) -> Option<String> {
+    let address = if let Some(lt) = tokens.iter().position(|s| *s == "<") {
+        if tokens.last() != Some(&">") || (lt > 0 && !phrase(&tokens[..lt])) {
+            return None;
+        }
+        &tokens[lt + 1..tokens.len() - 1]
+    } else {
+        tokens
+    };
+    let at = address.iter().position(|s| *s == "@")?;
+    let local = &address[..at];
+    let domain = &address[at + 1..];
+    if !(dot_atom(local) || local.len() == 1 && local[0].starts_with('"')) || !dot_atom(domain) {
         return None;
     }
-    let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
-    let phoneish = s
-        .chars()
-        .all(|c| c.is_ascii_digit() || " +-().".contains(c));
-    if phoneish && digits.len() >= 7 {
-        let plus = if s.trim_start().starts_with('+') {
-            "+"
+    let out = address.concat();
+    (out.len() <= 320).then(|| out.to_ascii_lowercase())
+}
+
+/// Parse the supported RFC 5322 address-list grammar, including groups. A partial
+/// parse is unsafe: an ignored suffix may name an additional recipient.
+fn email_recipients(raw: &str) -> Option<Vec<String>> {
+    let raw = raw.trim();
+    let raw = if raw
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("mailto:"))
+    {
+        &raw[7..]
+    } else {
+        raw
+    };
+    let tokens = address_tokens(raw)?;
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let start = i;
+        while i < tokens.len() && ![",", ":", ";"].contains(&tokens[i]) {
+            i += 1;
+        }
+        if tokens.get(i) == Some(&":") {
+            if !phrase(&tokens[start..i]) {
+                return None;
+            }
+            i += 1;
+            if tokens.get(i) != Some(&";") {
+                loop {
+                    let start = i;
+                    while i < tokens.len() && ![",", ":", ";"].contains(&tokens[i]) {
+                        i += 1;
+                    }
+                    out.push(mailbox(&tokens[start..i])?);
+                    match tokens.get(i) {
+                        Some(&",") => i += 1,
+                        Some(&";") => break,
+                        _ => return None,
+                    }
+                }
+            }
+            i += 1; // group terminator
         } else {
-            ""
-        };
+            out.push(mailbox(&tokens[start..i])?);
+        }
+        if i == tokens.len() {
+            break;
+        }
+        if tokens[i] != "," || i + 1 == tokens.len() {
+            return None;
+        }
+        i += 1;
+    }
+    // Empty groups do not identify a verifiable audience.
+    (!out.is_empty()).then_some(out)
+}
+
+/// Phone numbers, handles, and channels retain their existing canonical
+/// forms. Email syntax must go through the complete address-list parser.
+fn other_recipient(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() || s.len() > 320 || s.chars().any(char::is_control) {
+        return None;
+    }
+    let digits: String = s.chars().filter(char::is_ascii_digit).collect();
+    if digits.len() >= 7
+        && s.chars()
+            .all(|c| c.is_ascii_digit() || " +-().".contains(c))
+    {
+        let plus = if s.starts_with('+') { "+" } else { "" };
         return Some(format!("{plus}{digits}"));
+    }
+    if s.contains(['<', '>', '(', ')', '"', '\\', ':', '[', ']'])
+        || s.contains('@') && !(s.starts_with('@') && s[1..].bytes().all(atext))
+    {
+        return None;
     }
     Some(s.to_lowercase())
 }
 
+fn parse_recipients(raw: &str) -> Option<Vec<String>> {
+    if raw.contains('@') && !raw.trim().starts_with('@') || raw.contains(['<', '>', '"', ':']) {
+        email_recipients(raw)
+    } else {
+        raw.split([',', ';', '\n'])
+            .filter(|s| !s.trim().is_empty())
+            .map(other_recipient)
+            .collect()
+    }
+}
+
+/// Canonical form of exactly one unambiguous recipient.
+pub fn normalize_recipient(raw: &str) -> Option<String> {
+    let mut recipients = parse_recipients(raw)?;
+    (recipients.len() == 1).then(|| recipients.remove(0))
+}
+
 fn push_recipients(v: &Value, out: &mut Vec<String>) {
     match v {
-        Value::String(s) => {
-            for part in s.split([',', ';', '\n']) {
-                if let Some(r) = normalize_recipient(part) {
-                    out.push(r);
-                }
-            }
-        }
+        Value::String(s) => match parse_recipients(s) {
+            Some(recipients) => out.extend(recipients),
+            None => out.push(UNREADABLE_RECIPIENTS.into()),
+        },
         Value::Array(items) => items.iter().for_each(|i| push_recipients(i, out)),
         Value::Object(o) => {
             for (k, v) in o {
@@ -579,7 +760,7 @@ fn push_recipients(v: &Value, out: &mut Vec<String>) {
             }
         }
         Value::Number(n) => {
-            if let Some(r) = normalize_recipient(&n.to_string()) {
+            if let Some(r) = other_recipient(&n.to_string()) {
                 out.push(r);
             }
         }
@@ -860,6 +1041,128 @@ impl Preview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_recipient_comments_quotes_and_groups() {
+        for (raw, expected) in [
+            (
+                "evil@example.com (Friend <sam@example.com>)",
+                vec!["evil@example.com"],
+            ),
+            (
+                "evil@example.com (nested (Friend <sam@example.com>))",
+                vec!["evil@example.com"],
+            ),
+            (
+                "Sam (evil@example.com) <sam@example.com>",
+                vec!["sam@example.com"],
+            ),
+            (
+                "\"Doe, Sam\" <sam@example.com>, riley@example.com",
+                vec!["sam@example.com", "riley@example.com"],
+            ),
+            (
+                "\"Friend \\\"<sam@example.com>\\\"\" <evil@example.com>",
+                vec!["evil@example.com"],
+            ),
+            (
+                "Team: sam@example.com, Evil <evil@example.com>;",
+                vec!["sam@example.com", "evil@example.com"],
+            ),
+            (
+                "\"Team: Friends\": sam@example.com; , evil@example.com",
+                vec!["sam@example.com", "evil@example.com"],
+            ),
+            (
+                "\"evil,sam@example.com\"@example.net",
+                vec!["\"evil,sam@example.com\"@example.net"],
+            ),
+            ("<sam (comment) @ example.com>", vec!["sam@example.com"]),
+            ("Sam\r\n <SAM@Example.com>", vec!["sam@example.com"]),
+            ("MAILTO:SAM@Example.com", vec!["sam@example.com"]),
+        ] {
+            assert_eq!(recipients(&json!({"to": raw})), expected, "{raw}");
+        }
+        assert_eq!(
+            normalize_recipient("+1 (555) 010-9999").as_deref(),
+            Some("+15550109999")
+        );
+        assert_eq!(normalize_recipient("@Sam").as_deref(), Some("@sam"));
+        assert_eq!(normalize_recipient("#General").as_deref(), Some("#general"));
+        assert_eq!(
+            normalize_recipient("sam@example.com, riley@example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_recipient_lists_cannot_be_trusted_or_known() {
+        for raw in [
+            "evil@example.com Friend <sam@example.com>",
+            "\"a\" <evil@example.com> <sam@example.com>",
+            "Team: sam@example.com",
+            "Team: sam@example.com; evil@example.com",
+            "Team: Team: sam@example.com;;",
+            "<sam@example.com> evil@example.com",
+            "Sam <sam@example.com",
+            "\"unterminated <sam@example.com>",
+            "sam@example.com (unterminated",
+            "sam@example.com )",
+            "sam@example.com (escaped end \\)",
+            "mailto:sam@example.com?cc=evil@example.com",
+            "\"sam@example.com\" <evil@example.com>x",
+            "sam@example.com,",
+            "sam@example.com,,evil@example.com",
+            "sam@example.com\r\nBcc: evil@example.com",
+            "sam..lee@example.com",
+            "sam@example..com",
+            "sam@example.com@evil.example.com",
+            "sam(comment)lee@example.com",
+            "<@evil.example.com:sam@example.com>",
+            "Undisclosed:;",
+        ] {
+            let out = recipients(&json!({"to": raw}));
+            assert_eq!(out, [UNREADABLE_RECIPIENTS], "{raw}");
+            // Even a stored/trusted string matching the placeholder must
+            // never let a malformed audience run automatically.
+            assert!(
+                matches!(
+                    decide(
+                        &Policy::default(),
+                        "send_email",
+                        Category::Send,
+                        &out,
+                        &|_| true,
+                        &|_| true
+                    ),
+                    Verdict::Ask(_)
+                ),
+                "{raw}"
+            );
+            assert_eq!(normalize_recipient(raw), None, "{raw}");
+        }
+        for raw in [
+            "evil@example.com (Friend <sam@example.com>)",
+            "\"sam@example.com\" <evil@example.com>",
+            "Team: sam@example.com, evil@example.com;",
+        ] {
+            let out = recipients(&json!({"to": raw}));
+            assert!(
+                matches!(
+                    decide(
+                        &Policy::default(),
+                        "send_email",
+                        Category::Send,
+                        &out,
+                        &|r| r == "sam@example.com",
+                        &|_| false
+                    ),
+                    Verdict::Ask(_)
+                ),
+                "{raw}: {out:?}"
+            );
+        }
+    }
 
     fn c(name: &str) -> Category {
         classify(name, &Value::Null)

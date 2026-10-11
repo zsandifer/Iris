@@ -101,7 +101,7 @@ struct Session {
     /// Calls running right now (an idle reaper must not stop them).
     inflight: std::sync::atomic::AtomicUsize,
     /// Secret values it was given (including every bearer token swapped
-    /// in since), to scrub from diagnostics.
+    /// in since), to scrub from results and diagnostics.
     secrets: Mutex<Vec<String>>,
 }
 
@@ -113,8 +113,7 @@ impl Session {
         )
     }
 
-    /// Scrub every string in a JSON value (a tool's error result, which
-    /// often echoes its configuration).
+    /// Scrub every string in a tool result, which may echo configuration.
     fn scrub_value(&self, v: &mut Value) {
         match v {
             Value::String(s) => *s = self.scrub(s),
@@ -753,10 +752,15 @@ fn cached_tools(state: &AppState, con: &Connector) -> Option<Vec<Value>> {
 }
 
 /// The connector's tools, from cache or the running server. A token
-/// refused while listing is refreshed and tried once more.
-async fn upstream_tools(state: &AppState, con: &Connector) -> Result<Vec<Value>, CallError> {
+/// refused while listing is refreshed and tried once more. `None` means
+/// the server started but could not list its tools: calls need approval.
+/// Startup and sign-in failures remain errors; no call can run through them.
+async fn upstream_tools(
+    state: &AppState,
+    con: &Connector,
+) -> Result<Option<Vec<Value>>, CallError> {
     if let Some(t) = cached_tools(state, con) {
-        return Ok(t);
+        return Ok(Some(t));
     }
     let mut con = con.clone();
     for attempt in 0..2 {
@@ -769,7 +773,7 @@ async fn upstream_tools(state: &AppState, con: &Connector) -> Result<Vec<Value>,
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .insert(con.id.clone(), (fingerprint(&con), tools.clone()));
-                return Ok(tools);
+                return Ok(Some(tools));
             }
             Err(UpstreamError::Auth(_)) if attempt == 0 && con.config.oauth.is_some() => {
                 let used = s.bearer.lock().unwrap_or_else(|p| p.into_inner()).clone();
@@ -791,10 +795,7 @@ async fn upstream_tools(state: &AppState, con: &Connector) -> Result<Vec<Value>,
                         con.id.clone(),
                         truncate_chars(&s.scrub(&e.to_string()), 300),
                     );
-                return Err(CallError::Other(format!(
-                    "{} could not list its tools (the owner can see why on its page in the app)",
-                    con.name
-                )));
+                return Ok(None);
             }
         }
     }
@@ -805,7 +806,13 @@ async fn upstream_tools(state: &AppState, con: &Connector) -> Result<Vec<Value>,
 /// the owner marked in their description.
 pub async fn list_tools(state: &AppState, con: &Connector) -> Result<Vec<Value>, String> {
     let tools = match upstream_tools(state, con).await {
-        Ok(t) => t,
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return Err(format!(
+                "{} could not list its tools (the owner can see why on its page in the app)",
+                con.name
+            ));
+        }
         Err(CallError::Auth) => {
             needs_sign_in(state, con).await;
             return Err(format!("{} needs to be signed in again", con.name));
@@ -852,11 +859,17 @@ pub async fn describe_tools(state: &AppState, con: &Connector) -> Result<Vec<Val
     };
     let found = match (blocked, cached_tools(state, con)) {
         (None, _) => upstream_tools(state, con).await,
-        (Some(_), Some(t)) => Ok(t),
+        (Some(_), Some(t)) => Ok(Some(t)),
         (Some(why), None) => return Err(why.into()),
     };
     let tools = match found {
-        Ok(t) => t,
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return Err(format!(
+                "{} could not list its tools (the owner can see why on its page in the app)",
+                con.name
+            ));
+        }
         Err(CallError::Auth) => return Err("sign in first".into()),
         Err(CallError::Other(e)) => return Err(e),
     };
@@ -1073,14 +1086,29 @@ pub async fn call_tool(
         return tool_error(&r);
     }
     let bound_target = target(con);
-    let tools = upstream_tools(state, con).await;
-    let annotations = tools
+    let tools = match upstream_tools(state, con).await {
+        Ok(tools) => tools,
+        Err(e) => {
+            crate::warn!("connector {}: discovery unavailable; call refused", con.id);
+            return call_error(state, con, e).await;
+        }
+    };
+    let found = tools
         .as_ref()
-        .ok()
-        .and_then(|t| t.iter().find(|x| x["name"] == tool))
+        .and_then(|t| t.iter().find(|x| x["name"] == tool));
+    let annotations = found
         .map(|t| t["annotations"].clone())
         .unwrap_or(Value::Null);
-    let category = policy::classify_call(tool, &annotations, args);
+    let mut category = policy::classify_call(tool, &annotations, args);
+    if found.is_none() {
+        // Fail closed: without the tool's definition Iris cannot trust its
+        // read-only hints, so the call asks.
+        crate::warn!(
+            "connector {}: tool definition unavailable; approval required",
+            con.id
+        );
+        category = category.riskier(Category::Unclear);
+    }
     let recipients = policy::audience(tool, args);
     let label = service_label(con);
     let preview = policy::preview(&label, tool, category, args);
@@ -1101,6 +1129,9 @@ pub async fn call_tool(
         )
     };
     let mut verdict = judge(&con.policy);
+    if found.is_none() && matches!(verdict, Verdict::Allow(_)) {
+        verdict = Verdict::Ask("Iris could not verify this action's definition".into());
+    }
     if !matches!(verdict, Verdict::Block(_))
         && policy::request_text(args).chars().count() > policy::MAX_DETAILS
     {
@@ -1228,7 +1259,13 @@ pub async fn call_tool(
     }
     match result {
         Ok(v) => v,
-        Err(CallError::Auth) => {
+        Err(e) => call_error(state, con, e).await,
+    }
+}
+
+async fn call_error(state: &AppState, con: &Connector, error: CallError) -> Value {
+    match error {
+        CallError::Auth => {
             needs_sign_in(state, con).await;
             tool_error(&format!(
                 "{} refused the sign-in, so nothing was done. I posted a Reconnect card for the \
@@ -1236,7 +1273,7 @@ pub async fn call_tool(
                 con.name
             ))
         }
-        Err(CallError::Other(e)) => tool_error(&format!("The connection failed: {e}")),
+        CallError::Other(e) => tool_error(&format!("The connection failed: {e}")),
     }
 }
 
@@ -1291,9 +1328,9 @@ async fn forward(
         s.last_used.store(now_ms(), Ordering::SeqCst);
         match result {
             Ok(mut v) => {
-                if v["isError"] == true {
-                    s.scrub_value(&mut v);
-                }
+                // Every result, not only errors: a tool may echo what it
+                // was given.
+                s.scrub_value(&mut v);
                 if s.upstream.tools_changed() {
                     state
                         .gateway
@@ -1596,17 +1633,35 @@ async fn ask(
     }
     let conv = grant.card_conversation_id.clone();
     let epoch = state.gateway.cancel_epoch(&con.id);
+    let private = grant.private_conversation.clone();
+    let owner = grant.owner_user_id.clone();
+    let cancelled = grant.cancel.subscribe();
+    let hub = state.hub.clone();
     let inserted = state
         .db
         .call(move |c| {
+            // Checked in the same database step as the insert: a member
+            // who joined while the call waited must never see the request.
+            let cancelled = cancelled.borrow();
+            if *cancelled {
+                return Ok(None);
+            }
+            if let Some(conv) = &private
+                && db::conversation_member_ids(c, conv)? != [owner]
+            {
+                return Ok(None);
+            }
             let m = entities::insert_card(c, &conv, &card, "assistant")?;
-            Ok((
-                m.clone(),
-                db::conversation_member_ids(c, &m.conversation_id)?,
-            ))
+            let members = db::conversation_member_ids(c, &m.conversation_id)?;
+            hub.to_users(
+                &members,
+                json!({"type": "message.created", "conversation_id": m.conversation_id, "message": m}),
+            );
+            Ok(Some(m))
         })
         .await;
-    let Ok((msg, members)) = inserted else {
+    let Ok(Some(msg)) = inserted else {
+        grant.cancel.send_replace(true);
         return Answer::Cancelled;
     };
     let (tx, rx) = oneshot::channel();
@@ -1633,10 +1688,6 @@ async fn ask(
     let mut c = call.clone();
     c.card_message_id = Some(msg.id.clone());
     record(state, &c).await;
-    state.hub.to_users(
-        &members,
-        json!({"type": "message.created", "conversation_id": msg.conversation_id, "message": msg}),
-    );
     crate::notify::push_users(
         state,
         std::slice::from_ref(&grant.owner_user_id),

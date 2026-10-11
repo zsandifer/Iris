@@ -261,11 +261,14 @@ pub async fn wait_for_reaping(limit: Duration) {
 /// never starve it.
 const MAX_HTTP_EXCHANGES: usize = 6;
 
-async fn http_permit() -> Result<tokio::sync::OwnedSemaphorePermit, UpstreamError> {
+fn http_permits() -> Arc<tokio::sync::Semaphore> {
     static PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
         std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_EXCHANGES)));
-    PERMITS
-        .clone()
+    PERMITS.clone()
+}
+
+async fn http_permit() -> Result<tokio::sync::OwnedSemaphorePermit, UpstreamError> {
+    http_permits()
         .acquire_owned()
         .await
         .map_err(|_| UpstreamError::Transport("shutting down".into()))
@@ -991,10 +994,13 @@ impl HttpConn {
         let url = self.url.clone();
         let mut headers = self.header_list();
         headers.push(("Mcp-Session-Id".into(), sid));
-        let Ok(permit) = http_permit().await else {
+        // Closing is best effort: never wait long for a permit (Pause and
+        // Disconnect must not hang behind slow exchanges) or for the DELETE.
+        let Ok(Ok(permit)) = tokio::time::timeout(Duration::from_secs(2), http_permit()).await
+        else {
             return;
         };
-        let _ = tokio::task::spawn_blocking(move || {
+        let work = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let agent = http_agent(Duration::from_secs(5));
             let mut req = agent.delete(&url);
@@ -1002,14 +1008,30 @@ impl HttpConn {
                 req = req.header(k.as_str(), v.as_str());
             }
             let _ = req.call();
-        })
-        .await;
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(7), work).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closing_does_not_wait_forever_for_a_permit() {
+        // Exercise close itself, with all exchange slots occupied. Holding
+        // them until close returns would deadlock without its timeout.
+        let _held = http_permits()
+            .acquire_many_owned(MAX_HTTP_EXCHANGES as u32)
+            .await
+            .unwrap();
+        let h = HttpConn::new("http://127.0.0.1:1/mcp".into(), BTreeMap::new());
+        *h.session.lock().unwrap() = Some("test-session".into());
+        tokio::time::timeout(Duration::from_secs(3), h.close())
+            .await
+            .expect("cleanup must not wait for busy exchanges");
+        assert!(h.session.lock().unwrap().is_none());
+    }
 
     #[test]
     fn sse_picks_our_response() {

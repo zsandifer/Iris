@@ -229,14 +229,7 @@ impl Harness for Codex {
         // Codex merges `-c` overrides into a server of the same name in its
         // own config (whose `url` would then clash with Iris's `command`):
         // Iris's servers get names Codex itself does not use.
-        let servers: Vec<McpServer> = spec
-            .mcp_servers
-            .iter()
-            .map(|s| McpServer {
-                name: super::unclaimed_name(&s.name, &spec.own_mcp_servers),
-                ..s.clone()
-            })
-            .collect();
+        let servers = super::unclaimed_servers(&spec.mcp_servers, &spec.own_mcp_servers);
         let mcp = mcp_setup(&servers, &exe, &spec.run_dir, &spec.turn_id)?;
         overrides.extend(mcp.overrides);
         // MCP servers configured in Codex itself are off in every turn:
@@ -247,12 +240,16 @@ impl Harness for Codex {
             }
             overrides.push(format!("mcp_servers.{name}.enabled=false"));
         }
+        // Hosted ChatGPT apps (`codex_apps`) and plugins are connectors
+        // that would bypass Iris's gateway and approvals: off in every turn.
+        // Verified with codex-cli 0.162.1: `features list` and the
+        // `-c features.<name>=false` overrides in `exec --help`.
+        for f in ["apps", "plugins"] {
+            overrides.push(format!("features.{f}=false"));
+        }
         if spec.isolated {
-            // Someone else's chat: none of the owner's ChatGPT apps,
-            // plugins, or memories either.
-            for f in ["apps", "plugins", "memories"] {
-                overrides.push(format!("features.{f}=false"));
-            }
+            // Someone else's chat: none of the owner's memories either.
+            overrides.push("features.memories=false".into());
             // No AGENTS.md from the shared workspace (an owner's turn could
             // have written one). The global one cannot be switched off; see
             // `can_isolate`.
@@ -795,8 +792,19 @@ mod tests {
         // A resumed thread already has the instructions.
         assert_eq!(inv.stdin, b"hello");
 
-        // The owner's chat keeps Codex's apps, plugins, and memories.
-        assert!(!inv.args.iter().any(|a| a.starts_with("features.")));
+        // Apps and plugins would bypass the gateway, including in owner
+        // chats and jobs; memories are only disabled for isolated turns.
+        for resume in [None, Some("th-1".to_string())] {
+            for scope in ["c1", "job:scheduled"] {
+                spec.resume = resume.clone();
+                spec.scope = scope.into();
+                let inv = h.build(&spec).unwrap();
+                for flag in ["features.apps=false", "features.plugins=false"] {
+                    assert!(inv.args.contains(&flag.to_string()), "{scope}: {flag}");
+                }
+                assert!(!inv.args.contains(&"features.memories=false".to_string()));
+            }
+        }
         // Someone else's chat: Codex's own apps, plugins, and memories are
         // switched off too (its own MCP servers are off in every turn;
         // Iris's own servers stay, renamed if Codex has one by that name).

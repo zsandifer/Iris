@@ -213,9 +213,9 @@ async fn secrets_stay_on_irises_side_and_reads_run_freely() {
         .call(&token, "search_messages", json!({"query": "dinner"}))
         .await;
     assert_eq!(r["isError"], Value::Null, "{r}");
-    // The connector got its secret from the vault; the agent sees only
-    // what the tool returns.
-    assert_eq!(text(&r), "ok search_messages secret=vaultsecret42");
+    // The connector got its secret from the vault; even successful
+    // results are scrubbed before the agent sees them.
+    assert_eq!(text(&r), "ok search_messages secret=[hidden]");
     let calls = t.calls();
     assert_eq!(calls[0].decision, "auto");
     assert_eq!(calls[0].outcome.as_deref(), Some("ok"));
@@ -276,7 +276,7 @@ async fn a_send_waits_for_approval_then_runs() {
     assert_eq!(t.state.gateway.pending_count(), 1);
     t.decide(&card.id, true);
     let r = call.await.unwrap()["result"].clone();
-    assert_eq!(text(&r), "ok send_message secret=vaultsecret42");
+    assert_eq!(text(&r), "ok send_message secret=[hidden]");
     assert!(t.calls_log().contains("send_message"));
     // Exactly what was approved reached the connector, unchanged.
     assert_eq!(
@@ -354,7 +354,7 @@ async fn trusted_recipients_skip_approval_and_the_send_tripwire_pauses() {
                 json!({"to": "SAM@example.com", "text": "hi"}),
             )
             .await;
-        assert_eq!(text(&r), "ok send_message secret=vaultsecret42");
+        assert_eq!(text(&r), "ok send_message secret=[hidden]");
     }
     assert_eq!(t.calls()[0].decision, "trusted");
     // The third send in an hour trips the wire: paused, owner told.
@@ -565,7 +565,7 @@ async fn rules_block_and_new_recipients_ask() {
     );
     t.decide(&card.id, true);
     let r = call.await.unwrap()["result"].clone();
-    assert_eq!(text(&r), "ok create_event secret=vaultsecret42");
+    assert_eq!(text(&r), "ok create_event secret=[hidden]");
     // Known now: the next invite to them runs without asking.
     let r = t
         .call(
@@ -574,7 +574,7 @@ async fn rules_block_and_new_recipients_ask() {
             json!({"title": "Coffee", "attendees": [{"email": "new@example.com"}]}),
         )
         .await;
-    assert_eq!(text(&r), "ok create_event secret=vaultsecret42");
+    assert_eq!(text(&r), "ok create_event secret=[hidden]");
 }
 
 #[tokio::test]
@@ -805,7 +805,7 @@ async fn the_call_count_tripwire_pauses() {
         let r = t
             .call(&token, "search_messages", json!({"query": "x"}))
             .await;
-        assert_eq!(text(&r), "ok search_messages secret=vaultsecret42");
+        assert_eq!(text(&r), "ok search_messages secret=[hidden]");
     }
     let r = t
         .call(&token, "search_messages", json!({"query": "x"}))
@@ -930,4 +930,235 @@ async fn safety_routes_cancel_held_calls() {
         assert_eq!(m.card.unwrap()["state"], "cancelled", "{path}");
         assert!(!t.calls_log().contains("send_message"), "{path}");
     }
+}
+
+#[tokio::test]
+async fn a_card_is_never_posted_once_someone_joined_the_chat() {
+    let t = setup(|_| {});
+    let (token, _guard, _) = t.grant().await;
+    let grant = t
+        .state
+        .gateway
+        .grants
+        .lock()
+        .unwrap()
+        .get(&token)
+        .unwrap()
+        .clone();
+    // A member joins after the call passed its checks, before the card.
+    let main = t.main.clone();
+    t.state
+        .db
+        .with(|c| {
+            c.execute(
+                "INSERT INTO users (id, display_name, created_at) VALUES ('guest', 'Guest', 0)",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO conversation_members (conversation_id, user_id, role, joined_at)
+                 VALUES (?1, 'guest', 'member', 0)",
+                [&main],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let con = t.connector();
+    let args = json!({"to": "sam@example.com", "text": "secret plans"});
+    let p = policy::preview("Chat", "send_message", Category::Send, &args);
+    let call = ConnectorCall::default();
+    let mut events = t.state.hub.subscribe();
+    let answer = ask(&t.state, &grant, &con, &call, &p, Category::Send).await;
+    assert!(events.try_recv().is_err(), "no card was broadcast");
+    assert!(matches!(answer, Answer::Cancelled));
+    let msgs = t
+        .state
+        .db
+        .with(|c| db::list_messages(c, &t.main, None, 50))
+        .unwrap();
+    assert!(msgs.iter().all(|m| m.card.is_none()), "no card was posted");
+}
+
+#[tokio::test]
+async fn unverified_tools_require_approval_even_with_an_allow_override() {
+    for discovery_fails in [false, true] {
+        for allow_override in [false, true] {
+            let t = setup(|_| {});
+            let tool = if discovery_fails {
+                "search_messages"
+            } else {
+                "search_hidden"
+            };
+            let mut con = t.connector();
+            if discovery_fails {
+                con.config.args[1] = FAKE_SERVER.replace(
+                    "*'\"method\":\"tools/list\"'*)",
+                    "*'\"method\":\"tools/list\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":-32603,\"message\":\"discovery failed\"}}\n' \"$id\"; continue;",
+                );
+            }
+            if allow_override {
+                con.policy
+                    .tools
+                    .insert(tool.into(), policy::ToolRule::Allow);
+            }
+            t.state
+                .db
+                .with(|c| {
+                    c.execute(
+                        "UPDATE connectors SET config = ?2, policy = ?3 WHERE id = ?1",
+                        rusqlite::params![
+                            con.id,
+                            serde_json::to_string(&con.config).unwrap(),
+                            serde_json::to_string(&con.policy).unwrap()
+                        ],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            let (token, _guard, _) = t.grant().await;
+            let state = t.state.clone();
+            let call = tokio::spawn(async move {
+                handle(
+                    &state,
+                    &json!({"token": token, "connector": "chat", "request": {
+                    "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                    "params": {"name": tool, "arguments": {"query": "x"}}}}),
+                )
+                .await
+            });
+            let card = t.pending_card().await;
+            assert!(t.calls_log().is_empty());
+            t.decide(&card.id, false);
+            let r = call.await.unwrap()["result"].clone();
+            assert_eq!(r["isError"], true);
+            assert!(t.calls_log().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_grant_posts_no_approval_card() {
+    let t = setup(|_| {});
+    let (token, _guard, _) = t.grant().await;
+    let grant = t.state.gateway.grant(&token).unwrap();
+    grant.cancel.send_replace(true);
+    let mut events = t.state.hub.subscribe();
+    let args = json!({"to": "sam@example.com", "text": "private request"});
+    let p = policy::preview("Chat", "send_message", Category::Send, &args);
+    let answer = ask(
+        &t.state,
+        &grant,
+        &t.connector(),
+        &ConnectorCall::default(),
+        &p,
+        Category::Send,
+    )
+    .await;
+    assert!(matches!(answer, Answer::Cancelled));
+    assert!(events.try_recv().is_err());
+    assert!(
+        t.state
+            .db
+            .with(|c| db::list_messages(c, &t.main, None, 50))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn joining_during_discovery_posts_no_private_request() {
+    let t = setup(|_| {});
+    let mut con = t.connector();
+    con.config.args[1] = FAKE_SERVER.replace(
+        "*'\"method\":\"tools/list\"'*)",
+        "*'\"method\":\"tools/list\"'*) touch discovering; while [ ! -e discovered ]; do sleep 0.01; done;",
+    );
+    t.state
+        .db
+        .with(|c| {
+            c.execute(
+                "UPDATE connectors SET config = ?2 WHERE id = ?1",
+                rusqlite::params![con.id, serde_json::to_string(&con.config).unwrap()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let (token, _guard, _) = t.grant().await;
+    let state = t.state.clone();
+    let call = tokio::spawn(async move {
+        handle(&state, &json!({"token": token, "connector": "chat", "request": {
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "send_message", "arguments": {"to": "sam@example.com", "text": "private request"}}}})).await
+    });
+    let dir = connector_dir(&t.state, &t.connector_id);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !dir.join("discovering").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the call reached discovery");
+    let mut events = t.state.hub.subscribe();
+    t.state
+        .db
+        .with(|c| {
+            c.execute(
+                "INSERT INTO users (id, display_name, created_at) VALUES ('guest', 'Guest', 0)",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO conversation_members (conversation_id, user_id, role, joined_at)
+            VALUES (?1, 'guest', 'member', 0)",
+                [&t.main],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    cancel_conversation_grants(&t.state, &t.main);
+    std::fs::write(dir.join("discovered"), "").unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(2), call)
+        .await
+        .unwrap()
+        .unwrap()["result"]
+        .clone();
+    assert_eq!(r["isError"], true);
+    assert!(text(&r).contains("cancelled"));
+    assert!(
+        events.try_recv().is_err(),
+        "no private request was broadcast"
+    );
+    assert!(
+        t.state
+            .db
+            .with(|c| db::list_messages(c, &t.main, None, 50))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(t.calls_log().is_empty());
+}
+
+#[tokio::test]
+async fn an_unverified_tool_is_denied_on_a_read_only_connection() {
+    let t = setup(|_| {});
+    let policy = policy::Policy {
+        mode: policy::Mode::ReadOnly,
+        ..Default::default()
+    };
+    t.state
+        .db
+        .with(|c| {
+            c.execute(
+                "UPDATE connectors SET policy = ?2 WHERE id = ?1",
+                rusqlite::params![t.connector_id, serde_json::to_string(&policy).unwrap()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let (token, _guard, _) = t.grant().await;
+    let mut events = t.state.hub.subscribe();
+    let r = t.call(&token, "search_hidden", json!({"query": "x"})).await;
+    assert_eq!(r["isError"], true);
+    assert!(text(&r).contains("read only"), "{r}");
+    assert!(events.try_recv().is_err());
+    assert!(t.calls_log().is_empty());
+    assert_eq!(t.calls()[0].decision, "blocked");
 }

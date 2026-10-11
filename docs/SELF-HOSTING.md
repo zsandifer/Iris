@@ -306,7 +306,11 @@ agent's workspace), or a remote server it calls with the connection's
 token. Secrets and tokens live in the encrypted vault and never reach the
 agent. This works the same with Claude Code, Codex, Gemini CLI, and
 OpenCode, and MCP servers you configured in a CLI yourself are switched
-off in Iris's turns so nothing goes around the gateway. Only your own
+off in Iris's turns so nothing goes around the gateway. Codex's hosted
+ChatGPT apps and plugins are also disabled in every turn, including your
+own chats and scheduled jobs, with `features.apps=false` and
+`features.plugins=false` (verified against Codex CLI 0.162.1). Connect
+those services through Iris to use its approval rules. Only your own
 personal chats and your scheduled jobs use connections; shared chats and
 other people's chats never do. Idle
 connection programs stop after `safety.idle_minutes`.

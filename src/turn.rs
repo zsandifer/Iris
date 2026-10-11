@@ -592,11 +592,14 @@ async fn run_locked(
 
         let strip = state.strip_env(entry);
         // As the CLI knows them (renamed where its own config has the name).
-        let server_names: Vec<String> = spec
-            .mcp_servers
-            .iter()
-            .map(|s| crate::harness::unclaimed_name(&s.name, &spec.own_mcp_servers))
-            .collect();
+        let server_names: Vec<String> = crate::harness::unclaimed_names(
+            &spec
+                .mcp_servers
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>(),
+            &spec.own_mcp_servers,
+        );
         let (tx, rx) = mpsc::unbounded_channel();
         let run_fut = runner::run(
             RunRequest {

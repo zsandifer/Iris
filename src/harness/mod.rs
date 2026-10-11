@@ -91,14 +91,32 @@ pub struct TurnSpec {
     pub own_mcp_servers: Vec<String>,
 }
 
-/// The name an Iris MCP server gets in a CLI whose own configuration
-/// already has a server called `name` (the CLI would merge the two).
-pub fn unclaimed_name(name: &str, own: &[String]) -> String {
-    let mut n = name.to_string();
-    while own.contains(&n) {
-        n.insert_str(0, "iris_");
+/// The names Iris's MCP servers get in a CLI whose own configuration
+/// already has servers called `own` (the CLI would merge same-named ones).
+/// Aliases are allocated across the CLI's names and every name already
+/// assigned, so no two servers end up sharing one.
+pub fn unclaimed_names(names: &[String], own: &[String]) -> Vec<String> {
+    let mut taken: std::collections::HashSet<String> = own.iter().cloned().collect();
+    let mut out = Vec::new();
+    for name in names {
+        let mut n = name.clone();
+        while taken.contains(&n) {
+            n.insert_str(0, "iris_");
+        }
+        taken.insert(n.clone());
+        out.push(n);
     }
-    n
+    out
+}
+
+/// Rename `servers` per `unclaimed_names`.
+pub fn unclaimed_servers(servers: &[McpServer], own: &[String]) -> Vec<McpServer> {
+    let names: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+    unclaimed_names(&names, own)
+        .into_iter()
+        .zip(servers)
+        .map(|(name, s)| McpServer { name, ..s.clone() })
+        .collect()
 }
 
 /// A fully built command line.
@@ -464,5 +482,17 @@ mod tests {
         assert!(resolve_command("sh").is_some());
         assert!(resolve_command("/bin/sh").is_some());
         assert!(resolve_command("definitely-not-a-real-binary-xyz").is_none());
+    }
+
+    #[test]
+    fn aliases_never_collide_with_each_other_or_native_names() {
+        let own = vec!["mail".to_string()];
+        for order in [["mail", "iris_mail"], ["iris_mail", "mail"]] {
+            let names: Vec<String> = order.iter().map(|s| s.to_string()).collect();
+            let out = unclaimed_names(&names, &own);
+            let set: std::collections::HashSet<_> = out.iter().collect();
+            assert_eq!(set.len(), 2, "{out:?}");
+            assert!(!out.contains(&"mail".to_string()), "{out:?}");
+        }
     }
 }

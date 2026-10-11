@@ -125,14 +125,7 @@ impl Harness for OpenCode {
         // OpenCode merges this file into its own config, so Iris's servers
         // get names OpenCode itself does not use, and its own servers are
         // switched off (they would bypass Iris's gateway).
-        let servers: Vec<super::McpServer> = spec
-            .mcp_servers
-            .iter()
-            .map(|s| super::McpServer {
-                name: super::unclaimed_name(&s.name, &spec.own_mcp_servers),
-                ..s.clone()
-            })
-            .collect();
+        let servers = super::unclaimed_servers(&spec.mcp_servers, &spec.own_mcp_servers);
         let mut mcp = mcp_config(&servers);
         for name in &spec.own_mcp_servers {
             mcp[name] = json!({"enabled": false});
