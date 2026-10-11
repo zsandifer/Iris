@@ -4,10 +4,18 @@
 const TOKEN_KEY = 'iris.token';
 let token = localStorage.getItem(TOKEN_KEY) || '';
 let unauthorizedHandler = () => {};
+// Bumped whenever the token changes. Responses to requests made under an
+// earlier token are dropped, so one user's data never reaches the next.
+let generation = 0;
 
 export const hasToken = () => !!token;
 export function setToken(t) {
-  token = t || '';
+  const next = t || '';
+  if (next !== token) {
+    generation++;
+    clearBlobs();
+  }
+  token = next;
   if (token) localStorage.setItem(TOKEN_KEY, token);
   else localStorage.removeItem(TOKEN_KEY);
 }
@@ -21,8 +29,13 @@ export class ApiError extends Error {
   }
 }
 
+// Thrown for a response that belongs to an earlier sign-in. No message, so
+// a caller that toasts errors shows nothing.
+const stale = () => new ApiError(0, 'stale', '');
+
 /** Call `/api<path>`. JSON bodies are serialized; Blobs are sent raw. */
 export async function api(method, path, body, { raw = false, timeout } = {}) {
+  const gen = generation;
   const headers = {};
   if (token) headers.Authorization = 'Bearer ' + token;
   let payload;
@@ -43,6 +56,7 @@ export async function api(method, path, body, { raw = false, timeout } = {}) {
   } finally {
     clearTimeout(timer);
   }
+  if (gen !== generation) throw stale();
   if (res.status === 401 && path !== '/pair') unauthorizedHandler();
   if (!res.ok) {
     let code = 'error';
@@ -56,7 +70,9 @@ export async function api(method, path, body, { raw = false, timeout } = {}) {
   }
   if (raw) return res;
   const ct = res.headers.get('content-type') || '';
-  return ct.includes('json') ? res.json() : res.text();
+  const data = await (ct.includes('json') ? res.json() : res.text());
+  if (gen !== generation) throw stale();
+  return data;
 }
 
 export const get = (p) => api('GET', p);
@@ -94,6 +110,12 @@ function trimBlobs() {
   }
 }
 
+/** Revoke and forget every cached image (the signed-in user changed). */
+function clearBlobs() {
+  for (const e of blobs.values()) e.p.then((u) => URL.revokeObjectURL(u), () => {});
+  blobs.clear();
+}
+
 /**
  * Hold an object URL for an authenticated `/api/...` path. The URL stays
  * valid until `release()` is called.
@@ -103,9 +125,13 @@ export function holdBlob(path) {
   if (e) blobs.delete(path); // re-insert as most recently used
   else {
     e = { refs: 0 };
+    const gen = generation;
     e.p = api('GET', path.replace(/^\/api(?=\/)/, ''), undefined, { raw: true })
       .then((r) => r.blob())
-      .then((b) => URL.createObjectURL(b));
+      .then((b) => {
+        if (gen !== generation) throw stale();
+        return URL.createObjectURL(b);
+      });
     e.p.catch(() => { if (blobs.get(path) === e) blobs.delete(path); });
   }
   blobs.set(path, e);

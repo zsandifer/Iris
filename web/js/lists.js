@@ -1,7 +1,9 @@
 // Ideas, Goals, and Library tabs.
 import { html, useEffect, useState } from './h.js';
 import { post, patch, del, api, seg } from './api.js';
-import { S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary } from './store.js';
+import {
+  S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary, loadMoreSaved, loadMorePhotos,
+} from './store.js';
 import { Icon, Img, Empty, Spinner, ago, since, openSheet, closeSheet, confirmSheet, hostOf, useBlob } from './ui.js';
 import { md } from './md.js';
 import { Post, findPost } from './feed.js';
@@ -167,6 +169,16 @@ function Saved({ posts, limit }) {
     <${Icon} name="chev" size=${16} cls="rc" /></div>`)}</div>`;
 }
 
+function ShowMore({ load }) {
+  const [busy, setBusy] = useState(false);
+  const more = async () => {
+    setBusy(true);
+    try { await load(); } catch (e) { toast(e.message); }
+    setBusy(false);
+  };
+  return html`<button class="b2 wide" disabled=${busy} onClick=${more}>${busy ? 'Loading…' : 'Show more'}</button>`;
+}
+
 export function LibraryScreen() {
   useStore();
   const [tab, setTab] = useState('all');
@@ -176,8 +188,8 @@ export function LibraryScreen() {
   let body;
   if (!lib) body = html`<${Spinner} />`;
   else if (tab === 'made') body = lib.items.length ? html`<${MadeByIris} items=${lib.items} />` : html`<${Empty} icon="file" title="Nothing yet">Reports, drafts, and images I make for you land here.<//>`;
-  else if (tab === 'photos') body = lib.photos.length ? html`<${PhotoGrid} photos=${lib.photos} />` : html`<${Empty} icon="image" title="No photos yet">Photos you send me show up here.<//>`;
-  else if (tab === 'saved') body = lib.saved.length ? html`<${Saved} posts=${lib.saved} />` : html`<${Empty} icon="heart" title="Nothing saved">Tap ♡ on a post in For you to keep it here.<//>`;
+  else if (tab === 'photos') body = lib.photos.length ? html`<${PhotoGrid} photos=${lib.photos} />${lib.photosMore && html`<${ShowMore} load=${loadMorePhotos} />`}` : html`<${Empty} icon="image" title="No photos yet">Photos you send me show up here.<//>`;
+  else if (tab === 'saved') body = lib.saved.length ? html`<${Saved} posts=${lib.saved} />${lib.savedMore && html`<${ShowMore} load=${loadMoreSaved} />`}` : html`<${Empty} icon="heart" title="Nothing saved">Tap ♡ on a post in For you to keep it here.<//>`;
   else {
     const any = lib.items.length || lib.photos.length || lib.saved.length;
     body = any ? html`

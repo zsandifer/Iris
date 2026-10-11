@@ -49,6 +49,7 @@ const P = {
   hand: 'M8 13V5.5a1.5 1.5 0 0 1 3 0V11M11 10V4.5a1.5 1.5 0 0 1 3 0V11M14 10.5V6a1.5 1.5 0 0 1 3 0v8a7 7 0 0 1-7 7h-.5A5.5 5.5 0 0 1 5 18.2L3.3 14.6a1.5 1.5 0 0 1 2.6-1.5L8 16',
   stop: 'M8 7h8a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1z',
   download: 'M12 4v11M7 10.5l5 5 5-5M5 20h14',
+  archive: 'M4 5h16v4H4zM5.5 9v10h13V9M10 13h4',
 };
 
 export function Icon({ name, size = 22, fill = false, cls = '' }) {
@@ -123,8 +124,15 @@ export function Toggle({ on, onChange, disabled = false, label }) {
 /** A settings-style row. */
 export function Row({ icon, iconBg, title, sub, value, onClick, right, danger = false, accent = false, chevron }) {
   const showChev = chevron ?? !!onClick;
+  // A button or link inside the row (e.g. in `right`) does its own thing;
+  // the click must not also run the row's action.
+  const tap = onClick && ((e) => {
+    const inner = e.target.closest?.('button, a, input, select, textarea, label');
+    if (inner && inner !== e.currentTarget && e.currentTarget.contains(inner)) return;
+    onClick(e);
+  });
   return html`<div class=${'r' + (onClick ? ' tap' : '') + (danger ? ' danger' : '') + (accent ? ' accent' : '')}
-    onClick=${onClick} role=${onClick ? 'button' : undefined} tabindex=${onClick ? 0 : undefined}>
+    onClick=${tap} role=${onClick ? 'button' : undefined} tabindex=${onClick ? 0 : undefined}>
     ${icon && html`<div class="ri" style=${iconBg ? `background:${iconBg}` : ''}>${typeof icon === 'string' ? html`<${Icon} name=${icon} size=${17} />` : icon}</div>`}
     <div class="rt">${title}${sub && html`<small>${sub}</small>`}</div>
     ${value != null && html`<span class="rv">${value}</span>`}
