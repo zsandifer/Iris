@@ -791,6 +791,62 @@ async fn wait_decision(state: &AppState, ctx: &TurnCtx, message_id: &str) -> Opt
     }
 }
 
+/// The owner approved a card after `fill_card` stopped waiting (the turn
+/// may even be over). Once no turn runs in that chat and the approval is
+/// still unused, continue with a short message from the owner, so Iris
+/// picks it up (`fill_card` then finds the approval).
+pub fn resume_after_approval(state: AppState, message_id: String, conv: String, approver: String) {
+    tokio::spawn(async move {
+        // Give a waiting fill_card its chance to take it first.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
+        loop {
+            let busy = state
+                .running
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&conv);
+            if !busy {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let id = message_id.clone();
+        let card = state
+            .db
+            .call(move |c| db::get_message(c, &id))
+            .await
+            .ok()
+            .flatten();
+        let still_open = card.is_some_and(|m| {
+            m.card.as_ref().is_some_and(|c| {
+                c["state"] == "approved"
+                    && c["wallet"]["used_at"].is_null()
+                    && now_ms() - m.created_at < APPROVAL_TTL_MS
+            })
+        });
+        if !still_open {
+            return;
+        }
+        if let Err(e) = crate::turn::start_chat_turn(
+            &state,
+            &conv,
+            Some(&approver),
+            "I approved the card. Go ahead.",
+            &[],
+            crate::router::Purpose::Chat,
+            &approver,
+        )
+        .await
+        {
+            crate::warn!("browser: could not continue after card approval {message_id}: {e}");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,60 +911,4 @@ mod tests {
         assert!(secure_enough("http", "::1"));
         assert!(secure_enough("http", "app.localhost"));
     }
-}
-
-/// The owner approved a card after `fill_card` stopped waiting (the turn
-/// may even be over). Once no turn runs in that chat and the approval is
-/// still unused, continue with a short message from the owner, so Iris
-/// picks it up (`fill_card` then finds the approval).
-pub fn resume_after_approval(state: AppState, message_id: String, conv: String, approver: String) {
-    tokio::spawn(async move {
-        // Give a waiting fill_card its chance to take it first.
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
-        loop {
-            let busy = state
-                .running
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(&conv);
-            if !busy {
-                break;
-            }
-            if tokio::time::Instant::now() > deadline {
-                return;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        let id = message_id.clone();
-        let card = state
-            .db
-            .call(move |c| db::get_message(c, &id))
-            .await
-            .ok()
-            .flatten();
-        let still_open = card.is_some_and(|m| {
-            m.card.as_ref().is_some_and(|c| {
-                c["state"] == "approved"
-                    && c["wallet"]["used_at"].is_null()
-                    && now_ms() - m.created_at < APPROVAL_TTL_MS
-            })
-        });
-        if !still_open {
-            return;
-        }
-        if let Err(e) = crate::turn::start_chat_turn(
-            &state,
-            &conv,
-            Some(&approver),
-            "I approved the card. Go ahead.",
-            &[],
-            crate::router::Purpose::Chat,
-            &approver,
-        )
-        .await
-        {
-            crate::warn!("browser: could not continue after card approval {message_id}: {e}");
-        }
-    });
 }
