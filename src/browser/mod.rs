@@ -420,6 +420,11 @@ impl Browser {
 
     /// The running browser, starting it if needed.
     pub async fn ensure(&self) -> Result<Arc<Running>> {
+        if !self.cfg.enabled {
+            return Err(
+                "the browser is turned off in the server's config ([browser] enabled)".into(),
+            );
+        }
         if self.is_paused() {
             return Err("Iris is paused".into());
         }

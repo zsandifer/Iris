@@ -35,6 +35,7 @@ state (conversations, goals, feed, and so on) in SQLite.
 - [Configuration](#configuration)
 - [Engines and models](#engines-and-models)
 - [Engines from the app](#engines-from-the-app)
+- [Iris's computer (browser)](#iriss-computer-browser)
 - [Proactive jobs](#proactive-jobs)
 - [Security model](#security-model)
 - [Subscription terms](#subscription-terms)
@@ -93,6 +94,8 @@ See [docs/API.md](API.md) for every route, event, and data type.
   - OpenCode 1.19 or newer
 - Node.js (with npm) on the server if you want to install Codex, Gemini CLI,
   or OpenCode from the app (Claude Code installs natively)
+- Optional, for Iris's own browser: Chromium or Chrome, or Node.js to
+  install Chromium from the app
 
 Iris resolves the CLIs from its engines directory, then `PATH` (plus
 `~/.local/bin` and similar), and reports their versions. It never pins or
@@ -234,6 +237,52 @@ engines but cannot modify them, and never needs download or install rights.
   these steps in the card when needed.
 - The optional privilege split (`deploy/setup-engines.sh`, as root).
 
+## Iris's computer (browser)
+
+Iris launches and owns one headless Chromium for the agent. Every engine
+gets it as the `browser` MCP tools (open pages, read them, click, type,
+screenshots, tabs), and you can watch it live and take over from the app
+(Iris hub, Iris's computer). Iris itself is not an agent here: it carries
+out each tool call the CLI makes, nothing more.
+
+- **Getting a browser.** Tap "Set up the browser" in Iris's computer: Iris
+  installs the official `playwright-core` npm package into its engines
+  directory and runs its own `install chromium`, which downloads Chromium
+  from Playwright's official servers (needs Node.js). Iris updates it daily
+  with the other engines it installed, while the browser is closed. Or
+  install Chromium or Chrome yourself; Iris looks at `browser.command`, then
+  `PATH` (`chromium`, `google-chrome`, ...; snap packages are skipped because
+  their sandbox cannot use Iris's profile), then Playwright's cache
+  (`~/.cache/ms-playwright`).
+- **System libraries.** A fresh server may lack the libraries Chromium
+  needs; the app then shows the error. Fix it once as root with
+  `npx playwright install-deps chromium` (or install your distribution's
+  Chromium package).
+- **Sign-ins persist.** The profile lives in `<data dir>/browser/profile`,
+  so sites you or Iris signed in to stay signed in. Chrome's own password
+  manager and autofill are turned off there.
+- **Memory.** The browser starts on first use and closes after
+  `browser.idle_mins` (default 10) without use, so it costs nothing while
+  idle. A running browser with one tab takes roughly 200 to 400 MB.
+- **Live view and take over.** Frames stream over the app's WebSocket only
+  while you watch (about 1 per second for the small peek in chat, up to
+  about 6 full screen, only when the page changes). Take over forwards your
+  taps, scrolling, and typing; the agent's browser tools wait until you hand
+  back.
+- **Saved logins and cards.** The agent asks Iris to fill a login
+  (`fill_login`) or card (`fill_card`) on the current page; Iris types it in
+  from the vault and the agent only hears `filled` or `not found`. Logins go
+  only to the site they were saved for, over HTTPS. Every card use asks you
+  first with an approval card in the chat.
+- **Who gets it.** Only the owner's own conversations and jobs (the profile
+  holds the owner's sign-ins); never shared chats.
+- **Sandbox.** Iris starts Chrome with its sandbox and turns it off only if
+  the system cannot start it (for example Ubuntu 24.04's AppArmor
+  restriction on unprivileged user namespaces; a warning is logged). To keep
+  it on there, allow user namespaces for Chrome with an AppArmor profile
+  (see Chromium's `apparmor-userns-restrictions.md`).
+- **Turning it off.** `[browser] enabled = false` removes the tools.
+
 ## Proactive jobs
 
 - **Heartbeat** (`[heartbeat]`): on a schedule, the agent works through
@@ -269,6 +318,13 @@ Both are off by default, respect active hours, and can be triggered manually
   that headless runs reject. Adjust all of them in `config.toml`.
 - Engines installed from the app come only from official sources and are
   verified (checksum or npm integrity); see the privilege split above.
+- Iris's browser is driven over a private pipe (no DevTools port is opened),
+  and its tools reach the server through a Unix socket in the private run
+  directory, accepted only for a running turn. Saved secrets go from the
+  vault straight into the page; filled fields are masked on screen and in
+  what the agent reads. Only `http`/`https` pages can be opened.
+- "Pause Iris" in Iris's computer stops running turns, closes the browser,
+  and holds chats and jobs until you turn it back on.
 
 ## Subscription terms
 
@@ -319,12 +375,9 @@ Contributor notes, architecture, and invariants are in
 ## Not done yet
 
 - **Voice replies**: `POST /api/voice/speak` is a placeholder (returns 501).
-- **Using saved credentials**: logins and cards are stored encrypted and
-  managed through the API, but nothing injects them into the agent's
-  browsing yet. Planned design: the agent requests a credential by id
-  through a tool and Iris fills it into a browser session without the
-  model ever seeing the secret.
-- **Live view of the agent's browser**, group chat UI.
+- **Group chat UI**.
+- **Logins and cards inside cross-origin frames** (for example embedded
+  payment widgets) cannot be filled; take over and type them yourself.
 - **Gemini CLI and OpenCode sign-in from the app**: both need one step on
   the server (see above).
 

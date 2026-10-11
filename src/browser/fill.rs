@@ -448,7 +448,7 @@ async fn ask_approval(
     };
     let preview = format!(
         "Fill your {name}{exp} (\"{}\") into the payment form on this page:\n{url}\n\n\
-         Approving lets me fill it in once. I'll still show you what I'm buying.",
+         Approving lets me fill it in this once, to finish what you asked for.",
         card.label
     );
     let title_text = format!("Use your {name} on {host}");

@@ -106,7 +106,8 @@ if (!globalThis.__iris) {
         const v = el.value || '';
         if (!v) return '';
         const ty = (el.getAttribute('type') || '').toLowerCase();
-        if (ty === 'password' || secret.has(el)) return ' value="••••"';
+        const cc = /cc-number|cc-csc/.test(el.getAttribute('autocomplete') || '');
+        if (ty === 'password' || cc || secret.has(el)) return ' value="••••"';
         return ` value=${q(clean(v, 80))}`;
       }
       return '';

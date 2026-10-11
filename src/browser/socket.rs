@@ -48,6 +48,9 @@ pub async fn serve(state: AppState) -> Result<()> {
     let p = path(&state.paths);
     if let Some(dir) = p.parent() {
         crate::config::ensure_private_dir(dir)?;
+        if !owned_by_us(dir) {
+            return Err(format!("{} belongs to another user", dir.display()).into());
+        }
     }
     let _ = std::fs::remove_file(&p);
     let listener = tokio::net::UnixListener::bind(&p)
@@ -92,9 +95,21 @@ async fn handle(state: AppState, stream: tokio::net::UnixStream) -> Result<()> {
     Ok(())
 }
 
+/// The socket's directory must be ours and private (it may sit under /tmp).
+fn owned_by_us(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    std::fs::symlink_metadata(dir)
+        .is_ok_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0)
+}
+
 /// Client side (inside `iris mcp --browser`): forward one call.
 pub fn forward(socket: &Path, token: &str, name: &str, arguments: &Value) -> Value {
     let fail = |msg: &str| json!({"content": [{"type": "text", "text": msg}], "isError": true});
+    if !socket.parent().is_some_and(owned_by_us) {
+        return fail("The browser is not available right now (Iris is not running).");
+    }
     let mut stream = match std::os::unix::net::UnixStream::connect(socket) {
         Ok(s) => s,
         Err(_) => return fail("The browser is not available right now (Iris is not running)."),

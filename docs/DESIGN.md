@@ -51,7 +51,9 @@ own personality. It is not a clone.
   "Checking your calendar…" or "Reading your email…". There are no "…" dots
   and no quick-reply chips.
 - **Browser peek:** only while Iris is browsing or researching, a small live
-  thumbnail of its browser appears. Tap it to watch full screen or take over.
+  thumbnail of its browser appears under the status line (from Iris's first
+  browser step in a turn until the turn ends). Tap it to watch full screen or
+  take over.
 - **Approval card:** rendered by Iris (not the agent) for sending email or
   messages, purchases, and messages to new recipients. It shows the real
   preview with Deny / Approve buttons.
@@ -108,7 +110,11 @@ own personality. It is not a clone.
 - **Logins & wallet:** an encrypted store. The app explains that Iris can use
   these but never sees them. Cards always ask before paying.
 - **Iris's computer:** a live screen with Watch / Take over, recent activity,
-  Pause Iris, and Disconnect everything.
+  Pause Iris, and Disconnect everything. Watch is a dark full-screen view;
+  Take over forwards taps, drags (scrolling), and typing (a keyboard button,
+  an address bar, Back) while Iris waits, until "Hand back". When there is
+  no browser yet, the screen offers to set one up. Pause Iris stops what it
+  is doing and holds chats and check-ins until turned back on.
 - **System files:** the persona markdown files and memory/workspace folders,
   each with a plain-language label, editable.
 - **Settings:**

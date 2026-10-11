@@ -28,11 +28,13 @@ if the two ever disagree, the code wins and this file has a bug.
    - [3.15 Jobs](#315-jobs)
    - [3.16 Voice](#316-voice)
    - [3.17 Engines (install and update)](#317-engines-install-and-update)
+   - [3.18 Iris's computer (browser)](#318-iriss-computer-browser)
 4. [WebSocket: `GET /api/ws`](#4-websocket-get-apiws)
 5. [Turn lifecycle](#5-turn-lifecycle)
 6. [Data model](#6-data-model)
 7. [Engine selection](#7-engine-selection)
 8. [The iris-mcp bridge](#8-the-iris-mcp-bridge)
+   - [The browser tools](#the-browser-tools)
 9. [Push notifications](#9-push-notifications)
 10. [Placeholders and TODO](#10-placeholders-and-todo)
 11. [The app](#11-the-app)
@@ -278,6 +280,13 @@ All paths are under `/api`. "Any" means any authenticated user.
 | POST | `/credentials` | **Owner** | Create a credential |
 | PATCH | `/credentials/{id}` | **Owner** | Update a credential |
 | DELETE | `/credentials/{id}` | **Owner** | Delete a credential |
+| GET | `/browser` | **Owner** | Iris's browser: status and setup state |
+| POST | `/browser/start` | **Owner** | Open the browser |
+| POST | `/browser/stop` | **Owner** | Close the browser (sign-ins are kept) |
+| POST | `/browser/takeover` | **Owner** | Take control from this device |
+| POST | `/browser/handback` | **Owner** | Give control back to Iris |
+| POST | `/browser/navigate` | **Owner** | Open a page while in control |
+| POST | `/browser/install` | **Owner** | Install Chromium for Iris (`engines`) |
 | GET | `/push/vapid-public-key` | Any | VAPID public key |
 | GET | `/push/subscriptions` | Any | Your push subscriptions |
 | POST | `/push/subscriptions` | Any | Subscribe this device |
@@ -984,6 +993,7 @@ Returns the [Settings](#settings) object directly (not wrapped):
   "avatar_custom": false,
   "allow_claude_for_shared": false,
   "feed_prompt": "...",
+  "paused": false,
   "voice": {"enabled": false, "status": "not_implemented"}
 }
 ```
@@ -997,6 +1007,7 @@ All fields optional; only supplied fields change.
 | `agent_name` | string | Non-blank, max 40, must not contain newline, carriage return, `<`, `>`, or a backtick. Trimmed. |
 | `allow_claude_for_shared` | bool | Owner opt-in to let Claude answer in conversations with more than one person ([individual-use policy](#individual-use-policy)). `false` clears the app setting (the config value still applies). |
 | `feed_prompt` | string | Max 4,000. Blank resets to the default. |
+| `paused` | bool | "Pause Iris". `true` stops every running turn (its CLI process group is killed), closes the browser, and until it is turned off again: chat turns end at once with a short first-person note (error kind `paused`, no push), scheduled jobs do not run, and the browser tools are refused. Saved in the database, so it survives restarts. |
 
 Unknown fields are ignored. Models are no longer set here: pin slots with
 [`PUT /api/models/slots/{slot}`](#put-apimodelsslotsslot-owner). (An
@@ -1192,14 +1203,20 @@ Set `enabled` to `true` / `false`. Response `{"connector": {Connector}}`.
 
 Saved logins and payment cards. All routes are **owner-only** and scoped to
 the caller. Secrets (password, notes, card number, CVC) are encrypted at rest
-and **never returned**; responses only contain non-secret metadata. Iris does
-not yet give credentials to the agent (see
-[section 10](#10-placeholders-and-todo)).
+and **never returned**; responses only contain non-secret metadata.
+
+The agent uses them only through Iris's browser: `fill_login` and
+`fill_card` ([browser tools](#the-browser-tools)) make Iris type the saved
+values into the current page itself. The secret never reaches a tool result,
+a message, or a log. A login is filled only into the site it was saved for
+(the page's host must be the saved `site` or a subdomain of it) over HTTPS
+(plain HTTP only on this machine). Every card use needs the owner's OK on an
+[approval card](#server-cards).
 
 #### `GET /api/credentials`
 
 ```json
-{"credentials": [{Credential}], "injection": "not_implemented"}
+{"credentials": [{Credential}]}
 ```
 
 Ordered by kind, then label.
@@ -1365,6 +1382,7 @@ official sources, into its engines directory (`engines.dir`, default
 | `codex` | npm `@openai/codex` | npm registry integrity; install scripts not run |
 | `gemini` | npm `@google/gemini-cli` | same |
 | `opencode` | npm `opencode-ai` (its native platform binary) | same |
+| `browser` | Chromium for [Iris's computer](#318-iriss-computer-browser): npm `playwright-core`, then its own `install chromium` from Playwright's official downloads | npm registry integrity for the package; Playwright's installer for the browser |
 
 The npm engines need Node.js on the server. Iris only ever updates or
 removes engines it installed; a CLI the operator installed (for example in
@@ -1413,7 +1431,8 @@ Removes an engine Iris installed (`400` if Iris did not install it).
 #### Automatic updates
 
 With `engines.auto_update` (default `true`), the scheduler updates the
-engines Iris installed once a day, when no turn is running. Claude Code
+engines Iris installed once a day, when no turn is running (and the browser
+only while it is closed). Claude Code
 updates swap a new verified binary in atomically, so running turns are not
 interrupted.
 
@@ -1425,6 +1444,87 @@ with install actions. Installing one is followed by its sign-in card; the
 setup card becomes `done` once any engine is signed in.
 
 ---
+
+### 3.18 Iris's computer (browser)
+
+Owner only. Iris's own headless Chromium, which the agent drives through
+the [browser tools](#the-browser-tools) and the owner can watch and take
+over from the app. One browser serves the owner's personal conversations
+and jobs; its profile (cookies, so sign-ins) lives in `<data dir>/browser`.
+It starts on first use and closes after `browser.idle_mins` (default 10)
+without use. Chrome's own password manager and form autofill are turned off
+in that profile.
+
+Where the browser comes from: `browser.command` in the config; else the copy
+installed from the app (`POST /api/browser/install`, into the engines
+directory); else `chromium`, `chromium-browser`, `google-chrome-stable`,
+`google-chrome`, or `chrome` on `PATH` (snap wrappers are skipped); else
+Playwright's browser cache (`$PLAYWRIGHT_BROWSERS_PATH` or
+`~/.cache/ms-playwright`).
+
+#### `GET /api/browser`
+
+```json
+{"browser": {BrowserStatus}}
+```
+
+<a id="browserstatus"></a>**BrowserStatus**
+
+| Field | Type | Notes |
+|---|---|---|
+| `enabled` | bool | `browser.enabled` in the config. |
+| `available` | bool | A browser executable was found. |
+| `running` | bool | The browser is open. |
+| `paused` | bool | "Pause Iris" is on. |
+| `url`, `title` | string | Current page (empty while closed). |
+| `controller` | string | `agent`, or `user` while the owner has taken over. |
+| `controller_device_id` | string or null | The device in control. |
+| `busy` | bool | The agent is carrying out a browser action right now. |
+| `active` | array | `[{"conversation_id", "message_id"}]`: turns that have used the browser and are still running (show the chat peek for these). |
+| `watchers` | int | App sockets watching the live view. |
+| `sandbox` | bool or null | Chrome's sandbox is on (null while closed). It is turned off only when this system cannot start it (for example Ubuntu's AppArmor restriction on unprivileged user namespaces). |
+| `version` | string or null | Browser version while open. |
+| `error` | string or null | Why the last start failed (for example missing system libraries, with the command that fixes it). |
+| `managed`, `managed_version` | bool, string or null | Installed from the app. |
+| `requires` | string or null | `"nodejs"` when installing from the app needs Node.js first. |
+| `install` | object or null | The last install/update, as `operation` in [`GET /api/engines`](#get-apiengines). |
+
+#### `POST /api/browser/start`, `POST /api/browser/stop`
+
+Open (`503 browser_unavailable` with the reason if it cannot start) or close
+the browser. Closing is graceful, so cookies are saved. Both return
+`{"browser": {BrowserStatus}}`.
+
+#### `POST /api/browser/takeover` (Owner)
+
+The calling device takes control (the browser opens if needed). While the
+owner is in control the agent's browser tools wait (up to about 50 seconds
+per call, then tell the agent the user is still using it), and the device
+sends input over the WebSocket (`browser.input`). Control returns to the
+agent on `POST /api/browser/handback`, when the browser closes, or after 5
+minutes without input. Returns `{"browser": {BrowserStatus}}`.
+
+#### `POST /api/browser/handback` (Owner)
+
+Give control back to the agent.
+
+#### `POST /api/browser/navigate` (Owner)
+
+`{"url": "https://..."}`: open a page while this device has control (for
+example a site's sign-in page). Only `http` and `https`; a bare domain gets
+`https://`. `400` unless this device has control.
+
+#### `POST /api/browser/install` (Owner)
+
+Install (or update) Chromium for Iris, like
+[`POST /api/engines/browser/install`](#post-apienginesnameinstall-post-apienginesnameupdate):
+the official `playwright-core` npm package, then its `install chromium` into
+`<engines dir>/browser/browsers`, linked as `<engines dir>/bin/browser`.
+Needs Node.js. Returns `{"started": bool, "browser": {BrowserStatus}}`;
+progress arrives as `browser.state`. If Chromium then fails to start for
+missing system libraries, `error` says so; the fix needs root once on the
+server (`npx playwright install-deps chromium`, or your distribution's
+Chromium package).
 
 ## 4. WebSocket: `GET /api/ws`
 
@@ -1484,6 +1584,9 @@ was emitted). Events are delivered only to the users listed under
 | `models.changed` | `{"slots": [{Slot}]}` | All users |
 | `harness.login` | `{"login": {LoginStatus}}` | The owner |
 | `engines.changed` | `{"engines": [...]}` (as in `GET /api/engines`) | All users |
+| `browser.state` | `{"browser": {BrowserStatus}}` (may omit the setup fields `managed`, `managed_version`, `requires`, `install`; merge into what you have) | The owner |
+| `browser.active` | `{"conversation_id", "message_id"}` | Conversation members |
+| `browser.done` | `{"conversation_id", "message_id"}` | Conversation members |
 
 Example:
 
@@ -1522,6 +1625,13 @@ Event details:
   `POST /api/ideas/{id}/start`, and to the added user by
   `POST /api/conversations/{id}/members`. Removing a member sends no event.
 
+- **`browser.active`** / **`browser.done`**: the turn answering
+  `message_id` used Iris's browser for the first time / ended. Show the
+  browser peek under that streaming message in between.
+- **`browser.state`**: Iris's browser opened or closed, changed page or
+  title, changed hands (take over / hand back), started or finished an
+  action, or its setup state changed.
+
 Scheduled jobs run in hidden `job` conversations, and their turns emit no
 `turn.status`, `message.*`, or card events at all. A job only becomes
 visible through its results: `message.created` for a heartbeat post in the
@@ -1533,8 +1643,42 @@ Main chat, and `entities.changed` for data it changed.
 |---|---|
 | `{"type": "auth", "token": "..."}` | Only meaningful as the first frame. |
 | `{"type": "ping"}` | Server replies `{"type": "pong"}`. |
+| `{"type": "browser.watch", "mode": "peek" \| "full" \| "off"}` | Owner only. Start (or change, or stop) the live view of Iris's browser on this socket. |
+| `{"type": "browser.input", "kind": ...}` | Owner only, while this device has [taken over](#post-apibrowsertakeover-owner). See below. |
 
-Any other client frame is ignored.
+Any other client frame is ignored. Non-owners get `{"type": "error", "code":
+"forbidden", ...}` for the two browser frames (the socket stays open).
+
+**Live view.** While watching, the socket receives connection-level frames
+(no `at`):
+
+```json
+{"type": "browser.frame", "seq": 41, "mode": "full", "width": 500, "height": 857, "data": "<base64 JPEG>"}
+```
+
+`width` and `height` are the page viewport in CSS pixels; the JPEG itself
+is up to 1000 px wide (`full`) or 360 px (`peek`). Frames are sent only when
+the page changes, and at most about 6 per second for `full` and 1 per
+second for `peek`; throttling never drops the newest frame, so a still page
+always ends up on screen. A new watcher gets the current picture at once.
+The browser streams only while some app is watching. Stop watching (`"off"`)
+when the view is hidden or the app goes to the background.
+
+**Input while in control.** Coordinates are fractions (0 to 1) of the frame
+image:
+
+| `kind` | Fields | Effect |
+|---|---|---|
+| `tap` | `x`, `y` | A left click at that point. |
+| `scroll` | `x`, `y` (optional), `dx`, `dy` | Mouse wheel; deltas in CSS pixels (max 4,000). |
+| `text` | `text` (max 2,000 characters) | Typed into the focused element. |
+| `key` | `key` | `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, arrows, `Home`, `End`, `PageUp`, `PageDown`, `Space`, or one character. |
+| `back` | none | History back. |
+| `navigate` | `url` | Open an http(s) page (as `POST /api/browser/navigate`). |
+
+Input from a device that does not have control, or a failed input, gets
+`{"type": "browser.input_error", "message": "..."}`. Typed text is never
+logged.
 
 ### Keepalive and revocation
 
@@ -1658,6 +1802,7 @@ A Main chat message posted by the heartbeat job has
 | `timeout` | No result within `turn_timeout_secs` (default 600) | `no result after 600s` | "That took too long, so I stopped. Want me to try again?" |
 | `harness_error` | The CLI reported an error, or exited without a result | The CLI's error text | "Something went wrong on my end. Want me to try again?" |
 | `internal` | Iris could not build the CLI command | `could not build command: ...` | "Something went wrong on my end. Want me to try again?" |
+| `paused` | The owner turned on "Pause Iris" (the engine is not run; no "stuck" push) | `the owner paused Iris` | "I'm paused right now, so I'm not doing anything. You can turn me back on in my computer settings whenever you want me again." |
 
 The friendly text is written to be shown as the agent's own reply; clients do
 not need special error UI, though they may style `status: "error"`
@@ -1815,7 +1960,7 @@ changes are re-sent as `message.updated`.
 | `engine_signin` | `harness`, `flow` (`code_paste`, `device_code`, `manual`), `state` (`needs_reconnect`, `starting`, `waiting_for_code`, `waiting_for_approval`, `verifying`, `connected`, `failed`, `cancelled`), `url`, `user_code`, `error`, `instructions` (manual flow), `login_id` | Start with `POST /api/harnesses/{harness}/login`. For `waiting_for_code`, show `url` and a code field (`/login/code`); for `waiting_for_approval`, show `url` and `user_code`; for `manual`, show `instructions` and a "Check again" button (the same `POST`). |
 | `engine_setup` | `state` (`needs_setup`, `done`), `options: [{"harness", "label", "installed", "requires", "action": {"method", "path"}}]` | Each option installs that engine (`POST /api/engines/{name}/install`). |
 | `connector_reconnect` | `connector_id`, `service`, `state` (`needs_reconnect`, `connected`) | Open the connector's settings so the owner can update its credentials (`PATCH /api/connectors/{id}`); the card turns `connected` when they do. |
-| `approval` | `service`, `preview: {"to", "subject", "body"}`, `action_label` (e.g. "Send"), `approver_user_id`, `owner_only: false`, `state` (`pending`, `approved`, `denied`), `decided_at` | Show the preview exactly as given with Deny / `action_label`; decide with [`POST /api/messages/{id}/decision`](#post-apimessagesiddecision). The preview is built by Iris from the real action, never from agent text. |
+| `approval` | `service`, `preview: {"to", "subject", "body"}`, `action_label` (e.g. "Send"), `approver_user_id`, `owner_only: false`, `state` (`pending`, `approved`, `denied`), `decided_at`; wallet approvals (`service: "wallet"`) add `wallet: {"credential_id", "origin", "used_at"}` | Show the preview exactly as given with Deny / `action_label`; decide with [`POST /api/messages/{id}/decision`](#post-apimessagesiddecision). The preview is built by Iris from the real action, never from agent text. For `wallet`, `preview.to` is the site and `preview.subject` the page title (the app labels them Site and Page); one approval fills the card once (`used_at` is set when it does) and expires after 30 minutes. |
 
 ### Attachment
 
@@ -1918,7 +2063,7 @@ Metadata only; the encrypted secret is never returned.
 | `label` | string | |
 | `metadata` | object | login: `{"site", "username"}`; card: `{"brand", "last4", "exp_month", "exp_year", "cardholder"}` (values may be `null`). |
 | `created_at`, `updated_at` | int | |
-| `last_used_at` | int or null | Always null for now. |
+| `last_used_at` | int or null | When Iris last filled it into a page. |
 
 ### PushSubscription
 
@@ -2032,6 +2177,7 @@ Stored as `meta.routing` (plus `notes`).
 | `avatar_custom` | bool | A custom avatar is set. |
 | `allow_claude_for_shared` | bool | Effective opt-in (config or app setting) for Claude in shared conversations. |
 | `feed_prompt` | string | Effective feed prompt (default if unset). |
+| `paused` | bool | "Pause Iris" is on (see [`PUT /api/settings`](#put-apisettings-owner)). |
 | `voice` | object | Always `{"enabled": false, "status": "not_implemented"}`. |
 
 ---
@@ -2275,6 +2421,63 @@ All tools are available in normal mode; only `create_card` in shared mode.
 message (`role: "assistant"`) into the current conversation. Clients receive
 it as `message.created` right after the turn's `message.completed`.
 
+### The browser tools
+
+In the owner's personal (not shared) conversations and jobs, when a browser
+is available and Iris is not paused, each turn also gets a second MCP server
+named **`browser`** (reserved for connectors too; tool prefix
+`mcp__browser__`, activity names `browser/<tool>`):
+
+```
+<path to iris binary> mcp --browser --data-dir <DATA_DIR>
+```
+
+with `IRIS_BROWSER_TOKEN` in its environment. That process only forwards
+each `tools/call` over a private Unix socket (`<data dir>/run/browser.sock`,
+or a private directory under `$XDG_RUNTIME_DIR` when that path is too long)
+to the server, which owns the browser; the token identifies the turn and
+stops working when the turn ends. Iris carries out each call over the
+DevTools protocol (through a pipe, so no DevTools port is opened); the CLI
+does all the deciding.
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `navigate` | `url` (http(s); a bare domain gets `https://`) | Snapshot of the page |
+| `snapshot` | none | Snapshot: `Page:` title, `URL:`, then one line per heading, text block, image with alt text, and interactive element (`- button "Sign in" [ref=e3]`, with `value=`, `[checked]`, `[disabled]`, `[expanded]`, link targets, select options). Up to 12,000 characters. |
+| `click` | `ref` | Clicks the element's center with real mouse events, waits for a navigation it starts, returns the new snapshot |
+| `type` | `ref`, `text` (max 5,000), `submit?` | Replaces the field's content; with `submit`, presses Enter and returns the new snapshot |
+| `select_option` | `ref`, `value` (option text or value) | `Selected "..."` |
+| `press_key` | `key` | Snapshot |
+| `scroll` | `direction` (`up`/`down`), `pages?` (0.1 to 10) | `Scrolled ...` |
+| `back` | none | Snapshot |
+| `screenshot` | none | Text plus an `image` content block (JPEG of the visible page, 500 px wide) |
+| `wait` | `text?`, `seconds?` (max 30) | Snapshot once the text appears, or after the time |
+| `tabs` | `action` (`list`, `new`, `select`, `close`), `index?`, `url?` | Tab list or snapshot. Tabs a page opens become the current tab. |
+| `fill_login` | `site?` | `filled`, or `not found (<reason>)` |
+| `fill_card` | `card?` (name or last 4 digits) | `filled`, `denied (...)`, `waiting for approval (...)`, or `not found (...)` |
+
+Refs are valid until the page changes; a stale ref gets an error asking for
+a new snapshot. Values of password fields and of fields Iris filled from the
+vault are shown as `••••` in snapshots and masked on screen. JavaScript
+dialogs are answered (alerts and confirms accepted, prompts dismissed) and
+reported at the top of the next result.
+
+`fill_login` takes the saved login whose `site` matches the current page's
+host (a subdomain matches too; the most recently used wins), finds the
+sign-in fields (also in same-origin frames), and types the username and
+password itself. It answers `not found` when the page is not that site, not
+HTTPS (plain HTTP only on this machine), has no sign-in field, or nothing is
+saved for it.
+
+`fill_card` picks the card (the only one, or the one named), checks the
+page has a card number field, and posts an [approval card](#server-cards)
+in the conversation (with a push to the owner if no app is open), built
+from the real page and card. It waits up to 45 seconds for the decision;
+after that it answers `waiting for approval`, and calling it again on the
+same site later picks up the decision. After approval, Iris types the card
+number, expiry, CVC, and name itself; each approval fills once. Cards are
+never used in jobs (nobody could approve).
+
 ### `save_to_library` details
 
 - **`content`** (text, up to 1,000,000 characters): `mime` defaults to
@@ -2375,21 +2578,17 @@ Requests use `TTL: 86400` and `Urgency: normal`.
   and `settings.voice` is `{"enabled": false, "status": "not_implemented"}`.
   The planned shape is `POST /api/voice/speak {"message_id"}` returning
   `audio/mpeg` from a local TTS engine.
-- **Approvals**: the `approval` card, its decision route, and the app's
-  card are in place, but nothing creates approval cards yet. The plan is to
-  route risky tool calls (sending email or messages, purchases, new
-  recipients) through the CLI's own permission hook (for Claude Code,
-  `--permission-prompt-tool` served by `iris mcp`), post the card from the
-  real tool input, and wait for the decision.
-- **Live view of Iris's computer**: there is no browser stream yet, so the
-  app's "Iris's computer" screen shows recent activity and an honest empty
-  state instead of Watch / Take over.
+- **Approvals**: the `approval` card and its decision route are used for
+  every wallet card fill (`fill_card`). Routing other risky tool calls
+  (sending email or messages, purchases through connectors, new recipients)
+  through the card is planned via the CLI's own permission hook (for Claude
+  Code, `--permission-prompt-tool` served by `iris mcp`).
 - **Connector sign-in (OAuth)**: connectors are configured as MCP servers
   with secrets; "Connect" in the app asks the agent to walk the user
   through it or opens the custom connector form.
-- **Credential injection**: credentials can be stored and managed, but
-  nothing gives them to the agent yet. `GET /api/credentials` returns
-  `"injection": "not_implemented"` and `last_used_at` is always `null`.
+- **Browser limits**: logins and cards in cross-origin frames (for example
+  embedded payment widgets from another domain) cannot be filled; the agent
+  is told `not found` and can ask the owner to take over.
 
 ---
 
@@ -2407,6 +2606,12 @@ The app only uses the routes and events in this document. It stores its
 device token in `localStorage` and fetches binary routes with the
 `Authorization` header (object URLs). End users never see model names,
 efforts, or tokens outside Settings, AI engine.
+
+Iris's computer (`#/iris/computer`, owner only) shows the live browser,
+Watch (full screen) and Take over (taps, drags as scrolling, an address bar,
+and a keyboard button whose hidden field forwards typing), plus Pause Iris.
+While a turn uses the browser, a small live thumbnail (the browser peek)
+sits under that message in chat; it disappears when the turn ends.
 
 For development, `IRIS_WEB_DIR=web iris serve` serves the app files from
 disk so changes need no rebuild. `iris demo-seed --assets

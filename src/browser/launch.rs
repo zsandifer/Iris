@@ -179,6 +179,9 @@ pub async fn launch(opts: &LaunchOptions<'_>) -> Result<Launched> {
     /// Learned once per run: this system cannot start Chrome's sandbox.
     static NO_SANDBOX: AtomicBool = AtomicBool::new(false);
     release_stale_profile_lock(opts.profile_dir);
+    if let Err(e) = set_profile_prefs(opts.profile_dir) {
+        crate::warn!("browser: could not set profile preferences: {e}");
+    }
     let known = NO_SANDBOX.load(Ordering::Relaxed);
     match spawn(opts, known).await {
         Ok(l) => Ok(l),
@@ -318,6 +321,37 @@ async fn spawn(
     }
 }
 
+/// Turn off Chrome's own password manager and form autofill in Iris's
+/// profile: saved logins and cards live in Iris's vault, and nothing typed
+/// into a page (also while the owner has taken over) should be stored by
+/// the browser.
+pub fn set_profile_prefs(profile: &Path) -> Result<()> {
+    let file = profile.join("Default").join("Preferences");
+    let mut prefs: serde_json::Value = std::fs::read(&file)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let set = |v: &mut serde_json::Value, path: &[&str], val: bool| {
+        let mut cur = v;
+        for k in &path[..path.len() - 1] {
+            if !cur[*k].is_object() {
+                cur[*k] = serde_json::json!({});
+            }
+            cur = &mut cur[*k];
+        }
+        cur[path[path.len() - 1]] = val.into();
+    };
+    set(&mut prefs, &["credentials_enable_service"], false);
+    set(&mut prefs, &["credentials_enable_autosignin"], false);
+    set(&mut prefs, &["profile", "password_manager_enabled"], false);
+    set(&mut prefs, &["autofill", "profile_enabled"], false);
+    set(&mut prefs, &["autofill", "credit_card_enabled"], false);
+    crate::config::ensure_private_dir(&profile.join("Default"))?;
+    crate::config::write_private_file(&file, prefs.to_string().as_bytes())?;
+    Ok(())
+}
+
 /// Chrome refuses to share a profile: if a previous Iris run left a browser
 /// behind (crash), stop it so this run can use the profile.
 fn release_stale_profile_lock(profile: &Path) {
@@ -387,6 +421,25 @@ mod tests {
                 .ends_with("chrome-headless-shell")
         );
         assert!(newest_in_playwright_cache(&d.join("missing")).is_none());
+    }
+
+    #[test]
+    fn profile_prefs_turn_off_chromes_password_manager() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        std::fs::create_dir_all(p.join("Default")).unwrap();
+        std::fs::write(
+            p.join("Default/Preferences"),
+            r#"{"profile": {"name": "x", "password_manager_enabled": true}, "autofill": 3}"#,
+        )
+        .unwrap();
+        set_profile_prefs(p).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(p.join("Default/Preferences")).unwrap()).unwrap();
+        assert_eq!(v["profile"]["name"], "x");
+        assert_eq!(v["profile"]["password_manager_enabled"], false);
+        assert_eq!(v["credentials_enable_service"], false);
+        assert_eq!(v["autofill"]["credit_card_enabled"], false);
     }
 
     #[test]
