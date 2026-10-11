@@ -51,7 +51,11 @@ pub struct Item {
 
 impl Item {
     fn push_image(&mut self, base: &str, src: &str) {
-        if let Some(u) = resolve(base, src).map(|u| https_image(&u))
+        // A few photos are plenty; stop before any per-image work.
+        if self.images.len() >= MAX_ITEM_IMAGES {
+            return;
+        }
+        if let Some(u) = resolve(base, src)
             && !self.images.contains(&u)
             && !looks_like_icon(&u)
         {
@@ -60,14 +64,8 @@ impl Item {
     }
 }
 
-/// Photos are shown in an https app: ask for the https copy (sites that
-/// still link http images almost always serve them over https too).
-pub fn https_image(url: &str) -> String {
-    match url.get(..7) {
-        Some(p) if p.eq_ignore_ascii_case("http://") => format!("https://{}", &url[7..]),
-        _ => url.to_string(),
-    }
-}
+/// Photos kept per candidate.
+pub const MAX_ITEM_IMAGES: usize = 8;
 
 /// URLs that are almost never a real photo (logos, tracking pixels, icons).
 pub fn looks_like_icon(url: &str) -> bool {
@@ -334,15 +332,37 @@ fn atom_link(node: &Node) -> Option<String> {
         })
 }
 
+/// An Atom text construct's plain text and, for `type="html"`, its markup
+/// (to find images in). `type="text"` (the default) is literal text and is
+/// never parsed as markup; XHTML arrives as elements. RSS fields are HTML.
+fn construct(n: &Node, atom: bool) -> (String, String) {
+    if n.has_elements() {
+        return (collapse_ws(&n.all_text()), String::new());
+    }
+    let ty = n.attr("type").unwrap_or("").to_ascii_lowercase();
+    let plain_text = atom && (ty.is_empty() || ty == "text" || ty == "text/plain");
+    if plain_text {
+        (collapse_ws(&n.text), String::new())
+    } else {
+        (collapse_ws(&strip_tags(&n.text)), n.text.clone())
+    }
+}
+
 fn feed_item(node: &Node, base: &str, atom: bool) -> Option<Item> {
     let mut item = Item {
         source_kind: "rss".into(),
         popularity: 0.3,
         ..Default::default()
     };
+    // xml:base on the entry scopes its links.
+    let entry_base = node
+        .attr("xml:base")
+        .and_then(|b| resolve(base, b))
+        .unwrap_or_else(|| base.to_string());
+    let base = entry_base.as_str();
     item.title = node
-        .child_text("title")
-        .map(|t| clean_title(&t))
+        .child("title")
+        .map(|t| crate::util::truncate_chars(&construct(t, atom).0, 300))
         .unwrap_or_default();
     let link = atom_link(node).or_else(|| {
         node.child("guid")
@@ -352,6 +372,7 @@ fn feed_item(node: &Node, base: &str, atom: bool) -> Option<Item> {
     })?;
     item.url = resolve(base, &link)?;
     let mut html = String::new();
+    let mut first: Option<String> = None;
     for name in [
         "content:encoded",
         "content",
@@ -364,15 +385,16 @@ fn feed_item(node: &Node, base: &str, atom: bool) -> Option<Item> {
                 .then(|| node.child("media:group").and_then(|g| g.child(name)))
                 .flatten()
         }) {
-            let h = html_of(n);
-            if !h.trim().is_empty() {
-                if html.is_empty() {
+            let (text, h) = construct(n, atom);
+            if !text.is_empty() {
+                if first.is_none() {
+                    first = Some(text);
                     html = h;
                 } else if item.description.is_empty() {
                     // Prefer the shorter summary for the description.
-                    let short = collapse_ws(&strip_tags(&h));
-                    if !short.is_empty() {
-                        item.description = short;
+                    item.description = text;
+                    if html.is_empty() {
+                        html = h;
                     }
                 }
                 collect_imgs(n, base, &mut item);
@@ -380,7 +402,7 @@ fn feed_item(node: &Node, base: &str, atom: bool) -> Option<Item> {
         }
     }
     if item.description.is_empty() {
-        item.description = collapse_ws(&strip_tags(&html));
+        item.description = first.unwrap_or_default();
     }
     item.description = crate::util::truncate_chars(&item.description, 1500);
     media_images(node, base, &mut item);
@@ -415,23 +437,52 @@ fn feed_item(node: &Node, base: &str, atom: bool) -> Option<Item> {
                 .push(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"));
         }
     }
-    let _ = atom;
     item.needs_page = item.images.is_empty() || item.description.chars().count() < 80;
     Some(item)
 }
 
 /// Parse an RSS or Atom document. `None` when it is not a feed.
+const ATOM_NS: &str = "http://www.w3.org/2005/Atom";
+
+/// `<atom:feed xmlns:atom="...">`: drop the prefix so Atom elements match
+/// by local name whatever prefix the document picked.
+fn unprefix_atom(root: &mut Node) {
+    fn strip(n: &mut Node, prefix: &str) {
+        if let Some(local) = n.name.strip_prefix(prefix) {
+            n.name = local.to_string();
+        }
+        for c in &mut n.children {
+            strip(c, prefix);
+        }
+    }
+    let prefix = root.children.iter().find_map(|c| {
+        let (p, local) = c.name.split_once(':')?;
+        (local == "feed" && c.attr(&format!("xmlns:{p}")) == Some(ATOM_NS)).then(|| format!("{p}:"))
+    });
+    if let Some(p) = prefix {
+        strip(root, &p);
+    }
+}
+
 pub fn parse_feed(xml: &str, feed_url: &str) -> Option<FeedDoc> {
-    let root = markup::parse_xml(xml);
+    let mut root = markup::parse_xml(xml);
+    unprefix_atom(&mut root);
     let mut doc = FeedDoc::default();
     if let Some(feed) = root.child("feed") {
-        doc.title = feed.child_text("title").map(|t| clean_title(&t));
+        doc.title = feed
+            .child("title")
+            .map(|t| crate::util::truncate_chars(&construct(t, true).0, 300));
         doc.site_url = atom_link(feed).and_then(|l| resolve(feed_url, &l));
         doc.icon = feed
             .child_text("icon")
             .or_else(|| feed.child_text("logo"))
             .and_then(|i| resolve(feed_url, &i));
-        let base = doc.site_url.clone().unwrap_or_else(|| feed_url.to_string());
+        // Atom references resolve against the document's own URL and any
+        // xml:base, not the site's homepage.
+        let base = feed
+            .attr("xml:base")
+            .and_then(|b| resolve(feed_url, b))
+            .unwrap_or_else(|| feed_url.to_string());
         doc.items = feed
             .children_named("entry")
             .take(MAX_ENTRIES)
@@ -965,6 +1016,36 @@ mod tests {
         );
         assert!(v.description.starts_with("We look at how boosters"));
         assert!(!v.needs_page);
+    }
+
+    #[test]
+    fn atom_text_constructs_base_and_prefixes() {
+        let xml = r#"<a:feed xmlns:a="http://www.w3.org/2005/Atom" xml:base="https://site.example/articles/">
+<a:title>Blog</a:title><a:link rel="alternate" href="https://site.example/"/>
+<a:entry><a:title type="text">How to escape &lt;script&gt; safely</a:title><a:link href="post"/>
+<a:summary type="html">&lt;p&gt;A &lt;b&gt;bold&lt;/b&gt; move&lt;/p&gt;</a:summary>
+<a:content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">A <b>bright</b> comet tonight, as seen from the hills above town, with a long tail.</div></a:content>
+<a:updated>2026-10-10T14:36:15Z</a:updated></a:entry></a:feed>"#;
+        let doc = parse_feed(xml, "https://site.example/feed.atom").unwrap();
+        let e = &doc.items[0];
+        assert_eq!(e.title, "How to escape <script> safely");
+        assert_eq!(e.url, "https://site.example/articles/post");
+        assert_eq!(e.description, "A bold move");
+        assert_eq!(doc.title.as_deref(), Some("Blog"));
+    }
+
+    #[test]
+    fn image_list_is_capped() {
+        let thumbs: String = (0..5000)
+            .map(|i| format!(r#"<media:thumbnail url="https://cdn.example/{i}.jpg"/>"#))
+            .collect();
+        let xml = format!(
+            r#"<rss><channel><item><title>Many pictures here</title><link>https://x.example/a</link>{thumbs}</item></channel></rss>"#
+        );
+        let t0 = std::time::Instant::now();
+        let doc = parse_feed(&xml, "https://x.example/feed").unwrap();
+        assert_eq!(doc.items[0].images.len(), MAX_ITEM_IMAGES);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

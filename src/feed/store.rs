@@ -191,14 +191,15 @@ fn source_from_row(r: &rusqlite::Row) -> rusqlite::Result<Source> {
 
 pub fn list_sources(conn: &Connection, user_id: &str) -> rusqlite::Result<Vec<Source>> {
     let mut stmt = conn.prepare(
-        "SELECT * FROM feed_sources WHERE user_id = ?1 ORDER BY origin = 'user' DESC, created_at",
+        "SELECT * FROM feed_sources WHERE user_id = ?1 AND removed = 0
+         ORDER BY origin = 'user' DESC, created_at",
     )?;
     stmt.query_map([user_id], source_from_row)?.collect()
 }
 
 pub fn get_source(conn: &Connection, user_id: &str, id: &str) -> rusqlite::Result<Option<Source>> {
     conn.query_row(
-        "SELECT * FROM feed_sources WHERE id = ?1 AND user_id = ?2",
+        "SELECT * FROM feed_sources WHERE id = ?1 AND user_id = ?2 AND removed = 0",
         params![id, user_id],
         source_from_row,
     )
@@ -244,11 +245,44 @@ pub fn set_source_enabled(
     )? > 0)
 }
 
+/// Remove a source. The user's own are deleted; suggested and imported
+/// ones are hidden instead, so the next suggestion or import does not add
+/// them back.
 pub fn delete_source(conn: &Connection, user_id: &str, id: &str) -> rusqlite::Result<bool> {
-    Ok(conn.execute(
-        "DELETE FROM feed_sources WHERE id = ?1 AND user_id = ?2",
+    let n = conn.execute(
+        "DELETE FROM feed_sources WHERE id = ?1 AND user_id = ?2 AND origin = 'user'",
         params![id, user_id],
+    )?;
+    if n > 0 {
+        return Ok(true);
+    }
+    Ok(conn.execute(
+        "UPDATE feed_sources SET removed = 1, enabled = 0, updated_at = ?3
+         WHERE id = ?1 AND user_id = ?2 AND removed = 0",
+        params![id, user_id, now_ms()],
     )? > 0)
+}
+
+/// Add a source the user typed: new, or an existing (even removed) one
+/// made theirs and turned on.
+pub fn add_user_source(
+    conn: &Connection,
+    user_id: &str,
+    kind: &str,
+    value: &str,
+    topic: Option<&str>,
+) -> rusqlite::Result<Option<Source>> {
+    if add_source(conn, user_id, kind, value, None, topic, "user")?.is_none() {
+        conn.execute(
+            "UPDATE feed_sources SET origin = 'user', enabled = 1, removed = 0, fail_count = 0,
+                    updated_at = ?4
+             WHERE user_id = ?1 AND kind = ?2 AND value = ?3",
+            params![user_id, kind, value, now_ms()],
+        )?;
+    }
+    Ok(list_sources(conn, user_id)?
+        .into_iter()
+        .find(|s| s.kind == kind && s.value == value))
 }
 
 /// Record a fetch. Suggested and Google sources that keep failing are
@@ -285,7 +319,7 @@ pub fn record_fetch(
 pub fn trim_suggested(conn: &Connection, user_id: &str, max: usize) -> rusqlite::Result<usize> {
     conn.execute(
         "DELETE FROM feed_sources WHERE id IN (
-             SELECT id FROM feed_sources WHERE user_id = ?1 AND origin = 'suggested'
+             SELECT id FROM feed_sources WHERE user_id = ?1 AND origin = 'suggested' AND removed = 0
              ORDER BY enabled DESC, created_at DESC LIMIT -1 OFFSET ?2)",
         params![user_id, max as i64],
     )
@@ -588,6 +622,17 @@ pub fn due_watches(conn: &Connection, user_id: &str, limit: usize) -> rusqlite::
     .collect()
 }
 
+/// The watch still exists and a liked post still links to its product.
+pub fn watch_active(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM feed_watches w WHERE w.id = ?1 AND EXISTS (
+             SELECT 1 FROM feed_posts p WHERE p.user_id = w.user_id
+             AND p.source_url = w.url AND p.liked = 1))",
+        [id],
+        |r| r.get(0),
+    )
+}
+
 /// Record a check; `price` replaces the reference price when given.
 pub fn checked_watch(conn: &Connection, id: &str, price: Option<f64>) -> rusqlite::Result<()> {
     conn.execute(
@@ -651,6 +696,21 @@ mod tests {
                 .filter(|s| s.origin == "suggested")
                 .count();
             assert_eq!(n, 2);
+
+            // Removing an imported source sticks; adding it by hand revives it.
+            let ch = "UCabcdefghijklmnopqrstuv";
+            let g = add_source(c, u, "youtube", ch, None, None, "google")?.unwrap();
+            assert!(delete_source(c, u, &g.id)?);
+            assert!(add_source(c, u, "youtube", ch, None, None, "google")?.is_none());
+            assert!(!list_sources(c, u)?.iter().any(|s| s.id == g.id));
+            let back = add_user_source(c, u, "youtube", ch, None)?.unwrap();
+            assert_eq!(back.id, g.id);
+            assert_eq!((back.origin.as_str(), back.enabled), ("user", true));
+            assert!(delete_source(c, u, &g.id)?);
+            assert!(
+                get_source(c, u, &g.id)?.is_none(),
+                "the user's own are deleted"
+            );
 
             add_seen(c, u, &["u:a".into(), "t:b".into()])?;
             assert!(seen_keys(c, u)?.contains("t:b"));

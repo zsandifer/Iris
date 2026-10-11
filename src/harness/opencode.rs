@@ -88,7 +88,9 @@ impl Harness for OpenCode {
             effort: true,
             mcp: true,
             resume: true,
-            tool_less: true,
+            // Agent-level permissions in the user's own config can override
+            // the deny-all rules Iris passes, so helper calls skip OpenCode.
+            tool_less: false,
         }
     }
 

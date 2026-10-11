@@ -234,35 +234,8 @@ async fn pause(state: &AppState, user_id: &str) -> Result<()> {
     let msgs = state
         .db
         .call(move |c| {
-            store::update_state(c, &uid, |s| {
-                s.paused = true;
-                s.paused_by_user = false;
-                s.paused_at = Some(now_ms());
-            })?;
-            let main = db::ensure_main_conversation(c, &uid)?;
-            let text = "I paused your For you feed. It hasn't been opened in two weeks, so I \
-                        stopped looking for posts instead of piling them up. Tap Resume whenever \
-                        you want them again.";
-            let m1 = db::insert_message(
-                c,
-                &NewMessage {
-                    conversation_id: &main,
-                    role: "assistant",
-                    content: text,
-                    meta: Some(&json!({"initiated_by": "feed"})),
-                    ..Default::default()
-                },
-            )?;
-            let card = json!({
-                "type": "action",
-                "title": "Resume my feed",
-                "body": "I'll start finding posts again right away.",
-                "action_label": "Resume",
-                "action": {"method": "POST", "path": "/api/feed/resume"},
-                "owner_only": false,
-            });
-            let m2 = entities::insert_card(c, &main, &card, "assistant")?;
-            Ok(vec![m1, m2])
+            // State, message, and card together: never paused in silence.
+            crate::db::write_tx(c, |c| pause_locked(c, &uid))
         })
         .await?;
     for m in msgs {
@@ -273,6 +246,38 @@ async fn pause(state: &AppState, user_id: &str) -> Result<()> {
     }
     crate::info!("feed paused after {PAUSE_AFTER_DAYS} days unused");
     Ok(())
+}
+
+fn pause_locked(c: &rusqlite::Connection, uid: &str) -> rusqlite::Result<Vec<db::Message>> {
+    store::update_state(c, uid, |s| {
+        s.paused = true;
+        s.paused_by_user = false;
+        s.paused_at = Some(now_ms());
+    })?;
+    let main = db::ensure_main_conversation(c, uid)?;
+    let text = "I paused your For you feed. It hasn't been opened in two weeks, so I \
+                        stopped looking for posts instead of piling them up. Tap Resume whenever \
+                        you want them again.";
+    let m1 = db::insert_message(
+        c,
+        &NewMessage {
+            conversation_id: &main,
+            role: "assistant",
+            content: text,
+            meta: Some(&json!({"initiated_by": "feed"})),
+            ..Default::default()
+        },
+    )?;
+    let card = json!({
+        "type": "action",
+        "title": "Resume my feed",
+        "body": "I'll start finding posts again right away.",
+        "action_label": "Resume",
+        "action": {"method": "POST", "path": "/api/feed/resume"},
+        "owner_only": false,
+    });
+    let m2 = entities::insert_card(c, &main, &card, "assistant")?;
+    Ok(vec![m1, m2])
 }
 
 // --------------------------------------------------------------- the run
@@ -502,46 +507,12 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
         .collect();
     // At most one summary call a day: later runs use the descriptions.
     if !need.is_empty() && summaries_due(&st, &today) {
-        let uid = user_id.to_string();
-        let liked: Vec<String> = state
-            .db
-            .call(move |c| store::liked_posts(c, &uid, 8))
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(t, _)| t)
-            .collect();
         let topic_names: Vec<String> = topics.iter().map(|t| t.name.clone()).collect();
-        let prompt = model::summary_prompt(&need, &topic_names, &liked);
-        match one_shot(
-            state,
-            OneShotRequest {
-                slot: Slot::Feed,
-                shared: false,
-                system_prompt: model::SUMMARY_SYSTEM,
-                prompt: &prompt,
-                timeout: Duration::from_secs(300),
-                scope: "feed-summaries",
-                // One real model call; a signed-out CLI falls through to the next.
-                max_attempts: 1,
-                take_slot: true,
-            },
-        )
-        .await
-        {
-            Ok(reply) => {
-                blurbs = model::parse_summaries(&reply.text);
-                report.model_used = true;
-                model_notes.push((reply, "summaries"));
-                mark_call(state, user_id, &today, Call::Summaries).await;
-            }
-            Err(OneShotError::NoEngine) => {
-                crate::warn!("feed: no engine for summaries; using descriptions")
-            }
-            Err(OneShotError::Failed(e)) => {
-                crate::warn!("feed: summaries failed ({e}); using descriptions");
-                mark_call(state, user_id, &today, Call::Summaries).await;
-            }
+        let (b, reply) = write_blurbs(state, user_id, &today, &need, &topic_names).await;
+        blurbs = b;
+        if let Some(reply) = reply {
+            report.model_used = true;
+            model_notes.push((reply, "summaries"));
         }
     }
 
@@ -550,12 +521,7 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
     let data_dir = state.paths.data_dir.clone();
     let to_cache: Vec<(Vec<String>, Option<String>)> = picked
         .iter()
-        .map(|(_, it)| {
-            (
-                it.images.iter().take(4).cloned().collect(),
-                it.favicon.clone(),
-            )
-        })
+        .map(|(_, it)| (it.images.clone(), it.favicon.clone()))
         .collect();
     // Original URL -> cached file.
     let cached: Vec<BTreeMap<String, String>> = tokio::task::spawn_blocking(move || {
@@ -635,23 +601,34 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
             facts,
         });
     }
-    report.published = posts.len() as u32;
-
     let uid = user_id.to_string();
     let t = today.clone();
     let rep = report.clone().with_stats(fetcher.stats());
-    state
+    let published: Vec<String> = state
         .db
         .call(move |c| {
             crate::db::write_tx(c, |c| {
+                // Recheck inside the transaction: the agent may have posted
+                // the same story (through the bridge) while this run worked.
+                let seen_now = store::seen_keys(c, &uid)?;
+                let fresh: Vec<&PipelinePost> = posts
+                    .iter()
+                    .filter(|p| {
+                        !seen_now.contains(&p.url_key)
+                            && !seen_now.contains(&rank::title_key(&p.title))
+                    })
+                    .collect();
                 // Lowest ranked first: each insert gets a later unique
                 // timestamp, so the best post is the newest.
                 let mut first: Option<entities::FeedPost> = None;
-                for p in posts.iter().rev() {
+                for p in fresh.iter().rev() {
                     let post = entities::insert_pipeline_post(c, &uid, p)?;
                     first.get_or_insert(post);
                 }
                 store::add_seen(c, &uid, &seen_new)?;
+                let n = fresh.len();
+                let mut rep = rep;
+                rep.published = n as u32;
                 store::update_state(c, &uid, |s| {
                     s.last_run = Some(rep);
                     let Some(first) = &first else {
@@ -662,18 +639,21 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
                     s.last_batch_at = Some(first.created_at);
                     s.last_batch_end_id = Some(first.id.clone());
                     s.last_batch_day = Some(t.clone());
-                    s.last_batch_count = posts.len() as u32;
+                    s.last_batch_count = n as u32;
                     if s.first_batch_at.is_none() {
                         s.first_batch_at = Some(first.created_at);
                     }
                 })?;
-                if !posts.is_empty() {
-                    store::record_published(c, &uid, &t, posts.len() as i64)?;
+                if n > 0 {
+                    store::record_published(c, &uid, &t, n as i64)?;
                 }
-                store::prune(c, &uid)
+                store::prune(c, &uid)?;
+                Ok(fresh.iter().map(|p| p.title.clone()).collect())
             })
         })
         .await?;
+    report.published = published.len() as u32;
+    urgent_candidates.retain(|(title, ..)| published.contains(title));
     state.hub.to_users(
         &[user_id.to_string()],
         json!({"type": "entities.changed", "kinds": ["feed"]}),
@@ -772,8 +752,15 @@ fn enrich(f: &Fetcher, mut it: Item) -> Item {
         return it;
     }
     let m = extract::extract(&res.text(), &res.final_url);
-    if it.images.is_empty() {
-        it.images = m.images;
+    // The page's photos back up the feed's (thumbnails may be too small to
+    // keep or fail to load).
+    for u in m.images {
+        if it.images.len() >= parse::MAX_ITEM_IMAGES {
+            break;
+        }
+        if !it.images.contains(&u) {
+            it.images.push(u);
+        }
     }
     if let Some(d) = m.description
         && d.chars().count() > it.description.chars().count()
@@ -795,8 +782,10 @@ fn enrich(f: &Fetcher, mut it: Item) -> Item {
     if let Some(icon) = m.favicon {
         it.favicon = Some(icon);
     }
-    if it.published_ms.is_none() {
-        it.published_ms = m.published_ms;
+    // The article's own date wins when older (a fresh share of an old
+    // story is still an old story).
+    if let Some(page) = m.published_ms {
+        it.published_ms = Some(it.published_ms.map_or(page, |t| t.min(page)));
     }
     it.price = it.price.or(m.price);
     it.event = it.event.or(m.event);
@@ -862,6 +851,13 @@ async fn refresh_interests(
             .collect(),
     };
     let prompt = model::interests_prompt(&input);
+    if !reserve_call(state, user_id, today, Call::Interests).await {
+        let keep = st
+            .interests
+            .clone()
+            .unwrap_or_else(|| fallback_interests(&liked));
+        return Ok((keep, None));
+    }
     let reply = one_shot(
         state,
         OneShotRequest {
@@ -877,9 +873,9 @@ async fn refresh_interests(
         },
     )
     .await;
-    // An engine answered (or failed): today's interests call is used up.
-    if !matches!(reply, Err(OneShotError::NoEngine)) {
-        mark_call(state, user_id, today, Call::Interests).await;
+    // No model ran: give the day's call back.
+    if matches!(reply, Err(OneShotError::NoEngine)) {
+        release_call(state, user_id, Call::Interests).await;
     }
     let parsed = reply
         .as_ref()
@@ -979,17 +975,91 @@ enum Call {
 }
 
 /// Record that today's model call of this kind happened.
-async fn mark_call(state: &AppState, user_id: &str, today: &str, call: Call) {
+/// Reserve today's call of this kind before making it (so a restart
+/// mid-call cannot lead to a second one). False when already used today.
+async fn reserve_call(state: &AppState, user_id: &str, today: &str, call: Call) -> bool {
     let (uid, day) = (user_id.to_string(), today.to_string());
+    state
+        .db
+        .call(move |c| {
+            store::update_state(c, &uid, |s| {
+                let slot = match call {
+                    Call::Interests => &mut s.interests_call_day,
+                    Call::Summaries => &mut s.summary_call_day,
+                };
+                if slot.as_deref() == Some(day.as_str()) {
+                    return false;
+                }
+                *slot = Some(day);
+                true
+            })
+        })
+        .await
+        .unwrap_or(false)
+}
+
+/// Give back a reservation when no model ran (no engine available).
+async fn release_call(state: &AppState, user_id: &str, call: Call) {
+    let uid = user_id.to_string();
     let _ = state
         .db
         .call(move |c| {
             store::update_state(c, &uid, |s| match call {
-                Call::Interests => s.interests_call_day = Some(day),
-                Call::Summaries => s.summary_call_day = Some(day),
+                Call::Interests => s.interests_call_day = None,
+                Call::Summaries => s.summary_call_day = None,
             })
         })
         .await;
+}
+
+/// The day's one batched summary call: blurbs by post id.
+async fn write_blurbs(
+    state: &AppState,
+    user_id: &str,
+    today: &str,
+    need: &[model::SummaryInput],
+    topic_names: &[String],
+) -> (HashMap<String, model::Blurb>, Option<OneShotReply>) {
+    if !reserve_call(state, user_id, today, Call::Summaries).await {
+        return (HashMap::new(), None);
+    }
+    let uid = user_id.to_string();
+    let liked: Vec<String> = state
+        .db
+        .call(move |c| store::liked_posts(c, &uid, 8))
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+    let prompt = model::summary_prompt(need, topic_names, &liked);
+    match one_shot(
+        state,
+        OneShotRequest {
+            slot: Slot::Feed,
+            shared: false,
+            system_prompt: model::SUMMARY_SYSTEM,
+            prompt: &prompt,
+            timeout: Duration::from_secs(300),
+            scope: "feed-summaries",
+            // One real model run; a signed-out CLI falls through.
+            max_attempts: 1,
+            take_slot: true,
+        },
+    )
+    .await
+    {
+        Ok(reply) => (model::parse_summaries(&reply.text), Some(reply)),
+        Err(OneShotError::NoEngine) => {
+            crate::warn!("feed: no engine for summaries; using descriptions");
+            release_call(state, user_id, Call::Summaries).await;
+            (HashMap::new(), None)
+        }
+        Err(OneShotError::Failed(e)) => {
+            crate::warn!("feed: summaries failed ({e}); using descriptions");
+            (HashMap::new(), None)
+        }
+    }
 }
 
 /// Which sources this run reads: the user's own first, then Google, then
@@ -1156,7 +1226,12 @@ async fn check_price_watches(state: &AppState, user_id: &str, fetcher: &Arc<Fetc
                 return (w, Some(new), None);
             }
             // Same photo rules as every post: only copies Iris checked.
-            let images: Vec<String> = meta.images.iter().take(4).cloned().collect();
+            let images: Vec<String> = meta
+                .images
+                .iter()
+                .take(parse::MAX_ITEM_IMAGES)
+                .cloned()
+                .collect();
             let cached = cache_assets(&f, &data_dir, &images, meta.favicon.as_deref());
             let post = PipelinePost {
                 title: format!("Price drop: {}", truncate_chars(&w.title, 200)),
@@ -1194,6 +1269,11 @@ async fn check_price_watches(state: &AppState, user_id: &str, fetcher: &Arc<Fetc
             .db
             .call(move |c| {
                 crate::db::write_tx(c, |c| {
+                    // Unliked or deleted while the page was being read:
+                    // nothing to alert about any more.
+                    if !store::watch_active(c, &w.id)? {
+                        return Ok(false);
+                    }
                     let drop_to = post
                         .as_ref()
                         .and_then(|p| p.facts["price"]["amount"].as_f64());
@@ -1201,11 +1281,11 @@ async fn check_price_watches(state: &AppState, user_id: &str, fetcher: &Arc<Fetc
                     if let Some(p) = &post {
                         entities::insert_pipeline_post(c, &uid, p)?;
                     }
-                    Ok(())
+                    Ok(true)
                 })
             })
             .await
-            .is_ok();
+            .unwrap_or(false);
         if let (true, Some(text)) = (ok, push) {
             state.hub.to_users(
                 &[user_id.to_string()],
@@ -1310,6 +1390,131 @@ async fn record_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An AppState whose only engine is a fake `claude` script that counts
+    /// its runs and answers according to `<dir>/mode` (`ok`, `auth`,
+    /// anything else fails) with the reply in `<dir>/reply`.
+    async fn fake_engine() -> (AppState, tempfile::TempDir, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let script = dir.join("claude");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+D="$(dirname "$0")"
+case "$1" in
+  --version) echo "9.9.9 (fake)"; exit 0;;
+  auth) echo '{"loggedIn": true}'; exit 0;;
+esac
+cat >/dev/null
+echo run >> "$D/calls"
+case "$(cat "$D/mode")" in
+  ok) printf '{"type":"result","subtype":"success","is_error":false,"result":%s}\n' "$(cat "$D/reply")";;
+  auth) echo '{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login"}';;
+  *) echo '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}';;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let paths = crate::config::Paths {
+            config_file: dir.join("config.toml"),
+            data_dir: dir.join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let db = crate::db::Db::open(&paths.db_file()).unwrap();
+        let mut cfg = crate::config::Config::default();
+        for (name, h) in cfg.harness.iter_mut() {
+            h.enabled = name == "claude";
+        }
+        cfg.harness.get_mut("claude").unwrap().command = script.to_string_lossy().into_owned();
+        cfg.feed.enabled = false;
+        cfg.push.enabled = false;
+        let state = AppState::new(cfg, paths, db).unwrap();
+        state.refresh_harnesses().await;
+        let owner = state.db.with(db::owner_user_id).unwrap().unwrap();
+        (state, tmp, owner)
+    }
+
+    fn set(tmp: &tempfile::TempDir, mode: &str, reply: &str) {
+        std::fs::write(tmp.path().join("mode"), mode).unwrap();
+        std::fs::write(
+            tmp.path().join("reply"),
+            serde_json::to_string(reply).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn runs(tmp: &tempfile::TempDir) -> usize {
+        std::fs::read_to_string(tmp.path().join("calls"))
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    fn feed_state(state: &AppState, owner: &str) -> FeedState {
+        state.db.with(|c| store::get_state(c, owner)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn daily_calls_are_counted_through_the_real_helper_path() {
+        let (state, tmp, owner) = fake_engine().await;
+        let need = vec![model::SummaryInput {
+            id: "p0".into(),
+            title: "A comet".into(),
+            source: "Sky".into(),
+            topic: None,
+            text: "Short".into(),
+        }];
+        let topics = vec!["Space".to_string()];
+
+        // A failed summary call uses up the day: no second run.
+        set(&tmp, "fail", "");
+        let (b, reply) = write_blurbs(&state, &owner, "2026-10-11", &need, &topics).await;
+        assert!(b.is_empty() && reply.is_none());
+        assert_eq!(runs(&tmp), 1);
+        assert_eq!(
+            feed_state(&state, &owner).summary_call_day.as_deref(),
+            Some("2026-10-11")
+        );
+        set(&tmp, "ok", r#"[{"id": "p0", "summary": "S"}]"#);
+        let (b, _) = write_blurbs(&state, &owner, "2026-10-11", &need, &topics).await;
+        assert!(b.is_empty());
+        assert_eq!(runs(&tmp), 1, "same day: no second call");
+
+        // Next day it works, once.
+        let (b, reply) = write_blurbs(&state, &owner, "2026-10-12", &need, &topics).await;
+        assert_eq!(b["p0"].summary.as_deref(), Some("S"));
+        assert!(reply.is_some());
+        assert_eq!(runs(&tmp), 2);
+
+        // An unusable interests reply also uses up the day, and the derived
+        // fallback is kept.
+        set(&tmp, "ok", "sorry, no JSON today");
+        let (i, reply) = refresh_interests(&state, &owner, "2026-10-12", Vec::new())
+            .await
+            .unwrap();
+        assert!(reply.is_none() && !i.by_model);
+        assert_eq!(runs(&tmp), 3);
+        let st = feed_state(&state, &owner);
+        assert!(st.interests.is_some());
+        assert!(!interests_due(&st, "2026-10-12"));
+        let _ = refresh_interests(&state, &owner, "2026-10-12", Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(runs(&tmp), 3, "reserved: no second call");
+
+        // A signed-out CLI is one run, gives the reservation back, and is
+        // marked signed out (so nothing else runs today).
+        set(&tmp, "auth", "");
+        let (_, reply) = write_blurbs(&state, &owner, "2026-10-13", &need, &topics).await;
+        assert!(reply.is_none());
+        assert_eq!(runs(&tmp), 4);
+        assert_eq!(feed_state(&state, &owner).summary_call_day, None);
+        let (_, reply) = write_blurbs(&state, &owner, "2026-10-13", &need, &topics).await;
+        assert!(reply.is_none());
+        assert_eq!(runs(&tmp), 4, "no usable engine left");
+    }
 
     fn day(published: i64, opened: i64, reached_end: i64) -> DayStat {
         DayStat {

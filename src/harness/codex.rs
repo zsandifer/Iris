@@ -147,6 +147,25 @@ pub fn mcp_setup(
     Ok(out)
 }
 
+/// Codex features that give the model tools (shell, apps, browser, image
+/// viewing, code mode, ...), disabled for tool-less helper calls.
+const CODEX_TOOL_FEATURES: &[&str] = &[
+    "shell_tool",
+    "unified_exec",
+    "apps",
+    "plugins",
+    "browser_use",
+    "browser_use_external",
+    "in_app_browser",
+    "computer_use",
+    "image_generation",
+    "view_image",
+    "code_mode_host",
+    "tool_suggest",
+    "goals",
+    "sleep_tool",
+];
+
 impl Harness for Codex {
     fn name(&self) -> &'static str {
         "codex"
@@ -176,6 +195,13 @@ impl Harness for Codex {
         a.extend(["--json", "--skip-git-repo-check"].map(String::from));
         if !spec.tools {
             a.extend(["--ignore-user-config", "--ignore-rules", "--ephemeral"].map(String::from));
+            // Every tool-providing feature off, so the model has no tools at
+            // all (verified with codex-cli 0.162: without these it runs
+            // shell commands; with them it reports none).
+            for feature in CODEX_TOOL_FEATURES {
+                a.push("--disable".into());
+                a.push((*feature).into());
+            }
         }
         a.push("-m".into());
         a.push(spec.model.clone());

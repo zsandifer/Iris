@@ -185,14 +185,15 @@ pub async fn flush_quiet(state: &AppState) {
         let read = |conv: &str, at: i64| reads.get(conv).is_some_and(|r| *r >= at);
         // Chats the user has left since (or was removed from) are dropped:
         // no previews after access ends.
-        let items: Vec<(Value, i64)> = held
-            .iter()
-            .filter(|(_, p, _)| p.is_object())
-            .filter(|(_, p, _)| {
-                p["conversation_id"]
+        let keep = |p: &Value| {
+            p.is_object()
+                && p["conversation_id"]
                     .as_str()
                     .is_none_or(|c| reads.contains_key(c))
-            })
+        };
+        let items: Vec<(Value, i64)> = held
+            .iter()
+            .filter(|(_, p, _)| keep(p))
             .map(|(_, p, at)| (p.clone(), *at))
             .collect();
         let done = match digest(&name, &items, &read) {
@@ -216,7 +217,7 @@ pub async fn flush_quiet(state: &AppState) {
         let now = now_ms();
         let ids: Vec<String> = held
             .iter()
-            .filter(|(_, _, at)| done || now - at > MAX_HOLD_MS)
+            .filter(|(_, p, at)| done || !keep(p) || now - at > MAX_HOLD_MS)
             .map(|(id, _, _)| id.clone())
             .collect();
         let _ = state
@@ -463,9 +464,39 @@ mod tests {
                 Ok(conv.id)
             })
             .unwrap();
-        let held = json!({"title": "Iris", "body": "secret", "conversation_id": other});
-        enqueue(&state, &owner, &held).await;
+        // With a (failing) device again: the member chat's reply is kept
+        // for a retry, the other one is dropped without a push attempt.
+        state
+            .db
+            .with(|c| {
+                let d = crate::db::insert_device(c, &owner, "phone2", "hash-2")?;
+                entities::upsert_push_subscription(
+                    c,
+                    &owner,
+                    &d.id,
+                    "https://127.0.0.1:9/push2",
+                    "bad",
+                    "bad",
+                )
+            })
+            .unwrap();
+        let main = state
+            .db
+            .with(|c| crate::db::ensure_main_conversation(c, &owner))
+            .unwrap();
+        let gone = json!({"title": "Iris", "body": "secret", "conversation_id": other});
+        let mine = json!({"title": "Iris", "body": "hello", "conversation_id": main});
+        enqueue(&state, &owner, &gone).await;
+        enqueue(&state, &owner, &mine).await;
         flush_quiet(&state).await;
-        assert_eq!(queued(&state), 0, "dropped without a push");
+        let left: Vec<String> = state
+            .db
+            .with(|c| {
+                let mut st = c.prepare("SELECT payload FROM push_queue")?;
+                st.query_map([], |r| r.get(0))?.collect()
+            })
+            .unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(left[0].contains("hello") && !left[0].contains("secret"));
     }
 }

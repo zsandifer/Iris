@@ -3,7 +3,7 @@
 //! generated ones), and, for urgent alerts, a product price or event date.
 
 use super::markup::{self, Token, attr, collapse_ws, resolve};
-use super::parse::{Event, Price, https_image, looks_like_icon, parse_date};
+use super::parse::{Event, Price, looks_like_icon, parse_date};
 use serde_json::Value;
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -159,7 +159,6 @@ pub fn extract(html: &str, url: &str) -> PageMeta {
     m.published_ms = m.published_ms.or(ld.published_ms);
     let mut images = Vec::new();
     for u in og_images.into_iter().chain(ld.images).chain(tw_images) {
-        let u = https_image(&u);
         if !images.contains(&u) && !looks_like_icon(&u) && images.len() < MAX_IMAGES {
             images.push(u);
         }

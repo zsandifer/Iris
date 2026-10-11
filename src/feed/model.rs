@@ -83,17 +83,29 @@ Weight 1.0 means a core interest, 0.3 a passing one.",
     )
 }
 
+/// Longest reply read (a well-formed reply is a few KB).
+const MAX_REPLY: usize = 256 * 1024;
+
 /// The first JSON value of the wanted kind (`{` or `[`) in a reply that may
-/// wrap it in prose or a code fence.
+/// wrap it in prose or a code fence. Each candidate start is parsed once,
+/// streaming, so trailing text costs nothing.
 pub fn find_json(reply: &str, open: char) -> Option<Value> {
-    let close = if open == '{' { '}' } else { ']' };
-    let start = reply.find(open)?;
-    let mut end = reply.rfind(close)?;
-    while end > start {
-        if let Ok(v) = serde_json::from_str::<Value>(&reply[start..=end]) {
+    let mut reply = reply;
+    if reply.len() > MAX_REPLY {
+        let mut cut = MAX_REPLY;
+        while !reply.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        reply = &reply[..cut];
+    }
+    let mut from = 0;
+    for _ in 0..8 {
+        let start = from + reply[from..].find(open)?;
+        let mut stream = serde_json::Deserializer::from_str(&reply[start..]).into_iter::<Value>();
+        if let Some(Ok(v)) = stream.next() {
             return Some(v);
         }
-        end = reply[..end].rfind(close)?;
+        from = start + open.len_utf8();
     }
     None
 }
@@ -303,6 +315,15 @@ mod tests {
         let wrapped = parse_summaries(r#"{"items": [{"id": "a", "summary": "S"}]}"#);
         assert_eq!(wrapped["a"].summary.as_deref(), Some("S"));
         assert!(parse_summaries("sorry").is_empty());
+        // Trailing junk is ignored without rescanning.
+        let big = format!(
+            r#"[{{"id": "x", "summary": "{}"}}]{}"#,
+            "a".repeat(100_000),
+            "]".repeat(50_000)
+        );
+        let t0 = std::time::Instant::now();
+        assert!(parse_summaries(&big).contains_key("x"));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

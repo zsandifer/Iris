@@ -252,6 +252,9 @@ CREATE TABLE feed_sources (
     topic         TEXT,
     origin        TEXT NOT NULL DEFAULT 'user' CHECK (origin IN ('user', 'suggested', 'google')),
     enabled       INTEGER NOT NULL DEFAULT 1,
+    -- Removed by the user: kept (hidden) so suggestions and imports do not
+    -- bring it back; adding it again clears this.
+    removed       INTEGER NOT NULL DEFAULT 0,
     state         TEXT NOT NULL DEFAULT '{}',
     last_fetch_at INTEGER,
     last_ok_at    INTEGER,

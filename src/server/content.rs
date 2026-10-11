@@ -190,21 +190,7 @@ async fn add_source(
     let (k, v) = (kind.clone(), value.clone());
     let added = state
         .db
-        .call(move |c| {
-            let added =
-                crate::feed::store::add_source(c, &uid, &k, &v, None, topic.as_deref(), "user")?;
-            if added.is_none() {
-                // Already there (maybe suggested or turned off): make it the
-                // user's own and turn it on.
-                c.execute(
-                    "UPDATE feed_sources SET origin = 'user', enabled = 1, fail_count = 0
-                     WHERE user_id = ?1 AND kind = ?2 AND value = ?3",
-                    rusqlite::params![uid, k, v],
-                )?;
-            }
-            let all = crate::feed::store::list_sources(c, &uid)?;
-            Ok(all.into_iter().find(|s| s.kind == k && s.value == v))
-        })
+        .call(move |c| crate::feed::store::add_user_source(c, &uid, &k, &v, topic.as_deref()))
         .await?
         .ok_or_else(|| ApiError::not_found("source"))?;
     ok(json!({"source": added}))

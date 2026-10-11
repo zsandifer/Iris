@@ -297,11 +297,14 @@ impl Fetcher {
             return r.clone();
         }
         let url = format!("{origin}/robots.txt");
-        let rules = match self.raw(&Request::new(&url, Mode::Feed, "text/plain", 512 * 1024)) {
-            Ok(r) if (200..300).contains(&r.status) => Robots::parse(&r.text(), ROBOTS_TOKEN),
+        // Redirects are followed (RFC 9309, 2.3.1.2); the rules apply to
+        // the original origin.
+        let rules = match self.get(&Request::new(&url, Mode::Feed, "text/plain", 512 * 1024)) {
+            Ok(r) => Robots::parse(&r.text(), ROBOTS_TOKEN),
             // No robots.txt (or access denied to it): everything is allowed.
-            Ok(r) if (400..500).contains(&r.status) => Robots::default(),
-            // Server errors and network failures: stay away this run.
+            Err(FetchError::Status(s)) if (400..500).contains(&s) => Robots::default(),
+            // Server errors, too many redirects, network failures: stay
+            // away this run.
             _ => Robots::disallow_all(),
         };
         let rules = Arc::new(rules);
@@ -688,6 +691,27 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    #[test]
+    fn robots_redirects_are_followed() {
+        let base = serve(vec![
+            (
+                "/robots.txt",
+                301,
+                "Location: /real-robots.txt\r\n",
+                String::new(),
+            ),
+            (
+                "/real-robots.txt",
+                200,
+                "",
+                "User-agent: *\nDisallow: /secret\n".into(),
+            ),
+        ]);
+        let f = Fetcher::for_tests();
+        assert!(f.allowed(&format!("{base}/news")));
+        assert!(!f.allowed(&format!("{base}/secret/1")));
     }
 
     #[test]

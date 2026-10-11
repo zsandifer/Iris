@@ -467,6 +467,9 @@ mod tests {
             "web_search=\"disabled\"",
             "--ignore-user-config",
             "--ephemeral",
+            "shell_tool",
+            "view_image",
+            "code_mode_host",
         ] {
             assert!(x.args.iter().any(|a| a == o), "{o}");
         }
@@ -477,10 +480,11 @@ mod tests {
         for h in [
             &claude::Claude::new(HarnessConfig::claude_default()) as &dyn Harness,
             &codex::Codex::new(HarnessConfig::codex_default()),
-            &opencode::OpenCode::new(HarnessConfig::opencode_default()),
         ] {
             assert!(h.capabilities().tool_less, "{}", h.name());
         }
+        let oc = opencode::OpenCode::new(HarnessConfig::opencode_default());
+        assert!(!oc.capabilities().tool_less, "helper calls skip OpenCode");
         let g = args(&gem);
         let pos = g.args.iter().position(|a| a == "--approval-mode").unwrap();
         assert_eq!(g.args[pos + 1], "default");

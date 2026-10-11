@@ -746,7 +746,9 @@ already exists makes it yours and turns it on. Response
 
 #### `DELETE /api/feed/sources/{id}`
 
-`{"ok": true}`.
+`{"ok": true}`. Sources you added are deleted. Suggested and YouTube-imported
+ones are hidden instead, so later suggestions and imports do not bring
+them back; adding the same source by hand restores it.
 
 #### `GET /api/feed/images/{file}`
 
@@ -1832,14 +1834,17 @@ once for summaries (later runs that day use the last interests and the
 posts' own descriptions). Each call goes through the owner's own CLI as a
 single prompt with no session, no Iris persona, and tools turned off with
 the CLI's own controls: Claude Code `--tools "" --strict-mcp-config`;
-Codex `--ignore-user-config --ignore-rules --ephemeral` with
-`sandbox_mode="read-only"`, `approval_policy="never"`, and
-`web_search="disabled"` (Codex cannot remove its shell tool; the read-only
-sandbox has no writes or network); OpenCode `tools: {"*": false}` and every
-permission denied. Gemini CLI cannot reliably drop MCP servers and tools
-from the user's own settings, so these calls skip it (with only Gemini
-signed in, the feed uses the posts' own text). Each call is one real model
-run: a signed-out CLI falls through to the next engine, a failure does not.
+Codex `--ignore-user-config --ignore-rules --ephemeral`, every
+tool-providing feature disabled (`shell_tool`, `unified_exec`, `apps`,
+`plugins`, browser and computer use, `view_image`, `image_generation`,
+`code_mode_host`, ...), `sandbox_mode="read-only"`,
+`approval_policy="never"`, and `web_search="disabled"`. Gemini CLI and
+OpenCode cannot reliably override tools, MCP servers, or agent permissions
+from the user's own settings, so these calls skip them (if only they are
+signed in, the feed uses the posts' own text). The day's call is reserved
+before it starts, so a restart mid-call cannot cause a second one; it is
+given back only when no model ran. Each call is one real model run: a
+signed-out CLI falls through to the next engine, a failure does not.
 The activity log shows each run, in the hidden `feed` job conversation,
 with the engine that wrote the text.
 
@@ -1911,9 +1916,9 @@ for events in the next 30 days. Without the city match an event cannot
 reach 70.
 
 **Polite fetching.** `User-Agent: IrisFeed/<version> (self-hosted personal feed
-reader)`. robots.txt is honored for every page
-read for a preview and every photo downloaded (`5xx` or unreachable
-robots.txt means "not this run"). Feeds and documented APIs the user
+reader)`. robots.txt (redirects followed) is honored for every page read for a
+preview and every photo downloaded (`5xx` or unreachable robots.txt means
+"not this run"). Feeds and documented APIs the user
 subscribed to are read like a feed reader reads them, once a day (in full,
 so items not picked today are still candidates tomorrow). One request per
 host per second (more
