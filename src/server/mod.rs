@@ -1075,7 +1075,7 @@ esac
                 .starts_with("https://login.example.com/")
         );
         let code_uri = "/api/harnesses/claude/login/code";
-        send(
+        let (s, b) = send(
             &h.app,
             "POST",
             code_uri,
@@ -1083,15 +1083,24 @@ esac
             Some(json!({"code": "bad-code"})),
         )
         .await;
-        let b = wait_login(&h, &t, "waiting_for_code").await;
-        let _ = b;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["login"]["state"], "verifying");
+        // The CLI rejects it: back to waiting, with a friendly error.
+        let mut rejected = Value::Null;
         for _ in 0..100 {
             let (_, b) = send(&h.app, "GET", "/api/harnesses/claude/login", Some(&t), None).await;
-            if b["login"]["error"].is_string() {
+            if b["login"]["state"] == "waiting_for_code" && b["login"]["error"].is_string() {
+                rejected = b;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        assert!(
+            rejected["login"]["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("didn't work")),
+            "rejected code was reported: {rejected}"
+        );
         let (s, _) = send(
             &h.app,
             "POST",
