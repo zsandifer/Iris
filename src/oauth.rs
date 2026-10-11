@@ -286,7 +286,12 @@ pub fn discover(mcp_url: &str) -> Result<Discovered, String> {
     let (rm, scope) = parse_www_authenticate(&www);
     let origin = origin_of(mcp_url);
     let path = path_of(mcp_url);
-    let mut prm_urls: Vec<String> = rm.into_iter().collect();
+    // Metadata addresses a server points us to must be https (or this
+    // machine, for testing), like the endpoints themselves.
+    let mut prm_urls: Vec<String> = rm
+        .into_iter()
+        .filter(|u| check_endpoint(u).is_ok())
+        .collect();
     if !path.is_empty() {
         prm_urls.push(format!(
             "{origin}/.well-known/oauth-protected-resource{path}"
@@ -309,6 +314,7 @@ pub fn discover(mcp_url: &str) -> Result<Discovered, String> {
         // Older servers: the MCP server is its own authorization server.
         None => (origin.clone(), mcp_url.to_string(), Value::Null),
     };
+    check_endpoint(&issuer)?;
     let meta = as_metadata_urls(&issuer).iter().find_map(|u| get_json(u));
     let (auth, token, reg, scopes_meta) = match &meta {
         Some(m) => {

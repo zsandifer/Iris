@@ -16,7 +16,7 @@ export function ServiceTile({ c, size = 30 }) {
   const svc = c.service || c.id;
   if (BRAND[svc]) {
     const name = svc === 'google' ? 'G' : 'GH';
-    return html`<div class="tile" style=${`width:${size}px;height:${size}px;border-radius:9px;background:${BRAND[svc]};font-size:${svc === 'github' ? 11 : 14}px`}>${name}</div>`;
+    return html`<div class="tile brand" style=${`width:${size}px;height:${size}px;border-radius:9px;background:${BRAND[svc]};font-size:${svc === 'github' ? 11 : 14}px`}>${name}</div>`;
   }
   return html`<${LetterTile} name=${c.name || c.label} size=${size} />`;
 }
@@ -450,7 +450,7 @@ export function TrustedPeople() {
         right=${html`<button class="icon-btn" aria-label=${`Remove ${r}`} onClick=${() => save(list.filter((x) => x !== r))}><${Icon} name="trash" size=${16} /></button>`} />`)}
       ${!list.length && html`<div class="r"><div class="rt mu">No one yet</div></div>`}
     <//>
-    <form class="code-row" onSubmit=${add}><input class="field" value=${v} placeholder="Email address or phone number" autocapitalize="off" inputmode="email" onInput=${(e) => setV(e.target.value)} />
+    <form class="code-row plain gap" onSubmit=${add}><input class="field" value=${v} placeholder="Email address or phone number" autocapitalize="off" inputmode="email" onInput=${(e) => setV(e.target.value)} />
       <button class="b1 sm" disabled=${!v.trim()}>Add</button></form>`}
   <//>`;
 }

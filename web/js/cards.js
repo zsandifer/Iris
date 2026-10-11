@@ -315,7 +315,7 @@ function ApprovalCard({ c, m }) {
       ${p.subject && html`<div><span class="mu">Subject</span> ${p.subject}</div>`}
       ${(p.fields || []).map((f) => html`<div><span class="mu">${f.label}</span> ${f.value}</div>`)}
       ${p.body && html`<div class="ap-body">${p.body}</div>`}</div>
-    ${c.details && html`<button class="ap-raw-btn" onClick=${() => setRaw(!raw)} aria-expanded=${raw ? 'true' : 'false'}>${raw ? 'Hide' : 'Show'} exactly what will be sent</button>
+    ${c.details && html`<button class="ap-raw-btn" onClick=${() => setRaw(!raw)} aria-expanded=${raw ? 'true' : 'false'}>${raw ? 'Hide' : 'Show'} the exact request</button>
       ${raw && html`<pre class="ap-raw">${c.details}</pre>`}`}
     ${c.state === 'approved' ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> ${APPROVAL_DONE.approved}</div>`
       : !pending ? html`<div class="mu small">${APPROVAL_DONE[c.state] || 'Decided.'}</div>`

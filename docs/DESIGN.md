@@ -57,7 +57,7 @@ own personality. It is not a clone.
   new recipient through a connected service. It says why it asks ("Sends a
   message to someone new: sam@example.com"), shows the real preview (to,
   subject, the exact text, other fields) built from the held call's
-  arguments, a "Show exactly what will be sent" toggle with the raw
+  arguments, a "Show the exact request" toggle with the raw
   request, a countdown, and Deny / Send (Pay, Delete, Allow). It sits just
   above the reply of the turn that asked, and the status line says
   "Waiting for your OK…" meanwhile. Afterwards it reads "You approved
