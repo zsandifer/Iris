@@ -430,7 +430,11 @@ async fn delete_user(
         let _ = tokio::fs::remove_dir_all(state.paths.together_dir(c)).await;
     }
     for f in files {
-        let _ = tokio::fs::remove_file(state.paths.library_dir().join(f)).await;
+        let path = match f.strip_prefix("uploads/") {
+            Some(upload) => state.paths.uploads_dir().join(upload),
+            None => state.paths.library_dir().join(f),
+        };
+        let _ = tokio::fs::remove_file(path).await;
     }
     let dirs = state.dirs_for(&target);
     if let Some(root) = dirs.persona.parent()

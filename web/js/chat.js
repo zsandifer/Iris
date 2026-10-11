@@ -264,6 +264,8 @@ function Composer({ cid, running, name }) {
   const file = useRef();
   const textRef = useRef('');
   textRef.current = text;
+  const recRef = useRef(null);
+  recRef.current = recording;
 
   useEffect(() => {
     const d = S.drafts[cid];
@@ -287,7 +289,7 @@ function Composer({ cid, running, name }) {
     const t = setInterval(() => setSecs(Math.floor((Date.now() - recording.started) / 1000)), 250);
     return () => clearInterval(t);
   }, [recording]);
-  useEffect(() => () => recording?.cancel(), [recording]);
+  useEffect(() => () => recRef.current?.cancel(), []);
 
   const pick = async (e) => {
     const files = [...e.target.files].slice(0, 4 - atts.length);
@@ -344,6 +346,7 @@ function Composer({ cid, running, name }) {
   const listenServer = async () => {
     if (recording) {
       const handle = recording;
+      recRef.current = null;
       setRecording(null);
       setHearing(true);
       try {

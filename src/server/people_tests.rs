@@ -399,8 +399,19 @@ async fn each_person_has_their_own_iris() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
     let (s, _) = send(&h, "DELETE", &format!("/api/users/{sam_id}"), &sam, None).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
+    let uploads = h.state.paths.uploads_dir();
+    assert_eq!(
+        std::fs::read_dir(&uploads).unwrap().count(),
+        1,
+        "Sam's picture"
+    );
     let (s, _) = send(&h, "DELETE", &format!("/api/users/{sam_id}"), &owner, None).await;
     assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        std::fs::read_dir(&uploads).unwrap().count(),
+        0,
+        "picture removed"
+    );
     assert!(!dirs.persona.exists() && !dirs.memory.exists());
     let (s, _) = send(&h, "GET", "/api/me", &sam, None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);

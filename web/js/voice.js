@@ -8,7 +8,7 @@
 // the server (POST /voice/transcribe), so audio stays on your server. When
 // the server cannot transcribe, the browser's own speech recognition is
 // used if it has one.
-import { html, useEffect, useState } from './h.js';
+import { html } from './h.js';
 import { api } from './api.js';
 import { S, set, useStore, toast } from './store.js';
 import { Icon } from './ui.js';
@@ -65,10 +65,16 @@ function tick(t) { if (S.voice?.playing) setVoice({ t }); }
 function stopped() { setVoice({ playing: false, t: 0, id: null }); }
 
 const notes = new Map(); // message id -> Promise<{url, dur}>
+const durs = new Map();  // message id -> length in ms, once known
 function serverNote(id) {
   if (!notes.has(id)) {
     const p = api('POST', '/voice/speak', { message_id: id }, { raw: true, timeout: 180000 })
-      .then(async (r) => ({ dur: Number(r.headers.get('x-voice-duration-ms')) || 0, url: URL.createObjectURL(await r.blob()) }));
+      .then(async (r) => {
+        const n = { dur: Number(r.headers.get('x-voice-duration-ms')) || 0, url: URL.createObjectURL(await r.blob()) };
+        durs.set(id, n.dur);
+        set({});
+        return n;
+      });
     p.catch(() => notes.delete(id));
     notes.set(id, p);
   }
@@ -170,14 +176,11 @@ export function VoiceNote({ m }) {
   const active = v.id === m.id;
   const playing = active && v.playing;
   const device = !serverVoice();
-  const [dur, setDur] = useState(null);
-  useEffect(() => {
-    let live = true;
-    if (device) setDur(estimate(speechText(m.content)));
-    else serverNote(m.id).then((n) => live && setDur(n.dur)).catch(() => live && setDur(null));
-    return () => { live = false; };
-  }, [m.id, device]);
-  const total = (active && v.dur) || dur || 0;
+  // Only the newest reply is made ahead of time (see prefetch); older ones
+  // are made when played, so opening a long chat costs the server nothing.
+  // Until a note's real length is known, show an estimate from the text.
+  const known = device ? null : durs.get(m.id);
+  const total = (active && v.dur) || known || estimate(speechText(m.content));
   const progress = active && total ? Math.min(1, (v.t || 0) / total) : 0;
   const shape = bars(m.id);
   return html`<div class=${'vn' + (playing ? ' on' : '')}>

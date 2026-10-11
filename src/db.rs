@@ -365,7 +365,8 @@ pub fn list_users(conn: &Connection) -> rusqlite::Result<Vec<User>> {
 /// Remove a person (never the owner) and everything that is only theirs:
 /// devices, pairing codes, push subscriptions, feed, ideas, goals, library
 /// rows, credentials, their own chats, and Together chats they created.
-/// Returns the library file names and conversation ids to clean up.
+/// Returns the files to delete (library file names, and `uploads/<name>`
+/// for uploads) and the conversation ids to clean up.
 pub fn delete_person(
     conn: &Connection,
     id: &str,
@@ -377,7 +378,7 @@ pub fn delete_person(
         return Ok(None);
     }
     let mut stmt = conn.prepare("SELECT file_name FROM library_items WHERE user_id = ?1")?;
-    let files: Vec<String> = stmt
+    let mut files: Vec<String> = stmt
         .query_map([id], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let mut stmt = conn.prepare("SELECT id FROM conversations WHERE created_by = ?1")?;
@@ -386,6 +387,20 @@ pub fn delete_person(
         .collect::<rusqlite::Result<_>>()?;
     for c in &convs {
         conn.execute("DELETE FROM conversations WHERE id = ?1", [c])?;
+    }
+    // Their uploads that no remaining message shows (their Iris's picture,
+    // photos from their own chats) go too; photos they sent into other
+    // people's chats stay with those chats.
+    let mut stmt = conn.prepare(
+        "SELECT id, file_name FROM attachments a WHERE user_id = ?1 AND NOT EXISTS (
+             SELECT 1 FROM messages m, json_each(m.attachments) j WHERE j.value = a.id)",
+    )?;
+    let uploads: Vec<(String, String)> = stmt
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (att, file) in uploads {
+        conn.execute("DELETE FROM attachments WHERE id = ?1", [&att])?;
+        files.push(format!("uploads/{file}"));
     }
     conn.execute(
         "DELETE FROM settings WHERE key LIKE ?1",
