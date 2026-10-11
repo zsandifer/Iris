@@ -1293,12 +1293,12 @@ Body: the browser's `PushSubscription.toJSON()`. Extra fields such as
 
 | Field | Type | Notes |
 |---|---|---|
-| `endpoint` | string | Required, must start with `https://`, max 2,000. |
+| `endpoint` | string | Required, max 2,000. Must be an `https://` URL on a browser push service (`fcm.googleapis.com`, `android.googleapis.com`, `*.push.services.mozilla.com`, `*.push.apple.com`, `*.notify.windows.com`; default port, no credentials), so Iris never sends to addresses on its own network. Iris also follows no redirects when delivering. |
 | `keys.p256dh` | string | Required, base64url P-256 public key. |
 | `keys.auth` | string | Required, base64url 16-byte auth secret. |
 
 ```json
-{"endpoint": "https://push.example.com/send/abc", "expirationTime": null,
+{"endpoint": "https://fcm.googleapis.com/fcm/send/abc", "expirationTime": null,
  "keys": {"p256dh": "B...", "auth": "..."}}
 ```
 

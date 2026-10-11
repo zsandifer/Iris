@@ -912,8 +912,10 @@ async fn subscribe_push(
     user: AuthUser,
     JsonBody(body): JsonBody<SubscribeBody>,
 ) -> ApiResult {
-    if !body.endpoint.starts_with("https://") || body.endpoint.len() > 2000 {
-        return Err(ApiError::bad_request("endpoint must be an https URL"));
+    if body.endpoint.len() > 2000 || !crate::push::endpoint_allowed(&body.endpoint) {
+        return Err(ApiError::bad_request(
+            "endpoint must be an https URL of a browser push service",
+        ));
     }
     // Validate the keys now rather than failing at send time.
     crate::push::encrypt(b"{}", &body.keys.p256dh, &body.keys.auth)
