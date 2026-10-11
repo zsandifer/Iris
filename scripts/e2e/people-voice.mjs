@@ -150,7 +150,8 @@ await owner.waitForSelector('.vn:not(.on)');
 check(await owner.evaluate(() => window.speechSynthesis.paused), 'pausing pauses the device voice');
 await owner.click('.vn-play'); // resume, same utterance
 await owner.waitForSelector('.vn.on');
-check(await owner.evaluate(() => !window.speechSynthesis.paused && window.__spoken.length === 1), 'resuming continues it (no restart)');
+// (The empty utterance is the one-time unlock from tapping Send.)
+check(await owner.evaluate(() => !window.speechSynthesis.paused && window.__spoken.filter(Boolean).length === 1), 'resuming continues it (no restart)');
 await owner.evaluate(() => window.speechSynthesis.finish());
 await owner.waitForSelector('.vn:not(.on)');
 check(true, 'the note stops when the device voice finishes, even after a pause');
