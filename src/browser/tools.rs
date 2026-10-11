@@ -244,7 +244,12 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Ou
     }
     b.set_busy(true);
     let started = std::time::Instant::now();
-    let mut out = match run_tool(state, &ctx, &run, name, args).await {
+    // An ended turn stops its tool at once (and frees the page).
+    let result = tokio::select! {
+        r = run_tool(state, &ctx, &run, name, args) => r,
+        _ = ctx.wait_ended() => Err(super::TURN_ENDED.into()),
+    };
+    let mut out = match result {
         Ok(o) => o,
         Err(e) => Output::error(format!("{e}")),
     };
@@ -338,6 +343,7 @@ async fn run_tool(
                 .await?;
             if a["submit"].as_bool().unwrap_or(false) {
                 let events = cdp.subscribe();
+                b.check_agent(ctx)?;
                 press_key(cdp, s, "Enter").await?;
                 settle(events, &page, Duration::from_millis(800)).await;
                 return snapshot(run).await;
@@ -345,8 +351,10 @@ async fn run_tool(
             Ok(Output::text("Typed it."))
         }
         "select_option" => {
-            let r = eval(
+            let r = eval_mut(
                 run,
+                b,
+                ctx,
                 &format!("choose({}, {})", json!(arg("ref")), json!(arg("value"))),
             )
             .await?;
@@ -388,7 +396,7 @@ async fn run_tool(
         }
         "back" => {
             let events = cdp.subscribe();
-            if !history_step(cdp, s, -1).await? {
+            if !history_step(cdp, s, -1, || b.check_agent(ctx)).await? {
                 return Ok(Output::error("There is no previous page."));
             }
             wait_load(events, &page.session_id, Duration::from_secs(10)).await;
@@ -397,6 +405,13 @@ async fn run_tool(
         "screenshot" => {
             // Text can be redacted, pixels cannot: no picture while the page
             // shows a secret Iris filled (outside the masked fields).
+            let info = eval(run, "info()").await?;
+            if run.has_secret_doc(info["doc"].as_str().unwrap_or("")) {
+                return Ok(Output::error(
+                    "No screenshot of this page: Iris filled saved sign-in or card details \
+                     here. Use snapshot instead.",
+                ));
+            }
             let shown = eval(run, "pageText()").await?;
             if run.shows_secret(shown.as_str().unwrap_or("")) {
                 return Ok(Output::error(
@@ -456,7 +471,7 @@ async fn run_tool(
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
-        "tabs" => tabs(state, run, a).await,
+        "tabs" => tabs(state, ctx, run, a).await,
         "fill_login" => {
             super::fill::login(state, ctx, run, a.get("site").and_then(Value::as_str)).await
         }
@@ -474,7 +489,7 @@ fn stale_message(e: &str) -> String {
     }
 }
 
-async fn tabs(state: &AppState, run: &Arc<Running>, a: &Value) -> Result<Output> {
+async fn tabs(state: &AppState, ctx: &TurnCtx, run: &Arc<Running>, a: &Value) -> Result<Output> {
     let cdp = &run.cdp;
     let list = |v: &Value| -> Vec<(String, String, String)> {
         v["targetInfos"]
@@ -494,6 +509,10 @@ async fn tabs(state: &AppState, run: &Arc<Running>, a: &Value) -> Result<Output>
             .unwrap_or_default()
     };
     let pages = list(&cdp.call("Target.getTargets", json!({}), None).await?);
+    // That took a moment: still this turn's, and still the agent's?
+    if a["action"].as_str().unwrap_or("list") != "list" {
+        state.browser.check_agent(ctx)?;
+    }
     let index = a["index"].as_u64().map(|i| i as usize);
     let pick = |i: Option<usize>| -> Result<String> {
         i.and_then(|i| pages.get(i))
@@ -524,7 +543,7 @@ async fn tabs(state: &AppState, run: &Arc<Running>, a: &Value) -> Result<Output>
             cdp.call("Target.closeTarget", json!({"targetId": id}), None)
                 .await?;
             if id == run.page().target_id {
-                state.browser.switch_to_any(run).await?;
+                state.browser.switch_to_any(run, &id).await?;
             }
             Ok(Output::text("Closed the tab."))
         }
@@ -577,6 +596,26 @@ pub fn normalize_url(raw: &str) -> Result<String> {
 
 /// Evaluate `__iris.<call>` in Iris's isolated world of the current page.
 pub async fn eval(run: &Running, call: &str) -> Result<Value> {
+    eval_inner(run, call, None).await
+}
+
+/// `eval` for calls that change the page: the turn and control are checked
+/// once more right before the command is sent (after the await for the
+/// isolated world).
+pub async fn eval_mut(
+    run: &Running,
+    b: &super::Browser,
+    ctx: &TurnCtx,
+    call: &str,
+) -> Result<Value> {
+    eval_inner(run, call, Some((b, ctx))).await
+}
+
+async fn eval_inner(
+    run: &Running,
+    call: &str,
+    guard: Option<(&super::Browser, &TurnCtx)>,
+) -> Result<Value> {
     let page = run.page();
     let s = Some(page.session_id.as_str());
     let world = run
@@ -598,6 +637,9 @@ pub async fn eval(run: &Running, call: &str) -> Result<Value> {
     } else {
         format!("__iris.setSecrets({});\n", json!(secrets))
     };
+    if let Some((b, ctx)) = guard {
+        b.check_agent(ctx)?;
+    }
     let r = run
         .cdp
         .call(
@@ -721,7 +763,12 @@ pub async fn press_key(cdp: &Cdp, s: Option<&str>, key: &str) -> Result<()> {
 }
 
 /// Go back (-1) or forward (+1). False when there is nowhere to go.
-pub async fn history_step(cdp: &Cdp, s: Option<&str>, delta: i64) -> Result<bool> {
+pub async fn history_step(
+    cdp: &Cdp,
+    s: Option<&str>,
+    delta: i64,
+    guard: impl Fn() -> Result<()>,
+) -> Result<bool> {
     let h = cdp.call("Page.getNavigationHistory", json!({}), s).await?;
     let idx = h["currentIndex"].as_i64().unwrap_or(0) + delta;
     let Some(entry) = h["entries"]
@@ -730,6 +777,7 @@ pub async fn history_step(cdp: &Cdp, s: Option<&str>, delta: i64) -> Result<bool
     else {
         return Ok(false);
     };
+    guard()?;
     cdp.call(
         "Page.navigateToHistoryEntry",
         json!({"entryId": entry["id"]}),

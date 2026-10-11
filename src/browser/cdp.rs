@@ -69,11 +69,18 @@ impl Cdp {
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
                 };
+                // Bytes kept from earlier reads hold no delimiter: scan only
+                // the new ones, and drop consumed messages once per read.
+                let mut scan = buf.len();
                 buf.extend_from_slice(&chunk[..n]);
-                while let Some(end) = buf.iter().position(|b| *b == 0) {
-                    let msg: Vec<u8> = buf.drain(..=end).collect();
-                    dispatch(&msg[..msg.len() - 1], &p, &ev);
+                let mut from = 0;
+                while let Some(rel) = buf[scan..].iter().position(|b| *b == 0) {
+                    let end = scan + rel;
+                    dispatch(&buf[from..end], &p, &ev);
+                    from = end + 1;
+                    scan = from;
                 }
+                buf.drain(..from);
                 if buf.len() > MAX_MESSAGE {
                     crate::warn!("browser: oversized protocol message; closing");
                     break 'read;

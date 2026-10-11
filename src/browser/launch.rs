@@ -95,7 +95,10 @@ pub fn newest_in_playwright_cache(dir: &Path) -> Option<PathBuf> {
         } else {
             &[
                 "chrome-linux64/chrome",
+                "chrome-linux-arm64/chrome",
                 "chrome-linux/chrome",
+                "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
                 "chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
                 "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
             ]
@@ -443,6 +446,24 @@ mod tests {
                 .ends_with("chrome-headless-shell")
         );
         assert!(newest_in_playwright_cache(&d.join("missing")).is_none());
+        // Current layouts on other platforms.
+        for (dir, bin) in [
+            ("a/chromium-1300", "chrome-linux-arm64/chrome"),
+            (
+                "b/chromium-1300",
+                "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+            ),
+            (
+                "c/chromium-1300",
+                "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+            ),
+        ] {
+            let p = d.join(dir).join(bin);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+            let root = d.join(dir).parent().unwrap().to_path_buf();
+            assert_eq!(newest_in_playwright_cache(&root).unwrap(), p);
+        }
     }
 
     #[test]

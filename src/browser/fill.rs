@@ -8,7 +8,7 @@
 //! HTTPS (plain HTTP only on this machine). Cards always need the owner's
 //! OK on an approval card in the chat first.
 
-use super::tools::{Output, eval};
+use super::tools::{Output, eval, eval_mut};
 use super::{Running, TurnCtx};
 use crate::browser::Browser;
 use crate::db;
@@ -89,6 +89,8 @@ struct PageInfo {
     title: String,
     scheme: String,
     host: String,
+    /// The browser's own origin (scheme, host, and port).
+    origin: String,
     doc: String,
 }
 
@@ -99,6 +101,7 @@ async fn page_info(run: &Running) -> Result<PageInfo> {
     Ok(PageInfo {
         title: info["title"].as_str().unwrap_or("").to_string(),
         doc: info["doc"].as_str().unwrap_or("").to_string(),
+        origin: info["origin"].as_str().unwrap_or("").to_string(),
         url,
         scheme,
         host,
@@ -106,6 +109,8 @@ async fn page_info(run: &Running) -> Result<PageInfo> {
 }
 
 const PAGE_CHANGED: &str = "the page changed while filling, so I stopped";
+const TOO_SHORT: &str =
+    "the saved secret is too short to keep out of what I read; ask the user to take over";
 
 async fn credentials(state: &AppState, user_id: &str, kind: &'static str) -> Vec<Credential> {
     let uid = user_id.to_string();
@@ -160,12 +165,17 @@ async fn type_into(
         return Err(PAGE_CHANGED.into());
     }
     if secret {
+        if text.chars().count() < super::MIN_SECRET {
+            return Err(TOO_SHORT.into());
+        }
         run.remember_secret(text);
+        run.remember_secret_doc(&pin.doc);
     }
-    // Checked right before the single command that fills.
-    b.check_agent(ctx)?;
-    let p = eval(
+    // Checked again right before the single command that fills.
+    let p = eval_mut(
         run,
+        b,
+        ctx,
         &format!(
             "fillField({}, {}, {secret}, {})",
             json!(r),
@@ -196,15 +206,14 @@ async fn choose(
     if info["doc"].as_str() != Some(pin.doc.as_str()) {
         return Err(PAGE_CHANGED.into());
     }
-    b.check_agent(ctx)?;
-    let r = eval(run, &format!("choose({}, {options})", json!(r))).await?;
+    let r = eval_mut(run, b, ctx, &format!("choose({}, {options})", json!(r))).await?;
     Ok(r["ok"] == true)
 }
 
 fn not_found_for(e: crate::util::BoxError) -> Result<Output> {
     let msg = e.to_string();
-    if msg == PAGE_CHANGED {
-        Ok(Output::text(format!("not found ({PAGE_CHANGED})")))
+    if msg == PAGE_CHANGED || msg == TOO_SHORT {
+        Ok(Output::text(format!("not found ({msg})")))
     } else {
         Err(e)
     }
@@ -419,7 +428,13 @@ pub async fn card(
             "not found (no card number field on this page)",
         ));
     }
-    let origin = format!("{}://{}", page.scheme, page.host);
+    // Approvals bind to the browser's exact origin (scheme, host, port).
+    let origin = page.origin.clone();
+    if origin.is_empty() || origin == "null" || run.shows_secret(&origin) {
+        return Ok(Output::text(
+            "not found (this page's address cannot be used for a card)",
+        ));
+    }
 
     // The owner approves every use of a card, for this card as it is now.
     let revision = card.updated_at;
@@ -546,14 +561,10 @@ async fn fill_card_fields(
         return Ok(None);
     }
     let mut missing = Vec::new();
-    match (fields["cvc"].as_str(), cvc.is_empty()) {
-        (Some(r), false) => {
-            if !type_into(b, ctx, run, pin, r, cvc, true).await? {
-                missing.push("security code");
-            }
+    if let Some(r) = fields["cvc"].as_str() {
+        if cvc.is_empty() || !type_into(b, ctx, run, pin, r, cvc, true).await? {
+            missing.push("security code");
         }
-        (None, false) => {}
-        _ => {}
     }
     let month = m["exp_month"].as_u64().map(|v| format!("{v:02}"));
     let year = m["exp_year"].as_u64().map(|v| v.to_string());
@@ -616,6 +627,7 @@ async fn ask_approval(
     let name = card_name(card);
     // Page-derived text is stored: a page may have echoed an earlier secret.
     let (url, page_title) = (run.redact(&page.url), run.redact(&page.title));
+    let host = &run.redact(&page.host);
     let exp = match (
         card.metadata["exp_month"].as_u64(),
         card.metadata["exp_year"].as_u64(),
@@ -628,7 +640,6 @@ async fn ask_approval(
          Approving lets me fill it in this once, to finish what you asked for.",
         card.label, url
     );
-    let host = &page.host;
     let title_text = format!("Use your {name} on {host}");
     let mut value = entities::approval_card(&entities::ApprovalRequest {
         title: &title_text,

@@ -35,12 +35,24 @@ if (!globalThis.__iris) {
       for (const x of list || []) {
         all.add(x);
         all.add(x.replace(/\s+/g, ' ').trim());
+        // As it appears in addresses and submitted forms.
+        const enc = encodeURIComponent(x);
+        all.add(enc);
+        all.add(enc.replace(/%20/g, '+'));
       }
       secrets = [...all].filter((x) => x.length >= 3).sort((a, b) => b.length - a.length);
     };
+    const decodeLoose = (s) => s.replace(/\+/g, ' ')
+      .replace(/%[0-9a-f]{2}/gi, (m) => { try { return decodeURIComponent(m); } catch { return m; } });
     const redact = (s) => {
       let out = String(s ?? '');
       for (const x of secrets) if (out.includes(x)) out = out.split(x).join('••••');
+      // Still there once percent-decoded (an address in another escaping):
+      // drop the query, or the whole piece.
+      if (secrets.length && secrets.some((x) => decodeLoose(out).includes(x))) {
+        const q = out.indexOf('?');
+        out = q >= 0 ? out.slice(0, q) + '?••••' : '••••';
+      }
       return out;
     };
 
@@ -320,7 +332,10 @@ if (!globalThis.__iris) {
       setter.call(e, value);
       e.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
       e.dispatchEvent(new Event('change', { bubbles: true }));
-      return { ok: e.value === value };
+      // Card forms often reformat numbers ("4242 4242 ..."): same digits
+      // count as filled.
+      const digits = /^\d+$/.test(value) && e.value.replace(/\D/g, '') === value;
+      return { ok: e.value === value || digits };
     }
 
     // The field shows dots right now (its type or style may have changed
@@ -337,10 +352,20 @@ if (!globalThis.__iris) {
     // fields and password fields show dots, so their values are left out.
     function pageText() {
       return docs().map((d) => {
-        const vals = [...d.querySelectorAll('input,textarea')]
-          .filter((e) => !maskedNow(e))
-          .map((e) => e.value || '');
-        return [d.title, d.location.href, d.body ? d.body.innerText : '', ...vals].join('\n');
+        const out = [d.title, d.location.href, d.body ? d.body.innerText : ''];
+        // Open shadow roots too: innerText skips them.
+        const walk = (root) => {
+          for (const e of root.querySelectorAll('*')) {
+            const t = e.tagName.toLowerCase();
+            if ((t === 'input' || t === 'textarea') && !maskedNow(e)) out.push(e.value || '');
+            if (e.shadowRoot) {
+              out.push(e.shadowRoot.textContent || '');
+              walk(e.shadowRoot);
+            }
+          }
+        };
+        walk(d);
+        return out.join('\n');
       }).join('\n');
     }
 
@@ -426,6 +451,6 @@ if (!globalThis.__iris) {
     }
 
     return { snapshot, point, focus, choose, loginFields, cardFields, fillField, pageText, hasText, setSecrets,
-      info: () => ({ url: location.href, title: document.title, doc }) };
+      info: () => ({ url: location.href, title: document.title, origin: location.origin, doc }) };
   })();
 }

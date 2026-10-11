@@ -187,6 +187,52 @@ pub struct Running {
     /// page reflects (a dialog, another field, the title) is redacted from
     /// what the agent reads. Memory only; gone when the browser closes.
     secrets: Mutex<Vec<String>>,
+    /// Documents Iris filled a secret into: never screenshotted (a page can
+    /// paint a value it was given in ways no text check sees).
+    secret_docs: Mutex<std::collections::HashSet<String>>,
+    /// Serializes recovering from a closed tab.
+    recover_lock: tokio::sync::Mutex<()>,
+}
+
+/// Shortest secret Iris fills: shorter ones could not be told apart from
+/// ordinary text when redacting, so Iris will not fill them.
+pub const MIN_SECRET: usize = 3;
+
+/// Percent-decoding that never fails (`+` as space; bad escapes kept).
+fn decode_loose(s: &str) -> String {
+    let b = s.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => match (hex(b[i + 1]), hex(b[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
+                }
+                _ => out.push(b'%'),
+            },
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Percent-encoding as JavaScript's `encodeURIComponent`.
+fn uri_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Default)]
@@ -207,10 +253,14 @@ impl Running {
     /// Remember a secret Iris typed (and common spaced forms of card
     /// numbers) for redaction.
     pub fn remember_secret(&self, secret: &str) {
-        if secret.chars().count() < 3 {
+        if secret.chars().count() < MIN_SECRET {
             return;
         }
         let mut forms = vec![secret.to_string()];
+        // As it appears in addresses and submitted forms.
+        let enc = uri_encode(secret);
+        forms.push(enc.replace("%20", "+"));
+        forms.push(enc);
         let folded = secret.split_whitespace().collect::<Vec<_>>().join(" ");
         if folded.chars().count() >= 3 && folded != secret {
             forms.push(folded);
@@ -234,16 +284,39 @@ impl Running {
         s.sort_by_key(|x| std::cmp::Reverse(x.len()));
     }
 
-    /// Replace every remembered secret in text the agent will read.
+    /// Replace every remembered secret in text the agent will read. A line
+    /// that still holds one once percent-decoded (an address shown in some
+    /// other escaping) loses its query, or the whole line.
     pub fn redact(&self, text: &str) -> String {
         let secrets = lock(&self.secrets);
+        if secrets.is_empty() {
+            return text.to_string();
+        }
         let mut out = text.to_string();
         for s in secrets.iter() {
             if out.contains(s.as_str()) {
                 out = out.replace(s.as_str(), "••••");
             }
         }
-        out
+        let leaks = |line: &str| {
+            let d = decode_loose(line);
+            secrets.iter().any(|s| d.contains(s.as_str()))
+        };
+        if !out.lines().any(leaks) {
+            return out;
+        }
+        out.split('\n')
+            .map(|line| {
+                if !leaks(line) {
+                    line.to_string()
+                } else if let Some(q) = line.find('?') {
+                    format!("{}?••••", &line[..q])
+                } else {
+                    "••••".to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The screencast running now, if any.
@@ -251,16 +324,26 @@ impl Running {
         lock(&self.cast).as_ref().map(|(_, m)| *m)
     }
 
+    pub fn remember_secret_doc(&self, doc: &str) {
+        lock(&self.secret_docs).insert(doc.to_string());
+    }
+
+    pub fn has_secret_doc(&self, doc: &str) -> bool {
+        lock(&self.secret_docs).contains(doc)
+    }
+
     /// The remembered secrets (to hand to the page helpers' isolated world).
     pub fn secrets(&self) -> Vec<String> {
         lock(&self.secrets).clone()
     }
 
-    /// Whether text contains a remembered secret.
+    /// Whether text contains a remembered secret (also percent-encoded).
     pub fn shows_secret(&self, text: &str) -> bool {
-        lock(&self.secrets)
+        let secrets = lock(&self.secrets);
+        let decoded = decode_loose(text);
+        secrets
             .iter()
-            .any(|s| text.contains(s.as_str()))
+            .any(|s| text.contains(s.as_str()) || decoded.contains(s.as_str()))
     }
 }
 
@@ -559,7 +642,12 @@ impl Browser {
         );
     }
 
-    fn set_page_info(&self, url: Option<&str>, title: Option<&str>) {
+    /// Every page address and title shown in the app goes through here,
+    /// redacted (a page may echo a filled secret into either).
+    fn set_page_info(&self, run: &Running, url: Option<&str>, title: Option<&str>) {
+        let url = url.map(|u| run.redact(u));
+        let title = title.map(|t| run.redact(t));
+        let (url, title) = (url.as_deref(), title.as_deref());
         let changed = {
             let mut v = lock(&self.view);
             let mut changed = false;
@@ -653,6 +741,8 @@ impl Browser {
             dialogs: Mutex::default(),
             last_meta: Mutex::new((VIEW_W as f64, VIEW_H as f64)),
             secrets: Mutex::default(),
+            secret_docs: Mutex::default(),
+            recover_lock: tokio::sync::Mutex::new(()),
         });
         let events = cdp.subscribe();
         cdp.call("Target.setDiscoverTargets", json!({"discover": true}), None)
@@ -766,6 +856,7 @@ impl Browser {
             .await
         {
             self.set_page_info(
+                run,
                 info["targetInfo"]["url"].as_str(),
                 info["targetInfo"]["title"].as_str(),
             );
@@ -898,9 +989,7 @@ impl Browser {
                 "Target.targetInfoChanged" => {
                     let info = &ev.params["targetInfo"];
                     if info["targetId"].as_str() == Some(page.target_id.as_str()) {
-                        let url = info["url"].as_str().map(|u| run.redact(u));
-                        let title = info["title"].as_str().map(|t| run.redact(t));
-                        self.set_page_info(url.as_deref(), title.as_deref());
+                        self.set_page_info(&run, info["url"].as_str(), info["title"].as_str());
                     }
                 }
                 "Target.targetCreated" => {
@@ -921,9 +1010,9 @@ impl Browser {
                     let gone = ev.params["targetId"].as_str() == Some(page.target_id.as_str())
                         || ev.params["sessionId"].as_str() == Some(page.session_id.as_str());
                     if gone {
-                        let (b, r) = (self.clone(), run.clone());
+                        let (b, r, t) = (self.clone(), run.clone(), page.target_id.clone());
                         tokio::spawn(async move {
-                            let _ = b.switch_to_any(&r).await;
+                            let _ = b.switch_to_any(&r, &t).await;
                         });
                     }
                 }
@@ -932,9 +1021,14 @@ impl Browser {
         }
     }
 
-    /// The current tab closed: use another one (or open a blank tab).
-    pub async fn switch_to_any(&self, run: &Running) -> Result<()> {
-        let current = run.page().target_id;
+    /// The tab `gone` closed: use another one (or open a blank tab). Runs
+    /// once however many paths notice; a no-op if it was already replaced.
+    pub async fn switch_to_any(&self, run: &Running, gone: &str) -> Result<()> {
+        let _g = run.recover_lock.lock().await;
+        if run.page().target_id != gone {
+            return Ok(());
+        }
+        let current = gone.to_string();
         let targets = run.cdp.call("Target.getTargets", json!({}), None).await?;
         let other = targets["targetInfos"]
             .as_array()
@@ -1009,15 +1103,17 @@ impl Browser {
             vv["clientHeight"].as_f64().unwrap_or(VIEW_H as f64),
         );
         let scale = (mode.max_width() as f64 / (w * SCALE)).min(1.0);
+        // Bounded: a page that never paints must not hold up the live view.
         let shot = run
             .cdp
-            .call(
+            .call_timeout(
                 "Page.captureScreenshot",
                 json!({"format": "jpeg", "quality": mode.quality(), "clip": {
                     "x": vv["pageX"].as_f64().unwrap_or(0.0),
                     "y": vv["pageY"].as_f64().unwrap_or(0.0),
                     "width": w, "height": h, "scale": scale}}),
                 s,
+                Duration::from_secs(3),
             )
             .await?;
         if let Some(data) = shot["data"].as_str() {
@@ -1166,7 +1262,7 @@ impl Browser {
                 tools::press_key(cdp, s, key).await?;
             }
             "back" => {
-                tools::history_step(cdp, s, -1).await?;
+                tools::history_step(cdp, s, -1, || Ok(())).await?;
             }
             "navigate" => {
                 let url = tools::normalize_url(ev["url"].as_str().unwrap_or(""))?;
@@ -1276,15 +1372,28 @@ mod tests {
             dialogs: Mutex::default(),
             last_meta: Mutex::new((0.0, 0.0)),
             secrets: Mutex::default(),
+            secret_docs: Mutex::default(),
+            recover_lock: tokio::sync::Mutex::new(()),
         };
         run.remember_secret("hunter2-long");
         run.remember_secret("4242424242424242");
-        run.remember_secret("12");
-        let text = "alert: hunter2-long / 4242 4242 4242 4242 / 4242-4242-4242-4242 / 4242424242424242 / 12";
+        run.remember_secret("a b+c/d?e");
+        let text = "alert: hunter2-long / 4242 4242 4242 4242 / 4242-4242-4242-4242 / \
+                    4242424242424242 / ?p=a+b%2Bc%2Fd%3Fe / a%20b%2Bc%2Fd%3Fe";
         let out = run.redact(text);
         assert!(!out.contains("hunter2") && !out.contains("4242"), "{out}");
-        // Too short to redact safely (would mangle ordinary text).
-        assert!(out.ends_with("/ 12"));
+        assert!(!out.contains("b%2Bc"), "{out}");
+        // Shown with other escaping (a browser's display form of an address).
+        let shown = "Page: x\nhttp://h/p?pw=a+b%2Bc/d%3Fe&x=1\nnext line";
+        let out = run.redact(shown);
+        assert_eq!(out, "Page: x\nhttp://h/p?••••\nnext line");
+        assert!(run.shows_secret("t?q=a%20b%2Bc%2Fd?e"));
+        assert_eq!(decode_loose("a%2"), "a%2");
+        assert_eq!(decode_loose("%41+%zz"), "A %zz");
+        // Shorter than MIN_SECRET is never remembered: such secrets are
+        // never filled (fill.rs refuses them).
+        run.remember_secret("12");
+        assert!(!run.secrets().contains(&"12".to_string()));
         assert!(run.shows_secret("x hunter2-long y"));
         assert!(!run.shows_secret("nothing here"));
     }

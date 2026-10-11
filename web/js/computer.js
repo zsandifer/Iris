@@ -234,11 +234,17 @@ function NoSandbox() {
       setBrowserState((await post('/browser/start')).browser);
     } catch (e) { toast(e.message); }
   };
+  // After fixing the server: start again with the sandbox.
+  const retry = async () => {
+    try { setBrowserState((await post('/browser/start')).browser); } catch (e) { toast(e.message); }
+    loadBrowser().catch(() => {});
+  };
   return html`<div class="screen">
     <${Icon} name="lock" size=${30} />
     <b>The browser's safety sandbox can't run here</b>
     <small>This server blocks the sandbox Chrome uses to keep websites away from the rest of the system (common on Ubuntu). You can allow it on the server once, or run without it.</small>
-    <button class="b1" onClick=${allow}>Run without the sandbox</button>
+    <div class="row-btns"><button class="b2" onClick=${retry}>Try again</button>
+      <button class="b1" onClick=${allow}>Run without the sandbox</button></div>
   </div>`;
 }
 

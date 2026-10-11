@@ -2484,14 +2484,20 @@ Every secret Iris filled in the current browser session is replaced with
 `••••` anywhere in a tool result (a page could echo it in a dialog, title,
 or other field). The page helpers do this on the raw text, before folding
 whitespace, cutting long values, or quoting, so no escaped or partial copy
-survives; dialogs and the live title are redacted the same way.
-`screenshot` refuses while the page shows a secret anywhere outside fields
-that are masked right now (a page that unmasks a filled field counts).
+survives; its URL-encoded forms are covered too, and a line that still
+holds a secret once percent-decoded (an address in some other escaping)
+loses its query. Dialogs, the live title and address, and approval cards
+are redacted the same way. `screenshot` never shows a page Iris filled a
+secret into (a page could paint it where no text check sees), and refuses
+on any other page whose text or unmasked fields (open shadow roots too)
+show one. Saved secrets shorter than 3 characters are not filled (they
+could not be told apart from ordinary text).
 
 Each call waits while the owner has taken over, and checks again once it
-holds the page, so a queued call never acts under the owner's control.
-When the turn ends (finished, cancelled, or failed), its calls still waiting
-stop at once and nothing more is done for it. Codex gets a 180 s tool
+holds the page and right before every command that changes the page, so a
+queued or slow call never acts under the owner's control. When the turn
+ends (finished, cancelled, or failed), its calls stop at once, even in the
+middle of a wait, and nothing more is done for it. Codex gets a 180 s tool
 timeout for this server (its default is 60 s).
 
 `fill_login` takes the saved login whose `site` matches the current page's
@@ -2516,7 +2522,8 @@ Go ahead." when the owner approves after the turn ended, which starts that
 call). An approval is for the card as it was: editing the card asks again.
 After approval (still unexpired and unused when it is consumed), Iris fills
 the card number, expiry, CVC, and name itself the same way, on the approved
-page only; each approval fills once. If some part could not be filled (for
+page only; each approval fills once and is bound to the browser's exact
+origin (scheme, host, and port). If some part could not be filled (for
 example the expiry dropdown has no matching option) the answer is
 `filled (but the ... could not be filled in; ...)`. Page titles and
 addresses in the approval card are redacted like tool results. Cards are

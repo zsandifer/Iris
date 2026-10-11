@@ -14,8 +14,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const PASSWORD: &str = "S3cret-Pa55-xyz!";
 /// Quotes, a backslash, doubled spaces, and longer than snapshot cuts.
-const TRICKY: &str =
-    "q\"uo  te\\back-slash-0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-end";
+const TRICKY: &str = concat!(
+    "q\"uo  te\\back-slash+plus/slash?query&amp-",
+    "0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-",
+    "0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-",
+    "0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-",
+    "end"
+);
 const CARD: &str = "4242424242424242";
 const CVC: &str = "987";
 
@@ -60,10 +65,12 @@ const REFLECT_PAGE: &str = r#"<!doctype html><html><head><title>Echo sign in</ti
 const TRICKY_PAGE: &str = r#"<!doctype html><html><head><title>Tricky</title></head><body>
 <h1>Tricky</h1><form>
 <input name="email" type="email" autocomplete="username" aria-label="Email">
-<input id="pw" type="password" aria-label="Password"
+<input id="pw" name="password" type="password" aria-label="Password"
   onfocus="queueMicrotask(() => document.getElementById('other').focus())"
-  oninput="document.title = 'Hi ' + this.value">
+  oninput="document.title = 'Hi ' + this.value; document.getElementById('mirror').value = this.value">
 <input id="other" aria-label="Other">
+<label>Mirror <input id="mirror"></label>
+<button type="submit">Go</button>
 <button type="button" onclick="pw.type = 'text'; pw.style.removeProperty('-webkit-text-security')">Reveal</button>
 <input name="cardnumber" autocomplete="cc-number" aria-label="Card number">
 </form></body></html>"#;
@@ -71,7 +78,8 @@ const TRICKY_PAGE: &str = r#"<!doctype html><html><head><title>Tricky</title></h
 /// Card fields recognized by name only (no autocomplete hints).
 const PLAIN_CHECKOUT: &str = r#"<!doctype html><html><head><title>Plain checkout</title></head><body>
 <h1>Pay</h1><form method="post" action="/pay">
-<label>Card number <input name="card_number"></label>
+<label>Card number <input name="card_number"
+  oninput="this.value = this.value.replace(/\D/g, '').replace(/(\d{4})(?=\d)/g, '$1 ')"></label>
 <label>Expiry <input name="expiry" placeholder="MM/YY"></label>
 <label>Security code <input name="security_code"></label>
 <label>Name on card <input name="name_on_card"></label>
@@ -289,6 +297,10 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
     let out = call("select_option", json!({"ref": lang, "value": "Deutsch"})).await;
     assert_eq!(out.text, "Selected \"Deutsch\".");
 
+    let shot = call("screenshot", json!({})).await;
+    assert!(shot.image.as_ref().is_some_and(|i| i.len() > 1000));
+    outputs.push(shot.text);
+
     let out = call("fill_login", json!({"site": "example.com"})).await;
     assert!(out.text.starts_with("not found"), "{}", out.text);
     let out = call("fill_login", json!({})).await;
@@ -299,9 +311,9 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
     assert!(out.text.contains("value=\"••••\""), "{}", out.text);
     outputs.push(out.text.clone());
 
+    // Never a picture of a page Iris typed a secret into.
     let shot = call("screenshot", json!({})).await;
-    assert!(shot.image.as_ref().is_some_and(|i| i.len() > 1000));
-    outputs.push(shot.text);
+    assert!(shot.is_error && shot.image.is_none(), "{}", shot.text);
 
     let sign_in = ref_of(&out.text, "button \"Sign in\"");
     let out = call("click", json!({"ref": sign_in})).await;
@@ -323,21 +335,29 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
         .await
         .expect("a frame")
         .unwrap();
-    let before = frames.borrow_and_update().as_ref().unwrap().json.clone();
+    let data = |json: &str| -> String {
+        serde_json::from_str::<Value>(json).unwrap()["data"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let before = data(&frames.borrow_and_update().as_ref().unwrap().json);
     call(
         "navigate",
         json!({"url": format!("http://127.0.0.1:{port}/about")}),
     )
     .await;
-    tokio::time::timeout(Duration::from_secs(10), frames.changed())
-        .await
-        .expect("a newer frame")
-        .unwrap();
-    let after = frames.borrow().as_ref().unwrap().json.clone();
-    assert_ne!(before, after);
+    // Wait for a frame whose pixels differ (not just a newer number).
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        frames.wait_for(|f| f.as_ref().is_some_and(|f| data(&f.json) != before)),
+    )
+    .await
+    .expect("a frame showing the new page")
+    .unwrap();
     // Nobody watching: the screencast stops.
     drop(watch_guard);
-    for _ in 0..50 {
+    for _ in 0..150 {
         if state.browser.running().unwrap().casting().is_none() {
             break;
         }
@@ -515,7 +535,37 @@ async fn reflected_secrets_pending_and_denied_cards_and_stale_refs() {
     // Still just the one card: a fresh "no" is not asked again at once.
     assert_eq!(approvals(&state, &conv).await.len(), 1);
 
-    // Card fields found by name alone are masked once filled.
+    // An OK for one origin never covers another (same host, other port).
+    let (port_b, _) = test_site().await;
+    call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/plain-checkout")}),
+    )
+    .await;
+    let out = call("fill_card", json!({})).await;
+    assert!(out.text.starts_with("waiting for approval"), "{}", out.text);
+    let pending = approvals(&state, &conv).await;
+    let (id, mut card) = (
+        pending.last().unwrap().id.clone(),
+        pending.last().unwrap().card.clone().unwrap(),
+    );
+    card["state"] = "approved".into();
+    state
+        .db
+        .call(move |db| crate::db::update_message_card(db, &id, &card))
+        .await
+        .unwrap();
+    call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port_b}/plain-checkout")}),
+    )
+    .await;
+    let out = call("fill_card", json!({})).await;
+    assert!(out.text.starts_with("waiting for approval"), "{}", out.text);
+    assert_eq!(approvals(&state, &conv).await.len(), pending.len() + 1);
+
+    // Card fields found by name alone are masked once filled, also when the
+    // page reformats the number; the rest of the form is filled too.
     let url = format!("http://127.0.0.1:{port}/plain-checkout");
     call("navigate", json!({"url": url})).await;
     let approver = {
@@ -623,9 +673,58 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
             .unwrap()
             .contains("••••")
     );
+    // Switching tabs and back: the app's status shows no echoed secret.
+    outputs.push(call("tabs", json!({"action": "new"})).await.text);
+    outputs.push(
+        call("tabs", json!({"action": "select", "index": 0}))
+            .await
+            .text,
+    );
+    let status = state.browser.state_json().to_string();
+    assert!(!leaks(&status), "{status}");
+    // A GET form puts the password in the address: redacted there too.
+    let snap = call("snapshot", json!({})).await;
+    let go = ref_of(&snap.text, "button \"Go\"");
+    let after = call("click", json!({"ref": go})).await;
+    assert!(after.text.contains("password=••••"), "{}", after.text);
+    outputs.push(after.text);
+    let status = state.browser.state_json().to_string();
+    assert!(!leaks(&status), "{status}");
     for o in &outputs {
         assert!(!leaks(o), "{o}");
     }
+
+    // A password too short to redact safely is not filled at all.
+    let ct = state
+        .vault
+        .encrypt(
+            json!({"password": "ab"}).to_string().as_bytes(),
+            "cred-login-local",
+        )
+        .unwrap();
+    let owner2 = owner.clone();
+    state
+        .db
+        .with(|c| {
+            crate::entities::update_credential(
+                c,
+                &owner2,
+                "cred-login-local",
+                None,
+                None,
+                Some(&ct),
+            )
+        })
+        .unwrap();
+    let url = format!("http://localhost:{port}/tricky");
+    call("navigate", json!({"url": url})).await;
+    let out = call("fill_login", json!({})).await;
+    assert!(
+        out.text
+            .starts_with("not found (the saved secret is too short"),
+        "{}",
+        out.text
+    );
 
     // A turn that ends while the browser is starting does nothing after.
     state.browser.close().await;
