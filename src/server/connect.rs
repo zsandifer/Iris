@@ -939,7 +939,7 @@ mod tests {
                     "new-at",
                     "new-rt",
                 ] {
-                    assert!(!b.contains(secret), "leaked {secret}: {b}");
+                    assert!(!b.contains(secret), "a test secret leaked into the response");
                 }
                 assert!(b.len() < 2500, "provider prose must be capped");
             }
