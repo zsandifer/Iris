@@ -284,7 +284,9 @@ impl StreamParser for ClaudeParser {
             return out;
         };
         // Ignore subagent traffic; only the top-level conversation is shown.
-        if v.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
+        // After a terminal event nothing else counts: a run reports exactly
+        // one (a signed-out run sends an auth error and then an error result).
+        if self.finished || v.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
             return out;
         }
         match v.get("type").and_then(Value::as_str) {
@@ -574,13 +576,20 @@ mod tests {
             json!({"type": "result", "subtype": "success", "is_error": true, "result": "Not logged in · Please run /login"}),
         ];
         let ev = run(&lines);
+        let terminals: Vec<_> = ev
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    HarnessEvent::Done
+                        | HarnessEvent::Error { .. }
+                        | HarnessEvent::AuthRequired { .. }
+                )
+            })
+            .collect();
         assert!(
-            ev.iter()
-                .any(|e| matches!(e, HarnessEvent::AuthRequired { .. }))
-        );
-        assert!(
-            !ev.iter()
-                .any(|e| matches!(e, HarnessEvent::Done | HarnessEvent::Error { .. }))
+            matches!(terminals[..], [HarnessEvent::AuthRequired { .. }]),
+            "exactly one terminal event: {terminals:?}"
         );
     }
 
