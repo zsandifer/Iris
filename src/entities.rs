@@ -46,15 +46,45 @@ pub struct FeedPost {
     pub image_url: Option<String>,
     /// The source page's original photos, in order.
     pub images: Vec<String>,
+    /// What the app shows for each of `images`, same order: the local copy
+    /// (`/api/feed/images/<file>`) when Iris cached it, else the original.
+    pub photos: Vec<String>,
     /// One line on why the user would like this post.
     pub why: Option<String>,
+    /// A short line for the story viewer (pipeline posts with a summary).
+    pub hook: Option<String>,
+    /// The source's own icon (original URL).
+    pub favicon_url: Option<String>,
+    /// What the app shows for the icon: the local copy when cached.
+    pub favicon: Option<String>,
+    /// rss | youtube | reddit | hn | bluesky | mastodon | price_drop, or
+    /// null for posts the agent wrote.
+    pub source_kind: Option<String>,
+    /// Facts read from the page: `{"price": {"amount", "currency"}}`,
+    /// `{"event": {"start_ms", "location"}}`, or `{}`.
+    pub facts: Value,
     pub liked: bool,
     pub discuss_conversation_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
+/// Local URL of a cached feed image.
+pub fn feed_image_path(file: &str) -> String {
+    format!("/api/feed/images/{file}")
+}
+
 fn feed_from_row(r: &rusqlite::Row) -> rusqlite::Result<FeedPost> {
+    let images: Vec<String> =
+        serde_json::from_str(&r.get::<_, String>("images")?).unwrap_or_default();
+    let cached: BTreeMap<String, String> =
+        serde_json::from_str(&r.get::<_, String>("cached")?).unwrap_or_default();
+    let shown = |u: &String| {
+        cached
+            .get(u)
+            .map_or_else(|| u.clone(), |f| feed_image_path(f))
+    };
+    let favicon_url: Option<String> = r.get("favicon_url")?;
     Ok(FeedPost {
         id: r.get("id")?,
         title: r.get("title")?,
@@ -63,13 +93,86 @@ fn feed_from_row(r: &rusqlite::Row) -> rusqlite::Result<FeedPost> {
         source_url: r.get("source_url")?,
         source_name: r.get("source_name")?,
         image_url: r.get("image_url")?,
-        images: serde_json::from_str(&r.get::<_, String>("images")?).unwrap_or_default(),
+        photos: images.iter().map(shown).collect(),
+        images,
         why: r.get("why")?,
+        hook: r.get("hook")?,
+        favicon: favicon_url.as_ref().map(shown),
+        favicon_url,
+        source_kind: r.get("source_kind")?,
+        facts: serde_json::from_str(&r.get::<_, String>("facts")?).unwrap_or_else(|_| json!({})),
         liked: r.get("liked")?,
         discuss_conversation_id: r.get("discuss_conversation_id")?,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
     })
+}
+
+/// A post built by the For you pipeline (`src/feed`).
+#[derive(Debug, Clone, Default)]
+pub struct PipelinePost {
+    pub title: String,
+    pub body: String,
+    pub hook: Option<String>,
+    pub why: Option<String>,
+    pub topic: Option<String>,
+    pub source_url: String,
+    pub source_name: String,
+    pub source_kind: String,
+    pub url_key: String,
+    pub images: Vec<String>,
+    pub favicon_url: Option<String>,
+    /// Original URL -> cached file name.
+    pub cached: BTreeMap<String, String>,
+    pub facts: Value,
+    pub created_at: i64,
+}
+
+pub fn insert_pipeline_post(
+    conn: &Connection,
+    user_id: &str,
+    p: &PipelinePost,
+) -> rusqlite::Result<FeedPost> {
+    let id = new_id();
+    let cut = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+    let opt = |v: &Option<String>, n: usize| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| cut(s, n))
+    };
+    let images: Vec<String> = p.images.iter().take(MAX_FEED_IMAGES).cloned().collect();
+    let facts = if p.facts.is_object() {
+        p.facts.clone()
+    } else {
+        json!({})
+    };
+    conn.execute(
+        "INSERT INTO feed_posts (id, user_id, title, body, topic, source_url, image_url, images,
+                                 source_name, why, hook, favicon_url, cached, source_kind, url_key,
+                                 facts, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
+        params![
+            id,
+            user_id,
+            cut(p.title.trim(), MAX_TITLE),
+            cut(p.body.trim(), MAX_BODY),
+            opt(&p.topic, 100),
+            p.source_url,
+            images.first(),
+            serde_json::to_string(&images).unwrap_or_else(|_| "[]".into()),
+            cut(p.source_name.trim(), 100),
+            opt(&p.why, 300),
+            opt(&p.hook, 200),
+            p.favicon_url,
+            serde_json::to_string(&p.cached).unwrap_or_else(|_| "{}".into()),
+            p.source_kind,
+            p.url_key,
+            facts.to_string(),
+            p.created_at
+        ],
+    )?;
+    get_feed_post(conn, user_id, &id).map(|p| p.expect("inserted"))
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -242,20 +345,6 @@ pub fn delete_feed_post(conn: &Connection, user_id: &str, id: &str) -> rusqlite:
         "DELETE FROM feed_posts WHERE id = ?1 AND user_id = ?2",
         params![id, user_id],
     )? > 0)
-}
-
-/// Recently liked topics/titles, used to steer feed generation.
-pub fn liked_feed_titles(
-    conn: &Connection,
-    user_id: &str,
-    limit: usize,
-) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT title FROM feed_posts WHERE user_id = ?1 AND liked = 1
-         ORDER BY updated_at DESC LIMIT ?2",
-    )?;
-    stmt.query_map(params![user_id, limit as i64], |r| r.get(0))?
-        .collect()
 }
 
 // -------------------------------------------------------------------- ideas
@@ -1127,7 +1216,7 @@ mod tests {
                 },
             )?;
             assert!(set_feed_liked(c, u, &p.id, true)?);
-            assert_eq!(liked_feed_titles(c, u, 5)?, vec!["Comet visible tonight"]);
+            assert!(get_feed_post(c, u, &p.id)?.unwrap().liked);
             assert_eq!(list_feed(c, u, None, 10)?.len(), 1);
             assert!(get_feed_post(c, "other", &p.id)?.is_none());
             let i = create_idea(

@@ -961,7 +961,7 @@ async fn run_job(
 ) -> Result<Response, ApiError> {
     user.require_owner()?;
     let job = crate::jobs::Job::parse(&name).ok_or_else(|| ApiError::not_found("job"))?;
-    let started = crate::jobs::trigger(&state, job);
+    let started = crate::jobs::trigger(&state, job, true);
     Ok((
         StatusCode::ACCEPTED,
         axum::Json(json!({"started": started})),

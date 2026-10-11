@@ -134,9 +134,8 @@ impl std::ops::Deref for AppState {
     }
 }
 
-pub const DEFAULT_FEED_PROMPT: &str = "Write a few short, genuinely interesting posts about \
-things I care about (see USER.md and PROACTIVE_PREFERENCES.md): news, ideas, or finds I would \
-want to see. Skip anything I have already seen in the feed.";
+pub const DEFAULT_FEED_PROMPT: &str = "News, ideas, and finds that fit what I care about (see \
+USER.md and PROACTIVE_PREFERENCES.md). Prefer original reporting and creators over aggregators.";
 
 impl AppState {
     pub fn new(cfg: Config, paths: Paths, db: Db) -> Result<Self> {

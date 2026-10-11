@@ -20,6 +20,16 @@ use std::path::{Component, PathBuf};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/feed", get(list_feed))
+        .route("/feed/status", get(feed_status))
+        .route("/feed/activity", post(feed_activity))
+        .route("/feed/resume", post(resume_feed))
+        .route("/feed/pause", post(pause_feed))
+        .route("/feed/sources", get(list_sources).post(add_source))
+        .route(
+            "/feed/sources/{id}",
+            axum::routing::patch(update_source).delete(delete_source),
+        )
+        .route("/feed/images/{name}", get(feed_image))
         .route("/feed/refresh", post(refresh_feed))
         .route("/feed/prompt", get(get_feed_prompt).put(put_feed_prompt))
         .route("/feed/{id}", axum::routing::delete(delete_feed_post))
@@ -92,7 +102,176 @@ async fn list_feed(
         .await?;
     let has_more = posts.len() > limit;
     posts.truncate(limit);
-    ok(json!({"posts": posts, "has_more": has_more}))
+    let status = crate::feed::status_json(&state, user.id()).await;
+    ok(json!({"posts": posts, "has_more": has_more, "status": status}))
+}
+
+async fn feed_status(State(state): State<AppState>, user: AuthUser) -> ApiResult {
+    ok(json!({"status": crate::feed::status_json(&state, user.id()).await}))
+}
+
+#[derive(Deserialize)]
+struct Activity {
+    event: String,
+}
+
+/// The app reports feed opens and reaching the end of today's posts; they
+/// drive the adaptive daily size and the two-week pause.
+async fn feed_activity(
+    State(state): State<AppState>,
+    user: AuthUser,
+    JsonBody(body): JsonBody<Activity>,
+) -> ApiResult {
+    if !matches!(body.event.as_str(), "opened" | "reached_end") {
+        return Err(ApiError::bad_request("event must be opened or reached_end"));
+    }
+    crate::feed::record_activity(&state, user.id(), &body.event).await?;
+    ok(json!({"ok": true}))
+}
+
+async fn resume_feed(State(state): State<AppState>, user: AuthUser) -> ApiResult {
+    let was_paused = crate::feed::resume(&state, user.id()).await?;
+    changed(&state, &user, "feed");
+    ok(
+        json!({"ok": true, "was_paused": was_paused, "status": crate::feed::status_json(&state, user.id()).await}),
+    )
+}
+
+/// Pause the daily posts by hand (no chat message; that is only for the
+/// automatic pause).
+async fn pause_feed(State(state): State<AppState>, user: AuthUser) -> ApiResult {
+    let uid = user.id().to_string();
+    state
+        .db
+        .call(move |c| {
+            crate::feed::store::update_state(c, &uid, |s| {
+                if !s.paused {
+                    s.paused = true;
+                    s.paused_by_user = true;
+                    s.paused_at = Some(crate::util::now_ms());
+                }
+            })
+        })
+        .await?;
+    changed(&state, &user, "feed");
+    ok(json!({"ok": true, "status": crate::feed::status_json(&state, user.id()).await}))
+}
+
+async fn list_sources(State(state): State<AppState>, user: AuthUser) -> ApiResult {
+    let uid = user.id().to_string();
+    let sources = state
+        .db
+        .call(move |c| crate::feed::store::list_sources(c, &uid))
+        .await?;
+    ok(json!({"sources": sources}))
+}
+
+#[derive(Deserialize)]
+struct NewSource {
+    /// A link, `r/name`, `@handle`, `user@instance`, `#tag`, or a YouTube
+    /// channel link.
+    input: String,
+    #[serde(default)]
+    topic: Option<String>,
+}
+
+async fn add_source(
+    State(state): State<AppState>,
+    user: AuthUser,
+    JsonBody(body): JsonBody<NewSource>,
+) -> ApiResult {
+    let (kind, value) =
+        crate::feed::sources::parse_input(&body.input).map_err(ApiError::bad_request)?;
+    let topic = body
+        .topic
+        .map(|t| t.trim().chars().take(40).collect::<String>())
+        .filter(|t| !t.is_empty());
+    let uid = user.id().to_string();
+    let (k, v) = (kind.clone(), value.clone());
+    let added = state
+        .db
+        .call(move |c| {
+            let added =
+                crate::feed::store::add_source(c, &uid, &k, &v, None, topic.as_deref(), "user")?;
+            if added.is_none() {
+                // Already there (maybe suggested or turned off): make it the
+                // user's own and turn it on.
+                c.execute(
+                    "UPDATE feed_sources SET origin = 'user', enabled = 1, fail_count = 0
+                     WHERE user_id = ?1 AND kind = ?2 AND value = ?3",
+                    rusqlite::params![uid, k, v],
+                )?;
+            }
+            let all = crate::feed::store::list_sources(c, &uid)?;
+            Ok(all.into_iter().find(|s| s.kind == k && s.value == v))
+        })
+        .await?
+        .ok_or_else(|| ApiError::not_found("source"))?;
+    ok(json!({"source": added}))
+}
+
+#[derive(Deserialize)]
+struct SourcePatch {
+    enabled: bool,
+}
+
+async fn update_source(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody<SourcePatch>,
+) -> ApiResult {
+    let uid = user.id().to_string();
+    let source = state
+        .db
+        .call(move |c| {
+            if !crate::feed::store::set_source_enabled(c, &uid, &id, body.enabled)? {
+                return Ok(None);
+            }
+            crate::feed::store::get_source(c, &uid, &id)
+        })
+        .await?
+        .ok_or_else(|| ApiError::not_found("source"))?;
+    ok(json!({"source": source}))
+}
+
+async fn delete_source(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let uid = user.id().to_string();
+    if !state
+        .db
+        .call(move |c| crate::feed::store::delete_source(c, &uid, &id))
+        .await?
+    {
+        return Err(ApiError::not_found("source"));
+    }
+    ok(json!({"ok": true}))
+}
+
+/// A cached feed photo or icon (the source's original image, stored
+/// locally so the phone does not contact third-party sites).
+async fn feed_image(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    if !crate::feed::images::valid_name(&name) {
+        return Err(ApiError::not_found("image"));
+    }
+    let mime = crate::feed::images::mime_for(&name).ok_or_else(|| ApiError::not_found("image"))?;
+    let path = crate::feed::images::dir(&state.paths.data_dir).join(&name);
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| ApiError::not_found("image"))?;
+    let mut res = file_response(mime, bytes);
+    res.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, max-age=604800, immutable"),
+    );
+    Ok(res)
 }
 
 #[derive(Deserialize)]
@@ -124,7 +303,18 @@ async fn like_feed_post(
     let pid = id.clone();
     if !state
         .db
-        .call(move |c| entities::set_feed_liked(c, &uid, &pid, liked))
+        .call(move |c| {
+            if !entities::set_feed_liked(c, &uid, &pid, liked)? {
+                return Ok(false);
+            }
+            // Saved products are watched for price drops.
+            if liked {
+                crate::feed::store::watch_post(c, &uid, &pid)?;
+            } else {
+                crate::feed::store::unwatch_post(c, &uid, &pid)?;
+            }
+            Ok(true)
+        })
         .await?
     {
         return Err(ApiError::not_found("post"));
@@ -185,7 +375,7 @@ async fn discuss_feed_post(
                     conversation_id: &conv.id,
                     role: "system",
                     kind: "card",
-                    content: &format!("Feed post \"{}\": {}", post.title, post.body),
+                    content: &discussion_context(&post),
                     card: Some(&card),
                     ..Default::default()
                 },
@@ -202,9 +392,24 @@ async fn discuss_feed_post(
     ok(json!({"conversation": conv}))
 }
 
+/// What the agent sees about a post when the user wants to talk about it.
+fn discussion_context(post: &entities::FeedPost) -> String {
+    let mut s = format!("Feed post \"{}\": {}", post.title, post.body);
+    if let Some(src) = post.source_name.as_deref().filter(|s| !s.is_empty()) {
+        s.push_str(&format!("\nSource: {src}"));
+    }
+    if let Some(url) = post.source_url.as_deref().filter(|s| !s.is_empty()) {
+        s.push_str(&format!("\nLink: {url}"));
+    }
+    if let Some(why) = post.why.as_deref().filter(|s| !s.is_empty()) {
+        s.push_str(&format!("\nWhy it was picked: {why}"));
+    }
+    s
+}
+
 async fn refresh_feed(State(state): State<AppState>, user: AuthUser) -> Result<Response, ApiError> {
     user.require_owner()?;
-    let started = crate::jobs::trigger(&state, crate::jobs::Job::Feed);
+    let started = crate::jobs::trigger(&state, crate::jobs::Job::Feed, true);
     Ok((
         StatusCode::ACCEPTED,
         axum::Json(json!({"started": started})),

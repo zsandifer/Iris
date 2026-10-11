@@ -547,57 +547,164 @@ async fn assess_turn(state: &AppState, input: &TurnInput) -> Assessment {
 /// Optional: ask the `classifier` slot's model about an ambiguous message.
 /// One short, tool-less, session-less run; None on any failure.
 async fn refine_with_model(state: &AppState, text: &str) -> Option<Effort> {
-    let (res, pin) = state.resolve_slot(Slot::Classifier, false).await;
-    let model_id = res.effective?;
-    let catalog = state.catalog();
-    let m = catalog.get(&model_id)?;
-    let entry = state.harness(&m.harness)?;
-    let program = entry.program()?;
-    let effort = pin
-        .and_then(|p| p.effort)
-        .or_else(|| crate::ranking::default_effort(m));
-    let spec = TurnSpec {
-        turn_id: new_id(),
-        prompt: classifier::model_prompt(text),
-        images: Vec::new(),
-        system_prompt: "You classify requests. Answer with one word.".into(),
-        model: m.model.clone(),
-        effort,
-        resume: None,
-        mcp_servers: Vec::new(),
-        cwd: state.paths.workspace_dir(),
-        writable_dirs: Vec::new(),
-        run_dir: state.paths.run_dir(),
-        scope: "classifier".into(),
-    };
-    let invocation = entry.harness.build(&spec).ok()?;
-    let strip = state.strip_env(entry);
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
-    let run = runner::run(
-        RunRequest {
-            program: &program,
-            invocation: &invocation,
-            cwd: &spec.cwd,
-            env_remove: &strip,
+    let reply = one_shot(
+        state,
+        OneShotRequest {
+            slot: Slot::Classifier,
+            system_prompt: "You classify requests. Answer with one word.",
+            prompt: &classifier::model_prompt(text),
             timeout: Duration::from_secs(30),
+            scope: "classifier",
+            max_attempts: 1,
+            // Runs inside a chat turn that already holds a CLI slot.
+            take_slot: false,
         },
-        entry.harness.parser(&[]),
-        cancel_rx,
-        tx,
     )
-    .await;
-    for f in &invocation.temp_files {
-        let _ = std::fs::remove_file(f);
-    }
-    run.ok()?;
-    let mut reply = String::new();
-    while let Ok(ev) = rx.try_recv() {
-        if let HarnessEvent::TextDelta { text } = ev {
-            reply.push_str(&text);
+    .await
+    .ok()?;
+    classifier::parse_model_reply(&reply.text)
+}
+
+/// A single tool-less, session-less model call (no persona, no MCP).
+pub struct OneShotRequest<'a> {
+    pub slot: Slot,
+    pub system_prompt: &'a str,
+    pub prompt: &'a str,
+    pub timeout: Duration,
+    /// Names the run's private temp files.
+    pub scope: &'a str,
+    /// Engines to try: the slot's model first, then the next-ranked model
+    /// on a different CLI when one is signed out or fails.
+    pub max_attempts: usize,
+    /// Wait for a free CLI slot (`max_concurrent_turns`) first.
+    pub take_slot: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct OneShotReply {
+    pub text: String,
+    /// Catalog id of the model that answered, e.g. "claude:haiku".
+    pub model: String,
+    pub harness: String,
+}
+
+/// Run one prompt on a slot's model and return the reply text. Used for
+/// small helper calls (effort classification, the feed's daily interests
+/// and summaries). Personal context only.
+pub async fn one_shot(state: &AppState, req: OneShotRequest<'_>) -> Result<OneShotReply, String> {
+    let (res, pin) = state.resolve_slot(req.slot, false).await;
+    let catalog = state.catalog();
+    let mut candidates: Vec<String> = res.effective.iter().cloned().collect();
+    for id in &res.ranked {
+        if !candidates.contains(id) {
+            candidates.push(id.clone());
         }
     }
-    classifier::parse_model_reply(&reply)
+    let mut tried_harnesses: Vec<String> = Vec::new();
+    let mut last_error = "no usable engine".to_string();
+    for model_id in candidates {
+        if tried_harnesses.len() >= req.max_attempts.max(1) {
+            break;
+        }
+        let Some(m) = catalog.get(&model_id) else {
+            continue;
+        };
+        if tried_harnesses.contains(&m.harness) {
+            continue;
+        }
+        let Some(entry) = state.harness(&m.harness).filter(|e| e.usable()) else {
+            continue;
+        };
+        let Some(program) = entry.program() else {
+            continue;
+        };
+        tried_harnesses.push(m.harness.clone());
+        let effort = pin
+            .as_ref()
+            .filter(|p| p.model == model_id)
+            .and_then(|p| p.effort.clone())
+            .or_else(|| crate::ranking::default_effort(m));
+        let spec = TurnSpec {
+            turn_id: new_id(),
+            prompt: req.prompt.to_string(),
+            images: Vec::new(),
+            system_prompt: req.system_prompt.to_string(),
+            model: m.model.clone(),
+            effort,
+            resume: None,
+            mcp_servers: Vec::new(),
+            cwd: state.paths.workspace_dir(),
+            writable_dirs: Vec::new(),
+            run_dir: state.paths.run_dir(),
+            scope: req.scope.to_string(),
+        };
+        let invocation = match entry.harness.build(&spec) {
+            Ok(i) => i,
+            Err(e) => {
+                last_error = format!("could not build command: {e}");
+                continue;
+            }
+        };
+        let _permit = if req.take_slot {
+            Some(state.limiter.acquire().await)
+        } else {
+            None
+        };
+        let strip = state.strip_env(entry);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let run = runner::run(
+            RunRequest {
+                program: &program,
+                invocation: &invocation,
+                cwd: &spec.cwd,
+                env_remove: &strip,
+                timeout: req.timeout,
+            },
+            entry.harness.parser(&[]),
+            cancel_rx,
+            tx,
+        )
+        .await;
+        for f in &invocation.temp_files {
+            let _ = std::fs::remove_file(f);
+        }
+        let mut text = String::new();
+        let mut terminal: Option<Terminal> = None;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                HarnessEvent::TextDelta { text: t } => text.push_str(&t),
+                HarnessEvent::Done => terminal = Some(Terminal::Done),
+                HarnessEvent::AuthRequired { message } => terminal = Some(Terminal::Auth(message)),
+                HarnessEvent::Error { message } => terminal = Some(Terminal::Error(message)),
+                _ => {}
+            }
+        }
+        match (run, terminal) {
+            (Ok(out), _) if out.timed_out => {
+                last_error = format!("no result after {}s", req.timeout.as_secs());
+            }
+            (Ok(_), Some(Terminal::Done)) => {
+                state.note_auth(&m.harness, AuthState::Ok, None).await;
+                return Ok(OneShotReply {
+                    text,
+                    model: model_id,
+                    harness: m.harness.clone(),
+                });
+            }
+            (Ok(_), Some(Terminal::Auth(message))) => {
+                crate::warn!("{}: {} is not signed in", req.scope, m.harness);
+                state
+                    .note_auth(&m.harness, AuthState::AuthRequired, Some(message))
+                    .await;
+                last_error = format!("{} is signed out", m.harness);
+            }
+            (Ok(_), Some(Terminal::Error(e))) => last_error = truncate_chars(&e, 300),
+            (Ok(_), None) => last_error = "the CLI exited without a result".into(),
+            (Err(e), _) => last_error = format!("could not start {}: {e}", m.harness),
+        }
+    }
+    Err(last_error)
 }
 
 /// In a shared conversation where Claude is the only engine, explain once

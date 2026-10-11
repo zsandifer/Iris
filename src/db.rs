@@ -224,6 +224,81 @@ CREATE INDEX feed_posts_liked ON feed_posts(user_id, liked);
 -- Goals the agent suggested and the user has not confirmed yet.
 ALTER TABLE goals ADD COLUMN suggested INTEGER NOT NULL DEFAULT 0;
 "#,
+    r#"
+-- The For you pipeline (src/feed). Posts gain a story hook, the source's
+-- favicon, local copies of their photos ({original url: cached file}),
+-- the source kind, a canonical link key, and page facts (price, event).
+ALTER TABLE feed_posts ADD COLUMN hook TEXT;
+ALTER TABLE feed_posts ADD COLUMN favicon_url TEXT;
+ALTER TABLE feed_posts ADD COLUMN cached TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE feed_posts ADD COLUMN source_kind TEXT;
+ALTER TABLE feed_posts ADD COLUMN url_key TEXT;
+ALTER TABLE feed_posts ADD COLUMN facts TEXT NOT NULL DEFAULT '{}';
+CREATE INDEX feed_posts_user_recent ON feed_posts(user_id, created_at);
+
+-- Where the pipeline looks. origin: user (added in the app), suggested (by
+-- the daily interests call), google (YouTube subscriptions).
+CREATE TABLE feed_sources (
+    id            TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind          TEXT NOT NULL CHECK (kind IN ('rss', 'youtube', 'reddit', 'hn', 'bluesky', 'mastodon')),
+    value         TEXT NOT NULL,
+    label         TEXT,
+    topic         TEXT,
+    origin        TEXT NOT NULL DEFAULT 'user' CHECK (origin IN ('user', 'suggested', 'google')),
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    state         TEXT NOT NULL DEFAULT '{}',
+    last_fetch_at INTEGER,
+    last_ok_at    INTEGER,
+    last_error    TEXT,
+    fail_count    INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    UNIQUE (user_id, kind, value)
+);
+
+-- Links and titles already shown, so nothing repeats.
+CREATE TABLE feed_seen (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    key     TEXT NOT NULL,
+    seen_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, key)
+);
+
+-- Per local day: posts published, feed opens, and whether the user reached
+-- the end of the day's posts (drives the adaptive daily size).
+CREATE TABLE feed_days (
+    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    day         TEXT NOT NULL,
+    published   INTEGER NOT NULL DEFAULT 0,
+    opened      INTEGER NOT NULL DEFAULT 0,
+    reached_end INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, day)
+);
+
+-- Prices of saved (liked) products, checked daily for drops.
+CREATE TABLE feed_watches (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    post_id     TEXT REFERENCES feed_posts(id) ON DELETE SET NULL,
+    url         TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    price       REAL NOT NULL,
+    currency    TEXT NOT NULL DEFAULT '',
+    checked_at  INTEGER,
+    created_at  INTEGER NOT NULL,
+    UNIQUE (user_id, url)
+);
+
+-- Notifications held during quiet hours, delivered as a digest after.
+CREATE TABLE push_queue (
+    id         TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    payload    TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX push_queue_user ON push_queue(user_id, created_at);
+"#,
 ];
 
 #[derive(Clone)]
