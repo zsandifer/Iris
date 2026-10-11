@@ -297,7 +297,32 @@ fn runtime(cfg: &Config) -> Result<tokio::runtime::Runtime> {
         .build()?)
 }
 
+/// Hold an exclusive lock on the data directory for this process's
+/// lifetime, so a second `iris serve` cannot clean up the first one's
+/// per-turn files or mark its replies interrupted.
+fn lock_data_dir(paths: &Paths) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    config::ensure_private_dir(&paths.data_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(paths.data_dir.join("serve.lock"))?;
+    // SAFETY: flock on a descriptor this function owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!(
+            "another `iris serve` is already using {}",
+            paths.data_dir.display()
+        )
+        .into());
+    }
+    Ok(file)
+}
+
 fn serve(cfg: Config, paths: Paths) -> Result<()> {
+    let _lock = lock_data_dir(&paths)?;
     persona::seed(&paths)?;
     // Leftover per-turn files from a crash.
     if let Ok(rd) = std::fs::read_dir(paths.run_dir()) {
@@ -415,6 +440,20 @@ mod tests {
 
     fn parse(s: &str) -> Args {
         Args::parse(s.split_whitespace().map(String::from)).unwrap()
+    }
+
+    #[test]
+    fn one_server_per_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        let first = lock_data_dir(&paths).unwrap();
+        let err = lock_data_dir(&paths).unwrap_err().to_string();
+        assert!(err.contains("already using"), "{err}");
+        drop(first);
+        assert!(lock_data_dir(&paths).is_ok(), "released with the process");
     }
 
     #[test]

@@ -191,7 +191,8 @@ Data directory layout:
 ├── run/             # per-turn private files (prompt, MCP config)
 ├── engines/         # CLIs installed from the app (single-user mode)
 ├── vault.key        # 32-byte key for encrypted secrets, 0600
-└── vapid.json       # Web Push key pair, 0600
+├── vapid.json       # Web Push key pair, 0600
+└── serve.lock       # held by the running `iris serve`
 ```
 
 ## Engines and models
