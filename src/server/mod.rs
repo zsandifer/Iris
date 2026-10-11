@@ -436,6 +436,13 @@ async fn delete_user(
         let _ = tokio::fs::remove_file(state.paths.uploads_dir().join(f)).await;
     }
     voice::forget_notes(&state, &removed.messages).await;
+    // Their Together chats are gone for everyone else too.
+    for c in &removed.conversations {
+        state.hub.to_users(
+            &removed.members,
+            json!({"type": "conversation.deleted", "conversation_id": c}),
+        );
+    }
     let dirs = state.dirs_for(&target);
     if let Some(root) = dirs.persona.parent()
         && root.starts_with(state.paths.people_dir())

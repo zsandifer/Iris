@@ -576,8 +576,11 @@ async fn read_system_file(
     Path(name): Path<String>,
 ) -> ApiResult {
     let f = system_file(&name).ok_or_else(|| ApiError::not_found("system file"))?;
-    let content = tokio::fs::read_to_string(system_file_path(&state.dirs_for(&user.user), f))
+    let path = system_file_path(&state.dirs_for(&user.user), f);
+    let content = tokio::task::spawn_blocking(move || crate::config::read_own_text(&path))
         .await
+        .ok()
+        .and_then(|r| r.ok())
         .unwrap_or_default();
     ok(json!({"name": f.name, "description": f.description, "content": content}))
 }
@@ -699,10 +702,10 @@ async fn read_file(
     if meta.len() as usize > MAX_TEXT_FILE {
         return Err(ApiError::bad_request("file is too large to edit here"));
     }
-    let bytes = tokio::fs::read(&path)
+    let content = tokio::task::spawn_blocking(move || crate::config::read_own_text(&path))
         .await
-        .map_err(|_| ApiError::not_found("file"))?;
-    let content = String::from_utf8(bytes).map_err(|_| ApiError::bad_request("not a text file"))?;
+        .map_err(|_| ApiError::not_found("file"))?
+        .map_err(|_| ApiError::bad_request("not a plain text file"))?;
     ok(json!({"area": area, "path": q.path, "content": content}))
 }
 

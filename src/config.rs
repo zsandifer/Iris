@@ -570,6 +570,29 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Read a person's text file only if it is really theirs: a regular file
+/// reached without following a symlink, with no other hard links. An agent
+/// that can write its own memory folder could otherwise plant a link to
+/// someone else's file and have Iris read it for them.
+pub fn read_own_text(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() || meta.nlink() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a plain file",
+        ));
+    }
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    Ok(s)
+}
+
 /// Atomically write a file readable only by the owner.
 pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write;

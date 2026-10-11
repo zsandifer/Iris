@@ -180,6 +180,14 @@ pub fn missing_tools() -> Option<&'static str> {
 /// Download `a` into `dir`, verifying size and SHA-256 while streaming.
 fn download(a: &Artifact, dir: &Path) -> Result<PathBuf> {
     let file = dir.join(format!("{}.tar.bz2", new_id()));
+    // Tests install from local archives through the same verification.
+    #[cfg(test)]
+    if let Some(local) = a.url.strip_prefix("file://") {
+        let out = std::fs::File::create(&file)?;
+        let copied = copy_hashed(std::fs::File::open(local)?, out, a.size);
+        verify_download(&file, copied, a)?;
+        return Ok(file);
+    }
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(60 * 60)))
         .timeout_connect(Some(Duration::from_secs(20)))
@@ -272,8 +280,7 @@ fn swap_into_place(root: &Path, from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-fn install_runtime(root: &Path, staging: &Path) -> Result<bool> {
-    let a = runtime_artifact()?;
+fn install_runtime(root: &Path, staging: &Path, a: &Artifact) -> Result<bool> {
     let dir = runtime_dir(root);
     if read_version(&dir).as_deref() == Some(a.id)
         && tts_bin(root).is_file()
@@ -312,8 +319,7 @@ fn install_runtime(root: &Path, staging: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn install_model(root: &Path, c: Component, staging: &Path) -> Result<bool> {
-    let a = c.model();
+fn install_model(root: &Path, c: Component, staging: &Path, a: &Artifact) -> Result<bool> {
     let dir = component_dir(root, c);
     if read_version(&dir).as_deref() == Some(a.id) {
         return Ok(false);
@@ -366,6 +372,15 @@ fn install_model(root: &Path, c: Component, staging: &Path) -> Result<bool> {
 /// runtime it needs (blocking). Idempotent: nothing is downloaded when
 /// the pinned versions are already in place.
 pub fn install(root: &Path, c: Component) -> Result<crate::engines::Report> {
+    install_from(root, c, runtime_artifact()?, c.model())
+}
+
+fn install_from(
+    root: &Path,
+    c: Component,
+    runtime: &Artifact,
+    model: &Artifact,
+) -> Result<crate::engines::Report> {
     std::fs::create_dir_all(root)?;
     // Both components share the runtime; one install at a time, also
     // across processes (the privileged helper runs as its own process).
@@ -373,9 +388,9 @@ pub fn install(root: &Path, c: Component) -> Result<crate::engines::Report> {
     clean_leftovers(root);
     let staging = root.join(format!(".staging-{}", new_id()));
     std::fs::create_dir_all(&staging)?;
-    let res = install_runtime(root, &staging).and_then(|rt| {
-        let model = install_model(root, c, &staging)?;
-        Ok(rt || model)
+    let res = install_runtime(root, &staging, runtime).and_then(|rt| {
+        let changed = install_model(root, c, &staging, model)?;
+        Ok(rt || changed)
     });
     let _ = std::fs::remove_dir_all(&staging);
     let changed = res?;
@@ -527,63 +542,42 @@ pub struct WavInfo {
     pub duration_ms: u64,
 }
 
-/// Parse and validate a RIFF/WAVE file (16-bit PCM only). Every length the
-/// header declares must fit inside the bytes actually present, so a tiny
-/// upload cannot claim gigabytes of audio (the decoder allocates from the
-/// declared size). Used to check uploads and to report a voice note's
-/// length.
+/// Parse and validate a WAV file. Only the canonical 44-byte layout is
+/// accepted (`RIFF`, one 16-byte PCM `fmt ` chunk, then one `data` chunk
+/// running exactly to the end of the file, 16-bit samples, whole frames),
+/// which is what the app and the voice program write. Anything else could
+/// be read differently by the native decoder, which allocates from the
+/// declared sizes, so it is refused. Used to check uploads and to report a
+/// voice note's length.
 pub fn wav_info(bytes: &[u8]) -> Option<WavInfo> {
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+    if bytes.len() <= 44 || &bytes[0..4] != b"RIFF" || &bytes[8..16] != b"WAVEfmt " {
         return None;
     }
-    let u16_at = |i: usize| Some(u16::from_le_bytes(bytes.get(i..i + 2)?.try_into().ok()?));
-    let u32_at = |i: usize| Some(u32::from_le_bytes(bytes.get(i..i + 4)?.try_into().ok()?));
-    let riff_end = (u32_at(4)? as usize).checked_add(8)?;
-    if riff_end > bytes.len() {
-        return None;
-    }
-    let mut pos = 12;
-    let mut fmt: Option<(u16, u16, u32, u16)> = None;
-    while pos + 8 <= riff_end {
-        let id = &bytes[pos..pos + 4];
-        let len = u32_at(pos + 4)? as usize;
-        let body = pos + 8;
-        let end = body.checked_add(len)?;
-        if end > riff_end {
-            return None;
-        }
-        if id == b"fmt " {
-            if len < 16 {
-                return None;
-            }
-            fmt = Some((
-                u16_at(body)?,
-                u16_at(body + 2)?,
-                u32_at(body + 4)?,
-                u16_at(body + 14)?,
-            ));
-        } else if id == b"data" {
-            let (format, channels, sample_rate, bits) = fmt?;
-            // 1 = PCM, 0xFFFE = extensible (PCM in practice for 16-bit).
-            if !(format == 1 || format == 0xFFFE) || channels == 0 || sample_rate == 0 || bits != 16
-            {
-                return None;
-            }
-            let frame = channels as usize * 2;
-            if len == 0 || len % frame != 0 {
-                return None;
-            }
-            let per_sec = sample_rate as u64 * frame as u64;
-            return Some(WavInfo {
-                channels,
-                sample_rate,
-                bits,
-                duration_ms: len as u64 * 1000 / per_sec,
-            });
-        }
-        pos = end + (len & 1);
-    }
-    None
+    let u16_at = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+    let u32_at =
+        |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+    let (riff, fmt_len, format) = (u32_at(4) as usize, u32_at(16), u16_at(20));
+    let (channels, sample_rate, byte_rate) = (u16_at(22), u32_at(24), u32_at(28));
+    let (block_align, bits) = (u16_at(32), u16_at(34));
+    let data_len = u32_at(40) as usize;
+    let frame = channels as usize * 2;
+    let ok = riff == bytes.len() - 8
+        && fmt_len == 16
+        && format == 1
+        && (1..=2).contains(&channels)
+        && (8_000..=48_000).contains(&sample_rate)
+        && bits == 16
+        && block_align as usize == frame
+        && byte_rate as usize == sample_rate as usize * frame
+        && &bytes[36..40] == b"data"
+        && data_len == bytes.len() - 44
+        && data_len % frame == 0;
+    ok.then(|| WavInfo {
+        channels,
+        sample_rate,
+        bits,
+        duration_ms: data_len as u64 * 1000 / (sample_rate as u64 * frame as u64),
+    })
 }
 
 // ------------------------------------------------------------------ speech
@@ -797,8 +791,10 @@ mod tests {
             1000
         );
         assert!(wav_info(&wav(1, 16000, 8, 100)).is_none());
-        // Declared lengths beyond the bytes present are refused.
-        let mut lying = wav(1, 16000, 16, 0);
+        assert!(wav_info(b"RIFF\0\0\0\0WAVE").is_none());
+        assert!(wav_info(b"\x89PNG....").is_none());
+        // Declared sizes must match the bytes present exactly.
+        let mut lying = wav(1, 16000, 16, 320);
         lying[40..44].copy_from_slice(&0x7fff_fffeu32.to_le_bytes());
         assert!(
             wav_info(&lying).is_none(),
@@ -807,10 +803,17 @@ mod tests {
         let mut riff = wav(1, 16000, 16, 320);
         riff[4..8].copy_from_slice(&0x7fff_fffeu32.to_le_bytes());
         assert!(wav_info(&riff).is_none(), "RIFF size larger than the file");
-        assert!(wav_info(&wav(2, 16000, 16, 3)).is_none(), "partial frame");
+        let mut extra = wav(1, 16000, 16, 320);
+        extra.extend_from_slice(b"LIST\x04\0\0\0abcd");
+        assert!(wav_info(&extra).is_none(), "trailing chunks");
+        let mut rate = wav(1, 16000, 16, 320);
+        rate[24..28].copy_from_slice(&1u32.to_le_bytes());
+        assert!(
+            wav_info(&rate).is_none(),
+            "implausible rate / inconsistent header"
+        );
+        assert!(wav_info(&wav(2, 16000, 16, 6)).is_none(), "partial frame");
         assert!(wav_info(&wav(1, 16000, 16, 0)).is_none(), "no audio");
-        assert!(wav_info(b"RIFF\0\0\0\0WAVE").is_none());
-        assert!(wav_info(b"\x89PNG....").is_none());
     }
 
     #[test]
@@ -835,62 +838,133 @@ mod tests {
         );
     }
 
-    /// Build a tar.bz2 shaped like the official runtime and models with
-    /// fake programs, and check the install layout and verification.
-    #[test]
-    fn install_layout_and_verification() {
-        if missing_tools().is_some() {
-            return;
+    /// A tar.bz2 of `files` (relative path -> contents) and its artifact.
+    fn archive(dir: &Path, name: &str, files: &[(&str, &str)]) -> Artifact {
+        let src = dir.join(format!("{name}-src"));
+        for (rel, body) in files {
+            let p = src.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
         }
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("src");
-        let rt = src.join("sherpa-onnx-v9-linux/bin");
-        std::fs::create_dir_all(&rt).unwrap();
-        std::fs::create_dir_all(src.join("sherpa-onnx-v9-linux/lib")).unwrap();
-        std::fs::write(rt.join("sherpa-onnx-offline-tts"), "#!/bin/sh\n").unwrap();
-        std::fs::write(rt.join("sherpa-onnx-offline"), "#!/bin/sh\n").unwrap();
-        std::fs::write(src.join("sherpa-onnx-v9-linux/lib/libonnxruntime.so"), "x").unwrap();
-        let archive = tmp.path().join("rt.tar.bz2");
-        let st = std::process::Command::new("tar")
+        let file = dir.join(format!("{name}.tar.bz2"));
+        let ok = std::process::Command::new("tar")
             .arg("-cjf")
-            .arg(&archive)
+            .arg(&file)
             .arg("-C")
             .arg(&src)
             .arg(".")
             .status()
-            .unwrap();
-        assert!(st.success());
-        let bytes = std::fs::read(&archive).unwrap();
-        let (hash, n) = copy_hashed(&bytes[..], std::io::sink(), u64::MAX).unwrap();
-        let good = Artifact {
-            id: "9",
-            url: "",
+            .unwrap()
+            .success();
+        assert!(ok);
+        let bytes = std::fs::read(&file).unwrap();
+        let (hash, size) = copy_hashed(&bytes[..], std::io::sink(), u64::MAX).unwrap();
+        Artifact {
+            id: Box::leak(format!("{name}-1").into_boxed_str()),
+            url: Box::leak(format!("file://{}", file.display()).into_boxed_str()),
             sha256: Box::leak(hash.into_boxed_str()),
-            size: n,
-        };
-        let bad = Artifact {
-            sha256: "00",
-            ..good
-        };
-        let f = tmp.path().join("copy.tar.bz2");
-        std::fs::write(&f, &bytes).unwrap();
-        let copied = copy_hashed(&bytes[..], std::io::sink(), u64::MAX);
-        assert!(verify_download(&f, copied, &bad).is_err());
-        assert!(!f.exists(), "a bad download is deleted");
-        std::fs::write(&f, &bytes).unwrap();
-        let copied = copy_hashed(&bytes[..], std::io::sink(), u64::MAX);
-        verify_download(&f, copied, &good).unwrap();
-        let x = tmp.path().join("x");
-        unpack(&f, &x, &[]).unwrap();
-        assert!(
-            find(&x, 3, &|n, d| !d && n == "sherpa-onnx-offline-tts").is_some(),
-            "found nested program"
+            size,
+        }
+    }
+
+    /// The whole install from archives shaped like the official ones:
+    /// runtime + Piper voice + Whisper, layout, repeat installs, and a
+    /// failed update that leaves the working install alone.
+    #[test]
+    fn installs_from_verified_archives() {
+        if missing_tools().is_some() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = archive(
+            tmp.path(),
+            "runtime",
+            &[
+                ("sherpa-onnx-v9-linux/bin/sherpa-onnx-offline-tts", "tts"),
+                ("sherpa-onnx-v9-linux/bin/sherpa-onnx-offline", "stt"),
+                ("sherpa-onnx-v9-linux/bin/other-tool", "x"),
+                ("sherpa-onnx-v9-linux/lib/libonnxruntime.so", "lib"),
+                ("sherpa-onnx-v9-linux/lib/libsherpa-onnx-c-api.so", "lib2"),
+            ],
+        );
+        let voice = archive(
+            tmp.path(),
+            "voice",
+            &[
+                ("vits-piper-x/en_US-x-medium.onnx", "model"),
+                ("vits-piper-x/en_US-x-medium.onnx.json", "{}"),
+                ("vits-piper-x/tokens.txt", "tokens"),
+                ("vits-piper-x/MODEL_CARD", "card"),
+                ("vits-piper-x/espeak-ng-data/phontab", "data"),
+            ],
+        );
+        let whisper = archive(
+            tmp.path(),
+            "whisper",
+            &[
+                ("w/base.en-encoder.onnx", "big"),
+                ("w/base.en-decoder.onnx", "big"),
+                ("w/base.en-encoder.int8.onnx", "enc"),
+                ("w/base.en-decoder.int8.onnx", "dec"),
+                ("w/base.en-tokens.txt", "tok"),
+                ("w/test_wavs/0.wav", "wav"),
+            ],
         );
         let root = tmp.path().join("engines");
-        std::fs::create_dir_all(component_dir(&root, Component::Tts)).unwrap();
-        std::fs::write(component_dir(&root, Component::Tts).join("VERSION"), "v").unwrap();
-        assert!(!installed(&root, Component::Tts), "runtime missing");
+        let r = install_from(&root, Component::Tts, &rt, &voice).unwrap();
+        assert!(r.changed && installed(&root, Component::Tts));
+        assert_eq!(std::fs::read_to_string(tts_bin(&root)).unwrap(), "tts");
+        assert!(runtime_dir(&root).join("lib/libonnxruntime.so").is_file());
+        assert!(
+            runtime_dir(&root)
+                .join("lib/libsherpa-onnx-c-api.so")
+                .is_file()
+        );
+        assert!(!runtime_dir(&root).join("bin/other-tool").exists());
+        let t = component_dir(&root, Component::Tts);
+        assert_eq!(
+            std::fs::read_to_string(t.join("model.onnx")).unwrap(),
+            "model"
+        );
+        assert!(t.join("espeak-ng-data/phontab").is_file() && t.join("tokens.txt").is_file());
+        // Whisper keeps only the int8 files; the runtime is shared.
+        let r = install_from(&root, Component::Stt, &rt, &whisper).unwrap();
+        assert!(r.changed && installed(&root, Component::Stt));
+        let w = component_dir(&root, Component::Stt);
+        assert_eq!(
+            std::fs::read_to_string(w.join("encoder.int8.onnx")).unwrap(),
+            "enc"
+        );
+        assert_eq!(
+            std::fs::read_dir(&w).unwrap().count(),
+            4,
+            "3 files + VERSION"
+        );
+        // Nothing to do the second time.
+        assert!(
+            !install_from(&root, Component::Tts, &rt, &voice)
+                .unwrap()
+                .changed
+        );
+        // A newer version whose download fails verification changes nothing.
+        let bad = Artifact {
+            id: "voice-2",
+            sha256: "00",
+            ..voice
+        };
+        assert!(install_from(&root, Component::Tts, &rt, &bad).is_err());
+        assert!(installed(&root, Component::Tts));
+        assert_eq!(read_version(&t).as_deref(), Some("voice-1"));
+        let leftovers = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".staging"))
+            .count();
+        assert_eq!(leftovers, 0);
+        // Removing one component keeps the shared runtime; the last takes it.
         uninstall(&root, Component::Tts).unwrap();
-        assert!(!component_dir(&root, Component::Tts).exists());
+        assert!(runtime_dir(&root).exists() && installed(&root, Component::Stt));
+        uninstall(&root, Component::Stt).unwrap();
+        assert!(!runtime_dir(&root).exists());
     }
 }

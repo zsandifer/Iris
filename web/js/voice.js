@@ -31,8 +31,14 @@ function player() {
     audio = new Audio();
     audio.preload = 'auto';
     audio.addEventListener('timeupdate', () => tick(audio.currentTime * 1000));
-    audio.addEventListener('ended', () => stopped());
-    audio.addEventListener('pause', () => { if (S.voice?.mode === 'server') setVoice({ playing: false }); });
+    audio.addEventListener('ended', () => { if (audio.dataset.mid && audio.dataset.mid === S.voice?.id) stopped(); });
+    // Paused outside the app (lock screen, headphones). Only the note this
+    // element is playing counts: a pause from a note being switched away
+    // from must not stop the next one while it loads.
+    audio.addEventListener('pause', () => {
+      const v = S.voice;
+      if (v?.mode === 'server' && v.playing && !v.loading && audio.dataset.mid === v.id) setVoice({ playing: false });
+    });
     audio.addEventListener('loadedmetadata', () => {
       if (Number.isFinite(audio.duration)) setVoice({ dur: Math.round(audio.duration * 1000) });
     });
@@ -56,6 +62,7 @@ export function unlockAudio() {
   unlocked = true;
   const a = player();
   a.src = silentUrl();
+  a.dataset.mid = '';
   a.play().catch(() => { unlocked = false; });
   try { if (synth && !serverVoice()) synth.speak(new SpeechSynthesisUtterance('')); } catch { /* not supported */ }
 }
@@ -146,6 +153,7 @@ export async function play(m) {
       if (playGen !== my || S.voice?.id !== m.id || !S.voice.playing) return;
       const a = player();
       if (a.src !== n.url) a.src = n.url;
+      a.dataset.mid = m.id;
       setVoice({ loading: false, dur: n.dur });
       await a.play();
     } catch (e) {

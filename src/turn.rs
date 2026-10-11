@@ -295,7 +295,17 @@ async fn run_locked(
             Some(u) => state.agent_name_for(u).await,
             None => state.agent_name().await,
         };
-        let persona_hash = persona::persona_hash(&dirs, &agent_name, &ctx.kind);
+        // Who the prompt is for is part of the fingerprint: a group that
+        // gains a member (personal -> shared) or a renamed person gets a
+        // session that matches the new prompt.
+        let persona_hash = persona::persona_hash(
+            &dirs,
+            &agent_name,
+            &format!(
+                "{}|shared={shared}|user={}",
+                ctx.kind, host_user.display_name
+            ),
+        );
         let mut session = if fresh_session {
             None
         } else {
@@ -310,7 +320,9 @@ async fn run_locked(
         if session
             .as_ref()
             .is_some_and(|s| s.persona_hash != persona_hash)
-            && !entry.harness.resume_updates_system_prompt()
+            // A session that saw a personal prompt never continues in a
+            // shared chat, whatever the CLI does with new instructions.
+            && (shared || !entry.harness.resume_updates_system_prompt())
         {
             // The CLI would keep the old persona; start over with replay.
             routing_notes.push("persona changed; started a new session".into());
@@ -589,7 +601,10 @@ async fn assess_turn(state: &AppState, input: &TurnInput, for_others: bool) -> A
         very_long_chars: state.cfg.router.very_long_chars,
     };
     let mut a = classifier::assess(&input.user_message.content, &turns, &thresholds);
+    // The optional model classifier runs a CLI in the owner's workspace, so
+    // it only looks at the owner's own messages.
     if state.cfg.router.classifier_model
+        && !for_others
         && a.ambiguous
         && let Some(effort) =
             refine_with_model(state, &input.user_message.content, for_others).await
@@ -796,8 +811,13 @@ async fn private_paths(
             out.extend(state.dirs_for(&u).all().into_iter().cloned());
         }
     }
-    // Other Together chats' folders.
-    if let Ok(rd) = std::fs::read_dir(p.data_dir.join("together")) {
+    // Together chats' folders: all of them for a personal turn (one rule),
+    // the other ones for a shared turn (their folders go when they are
+    // deleted, so this stays as short as the list of Together chats).
+    let together = p.data_dir.join("together");
+    if !shared {
+        out.push(together);
+    } else if let Ok(rd) = std::fs::read_dir(&together) {
         out.extend(rd.flatten().map(|e| e.path()).filter(|d| d != cwd));
     }
     out.extend(cli_data_paths());

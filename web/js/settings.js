@@ -350,7 +350,12 @@ export function People() {
   const remove = async (u) => {
     closeSheet();
     if (!(await confirmSheet({ title: `Remove ${u.display_name}?`, body: `Their ${agentName()}, chats, memory, feed, goals, and devices are deleted. This can't be undone.`, yes: 'Remove', danger: true }))) return;
-    try { await del(`/users/${u.id}`); load(); toast(`${u.display_name} was removed`); } catch (e) { toast(e.message); }
+    try {
+      await del(`/users/${u.id}`);
+      load();
+      loadConvs().catch(() => {});
+      toast(`${u.display_name} was removed`);
+    } catch (e) { toast(e.message); }
   };
   const menu = (u) => openSheet(() => html`<div class="sheet-body"><h3>${u.display_name}</h3>
     <p class="mu">${u.devices ? `${u.devices} device${u.devices === 1 ? '' : 's'} paired` : 'No device paired yet'} · added ${since(u.created_at)}</p>

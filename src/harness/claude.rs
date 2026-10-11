@@ -166,9 +166,15 @@ impl Harness for Claude {
         }
         let denied = deny_rules(&spec.private_paths);
         if !denied.is_empty() {
-            // Variadic like --allowedTools; only flags follow.
-            a.push("--disallowedTools".into());
-            a.push(denied.join(","));
+            // Permission deny rules in a per-turn settings file (layered over
+            // the user's own settings, which are never edited); a file keeps
+            // any number of paths off the command line.
+            let file = spec.run_dir.join(format!("{}.settings.json", spec.turn_id));
+            let body = serde_json::to_vec(&json!({"permissions": {"deny": denied}}))?;
+            write_private_file(&file, &body)?;
+            inv.temp_files.push(file.clone());
+            a.push("--settings".into());
+            a.push(file.to_string_lossy().into_owned());
         }
         for dir in &spec.writable_dirs {
             a.push("--add-dir".into());
@@ -688,18 +694,20 @@ mod tests {
             .build(&spec)
             .unwrap();
         let args = inv.args.join(" ");
-        let i = inv
-            .args
-            .iter()
-            .position(|a| a == "--disallowedTools")
-            .unwrap();
+        let i = inv.args.iter().position(|a| a == "--settings").unwrap();
+        let settings: Value =
+            serde_json::from_slice(&std::fs::read(&inv.args[i + 1]).unwrap()).unwrap();
         let other = tmp.path().join("other").display().to_string();
         let key = tmp.path().join("vault.key").display().to_string();
         assert_eq!(
-            inv.args[i + 1],
-            format!("Read(/{other}/**),Edit(/{other}/**),Read(/{key}),Edit(/{key})")
+            settings["permissions"]["deny"],
+            json!([
+                format!("Read(/{other}/**)"),
+                format!("Edit(/{other}/**)"),
+                format!("Read(/{key})"),
+                format!("Edit(/{key})")
+            ])
         );
-        assert!(inv.args[i + 2].starts_with("--"), "followed by a flag");
         assert!(deny_rules(&["/a,b".into(), "rel".into()]).is_empty());
         assert_eq!(
             deny_rules(&["/no/such/dir".into()]),
@@ -715,7 +723,7 @@ mod tests {
         assert!(args.contains("--system-prompt-snapshot off"));
         assert!(args.contains("--permission-prompts none"));
         assert!(args.contains("--allowedTools Read,Glob,Grep,WebSearch,WebFetch,mcp__iris"));
-        assert_eq!(inv.temp_files.len(), 2);
+        assert_eq!(inv.temp_files.len(), 3, "prompt, MCP config, settings");
         let mcp: Value =
             serde_json::from_slice(&std::fs::read(&inv.temp_files[1]).unwrap()).unwrap();
         assert_eq!(mcp["mcpServers"]["iris"]["command"], "/usr/bin/iris");

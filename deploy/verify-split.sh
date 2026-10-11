@@ -174,6 +174,26 @@ if [ "$AGENT_USER" = "iris-agent" ] || systemctl cat iris >/dev/null 2>&1; then
     else
         fail "iris.service is not running: journalctl -u iris -n 50"
     fi
+else
+    # Existing-account mode: Iris is that account's systemd user service.
+    AUID=$(id -u "$AGENT_USER")
+    as_user() { runuser -u "$AGENT_USER" -- env HOME="$AGENT_HOME" XDG_RUNTIME_DIR="/run/user/$AUID" "$@"; }
+    if [ "$(as_user systemctl --user show iris -p NoNewPrivileges --value 2>/dev/null)" = no ]; then
+        pass "$AGENT_USER's iris user service allows sudo for the helper (NoNewPrivileges=no)"
+    else
+        fail "$AGENT_USER's iris user service sets NoNewPrivileges or was not found (systemctl --user cat iris)"
+    fi
+    if as_user systemctl --user is-active --quiet iris 2>/dev/null; then
+        pass "$AGENT_USER's iris user service is running"
+        if as_user systemd-run --user --wait --quiet --collect --pipe -p NoNewPrivileges=no \
+            sudo -n -u "$ADMIN_USER" "$IRIS_BIN" engines list --dir "$ENGINES_DIR" 2>/dev/null | grep -q '^\['; then
+            pass "the helper works from $AGENT_USER's user services"
+        else
+            fail "the helper fails from $AGENT_USER's user services"
+        fi
+    else
+        fail "$AGENT_USER's iris user service is not running (needs loginctl enable-linger $AGENT_USER)"
+    fi
 fi
 if command -v curl >/dev/null 2>&1; then
     if curl -sf "$URL/api/health" | grep -q '"ok":true'; then pass "Iris answers at $URL"; else fail "no answer from $URL/api/health"; fi

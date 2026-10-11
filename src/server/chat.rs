@@ -232,10 +232,20 @@ async fn delete_conversation(
     }
     require_creator(&state, &user, &conv).await?;
     turn::cancel(&state, &id);
-    state
+    let cid = id.clone();
+    let members = state
         .db
-        .call(move |c| db::delete_conversation(c, &id))
+        .call(move |c| {
+            let members = db::conversation_member_ids(c, &cid)?;
+            db::delete_conversation(c, &cid)?;
+            Ok(members)
+        })
         .await?;
+    let _ = tokio::fs::remove_dir_all(state.paths.together_dir(&id)).await;
+    state.hub.to_users(
+        &members,
+        json!({"type": "conversation.deleted", "conversation_id": id}),
+    );
     ok(json!({"ok": true}))
 }
 

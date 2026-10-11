@@ -224,6 +224,17 @@ CREATE INDEX feed_posts_liked ON feed_posts(user_id, liked);
 -- Goals the agent suggested and the user has not confirmed yet.
 ALTER TABLE goals ADD COLUMN suggested INTEGER NOT NULL DEFAULT 0;
 "#,
+    r#"
+-- People get their own Iris. Before this, other people's chats and shared
+-- chats ran with the owner's persona, memory, and folders, and CLI
+-- sessions keep everything they saw. Drop those sessions so the next turn
+-- starts fresh (replaying only the chat's own messages).
+DELETE FROM harness_sessions WHERE conversation_id IN (
+    SELECT c.id FROM conversations c LEFT JOIN users u ON u.id = c.created_by
+    WHERE COALESCE(u.is_owner, 0) = 0
+       OR (SELECT COUNT(*) FROM conversation_members m WHERE m.conversation_id = c.id) > 1
+);
+"#,
 ];
 
 #[derive(Clone)]
@@ -373,6 +384,8 @@ pub struct RemovedPerson {
     pub conversations: Vec<String>,
     /// Messages that were deleted (their cached voice notes).
     pub messages: Vec<String>,
+    /// Other people who were members of the deleted conversations.
+    pub members: Vec<String>,
 }
 
 /// Remove a person (never the owner) and everything that is only theirs:
@@ -381,6 +394,14 @@ pub struct RemovedPerson {
 /// their uploads no remaining message shows. `None` for the owner or an
 /// unknown id.
 pub fn delete_person(conn: &Connection, id: &str) -> rusqlite::Result<Option<RemovedPerson>> {
+    // All or nothing: one transaction, taken before anything is read.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let out = delete_person_in(&tx, id)?;
+    tx.commit()?;
+    Ok(out)
+}
+
+fn delete_person_in(conn: &Connection, id: &str) -> rusqlite::Result<Option<RemovedPerson>> {
     let Some(u) = get_user(conn, id)? else {
         return Ok(None);
     };
@@ -397,6 +418,11 @@ pub fn delete_person(conn: &Connection, id: &str) -> rusqlite::Result<Option<Rem
         messages: strings(
             "SELECT m.id FROM messages m JOIN conversations c ON c.id = m.conversation_id
              WHERE c.created_by = ?1",
+        )?,
+        members: strings(
+            "SELECT DISTINCT m.user_id FROM conversation_members m
+             JOIN conversations c ON c.id = m.conversation_id
+             WHERE c.created_by = ?1 AND m.user_id != ?1",
         )?,
         ..Default::default()
     };
@@ -1303,5 +1329,33 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn upgrade_drops_sessions_that_saw_the_owners_persona() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..2] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute_batch(
+            "INSERT INTO users VALUES ('o', 'Owner', 1, 0), ('s', 'Sam', 0, 0);
+             INSERT INTO conversations (id, kind, created_by, created_at, updated_at) VALUES
+                 ('own', 'main', 'o', 0, 0), ('sam', 'main', 's', 0, 0), ('grp', 'group', 'o', 0, 0);
+             INSERT INTO conversation_members (conversation_id, user_id, joined_at) VALUES
+                 ('own', 'o', 0), ('sam', 's', 0), ('grp', 'o', 0), ('grp', 's', 0);
+             INSERT INTO harness_sessions (conversation_id, harness, session_id, updated_at) VALUES
+                 ('own', 'claude', 'a', 0), ('sam', 'claude', 'b', 0), ('grp', 'codex', 'c', 0);",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        let left: Vec<String> = conn
+            .prepare("SELECT conversation_id FROM harness_sessions")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(left, ["own"], "only the owner's own chat keeps its session");
     }
 }

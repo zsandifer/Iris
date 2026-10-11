@@ -206,7 +206,7 @@ pub fn assemble(dirs: &PersonDirs, ctx: &PromptContext) -> String {
         .iter()
         .filter(|f| f.in_prompt && (!ctx.shared || SHARED_FILES.contains(&f.name)))
     {
-        let Ok(body) = std::fs::read_to_string(system_file_path(dirs, f)) else {
+        let Ok(body) = crate::config::read_own_text(&system_file_path(dirs, f)) else {
             continue;
         };
         let body = body.replace("{{agent_name}}", name);
@@ -262,7 +262,7 @@ pub fn assemble(dirs: &PersonDirs, ctx: &PromptContext) -> String {
                 ));
             }
         }
-        if let Ok(body) = std::fs::read_to_string(memory_dir.join("MEMORY.md")) {
+        if let Ok(body) = crate::config::read_own_text(&memory_dir.join("MEMORY.md")) {
             let body = body.trim();
             if !body.is_empty() {
                 out.push_str(&format!(
@@ -347,7 +347,7 @@ pub fn persona_hash(dirs: &PersonDirs, agent_name: &str, conversation_kind: &str
         .filter(|f| f.in_prompt || f.name == "MEMORY.md")
     {
         h.update([0]);
-        h.update(std::fs::read(system_file_path(dirs, f)).unwrap_or_default());
+        h.update(crate::config::read_own_text(&system_file_path(dirs, f)).unwrap_or_default());
     }
     crate::util::hex(&h.finalize()[..12])
 }
@@ -392,9 +392,20 @@ pub fn is_text_note(path: &Path) -> bool {
 /// First Markdown heading or first non-empty line, truncated.
 fn note_title(path: &Path) -> String {
     use std::io::{BufRead, BufReader};
-    let Ok(f) = std::fs::File::open(path) else {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let Ok(f) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    else {
         return String::new();
     };
+    // Same rule as `read_own_text`: no links to other people's files.
+    if f.metadata()
+        .map_or(true, |m| !m.is_file() || m.nlink() != 1)
+    {
+        return String::new();
+    }
     for line in BufReader::new(f).lines().take(20).map_while(|l| l.ok()) {
         let t = line.trim().trim_start_matches('#').trim();
         if !t.is_empty() && !t.starts_with("<!--") && t != "---" {

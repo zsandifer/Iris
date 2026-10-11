@@ -1439,8 +1439,10 @@ Response `200`:
 private temporary file, transcribed, and deleted; it is never stored or
 logged.
 
-Every length in the header must fit inside the uploaded bytes (no
-truncated or oversized chunks, whole frames only).
+Only the canonical 44-byte WAV layout is accepted (one 16-byte PCM `fmt `
+chunk, then one `data` chunk running exactly to the end of the file, rate
+8 to 48 kHz, whole frames): what the app and the voice program write. Any
+other layout could be read differently by the native decoder.
 
 Errors: `415 unsupported_media_type` (not a valid 16-bit PCM WAV), `413
 too_large`, `503 voice_unavailable` (no speech-to-text on the server),
@@ -1585,6 +1587,7 @@ was emitted). Events are delivered only to the users listed under
 | `models.changed` | `{"slots": [{Slot}]}` | All users |
 | `harness.login` | `{"login": {LoginStatus}}` | The owner |
 | `engines.changed` | `{"engines": [...]}` (as in `GET /api/engines`) | All users |
+| `conversation.deleted` | `{"conversation_id"}` | The members of a conversation that was deleted (`DELETE /api/conversations/{id}`, or a removed person's chats) |
 | `agent.changed` | `{"agent": {"user_id", "name", "avatar_url", "avatar_custom"}}` | The other members of Together chats that person's Iris hosts, when they rename it or change its picture |
 
 Example:
@@ -1690,12 +1693,17 @@ After `POST /api/conversations/{id}/messages` (or `POST
    folders, Iris's own state (database, keys, per-turn files, uploads,
    library, voice cache), and the CLIs' own data folders (`~/.claude`,
    `~/.codex`, ... which hold every session's transcript), and in shared
-   chats the host's folders too: Claude Code through permission deny rules,
+   chats the host's folders too: Claude Code through permission deny rules
+   (a per-turn `--settings` file),
    Codex through a permission profile with `deny` entries (instead of
    `sandbox_mode`). Gemini CLI and OpenCode keep their file tools inside the
    turn's own folders and reject shell commands headless. A turn still
    waiting in the queue when its conversation or person is deleted is
-   dropped without running.
+   dropped without running. A session that saw a personal prompt is never
+   resumed in a shared chat (the session fingerprint includes whether the
+   chat is shared and the person's name), and upgrading drops the sessions
+   of other people's chats and shared chats from before people had their
+   own Iris.
 5. While the CLI runs, Iris emits `message.delta` and `message.activity`.
 6. On a "not signed in" error with no text yet, the harness is marked
    `auth_required` (a `harness.status` event, plus a reconnect card if the

@@ -43,6 +43,7 @@ prev=""
 for a in "$@"; do
   if [ "$prev" = "--append-system-prompt-file" ]; then cp "$a" "$out/prompt"; fi
   if [ "$prev" = "--mcp-config" ]; then cp "$a" "$out/mcp"; fi
+  if [ "$prev" = "--settings" ]; then cp "$a" "$out/settings"; fi
   prev="$a"
 done
 input=$(cat)
@@ -245,7 +246,8 @@ fn last_turn(h: &H) -> (String, String, String, String) {
     let dir = turns.join((n - 1).to_string());
     let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
     (
-        read("args"),
+        // The command line plus the per-turn settings (deny rules).
+        format!("{}\n{}", read("args"), read("settings")),
         read("cwd").trim().to_string(),
         read("prompt"),
         read("mcp"),
@@ -340,6 +342,41 @@ async fn each_person_has_their_own_iris() {
     assert_eq!(s, StatusCode::OK);
     assert!(dirs.memory.join("notes/a.md").is_file());
     assert!(!h.state.paths.memory_dir().join("notes/a.md").exists());
+
+    // A link planted in Sam's writable memory folder never reads the
+    // owner's file (symlink or hard link), neither here nor in prompts.
+    let sam_mem = dirs.memory.join("MEMORY.md");
+    std::fs::remove_file(&sam_mem).unwrap();
+    std::os::unix::fs::symlink(h.state.paths.memory_dir().join("MEMORY.md"), &sam_mem).unwrap();
+    let (_, m) = send(&h, "GET", "/api/files/system/MEMORY.md", &sam, None).await;
+    assert_eq!(m["content"], "", "symlink not followed");
+    let mut c = crate::persona::PromptContext {
+        agent_name: "Juno",
+        conversation_kind: "main",
+        purpose: crate::router::Purpose::Chat,
+        participants: &[],
+        app_tools: false,
+        shared: false,
+        user_name: None,
+        notices: &[],
+    };
+    assert!(!crate::persona::assemble(&dirs, &c).contains("owner-secret"));
+    std::fs::remove_file(&sam_mem).unwrap();
+    std::fs::hard_link(h.state.paths.memory_dir().join("MEMORY.md"), &sam_mem).unwrap();
+    let (_, m) = send(&h, "GET", "/api/files/system/MEMORY.md", &sam, None).await;
+    assert_eq!(m["content"], "", "hard link not read");
+    c.shared = false;
+    assert!(!crate::persona::assemble(&dirs, &c).contains("owner-secret"));
+    let (s, _) = send(
+        &h,
+        "GET",
+        "/api/files/content/memory?path=MEMORY.md",
+        &sam,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    std::fs::remove_file(&sam_mem).unwrap();
 
     // Avatars: each person's own; another person's only once they share a chat.
     let png = b"\x89PNG\r\n\x1a\n0000".to_vec();

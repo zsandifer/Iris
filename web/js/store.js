@@ -240,6 +240,16 @@ export function handleEvent(ev) {
       upsert(ev.conversation_id, ev.message);
       set({});
       break;
+    case 'conversation.deleted': {
+      const cid = ev.conversation_id;
+      const msgs = { ...S.msgs };
+      delete msgs[cid];
+      const members = { ...S.members };
+      delete members[cid];
+      set({ convs: (S.convs || []).filter((c) => c.id !== cid), msgs, members });
+      if (S.route.tab === 'chat' && S.route.parts[1] === cid) go('chat');
+      break;
+    }
     case 'conversation.created':
       if (S.convs && !S.convs.some((c) => c.id === ev.conversation.id)) {
         set({ convs: [...S.convs, ev.conversation] });

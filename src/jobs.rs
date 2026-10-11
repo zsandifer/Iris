@@ -212,7 +212,7 @@ async fn job_prompt(state: &AppState, job: Job, user: &db::User) -> String {
     match job {
         Job::Heartbeat => {
             let checklist =
-                std::fs::read_to_string(state.dirs_for(user).persona.join("HEARTBEAT.md"))
+                crate::config::read_own_text(&state.dirs_for(user).persona.join("HEARTBEAT.md"))
                     .unwrap_or_default();
             format!(
                 "Scheduled heartbeat check at {}.\n\nWork through this checklist. Use your \
