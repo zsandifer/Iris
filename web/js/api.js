@@ -8,6 +8,8 @@ let unauthorizedHandler = () => {};
 // earlier token are dropped, so one user's data never reaches the next.
 let generation = 0;
 
+/** Changes whenever the signed-in token does; compare across awaits. */
+export const sessionGen = () => generation;
 export const hasToken = () => !!token;
 export function setToken(t) {
   const next = t || '';

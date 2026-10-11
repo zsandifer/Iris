@@ -1053,28 +1053,37 @@ pub fn upsert_push_subscription(
     endpoint: &str,
     p256dh: &str,
     auth: &str,
-) -> rusqlite::Result<PushSubscription> {
-    conn.execute(
+) -> rusqlite::Result<Option<PushSubscription>> {
+    // One statement: the device must still be active (not revoked) when the
+    // row is written, so a revocation cannot be undone by a racing subscribe.
+    let n = conn.execute(
         "INSERT INTO push_subscriptions (id, user_id, device_id, endpoint, p256dh, auth, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+         WHERE EXISTS (SELECT 1 FROM devices WHERE id = ?3 AND user_id = ?2 AND revoked_at IS NULL)
          ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id,
              device_id = excluded.device_id, p256dh = excluded.p256dh, auth = excluded.auth,
              failure_count = 0",
         params![new_id(), user_id, device_id, endpoint, p256dh, auth, now_ms()],
     )?;
+    if n == 0 {
+        return Ok(None);
+    }
     conn.query_row(
         "SELECT * FROM push_subscriptions WHERE endpoint = ?1",
         [endpoint],
         push_from_row,
     )
+    .optional()
 }
 
 pub fn list_push_subscriptions(
     conn: &Connection,
     user_id: &str,
 ) -> rusqlite::Result<Vec<PushSubscription>> {
-    let mut stmt =
-        conn.prepare("SELECT * FROM push_subscriptions WHERE user_id = ?1 ORDER BY created_at")?;
+    let mut stmt = conn.prepare(
+        "SELECT s.* FROM push_subscriptions s JOIN devices d ON d.id = s.device_id
+         WHERE s.user_id = ?1 AND d.revoked_at IS NULL ORDER BY s.created_at",
+    )?;
     stmt.query_map([user_id], push_from_row)?.collect()
 }
 
@@ -1354,13 +1363,34 @@ mod tests {
     fn push_subscriptions_upsert_and_prune() {
         with_db(|c, u| {
             let d = crate::db::insert_device(c, u, "phone", "hash")?;
-            let a = upsert_push_subscription(c, u, &d.id, "https://push.example/1", "k", "a")?;
-            let b = upsert_push_subscription(c, u, &d.id, "https://push.example/1", "k2", "a2")?;
+            let a =
+                upsert_push_subscription(c, u, &d.id, "https://push.example/1", "k", "a")?.unwrap();
+            let b = upsert_push_subscription(c, u, &d.id, "https://push.example/1", "k2", "a2")?
+                .unwrap();
             assert_eq!(a.id, b.id);
             assert_eq!(b.p256dh, "k2");
             for _ in 0..10 {
                 record_push_result(c, &a.id, false)?;
             }
+            assert!(list_push_subscriptions(c, u)?.is_empty());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn push_subscribe_refused_for_revoked_device() {
+        with_db(|c, u| {
+            let d = crate::db::insert_device(c, u, "phone", "hash")?;
+            assert!(crate::db::revoke_device(c, u, &d.id)?);
+            let r = upsert_push_subscription(c, u, &d.id, "https://push.example/2", "k", "a")?;
+            assert!(r.is_none());
+            assert!(list_push_subscriptions(c, u)?.is_empty());
+            // A row that somehow survives revocation is not listed either.
+            c.execute(
+                "INSERT INTO push_subscriptions (id, user_id, device_id, endpoint, p256dh, auth, created_at)
+                 VALUES ('x', ?1, ?2, 'https://push.example/3', 'k', 'a', 1)",
+                params![u, d.id],
+            )?;
             assert!(list_push_subscriptions(c, u)?.is_empty());
             Ok(())
         });

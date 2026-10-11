@@ -1,6 +1,6 @@
 // Ideas, Goals, and Library tabs.
 import { html, useEffect, useState } from './h.js';
-import { get, post, patch, del, api, seg, isId } from './api.js';
+import { get, post, patch, del, api, seg, isId, sessionGen } from './api.js';
 import {
   S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary, loadMoreSaved, loadMorePhotos, loadMoreItems, convFor, touchList,
 } from './store.js';
@@ -129,8 +129,9 @@ async function openableChat(cid) {
   }
 }
 
-async function openItem(it) {
+export async function openItem(it) {
   openSheet(() => html`<div class="sheet-body"><${Spinner} /></div>`);
+  const gen = sessionGen();
   const chat = openableChat(it.conversation_id);
   try {
     const path = `/library/${seg(it.id)}/content`;
@@ -142,6 +143,8 @@ async function openItem(it) {
         : html`<pre class="doc">${text}</pre>`;
     } else view = html`<p class="mu">I can't show this kind of file here, but you can download it.</p>`;
     const cid = await chat;
+    // Signed out or re-paired meanwhile: this belongs to the previous user.
+    if (gen !== sessionGen()) return;
     openSheet(() => html`<div class="sheet-body tall">
       <h3>${it.title}</h3>${it.description && html`<p class="mu">${it.description}</p>`}
       ${view}

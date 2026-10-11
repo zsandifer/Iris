@@ -930,7 +930,8 @@ async fn subscribe_push(
                 &body.keys.auth,
             )
         })
-        .await?;
+        .await?
+        .ok_or_else(|| ApiError::not_found("device"))?;
     ok(json!({"subscription": sub}))
 }
 

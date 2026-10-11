@@ -127,3 +127,24 @@ test('the image cache keeps held URLs and evicts unused ones beyond its cap', as
   assert.ok(!revoked.has(keepUrl), 'a held URL is never revoked');
   keep.release();
 });
+
+test('a library preview pending across a re-pair never opens', async () => {
+  const { openItem } = await import('../../web/js/lists.js');
+  const { S, set } = await import('../../web/js/store.js');
+  const cid = 'b'.repeat(32);
+  let release;
+  setToken('owner');
+  onFetch((url, opts) => {
+    if (String(url).includes('/conversations/')) return new Promise((r) => { release = () => r(reply(opts, { body: { conversation: { id: cid, kind: 'chat' } } })); });
+    return reply(opts, { type: 'text/plain', body: 'owner doc' });
+  });
+  set({ sheet: null, convs: [], archived: [] });
+  const p = openItem({ id: 'c'.repeat(32), mime: 'text/plain', title: 'T', conversation_id: cid });
+  await tick(); await tick();
+  setToken('');
+  setToken('guest');
+  set({ sheet: null });
+  release();
+  await p;
+  assert.equal(S.sheet, null);
+});

@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { setToken } from '../../web/js/api.js';
 import {
   S, set, loadMessages, loadOlder, handleEvent, loadLibrary, loadMoreSaved, loadMorePhotos, loadMoreItems,
-  loadFeed, refreshAll, loadGoals, loadIdeas, touchList,
+  loadConvs, loadFeed, refreshAll, loadGoals, loadIdeas, touchList,
   loginMark, applyLoginResponse,
 } from '../../web/js/store.js';
 
@@ -390,4 +390,27 @@ test('Ideas asks only for open and started ideas', async () => {
   await loadIdeas();
   assert.deepEqual(asked, ['open,started']);
   assert.deepEqual(S.ideas.map((i) => i.id).sort(), ['a', 'b', 'd']);
+});
+
+test('a conversation.created event during a list request is not lost', async () => {
+  let release;
+  route({ '/api/conversations': (q, opts) => new Promise((r) => {
+    release = () => r(reply(opts, { body: { conversations: [{ id: 'c1', created_at: 1 }] } }));
+  }) });
+  const p = loadConvs();
+  await tick();
+  handleEvent({ type: 'conversation.created', conversation: { id: 'c2', created_at: 2 } });
+  release();
+  await p;
+  assert.deepEqual(S.convs.map((c) => c.id).sort(), ['c1', 'c2']);
+});
+
+test('a cached older streaming reply outside the latest page is not kept live', async () => {
+  set({ msgs: {}, live: {} });
+  route({ [`/api/conversations/${CID}/messages`]: (q, opts) => reply(opts, { body: { messages: [msg('b', 2), msg('c', 3)], has_more: true } }) });
+  set({ msgs: { [CID]: { list: [msg('a', 0, 'streaming'), msg('b', 2)], hasMore: true } }, live: { a: { text: '', acts: [], cid: CID } } });
+  await loadMessages(CID);
+  const a = S.msgs[CID].list.find((m) => m.id === 'a');
+  assert.notEqual(a.status, 'streaming');
+  assert.equal(S.live.a, undefined);
 });

@@ -116,9 +116,20 @@ export const mainId = () => S.me?.main_conversation_id;
 
 // ----------------------------------------------------------------- loaders
 
+// conversation.created events that arrive while a list request is in flight
+// may be newer than its answer: each running load collects them.
+const convWatch = new Set();
+
 export async function loadConvs() {
-  const { conversations } = await get('/conversations');
-  set({ convs: conversations });
+  const seen = [];
+  convWatch.add(seen);
+  try {
+    const { conversations } = await get('/conversations');
+    const ids = new Set(conversations.map((c) => c.id));
+    set({ convs: [...conversations, ...seen.filter((c) => !ids.has(c.id))] });
+  } finally {
+    convWatch.delete(seen);
+  }
 }
 
 export async function loadArchived() {
@@ -178,7 +189,12 @@ function mergeSnapshot(list, snap) {
   const out = snap.map((m) => (have.has(m.id) ? newer(m, have.get(m.id)) : m));
   for (const m of list) {
     if (ids.has(m.id)) continue;
-    if (m.created_at >= newest || (joined && m.created_at <= oldest.created_at)) out.push(m);
+    if (m.created_at >= newest) out.push(m);
+    else if (joined && m.created_at <= oldest.created_at) {
+      // Outside the latest page, so only a cached copy: it cannot be
+      // confirmed as still streaming, and nothing would ever settle it.
+      out.push(m.status === 'streaming' ? { ...m, status: 'interrupted' } : m);
+    }
   }
   return { list: out.sort((x, y) => x.created_at - y.created_at), joined };
 }
@@ -517,6 +533,7 @@ export function handleEvent(ev) {
       set({});
       break;
     case 'conversation.created':
+      for (const seen of convWatch) seen.push(ev.conversation);
       if (S.convs && !S.convs.some((c) => c.id === ev.conversation.id)) {
         set({ convs: [...S.convs, ev.conversation] });
       }
