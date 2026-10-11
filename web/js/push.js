@@ -18,16 +18,18 @@ let syncing = null;
 
 /**
  * 'unsupported' | 'needs_install' | 'denied' | 'default' | 'on' | 'off' |
- * 'unavailable' (subscribed here, but the server can't deliver to it)
+ * 'unavailable' (the server can't deliver here: push is off on the server,
+ * or it refused this browser's push service)
  */
 export async function pushState() {
   if (!pushSupported()) return isIOS() && !standalone() ? 'needs_install' : 'unsupported';
+  await syncing;
+  if (accepted === false) return 'unavailable';
   if (Notification.permission === 'denied') return 'denied';
   if (Notification.permission === 'default') return 'default';
-  await syncing;
   const sub = await currentSubscription();
   if (!sub) return 'off';
-  return accepted === false ? 'unavailable' : 'on';
+  return 'on';
 }
 
 /**
@@ -39,11 +41,14 @@ export async function pushState() {
 export function syncPush() {
   accepted = null;
   syncing = (async () => {
-    if (!pushSupported() || Notification.permission !== 'granted') return;
-    let sub = await currentSubscription();
-    if (!sub) return;
+    if (!pushSupported()) return;
+    // Push can be off on the server (e.g. no VAPID contact configured):
+    // then notifications are unavailable whatever this browser allows.
     const { enabled, public_key: key } = await get('/push/vapid-public-key');
     if (!enabled || !key) { accepted = false; return; }
+    if (Notification.permission !== 'granted') return;
+    let sub = await currentSubscription();
+    if (!sub) return;
     // A subscription made for another server key can't get this server's pushes.
     const had = sub.options?.applicationServerKey;
     if (had && !sameBytes(new Uint8Array(had), keyBytes(key))) {
@@ -92,7 +97,10 @@ export async function enablePush() {
   const perm = await Notification.requestPermission();
   if (perm !== 'granted') throw new Error('Notifications are blocked. You can allow them in your phone settings.');
   const { enabled, public_key: key } = await get('/push/vapid-public-key');
-  if (!enabled || !key) throw new Error('Notifications are turned off on the server.');
+  if (!enabled || !key) {
+    accepted = false;
+    throw new Error('Notifications are turned off on the server.');
+  }
   const reg = await navigator.serviceWorker.ready;
   let sub = await reg.pushManager.getSubscription();
   if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(key) });

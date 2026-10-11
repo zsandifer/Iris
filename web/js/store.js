@@ -242,61 +242,76 @@ export async function loadIdeas() { set({ ideas: (await get('/ideas')).ideas });
 export async function loadGoals() { set({ goals: (await get('/goals?include_done=true')).goals }); }
 const SAVED_PAGE = 50;
 const PHOTO_PAGE = 60;
-// Feed posts page by created_at; photos by (used_at, id), newest first.
-const postOlder = (x, last) => x.created_at < last.created_at;
-const photoOlder = (x, last) => x.used_at < last.used_at || (x.used_at === last.used_at && x.id < last.id);
+const MAX_RELOAD = 600; // a refresh reloads at most this many shown items
 const photoCursor = (p) => `&before=${p.used_at}&before_id=${encodeURIComponent(p.id)}`;
-
-/**
- * A refreshed first page, keeping later pages that were already loaded, but
- * only when the fresh page reaches back to them (so nothing in between is
- * skipped); otherwise start over from the fresh page and its has_more.
- */
-function keepOlder(fresh, freshMore, old, oldMore, older) {
-  if (!freshMore || !old?.length || !fresh.length) return [fresh, !!freshMore];
-  const last = fresh.at(-1);
-  const newestOld = old.reduce((n, x) => (older(n, x) ? x : n));
-  if (older(newestOld, last)) return [fresh, true]; // a gap: drop the old pages
-  const ids = new Set(fresh.map((x) => x.id));
-  const tail = old.filter((x) => !ids.has(x.id) && older(x, last))
-    .sort((a, b) => (older(a, b) ? 1 : older(b, a) ? -1 : 0));
-  return tail.length ? [[...fresh, ...tail], oldMore] : [fresh, true];
-}
-
-export async function loadLibrary() {
-  const [items, ph, sv] = await Promise.all([
-    get('/library').then((r) => r.items),
-    get(`/attachments?limit=${PHOTO_PAGE}`),
-    get(`/feed?liked=true&limit=${SAVED_PAGE}`),
-  ]);
-  const cur = S.library;
-  const [photos, photosMore] = keepOlder(ph.attachments, ph.has_more, cur?.photos, cur?.photosMore, photoOlder);
-  const [saved, savedMore] = keepOlder(sv.posts, sv.has_more, cur?.saved, cur?.savedMore, postOlder);
-  set({ library: { items, photos, photosMore, saved, savedMore } });
-}
 
 const appendNew = (list, more) => {
   const ids = new Set(list.map((x) => x.id));
   return [...list, ...more.filter((x) => !ids.has(x.id))];
 };
 
-/** Next page of Library's Saved posts. */
-export async function loadMoreSaved() {
-  const last = S.library?.saved.at(-1);
-  if (!last) return;
-  const r = await get(`/feed?liked=true&limit=${SAVED_PAGE}&before=${last.created_at}`);
-  if (!S.library) return;
-  set({ library: { ...S.library, saved: appendNew(S.library.saved, r.posts), savedMore: !!r.has_more } });
+// Library lists, newest first. `page(last)` fetches the page after `last`
+// (the first page without it) and returns [items, hasMore].
+const PAGED = {
+  saved: {
+    more: 'savedMore',
+    page: (last) => get(`/feed?liked=true&limit=${SAVED_PAGE}${last ? `&before=${last.created_at}` : ''}`)
+      .then((r) => [r.posts, !!r.has_more]),
+  },
+  photos: {
+    more: 'photosMore',
+    page: (last) => get(`/attachments?limit=${PHOTO_PAGE}${last ? photoCursor(last) : ''}`)
+      .then((r) => [r.attachments, !!r.has_more]),
+  },
+};
+
+/** Pages from the top until at least `want` items are loaded (or the end). */
+async function loadPages(kind, want) {
+  let list = [];
+  let more;
+  do {
+    const [items, m] = await PAGED[kind].page(list.at(-1));
+    const had = list.length;
+    list = appendNew(list, items);
+    more = m && list.length > had; // stop if a page brings nothing new
+  } while (more && list.length < Math.min(want, MAX_RELOAD));
+  return [list, more];
 }
 
-/** Next page of Library's Photos. */
-export async function loadMorePhotos() {
-  const last = S.library?.photos.at(-1);
-  if (!last) return;
-  const r = await get(`/attachments?limit=${PHOTO_PAGE}${photoCursor(last)}`);
-  if (!S.library) return;
-  set({ library: { ...S.library, photos: appendNew(S.library.photos, r.attachments), photosMore: !!r.has_more } });
+/**
+ * (Re)load the Library. Saved and Photos are reloaded from the server as
+ * far as they were shown, never patched from what was cached, so an item
+ * unliked or removed elsewhere disappears and a newly saved one shows up.
+ */
+export async function loadLibrary() {
+  const cur = S.library;
+  const [items, [photos, photosMore], [saved, savedMore]] = await Promise.all([
+    get('/library').then((r) => r.items),
+    loadPages('photos', cur?.photos.length || 0),
+    loadPages('saved', cur?.saved.length || 0),
+  ]);
+  set({ library: { items, photos, photosMore, saved, savedMore } });
 }
+
+/**
+ * The next page of a Library list. Dropped if the list was replaced while
+ * the request was out (its last item is no longer the cursor), so a page
+ * never joins a list it doesn't follow.
+ */
+async function loadMore(kind) {
+  const last = S.library?.[kind].at(-1);
+  if (!last) return;
+  const [items, more] = await PAGED[kind].page(last);
+  const lib = S.library;
+  if (!lib || lib[kind].at(-1)?.id !== last.id) return;
+  set({ library: { ...lib, [kind]: appendNew(lib[kind], items), [PAGED[kind].more]: more } });
+}
+
+/** Next page of Library's Saved posts. */
+export const loadMoreSaved = () => loadMore('saved');
+/** Next page of Library's Photos. */
+export const loadMorePhotos = () => loadMore('photos');
+
 export async function loadSlots() { set({ slots: (await get('/models/slots')).slots }); }
 export async function loadEngines() {
   if (!isOwner()) return;
@@ -343,6 +358,29 @@ export function currentLogins(harnesses) {
     if (h.auth === 'auth_required' && logins[h.name]?.state === 'connected') delete logins[h.name];
   }
   return logins;
+}
+
+// Sign-in sessions: events are authoritative and arrive in order (a
+// rejected code legitimately goes back from verifying to waiting_for_code),
+// so an HTTP response is applied only when no event for that harness came
+// in while it was in flight. A session that started earlier than the one
+// shown is stale either way.
+const loginEvents = {}; // harness -> count of harness.login events seen
+
+/** Call before a sign-in request; pass the result to applyLoginResponse. */
+export const loginMark = (harness) => loginEvents[harness] || 0;
+
+function newerSession(cur, next) {
+  return !cur || cur.id === next.id || (next.started_at || 0) >= (cur.started_at || 0);
+}
+
+/** Apply a sign-in request's `{login}` response unless events moved past it. */
+export function applyLoginResponse(harness, login, mark) {
+  if (!login) return;
+  const cur = S.logins[harness];
+  if (cur && cur.id === login.id && loginMark(harness) !== mark) return;
+  if (!newerSession(cur, login)) return;
+  set({ logins: { ...S.logins, [harness]: login } });
 }
 
 export function handleEvent(ev) {
@@ -414,7 +452,8 @@ export function handleEvent(ev) {
       set({ slots: ev.slots });
       break;
     case 'harness.login':
-      set({ logins: { ...S.logins, [ev.login.harness]: ev.login } });
+      loginEvents[ev.login.harness] = loginMark(ev.login.harness) + 1;
+      if (newerSession(S.logins[ev.login.harness], ev.login)) set({ logins: { ...S.logins, [ev.login.harness]: ev.login } });
       break;
     case 'engines.changed':
       if (S.engines) set({ engines: { ...S.engines, engines: ev.engines } });

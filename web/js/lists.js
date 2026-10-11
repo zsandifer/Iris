@@ -1,8 +1,8 @@
 // Ideas, Goals, and Library tabs.
 import { html, useEffect, useState } from './h.js';
-import { post, patch, del, api, seg } from './api.js';
+import { get, post, patch, del, api, seg, isId } from './api.js';
 import {
-  S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary, loadMoreSaved, loadMorePhotos,
+  S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary, loadMoreSaved, loadMorePhotos, convFor,
 } from './store.js';
 import { Icon, Img, Empty, Spinner, ago, since, openSheet, closeSheet, confirmSheet, hostOf, useBlob } from './ui.js';
 import { md } from './md.js';
@@ -114,8 +114,21 @@ function Download({ src, name }) {
   return html`<a class="b1" href=${url || undefined} download=${name} aria-disabled=${url ? undefined : 'true'}>Download</a>`;
 }
 
+/** `cid` if it is a chat this user can open (not a background job's), else null. */
+async function openableChat(cid) {
+  if (!isId(cid)) return null;
+  if (convFor(cid)) return cid;
+  try {
+    const { conversation: c } = await get(`/conversations/${seg(cid)}`);
+    return c && c.kind !== 'job' ? cid : null;
+  } catch {
+    return null;
+  }
+}
+
 async function openItem(it) {
   openSheet(() => html`<div class="sheet-body"><${Spinner} /></div>`);
+  const chat = openableChat(it.conversation_id);
   try {
     const path = `/library/${seg(it.id)}/content`;
     let view;
@@ -125,11 +138,12 @@ async function openItem(it) {
       view = it.mime === 'text/markdown' ? html`<div class="md doc" dangerouslySetInnerHTML=${{ __html: md(text) }} />`
         : html`<pre class="doc">${text}</pre>`;
     } else view = html`<p class="mu">I can't show this kind of file here, but you can download it.</p>`;
+    const cid = await chat;
     openSheet(() => html`<div class="sheet-body tall">
       <h3>${it.title}</h3>${it.description && html`<p class="mu">${it.description}</p>`}
       ${view}
       <div class="btns">
-        ${it.conversation_id && html`<button class="b2" onClick=${() => { closeSheet(); go(`chat/${it.conversation_id}`); }}>Open chat</button>`}
+        ${cid && html`<button class="b2" onClick=${() => { closeSheet(); go(`chat/${cid}`); }}>Open chat</button>`}
         <${Download} src=${`/api${path}`} name=${it.title} />
       </div></div>`);
   } catch (e) { closeSheet(); toast(e.message); }

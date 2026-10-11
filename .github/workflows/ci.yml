@@ -20,6 +20,12 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # The phone app (web/js) has no build step; its tests use node's own
+      # runner and no packages.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test 'tests/web/*.test.mjs'
 
   msrv:
     # Builds with the oldest Rust that Cargo.toml's rust-version promises.

@@ -3,7 +3,9 @@
 // connector_reconnect, approval).
 import { html, useState } from './h.js';
 import { api, post, patch, seg, isId } from './api.js';
-import { S, set, go, isOwner, toast, loadGoals, loadEngines } from './store.js';
+import {
+  S, set, go, isOwner, toast, loadGoals, loadEngines, loginMark, applyLoginResponse,
+} from './store.js';
 import { Icon, Img, LetterTile, hostOf, safeUrl } from './ui.js';
 import { plain } from './md.js';
 
@@ -124,8 +126,9 @@ export function SignIn({ card, harness, flow, instructions }) {
   const start = async () => {
     setBusy(true);
     try {
+      const mark = loginMark(harness);
       const r = await post(`/harnesses/${seg(harness)}/login`);
-      if (r.login) set({ logins: { ...S.logins, [harness]: r.login } });
+      if (r.login) applyLoginResponse(harness, r.login, mark);
       else if (r.manual) toast(r.auth === 'ok' ? 'Signed in. Thanks!' : 'Still signed out. Follow the step above, then check again.');
     } catch (e) { toast(e.message); }
     setBusy(false);
@@ -135,8 +138,9 @@ export function SignIn({ card, harness, flow, instructions }) {
     if (!code.trim()) return;
     setBusy(true);
     try {
+      const mark = loginMark(harness);
       const r = await post(`/harnesses/${seg(harness)}/login/code`, { code: code.trim() });
-      set({ logins: { ...S.logins, [harness]: r.login } });
+      applyLoginResponse(harness, r.login, mark);
       setCode('');
     } catch (err) { toast(err.message); }
     setBusy(false);

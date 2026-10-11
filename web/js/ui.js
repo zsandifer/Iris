@@ -78,26 +78,37 @@ export function useBlob(src, enabled = true) {
 }
 
 const canObserve = typeof IntersectionObserver === 'function';
+// Fetch when within NEAR of the viewport; let go of the image (so the
+// cache may evict it) once it is more than FAR away. The gap keeps images
+// near the edge from flickering.
+const NEAR = '400px';
+const FAR = '1600px';
 
-/** Image from a URL; `/api/...` paths are fetched with the device token once near the viewport. */
+/**
+ * Image from a URL. `/api/...` paths are fetched with the device token while
+ * the image is near the viewport, and released when it scrolls far away.
+ */
 export function Img({ src, alt = '', cls = '', onLoad, onError, ...rest }) {
   const authed = !!src && src.startsWith('/api/');
-  const ph = useRef();
+  const [el, setEl] = useState(null);
   const [near, setNear] = useState(!canObserve);
   const [blob, blobFailed] = useBlob(authed ? src : null, near);
   const [failed, setFailed] = useState(false);
   useEffect(() => { setFailed(false); }, [src]);
   useEffect(() => {
-    if (near || !authed || !ph.current) return undefined;
-    const io = new IntersectionObserver((es) => {
-      if (es.some((e) => e.isIntersecting)) { io.disconnect(); setNear(true); }
-    }, { rootMargin: '400px', scrollMargin: '400px' });
-    io.observe(ph.current);
-    return () => io.disconnect();
-  }, [near, authed]);
+    if (!canObserve || !authed || !el) return undefined;
+    const watch = (margin, fn) => {
+      const io = new IntersectionObserver((es) => fn(es.at(-1).isIntersecting), { rootMargin: margin, scrollMargin: margin });
+      io.observe(el);
+      return io;
+    };
+    const near = watch(NEAR, (yes) => yes && setNear(true));
+    const far = watch(FAR, (yes) => !yes && setNear(false));
+    return () => { near.disconnect(); far.disconnect(); };
+  }, [el, authed]);
   const url = authed ? blob : src;
-  if (!url || failed || blobFailed) return html`<div ref=${ph} class=${'img-ph ' + cls} />`;
-  return html`<img class=${cls} src=${url} alt=${alt} loading="lazy" decoding="async"
+  if (!url || failed || blobFailed) return html`<div ref=${setEl} class=${'img-ph ' + cls} />`;
+  return html`<img ref=${setEl} class=${cls} src=${url} alt=${alt} loading="lazy" decoding="async"
     referrerpolicy="no-referrer" onLoad=${onLoad}
     onError=${() => { setFailed(true); onError?.(); }} ...${rest} />`;
 }
