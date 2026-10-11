@@ -35,11 +35,14 @@ state (conversations, goals, feed, and so on) in SQLite.
 - [Configuration](#configuration)
 - [Engines and models](#engines-and-models)
 - [Engines from the app](#engines-from-the-app)
+- [Voice](#voice)
+- [People and Together chats](#people-and-together-chats)
 - [Proactive jobs](#proactive-jobs)
 - [Security model](#security-model)
 - [Subscription terms](#subscription-terms)
 - [Importing from OpenClaw](#importing-from-openclaw)
 - [Running as a service](#running-as-a-service)
+- [The privilege split (iris and iris-agent)](#the-privilege-split-iris-and-iris-agent)
 - [Development](#development)
 - [Not done yet](#not-done-yet)
 - [License](#license)
@@ -155,9 +158,12 @@ Data directory layout:
 ├── memory/          # MEMORY.md plus notes the agent reads and writes
 ├── workspace/       # working directory for the CLIs
 ├── library/         # artifacts and media the agent saved
-├── uploads/         # images you sent, custom avatar
+├── uploads/         # images you sent, custom avatars
 ├── run/             # per-turn private files (prompt, MCP config)
-├── engines/         # CLIs installed from the app (single-user mode)
+├── people/<id>/     # every other person's own Iris: persona/, memory/, workspace/
+├── together/<id>/   # working folder of each Together chat
+├── voice/           # cached voice notes (deleted after 30 days)
+├── engines/         # CLIs and voice installed from the app (single-user mode)
 ├── vault.key        # 32-byte key for encrypted secrets, 0600
 └── vapid.json       # Web Push key pair, 0600
 ```
@@ -217,10 +223,11 @@ After pairing your phone you should not need the server again:
 - **First run.** If no engine works yet, a "Set up an AI engine" card walks
   you through install, then sign-in.
 
-For a stricter setup, `deploy/setup-engines.sh` (run once as root) creates a
-separate `iris` system user that owns the engines directory and performs
-installs through a narrow sudo rule. The user running Iris can then run the
-engines but cannot modify them, and never needs download or install rights.
+For a stricter setup, run Iris with the
+[privilege split](#the-privilege-split-iris-and-iris-agent): a separate
+`iris` admin account owns the engines and performs installs through a
+narrow sudo rule, and Iris itself runs as `iris-agent`, which can run the
+engines but cannot modify them and never needs download or install rights.
 
 ### What still needs the server
 
@@ -232,9 +239,72 @@ engines but cannot modify them, and never needs download or install rights.
   terminal: run `gemini` once) and adding providers to **OpenCode**
   (`opencode auth login`, or configuring Ollama / LM Studio). Iris shows
   these steps in the card when needed.
-- The optional privilege split (`deploy/setup-engines.sh`, as root).
+- The optional privilege split (`deploy/setup-engines.sh`, as root, then
+  `deploy/verify-split.sh`).
+
+## Voice
+
+Voice replies and voice input run **on your server** with open-source
+models, so audio never leaves it:
+
+- **Voice replies** (`tts`): a [Piper](https://github.com/rhasspy/piper)
+  voice (`en_US-ljspeech-medium`, trained on the public-domain LJ Speech
+  dataset). Turn on "Voice replies" in Settings and replies arrive as a
+  voice note plus the text; the newest one plays by itself.
+- **Voice input** (`stt`): OpenAI's [Whisper](https://github.com/openai/whisper)
+  `base.en`. The phone records, converts the recording to WAV, and the
+  server transcribes it; the text lands in the message box.
+
+Both run through [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
+(Apache-2.0) and are installed like engines: the owner taps **Set up** in
+Settings (or `POST /api/engines/tts/install`, `.../stt/install`). Iris
+downloads the official sherpa-onnx release for Linux x86_64 or aarch64 and
+the two models from the project's GitHub releases, checks each download's
+SHA-256 and size against values pinned in Iris, and unpacks them with the
+system `tar` and `bzip2` into the engines directory (about 115 MB for the
+voice and 190 MB for voice input on disk). They run only while speaking or
+transcribing, one at a time, as short-lived processes; nothing stays in
+memory. Iris updates them when an Iris release pins newer versions.
+
+Without them, the app still works: the phone reads replies aloud with its
+own voice (labeled "Read aloud by this device"), and voice input falls back
+to the browser's speech recognition where there is one (which may send
+audio to the browser maker).
+
+## People and Together chats
+
+Everyone in your home can have **their own Iris** on the same server. As
+the owner, open Settings, People, **Add a person**; the app shows a
+one-time pairing code for their phone (open your Iris address on their
+phone and type it in). Each person gets:
+
+- their own persona and memory files (`people/<id>/` in the data
+  directory), editable from their app under System files;
+- their own name and picture for their Iris, voice setting, feed and feed
+  prompt, ideas, goals, library, and scheduled jobs;
+- **Together** chats in the drawer: anyone can start one with the others.
+  The Iris of whoever started it answers, everyone sees every message, and
+  people get a push when they are not in the app.
+
+What stays the owner's: engines and models, connectors (only the owner's
+own chats use them), saved logins, and the setting that lets Claude answer
+for other people (see [Subscription terms](#subscription-terms)).
+
+Privacy between people: a person's Iris only gets their own files and
+memory. Together chats get nobody's private files or memory (only the
+host Iris's `IDENTITY.md` and `SOUL.md`), a working folder of their own,
+and a cards-only app bridge. With Claude Code, Iris also denies the agent's
+file tools access to everyone else's folders and to Iris's own database and
+keys. All people's CLIs still run as one operating-system account, so for a
+hard boundary between people run them on separate Iris servers (or
+accounts).
+
+To remove someone, tap them in People, then **Remove**: their Iris, chats,
+memory, feed, goals, and devices are deleted.
 
 ## Proactive jobs
+
+Jobs run for every person's Iris, each with their own files and feed.
 
 - **Heartbeat** (`[heartbeat]`): on a schedule, the agent works through
   `HEARTBEAT.md`. If something needs your attention it posts in your Main
@@ -268,7 +338,11 @@ Both are off by default, respect active hours, and can be triggered manually
   `workspace/` and `memory/` while shell commands stay behind an approval
   that headless runs reject. Adjust all of them in `config.toml`.
 - Engines installed from the app come only from official sources and are
-  verified (checksum or npm integrity); see the privilege split above.
+  verified (checksum or npm integrity); see the
+  [privilege split](#the-privilege-split-iris-and-iris-agent).
+- Each person's Iris works in its own folders, and Claude Code turns are
+  denied access to other people's folders and to Iris's database, keys,
+  and per-turn files (see [People](#people-and-together-chats)).
 
 ## Subscription terms
 
@@ -277,14 +351,14 @@ stores, proxies, or forwards Claude.ai or ChatGPT OAuth tokens or session
 credentials; it only asks each CLI whether it is signed in (`claude auth
 status`, `codex login status`) and keeps nothing but the yes/no answer.
 
-Claude subscriptions are for individual use. Iris never uses Claude in
-conversations with more than one person unless you opt in (in the app, or
-`router.allow_claude_for_shared`); those use another engine. Your own
-scheduled jobs (heartbeat, feed) on your own signed-in CLI are individual
-use and may use Claude. If Claude is your only engine, group chats pause
-with a one-time explanation and an opt-in card; everything else keeps
-working. Only opt in if your plan allows shared use, and check the current
-terms of each provider yourself.
+Claude subscriptions are for individual use. Iris uses Claude only for the
+owner's own use (the owner's chats and scheduled jobs) unless you opt in
+(Settings, AI engine, "Allow Claude for other people", or
+`router.allow_claude_for_shared`). Conversations with more than one person
+and other people's own Iris use another engine. If Claude is the only
+engine, those pause with a one-time explanation, and the owner gets a card
+to opt in; everything else keeps working. Only opt in if your plan allows
+shared use, and check the current terms of each provider yourself.
 
 ## Importing from OpenClaw
 
@@ -300,10 +374,55 @@ The source is never modified. Existing files are kept unless you pass
 
 ## Running as a service
 
-See [deploy/iris.service](../deploy/iris.service) for a systemd user unit and
-install steps. Engines installed from the app are found automatically. For
-CLIs you installed yourself, make sure the unit's `PATH` includes where they
-live, or set absolute `command` paths in `config.toml`.
+The simplest setup is a systemd **user** service running as you: see
+[deploy/iris.service](../deploy/iris.service) for the unit and install
+steps. Engines installed from the app are found automatically. For CLIs you
+installed yourself, make sure the unit's `PATH` includes where they live,
+or set absolute `command` paths in `config.toml`.
+
+For a home server, the recommended setup is the privilege split below,
+which runs Iris as a system service under its own account.
+
+## The privilege split (iris and iris-agent)
+
+`deploy/setup-engines.sh`, run once as root, separates who may change the
+software from who runs it:
+
+| Account | Can | Cannot |
+|---|---|---|
+| `iris` (admin, no login) | own `/opt/iris/engines`; download and install the official CLIs and voice models through `iris engines` | log in; read Iris's data |
+| `iris-agent` (runs Iris) | run Iris and the engines; ask `iris` for exactly the listed `iris engines <install\|update\|uninstall> <name> --dir /opt/iris/engines` commands (sudo, no password, no wildcards) | change the engines or the Iris binary; run anything else as `iris` or root; see `/home` (the service has `ProtectHome=yes`) |
+
+Iris then runs as the system service `iris` (from
+[deploy/iris-agent.service](../deploy/iris-agent.service), hardened with
+`ProtectSystem=strict`; it writes only its home and, through the helper,
+the engines directory). Its config and data live in
+`/var/lib/iris-agent` (`.config/iris/config.toml`, `.local/share/iris/`).
+
+```sh
+cargo build --release
+sudo install -Dm755 target/release/iris /usr/local/bin/iris   # root-owned
+sudo sh deploy/setup-engines.sh            # creates iris and iris-agent, starts iris.service
+sudo runuser -u iris-agent -- env HOME=/var/lib/iris-agent /usr/local/bin/iris pair
+sudo sh deploy/verify-split.sh             # checks every part of the split
+```
+
+Then pair your phone, install engines from the app (Settings, AI engine),
+and sign in from the app; sign-ins are kept in `iris-agent`'s home.
+Options:
+
+- `--copy-data ~you/.local/share/iris` brings over an existing Iris data
+  directory (chats, persona, memory; not CLI sign-ins). Stop the old
+  service first: `systemctl --user disable --now iris`.
+- `--agent-user you` keeps running Iris as your own account with the user
+  service instead (the engines are still owned by `iris`).
+- `--dry-run` with `DESTDIR=/some/dir` writes the sudo rule, service, and
+  config there without changing the system.
+
+To reach Iris from your phone, set `bind` (for example your Tailscale IP)
+and `public_url` in `/var/lib/iris-agent/.config/iris/config.toml`, then
+`sudo systemctl restart iris`. Codex, Gemini CLI, and OpenCode need Node.js
+(npm) on the server; voice needs `tar` and `bzip2`.
 
 ## Development
 
@@ -318,13 +437,12 @@ Contributor notes, architecture, and invariants are in
 
 ## Not done yet
 
-- **Voice replies**: `POST /api/voice/speak` is a placeholder (returns 501).
 - **Using saved credentials**: logins and cards are stored encrypted and
   managed through the API, but nothing injects them into the agent's
   browsing yet. Planned design: the agent requests a credential by id
   through a tool and Iris fills it into a browser session without the
   model ever seeing the secret.
-- **Live view of the agent's browser**, group chat UI.
+- **Live view of the agent's browser**.
 - **Gemini CLI and OpenCode sign-in from the app**: both need one step on
   the server (see above).
 

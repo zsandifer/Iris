@@ -61,7 +61,15 @@ own personality. It is not a clone.
 - **Stuck:** if a turn dies, Iris sends a push saying "Iris got stuck" with a
   retry, so the user is never left waiting.
 - **Voice replies:** off by default, toggled in Settings. Replies arrive as
-  voice notes plus text.
+  a voice note (play button, waveform, length) above the text, and the
+  newest one plays by itself after you send from that phone. The voice is
+  made on the server (an open-source Piper voice); until the owner sets it
+  up, the phone's own voice reads the text behind the same control,
+  labeled "Read aloud by this device".
+- **Voice input:** 🎙 records on the phone; the recording is transcribed on
+  the server (Whisper) and lands in the text box to check before sending.
+  Without server transcription the browser's own speech recognition is
+  used, and if there is none the mic explains how to set it up.
 - **Push notifications:** every message from Iris, unless that chat is open.
   Quiet hours are available.
 - **Reconnect cards:** when an engine's sign-in expires or a connector drops,
@@ -112,7 +120,10 @@ own personality. It is not a clone.
 - **System files:** the persona markdown files and memory/workspace folders,
   each with a plain-language label, editable.
 - **Settings:**
-  - Name, picture, voice replies, notifications, quiet hours.
+  - Name, picture (cropped to a square on the phone), voice replies,
+    notifications, quiet hours.
+  - Voice: the voice and voice input show whether they run on the server;
+    the owner sets them up with one tap (a one-time download).
   - Advanced: **AI engine**, devices, people, activity log.
 - **AI engine:** one selector per slot (Chat, Hard requests, Background,
   Feed), showing only models actually installed. Each slot defaults to
@@ -122,6 +133,18 @@ own personality. It is not a clone.
 
 ## People
 
-- Each person (for example a partner) gets **their own Iris** with separate
-  memory, plus shared "Together" chats.
+- Each person (for example a partner) gets **their own Iris**: its own name,
+  picture, personality and memory files, feed, ideas, goals, library, and
+  settings, plus shared "Together" chats.
+- The owner adds people under Settings → People, which shows a pairing code
+  for their phone; tapping a person offers Chat together, a new code, or
+  Remove.
 - Pairing: one-time code → long-lived per-device key, revocable per device.
+- **Together chats** live in the drawer under "Together"; anyone can start
+  one. Messages show who sent them, the host's Iris (whoever started the
+  chat) answers with its name and picture on everyone's phone, and nobody's
+  private memory or files are used. Everyone gets a push when they are not
+  in the app.
+- Engines, connectors, and saved logins stay the owner's. Claude plans are
+  for one person, so other people's Iris and Together chats use another
+  engine unless the owner allows Claude (asked once, on a card).

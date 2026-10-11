@@ -22,7 +22,8 @@ js/
 ├── feed.js           For you: story cards, posts, full-screen stories
 ├── lists.js          Ideas, Goals, Library
 ├── hub.js            Iris hub: Connections, Logins & wallet, computer, files
-├── settings.js       Settings, AI engine, devices, people, activity log
+├── settings.js       Settings (voice, people), AI engine, devices, activity log
+├── voice.js          voice notes (server voice or this device), recording + transcription
 ├── push.js           Web Push subscription
 ├── md.js             small, safe Markdown renderer
 ├── ui.js             icons, rows, sheets, time helpers

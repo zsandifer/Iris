@@ -24,9 +24,10 @@ manages subprocesses, normalizes their output, and stores app state.
    own status command (`claude auth status`, `codex login status`); keep
    only the boolean (that output contains account details).
 2. **Individual-use policy.** Claude is never used for conversations with
-   more than one human unless the owner opts in
-   (`router.allow_claude_for_shared` or the app setting). The owner's own
-   scheduled jobs on their own signed-in CLI are ordinary individual use.
+   more than one human, or for another person's own Iris (their chats and
+   jobs), unless the owner opts in (`router.allow_claude_for_shared` or the
+   app setting). The owner's own chats and scheduled jobs on their own
+   signed-in CLI are ordinary individual use.
    Enforced in `router::policy_allows` and `router::select_engine`; keep
    the tests. If Claude is the only engine, shared chats pause with a
    one-time explanation and opt-in card; nothing else stops working.
@@ -74,12 +75,13 @@ src/
 ├── turn.rs          the turn pipeline (routing, replay, fallback, persistence)
 ├── state.rs         shared state, harness registry, settings
 ├── events.rs        WebSocket event hub
-├── server/          axum routes (chat, content, admin), WebSocket, app + /console
+├── server/          axum routes (chat, content, admin, voice), WebSocket, app + /console
 ├── demo.rs          `iris demo-seed`: fake demo data for screenshots
 ├── mcp.rs           `iris mcp` stdio MCP bridge (CRUD into the DB)
 ├── jobs.rs          heartbeat and feed jobs, scheduler
 ├── login.rs         engine sign-in from the app, reconnect cards
 ├── engines.rs       install/update the official CLIs (official sources only)
+├── voice.rs         local voice (sherpa-onnx: Piper TTS, Whisper STT): pinned installs, runs
 ├── setup.rs         engine operations, setup card, daily update
 ├── secrets.rs       XChaCha20-Poly1305 vault
 ├── push.rs          Web Push: VAPID + RFC 8291 encryption
@@ -89,8 +91,11 @@ templates/           persona templates, config template, model rankings
 docs/API.md          REST, WebSocket, data model, MCP reference
 docs/DESIGN.md       app UX spec
 docs/SELF-HOSTING.md full setup and operations guide
-deploy/iris.service  systemd user unit
-deploy/setup-engines.sh  one-time root setup for the engine-install privilege split
+deploy/iris.service  systemd user unit (single-user mode)
+deploy/iris-agent.service  system unit for the iris-agent account (privilege split)
+deploy/setup-engines.sh  one-time root setup of the iris / iris-agent privilege split
+deploy/verify-split.sh   root check of that split
+scripts/e2e/         real-CLI, real-browser end-to-end checks (people, Together, voice)
 ```
 
 ## Adding a harness adapter

@@ -79,13 +79,14 @@ Errors produced by Iris use this shape:
 | `unauthorized` | 401 | Missing, malformed, unknown, or revoked device token. Message: `missing or invalid device token`. |
 | `invalid_code` | 401 | `POST /api/pair` with a wrong, used, or expired code. |
 | `forbidden` | 403 | Owner-only route called by a non-owner (`only the owner can do this`), or a creator-only group action by another member (`only the person who created this group can do that`). |
+| `voice_failed` | 502 | The local voice program could not make a voice note or transcribe a recording. The message is first-person and friendly. |
+| `voice_unavailable` | 503 | `POST /api/voice/speak` or `/api/voice/transcribe` while that voice component is not installed on the server. |
 | `not_found` | 404 | Unknown resource (message is `<thing> not found`), or an unknown route (`route not found`). |
 | `conflict` | 409 | Creating a connector whose name already exists. |
 | `too_large` | 413 | Uploaded image larger than `max_upload_bytes`. |
 | `unsupported_media_type` | 415 | Uploaded bytes are not PNG, JPEG, GIF, or WebP. |
 | `locked` | 429 | Pairing is locked after repeated failures (see [section 2](#2-authentication-and-pairing)). |
 | `internal` | 500 | Unexpected server error. Message is always `internal server error`; details only go to the server log. |
-| `not_implemented` | 501 | `POST /api/voice/speak`. |
 
 A few responses come from the HTTP framework (axum) and do **not** use the
 envelope:
@@ -120,10 +121,13 @@ authenticate with a first frame instead of the header (see
 
 **Owner-only** routes return `403 forbidden` for other users. They are marked
 **Owner** in the route tables. There is exactly one owner (the first user,
-created automatically when the database is initialized); additional people
-are created by the owner for group conversations. Some group-conversation
-actions are limited to the group's creator instead (see
-[section 3.3](#33-conversations-and-messages)).
+created automatically when the database is initialized). The owner adds
+other people (for example a partner); each person gets **their own Iris**:
+their own persona and memory files, feed, ideas, goals, library, and
+settings (name, picture, voice), plus shared "Together" chats. Server-wide
+things (engines, models, connectors, saved logins, the shared-chat policy)
+stay with the owner. Some group-conversation actions are limited to the
+group's creator instead (see [section 3.3](#33-conversations-and-messages)).
 
 Binary routes (`/api/attachments/{id}`, `/api/library/{id}/content`,
 `/api/avatar`) also require the header, so browser clients should `fetch()`
@@ -203,11 +207,12 @@ All paths are under `/api`. "Any" means any authenticated user.
 | PUT | `/me/quiet-hours` | Any | Set or clear your notification quiet hours |
 | GET | `/devices` | Any | Your devices |
 | DELETE | `/devices/{id}` | Any | Revoke one of your devices |
-| GET | `/users` | **Owner** | List all users |
-| POST | `/users` | **Owner** | Create another person |
+| GET | `/users` | Any | Everyone on this server |
+| POST | `/users` | **Owner** | Add a person (their own Iris) |
+| DELETE | `/users/{id}` | **Owner** | Remove a person and their Iris |
 | POST | `/users/{id}/pairing-code` | **Owner** | Pairing code for a user |
 | GET | `/conversations` | Any | List your conversations |
-| POST | `/conversations` | Any (group: **Owner**) | Create a side or group conversation |
+| POST | `/conversations` | Any | Create a side or group ("Together") conversation |
 | GET | `/conversations/main` | Any | Your Main chat |
 | GET | `/conversations/{id}` | Member | One conversation |
 | PATCH | `/conversations/{id}` | Member (group: creator) | Rename or archive |
@@ -225,9 +230,9 @@ All paths are under `/api`. "Any" means any authenticated user.
 | POST | `/messages/{id}/decision` | Approver | Approve or deny an approval card |
 | GET | `/activity` | Any | What Iris did with tools, newest first |
 | GET | `/feed` | Any | List feed posts (`?liked=true`: saved posts) |
-| POST | `/feed/refresh` | **Owner** | Run the feed job now (`202`) |
-| GET | `/feed/prompt` | Any | Read the feed prompt |
-| PUT | `/feed/prompt` | **Owner** | Set the feed prompt |
+| POST | `/feed/refresh` | Any | Run your feed job now (`202`) |
+| GET | `/feed/prompt` | Any | Read your feed prompt |
+| PUT | `/feed/prompt` | Any | Set your feed prompt |
 | DELETE | `/feed/{id}` | Any | Delete a post |
 | POST | `/feed/{id}/like` | Any | Like or unlike |
 | POST | `/feed/{id}/discuss` | Any | Open a side chat about a post |
@@ -243,18 +248,18 @@ All paths are under `/api`. "Any" means any authenticated user.
 | GET | `/library/{id}` | Any | One library item |
 | DELETE | `/library/{id}` | Any | Delete a library item |
 | GET | `/library/{id}/content` | Any | Download item content |
-| GET | `/files` | **Owner** | System files and folders |
-| GET | `/files/system/{name}` | **Owner** | Read a system file |
-| PUT | `/files/system/{name}` | **Owner** | Write a system file |
-| GET | `/files/browse/{area}` | **Owner** | List a folder |
-| GET | `/files/content/{area}` | **Owner** | Read a text file |
-| PUT | `/files/content/{area}` | **Owner** | Write a text file |
-| DELETE | `/files/content/{area}` | **Owner** | Delete a file or empty folder |
-| GET | `/settings` | Any | Read settings |
-| PUT | `/settings` | **Owner** | Update settings |
-| PUT | `/settings/avatar` | **Owner** | Upload agent avatar (raw body) |
-| DELETE | `/settings/avatar` | **Owner** | Reset agent avatar |
-| GET | `/avatar` | Any | Agent avatar image |
+| GET | `/files` | Any | Your Iris's system files and folders |
+| GET | `/files/system/{name}` | Any | Read one of your system files |
+| PUT | `/files/system/{name}` | Any | Write one of your system files |
+| GET | `/files/browse/{area}` | Any | List one of your folders |
+| GET | `/files/content/{area}` | Any | Read a text file |
+| PUT | `/files/content/{area}` | Any | Write a text file |
+| DELETE | `/files/content/{area}` | Any | Delete a file or empty folder |
+| GET | `/settings` | Any | Read your settings |
+| PUT | `/settings` | Any (policy: **Owner**) | Update your settings |
+| PUT | `/settings/avatar` | Any | Upload your Iris's picture (raw body) |
+| DELETE | `/settings/avatar` | Any | Reset your Iris's picture |
+| GET | `/avatar` | Any | An Iris's picture (yours, or a Together chat host's) |
 | GET | `/harnesses` | Any | CLI harness status |
 | POST | `/harnesses/refresh` | **Owner** | Re-probe harnesses |
 | GET | `/harnesses/{name}/login` | **Owner** | Sign-in session state |
@@ -285,14 +290,15 @@ All paths are under `/api`. "Any" means any authenticated user.
 | POST | `/push/test` | Any | Send yourself a test push |
 | GET | `/jobs` | **Owner** | Scheduled job status |
 | POST | `/jobs/{name}/run` | **Owner** | Run a job now (`202`) |
-| POST | `/voice/speak` | Any | Placeholder, always `501` |
+| POST | `/voice/speak` | Member | A reply as a voice note (WAV) |
+| POST | `/voice/transcribe` | Any | Voice input: WAV in, text out |
 | GET | `/ws` | token | WebSocket event stream |
 
 "Member" routes return `404 not_found` (`conversation not found`) when the
 caller is not a member of the conversation, and for hidden job conversations.
 
-Feed, idea, goal, and library routes only ever see the caller's own items;
-another user's id behaves like an unknown id (`404`).
+Feed, idea, goal, library, file, and settings routes only ever see the
+caller's own Iris; another user's id behaves like an unknown id (`404`).
 
 ### 3.2 Health, pairing, me, devices, users
 
@@ -374,24 +380,38 @@ Revokes one of the caller's own, not-yet-revoked devices (you can revoke the
 current device). Also deletes that device's push subscriptions. Response
 `{"ok": true}`; `404` if not found, not yours, or already revoked.
 
-#### `GET /api/users` (Owner)
+#### `GET /api/users`
+
+Everyone on this server, for starting Together chats.
 
 ```json
 {"users": [{User}]}
 ```
 
-Ordered by creation time.
+Ordered by creation time. For the owner each user also has `devices`, the
+number of devices they have paired (not revoked).
 
 #### `POST /api/users` (Owner)
 
-Creates another person (for group conversations). Their Main chat is created
-too.
+Adds a person with their own Iris: their Main chat is created and their
+persona and memory files are seeded from the generic templates (in
+`<data dir>/people/<user id>/`). They pair their phone with a code from
+`POST /api/users/{id}/pairing-code`.
 
 | Field | Type | Notes |
 |---|---|---|
 | `display_name` | string | Required, non-blank, max 80. Trimmed. |
 
 Response: `{"user": {User}}` with `is_owner: false`.
+
+#### `DELETE /api/users/{id}` (Owner)
+
+Removes a person and everything that is only theirs: their devices and
+push subscriptions, their persona/memory/workspace folder, their chats and
+the Together chats they created (running turns are cancelled), feed, ideas,
+goals, library items, saved logins, and settings. Their messages in other
+people's Together chats stay, without an author. The owner cannot be
+removed (`400`); unknown id: `404`. Response `{"ok": true}`.
 
 #### `POST /api/users/{id}/pairing-code`
 
@@ -403,7 +423,8 @@ Owner only. Creates a one-time pairing code for user `{id}`.
 
 `404` if the user does not exist.
 
-There is no API to delete users or to revoke another user's devices.
+There is no API to revoke another user's single devices; remove the person
+instead.
 
 ### 3.3 Conversations and messages
 
@@ -413,16 +434,19 @@ returned by the API).
 
 Each member has a role: `owner` for the person who created the conversation
 (its **creator**; not necessarily the Iris owner) and `member` for everyone
-added later. Only the Iris owner can create group conversations.
+added later. Anyone can start a group ("Together") conversation with other
+people on the server; the **creator's Iris** (name, picture, `IDENTITY.md`,
+`SOUL.md`) answers in it.
 
 A conversation is **shared** when it has more than one member
 (`member_count > 1`). A group whose only member is its creator is treated as
 personal. Shared conversations change how turns run: the individual-use
 policy keeps Claude out unless the owner opts in
-([section 7](#7-engine-selection)), no connectors
-are passed to the CLI, and the Iris bridge only offers cards
-([section 8](#8-the-iris-mcp-bridge)). In all conversations, bridge tools
-act on the creator's data.
+([section 7](#7-engine-selection)), no connectors are passed to the CLI,
+the Iris bridge only offers cards ([section 8](#8-the-iris-mcp-bridge)),
+nobody's private files or memory are in the prompt, and the CLI works in a
+folder of its own (`<data dir>/together/<conversation id>`). In personal
+conversations the bridge acts on the creator's data.
 
 #### `GET /api/conversations`
 
@@ -441,7 +465,7 @@ message bumps `updated_at`).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `kind` | string | `"side"` | `"side"` or `"group"`. `group` is **owner-only**. |
+| `kind` | string | `"side"` | `"side"` or `"group"` (a Together chat; anyone may start one, and their Iris answers in it). |
 | `title` | string | `""` | Max 200. Trimmed. |
 | `member_ids` | string[] | `[]` | Other users to add (group only; a side chat with members is `400`). Unknown ids are `400 unknown user <id>`. The caller is always a member. |
 
@@ -488,11 +512,15 @@ Any member.
   "members": [
     {"user_id": "...", "display_name": "Owner", "role": "owner", "joined_at": 1760000000000},
     {"user_id": "...", "display_name": "Sam", "role": "member", "joined_at": 1760000100000}
-  ]
+  ],
+  "agent": {"user_id": "...", "name": "Iris", "avatar_url": "/api/avatar?user=...&v=default",
+            "avatar_custom": false}
 }
 ```
 
-Ordered by `joined_at`.
+Members are ordered by `joined_at`. `agent` is the Iris that answers here
+(the creator's), so a Together chat shows the host's Iris name and picture
+on everyone's phone; `null` if the creator was removed.
 
 #### `POST /api/conversations/{id}/members`
 
@@ -568,6 +596,10 @@ response is sent, so they can arrive first.
 
 Sending while a turn is already running in the conversation is allowed; the
 new turn waits for the current one to finish.
+
+In a shared conversation, the other members whose app is closed (no
+connected WebSocket) also get a push notification with the message
+(`kind: "together"`, title `<sender> · <chat title>`).
 
 #### `POST /api/conversations/{id}/cancel`
 
@@ -649,11 +681,11 @@ tool). Users read, like, delete, and discuss them.
 Newest first. To page, pass the `created_at` of the last (oldest) post as
 `before`. `has_more` is `true` exactly when older posts exist.
 
-#### `POST /api/feed/refresh` (Owner)
+#### `POST /api/feed/refresh`
 
-Starts the feed job now. Response **`202`**: `{"started": true}`; `started` is
-`false` if the feed job was already running. Runs even if the feed job is
-disabled in config.
+Starts the caller's own feed job now. Response **`202`**: `{"started":
+true}`; `started` is `false` if that person's feed job was already running.
+Runs even if the feed job is disabled in config.
 
 #### `GET /api/feed/prompt`
 
@@ -663,14 +695,16 @@ disabled in config.
 
 Returns the built-in default when none is set.
 
-#### `PUT /api/feed/prompt` (Owner)
+#### `PUT /api/feed/prompt`
+
+Sets the caller's own feed prompt.
 
 | Field | Type | Notes |
 |---|---|---|
 | `feed_prompt` | string | Required field, max 4,000. Blank resets to the default. |
 
 Response: `{"feed_prompt": "<effective prompt>"}`. Emits `settings.changed`
-to all users.
+to the caller.
 
 #### `DELETE /api/feed/{id}`
 
@@ -878,7 +912,10 @@ Deletes the item and its file. `{"ok": true}`. Emits `entities.changed`
 
 ### 3.9 System files and folders
 
-All routes in this section are **owner-only**.
+Every person edits their **own** Iris here: the owner's files are the
+top-level `persona/`, `memory/`, and `workspace/` folders of the data
+directory; everyone else's are under `people/<user id>/`. Nobody can open
+another person's files through these routes.
 
 System files are the persona and memory markdown files the agent reads:
 
@@ -973,55 +1010,65 @@ Deletes a file, or an empty folder (`400 folder is not empty` otherwise).
 
 ### 3.10 Settings and avatar
 
+Settings are per person: each person's Iris has its own name, picture,
+feed prompt, and voice choice. `allow_claude_for_shared` is the one
+server-wide setting, and only the owner may change it.
+
 #### `GET /api/settings`
 
-Returns the [Settings](#settings) object directly (not wrapped):
+Returns the caller's [Settings](#settings) object directly (not wrapped):
 
 ```json
 {
   "agent_name": "Iris",
-  "avatar_url": "/api/avatar?v=default",
+  "avatar_url": "/api/avatar?user=<user id>&v=default",
   "avatar_custom": false,
   "allow_claude_for_shared": false,
   "feed_prompt": "...",
-  "voice": {"enabled": false, "status": "not_implemented"}
+  "voice": {"enabled": false, "tts": false, "stt": false}
 }
 ```
 
-#### `PUT /api/settings` (Owner)
+#### `PUT /api/settings`
 
 All fields optional; only supplied fields change.
 
 | Field | Type | Notes |
 |---|---|---|
-| `agent_name` | string | Non-blank, max 40, must not contain newline, carriage return, `<`, `>`, or a backtick. Trimmed. |
-| `allow_claude_for_shared` | bool | Owner opt-in to let Claude answer in conversations with more than one person ([individual-use policy](#individual-use-policy)). `false` clears the app setting (the config value still applies). |
-| `feed_prompt` | string | Max 4,000. Blank resets to the default. |
+| `agent_name` | string | The caller's Iris. Non-blank, max 40, must not contain newline, carriage return, `<`, `>`, or a backtick. Trimmed. |
+| `voice_replies` | bool | The caller hears replies as voice notes plus text (`voice.enabled`). |
+| `feed_prompt` | string | The caller's feed. Max 4,000. Blank resets to the default. |
+| `allow_claude_for_shared` | bool | **Owner only** (`403` otherwise). Opt-in to let Claude answer for other people: in conversations with more than one person and in other people's own Iris ([individual-use policy](#individual-use-policy)). `false` clears the app setting (the config value still applies). |
 
 Unknown fields are ignored. Models are no longer set here: pin slots with
 [`PUT /api/models/slots/{slot}`](#put-apimodelsslotsslot-owner). (An
 `engine` pin stored by earlier versions is read as the `chat` slot's pin.)
 
-Response: the updated Settings object. Emits `settings.changed` to **all**
-users (even when the body is `{}`).
+Response: the caller's updated Settings object. Emits `settings.changed` to
+the caller, or to every user (each with their own settings) when
+`allow_claude_for_shared` was sent.
 
-#### `PUT /api/settings/avatar` (Owner)
+#### `PUT /api/settings/avatar`
 
-Raw image body, validated exactly like `POST /api/attachments` (PNG, JPEG,
-GIF, WebP; `413`/`415` errors). Response: the updated Settings object
-(`avatar_custom: true`, `avatar_url` with a new `v`). Emits
-`settings.changed`.
+Sets the picture of the caller's own Iris. Raw image body, validated
+exactly like `POST /api/attachments` (PNG, JPEG, GIF, WebP; `413`/`415`
+errors); the app crops it to a 512 px square first. The previous custom
+picture is deleted. Response: the updated Settings object (`avatar_custom:
+true`, `avatar_url` with a new `v`). Emits `settings.changed` to the caller.
 
-#### `DELETE /api/settings/avatar` (Owner)
+#### `DELETE /api/settings/avatar`
 
-Reverts to the built-in avatar. Response: the Settings object. Emits
-`settings.changed`.
+Reverts the caller's Iris to the built-in picture. Response: the Settings
+object. Emits `settings.changed` to the caller.
 
 #### `GET /api/avatar`
 
-The current avatar image: the uploaded image, or the built-in SVG
-(`image/svg+xml`). The `v` query parameter in `avatar_url` is only a cache
-buster. Requires auth.
+| Query | Type | Notes |
+|---|---|---|
+| `user` | string | Whose Iris (default: the caller's). Another person's only if the caller shares a conversation with them (a Together chat's host); otherwise `404`. |
+| `v` | string | Cache buster only. |
+
+The uploaded image, or the built-in SVG (`image/svg+xml`). Requires auth.
 
 ### 3.11 Harnesses, sign-in, models, and slots
 
@@ -1132,10 +1179,10 @@ as `router: "fallback"`) and the slot shows `pin_unavailable: true`.
 
 ### 3.12 Connectors
 
-Connectors are MCP servers passed to the harness CLI on every turn while
-enabled (chat turns of any user, and scheduled jobs), **except turns in
-shared conversations** (more than one member), which get no connectors. All
-routes are **owner-only**.
+Connectors are the owner's accounts: MCP servers passed to the harness CLI
+while enabled on the owner's own turns (personal chats and scheduled jobs).
+Turns in shared conversations (more than one member) and other people's own
+Iris get no connectors. All routes are **owner-only**.
 
 Secret values (`env` values and `headers` values) are encrypted at rest and
 **never returned**; responses list only their key names. See
@@ -1313,7 +1360,9 @@ Returns `{"delivered": 0, "failed": 0}` when push is disabled.
 
 ### 3.15 Jobs
 
-Both routes are **owner-only**. Jobs: `heartbeat` and `feed` (see
+Both routes are **owner-only** and show or run the owner's own jobs (every
+person's Iris runs its own; people start their feed with
+`POST /api/feed/refresh`). Jobs: `heartbeat` and `feed` (see
 [section 5](#scheduled-jobs)).
 
 #### `GET /api/jobs`
@@ -1343,15 +1392,56 @@ now, even if disabled or outside its active hours. Response **`202`**:
 
 ### 3.16 Voice
 
+Voice runs on the server with open-source models, so audio never leaves it:
+a Piper voice for replies and Whisper (`base.en`) for voice input, both
+through [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache-2.0).
+The owner installs them from the app as the `tts` and `stt` engines
+([section 3.17](#317-engines-install-and-update)). `settings.voice.tts` and
+`settings.voice.stt` say whether they are installed. One synthesis or
+transcription runs at a time, as a short-lived process with a 3 minute
+limit.
+
+When the server has no voice, the app reads replies aloud with the phone's
+own voice (and labels them so); when it cannot transcribe, the app uses the
+browser's speech recognition if there is one.
+
 #### `POST /api/voice/speak`
 
-Placeholder. Always `501`:
+A finished assistant reply as a voice note.
+
+| Field | Type | Notes |
+|---|---|---|
+| `message_id` | string | Required. A finished `text` reply (`role: "assistant"`) in a conversation the caller belongs to (`404` otherwise; `400` for other messages). |
+
+Response `200`: `audio/wav` (16-bit mono PCM), with `x-voice-duration-ms`
+and `Cache-Control: private, max-age=86400`. The spoken text is the reply
+without Markdown, code (it says the code is in the text), or URLs, cut at
+a sentence near 1,500 characters ("The rest is in the text."). Voice notes
+are cached under `<data dir>/voice/` (keyed by message and text) for 30
+days; when a reply finishes and anyone in the conversation has voice
+replies on, it is made right away so it plays without a wait.
+
+Errors: `503 voice_unavailable` (no server voice), `502 voice_failed`.
+
+#### `POST /api/voice/transcribe`
+
+Voice input. The raw request body is a WAV file (16-bit PCM, mono or
+stereo, any sample rate; the app records on the phone and converts to 16
+kHz mono WAV before uploading), at most 5 minutes and `max_upload_bytes`.
+
+Response `200`:
 
 ```json
-{"error": {"code": "not_implemented", "message": "voice replies are not implemented yet"}}
+{"text": "What is the capital of France?", "duration_ms": 2400}
 ```
 
-(Auth is still checked first, so an unauthenticated call gets `401`.)
+`text` may be empty when nothing was heard. The recording is written to a
+private temporary file, transcribed, and deleted; it is never stored or
+logged.
+
+Errors: `415 unsupported_media_type` (not 16-bit PCM WAV), `413
+too_large`, `503 voice_unavailable` (no speech-to-text on the server),
+`502 voice_failed`.
 
 ### 3.17 Engines (install and update)
 
@@ -1365,8 +1455,13 @@ official sources, into its engines directory (`engines.dir`, default
 | `codex` | npm `@openai/codex` | npm registry integrity; install scripts not run |
 | `gemini` | npm `@google/gemini-cli` | same |
 | `opencode` | npm `opencode-ai` (its native platform binary) | same |
+| `tts` | `github.com/k2-fsa/sherpa-onnx` releases: the sherpa-onnx runtime for Linux x86_64/aarch64 and the Piper voice `en_US-ljspeech-medium` (public-domain dataset) | SHA-256 and size pinned in Iris for every download |
+| `stt` | the same runtime and Whisper `base.en` (only the int8 files are kept) | same |
 
-The npm engines need Node.js on the server. Iris only ever updates or
+The npm engines need Node.js on the server; `tts` and `stt` need `tar` and
+`bzip2` to unpack. The two voice entries are not AI engines (they never
+answer turns): they share one runtime, which is removed with the last of
+them, and updating them installs the versions pinned in this Iris release. Iris only ever updates or
 removes engines it installed; a CLI the operator installed (for example in
 `~/.local/bin`) is reported as `external` and never touched. With
 `engines.helper` set, installs run as a separate admin user through that
@@ -1378,7 +1473,7 @@ anything.
 ```json
 {
   "engines": [{
-    "name": "claude", "label": "Claude Code",
+    "name": "claude", "kind": "engine", "label": "Claude Code",
     "source": "downloads.claude.ai (Anthropic release manifest, SHA-256 verified)",
     "installed": true, "managed": true, "external": false,
     "version": "2.1.296 (Claude Code)", "managed_version": "2.1.296",
@@ -1392,10 +1487,13 @@ anything.
 }
 ```
 
+`kind`: `"engine"` for the AI engines, `"voice"` for `tts` and `stt`.
 `installed`: the CLI was found (anywhere). `managed`: Iris installed it.
-`requires`: `"nodejs"` when the engine needs npm and it is missing.
-`operation`: the last install/update/uninstall (`state` `running`, `done`,
-or `failed` with `error`), or `null`.
+`requires`: `"nodejs"` when the engine needs npm and it is missing (for
+voice: `"tar"` or `"bzip2"`). `operation`: the last install/update/uninstall
+(`state` `running`, `done`, or `failed` with `error`), or `null`. Voice
+entries also carry `download_mb` (approximate one-time download) and
+`unsupported` (a reason, when there is no official build for this server).
 
 #### `POST /api/engines/{name}/install`, `POST /api/engines/{name}/update`
 
@@ -1478,7 +1576,7 @@ was emitted). Events are delivered only to the users listed under
 | `turn.status` | `{"conversation_id", "message_id", "status": "queued" \| "running"}` | Conversation members |
 | `conversation.created` | `{"conversation": {Conversation}}` | Conversation members |
 | `entities.changed` | `{"kinds": ["goals" \| "ideas" \| "feed" \| "library", ...]}` | The affected user |
-| `settings.changed` | `{"settings": {Settings}}` | All users |
+| `settings.changed` | `{"settings": {Settings}}` | The person whose settings changed (everyone, each with their own, when the policy or voice availability changed) |
 | `harness.status` | `{"harness": {HarnessStatus}}` (`path` always `null`) | All users |
 | `message.updated` | `{"conversation_id", "message": {Message}}` | Conversation members |
 | `models.changed` | `{"slots": [{Slot}]}` | All users |
@@ -1516,7 +1614,7 @@ Event details:
   changes (to the caller), after a turn in which the agent successfully
   changed data through the bridge (to the conversation creator; see
   [section 8](#8-the-iris-mcp-bridge)), and after a successful feed job
-  (`["feed", "ideas"]`, to the owner).
+  (`["feed", "ideas"]`, to the person it ran for).
 - **`conversation.created`**: sent by `POST /api/conversations`,
   `POST /api/feed/{id}/discuss` (only when a new discussion is created),
   `POST /api/ideas/{id}/start`, and to the added user by
@@ -1566,8 +1664,12 @@ After `POST /api/conversations/{id}/messages` (or `POST
    and then for a global CLI slot (`max_concurrent_turns`, default 2). If all
    slots are busy it emits `turn.status` `queued`. When it gets a slot it
    emits `turn.status` `running`.
-3. It classifies the message (effort, and whether it is clearly hard), picks
-   a slot and model ([section 7](#7-engine-selection)), and records it on the
+3. It finds whose Iris answers: the conversation's creator (in a Together
+   chat, the person who started it). Their persona, memory, name, and
+   folders are used. It classifies the message (effort, and whether it is
+   clearly hard), picks a slot and model ([section 7](#7-engine-selection)),
+   applying the individual-use policy when the turn is not the owner's own
+   use, and records it on the
    placeholder (`harness`, `model`, `effort`, and `meta.routing`; no event is
    sent for this). Images are left out with a conversational note when the
    chosen model cannot see them, and the bridge is skipped for a CLI without
@@ -1575,9 +1677,16 @@ After `POST /api/conversations/{id}/messages` (or `POST
 4. It resumes the CLI session for this conversation and harness when possible,
    replaying messages the session has not seen (up to 40 messages / 24,000
    characters), wires in the [iris-mcp bridge](#8-the-iris-mcp-bridge) and
-   enabled connectors, and starts the CLI. In shared conversations (more than
-   one member) the bridge runs in cards-only mode and no connectors are
-   passed.
+   enabled connectors (only in the owner's personal chats; they are the
+   owner's accounts), and starts the CLI in the person's `workspace/`, with
+   their `memory/` writable. In shared conversations (more than one member)
+   the bridge runs in cards-only mode, no connectors are passed, the CLI
+   works in `<data dir>/together/<conversation id>`, and nothing is
+   writable outside it. Claude Code also gets permission deny rules for
+   every other person's folders and for Iris's own state (database, keys,
+   per-turn files, uploads, library, voice cache), and in shared chats for
+   the host's folders too; the other CLIs have no such rules and rely on the
+   separate folders and the prompt.
 5. While the CLI runs, Iris emits `message.delta` and `message.activity`.
 6. On a "not signed in" error with no text yet, the harness is marked
    `auth_required` (a `harness.status` event, plus a reconnect card if the
@@ -1587,7 +1696,8 @@ After `POST /api/conversations/{id}/messages` (or `POST
    `message.created` for each card message the agent created during the turn
    (and a `connector_reconnect` card if a connector refused its sign-in),
    then `entities.changed` if applicable, then sends a reply push if
-   applicable.
+   applicable, and starts making the voice note if a member has voice
+   replies on.
 
 The text streamed through `message.delta` is not saved until the turn ends.
 All events above go to the conversation's members, except `entities.changed`
@@ -1653,7 +1763,7 @@ A Main chat message posted by the heartbeat job has
 | `meta.error.kind` | Cause | `detail` | Friendly `content` (when no text streamed) |
 |---|---|---|---|
 | `auth_required` | A harness reported during the turn that it is not signed in (after text had streamed, or with no other engine left), or no engine was usable and at least one enabled harness **allowed in this conversation** is signed out | The signed-out harness name(s), comma-separated, e.g. `"claude"` or `"claude,codex"` | "I can't think right now because my AI engine on the server is signed out. To fix it, run \`claude\` on the Iris server and sign in with /login, then send your message again." (the fix names each listed harness: Codex "run \`codex login\`", Gemini "run \`gemini\` ... and sign in", OpenCode "run \`opencode auth login\`"; the app's reconnect card is the easier fix) |
-| `paused_policy` | A conversation with more than one person, Claude is the only usable engine, and the owner has not allowed Claude for shared chats | `only Claude is available and this conversation is shared` | "I can't reply in this group chat yet. The only AI engine on the server is Claude, and Claude subscriptions are for one person, so I stay out of shared conversations unless the owner turns that on." The first time per conversation an `action` card offers the owner the opt-in. |
+| `paused_policy` | Claude is the only usable engine, the turn is not the owner's own use (a conversation with more than one person, or another person's own Iris), and the owner has not allowed Claude for other people | `only Claude is available and this conversation is shared`, or `only Claude is available and this is not the owner's own Iris` | Group: "I can't reply in this group chat yet. The only AI engine on the server is Claude, and Claude subscriptions are for one person, so I stay out of shared conversations unless the owner turns that on." Another person's Iris: "I can't reply yet. The only AI engine on the server is Claude, and Claude subscriptions are for one person, so I can only use it for the owner unless they allow it. I've let them know." The first time per conversation, a group gets an `action` card with the owner's opt-in; another person's chat gets an `info` card, and the owner gets an `action` card ("Let Sam use Claude?") in their Main chat plus a push (`kind: "policy"`). |
 | `no_engine` | No usable engine at all (none installed, all disabled, or every harness failed to start) | `no usable engine` / `no engine available` | "I can't reach any AI engine on the server right now. One of Claude, Codex, Gemini, or OpenCode needs to be installed and signed in; I can walk you through it in Settings." |
 | `timeout` | No result within `turn_timeout_secs` (default 600) | `no result after 600s` | "That took too long, so I stopped. Want me to try again?" |
 | `harness_error` | The CLI reported an error, or exited without a result | The CLI's error text | "Something went wrong on my end. Want me to try again?" |
@@ -1681,27 +1791,31 @@ CLI model name.
 
 ### Scheduled jobs
 
-The `heartbeat` and `feed` jobs run as turns with `purpose: "scheduled"` in
-hidden per-job conversations owned by the owner, on the `background` and
-`feed` slots (low effort). They are the owner's own use, so any signed-in
-engine may run them, Claude included. Each run starts a fresh CLI
+The `heartbeat` and `feed` jobs run for **every person's Iris**, as turns
+with `purpose: "scheduled"` in hidden per-job conversations owned by that
+person, on the `background` and `feed` slots (low effort), with their own
+persona, memory, `HEARTBEAT.md`, feed prompt, and liked posts. The owner's
+jobs are the owner's own use, so any signed-in engine may run them, Claude
+included; other people's jobs follow the individual-use policy. Each run
+starts a fresh CLI
 session (no resume, no replay), and each job conversation is trimmed to its
 last 20 messages before every run. Job turns are not streamed: no
 `turn.status`, `message.*`, or card events are sent for them. The scheduler
 checks every minute and runs a job when it is enabled, the local time is
 inside `[active_start, active_end)` (windows may wrap past midnight; equal
 start and end means all day), and at least `interval_mins` have passed since
-the last start. Manual runs (`POST /api/jobs/{name}/run`,
+that person's last start. Manual runs (`POST /api/jobs/{name}/run`,
 `POST /api/feed/refresh`) skip those checks.
 
 - **heartbeat**: the agent works through `HEARTBEAT.md`. If it replies
   `HEARTBEAT_OK` (or the reply contains it, or is empty), nothing happens.
-  Otherwise the reply is posted as a new assistant message in the owner's Main
-  chat (`message.created`, `meta.initiated_by: "heartbeat"`) and pushed to all
-  of the owner's subscriptions.
+  Otherwise the reply is posted as a new assistant message in that person's
+  Main chat (`message.created`, `meta.initiated_by: "heartbeat"`) and pushed
+  to all of their subscriptions.
 - **feed**: the agent publishes 1 to 3 feed posts and up to 2 ideas through
-  the bridge, guided by the feed prompt and recently liked posts. When the
-  turn succeeds, the owner receives `entities.changed` `["feed", "ideas"]`.
+  the bridge, guided by the person's feed prompt and recently liked posts.
+  When the turn succeeds, that person receives `entities.changed` `["feed",
+  "ideas"]`.
 
 Failed job turns are only logged.
 
@@ -1720,6 +1834,7 @@ serialized.
 | `display_name` | string | The initial owner is named `"Owner"`. |
 | `is_owner` | bool | |
 | `created_at` | int | |
+| `devices` | int | Only in `GET /api/users` for the owner: devices paired and not revoked. |
 
 ### Device
 
@@ -1746,9 +1861,7 @@ The token hash is never serialized.
 | `updated_at` | int | Bumped by every new message and by renames. |
 | `archived_at` | int or null | |
 | `member_count` | int | Number of human members. More than 1 means the conversation is shared. |
-
-The conversation's creator is not included; use the members list (role
-`owner`).
+| `created_by` | string or null | The creator, whose Iris answers here (`null` once removed). |
 
 ### Member
 
@@ -2027,12 +2140,16 @@ Stored as `meta.routing` (plus `notes`).
 
 | Field | Type | Notes |
 |---|---|---|
+All fields except `allow_claude_for_shared` belong to the person's own Iris.
+
+| Field | Type | Notes |
+|---|---|---|
 | `agent_name` | string | Setting, or `agent_name` from config (default `Iris`). |
-| `avatar_url` | string | `/api/avatar?v=<n>`; `v` changes when the avatar does (`default` when none is set). |
+| `avatar_url` | string | `/api/avatar?user=<user id>&v=<n>`; `v` changes when the avatar does (`default` when none is set). |
 | `avatar_custom` | bool | A custom avatar is set. |
-| `allow_claude_for_shared` | bool | Effective opt-in (config or app setting) for Claude in shared conversations. |
+| `allow_claude_for_shared` | bool | Effective opt-in (config or app setting) for Claude answering other people: shared conversations and other people's own Iris. |
 | `feed_prompt` | string | Effective feed prompt (default if unset). |
-| `voice` | object | Always `{"enabled": false, "status": "not_implemented"}`. |
+| `voice` | object | `{"enabled": bool, "tts": bool, "stt": bool}`: the person turned voice replies on; the server can speak (voice notes) and transcribe (voice input). |
 
 ---
 
@@ -2126,25 +2243,34 @@ support would run without the bridge and connectors (all four have it).
 
 ### Individual-use policy
 
-Claude subscriptions are for one person. **Conversations with more than one
-member never use Claude** unless the owner opts in
-(`router.allow_claude_for_shared` in config, or `allow_claude_for_shared` in
-`PUT /api/settings`). The owner's own scheduled jobs are ordinary individual
-use and may use Claude. "More than one member" is literal: a group whose
-only member is its creator counts as personal.
+Claude subscriptions are for one person: the owner, who signed the CLI in.
+**Turns that are not the owner's own use never use Claude** unless the
+owner opts in (`router.allow_claude_for_shared` in config, or
+`allow_claude_for_shared` in `PUT /api/settings`). That covers
+conversations with more than one member and everything another person's
+own Iris does (their chats and their scheduled jobs). The owner's own chats
+and scheduled jobs are ordinary individual use and may use Claude. "More
+than one member" is literal: a group whose only member is its creator
+counts as personal.
 
-If Claude is the only usable engine, shared chats pause: turns there fail
-with `paused_policy`, and the first time per conversation an `action` card
-offers the owner the opt-in. Everything else keeps working. A pinned Claude
-slot in a shared chat falls back to the next allowed model (`router:
-"fallback"`, reason "individual-use policy").
+If Claude is the only usable engine, those turns pause: they fail with
+`paused_policy`, and the owner is offered the opt-in once per conversation
+(in a group, on a card there; for another person's Iris, on a card in the
+owner's Main chat). Everything else keeps working. A pinned Claude slot
+falls back to the next allowed model (`router: "fallback"`, reason
+"individual-use policy").
 
-Shared conversations are also isolated from the owner's data: their turns
-get no connectors, a cards-only bridge (see
-[section 8](#8-the-iris-mcp-bridge)), a system prompt without `USER.md`,
-`MEMORY.md`, or the memory index, and no write access to the memory folder.
-The CLI's own read tools are governed by its permission settings, so treat
-group chat as a preview until it gets its own access model.
+People are also isolated from each other's data. A person's own Iris uses
+only their persona, memory, and folders, and only the owner's personal
+chats get the connectors. Shared conversations get no connectors, a
+cards-only bridge (see [section 8](#8-the-iris-mcp-bridge)), a system
+prompt with only the host Iris's `IDENTITY.md` and `SOUL.md` (no
+`USER.md`, `TOOLS.md`, `PROACTIVE_PREFERENCES.md`, memory, or memory
+index), their own working folder, and no write access to anyone's memory.
+Claude Code is additionally denied reading or editing other people's
+folders and Iris's own state. All people's CLIs run as the same operating
+system account, so the other CLIs' read tools could still reach those
+folders if a turn went looking; the prompt never names them.
 
 ### Harness availability and fallback
 
@@ -2193,7 +2319,9 @@ Every turn passes this MCP server to the CLI under the server name **`iris`**
 ```
 
 - `--user` is whose data the tools operate on: the conversation's creator for
-  chat turns (so in a group conversation, its creator), the owner for jobs.
+  chat turns (so in a group conversation, its creator), the person a job
+  runs for. Files saved to the Library must come from that person's own
+  `workspace/` or `memory/`.
 - `--conversation` is the conversation of the turn (cards are posted there,
   library items are linked to it). Without it, `create_card` fails.
 - `--shared` is added for conversations with more than one member. In shared
@@ -2325,7 +2453,9 @@ generated on first use.
 
 | Trigger | Recipients | `kind` |
 |---|---|---|
-| Heartbeat job posts a message in the Main chat | The owner, always (online or not) | `heartbeat` |
+| Heartbeat job posts a message in the Main chat | That person, always (online or not) | `heartbeat` |
+| Someone sends a message in a Together chat | The other members with **no connected WebSocket** (title `<sender> · <chat title>`) | `together` |
+| Another person's Iris is waiting for the owner's Claude opt-in | The owner | `policy` |
 | A chat turn completes successfully (`status: "complete"`) and `push.notify_replies_when_offline` is true (default) | Conversation members with **no connected WebSocket** at that moment | `reply` |
 | A chat turn fails (`status: "error"`), same setting | Same | `stuck` (body "I got stuck on that. Tap to try again.") |
 | A CLI the owner used went signed out (reconnect card posted) | The owner | `engine_signin` |
@@ -2351,10 +2481,10 @@ The decrypted payload is a JSON object:
 
 | Field | Notes |
 |---|---|
-| `title` | The agent name. |
+| `title` | The name of the Iris that replied (the host's in a Together chat), or the sender for `together`. |
 | `body` | Message text cut to 180 characters (with `…` when cut). Test: `Notifications are working.` |
 | `conversation_id`, `message_id` | Omitted in test pushes. |
-| `kind` | `reply`, `stuck`, `heartbeat`, `engine_signin`, `connector_reconnect`, or `test`. |
+| `kind` | `reply`, `stuck`, `heartbeat`, `together`, `policy`, `engine_signin`, `connector_reconnect`, or `test`. |
 
 Requests use `TTL: 86400` and `Urgency: normal`.
 
@@ -2371,10 +2501,6 @@ Requests use `TTL: 86400` and `Urgency: normal`.
 
 ## 10. Placeholders and TODO
 
-- **Voice**: `POST /api/voice/speak` always returns `501 not_implemented`,
-  and `settings.voice` is `{"enabled": false, "status": "not_implemented"}`.
-  The planned shape is `POST /api/voice/speak {"message_id"}` returning
-  `audio/mpeg` from a local TTS engine.
 - **Approvals**: the `approval` card, its decision route, and the app's
   card are in place, but nothing creates approval cards yet. The plan is to
   route risky tool calls (sending email or messages, purchases, new

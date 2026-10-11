@@ -173,7 +173,9 @@ Iris is **early** and moving fast. What works today:
   auto-updating engines from the app
 - ✅ For you feed with stories, Ideas, Goals, Library, system file editing
 - ✅ Push notifications, quiet hours, an encrypted credentials vault
-- 🧪 Shared chats with more than one person (preview)
+- ✅ Voice replies and voice input, running on your server (Piper and
+  Whisper, installed from the app)
+- ✅ People: everyone in your home gets their own Iris, plus Together chats
 
 On the way:
 
@@ -182,7 +184,7 @@ On the way:
 - 🚧 "Sign in with Google" style connector setup from the chat
 - 🚧 Automatic feed sources (RSS, YouTube, Reddit) with adaptive size
 - 🚧 Watching and taking over Iris's browser
-- 🚧 Voice replies, and Iris using saved logins for you
+- 🚧 Iris using saved logins for you
 - 🚧 A character for Iris
 
 ## Contributing
