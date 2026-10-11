@@ -6,7 +6,7 @@ import {
 } from './store.js';
 import { Icon, Avatar, Img, Sheet, agentName, promptSheet, confirmSheet, openSheet, closeSheet, LetterTile } from './ui.js';
 import { ChatScreen } from './chat.js';
-import { FeedScreen, StoryViewer } from './feed.js';
+import { FeedScreen, StoryViewer, FeedSettings } from './feed.js';
 import { IdeasScreen, GoalsScreen, LibraryScreen } from './lists.js';
 import { Hub, Connections, ConnectorForm, Logins, Computer, Files, FileEditor, Folder } from './hub.js';
 import { Settings, AiEngine, Devices, People, ActivityLog } from './settings.js';
@@ -214,6 +214,7 @@ function Screen() {
       if (sub === 'devices') return html`<${Devices} />`;
       if (sub === 'people' && owner) return html`<${People} />`;
       if (sub === 'activity') return html`<${ActivityLog} />`;
+      if (sub === 'feed') return html`<${FeedSettings} />`;
       return html`<${Settings} />`;
     }
     default: return html`<${ChatScreen} cid=${mainId()} key=${mainId()} />`;

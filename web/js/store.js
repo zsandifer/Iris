@@ -14,7 +14,7 @@ export const S = {
   logins: {},          // harness -> LoginStatus (owner)
   engines: null,       // GET /api/engines (owner)
   slots: null,         // Slot[]
-  feed: null,          // {posts, hasMore}
+  feed: null,          // {posts, hasMore, status}
   ideas: null,
   goals: null,
   library: null,
@@ -128,7 +128,7 @@ export async function loadFeed(more = false) {
   const before = more && S.feed?.posts?.length ? `&before=${S.feed.posts.at(-1).created_at}` : '';
   const r = await get(`/feed?limit=30${before}`);
   const posts = more ? [...(S.feed?.posts || []), ...r.posts] : r.posts;
-  set({ feed: { posts, hasMore: r.has_more } });
+  set({ feed: { posts, hasMore: r.has_more, status: r.status } });
 }
 export async function loadIdeas() { set({ ideas: (await get('/ideas')).ideas }); }
 export async function loadGoals() { set({ goals: (await get('/goals?include_done=true')).goals }); }

@@ -30,7 +30,7 @@ function QuietHours() {
       } catch (e) { toast(e.message); }
     };
     return html`<div class="sheet-body"><h3>Quiet hours</h3>
-      <p class="mu">No notifications during these hours. Messages still arrive in the app.</p>
+      <p class="mu">No notifications during these hours. Messages still arrive in the app, and anything that came in gets one summary notification when quiet hours end.</p>
       <div class="two"><div><label class="lbl">From</label><input class="field" type="time" value=${start} onInput=${(e) => setStart(e.target.value)} /></div>
       <div><label class="lbl">Until</label><input class="field" type="time" value=${end} onInput=${(e) => setEnd(e.target.value)} /></div></div>
       <div class="btns"><button class="b2" onClick=${() => save(null)}>Turn off</button>
@@ -115,6 +115,7 @@ export function Settings() {
     <//>
     <${Group} label="You">
       <${Row} icon="user" title="Your name" value=${S.me?.user?.display_name} onClick=${renameMe} />
+      ${isOwner() && html`<${Row} icon="sparkles" title="For you" sub="Sources and daily posts" onClick=${() => go('settings/feed')} />`}
     <//>
     <${Notifications} />
     <${Group} label="Advanced">

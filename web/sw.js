@@ -60,15 +60,17 @@ self.addEventListener('push', (e) => {
     badge: '/icons/icon-192.png',
     tag: data.conversation_id || data.kind || 'iris',
     renotify: true,
-    data: { conversation_id: data.conversation_id || null, kind: data.kind || null },
+    data: { conversation_id: data.conversation_id || null, kind: data.kind || null, url: data.url || null },
   };
   e.waitUntil(self.registration.showNotification(title, options));
 });
 
 self.addEventListener('notificationclick', (e) => {
   e.notification.close();
-  const cid = e.notification.data && e.notification.data.conversation_id;
-  const url = cid ? `/#/chat/${cid}` : '/';
+  const d = e.notification.data || {};
+  // Only same-app paths ("/#/foryou"); never another origin.
+  const path = typeof d.url === 'string' && /^\/#\/[\w/-]*$/.test(d.url) ? d.url : '/';
+  const url = d.conversation_id ? `/#/chat/${d.conversation_id}` : path;
   e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((wins) => {
     for (const w of wins) {
       if (new URL(w.url).origin === self.location.origin) {
