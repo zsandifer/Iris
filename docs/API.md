@@ -607,10 +607,17 @@ newest use first, each image once. An upload that was never sent in a chat
 | Query | Type | Default | Notes |
 |---|---|---|---|
 | `limit` | int | 100 | Clamped to 1..500. |
+| `before` | int | none | Next page: the previous page's last `used_at`. |
+| `before_id` | string | none | With `before`: the previous page's last `id` (photos sent together share `used_at`). |
+
+Ordered by `used_at` (when the photo was last sent), then `id`, newest
+first.
 
 ```json
 {"attachments": [{"id": "...", "mime": "image/jpeg", "size": 48213, "sha256": "<64 hex>",
-                  "created_at": 1760000000000, "conversation_id": "...", "message_id": "..."}]}
+                  "created_at": 1760000000000, "conversation_id": "...", "message_id": "...",
+                  "used_at": 1760000005000}],
+ "has_more": false}
 ```
 
 #### `POST /api/attachments`
