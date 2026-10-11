@@ -2,7 +2,7 @@
 import { html, useEffect, useState } from './h.js';
 import { get, post, patch, del, api, seg, isId } from './api.js';
 import {
-  S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary, loadMoreSaved, loadMorePhotos, convFor,
+  S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary, loadMoreSaved, loadMorePhotos, loadMoreItems, convFor,
 } from './store.js';
 import { Icon, Img, Empty, Spinner, ago, since, openSheet, closeSheet, confirmSheet, hostOf, useBlob } from './ui.js';
 import { md } from './md.js';
@@ -204,7 +204,7 @@ export function LibraryScreen() {
   const tabs = [['all', 'All'], ['made', 'Made by me'], ['photos', 'Photos'], ['saved', 'Saved']];
   let body;
   if (!lib) body = html`<${Spinner} />`;
-  else if (tab === 'made') body = lib.items.length ? html`<${MadeByIris} items=${lib.items} />` : html`<${Empty} icon="file" title="Nothing yet">Reports, drafts, and images I make for you land here.<//>`;
+  else if (tab === 'made') body = lib.items.length ? html`<${MadeByIris} items=${lib.items} />${lib.itemsMore && html`<${ShowMore} load=${loadMoreItems} />`}` : html`<${Empty} icon="file" title="Nothing yet">Reports, drafts, and images I make for you land here.<//>`;
   else if (tab === 'photos') body = lib.photos.length ? html`<${PhotoGrid} photos=${lib.photos} />${lib.photosMore && html`<${ShowMore} load=${loadMorePhotos} />`}` : html`<${Empty} icon="image" title="No photos yet">Photos you send me show up here.<//>`;
   else if (tab === 'saved') body = saved.length || lib.savedMore ? html`<${Saved} posts=${saved} />${lib.savedMore && html`<${ShowMore} load=${loadMoreSaved} />`}` : html`<${Empty} icon="heart" title="Nothing saved">Tap ♡ on a post in For you to keep it here.<//>`;
   else {

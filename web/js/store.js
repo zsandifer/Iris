@@ -1,7 +1,7 @@
 // App state: one plain object, a change counter, and loaders that keep it
 // in sync with the REST API and the WebSocket event stream.
 import { useEffect, useReducer, useRef } from './h.js';
-import { get, post, patch, seg } from './api.js';
+import { get, post, patch, seg, isId } from './api.js';
 
 /** Fresh client state: everything here belongs to the signed-in user. */
 function initialState() {
@@ -13,7 +13,7 @@ function initialState() {
     convs: null,         // Conversation[] (not archived)
     archived: null,      // archived Conversation[] (loaded on demand)
     msgs: {},            // conversation id -> {list, hasMore, loading}
-    live: {},            // assistant message id -> {text, acts: Activity[], queued}
+    live: {},            // assistant message id -> {text, acts: Activity[], queued, cid}
     logins: {},          // harness -> LoginStatus (owner)
     engines: null,       // GET /api/engines (owner)
     slots: null,         // Slot[]
@@ -207,7 +207,7 @@ export async function loadMessages(cid) {
     const live = { ...S.live };
     for (const m of list) {
       if (m.status !== 'streaming') delete live[m.id];
-      else if (!live[m.id]) live[m.id] = { text: '', acts: [] };
+      else if (!live[m.id]) live[m.id] = { text: '', acts: [], cid };
     }
     set({ live });
     doneLoading(cid, { list, hasMore: joined ? (cur.hasMore ?? r.has_more) : r.has_more, error: undefined });
@@ -233,17 +233,29 @@ export async function loadOlder(cid) {
 }
 
 export async function loadFeed(more = false) {
-  const before = more && S.feed?.posts?.length ? `&before=${S.feed.posts.at(-1).created_at}` : '';
-  const r = await get(`/feed?limit=30${before}`);
-  const posts = more ? [...(S.feed?.posts || []), ...r.posts] : r.posts;
-  set({ feed: { posts, hasMore: r.has_more } });
+  if (!more) {
+    const r = await get('/feed?limit=30');
+    set({ feed: { posts: r.posts, hasMore: r.has_more } });
+    return;
+  }
+  const last = S.feed?.posts?.at(-1);
+  if (!last) return;
+  const r = await get(`/feed?limit=30&before=${last.created_at}`);
+  // A refresh may have replaced the list meanwhile: this page only follows
+  // the list it was asked for.
+  if (S.feed?.posts.at(-1)?.id !== last.id) return;
+  set({ feed: { posts: appendNew(S.feed.posts, r.posts), hasMore: r.has_more } });
 }
 export async function loadIdeas() { set({ ideas: (await get('/ideas')).ideas }); }
 export async function loadGoals() { set({ goals: (await get('/goals?include_done=true')).goals }); }
 const SAVED_PAGE = 50;
 const PHOTO_PAGE = 60;
+const ITEM_PAGE = 60;
 const MAX_RELOAD = 600; // a refresh reloads at most this many shown items
+// Photos page by (used_at, id), generated items by (created_at, id),
+// saved posts by created_at; all newest first.
 const photoCursor = (p) => `&before=${p.used_at}&before_id=${encodeURIComponent(p.id)}`;
+const itemCursor = (it) => `&before=${it.created_at}&before_id=${encodeURIComponent(it.id)}`;
 
 const appendNew = (list, more) => {
   const ids = new Set(list.map((x) => x.id));
@@ -253,6 +265,11 @@ const appendNew = (list, more) => {
 // Library lists, newest first. `page(last)` fetches the page after `last`
 // (the first page without it) and returns [items, hasMore].
 const PAGED = {
+  items: {
+    more: 'itemsMore',
+    page: (last) => get(`/library?limit=${ITEM_PAGE}${last ? itemCursor(last) : ''}`)
+      .then((r) => [r.items, !!r.has_more]),
+  },
   saved: {
     more: 'savedMore',
     page: (last) => get(`/feed?liked=true&limit=${SAVED_PAGE}${last ? `&before=${last.created_at}` : ''}`)
@@ -279,18 +296,19 @@ async function loadPages(kind, want) {
 }
 
 /**
- * (Re)load the Library. Saved and Photos are reloaded from the server as
- * far as they were shown, never patched from what was cached, so an item
- * unliked or removed elsewhere disappears and a newly saved one shows up.
+ * (Re)load the Library. Each list (made by me, photos, saved) is reloaded
+ * from the server as far as it was shown, never patched from what was
+ * cached, so an item unliked or removed elsewhere disappears and a newly
+ * saved one shows up.
  */
 export async function loadLibrary() {
   const cur = S.library;
-  const [items, [photos, photosMore], [saved, savedMore]] = await Promise.all([
-    get('/library').then((r) => r.items),
+  const [[items, itemsMore], [photos, photosMore], [saved, savedMore]] = await Promise.all([
+    loadPages('items', cur?.items.length || 0),
     loadPages('photos', cur?.photos.length || 0),
     loadPages('saved', cur?.saved.length || 0),
   ]);
-  set({ library: { items, photos, photosMore, saved, savedMore } });
+  set({ library: { items, itemsMore, photos, photosMore, saved, savedMore } });
 }
 
 /**
@@ -309,6 +327,8 @@ async function loadMore(kind) {
 
 /** Next page of Library's Saved posts. */
 export const loadMoreSaved = () => loadMore('saved');
+/** Next page of Library's generated items ("Made by me"). */
+export const loadMoreItems = () => loadMore('items');
 /** Next page of Library's Photos. */
 export const loadMorePhotos = () => loadMore('photos');
 
@@ -344,8 +364,9 @@ function bumpConv(cid, at) {
   S.convs = S.convs.map((c) => (c.id === cid ? { ...c, updated_at: at } : c));
 }
 
-function liveFor(mid) {
-  return S.live[mid] || { text: '', acts: [] };
+function liveFor(mid, cid) {
+  const l = S.live[mid] || { text: '', acts: [] };
+  return cid && !l.cid ? { ...l, cid } : l;
 }
 
 /**
@@ -394,19 +415,19 @@ export function handleEvent(ev) {
       break;
     case 'message.created': {
       const m = ev.message;
-      if (m.status === 'streaming' && !S.live[m.id]) S.live = { ...S.live, [m.id]: { text: '', acts: [] } };
+      if (m.status === 'streaming' && !S.live[m.id]) S.live = { ...S.live, [m.id]: { text: '', acts: [], cid: ev.conversation_id } };
       upsert(ev.conversation_id, m);
       bumpConv(ev.conversation_id, m.created_at);
       set({});
       break;
     }
     case 'message.delta': {
-      const l = liveFor(ev.message_id);
+      const l = liveFor(ev.message_id, ev.conversation_id);
       set({ live: { ...S.live, [ev.message_id]: { ...l, text: l.text + ev.text, queued: false } } });
       break;
     }
     case 'message.activity': {
-      const l = liveFor(ev.message_id);
+      const l = liveFor(ev.message_id, ev.conversation_id);
       const acts = l.acts.filter((a) => a.id !== ev.activity.id);
       const i = l.acts.findIndex((a) => a.id === ev.activity.id);
       if (i >= 0) acts.splice(i, 0, ev.activity);
@@ -415,7 +436,7 @@ export function handleEvent(ev) {
       break;
     }
     case 'turn.status': {
-      const l = liveFor(ev.message_id);
+      const l = liveFor(ev.message_id, ev.conversation_id);
       set({ live: { ...S.live, [ev.message_id]: { ...l, queued: ev.status === 'queued' } } });
       break;
     }
@@ -463,10 +484,35 @@ export function handleEvent(ev) {
   }
 }
 
+/**
+ * Live replies in chats that aren't loaded: reloading S.msgs won't see them
+ * finish (their completion may have been missed while offline). Ask whether
+ * a turn still holds each such chat and drop the entries if not.
+ */
+function reconcileLive() {
+  const byChat = {};
+  for (const [mid, l] of Object.entries(S.live)) {
+    if (l.cid && S.msgs[l.cid]) continue; // loadMessages reconciles these
+    (byChat[l.cid || ''] ||= []).push(mid);
+  }
+  for (const [cid, mids] of Object.entries(byChat)) {
+    const drop = () => {
+      const live = { ...S.live };
+      for (const m of mids) delete live[m];
+      set({ live });
+    };
+    if (!isId(cid)) { drop(); continue; }
+    get(`/conversations/${seg(cid)}`)
+      .then((r) => { if (!r.turn_running) drop(); })
+      .catch((e) => { if (e.status === 403 || e.status === 404) drop(); });
+  }
+}
+
 /** Refetch whatever is loaded (after a reconnect or a resync). */
 export function refreshAll() {
   loadConvs().catch(() => {});
   for (const cid of Object.keys(S.msgs)) loadMessages(cid).catch(() => {});
+  reconcileLive();
   for (const k of Object.keys(loaders)) if (S[k]) loaders[k]().catch(() => {});
   if (S.slots) loadSlots().catch(() => {});
   if (S.engines) loadEngines().catch(() => {});
@@ -481,7 +527,7 @@ export async function sendMessage(cid, text, attachments = []) {
   if (!known) {
     upsert(cid, r.assistant_message);
     if (!S.live[r.assistant_message.id]) {
-      S.live = { ...S.live, [r.assistant_message.id]: { text: '', acts: [] } };
+      S.live = { ...S.live, [r.assistant_message.id]: { text: '', acts: [], cid } };
     }
   }
   bumpConv(cid, r.user_message.created_at);

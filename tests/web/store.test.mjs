@@ -5,7 +5,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setToken } from '../../web/js/api.js';
 import {
-  S, set, loadMessages, loadOlder, handleEvent, loadLibrary, loadMoreSaved, loadMorePhotos,
+  S, set, loadMessages, loadOlder, handleEvent, loadLibrary, loadMoreSaved, loadMorePhotos, loadMoreItems,
+  loadFeed, refreshAll,
   loginMark, applyLoginResponse,
 } from '../../web/js/store.js';
 
@@ -62,7 +63,7 @@ test('loadOlder releases loading when the request fails, and paging works after'
 
 // ---------------------------------------------------------------- Library
 
-const server = { posts: [], photos: [] };
+const server = { posts: [], photos: [], items: [] };
 const posts = (hi, lo) => { const a = []; for (let i = hi; i >= lo; i--) a.push({ id: 'p' + i, created_at: i, liked: true }); return a; };
 const pid = (i) => String(i).padStart(4, '0');
 const photos = (hi, lo) => {
@@ -71,20 +72,24 @@ const photos = (hi, lo) => {
   return a.sort((x, y) => y.used_at - x.used_at || (x.id < y.id ? 1 : -1));
 };
 let gate = null; // when set, page requests wait for it
-const page = (list, q) => {
+const page = (list, q, key = 'used_at') => {
   const lim = +q.get('limit');
   let l = list;
   if (q.get('before_id')) {
     const b = +q.get('before'); const id = q.get('before_id');
-    l = l.filter((p) => p.used_at < b || (p.used_at === b && p.id < id));
+    l = l.filter((p) => p[key] < b || (p[key] === b && p.id < id));
   } else if (q.get('before')) l = l.filter((p) => p.created_at < +q.get('before'));
   return [l.slice(0, lim), l.length > lim];
 };
 const libraryRoutes = {
-  '/api/library': (q, opts) => reply(opts, { body: { items: [] } }),
+  '/api/library': async (q, opts) => {
+    if (gate && q.get('before')) await gate;
+    const [p, more] = page(server.items, q, 'created_at');
+    return reply(opts, { body: { items: p, has_more: more } });
+  },
   '/api/feed': async (q, opts) => {
     if (gate && q.get('before')) await gate;
-    const [p, more] = page(server.posts.filter((x) => x.liked), q);
+    const [p, more] = page(q.get('liked') === 'true' ? server.posts.filter((x) => x.liked) : server.posts, q);
     return reply(opts, { body: { posts: p, has_more: more } });
   },
   '/api/attachments': (q, opts) => {
@@ -181,4 +186,93 @@ test('a finished sign-in is dropped when the CLI is signed out again', () => {
   assert.equal(S.logins.codex?.state, 'connected', 'unknown counts as usable');
   handleEvent({ type: 'harness.status', harness: { name: 'codex', auth: 'auth_required' } });
   assert.equal(S.logins.codex, undefined);
+});
+
+// Generated items ("Made by me") page by (created_at, id), ties included.
+const items = (hi, lo) => {
+  const a = [];
+  for (let i = hi; i >= lo; i--) a.push({ id: 'i' + String(i).padStart(4, '0'), created_at: Math.floor(i / 3), mime: 'text/markdown' });
+  return a.sort((x, y) => y.created_at - x.created_at || (x.id < y.id ? 1 : -1));
+};
+
+test('generated items page with a (created_at, id) cursor and reload as far as shown', async () => {
+  route(libraryRoutes);
+  server.items = items(150, 1);
+  set({ library: null });
+  await loadLibrary();
+  assert.equal(S.library.items.length, 60);
+  assert.equal(S.library.itemsMore, true);
+  await loadMoreItems();
+  await loadMoreItems();
+  assert.equal(new Set(S.library.items.map((x) => x.id)).size, 150, 'every item once, ties on created_at included');
+  assert.equal(S.library.itemsMore, false);
+  // Removed elsewhere, and a new one: a refresh reloads all 150 shown.
+  server.items = items(151, 1).filter((x) => x.id !== 'i0010');
+  await loadLibrary();
+  const ids = S.library.items.map((x) => x.id);
+  assert.equal(ids.length, 150);
+  assert.ok(ids.includes('i0151') && !ids.includes('i0010'));
+  assert.equal(S.library.itemsMore, false);
+});
+
+test('a generated-items page that comes back after the list was replaced is dropped', async () => {
+  route(libraryRoutes);
+  server.items = items(100, 1);
+  set({ library: null });
+  await loadLibrary(); // 60 shown
+  let open;
+  gate = new Promise((r) => { open = r; });
+  const more = loadMoreItems();
+  await tick();
+  server.items = items(400, 1); // 300 new
+  await loadLibrary(); // reloads 60: now 400..341
+  open(); gate = null;
+  await more;
+  const ids = S.library.items.map((x) => x.id);
+  assert.equal(ids.length, 60);
+  assert.equal(ids[0], 'i0400');
+  assert.equal(S.library.itemsMore, true);
+});
+
+// ------------------------------------------------------------------- feed
+
+test('a feed page that comes back after a refresh replaced the list is dropped', async () => {
+  route(libraryRoutes);
+  server.posts = posts(100, 1);
+  set({ feed: null });
+  await loadFeed(); // 100..71
+  let open;
+  gate = new Promise((r) => { open = r; });
+  const more = loadFeed(true); // cursor p71, waits
+  await tick();
+  server.posts = posts(200, 1);
+  await loadFeed(); // refresh: 200..171
+  open(); gate = null;
+  await more;
+  const ids = S.feed.posts.map((p) => p.id);
+  assert.deepEqual([ids[0], ids.at(-1), ids.length], ['p200', 'p171', 30], 'the stale page (70..41) did not join');
+  assert.equal(S.feed.hasMore, true);
+  await loadFeed(true);
+  assert.equal(S.feed.posts.at(-1).id, 'p141', 'paging continues from the new list');
+});
+
+// ------------------------------------------------------- live replies
+
+test('after a reconnect, live replies in unopened chats are dropped once their turn is over', async () => {
+  const A = 'b'.repeat(32); // not opened; its turn finished while offline
+  const B = 'c'.repeat(32); // not opened; still running
+  set({ live: {}, msgs: {} });
+  handleEvent({ type: 'message.created', conversation_id: A, message: { ...msg('ra', 1, 'streaming'), conversation_id: A } });
+  handleEvent({ type: 'message.created', conversation_id: B, message: { ...msg('rb', 1, 'streaming'), conversation_id: B } });
+  handleEvent({ type: 'message.delta', conversation_id: B, message_id: 'rb2', text: 'x' }); // created by a delta
+  assert.ok(S.live.ra && S.live.rb && S.live.rb2);
+  route({
+    '/api/conversations': (q, opts) => reply(opts, { body: { conversations: [] } }),
+    [`/api/conversations/${A}`]: (q, opts) => reply(opts, { body: { conversation: { id: A }, turn_running: false } }),
+    [`/api/conversations/${B}`]: (q, opts) => reply(opts, { body: { conversation: { id: B }, turn_running: true } }),
+  });
+  refreshAll();
+  await tick(); await tick(); await tick();
+  assert.equal(S.live.ra, undefined, 'finished turn: no longer shown as working');
+  assert.ok(S.live.rb && S.live.rb2, 'running turn: kept');
 });
