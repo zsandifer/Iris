@@ -7,6 +7,7 @@ import { md } from './md.js';
 import { Card } from './cards.js';
 import { statusPhrase, receipt, seconds } from './status.js';
 import { pushState, enablePush } from './push.js';
+import { focusComposer, prepareComposerFocus } from './viewport.js';
 
 const GAP = 30 * 60 * 1000;
 
@@ -264,7 +265,7 @@ function Composer({ cid, running, onFocus, onBlur }) {
     if (d) {
       setText(d);
       set({ drafts: { ...S.drafts, [cid]: undefined } });
-      setTimeout(() => ta.current?.focus(), 50);
+      setTimeout(() => focusComposer(ta.current), 50);
     }
   }, [cid]);
 
@@ -348,6 +349,16 @@ function Composer({ cid, running, onFocus, onBlur }) {
 
   const stop = () => post(`/conversations/${seg(cid)}/cancel`).catch((e) => toast(e.message));
 
+  const onComposerPointerDown = (e) => {
+    const el = ta.current;
+    if (e.isPrimary === false || e.button > 0 || !el
+      || e.target.closest('button, input, a')) return;
+    if (document.activeElement === el) prepareComposerFocus(el);
+    else focusComposer(el);
+    // Leave the default gesture intact for native caret placement,
+    // selection, and scrolling within a multiline draft.
+  };
+
   let action;
   if (canSend) action = html`<button class="send" aria-label="Send" onClick=${send}><${Icon} name="send" size=${20} /></button>`;
   else if (rec) action = html`<button class="send rec" aria-label="Stop listening" onClick=${mic}><${Icon} name="stop" size=${18} fill /></button>`;
@@ -369,7 +380,7 @@ function Composer({ cid, running, onFocus, onBlur }) {
       <img src=${a.preview} alt="" />${a.uploading && html`<div class="att-busy"><${Spinner} /></div>`}
       <button class="att-x" aria-label="Remove photo" onClick=${() => { URL.revokeObjectURL(a.preview); setAtts((cur) => cur.filter((x) => x.key !== a.key)); }}><${Icon} name="x" size=${12} /></button>
     </div>`)}</div>`}
-    <div class=${'inp' + (rec ? ' listening' : '')}>
+    <div class=${'inp' + (rec ? ' listening' : '')} onPointerDown=${onComposerPointerDown} onTouchStart=${onComposerPointerDown}>
       <button class="pl" aria-label="Add photos" onClick=${() => file.current.click()} disabled=${atts.length >= MAX_PHOTOS}><${Icon} name="plus" size=${20} /></button>
       <input ref=${file} type="file" accept="image/*" multiple hidden tabindex="-1" onChange=${pick} />
       <textarea ref=${ta} rows="1" value=${text} placeholder=${rec ? 'Listening…' : `Talk to ${agentName()}…`}
