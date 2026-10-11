@@ -300,9 +300,12 @@ permission profile that denies those paths (this replaces its
 `sandbox_mode` for those turns; avoid setting `sandbox_mode` in
 `~/.codex/config.toml`, which makes Codex ignore profiles). Other people's
 turns and Together chats also skip the server account's own CLI settings,
-instruction files (`CLAUDE.md`), hooks, and MCP servers. Gemini CLI and
-OpenCode always load their user and project configuration, so they only
-answer the owner's own chats; other people need Codex or Claude. All
+instruction files (`CLAUDE.md`), hooks, and MCP servers, and Claude Code's
+shell is off. Codex answers other people from version 0.162 on, and only
+while `~/.codex` has no global `AGENTS.md` (it would reach everyone's
+turns). Gemini CLI and OpenCode always load their user and project
+configuration, so they only answer the owner's own chats; other people
+need Codex or Claude. All
 people's CLIs still run as one operating-system account, and the Iris app
 bridge they launch reads Iris's database, so for a hard boundary between
 people who do not trust each other, run separate Iris servers.

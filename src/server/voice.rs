@@ -100,7 +100,9 @@ pub async fn voice_note(state: &AppState, msg: &Message) -> Result<(Vec<u8>, u64
     if let Some(hit) = read(path.clone()).await {
         return Ok(hit);
     }
-    // A bounded number of notes may wait; the same note is made once.
+    // A bounded number of requests may wait (duplicates included); the
+    // same note is made once.
+    let _admitted = Waiting::enter_tts(state).ok_or_else(busy)?;
     let _pending = Pending::enter(state, &msg.id).ok_or_else(busy)?;
     let _permit = tokio::time::timeout(MAX_WAIT, state.tts_jobs.acquire())
         .await
@@ -215,8 +217,10 @@ pub fn prepare_for(state: &AppState, members: &[String], msg: &Message) {
     });
 }
 
-/// Voice notes allowed to be waiting or in progress at once.
+/// Voice notes allowed to be waiting or in progress at once, and voice-note
+/// requests (several can wait for the same note).
 const MAX_TTS_PENDING: usize = 4;
+const MAX_TTS_REQUESTS: usize = 8;
 
 /// A message's place among the voice notes being made. Entering for a
 /// message already there is allowed (it waits, then finds the cache).
@@ -271,10 +275,18 @@ struct Waiting<'a>(&'a std::sync::atomic::AtomicUsize);
 
 impl<'a> Waiting<'a> {
     fn enter(state: &'a AppState) -> Option<Self> {
+        Self::enter_counter(&state.voice_waiting, MAX_WAITING)
+    }
+
+    /// Voice-note requests waiting or in progress, duplicates included.
+    fn enter_tts(state: &'a AppState) -> Option<Self> {
+        Self::enter_counter(&state.tts_waiting, MAX_TTS_REQUESTS)
+    }
+
+    fn enter_counter(n: &'a std::sync::atomic::AtomicUsize, max: usize) -> Option<Self> {
         use std::sync::atomic::Ordering;
-        let n = &state.voice_waiting;
         n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-            (v < MAX_WAITING).then_some(v + 1)
+            (v < max).then_some(v + 1)
         })
         .ok()
         .map(|_| Self(n))

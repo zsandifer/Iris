@@ -321,10 +321,19 @@ pub async fn run_job(state: &AppState, job: Job, user_id: &str) -> crate::util::
     )
     .await;
     let key = job.last_run_key(&user);
+    let uid = user.id.clone();
+    let _here = state.people_lock.read().await;
     state
         .db
-        .call(move |c| db::set_setting(c, &key, &started.to_string()))
+        .call(move |c| {
+            // The person may have been removed while the job ran.
+            if db::get_user(c, &uid)?.is_some() {
+                db::set_setting(c, &key, &started.to_string())?;
+            }
+            Ok(())
+        })
         .await?;
+    drop(_here);
     crate::info!(
         "{} job finished: {}",
         job.name(),

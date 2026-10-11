@@ -126,6 +126,8 @@ pub struct Inner {
     pub tts_jobs: tokio::sync::Semaphore,
     /// Messages whose voice note is being made or waiting (bounded).
     pub tts_pending: Mutex<std::collections::HashSet<String>>,
+    /// Voice-note requests admitted (bounded, duplicates included).
+    pub tts_waiting: std::sync::atomic::AtomicUsize,
     /// Recordings waiting for `voice_jobs` (bounded).
     pub voice_waiting: std::sync::atomic::AtomicUsize,
     /// Writes to a person's own data hold this shared; removing a person
@@ -185,6 +187,7 @@ impl AppState {
             voice_waiting: std::sync::atomic::AtomicUsize::new(0),
             tts_jobs: tokio::sync::Semaphore::new(1),
             tts_pending: Mutex::default(),
+            tts_waiting: std::sync::atomic::AtomicUsize::new(0),
             people_lock: tokio::sync::RwLock::new(()),
             limiter: Limiter::new(cfg.max_concurrent_turns),
             cfg,
@@ -467,6 +470,28 @@ impl AppState {
         }
     }
 
+    /// Engines whose CLI Iris can confine to one person's folders and
+    /// configuration, so they may answer other people's turns: Claude Code
+    /// (deny rules, `--setting-sources ""`, strict MCP) and Codex 0.162 or
+    /// newer (permission profile, `--ignore-user-config`) when its home has
+    /// no global AGENTS.md instructions (those reach every turn and cannot
+    /// be switched off; only their presence is checked). Gemini CLI and
+    /// OpenCode load configuration Iris cannot override.
+    pub fn isolating(&self, harness: &str) -> bool {
+        match harness {
+            "claude" => true,
+            "codex" => self.codex_profiles_ok() && !codex_global_instructions(),
+            _ => false,
+        }
+    }
+
+    /// The Codex CLI understands permission profiles (0.162 and newer).
+    pub fn codex_profiles_ok(&self) -> bool {
+        self.harness("codex")
+            .and_then(|e| e.status().version)
+            .is_some_and(|v| version_at_least(&v, (0, 162, 0)))
+    }
+
     /// Owner opt-in (config or app setting) to use Claude in conversations
     /// with more than one person.
     pub async fn allow_claude_for_shared(&self) -> bool {
@@ -479,8 +504,10 @@ impl AppState {
         let catalog = self.catalog();
         let pin = self.slot_pins().await.remove(&slot);
         let allow_shared = self.allow_claude_for_shared().await;
+        // "Shared" here means other people's turns: same rules as routing.
         let allowed = |m: &crate::catalog::ModelEntry| {
             crate::router::policy_allows(&m.harness, shared, allow_shared)
+                && (!shared || self.isolating(&m.harness))
         };
         let available = |m: &crate::catalog::ModelEntry| self.model_available(m);
         let res = ranking::resolve(
@@ -698,6 +725,34 @@ impl AppState {
     }
 }
 
+/// Whether a version string such as `codex-cli 0.162.1` is at least `min`.
+pub fn version_at_least(v: &str, min: (u64, u64, u64)) -> bool {
+    let Some(num) = v
+        .split_whitespace()
+        .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
+    else {
+        return false;
+    };
+    let mut parts = num
+        .split(['.', '-', '+'])
+        .map(|p| p.parse::<u64>().unwrap_or(0));
+    let got = (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    );
+    got >= min
+}
+
+/// Codex's global instruction files exist (`$CODEX_HOME/AGENTS.md` or
+/// `AGENTS.override.md`). Only their existence is checked.
+fn codex_global_instructions() -> bool {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".codex")));
+    home.is_some_and(|h| h.join("AGENTS.md").exists() || h.join("AGENTS.override.md").exists())
+}
+
 /// Settings key for one person's Iris. The owner keeps the original
 /// top-level keys (`agent_name`, `agent_avatar`, ...).
 pub fn person_key(user_id: &str, is_owner: bool, key: &str) -> String {
@@ -759,5 +814,13 @@ mod tests {
         assert_eq!(pins.len(), 1);
         assert_eq!(pins[&Slot::Chat].model, "codex:gpt-6-luna");
         assert_eq!(parse_slot_pins(&slot_pins_json(&pins)), pins);
+    }
+
+    #[test]
+    fn versions_compare() {
+        assert!(version_at_least("codex-cli 0.162.1", (0, 162, 0)));
+        assert!(version_at_least("1.0.0", (0, 162, 0)));
+        assert!(!version_at_least("codex-cli 0.100.0", (0, 162, 0)));
+        assert!(!version_at_least("unknown", (0, 162, 0)));
     }
 }

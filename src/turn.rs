@@ -241,7 +241,7 @@ async fn run_locked(
             let available = |m: &crate::catalog::ModelEntry| {
                 !excluded.iter().any(|x| x == &m.harness)
                     && state.model_available(m)
-                    && (!for_others || isolating(&m.harness))
+                    && (!for_others || state.isolating(&m.harness))
             };
             let env = EngineEnv {
                 rankings: &state.rankings,
@@ -260,15 +260,6 @@ async fn run_locked(
         };
         let d = match routed {
             Ok(d) => d,
-            // Only engines that cannot keep people apart are left.
-            Err(_) if for_others && isolation_blocked(state, &catalog, &excluded, allow_shared) => {
-                outcome = Outcome::Failed {
-                    kind: "paused_isolation",
-                    detail: "only engines that cannot keep people's files apart are available"
-                        .into(),
-                };
-                break;
-            }
             Err(NoEngine::PausedPolicy) => {
                 post_policy_card_once(state, conv_id, shared, &ctx.members).await;
                 outcome = Outcome::Failed {
@@ -278,6 +269,15 @@ async fn run_locked(
                     } else {
                         "only Claude is available and this is not the owner's own Iris".into()
                     },
+                };
+                break;
+            }
+            // Only engines that cannot keep people apart are left.
+            Err(_) if for_others && isolation_blocked(state, &catalog, &excluded, allow_shared) => {
+                outcome = Outcome::Failed {
+                    kind: "paused_isolation",
+                    detail: "only engines that cannot keep people's files apart are available"
+                        .into(),
                 };
                 break;
             }
@@ -404,7 +404,13 @@ async fn run_locked(
             },
             run_dir: state.paths.run_dir(),
             scope: conv_id.to_string(),
-            private_paths: private_paths.clone(),
+            // Older Codex ignores permission profiles: keep its plain sandbox
+            // (it is not used for other people's turns, see `isolating`).
+            private_paths: if harness_name == "codex" && !state.codex_profiles_ok() {
+                Vec::new()
+            } else {
+                private_paths.clone()
+            },
             isolated: for_others,
         };
         let invocation = match entry.harness.build(&spec) {
@@ -565,15 +571,6 @@ async fn run_locked(
     finish(state, input, &audience, &acc, routing, outcome).await
 }
 
-/// Engines whose CLI Iris can confine to one person's folders and config:
-/// Claude Code (deny rules, no inherited settings or MCP servers) and Codex
-/// (permission profile, no inherited MCP servers). Gemini CLI and OpenCode
-/// load project and user configuration Iris cannot override, so they only
-/// answer the owner's own chats.
-pub fn isolating(harness: &str) -> bool {
-    matches!(harness, "claude" | "codex")
-}
-
 /// For a turn that is not the owner's own: nothing confinable can answer,
 /// but an engine that cannot be confined could.
 fn isolation_blocked(
@@ -586,13 +583,13 @@ fn isolation_blocked(
         !excluded.iter().any(|x| x == &m.harness) && state.model_available(m)
     };
     let confinable = catalog.models.iter().filter(up).any(|m| {
-        isolating(&m.harness) && crate::router::policy_allows(&m.harness, true, allow_shared)
+        state.isolating(&m.harness) && crate::router::policy_allows(&m.harness, true, allow_shared)
     });
     let other = catalog
         .models
         .iter()
         .filter(up)
-        .any(|m| !isolating(&m.harness));
+        .any(|m| !state.isolating(&m.harness));
     !confinable && other
 }
 
@@ -747,7 +744,7 @@ async fn post_policy_card_once(state: &AppState, conv_id: &str, shared: bool, me
                     "body": "Claude is the only AI engine on this server, and Claude \
                         subscriptions are meant for one person, so I stay out of chats with \
                         more than one person. If your plan allows shared use, the owner can turn \
-                        this on. Another engine (Codex, Gemini, or OpenCode) also fixes it.",
+                        this on. Setting up Codex also fixes it.",
                     "action_label": "Allow",
                     "action": allow,
                     "owner_only": true,
@@ -759,13 +756,11 @@ async fn post_policy_card_once(state: &AppState, conv_id: &str, shared: bool, me
                     "body": if shared {
                         "Claude is the only AI engine on this server, and Claude subscriptions \
                          are meant for one person, so I stay out of group chats. I've asked the \
-                         owner: they can allow it, or add another engine (Codex, Gemini, or \
-                         OpenCode)."
+                         owner: they can allow it, or set up Codex."
                     } else {
                         "Claude is the only AI engine on this server, and Claude subscriptions \
                          are meant for one person, so I can't use it for you. I've asked the \
-                         owner: they can allow it, or add another engine (Codex, Gemini, or \
-                         OpenCode)."
+                         owner: they can allow it, or set up Codex."
                     },
                 })
             };
@@ -805,8 +800,8 @@ async fn post_policy_card_once(state: &AppState, conv_id: &str, shared: bool, me
                 "title": heading,
                 "body": format!("{whose}: Claude is the only AI engine on this server, and \
                     Claude subscriptions are meant for one person. If your plan allows it, you \
-                    can let other people (and group chats) use it. Adding another engine (Codex, \
-                    Gemini, or OpenCode) in Settings also fixes it."),
+                    can let other people (and group chats) use it. Setting up Codex in Settings \
+                    also fixes it (Gemini CLI and OpenCode only answer your own chats)."),
                 "action_label": "Allow",
                 "action": allow,
                 "owner_only": true,

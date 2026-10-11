@@ -9,6 +9,7 @@ import { statusPhrase, receipt, seconds } from './status.js';
 import { pushState, enablePush } from './push.js';
 import {
   VoiceNote, voiceReplies, serverListen, canRecord, record, transcribe, unlockAudio, play, prefetch, Speech,
+  MAX_RECORDING_MS,
 } from './voice.js';
 
 const GAP = 30 * 60 * 1000;
@@ -157,7 +158,7 @@ export function ChatScreen({ cid }) {
     if (!last || last.role !== 'assistant' || last.status !== 'complete' || last.kind !== 'text' || !voiceReplies()) return;
     prefetch(last);
     const auto = S.voiceAuto;
-    if (auto && auto.cid === cid && last.created_at >= auto.at - 2000) {
+    if (auto && auto.cid === cid && auto.id === last.id) {
       set({ voiceAuto: null });
       if (document.visibilityState === 'visible') play(last);
     }
@@ -290,7 +291,11 @@ function Composer({ cid, running, name }) {
   // Recording timer; stop recording when leaving the chat.
   useEffect(() => {
     if (!recording) return undefined;
-    const t = setInterval(() => setSecs(Math.floor((Date.now() - recording.started) / 1000)), 250);
+    const t = setInterval(() => {
+      setSecs(Math.floor((Date.now() - recording.started) / 1000));
+      // At the limit, stop and transcribe what was said so far.
+      if (Date.now() - recording.started >= MAX_RECORDING_MS && recRef.current === recording) listenServer();
+    }, 250);
     return () => clearInterval(t);
   }, [recording]);
   useEffect(() => () => recRef.current?.cancel(), []);
@@ -323,11 +328,17 @@ function Composer({ cid, running, name }) {
     rec?.stop();
     setText('');
     setAtts([]);
-    if (voiceReplies()) {
-      unlockAudio();
-      set({ voiceAuto: { cid, at: Date.now() } });
-    }
-    try { await sendMessage(cid, t, ids); } catch (e) { toast(e.message); setText(t); }
+    if (voiceReplies()) unlockAudio();
+    try {
+      const r = await sendMessage(cid, t, ids);
+      if (voiceReplies()) {
+        // Play this reply when it is done (it may already be).
+        const id = r.assistant_message.id;
+        const done = S.msgs[cid]?.list.find((x) => x.id === id && x.status === 'complete');
+        if (done) play(done);
+        else set({ voiceAuto: { cid, id } });
+      }
+    } catch (e) { toast(e.message); setText(t); }
   };
 
   const listenBrowser = () => {

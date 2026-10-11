@@ -313,6 +313,10 @@ export async function toWav(blob) {
   return new Blob([buf], { type: 'audio/wav' });
 }
 
+/** Longest voice message (the server takes up to five minutes). */
+export const MAX_RECORDING_MS = 4.5 * 60 * 1000;
+const MAX_RECORDING_BYTES = 24 * 1024 * 1024;
+
 /** Start recording from the microphone. Resolves to a handle with
  *  `stop()` (resolves to the recording) and `cancel()`. */
 export async function record() {
@@ -326,7 +330,14 @@ export async function record() {
     throw e;
   }
   const chunks = [];
-  rec.ondataavailable = (e) => { if (e.data?.size) chunks.push(e.data); };
+  let bytes = 0;
+  rec.ondataavailable = (e) => {
+    if (!e.data?.size) return;
+    chunks.push(e.data);
+    bytes += e.data.size;
+    // A backstop on size; the composer stops at the time limit.
+    if (bytes > MAX_RECORDING_BYTES && rec.state !== 'inactive') rec.stop();
+  };
   const done = new Promise((resolve) => { rec.onstop = () => resolve(new Blob(chunks, { type: rec.mimeType || chunks[0]?.type || 'audio/webm' })); });
   try {
     rec.start(250);

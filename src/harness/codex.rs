@@ -149,9 +149,9 @@ impl Harness for Codex {
             }
         }
         if spec.isolated {
-            // Not the owner's own turn: drop MCP servers from the operator's
-            // Codex config; only the ones Iris passes remain.
-            overrides.push("mcp_servers={}".into());
+            // Not the owner's own turn: none of the operator's Codex config
+            // (MCP servers, profiles, ...); sign-in still comes from CODEX_HOME.
+            a.push("--ignore-user-config".into());
         }
         overrides.extend(mcp_overrides(&spec.mcp_servers));
         for o in overrides {
@@ -591,18 +591,13 @@ mod tests {
         let n = inv.args.len();
         assert_eq!(&inv.args[n - 2..], ["th-1", "-"]);
 
-        assert!(!inv.args.contains(&"mcp_servers={}".to_string()));
+        assert!(!inv.args.contains(&"--ignore-user-config".to_string()));
         spec.isolated = true;
         let a = h.build(&spec).unwrap().args;
-        let empty = a
-            .iter()
-            .position(|x| x == "mcp_servers={}")
-            .expect("inherited servers dropped");
-        let iris = a
-            .iter()
-            .position(|x| x.starts_with("mcp_servers.iris."))
-            .unwrap();
-        assert!(empty < iris, "then only Iris's servers are added");
+        assert!(
+            a.contains(&"--ignore-user-config".to_string()),
+            "none of the operator's Codex config"
+        );
         spec.isolated = false;
 
         // Paths to keep out switch to a permission profile with denies.

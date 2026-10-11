@@ -189,7 +189,14 @@ impl Harness for Claude {
             // which the agent can write (project hooks, settings, MCP).
             a.extend(["--setting-sources", "user"].map(String::from));
         }
-        let denied = deny_rules(&spec.private_paths)?;
+        let mut denied = deny_rules(&spec.private_paths)?;
+        // Read rules do not cover shell commands (Claude Code runs read-only
+        // ones such as grep without asking), so the shell is off unless the
+        // operator allowed it, and always off for other people's turns.
+        let operator_shell = self.cfg.allowed_tools.iter().any(|t| t.starts_with("Bash"));
+        if spec.isolated || !operator_shell {
+            denied.push("Bash".into());
+        }
         if !denied.is_empty() {
             // Permission deny rules in a per-turn settings file (layered over
             // the user's own settings, which are never edited); a file keeps
@@ -731,7 +738,8 @@ mod tests {
                 format!("Read(/{other}/**)"),
                 format!("Edit(/{other}/**)"),
                 format!("Read(/{key})"),
-                format!("Edit(/{key})")
+                format!("Edit(/{key})"),
+                "Bash"
             ])
         );
         assert!(deny_rules(&["rel".into()]).is_err(), "fails closed");

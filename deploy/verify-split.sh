@@ -157,6 +157,10 @@ fi
 if [ "$(stat -c %a "$AGENT_HOME")" = 700 ]; then pass "$AGENT_HOME is private (0700)"; else warn "$AGENT_HOME is mode $(stat -c %a "$AGENT_HOME"); 0700 keeps Iris data private"; fi
 if runuser -u "$ADMIN_USER" -- ls "$AGENT_HOME" >/dev/null 2>&1; then fail "$ADMIN_USER can read $AGENT_HOME"; else pass "$ADMIN_USER cannot read Iris's data in $AGENT_HOME"; fi
 
+if [ -e "$AGENT_HOME/.codex/AGENTS.md" ] || [ -e "$AGENT_HOME/.codex/AGENTS.override.md" ]; then
+    warn "$AGENT_HOME/.codex has global AGENTS.md instructions; they would reach everyone's turns, so Iris keeps Codex to the owner's own chats"
+fi
+
 # --- config and service
 CONF="$AGENT_HOME/.config/iris/config.toml"
 if [ -f "$CONF" ] && grep -q "^helper = \[\"sudo\", \"-n\", \"-u\", \"$ADMIN_USER\"" "$CONF" && grep -q "^dir = \"$ENGINES_DIR\"" "$CONF"; then
@@ -166,7 +170,7 @@ else
 fi
 if [ "$AGENT_USER" = "iris-agent" ] || systemctl cat iris >/dev/null 2>&1; then
     if [ "$(systemctl show iris -p User --value 2>/dev/null)" = "$AGENT_USER" ]; then pass "iris.service runs as $AGENT_USER"; else fail "iris.service does not run as $AGENT_USER"; fi
-    if [ "$(systemctl show iris -p ProtectHome --value 2>/dev/null)" = yes ]; then pass "iris.service hides /home (ProtectHome=yes)"; else warn "iris.service does not set ProtectHome=yes"; fi
+    if [ "$(systemctl show iris -p ProtectHome --value 2>/dev/null)" = yes ]; then pass "iris.service hides /home (ProtectHome=yes)"; else fail "iris.service does not set ProtectHome=yes (people's homes are visible to every engine)"; fi
     if [ "$(systemctl show iris -p NoNewPrivileges --value 2>/dev/null)" = no ]; then pass "iris.service allows sudo for the helper (NoNewPrivileges=no)"; else fail "iris.service sets NoNewPrivileges, which blocks the engine helper"; fi
     if systemctl is-active --quiet iris; then
         pass "iris.service is running"
@@ -194,6 +198,18 @@ if [ "$AGENT_USER" = "iris-agent" ] || systemctl cat iris >/dev/null 2>&1; then
             pass "the helper works inside the service's sandbox"
         else
             fail "the helper fails inside the service's sandbox (check NoNewPrivileges and seccomp options)"
+        fi
+        # Installs write the engines folder: the admin account must be able
+        # to, inside the same sandbox (ReadWritePaths).
+        PROBE_W="$ENGINES_DIR/.verify-write-$$"
+        ADMIN_PROPS=$(printf '%s' "$PROPS" | sed "s/-p User=[^ ]*/-p User=$ADMIN_USER/")
+        # shellcheck disable=SC2086
+        if systemd-run --wait --quiet --collect --pipe $ADMIN_PROPS "$@" \
+            /bin/sh -c "touch '$PROBE_W' && rm -f '$PROBE_W'" 2>/dev/null; then
+            pass "$ADMIN_USER can write $ENGINES_DIR inside the service's sandbox"
+        else
+            rm -f "$PROBE_W"
+            fail "$ADMIN_USER cannot write $ENGINES_DIR inside the service's sandbox (ReadWritePaths)"
         fi
     else
         fail "iris.service is not running: journalctl -u iris -n 50"

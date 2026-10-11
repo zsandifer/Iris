@@ -1021,3 +1021,46 @@ async fn engines_that_cannot_keep_people_apart_only_answer_the_owner() {
             .contains("only answer the owner's own chats")
     );
 }
+
+#[tokio::test]
+async fn removing_a_person_mid_job_leaves_no_settings() {
+    let h = setup(true).await;
+    let (owner, sam_id, _sam) = owner_and_sam(&h).await;
+    send(
+        &h,
+        "PUT",
+        "/api/settings",
+        &owner,
+        Some(json!({"allow_claude_for_shared": true})),
+    )
+    .await;
+    let dirs = h.state.paths.person_dirs(&sam_id, false);
+    std::fs::write(dirs.persona.join("HEARTBEAT.md"), "slow-please").unwrap();
+    assert!(crate::jobs::trigger(
+        &h.state,
+        crate::jobs::Job::Heartbeat,
+        &sam_id
+    ));
+    let turns = h.tmp.path().join("turns");
+    for _ in 0..200 {
+        if std::fs::read_dir(&turns).unwrap().count() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (s, _) = send(&h, "DELETE", &format!("/api/users/{sam_id}"), &owner, None).await;
+    assert_eq!(s, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let left: i64 = h
+        .state
+        .db
+        .with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM settings WHERE key LIKE ?1",
+                [format!("person.{sam_id}.%")],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(left, 0, "the job's last-run time was not written back");
+}

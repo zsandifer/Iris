@@ -1702,11 +1702,16 @@ After `POST /api/conversations/{id}/messages` (or `POST
    `sandbox_mode`). Turns that are not the owner's own also leave out the
    operator's own CLI configuration: Claude Code runs with
    `--setting-sources ""` (no user or project settings, hooks, or CLAUDE.md
-   files) and `--strict-mcp-config`, Codex with `mcp_servers={}` before
-   Iris's own servers; the owner's own Claude turns load only user settings
-   (never the agent-writable working folder's). Gemini CLI and OpenCode
-   load project and user configuration Iris cannot override, so they only
-   answer the owner's own chats (`paused_isolation` otherwise). A turn still
+   files) and `--strict-mcp-config`, Codex with `--ignore-user-config`;
+   the owner's own Claude turns load only user settings (never the
+   agent-writable working folder's), and Claude's shell is denied (read
+   rules do not cover it) unless the operator allowed `Bash`. Codex answers
+   other people only from version 0.162 (permission profiles) and when
+   `$CODEX_HOME` has no global `AGENTS.md`/`AGENTS.override.md` (those
+   instructions reach every turn). Gemini CLI and OpenCode load project and
+   user configuration Iris cannot override, so they only answer the owner's
+   own chats (`paused_isolation` otherwise); the Settings preview of the
+   shared slot applies the same rules. A turn still
    waiting in the queue when its conversation or person is deleted is
    dropped without running. A session that saw a personal prompt is never
    resumed in a shared chat (the session fingerprint includes whether the
