@@ -263,6 +263,8 @@ CREATE TABLE connector_calls (
 );
 CREATE INDEX connector_calls_recent ON connector_calls(connector_id, created_at);
 CREATE INDEX connector_calls_time ON connector_calls(created_at);
+-- The tripwires' hourly usage (by when calls ran).
+CREATE INDEX connector_calls_admitted ON connector_calls(connector_id, admitted_at);
 
 -- Recipients the owner approved a message or invite to.
 CREATE TABLE known_recipients (

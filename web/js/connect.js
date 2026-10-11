@@ -98,12 +98,17 @@ export function ServiceSignIn({ con, label, onDone }) {
   const [cid, setCid] = useState('');
   const [secret, setSecret] = useState('');
   const live = (S.connectors || []).find((c) => c.id === con.id) || con;
-  const connected = live.auth_state === 'ok' && live.oauth?.connected;
-  useEffect(() => { if (connected && flow) { setFlow(null); onDone?.(); } }, [connected]);
+  // Done when a sign-in newer than the one there when this flow started
+  // lands (signing in again keeps the old grant until then).
+  const signedInAt = live.auth_state === 'ok' && live.oauth?.connected ? live.oauth.connected_at || 1 : 0;
+  useEffect(() => {
+    if (flow && signedInAt && signedInAt !== flow.since) { setFlow(null); onDone?.(); }
+  }, [signedInAt]);
   const start = async () => {
     setBusy(true);
     try {
-      setFlow(await post(`/connectors/${seg(con.id)}/oauth/start`, { origin: location.origin }));
+      const r = await post(`/connectors/${seg(con.id)}/oauth/start`, { origin: location.origin });
+      setFlow({ ...r, since: signedInAt });
       setClient(null);
     } catch (e) {
       if (e instanceof ApiError && e.code === 'needs_client') setClient(e.message);

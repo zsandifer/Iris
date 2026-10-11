@@ -60,6 +60,9 @@ pub struct Grant {
     /// scheduled jobs, which run in hidden conversations).
     pub card_conversation_id: String,
     pub message_id: String,
+    /// The turn's conversation, which must stay the owner's alone (None
+    /// for scheduled jobs).
+    private_conversation: Option<String>,
     /// Connector names this turn may use.
     pub connectors: Vec<String>,
     cancel: watch::Sender<bool>,
@@ -108,6 +111,17 @@ impl Session {
             text,
             &self.secrets.lock().unwrap_or_else(|p| p.into_inner()),
         )
+    }
+
+    /// Scrub every string in a JSON value (a tool's error result, which
+    /// often echoes its configuration).
+    fn scrub_value(&self, v: &mut Value) {
+        match v {
+            Value::String(s) => *s = self.scrub(s),
+            Value::Array(a) => a.iter_mut().for_each(|x| self.scrub_value(x)),
+            Value::Object(m) => m.values_mut().for_each(|x| self.scrub_value(x)),
+            _ => {}
+        }
     }
 }
 
@@ -249,6 +263,8 @@ pub async fn grant_for_turn(
                 conversation_id: conversation_id.to_string(),
                 card_conversation_id,
                 message_id: message_id.to_string(),
+                private_conversation: (conversation_kind != "job")
+                    .then(|| conversation_id.to_string()),
                 connectors: names.clone(),
                 cancel,
             }),
@@ -900,6 +916,22 @@ async fn refusal(state: &AppState, grant: &Grant, con: &Connector) -> Option<Str
     if *grant.cancel.borrow() {
         return Some("This request was cancelled, so nothing was done.".into());
     }
+    if let Some(conv) = &grant.private_conversation {
+        let (c2, owner) = (conv.clone(), grant.owner_user_id.clone());
+        let alone = state
+            .db
+            .call(move |c| Ok(db::conversation_member_ids(c, &c2)? == [owner]))
+            .await
+            .unwrap_or(false);
+        if !alone {
+            grant.cancel.send_replace(true);
+            return Some(
+                "Someone else joined this chat, so the owner's connections are off here and \
+                 nothing was done."
+                    .into(),
+            );
+        }
+    }
     if !con.enabled {
         return Some("This connection is turned off, so nothing was done.".into());
     }
@@ -1017,6 +1049,26 @@ pub async fn call_tool(
     args: &Value,
 ) -> Value {
     if let Some(r) = refusal(state, grant, con).await {
+        // Recorded too (without starting the connector to learn more).
+        let category = policy::classify_call(tool, &Value::Null, args);
+        let preview = policy::preview(&service_label(con), tool, category, args);
+        record(
+            state,
+            &ConnectorCall {
+                id: new_id(),
+                connector_id: Some(con.id.clone()),
+                connector_name: con.name.clone(),
+                tool: tool.to_string(),
+                category: category.name().into(),
+                decision: "blocked".into(),
+                reason: r.clone(),
+                summary: summary(&preview),
+                conversation_id: Some(grant.conversation_id.clone()),
+                message_id: Some(grant.message_id.clone()),
+                ..ConnectorCall::default()
+            },
+        )
+        .await;
         return tool_error(&r);
     }
     let bound_target = target(con);
@@ -1028,7 +1080,7 @@ pub async fn call_tool(
         .map(|t| t["annotations"].clone())
         .unwrap_or(Value::Null);
     let category = policy::classify_call(tool, &annotations, args);
-    let recipients = policy::recipients(args);
+    let recipients = policy::audience(tool, args);
     let label = service_label(con);
     let preview = policy::preview(&label, tool, category, args);
     let trusted = state.trusted_recipients().await;
@@ -1139,7 +1191,11 @@ pub async fn call_tool(
         return tool_error(&tripped(&trip));
     }
     if decided_by == "approved" {
-        let r = recipients.clone();
+        let r: Vec<String> = recipients
+            .iter()
+            .filter(|r| !policy::is_placeholder(r))
+            .cloned()
+            .collect();
         let _ = state
             .db
             .call(move |c| entities::add_known_recipients(c, &r))
@@ -1233,7 +1289,10 @@ async fn forward(
         s.inflight.fetch_sub(1, Ordering::SeqCst);
         s.last_used.store(now_ms(), Ordering::SeqCst);
         match result {
-            Ok(v) => {
+            Ok(mut v) => {
+                if v["isError"] == true {
+                    s.scrub_value(&mut v);
+                }
                 if s.upstream.tools_changed() {
                     state
                         .gateway
@@ -1759,8 +1818,31 @@ pub async fn stop_all(state: &AppState) {
         .keys()
         .cloned()
         .collect();
+    // All at once: a remote service slow to end its session must not hold
+    // up stopping the others.
+    for id in &ids {
+        state.gateway.stopper(id).notify_waiters();
+    }
+    let mut stops = tokio::task::JoinSet::new();
     for id in ids {
-        stop(state, &id).await;
+        let st = state.clone();
+        stops.spawn(async move { stop(&st, &id).await });
+    }
+    while stops.join_next().await.is_some() {}
+}
+
+/// End connector access for the turns in one conversation (stopped, or
+/// no longer the owner's alone); their waiting approvals are cancelled.
+pub fn cancel_conversation_grants(state: &AppState, conversation_id: &str) {
+    for g in state
+        .gateway
+        .grants
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .values()
+        .filter(|g| g.conversation_id == conversation_id)
+    {
+        g.cancel.send_replace(true);
     }
 }
 

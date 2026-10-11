@@ -122,12 +122,20 @@ impl Harness for OpenCode {
         let prompt_file = spec.run_dir.join(format!("{}.prompt.md", spec.turn_id));
         write_private_file(&prompt_file, spec.system_prompt.as_bytes())?;
         inv.temp_files.push(prompt_file.clone());
-        let mut mcp = mcp_config(&spec.mcp_servers);
-        // Servers configured in OpenCode itself would bypass Iris's gateway.
+        // OpenCode merges this file into its own config, so Iris's servers
+        // get names OpenCode itself does not use, and its own servers are
+        // switched off (they would bypass Iris's gateway).
+        let servers: Vec<super::McpServer> = spec
+            .mcp_servers
+            .iter()
+            .map(|s| super::McpServer {
+                name: super::unclaimed_name(&s.name, &spec.own_mcp_servers),
+                ..s.clone()
+            })
+            .collect();
+        let mut mcp = mcp_config(&servers);
         for name in &spec.own_mcp_servers {
-            if !mcp.as_object().is_some_and(|m| m.contains_key(name)) {
-                mcp[name] = json!({"enabled": false});
-            }
+            mcp[name] = json!({"enabled": false});
         }
         let mut config = json!({
             "$schema": "https://opencode.ai/config.json",
@@ -786,6 +794,16 @@ anthropic/claude-haiku-4-5
         assert!(cfg["mcp"]["web"].get("timeout").is_none());
         assert_eq!(cfg["mcp"]["web"]["type"], "local");
         assert_eq!(cfg["mcp"]["mine"], json!({"enabled": false}));
+        // OpenCode has its own server named like one of Iris's: its own is
+        // off and Iris's is renamed rather than merged into it.
+        let mut clash = spec.clone();
+        clash.own_mcp_servers = vec!["web".into()];
+        let inv2 = OpenCode::new(HarnessConfig::opencode_default())
+            .build(&clash)
+            .unwrap();
+        let cfg2: Value = serde_json::from_slice(&std::fs::read(&inv2.env[0].1).unwrap()).unwrap();
+        assert_eq!(cfg2["mcp"]["web"], json!({"enabled": false}));
+        assert_eq!(cfg2["mcp"]["iris_web"]["type"], "local");
         let oc = OpenCode::new(HarnessConfig::opencode_default());
         assert_eq!(
             oc.parse_own_mcp_servers("{\n  \"mcp\": {\"mine\": {\"type\": \"local\"}}\n}"),

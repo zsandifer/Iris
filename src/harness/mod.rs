@@ -91,6 +91,16 @@ pub struct TurnSpec {
     pub own_mcp_servers: Vec<String>,
 }
 
+/// The name an Iris MCP server gets in a CLI whose own configuration
+/// already has a server called `name` (the CLI would merge the two).
+pub fn unclaimed_name(name: &str, own: &[String]) -> String {
+    let mut n = name.to_string();
+    while own.contains(&n) {
+        n.insert_str(0, "iris_");
+    }
+    n
+}
+
 /// A fully built command line.
 #[derive(Debug, Clone, Default)]
 pub struct Invocation {

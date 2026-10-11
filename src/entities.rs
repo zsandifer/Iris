@@ -1467,6 +1467,26 @@ mod tests {
     }
 
     #[test]
+    fn hourly_usage_is_an_index_lookup() {
+        with_db(|c, _| {
+            let plan: Vec<String> = c
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM connector_calls
+                     WHERE connector_id = ?1 AND admitted_at >= ?2
+                       AND decision IN ('auto', 'trusted', 'approved')",
+                )?
+                .query_map(params!["c", 0], |r| r.get::<_, String>(3))?
+                .collect::<rusqlite::Result<_>>()?;
+            assert!(
+                plan.iter().any(|p| p.contains("connector_calls_admitted")
+                    && p.contains("connector_id=? AND admitted_at>?")),
+                "{plan:?}"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
     fn job_artifacts_have_no_chat_link() {
         let db = Db::open_in_memory().unwrap();
         db.with(|c| {

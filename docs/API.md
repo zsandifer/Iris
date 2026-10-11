@@ -1256,7 +1256,9 @@ Claude Code runs with `--strict-mcp-config`, Gemini CLI with
 for the servers their own listings report (`codex mcp list --json`,
 `opencode debug config`; names only, read before each turn). If that
 listing fails, the engine is skipped for the turn rather than run with
-those servers on. Add such services as connectors instead.
+those servers on. Where a CLI's own server has the same name as one of
+Iris's, Iris's is passed as `iris_<name>` so the two are never merged. Add
+such services as connectors instead.
 
 **The approval gate.** Every call is classified from the real tool name,
 the server's own annotations (`readOnlyHint`, `destructiveHint`; risky words
@@ -1276,7 +1278,7 @@ the arguments (`to`, `cc`, `bcc`, `recipients`, `attendees`, `email`,
 |---|---|
 | read, draft | Runs. |
 | write | Runs, unless it reaches someone new (a recipient not trusted and never approved before), which asks. |
-| send | Runs without asking only when every recipient is a [trusted person](#318-safety-pause-disconnect-trusted-people) and the server cannot add others (a reply-all flag counts as "everyone else on the thread"); otherwise asks. |
+| send | Runs without asking only when every recipient is a [trusted person](#318-safety-pause-disconnect-trusted-people) and the server cannot add others (a reply-all flag counts as "everyone else on the thread"; publishing a pull request, issue, comment, or post counts as "everyone who can see it", whoever is assigned); otherwise asks. Sending, publishing, or forwarding an existing draft is a send; composing one is a draft. |
 | purchase | Always asks, whatever the rules. |
 | delete, export, unclear | Asks. |
 
@@ -1288,11 +1290,13 @@ within `safety.approval_timeout_secs` (default 300, and at most a minute
 less than `turn_timeout_secs`; the card becomes `expired`), or the turn
 ended, Iris was paused, or the connector was turned off, removed, or paused
 (the card becomes `cancelled`): it never runs, and the agent gets an error
-result saying so. Right before any call runs (and again after starting the
-connector), Iris checks that the connector still exists, is on, unpaused,
-and signed in, that it is the same target and account the owner approved,
-that its current rules and trusted people still allow the call, that the
-turn is still running, and that Iris is not paused. Editing a connector's
+result saying so. Stopping a turn, or someone joining its chat, ends its
+connector access at once (before the CLI has finished exiting). Right
+before any call runs (and again after starting the connector), Iris checks
+that the connector still exists, is on, unpaused, and signed in, that it is
+the same target and account the owner approved, that its current rules and
+trusted people still allow the call, that the turn is still running, that
+its chat is still the owner's alone, and that Iris is not paused. Editing a connector's
 settings or signing it in again cancels its waiting approvals. A request too large to show in full on the card (over 64,000
 characters) is refused rather than approved unseen. Tools that would ask are marked in their description; tools the
 rules turn off are left out of `tools/list`.
@@ -1306,7 +1310,8 @@ connector: the call is refused, an `action` card "I paused <service>" with a
 Resume button is posted in the Main chat, and the owner gets a push (`kind:
 "safety"`). Calls already admitted finish; waiting approvals for that
 connector are cancelled. The data limit is also checked right after each
-result. The hour counts from when calls ran, not when they were asked. Every call (ran, asked, refused) is recorded in the
+result. The hour counts from when calls ran, not when they were asked. Every call (ran, asked, refused, including calls refused because the
+connector was paused, off, or signed out) is recorded in the
 [connector activity log](#get-apiconnectorsactivity).
 
 **Sign-in (OAuth 2.1 + PKCE).** A connector with `auth: "oauth"` signs in on
@@ -1339,7 +1344,12 @@ connector `needs_reconnect` and posts a `connector_reconnect` card (`auth:
 "oauth"`) whose button signs in again. A sign-in server that cannot be
 reached or is having trouble (HTTP 429/5xx, `temporarily_unavailable`)
 fails only that call. A new sign-in replaces the previous grant entirely;
-changing a connector's web address clears its sign-in.
+changing a connector's web address clears its sign-in. A sign-in whose code
+exchange was overtaken by a newer change (another sign-in, a new client, a
+new address, or setting it up again) is refused instead of saving its
+tokens. Private addresses are allowed during sign-in only when every
+address the connector's host resolves to is private. Tool error results
+are scrubbed of the connector's secrets before the agent sees them.
 
 Secret values (`env` values, `headers` values, OAuth client secrets and
 tokens) are encrypted at rest and **never returned**; responses list only

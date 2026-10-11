@@ -47,14 +47,37 @@ struct Flow {
     verifier: String,
     redirect_uri: String,
     created_at: i64,
+    /// Sign-in generation when it started (see `Flows::epochs`).
+    epoch: (u64, u64),
 }
 
 /// Sign-ins in progress, by `state` parameter.
 #[derive(Default)]
 pub struct Flows {
     flows: Mutex<HashMap<String, Flow>>,
-    /// Serializes token refreshes.
+    /// Serializes token refreshes and every change to a connector's
+    /// sign-in state (see `credentials_lock`).
     refresh: tokio::sync::Mutex<()>,
+    /// Sign-in generations (all connectors, and per connector id). Bumped
+    /// under `credentials_lock` whenever a connector's address, client, or
+    /// grant changes, so a code exchange that was already under way when
+    /// that happened is refused instead of saving stale tokens.
+    epochs: Mutex<(u64, HashMap<String, u64>)>,
+}
+
+impl Flows {
+    fn epoch(&self, connector_id: &str) -> (u64, u64) {
+        let e = self.epochs.lock().unwrap_or_else(|p| p.into_inner());
+        (e.0, e.1.get(connector_id).copied().unwrap_or(0))
+    }
+
+    fn bump(&self, connector_id: Option<&str>) {
+        let mut e = self.epochs.lock().unwrap_or_else(|p| p.into_inner());
+        match connector_id {
+            None => e.0 += 1,
+            Some(id) => *e.1.entry(id.to_string()).or_default() += 1,
+        }
+    }
 }
 
 // ------------------------------------------------------------------ helpers
@@ -253,16 +276,20 @@ fn agent(local: bool) -> ureq::Agent {
     }
 }
 
-/// The URL's host resolves to this machine or a private network.
+/// The URL's host is on this machine or a private network: every address
+/// it resolves to is private. A name with any public address is treated as
+/// public, so a remote service cannot unlock private addresses by also
+/// publishing one.
 fn resolves_private(url: &str) -> bool {
     use std::net::ToSocketAddrs;
     if is_loopback_url(url) {
         return true;
     }
     let port = if url.starts_with("https://") { 443 } else { 80 };
-    (host_of(url), port)
-        .to_socket_addrs()
-        .is_ok_and(|mut a| a.any(|a| private_ip(a.ip())))
+    (host_of(url), port).to_socket_addrs().is_ok_and(|a| {
+        let ips: Vec<std::net::IpAddr> = a.map(|a| a.ip()).collect();
+        !ips.is_empty() && ips.iter().all(|ip| private_ip(*ip))
+    })
 }
 
 fn get_json(url: &str, local: bool) -> Option<Value> {
@@ -725,6 +752,7 @@ pub async fn invalidate(state: &AppState, connector_id: &str, rejected: Option<&
 /// Drop sign-ins in progress for a connector (or all): a connection that
 /// was turned off or removed is not signed in by an old browser tab.
 pub fn forget_flows(state: &AppState, connector_id: Option<&str>) {
+    state.oauth.bump(connector_id);
     state
         .oauth
         .flows
@@ -893,6 +921,9 @@ pub async fn start(
     save(state, &con.id, o.clone())
         .await
         .map_err(StartError::Other)?;
+    // Exchanges of earlier flows were for the previous client/endpoints.
+    state.oauth.bump(Some(&con.id));
+    let epoch = state.oauth.epoch(&con.id);
     {
         let mut flows = state.oauth.flows.lock().unwrap_or_else(|p| p.into_inner());
         let now = now_ms();
@@ -906,6 +937,7 @@ pub async fn start(
                 verifier,
                 redirect_uri: redirect.clone(),
                 created_at: now,
+                epoch,
             },
         );
     }
@@ -946,6 +978,7 @@ pub async fn finish(
         .filter(|c| !c.is_empty())
         .ok_or("The service did not send a sign-in code.")?;
     let id = flow.connector_id.clone();
+    let flow_epoch = flow.epoch;
     let con = state
         .db
         .call(move |c| entities::get_connector(c, &id))
@@ -1001,6 +1034,14 @@ pub async fn finish(
         ));
     }
     let _creds = credentials_lock(state).await;
+    // Refused if the connector's address, client, or grant changed while
+    // the code was being exchanged (a newer sign-in included).
+    if state.oauth.epoch(&con.id) != flow_epoch {
+        crate::warn!("connector {}: superseded sign-in ignored", con.name);
+        return Err(
+            "That sign-in was replaced by a newer change. Start again from the app.".into(),
+        );
+    }
     // Built on the latest stored state; a new sign-in replaces the old
     // grant entirely (never keeps the previous account's refresh token).
     let latest_id = con.id.clone();
@@ -1020,9 +1061,6 @@ pub async fn finish(
         updated.account = Some(email);
     }
     save(state, &con.id, updated).await?;
-    drop(_creds);
-    // Approvals were for the previous sign-in.
-    crate::gateway::cancel_approvals(state, Some(&con.id));
     let id = con.id.clone();
     let _ = state
         .db
@@ -1038,6 +1076,11 @@ pub async fn finish(
             )
         })
         .await;
+    // Any other exchange still under way is now stale.
+    state.oauth.bump(Some(&con.id));
+    drop(_creds);
+    // Approvals were for the previous sign-in.
+    crate::gateway::cancel_approvals(state, Some(&con.id));
     crate::gateway::stop(state, &con.id).await;
     crate::login::on_connector_updated(state, &con.id).await;
     crate::connectors::broadcast_changed(state).await;

@@ -346,8 +346,9 @@ fn classify_words(w: &[String]) -> Option<Category> {
     if has(&["send", "reply", "forward", "publish", "invite", "tweet"])
         || (!read_first && (has(SEND_WORDS) || lead(SEND_LEADING)))
     {
-        // `create_draft` and `draft_reply` stay drafts unless they send.
-        if has(DRAFT_WORDS) && !has(&["send"]) {
+        // `create_draft` and `draft_reply` stay drafts unless they send:
+        // `send_draft`, `publish_draft`, and `forward_draft` deliver one.
+        if has(DRAFT_WORDS) && !has(&["send", "publish", "forward", "post", "tweet", "invite"]) {
             return Some(Category::Draft);
         }
         return Some(Category::Send);
@@ -475,6 +476,42 @@ const IMPLICIT_RECIPIENT_FLAGS: &[&str] = &[
 ];
 /// Stands for recipients the server will add on its own; never trusted.
 pub const IMPLICIT_RECIPIENTS: &str = "everyone else on the thread";
+/// Stands for everyone who can see what a call publishes (a pull request,
+/// issue, comment, or post); never trusted.
+pub const PUBLIC_AUDIENCE: &str = "everyone who can see it";
+
+/// Placeholders for audiences Iris cannot list (never trusted or known).
+pub fn is_placeholder(r: &str) -> bool {
+    r == IMPLICIT_RECIPIENTS || r == PUBLIC_AUDIENCE
+}
+
+/// The call publishes something to an audience beyond the people its
+/// arguments name (assignees and reviewers are not the whole audience).
+fn publishes(tool: &str, args: &Value) -> bool {
+    let check = |w: &[String]| {
+        let has = |set: &[&str]| w.iter().any(|x| set.contains(&x.as_str()));
+        has(PUBLISH_NOUNS) || has(&["publish", "approve", "merge", "tweet", "broadcast"])
+    };
+    if check(&words(tool)) {
+        return true;
+    }
+    args.as_object().is_some_and(|o| {
+        o.iter().any(|(k, v)| {
+            SELECTOR_KEYS.contains(&norm_key(k).as_str())
+                && v.as_str().is_some_and(|t| check(&words(t)))
+        })
+    })
+}
+
+/// Everyone a call reaches: the recipients its arguments name, plus a
+/// placeholder for an audience they cannot list (reply-all, publishing).
+pub fn audience(tool: &str, args: &Value) -> Vec<String> {
+    let mut out = recipients(args);
+    if publishes(tool, args) && !out.iter().any(|r| r == PUBLIC_AUDIENCE) {
+        out.push(PUBLIC_AUDIENCE.to_string());
+    }
+    out
+}
 
 /// Fields of an object inside a recipient list that identify the person.
 const IDENTITY_FIELDS: &[&str] = &[
@@ -633,6 +670,8 @@ pub fn decide(
             ToolRule::Allow => Verdict::Allow(AllowedBy::Override),
         };
     }
+    let trusted = |r: &str| !is_placeholder(r) && trusted(r);
+    let known = |r: &str| !is_placeholder(r) && known(r);
     let all_trusted = !recipients.is_empty() && recipients.iter().all(|r| trusted(r));
     let new: Vec<&String> = recipients
         .iter()
@@ -660,6 +699,9 @@ pub fn decide(
             )),
             Category::Write => Verdict::Allow(AllowedBy::Rules),
             Category::Send if all_trusted => Verdict::Allow(AllowedBy::Trusted),
+            Category::Send if recipients.iter().any(|r| r == PUBLIC_AUDIENCE) => {
+                Verdict::Ask("Publishes something others can see".into())
+            }
             Category::Send if !new.is_empty() => Verdict::Ask(format!(
                 "Sends a message to someone new: {}",
                 new.iter()
@@ -948,6 +990,52 @@ mod tests {
         let r = recipients(&json!({"phone_number": "+1 (555) 010-2000"}));
         assert_eq!(r, ["+15550102000"]);
         assert!(recipients(&json!({"query": "from:x@y.com"})).is_empty());
+    }
+
+    #[test]
+    fn publications_are_never_only_to_trusted_people() {
+        let none = Value::Null;
+        // An issue assigned to a trusted teammate still reaches everyone
+        // who can read the repository.
+        let args = json!({"method": "create", "owner": "o", "repo": "r",
+                          "title": "Bug", "assignees": ["sam@example.com"]});
+        let cat = classify_call("issue_write", &none, &args);
+        assert_eq!(cat, Category::Send);
+        let who = audience("issue_write", &args);
+        assert!(who.contains(&PUBLIC_AUDIENCE.to_string()), "{who:?}");
+        let everyone = |_: &str| true;
+        assert!(matches!(
+            decide(
+                &Policy::default(),
+                "issue_write",
+                cat,
+                &who,
+                &everyone,
+                &everyone
+            ),
+            Verdict::Ask(_)
+        ));
+        // A plain message to trusted people still skips approval.
+        let args = json!({"to": "sam@example.com", "text": "hi"});
+        let who = audience("send_message", &args);
+        assert_eq!(who, ["sam@example.com"]);
+        assert!(matches!(
+            decide(
+                &Policy::default(),
+                "send_message",
+                Category::Send,
+                &who,
+                &everyone,
+                &everyone
+            ),
+            Verdict::Allow(AllowedBy::Trusted)
+        ));
+        // Delivering an existing draft is sending; composing one is not.
+        assert_eq!(c("publish_draft"), Category::Send);
+        assert_eq!(c("forward_draft"), Category::Send);
+        assert_eq!(c("send_draft"), Category::Send);
+        assert_eq!(c("create_draft"), Category::Draft);
+        assert_eq!(c("draft_reply"), Category::Draft);
     }
 
     #[test]

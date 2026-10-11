@@ -99,6 +99,9 @@ pub async fn run_turn(state: &AppState, input: TurnInput) -> TurnResult {
 
 /// Request cancellation of the running turn in a conversation.
 pub fn cancel(state: &AppState, conversation_id: &str) -> bool {
+    // Connector access ends now, not when the CLI has finished exiting: an
+    // approval tapped meanwhile must not run.
+    crate::gateway::cancel_conversation_grants(state, conversation_id);
     state
         .running
         .lock()
@@ -577,7 +580,12 @@ async fn run_locked(
         decision = Some(d.clone());
 
         let strip = state.strip_env(entry);
-        let server_names: Vec<String> = spec.mcp_servers.iter().map(|s| s.name.clone()).collect();
+        // As the CLI knows them (renamed where its own config has the name).
+        let server_names: Vec<String> = spec
+            .mcp_servers
+            .iter()
+            .map(|s| crate::harness::unclaimed_name(&s.name, &spec.own_mcp_servers))
+            .collect();
         let (tx, rx) = mpsc::unbounded_channel();
         let run_fut = runner::run(
             RunRequest {
@@ -858,11 +866,11 @@ pub(crate) async fn own_mcp_servers(
 async fn post_policy_card_once(state: &AppState, conv_id: &str) {
     let key = format!("notice.policy_card.{conv_id}");
     let c = conv_id.to_string();
-    let _ = state
+    let posted = state
         .db
         .call(move |db| {
             if db::get_setting(db, &key)?.is_some() {
-                return Ok(());
+                return Ok(None);
             }
             let card = json!({
                 "type": "action",
@@ -876,10 +884,18 @@ async fn post_policy_card_once(state: &AppState, conv_id: &str) {
                            "body": {"allow_claude_for_shared": true}},
                 "owner_only": true,
             });
-            crate::entities::insert_card(db, &c, &card, "assistant")?;
-            db::set_setting(db, &key, &crate::util::now_ms().to_string())
+            let m = crate::entities::insert_card(db, &c, &card, "assistant")?;
+            db::set_setting(db, &key, &crate::util::now_ms().to_string())?;
+            Ok(Some((m, db::conversation_member_ids(db, &c)?)))
         })
         .await;
+    // Sent live (turns only re-send the agent's own cards).
+    if let Ok(Some((m, members))) = posted {
+        state.hub.to_users(
+            &members,
+            json!({"type": "message.created", "conversation_id": m.conversation_id, "message": m}),
+        );
+    }
 }
 
 fn routing_json(d: &RouteDecision, notes: &[String]) -> Value {

@@ -20,6 +20,10 @@ const FAKE_SERVER: &str = r#"while IFS= read -r line; do
       tool=$(printf '%s' "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
       echo "$tool" >> calls.log
       printf '%s\n' "$line" >> requests.log
+      case "$line" in *'"fail":true'*)
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"isError":true,"content":[{"type":"text","text":"failed with key %s"}]}}\n' "$id" "$FAKE_SECRET"
+        continue ;;
+      esac
       if [ "$tool" = read_archive ]; then
         big=$(head -c 1100000 /dev/zero | tr '\0' a)
         printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$big"
@@ -215,6 +219,17 @@ async fn secrets_stay_on_irises_side_and_reads_run_freely() {
     let calls = t.calls();
     assert_eq!(calls[0].decision, "auto");
     assert_eq!(calls[0].outcome.as_deref(), Some("ok"));
+    // A tool error that echoes the connector's configuration does not
+    // hand its secret to the agent.
+    let r = t
+        .call(
+            &token,
+            "search_messages",
+            json!({"query": "x", "fail": true}),
+        )
+        .await;
+    assert_eq!(r["isError"], true, "{r}");
+    assert_eq!(text(&r), "failed with key [hidden]");
 
     // Wrong token or connector: refused.
     let bad = handle(
@@ -367,9 +382,17 @@ async fn trusted_recipients_skip_approval_and_the_send_tripwire_pauses() {
         notice.card.as_ref().unwrap()["action"]["path"],
         format!("/api/connectors/{}/resume", t.connector_id)
     );
-    // Reads are refused too while paused.
+    // Reads are refused too while paused, and the refusal is in the
+    // activity log.
     let r = t.call(&token, "search_messages", json!({})).await;
     assert!(text(&r).contains("paused"));
+    let last = t
+        .calls()
+        .into_iter()
+        .find(|c| c.tool == "search_messages")
+        .unwrap();
+    assert_eq!(last.decision, "blocked");
+    assert!(last.reason.contains("paused"), "{}", last.reason);
     // And the next turn does not get it at all.
     drop(_guard);
     assert!(
@@ -407,6 +430,66 @@ async fn ending_the_turn_cancels_a_waiting_approval() {
     // The token died with the turn.
     let r = t.call(&token, "search_messages", json!({})).await;
     assert_eq!(r, Value::Null);
+}
+
+/// Hold a send for approval; returns the call and its card.
+async fn held_send(t: &T, token: &str) -> (tokio::task::JoinHandle<Value>, db::Message) {
+    let (state, tok) = (t.state.clone(), token.to_string());
+    let call = tokio::spawn(async move {
+        handle(
+            &state,
+            &json!({"token": tok, "connector": "chat", "request": {
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "send_message", "arguments": {"to": "kim@example.com", "text": "hi"}}}}),
+        )
+        .await
+    });
+    let card = t.pending_card().await;
+    (call, card)
+}
+
+#[tokio::test]
+async fn stopping_the_turn_cancels_its_held_calls_right_away() {
+    let t = setup(|c| c.safety.approval_timeout_secs = 60);
+    // The grant outlives Stop while the CLI exits; Stop must still end it.
+    let (token, _guard, _) = t.grant().await;
+    let (call, card) = held_send(&t, &token).await;
+    crate::turn::cancel(&t.state, &t.main);
+    let r = call.await.unwrap()["result"].clone();
+    assert!(text(&r).contains("cancelled"), "{r}");
+    t.decide(&card.id, true);
+    assert!(!t.calls_log().contains("send_message"));
+    let r = t.call(&token, "search_messages", json!({})).await;
+    assert!(text(&r).contains("cancelled"), "{r}");
+}
+
+#[tokio::test]
+async fn a_chat_that_stops_being_private_loses_connectors() {
+    let t = setup(|c| c.safety.approval_timeout_secs = 60);
+    let (token, _guard, _) = t.grant().await;
+    let (call, card) = held_send(&t, &token).await;
+    // Someone joins (written directly, so only the dispatch check can
+    // notice), then the owner approves.
+    let main = t.main.clone();
+    t.state
+        .db
+        .with(|c| {
+            c.execute(
+                "INSERT INTO users (id, display_name, created_at) VALUES ('guest', 'Guest', 0)",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO conversation_members (conversation_id, user_id, role, joined_at)
+                 VALUES (?1, 'guest', 'member', 0)",
+                [&main],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    t.decide(&card.id, true);
+    let r = call.await.unwrap()["result"].clone();
+    assert!(text(&r).contains("joined"), "{r}");
+    assert!(!t.calls_log().contains("send_message"));
 }
 
 #[tokio::test]

@@ -693,14 +693,15 @@ async fn update_connector(
             Ok(Ok((con, url_changed)))
         })
         .await??;
+    if url_changed {
+        // Sign-ins under way were for the old address.
+        crate::oauth::forget_flows(&state, Some(&cid));
+    }
     drop(_creds);
     let enabled = con.enabled;
     if touches_config {
         // Approvals were for the old settings.
         crate::gateway::cancel_approvals(&state, Some(&cid));
-    }
-    if url_changed {
-        crate::oauth::forget_flows(&state, Some(&cid));
     }
     if !enabled {
         crate::gateway::cancel_approvals(&state, Some(&cid));

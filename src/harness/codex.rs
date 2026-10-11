@@ -210,14 +210,22 @@ impl Harness for Codex {
             }
         }
         let exe = std::env::current_exe()?;
-        let mcp = mcp_setup(&spec.mcp_servers, &exe, &spec.run_dir, &spec.turn_id)?;
+        // Codex merges `-c` overrides into a server of the same name in its
+        // own config (whose `url` would then clash with Iris's `command`):
+        // Iris's servers get names Codex itself does not use.
+        let servers: Vec<McpServer> = spec
+            .mcp_servers
+            .iter()
+            .map(|s| McpServer {
+                name: super::unclaimed_name(&s.name, &spec.own_mcp_servers),
+                ..s.clone()
+            })
+            .collect();
+        let mcp = mcp_setup(&servers, &exe, &spec.run_dir, &spec.turn_id)?;
         overrides.extend(mcp.overrides);
         // MCP servers configured in Codex itself are off in every turn:
         // they would bypass Iris's gateway and approvals.
         for name in &spec.own_mcp_servers {
-            if spec.mcp_servers.iter().any(|s| &s.name == name) {
-                continue;
-            }
             if !bare_key(name) {
                 return Err(format!("cannot switch off Codex MCP server {name:?}").into());
             }
@@ -646,7 +654,7 @@ mod tests {
             scope: "c1".into(),
             key_env: vec![],
             isolated: false,
-            own_mcp_servers: vec!["mine".into(), "notes".into()],
+            own_mcp_servers: vec!["mine".into()],
         };
         let mut cfg = HarnessConfig::codex_default();
         cfg.sandbox = "workspace-write".into();
@@ -758,7 +766,7 @@ mod tests {
         assert!(!inv.args.iter().any(|a| a.starts_with("features.")));
         // Someone else's chat: Codex's own apps, plugins, and memories are
         // switched off too (its own MCP servers are off in every turn;
-        // Iris's own servers stay).
+        // Iris's own servers stay, renamed if Codex has one by that name).
         spec.isolated = true;
         spec.own_mcp_servers = vec!["personal".into(), "notes".into()];
         let inv = h.build(&spec).unwrap();
@@ -767,12 +775,19 @@ mod tests {
             "features.plugins=false",
             "features.memories=false",
             "mcp_servers.personal.enabled=false",
+            "mcp_servers.notes.enabled=false",
         ] {
             assert!(inv.args.contains(&o.to_string()), "{o}");
         }
         assert!(
+            inv.args
+                .iter()
+                .any(|a| a.starts_with("mcp_servers.iris_notes.command="))
+        );
+        assert!(
             !inv.args
-                .contains(&"mcp_servers.notes.enabled=false".to_string())
+                .iter()
+                .any(|a| a.starts_with("mcp_servers.notes.command="))
         );
         spec.own_mcp_servers = vec!["has space".into()];
         assert!(h.build(&spec).is_err(), "unknown servers are never left on");

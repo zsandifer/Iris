@@ -323,6 +323,8 @@ pub async fn setup(
         })
         .await
         .map_err(|e| e.to_string())?;
+    // Sign-ins under way were for the previous setup.
+    crate::oauth::forget_flows(state, Some(&id));
     drop(_creds);
     crate::gateway::cancel_approvals(state, Some(&id));
     crate::gateway::stop(state, &id).await;

@@ -158,6 +158,8 @@ async fn oauth_client(
         .call(move |c| entities::update_connector(c, &cid, None, Some(&cfg), None))
         .await?
         .ok_or_else(|| ApiError::not_found("connector"))?;
+    // Sign-ins under way were for the previous client.
+    crate::oauth::forget_flows(&state, Some(&updated.id));
     drop(_creds);
     crate::gateway::cancel_approvals(&state, Some(&updated.id));
     crate::gateway::stop(&state, &updated.id).await;
@@ -281,42 +283,47 @@ async fn put_policy(
     JsonBody(body): JsonBody<PolicyBody>,
 ) -> ApiResult {
     user.require_owner()?;
-    let con = connector(&state, &id).await?;
-    let mut p: Policy = con.policy.clone();
-    if let Some(m) = body.mode {
-        p.mode = m;
+    let changes = body.tools.unwrap_or_default();
+    if changes.keys().any(|t| t.is_empty() || t.len() > 200) {
+        return Err(ApiError::bad_request("invalid tool name"));
     }
-    for (tool, rule) in body.tools.unwrap_or_default() {
-        if tool.is_empty() || tool.len() > 200 {
-            return Err(ApiError::bad_request("invalid tool name"));
-        }
-        match rule {
-            Some(r) => {
-                p.tools.insert(tool, r);
-            }
-            None => {
-                p.tools.remove(&tool);
-            }
-        }
-    }
-    if p.tools.len() > 500 {
-        return Err(ApiError::bad_request("too many tool rules"));
-    }
-    let cid = con.id.clone();
+    let mode = body.mode;
+    // Read, merge, and save in one database call, so concurrent changes to
+    // different rules cannot undo each other.
     let updated = state
         .db
         .call(move |c| {
-            entities::set_connector_state(
+            let Some(con) = entities::get_connector(c, &id)? else {
+                return Ok(Err(ApiError::not_found("connector")));
+            };
+            let mut p: Policy = con.policy.clone();
+            if let Some(m) = mode {
+                p.mode = m;
+            }
+            for (tool, rule) in changes {
+                match rule {
+                    Some(r) => {
+                        p.tools.insert(tool, r);
+                    }
+                    None => {
+                        p.tools.remove(&tool);
+                    }
+                }
+            }
+            if p.tools.len() > 500 {
+                return Ok(Err(ApiError::bad_request("too many tool rules")));
+            }
+            Ok(entities::set_connector_state(
                 c,
-                &cid,
+                &con.id,
                 &ConnectorState {
                     policy: Some(&p),
                     ..Default::default()
                 },
-            )
+            )?
+            .ok_or_else(|| ApiError::not_found("connector")))
         })
-        .await?
-        .ok_or_else(|| ApiError::not_found("connector"))?;
+        .await??;
     crate::connectors::broadcast_changed(&state).await;
     ok(json!({"connector": updated.public_json()}))
 }
@@ -575,6 +582,8 @@ mod tests {
         refresh_mode: &'static str,
         /// Refuse the first token on every request, initialize included.
         refuse_at_start: bool,
+        /// Hold code exchanges this long (a slow provider).
+        exchange_delay_ms: u64,
         challenge: Option<String>,
         refreshed: bool,
         last_auth: Option<String>,
@@ -659,6 +668,10 @@ mod tests {
                 "/auth/token",
                 post(|S(p): S<P>, body: String| async move {
                     let form = crate::oauth::parse_query(&body);
+                    let delay = p.lock().unwrap().exchange_delay_ms;
+                    if form.get("grant_type").map(String::as_str) == Some("authorization_code") {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
                     let mut g = p.lock().unwrap();
                     g.token_requests.push(form.clone());
                     match form.get("grant_type").map(String::as_str) {
@@ -756,6 +769,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_token_refused_at_startup_is_refreshed() {
         oauth_flow_with(true, "start").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sign_in_superseded_during_the_code_exchange_is_refused() {
+        oauth_flow_with(false, "stale").await;
     }
 
     async fn oauth_flow(strict: bool) {
@@ -859,6 +877,45 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK);
         assert!(b.contains("didn"), "{b}");
+        if refresh_mode == "stale" {
+            // The owner changes the address while the code is being
+            // exchanged: the old service's tokens are never saved.
+            provider.lock().unwrap().exchange_delay_ms = 600;
+            let callback = {
+                let (app, st) = (app.clone(), q["state"].clone());
+                tokio::spawn(async move {
+                    send(
+                        &app,
+                        "GET",
+                        &format!("/api/oauth/callback?state={st}&code=the-code"),
+                        "",
+                        None,
+                    )
+                    .await
+                })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let (s, b) = send(
+                &app,
+                "PATCH",
+                &format!("/api/connectors/{id}"),
+                &token,
+                Some(json!({"url": format!("{base}/other/mcp")})),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+            let (_, b) = callback.await.unwrap();
+            assert!(b.contains("replaced by a newer change"), "{b}");
+            let con = state
+                .db
+                .with(|c| crate::entities::get_connector(c, &id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(con.auth_state, "needs_sign_in");
+            let o = con.config.oauth.unwrap();
+            assert!(o.access_token.is_none() && o.refresh_token.is_none());
+            return;
+        }
         // The provider sends the phone's browser back to Iris.
         let (s, b) = send(
             &app,

@@ -143,13 +143,40 @@ fn free_port() -> Result<u16, UpstreamError> {
         .map_err(|e| UpstreamError::Transport(format!("no free port: {e}")))
 }
 
+/// Where a connector's program is, as it would be found when started in
+/// `cwd` with its own environment: relative paths from `cwd`, bare names
+/// on the connector's own `PATH` first, then the usual places.
+fn connector_program(
+    command: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let runnable = |p: &std::path::Path| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if command.contains('/') {
+        let p = cwd.join(command);
+        return runnable(&p).then_some(p);
+    }
+    if let Some(path) = env.get("PATH") {
+        let found = std::env::split_paths(path)
+            .map(|d| cwd.join(d).join(command))
+            .find(|c| runnable(c));
+        if found.is_some() {
+            return found;
+        }
+    }
+    crate::harness::resolve_command(command)
+}
+
 fn base_command(
     command: &str,
     args: &[String],
     env: &BTreeMap<String, String>,
     cwd: &std::path::Path,
 ) -> Result<Command, UpstreamError> {
-    let program = crate::harness::resolve_command(command)
+    let program = connector_program(command, env, cwd)
         .ok_or_else(|| UpstreamError::Transport(format!("{command} is not installed")))?;
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -227,6 +254,21 @@ pub async fn wait_for_reaping(limit: Duration) {
     while REAPING.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Connector HTTP exchanges run on the blocking pool, which the database
+/// shares (16 threads): at most this many at once, so slow services can
+/// never starve it.
+const MAX_HTTP_EXCHANGES: usize = 6;
+
+async fn http_permit() -> Result<tokio::sync::OwnedSemaphorePermit, UpstreamError> {
+    static PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_EXCHANGES)));
+    PERMITS
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| UpstreamError::Transport("shutting down".into()))
 }
 
 /// Start a `Serve` program and wait until its port accepts connections.
@@ -449,6 +491,11 @@ impl Upstream {
     pub async fn close(&self) {
         match &self.inner {
             Inner::Stdio(s) => s.kill(),
+            // A program Iris started is ended right after (shortly, even if
+            // it is slow to end the session).
+            Inner::Http(h) if self.server.is_some() => {
+                let _ = tokio::time::timeout(Duration::from_secs(1), h.close()).await;
+            }
             Inner::Http(h) => h.close().await,
         }
         if let Some(p) = &self.server {
@@ -578,11 +625,12 @@ impl StdioConn {
     async fn write(&self, msg: &Value) -> Result<(), UpstreamError> {
         let mut line = msg.to_string().into_bytes();
         line.push(b'\n');
-        // Written by its own task, so a caller that gives up halfway never
-        // leaves half a message in the pipe.
-        let w = self.stdin.clone();
+        // Waiting for the pipe happens here, so a caller cancelled while
+        // another message is being written sends nothing. Once it has the
+        // pipe, its own task writes the whole message, so a caller that
+        // gives up halfway never leaves half a message in the pipe.
+        let mut w = self.stdin.clone().lock_owned().await;
         tokio::spawn(async move {
-            let mut w = w.lock().await;
             w.write_all(&line).await?;
             w.flush().await
         })
@@ -876,9 +924,15 @@ impl HttpConn {
             timeout,
             want_id,
         };
-        let (reply, session) = tokio::task::spawn_blocking(move || exchange(x))
-            .await
-            .map_err(|e| UpstreamError::Transport(e.to_string()))??;
+        let permit = http_permit().await?;
+        let (reply, session) = tokio::task::spawn_blocking(move || {
+            // Held until the exchange really ends, even if the caller
+            // gave up on it.
+            let _permit = permit;
+            exchange(x)
+        })
+        .await
+        .map_err(|e| UpstreamError::Transport(e.to_string()))??;
         if let Some(s) = session {
             *self.session.lock().unwrap_or_else(|p| p.into_inner()) = Some(s);
         }
@@ -937,7 +991,11 @@ impl HttpConn {
         let url = self.url.clone();
         let mut headers = self.header_list();
         headers.push(("Mcp-Session-Id".into(), sid));
+        let Ok(permit) = http_permit().await else {
+            return;
+        };
         let _ = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let agent = http_agent(Duration::from_secs(5));
             let mut req = agent.delete(&url);
             for (k, v) in &headers {
@@ -1015,5 +1073,158 @@ done"#;
                 .await
                 .is_err()
         );
+    }
+
+    /// The process is gone (or only a zombie waiting to be reaped).
+    fn gone(pid: &str) -> bool {
+        match std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+        }
+    }
+
+    async fn wait_gone(pids: &[String]) -> bool {
+        for _ in 0..100 {
+            if pids.iter().all(|p| gone(p)) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn closing_ends_stubborn_programs_and_their_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Ignores TERM (so does its child) and leaves a child running.
+        let script = r#"trap '' TERM
+sleep 1000 &
+echo $! > child.pid
+echo $$ > main.pid
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"t","version":"1"}}}\n' "$id" ;;
+    *'"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}\n' "$id" ;;
+  esac
+done"#;
+        let up = Upstream::start(
+            Launch::Stdio {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                env: BTreeMap::new(),
+                cwd: tmp.path().to_path_buf(),
+            },
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        let read = |f: &str| std::fs::read_to_string(tmp.path().join(f)).unwrap();
+        let pids = [read("main.pid"), read("child.pid")];
+        assert!(!pids.iter().any(|p| gone(p)), "both running");
+        up.close().await;
+        assert!(wait_gone(&pids).await, "TERM, then KILL, ends the group");
+    }
+
+    #[tokio::test]
+    async fn a_program_that_closes_its_output_is_ended() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Closes stdout but keeps running (and ignores TERM).
+        let script = "trap '' TERM\necho $$ > main.pid\nexec 1>&-\nsleep 1000";
+        let started = Upstream::start(
+            Launch::Stdio {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                env: BTreeMap::new(),
+                cwd: tmp.path().to_path_buf(),
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(started.is_err());
+        let pid = std::fs::read_to_string(tmp.path().join("main.pid")).unwrap();
+        assert!(wait_gone(&[pid]).await, "ended once its output closed");
+    }
+
+    #[tokio::test]
+    async fn a_call_cancelled_while_waiting_for_the_pipe_is_never_sent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Answers the handshake, then stops reading for a while (the pipe
+        // fills up), then records everything it was sent.
+        let script = r#"IFS= read -r line
+id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"t","version":"1"}}}\n' "$id"
+sleep 2
+cat > requests.log"#;
+        let up = Arc::new(
+            Upstream::start(
+                Launch::Stdio {
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), script.into()],
+                    env: BTreeMap::new(),
+                    cwd: tmp.path().to_path_buf(),
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap(),
+        );
+        // Bigger than the pipe: its write blocks until the program reads.
+        let big = {
+            let up = up.clone();
+            tokio::spawn(async move {
+                let _ = up
+                    .call_tool(
+                        "big_one",
+                        &json!({"x": "a".repeat(300_000)}),
+                        Duration::from_secs(8),
+                    )
+                    .await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Queued behind it, then cancelled.
+        let r = tokio::time::timeout(
+            Duration::from_millis(300),
+            up.call_tool("cancelled_one", &json!({}), Duration::from_secs(8)),
+        )
+        .await;
+        assert!(r.is_err(), "still waiting for the pipe");
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        let log = std::fs::read_to_string(tmp.path().join("requests.log")).unwrap_or_default();
+        assert!(log.contains("big_one"), "the first call went out");
+        assert!(
+            !log.contains("cancelled_one"),
+            "the cancelled call never did"
+        );
+        big.abort();
+        up.close().await;
+    }
+
+    #[test]
+    fn programs_are_found_like_they_used_to_be() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = tmp.path().join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        for p in [tmp.path().join("mail-server"), tools.join("notes-server")] {
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Relative to the folder it runs in, not Iris's.
+        assert_eq!(
+            connector_program("./mail-server", &BTreeMap::new(), tmp.path()),
+            Some(tmp.path().join("./mail-server"))
+        );
+        // On the connector's own PATH (relative entries from its folder).
+        let env = BTreeMap::from([("PATH".to_string(), "tools:/nonexistent".to_string())]);
+        assert_eq!(
+            connector_program("notes-server", &env, tmp.path()),
+            Some(tmp.path().join("tools/notes-server"))
+        );
+        assert!(connector_program("notes-server", &BTreeMap::new(), tmp.path()).is_none());
+        assert!(connector_program("sh", &BTreeMap::new(), tmp.path()).is_some());
     }
 }
