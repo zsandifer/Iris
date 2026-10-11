@@ -402,6 +402,9 @@ async fn add_member(
     if !added {
         return Err(ApiError::not_found("user"));
     }
+    // A running turn re-checks who is in the chat: one that started with
+    // the owner's private context stops and withholds its reply.
+    turn::membership_changed(&state);
     let conv = member_conversation(&state, &user, &conv.id).await?;
     state.hub.to_users(
         &[new_member],

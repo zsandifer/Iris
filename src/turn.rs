@@ -162,7 +162,7 @@ async fn load_ctx(state: &AppState, conv_id: &str) -> Ctx {
         })
 }
 
-/// Call after someone leaves a conversation or it is deleted.
+/// Call after someone joins or leaves a conversation, or it is deleted.
 pub fn membership_changed(state: &AppState) {
     state.membership_generation.fetch_add(1, Ordering::SeqCst);
 }
@@ -174,6 +174,11 @@ struct Audience {
     conv_id: String,
     users: Vec<String>,
     generation: u64,
+    /// The owner, when the turn runs with the owner's private context.
+    private_owner: Option<String>,
+    /// Someone joined a private turn's conversation: its reply must not be
+    /// streamed or kept.
+    privacy_lost: bool,
 }
 
 impl Audience {
@@ -184,12 +189,20 @@ impl Audience {
             conv_id: conv_id.to_string(),
             users,
             generation,
+            private_owner: None,
+            privacy_lost: false,
         }
     }
 
     /// Narrow to a fresher member list read after `generation`.
     fn refresh(&mut self, members: &[String], generation: u64) {
         self.users.retain(|u| members.contains(u));
+        if let Some(owner) = &self.private_owner
+            && members != std::slice::from_ref(owner)
+        {
+            self.privacy_lost = true;
+            self.users.clear();
+        }
         self.generation = generation;
     }
 
@@ -202,11 +215,13 @@ impl Audience {
                 .call(move |c| db::conversation_member_ids(c, &id))
                 .await
             {
-                Ok(members) => self.users.retain(|u| members.contains(u)),
+                Ok(members) => self.refresh(&members, generation),
                 // Fail closed: stop streaming rather than risk a leak.
-                Err(_) => self.users.clear(),
+                Err(_) => {
+                    self.users.clear();
+                    self.generation = generation;
+                }
             }
-            self.generation = generation;
         }
         &self.users
     }
@@ -283,6 +298,9 @@ async fn run_locked(
     // Engine policy: more than one human. Privacy: see `Ctx::scope`.
     let shared = ctx.members.len() > 1;
     let scope = ctx.scope();
+    if scope == Scope::Private {
+        audience.private_owner = ctx.owner.clone();
+    }
     state.hub.to_users(
         audience.current(state).await,
         json!({"type": "turn.status", "conversation_id": conv_id, "message_id": msg_id, "status": "running"}),
@@ -304,6 +322,13 @@ async fn run_locked(
     };
 
     for _attempt in 0..MAX_ATTEMPTS {
+        // Someone joined a private turn's chat (or it was cancelled): no
+        // further attempt may run with the owner's context.
+        audience.current(state).await;
+        if audience.privacy_lost || *cancel.borrow() {
+            outcome = Outcome::Cancelled;
+            break;
+        }
         // Routing borrows non-Send closures; keep them out of any await.
         let routed = {
             let available = |m: &crate::catalog::ModelEntry| {
@@ -846,7 +871,15 @@ async fn consume(
     mut rx: mpsc::UnboundedReceiver<HarnessEvent>,
 ) -> Acc {
     let mut acc = Acc::default();
+    let mut stopped = false;
     while let Some(ev) = rx.recv().await {
+        audience.current(state).await;
+        if audience.privacy_lost && !stopped {
+            // Someone joined while the owner's private context is in use.
+            crate::info!("turn {msg_id}: people changed; stopping");
+            cancel(state, conv_id);
+            stopped = true;
+        }
         match ev {
             HarnessEvent::Session { id } => acc.session = Some(id),
             HarnessEvent::TextDelta { text } => {
@@ -988,15 +1021,43 @@ async fn finish(
     }
     let duration_ms = crate::util::now_ms() - input.assistant_message.created_at;
     meta["duration_ms"] = duration_ms.into();
+    // A reply made with the owner's private context is never kept once
+    // someone else has joined the conversation.
+    audience.current(state).await;
+    let outcome = if audience.privacy_lost {
+        meta["withheld"] = "people changed during a private reply".into();
+        meta["activity"] = json!([]);
+        // Cards the agent showed during this turn came from the same
+        // private context.
+        let (c, after) = (conv_id.clone(), input.assistant_message.created_at);
+        let _ = state
+            .db
+            .call(move |db| {
+                db.execute(
+                    "DELETE FROM messages WHERE conversation_id = ?1 AND kind = 'card'
+                     AND role = 'assistant' AND created_at > ?2",
+                    rusqlite::params![c, after],
+                )
+            })
+            .await;
+        Outcome::Cancelled
+    } else {
+        outcome
+    };
+    let text = if audience.privacy_lost {
+        ""
+    } else {
+        acc.text.trim()
+    };
     let (status, content, ok) = match &outcome {
-        Outcome::Complete => ("complete", acc.text.trim().to_string(), true),
-        Outcome::Cancelled => ("cancelled", acc.text.trim().to_string(), false),
+        Outcome::Complete => ("complete", text.to_string(), true),
+        Outcome::Cancelled => ("cancelled", text.to_string(), false),
         Outcome::Failed { kind, detail } => {
             meta["error"] = json!({"kind": kind, "detail": truncate_chars(detail, 500)});
-            let text = if acc.text.trim().is_empty() {
+            let text = if text.is_empty() {
                 failure_text(kind, detail)
             } else {
-                acc.text.trim().to_string()
+                text.to_string()
             };
             ("error", text, false)
         }

@@ -2173,6 +2173,61 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
     }
 
     #[tokio::test]
+    async fn joining_during_a_private_reply_withholds_it() {
+        let t = turn_setup(|c| c.router.allow_claude_for_shared = true).await;
+        let gid = t.create("group", &[]).await;
+        std::fs::write(t.dir.join("hold"), "").unwrap();
+        let (s, b) = send(
+            &t.h.app,
+            "POST",
+            &format!("/api/conversations/{gid}/messages"),
+            Some(&t.owner_t),
+            Some(json!({"text": "what's in my memory?"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::ACCEPTED);
+        let reply_id = b["assistant_message"]["id"].as_str().unwrap().to_string();
+        let started = t.run_dir(0).join("started");
+        t.wait_for("private run", || started.exists()).await;
+        assert!(t.read(0, "system.md").contains("owner-memory-fact"));
+        let (s, _) = send(
+            &t.h.app,
+            "POST",
+            &format!("/api/conversations/{gid}/members"),
+            Some(&t.owner_t),
+            Some(json!({"user_id": t.guest_id})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        std::fs::remove_file(t.dir.join("hold")).unwrap();
+        let reply = loop {
+            let (_, msgs) = send(
+                &t.h.app,
+                "GET",
+                &format!("/api/conversations/{gid}/messages"),
+                Some(&t.guest_t),
+                None,
+            )
+            .await;
+            let m = msgs["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == reply_id.as_str())
+                .cloned()
+                .unwrap();
+            if m["status"] != "streaming" {
+                break m;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(reply["status"], "cancelled", "{reply}");
+        assert_eq!(reply["content"], "");
+        assert_eq!(reply["meta"]["activity"], json!([]));
+        assert_eq!(t.runs(), 1, "no retry with the private context");
+    }
+
+    #[tokio::test]
     async fn a_removed_sender_s_queued_message_is_not_answered() {
         let t = turn_setup(|c| c.router.allow_claude_for_shared = true).await;
         let gid = t.create("group", &[&t.guest_id]).await;
