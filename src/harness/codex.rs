@@ -148,6 +148,11 @@ impl Harness for Codex {
                 ));
             }
         }
+        if spec.isolated {
+            // Not the owner's own turn: drop MCP servers from the operator's
+            // Codex config; only the ones Iris passes remain.
+            overrides.push("mcp_servers={}".into());
+        }
         overrides.extend(mcp_overrides(&spec.mcp_servers));
         for o in overrides {
             a.push("-c".into());
@@ -534,6 +539,7 @@ mod tests {
             run_dir: "/r".into(),
             scope: "c1".into(),
             private_paths: Vec::new(),
+            isolated: false,
         };
         let mut cfg = HarnessConfig::codex_default();
         cfg.sandbox = "workspace-write".into();
@@ -584,6 +590,20 @@ mod tests {
         assert_eq!(&inv.args[..3], ["exec", "resume", "--json"]);
         let n = inv.args.len();
         assert_eq!(&inv.args[n - 2..], ["th-1", "-"]);
+
+        assert!(!inv.args.contains(&"mcp_servers={}".to_string()));
+        spec.isolated = true;
+        let a = h.build(&spec).unwrap().args;
+        let empty = a
+            .iter()
+            .position(|x| x == "mcp_servers={}")
+            .expect("inherited servers dropped");
+        let iris = a
+            .iter()
+            .position(|x| x.starts_with("mcp_servers.iris."))
+            .unwrap();
+        assert!(empty < iris, "then only Iris's servers are added");
+        spec.isolated = false;
 
         // Paths to keep out switch to a permission profile with denies.
         spec.private_paths = vec!["/data/people/x".into(), "/data/a \"b\"".into()];

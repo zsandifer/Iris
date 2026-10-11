@@ -298,8 +298,11 @@ people's folders, Iris's database and keys, and the CLIs' own session
 transcripts: Claude Code with permission deny rules, Codex with a
 permission profile that denies those paths (this replaces its
 `sandbox_mode` for those turns; avoid setting `sandbox_mode` in
-`~/.codex/config.toml`, which makes Codex ignore profiles), and Gemini CLI
-and OpenCode keep their file tools inside the turn's own folders. All
+`~/.codex/config.toml`, which makes Codex ignore profiles). Other people's
+turns and Together chats also skip the server account's own CLI settings,
+instruction files (`CLAUDE.md`), hooks, and MCP servers. Gemini CLI and
+OpenCode always load their user and project configuration, so they only
+answer the owner's own chats; other people need Codex or Claude. All
 people's CLIs still run as one operating-system account, and the Iris app
 bridge they launch reads Iris's database, so for a hard boundary between
 people who do not trust each other, run separate Iris servers.

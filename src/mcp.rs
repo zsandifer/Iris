@@ -29,6 +29,9 @@ pub struct Bridge {
 
 /// Tools available in shared (group) conversations.
 const SHARED_TOOLS: &[&str] = &["create_card"];
+/// Tools about the owner's accounts (connectors are server-wide and the
+/// owner's), offered only when the bridge acts for the owner.
+const OWNER_TOOLS: &[&str] = &["list_connectors"];
 
 /// Run the stdio loop until stdin closes.
 pub fn run(bridge: Bridge) -> Result<()> {
@@ -215,10 +218,13 @@ impl Bridge {
             }
             "ping" => json!({}),
             "tools/list" => {
+                let owner = self.is_owner();
                 let tools: Vec<Value> = tool_definitions()
                     .into_iter()
                     .filter(|t| {
-                        !self.shared || SHARED_TOOLS.contains(&t["name"].as_str().unwrap_or(""))
+                        let name = t["name"].as_str().unwrap_or("");
+                        (!self.shared || SHARED_TOOLS.contains(&name))
+                            && (owner || !OWNER_TOOLS.contains(&name))
                     })
                     .collect();
                 json!({"tools": tools})
@@ -251,6 +257,9 @@ impl Bridge {
     fn call(&self, name: &str, a: &Value) -> std::result::Result<Value, String> {
         if self.shared && !SHARED_TOOLS.contains(&name) {
             return Err(format!("{name} is not available in shared conversations"));
+        }
+        if OWNER_TOOLS.contains(&name) && !self.is_owner() {
+            return Err(format!("{name} is only available in the owner's own chats"));
         }
         let s = |k: &str| a.get(k).and_then(Value::as_str);
         let uid = self.user_id.as_str();
@@ -480,6 +489,14 @@ impl Bridge {
 
     /// Only files inside the agent's workspace or memory folders can be
     /// saved, and never through symlinks.
+    fn is_owner(&self) -> bool {
+        self.db
+            .with(|c| crate::db::get_user(c, &self.user_id))
+            .ok()
+            .flatten()
+            .is_some_and(|u| u.is_owner)
+    }
+
     fn resolve_agent_file(
         &self,
         path: &str,
@@ -521,7 +538,6 @@ impl Bridge {
     /// opened (the agent could swap a folder for a link after the path
     /// check): a plain file with one link, inside the person's folders.
     fn open_agent_file(&self, path: &str) -> std::result::Result<(PathBuf, std::fs::File), String> {
-        use std::os::fd::AsRawFd;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let refuse = || "only regular files in the working folder or memory folder can be saved";
         let (real, allowed) = self.resolve_agent_file(path)?;
@@ -530,14 +546,38 @@ impl Bridge {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&real)
             .map_err(|_| refuse().to_string())?;
-        let opened = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-            .map_err(|_| refuse().to_string())?;
+        let opened = opened_path(&file).ok_or_else(|| refuse().to_string())?;
         let meta = file.metadata().map_err(|_| refuse().to_string())?;
         if !allowed.iter().any(|d| opened.starts_with(d)) || !meta.is_file() || meta.nlink() != 1 {
             return Err(refuse().into());
         }
         Ok((real, file))
     }
+}
+
+/// The real path of an opened file (to check where it actually is).
+#[cfg(target_os = "linux")]
+fn opened_path(file: &std::fs::File) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn opened_path(file: &std::fs::File) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes a NUL-terminated path into a PATH_MAX buffer.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..end])))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn opened_path(_file: &std::fs::File) -> Option<PathBuf> {
+    None
 }
 
 fn ext_for_mime(mime: &str) -> &'static str {
@@ -625,6 +665,35 @@ mod tests {
         assert_eq!(call(&b, "list_goals", json!({}))["isError"], true);
         let r = call(&b, "create_card", json!({"type": "info", "title": "Hello"}));
         assert_eq!(r["isError"], false);
+    }
+
+    #[test]
+    fn connectors_are_listed_only_for_the_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = bridge(tmp.path());
+        let names = |b: &Bridge| -> Vec<String> {
+            b.handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+                .unwrap()["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(names(&b).contains(&"list_connectors".to_string()));
+        assert_eq!(call(&b, "list_connectors", json!({}))["isError"], false);
+        let sam = crate::util::new_id();
+        b.db.with(|c| {
+            c.execute(
+                "INSERT INTO users (id, display_name, is_owner, created_at) VALUES (?1, 'Sam', 0, 0)",
+                [&sam],
+            )
+        })
+        .unwrap();
+        b.user_id = sam;
+        assert!(!names(&b).contains(&"list_connectors".to_string()));
+        assert!(names(&b).contains(&"list_goals".to_string()));
+        assert_eq!(call(&b, "list_connectors", json!({}))["isError"], true);
     }
 
     fn call(b: &Bridge, name: &str, args: Value) -> Value {

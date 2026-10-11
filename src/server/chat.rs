@@ -565,7 +565,8 @@ pub async fn store_upload(
     })?;
     let id = new_id();
     let file_name = format!("{id}.{ext}");
-    crate::config::write_private_file(&state.paths.uploads_dir().join(&file_name), bytes)?;
+    let path = state.paths.uploads_dir().join(&file_name);
+    crate::config::write_private_file(&path, bytes)?;
     let (uid, sha, size) = (
         user_id.to_string(),
         sha256_hex_bytes(bytes),
@@ -574,8 +575,12 @@ pub async fn store_upload(
     let att = state
         .db
         .call(move |c| db::insert_attachment(c, &id, &uid, mime, size, &sha, &file_name))
-        .await?;
-    Ok(att)
+        .await;
+    if att.is_err() {
+        // No row means nothing would ever find (and delete) the file.
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+    Ok(att?)
 }
 
 fn sha256_hex_bytes(bytes: &[u8]) -> String {
@@ -588,6 +593,7 @@ async fn upload_attachment(
     user: AuthUser,
     body: Bytes,
 ) -> ApiResult {
+    let _here = user.still_here(&state).await?;
     let att = store_upload(&state, user.id(), &body).await?;
     ok(json!({"attachment": att}))
 }

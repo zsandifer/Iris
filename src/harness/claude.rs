@@ -179,6 +179,16 @@ impl Harness for Claude {
             a.push("--allowedTools".into());
             a.push(allowed.join(","));
         }
+        if spec.isolated {
+            // Not the owner's own turn: none of the operator's Claude Code
+            // settings, hooks, CLAUDE.md files, or MCP servers (checked: an
+            // empty source list skips CLAUDE.md and still uses the sign-in).
+            a.extend(["--setting-sources", "", "--strict-mcp-config"].map(String::from));
+        } else {
+            // The owner's own settings, but nothing from the working folder,
+            // which the agent can write (project hooks, settings, MCP).
+            a.extend(["--setting-sources", "user"].map(String::from));
+        }
         let denied = deny_rules(&spec.private_paths)?;
         if !denied.is_empty() {
             // Permission deny rules in a per-turn settings file (layered over
@@ -702,6 +712,7 @@ mod tests {
             run_dir: tmp.path().into(),
             scope: "c1".into(),
             private_paths: vec![tmp.path().join("other"), tmp.path().join("vault.key")],
+            isolated: false,
         };
         std::fs::create_dir_all(tmp.path().join("other")).unwrap();
         std::fs::write(tmp.path().join("vault.key"), "k").unwrap();
@@ -745,6 +756,16 @@ mod tests {
         assert!(args.contains("--model haiku --effort low --resume sess-1"));
         assert!(args.contains("--system-prompt-snapshot off"));
         assert!(args.contains("--permission-prompts none"));
+        assert!(args.contains("--setting-sources user") && !args.contains("--strict-mcp-config"));
+        let mut iso = spec.clone();
+        iso.isolated = true;
+        let a = Claude::new(HarnessConfig::claude_default())
+            .build(&iso)
+            .unwrap()
+            .args;
+        let i = a.iter().position(|x| x == "--setting-sources").unwrap();
+        assert_eq!(a[i + 1], "", "no inherited settings, hooks, or CLAUDE.md");
+        assert!(a.contains(&"--strict-mcp-config".to_string()));
         assert!(args.contains("--allowedTools Read,Glob,Grep,WebSearch,WebFetch,mcp__iris"));
         assert_eq!(inv.temp_files.len(), 3, "prompt, MCP config, settings");
         let mcp: Value =

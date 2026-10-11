@@ -239,7 +239,9 @@ async fn run_locked(
         // Routing borrows non-Send closures; keep them out of any await.
         let routed = {
             let available = |m: &crate::catalog::ModelEntry| {
-                !excluded.iter().any(|x| x == &m.harness) && state.model_available(m)
+                !excluded.iter().any(|x| x == &m.harness)
+                    && state.model_available(m)
+                    && (!for_others || isolating(&m.harness))
             };
             let env = EngineEnv {
                 rankings: &state.rankings,
@@ -258,6 +260,15 @@ async fn run_locked(
         };
         let d = match routed {
             Ok(d) => d,
+            // Only engines that cannot keep people apart are left.
+            Err(_) if for_others && isolation_blocked(state, &catalog, &excluded, allow_shared) => {
+                outcome = Outcome::Failed {
+                    kind: "paused_isolation",
+                    detail: "only engines that cannot keep people's files apart are available"
+                        .into(),
+                };
+                break;
+            }
             Err(NoEngine::PausedPolicy) => {
                 post_policy_card_once(state, conv_id, shared, &ctx.members).await;
                 outcome = Outcome::Failed {
@@ -394,6 +405,7 @@ async fn run_locked(
             run_dir: state.paths.run_dir(),
             scope: conv_id.to_string(),
             private_paths: private_paths.clone(),
+            isolated: for_others,
         };
         let invocation = match entry.harness.build(&spec) {
             Ok(mut i) => {
@@ -553,6 +565,37 @@ async fn run_locked(
     finish(state, input, &audience, &acc, routing, outcome).await
 }
 
+/// Engines whose CLI Iris can confine to one person's folders and config:
+/// Claude Code (deny rules, no inherited settings or MCP servers) and Codex
+/// (permission profile, no inherited MCP servers). Gemini CLI and OpenCode
+/// load project and user configuration Iris cannot override, so they only
+/// answer the owner's own chats.
+pub fn isolating(harness: &str) -> bool {
+    matches!(harness, "claude" | "codex")
+}
+
+/// For a turn that is not the owner's own: nothing confinable can answer,
+/// but an engine that cannot be confined could.
+fn isolation_blocked(
+    state: &AppState,
+    catalog: &crate::catalog::Catalog,
+    excluded: &[String],
+    allow_shared: bool,
+) -> bool {
+    let up = |m: &&crate::catalog::ModelEntry| {
+        !excluded.iter().any(|x| x == &m.harness) && state.model_available(m)
+    };
+    let confinable = catalog.models.iter().filter(up).any(|m| {
+        isolating(&m.harness) && crate::router::policy_allows(&m.harness, true, allow_shared)
+    });
+    let other = catalog
+        .models
+        .iter()
+        .filter(up)
+        .any(|m| !isolating(&m.harness));
+    !confinable && other
+}
+
 /// Why no engine could run the turn: harnesses allowed here that are
 /// signed out (named in the detail), or none installed at all.
 fn no_engine_reason(state: &AppState, shared: bool, allow_shared: bool) -> (&'static str, String) {
@@ -644,6 +687,7 @@ async fn refine_with_model(state: &AppState, text: &str, for_others: bool) -> Op
         run_dir: state.paths.run_dir(),
         scope: "classifier".into(),
         private_paths: Vec::new(),
+        isolated: false,
     };
     let invocation = entry.harness.build(&spec).ok()?;
     let strip = state.strip_env(entry);
@@ -989,6 +1033,11 @@ fn failure_text(kind: &str, detail: &str) -> String {
                  To fix it, {fix}, then send your message again."
             )
         }
+        "paused_isolation" => "I can't answer here yet. The AI engines that are working \
+            right now (OpenCode or Gemini CLI) can't keep each person's files and accounts \
+            apart, so they only answer the owner's own chats. Codex or Claude can; the owner \
+            can set one up in Settings."
+            .into(),
         "paused_policy" if detail.contains("not the owner's own") => "I can't reply yet. The \
             only AI engine on the server is Claude, and Claude subscriptions are for one person, \
             so I can only use it for the owner unless they allow it. I've let them know."

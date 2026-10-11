@@ -146,6 +146,7 @@ function estimateFor(m) {
 function stopAll() {
   if (audio && !audio.paused) audio.pause();
   device.gen = -1;
+  device.utterance = null;
   if (synth && (synth.speaking || synth.paused)) synth.cancel();
 }
 
@@ -205,9 +206,15 @@ export async function play(m) {
   const u = new SpeechSynthesisUtterance(text);
   u.lang = navigator.language || 'en-US';
   const dur = estimate(text);
-  Object.assign(device, { id: m.id, started: Date.now(), pausedAt: 0, gen: my, dur });
-  // Callbacks of an utterance that was replaced or restarted do nothing.
-  const done = () => { if (device.gen === my && S.voice?.id === m.id) stopped(); };
+  Object.assign(device, { id: m.id, started: Date.now(), pausedAt: 0, gen: my, dur, utterance: u });
+  // Only this utterance's own end counts (not one that was replaced or
+  // restarted); pausing and resuming keep the same utterance.
+  const done = () => {
+    if (device.utterance !== u) return;
+    device.utterance = null;
+    device.gen = -1;
+    if (S.voice?.id === m.id) stopped();
+  };
   u.onend = done;
   u.onerror = done;
   setVoice({ id: m.id, playing: true, loading: false, t: 0, dur, mode: 'device' });
@@ -216,7 +223,7 @@ export async function play(m) {
 }
 
 // The device utterance being spoken (for pause, resume, and progress).
-const device = { id: null, started: 0, pausedAt: 0, gen: 0, dur: 0 };
+const device = { id: null, started: 0, pausedAt: 0, gen: 0, dur: 0, utterance: null };
 function tickDevice(id, gen) {
   const timer = setInterval(() => {
     if (device.gen !== gen || S.voice?.id !== id || !S.voice.playing) { clearInterval(timer); return; }
@@ -310,12 +317,23 @@ export async function toWav(blob) {
  *  `stop()` (resolves to the recording) and `cancel()`. */
 export async function record() {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
-  const rec = new MediaRecorder(stream);
+  const release = () => stream.getTracks().forEach((t) => t.stop());
+  let rec;
+  try {
+    rec = new MediaRecorder(stream);
+  } catch (e) {
+    release();
+    throw e;
+  }
   const chunks = [];
   rec.ondataavailable = (e) => { if (e.data?.size) chunks.push(e.data); };
   const done = new Promise((resolve) => { rec.onstop = () => resolve(new Blob(chunks, { type: rec.mimeType || chunks[0]?.type || 'audio/webm' })); });
-  const release = () => stream.getTracks().forEach((t) => t.stop());
-  rec.start(250);
+  try {
+    rec.start(250);
+  } catch (e) {
+    release();
+    throw e;
+  }
   return {
     started: Date.now(),
     async stop() { if (rec.state !== 'inactive') rec.stop(); const b = await done; release(); return b; },

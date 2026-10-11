@@ -100,25 +100,28 @@ pub async fn voice_note(state: &AppState, msg: &Message) -> Result<(Vec<u8>, u64
     if let Some(hit) = read(path.clone()).await {
         return Ok(hit);
     }
-    let _permit = state
-        .voice_jobs
-        .acquire()
+    // A bounded number of notes may wait; the same note is made once.
+    let _pending = Pending::enter(state, &msg.id).ok_or_else(busy)?;
+    let _permit = tokio::time::timeout(MAX_WAIT, state.tts_jobs.acquire())
         .await
-        .map_err(|_| ApiError::from(crate::util::BoxError::from("voice is shutting down")))?;
+        .map_err(|_| busy())?
+        .map_err(|_| busy())?;
     if let Some(hit) = read(path.clone()).await {
         return Ok(hit);
     }
     crate::config::ensure_private_dir(&state.paths.voice_dir())?;
-    // Named after the message so removing its person also finds it.
-    let tmp = state
-        .paths
-        .voice_dir()
-        .join(format!(".{}-{}.tmp.wav", msg.id, new_id()));
+    // Named after the message so removing its person also finds it, and
+    // deleted however this ends (including a dropped request).
+    let tmp = TempFile(
+        state
+            .paths
+            .voice_dir()
+            .join(format!(".{}-{}.tmp.wav", msg.id, new_id())),
+    );
     let root = state.cfg.engines_dir(&state.paths);
     let started = std::time::Instant::now();
-    let res = voice::synthesize(&root, &text, &tmp).await;
+    let res = voice::synthesize(&root, &text, &tmp.0).await;
     if let Err(e) = res {
-        let _ = tokio::fs::remove_file(&tmp).await;
         crate::warn!("voice note for {} failed: {e}", msg.id);
         return Err(ApiError::new(
             StatusCode::BAD_GATEWAY,
@@ -126,7 +129,7 @@ pub async fn voice_note(state: &AppState, msg: &Message) -> Result<(Vec<u8>, u64
             "I couldn't make a voice note for that one.",
         ));
     }
-    tokio::fs::rename(&tmp, &path)
+    tokio::fs::rename(&tmp.0, &path)
         .await
         .map_err(|e| ApiError::from(crate::util::BoxError::from(format!("voice cache: {e}"))))?;
     // The message may have been deleted (its person removed) while this
@@ -199,10 +202,56 @@ pub fn prepare_for(state: &AppState, members: &[String], msg: &Message) {
                 break;
             }
         }
-        if wanted {
+        // Ahead-of-time notes are a nicety: skip them when busy.
+        let full = st
+            .tts_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+            >= MAX_TTS_PENDING;
+        if wanted && !full {
             let _ = voice_note(&st, &msg).await;
         }
     });
+}
+
+/// Voice notes allowed to be waiting or in progress at once.
+const MAX_TTS_PENDING: usize = 4;
+
+/// A message's place among the voice notes being made. Entering for a
+/// message already there is allowed (it waits, then finds the cache).
+struct Pending<'a> {
+    state: &'a AppState,
+    id: Option<String>,
+}
+
+impl<'a> Pending<'a> {
+    fn enter(state: &'a AppState, id: &str) -> Option<Self> {
+        let mut set = state.tts_pending.lock().unwrap_or_else(|p| p.into_inner());
+        if set.contains(id) {
+            return Some(Self { state, id: None });
+        }
+        if set.len() >= MAX_TTS_PENDING {
+            return None;
+        }
+        set.insert(id.to_string());
+        Some(Self {
+            state,
+            id: Some(id.to_string()),
+        })
+    }
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = &self.id {
+            self.state
+                .tts_pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(id);
+        }
+    }
 }
 
 /// Recordings allowed to wait for the voice program, and for how long.

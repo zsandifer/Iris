@@ -523,6 +523,7 @@ mod tests {
             run_dir: tmp.path().into(),
             scope: "conv/../1".into(),
             private_paths: Vec::new(),
+            isolated: false,
         };
         let inv = Gemini::new(HarnessConfig::gemini_default())
             .build(&spec)

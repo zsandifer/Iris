@@ -1699,8 +1699,14 @@ After `POST /api/conversations/{id}/messages` (or `POST
    chats the host's folders too: Claude Code through permission deny rules
    (a per-turn `--settings` file),
    Codex through a permission profile with `deny` entries (instead of
-   `sandbox_mode`). Gemini CLI and OpenCode keep their file tools inside the
-   turn's own folders and reject shell commands headless. A turn still
+   `sandbox_mode`). Turns that are not the owner's own also leave out the
+   operator's own CLI configuration: Claude Code runs with
+   `--setting-sources ""` (no user or project settings, hooks, or CLAUDE.md
+   files) and `--strict-mcp-config`, Codex with `mcp_servers={}` before
+   Iris's own servers; the owner's own Claude turns load only user settings
+   (never the agent-writable working folder's). Gemini CLI and OpenCode
+   load project and user configuration Iris cannot override, so they only
+   answer the owner's own chats (`paused_isolation` otherwise). A turn still
    waiting in the queue when its conversation or person is deleted is
    dropped without running. A session that saw a personal prompt is never
    resumed in a shared chat (the session fingerprint includes whether the
@@ -1784,6 +1790,7 @@ A Main chat message posted by the heartbeat job has
 |---|---|---|---|
 | `auth_required` | A harness reported during the turn that it is not signed in (after text had streamed, or with no other engine left), or no engine was usable and at least one enabled harness **allowed in this conversation** is signed out | The signed-out harness name(s), comma-separated, e.g. `"claude"` or `"claude,codex"` | "I can't think right now because my AI engine on the server is signed out. To fix it, run \`claude\` on the Iris server and sign in with /login, then send your message again." (the fix names each listed harness: Codex "run \`codex login\`", Gemini "run \`gemini\` ... and sign in", OpenCode "run \`opencode auth login\`"; the app's reconnect card is the easier fix) |
 | `paused_policy` | Claude is the only usable engine, the turn is not the owner's own use (a conversation with more than one person, or another person's own Iris), and the owner has not allowed Claude for other people | `only Claude is available and this conversation is shared`, or `only Claude is available and this is not the owner's own Iris` | Group: "I can't reply in this group chat yet. The only AI engine on the server is Claude, and Claude subscriptions are for one person, so I stay out of shared conversations unless the owner turns that on." Another person's Iris: "I can't reply yet. The only AI engine on the server is Claude, and Claude subscriptions are for one person, so I can only use it for the owner unless they allow it. I've let them know." The first time per conversation, a group gets an `action` card with the owner's opt-in; another person's chat gets an `info` card, and the owner gets an `action` card ("Let Sam use Claude?") in their Main chat plus a push (`kind: "policy"`). |
+| `paused_isolation` | The turn is not the owner's own, and the only engines that could answer are Gemini CLI or OpenCode, which Iris cannot confine to one person's folders and configuration | `only engines that cannot keep people's files apart are available` | "I can't answer here yet. The AI engines that are working right now (OpenCode or Gemini CLI) can't keep each person's files and accounts apart, so they only answer the owner's own chats. Codex or Claude can; the owner can set one up in Settings." |
 | `no_engine` | No usable engine at all (none installed, all disabled, or every harness failed to start) | `no usable engine` / `no engine available` | "I can't reach any AI engine on the server right now. One of Claude, Codex, Gemini, or OpenCode needs to be installed and signed in; I can walk you through it in Settings." |
 | `timeout` | No result within `turn_timeout_secs` (default 600) | `no result after 600s` | "That took too long, so I stopped. Want me to try again?" |
 | `harness_error` | The CLI reported an error, or exited without a result | The CLI's error text | "Something went wrong on my end. Want me to try again?" |

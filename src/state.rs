@@ -121,6 +121,11 @@ pub struct Inner {
     last_recommended: Mutex<BTreeMap<Slot, Option<String>>>,
     /// Voice synthesis and transcription run one at a time.
     pub voice_jobs: tokio::sync::Semaphore,
+    /// Speech synthesis runs one at a time, apart from transcription, so a
+    /// backlog of notes never holds up someone talking to Iris.
+    pub tts_jobs: tokio::sync::Semaphore,
+    /// Messages whose voice note is being made or waiting (bounded).
+    pub tts_pending: Mutex<std::collections::HashSet<String>>,
     /// Recordings waiting for `voice_jobs` (bounded).
     pub voice_waiting: std::sync::atomic::AtomicUsize,
     /// Writes to a person's own data hold this shared; removing a person
@@ -178,6 +183,8 @@ impl AppState {
             last_recommended: Mutex::default(),
             voice_jobs: tokio::sync::Semaphore::new(1),
             voice_waiting: std::sync::atomic::AtomicUsize::new(0),
+            tts_jobs: tokio::sync::Semaphore::new(1),
+            tts_pending: Mutex::default(),
             people_lock: tokio::sync::RwLock::new(()),
             limiter: Limiter::new(cfg.max_concurrent_turns),
             cfg,

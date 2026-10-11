@@ -81,6 +81,10 @@ pub struct TurnSpec {
     /// path deny rules (Claude Code); the others rely on folder separation
     /// and the prompt.
     pub private_paths: Vec<PathBuf>,
+    /// The turn is not the owner's own (another person's Iris, or a chat
+    /// with several people): the CLI must not pick up the operator's own
+    /// CLI settings, instruction files, hooks, or MCP servers.
+    pub isolated: bool,
 }
 
 /// A fully built command line.

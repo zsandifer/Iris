@@ -69,10 +69,13 @@ fn fake_voice(root: &Path) {
         std::fs::create_dir_all(root.join(c)).unwrap();
         std::fs::write(root.join(c).join("VERSION"), v).unwrap();
     }
-    // Both programs wait a second while `<root>/slow` exists and fail while
-    // `<root>/fail` exists, for lifecycle tests.
+    // While `<root>/slow` exists, both programs say they started (touch
+    // `<root>/started`) and wait for `<root>/release`; while `<root>/fail`
+    // exists they fail. For lifecycle tests.
     let gate = format!(
-        "[ -f '{r}/slow' ] && sleep 1\n[ -f '{r}/fail' ] && exit 1\n",
+        "if [ -f '{r}/slow' ]; then : > '{r}/started'; n=0; \
+         while [ ! -f '{r}/release' ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done; fi\n\
+         [ -f '{r}/fail' ] && exit 1\n",
         r = root.display()
     );
     // Writes one second of 16 kHz silence to --output-filename.
@@ -901,6 +904,16 @@ async fn voice_work_leaves_nothing_behind() {
     std::fs::remove_file(root.join("fail")).unwrap();
 
     // A request dropped while transcribing deletes it too, and frees the slot.
+    let started = root.join("started");
+    let wait_started = || async {
+        for _ in 0..200 {
+            if started.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the voice program never started");
+    };
     std::fs::write(root.join("slow"), "").unwrap();
     let req = Request::builder()
         .method("POST")
@@ -910,12 +923,17 @@ async fn voice_work_leaves_nothing_behind() {
         .unwrap();
     let app = h.app.clone();
     let pending = tokio::spawn(async move { app.oneshot(req).await });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    wait_started().await;
+    assert_eq!(
+        run_files(),
+        1,
+        "the recording is on disk while transcribing"
+    );
     pending.abort();
-    let _ = pending.await;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(pending.await.unwrap_err().is_cancelled());
     assert_eq!(run_files(), 0, "recording deleted on cancel");
     std::fs::remove_file(root.join("slow")).unwrap();
+    std::fs::remove_file(&started).unwrap();
     let (s, _) = send_raw(&h, "POST", "/api/voice/transcribe", &sam, wav).await;
     assert_eq!(s, StatusCode::OK, "the voice slot was released");
 
@@ -949,13 +967,57 @@ async fn voice_work_leaves_nothing_behind() {
             .unwrap();
         h2.oneshot(req).await.unwrap().status()
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    wait_started().await;
     let (s, _) = send(&h, "DELETE", &format!("/api/users/{sam_id}"), &owner, None).await;
     assert_eq!(s, StatusCode::OK);
-    assert_ne!(making.await.unwrap(), StatusCode::OK);
+    std::fs::write(root.join("release"), "").unwrap();
+    assert_eq!(
+        making.await.unwrap(),
+        StatusCode::NOT_FOUND,
+        "made, then discarded"
+    );
     assert_eq!(
         voice_files(),
         0,
         "no voice note of a removed person's reply"
+    );
+}
+
+#[tokio::test]
+async fn engines_that_cannot_keep_people_apart_only_answer_the_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths {
+        config_file: tmp.path().join("config.toml"),
+        data_dir: tmp.path().join("data"),
+    };
+    crate::persona::seed(&paths).unwrap();
+    let db = crate::db::Db::open(&paths.db_file()).unwrap();
+    let mut cfg = Config::default();
+    for h in cfg.harness.values_mut() {
+        h.enabled = false;
+    }
+    // A stand-in Gemini CLI that is installed (it has no sign-in check).
+    let gem = tmp.path().join("fake-gemini");
+    std::fs::write(&gem, "#!/bin/sh\necho 9.9.9\n").unwrap();
+    std::fs::set_permissions(&gem, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let g = cfg.harness.get_mut("gemini").unwrap();
+    g.enabled = true;
+    g.command = gem.to_string_lossy().into_owned();
+    let state = AppState::new(cfg, paths, db).unwrap();
+    state.refresh_harnesses().await;
+    let h = H {
+        app: router(state.clone()),
+        state,
+        tmp,
+    };
+    let (_owner, _sam_id, sam) = owner_and_sam(&h).await;
+    let sam_main = main_of(&h, &sam).await;
+    let m = turn(&h, &sam, &sam_main, "hi").await;
+    assert_eq!(m["meta"]["error"]["kind"], "paused_isolation", "{m}");
+    assert!(
+        m["content"]
+            .as_str()
+            .unwrap()
+            .contains("only answer the owner's own chats")
     );
 }

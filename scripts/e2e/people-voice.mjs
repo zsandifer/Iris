@@ -89,6 +89,24 @@ async function typeAndSend(page, text) {
 const browser = await chromium.launch({ executablePath });
 const ownerCtx = await browser.newContext({ ...phone, colorScheme: 'light' });
 await ownerCtx.addInitScript(() => localStorage.setItem('iris.notify.dismissed', '1'));
+// A deterministic stand-in for the device voice (headless Chromium has no
+// voices): records what is spoken and ends each utterance on cue.
+await ownerCtx.addInitScript(() => {
+  const spoken = [];
+  window.__spoken = spoken;
+  const fake = {
+    speaking: false,
+    paused: false,
+    current: null,
+    speak(u) { this.current = u; this.speaking = true; spoken.push(u.text); },
+    pause() { this.paused = true; },
+    resume() { this.paused = false; },
+    cancel() { this.speaking = false; this.paused = false; this.current = null; },
+    finish() { const u = this.current; this.cancel(); u?.onend?.(); },
+  };
+  Object.defineProperty(window, 'speechSynthesis', { value: fake, configurable: true });
+  window.SpeechSynthesisUtterance = function SpeechSynthesisUtterance(text) { this.text = text; };
+});
 step('Owner pairs and names themselves');
 let owner = await pair(ownerCtx, ownerCode, 'owner');
 await call(owner, 'PUT', '/me', { display_name: 'Alex' });
@@ -124,8 +142,18 @@ check(m.status === 'complete', `owner's own chat answered (engine: ${m.harness})
 await owner.waitForSelector('.vn');
 check(await owner.isVisible('text=Read aloud by this device'), 'fallback voice note is labeled as this device\'s voice');
 await owner.click('.vn-play');
-await owner.waitForTimeout(400);
+await owner.waitForSelector('.vn.on');
+check((await owner.evaluate(() => window.__spoken.at(-1))) === 'Good morning to you.', 'the device voice speaks the reply');
 await shot(owner, '03-owner-device-voice-note');
+await owner.click('.vn-play'); // pause
+await owner.waitForSelector('.vn:not(.on)');
+check(await owner.evaluate(() => window.speechSynthesis.paused), 'pausing pauses the device voice');
+await owner.click('.vn-play'); // resume, same utterance
+await owner.waitForSelector('.vn.on');
+check(await owner.evaluate(() => !window.speechSynthesis.paused && window.__spoken.length === 1), 'resuming continues it (no restart)');
+await owner.evaluate(() => window.speechSynthesis.finish());
+await owner.waitForSelector('.vn:not(.on)');
+check(true, 'the note stops when the device voice finishes, even after a pause');
 
 step('Set up the server voice and voice input from Settings');
 await owner.goto(base + '/#/settings');
@@ -311,26 +339,32 @@ await sam.close();
 const ownerProbe = await ownerCtx2.newPage(); // API only, no WebSocket
 await ownerProbe.goto(base + '/manifest.webmanifest');
 const before = Date.now();
-const sent = await ownerProbe.evaluate(async ([cid, token]) => {
-  const r = await fetch(`/api/conversations/${cid}/messages`, { method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ text: 'One more: reply with just the word "done".' }) });
-  return r.status;
-}, [together.id, await ownerProbe.evaluate(() => localStorage.getItem('iris.token'))]);
-check(sent === 202, 'message sent with both apps closed');
-// The reply push goes to both people; the message push goes to Sam.
-await ownerProbe.waitForTimeout(1000);
-const deadline = Date.now() + 240000;
-let pushed = { owner: 0, sam: 0 };
-while (Date.now() < deadline) {
+const pushCounts = () => {
   const log = readFileSync(process.env.SERVE_LOG, 'utf8');
-  pushed = {
+  return {
     owner: (log.match(new RegExp(`push to subscription ${subOwner.subscription.id} failed`, 'g')) || []).length,
     sam: (log.match(new RegExp(`push to subscription ${subSam.subscription.id} failed`, 'g')) || []).length,
   };
+};
+const start = pushCounts();
+const sent = await ownerProbe.evaluate(async ([cid, token]) => {
+  const r = await fetch(`/api/conversations/${cid}/messages`, { method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ text: 'One more: reply with just the word "done".' }) });
+  return { status: r.status, body: await r.json() };
+}, [together.id, await ownerProbe.evaluate(() => localStorage.getItem('iris.token'))]);
+check(sent.status === 202, 'message sent with both apps closed');
+m = await reply(ownerProbe, together.id, sent.body.assistant_message.id);
+check(m.status === 'complete', `Iris replied with both apps closed (engine: ${m.harness})`);
+// This exchange: the reply push to both people, the message push to Sam.
+const deadline = Date.now() + 60000;
+let pushed = { owner: 0, sam: 0 };
+while (Date.now() < deadline) {
+  const now = pushCounts();
+  pushed = { owner: now.owner - start.owner, sam: now.sam - start.sam };
   if (pushed.owner >= 1 && pushed.sam >= 2) break;
-  await ownerProbe.waitForTimeout(2000);
+  await ownerProbe.waitForTimeout(1000);
 }
-check(pushed.owner >= 1, `reply push sent to Alex (${pushed.owner} attempt(s); the fake endpoint refuses it)`);
-check(pushed.sam >= 2, `message and reply pushes sent to Sam (${pushed.sam} attempts)`);
+check(pushed.owner === 1, `reply push sent to Alex (${pushed.owner}; the fake endpoint refuses it)`);
+check(pushed.sam === 2, `message and reply pushes sent to Sam (${pushed.sam})`);
 console.log(`   (finished ${Math.round((Date.now() - before) / 1000)}s after sending)`);
 
 await browser2.close();

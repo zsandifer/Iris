@@ -193,8 +193,8 @@ EOF
     # Bring over an existing data directory, if asked (never CLI sign-ins).
     DATA="$AGENT_HOME/.local/share/iris"
     if [ -n "$COPY_DATA" ]; then
-        if [ -e "$ROOT_PREFIX$DATA/iris.db" ]; then
-            echo "$DATA already has data; not copying over it." >&2
+        if [ -e "$ROOT_PREFIX$DATA" ] && [ -n "$(ls -A "$ROOT_PREFIX$DATA" 2>/dev/null)" ]; then
+            echo "$DATA already exists and is not empty; not copying over it." >&2
             exit 1
         fi
         if [ ! -e "$COPY_DATA/iris.db" ]; then
@@ -202,7 +202,13 @@ EOF
             exit 1
         fi
         run install -d -m 0700 -o "$AGENT_USER" -g "$AGENT_USER" "$AGENT_HOME/.local" "$AGENT_HOME/.local/share"
-        run cp -a "$COPY_DATA" "$DATA"
+        run install -d -m 0700 "$DATA"
+        # The contents, into the data directory itself.
+        run cp -a "$COPY_DATA/." "$DATA/"
+        if [ "$DRY" = 0 ] && [ ! -e "$DATA/iris.db" ]; then
+            echo "Copying $COPY_DATA did not produce $DATA/iris.db; stopping." >&2
+            exit 1
+        fi
         # Engines the old setup installed for itself stay behind.
         run rm -rf "$DATA/engines"
         run chown -R "$AGENT_USER:$AGENT_USER" "$AGENT_HOME/.local"

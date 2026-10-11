@@ -118,6 +118,35 @@ fn is_type(st: &libc::stat, kind: libc::mode_t) -> bool {
     st.st_mode & libc::S_IFMT == kind
 }
 
+/// Names in an opened folder, read through the descriptor itself
+/// (`fdopendir`; no `/proc` needed).
+fn names_in(dir: &OwnedFd) -> io::Result<Vec<String>> {
+    // SAFETY: dup gives an fd that fdopendir/closedir then own.
+    let fd = check(unsafe { libc::dup(dir.as_raw_fd()) })?;
+    let d = unsafe { libc::fdopendir(fd) };
+    if d.is_null() {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    let mut out = Vec::new();
+    loop {
+        // SAFETY: d is a valid DIR*; entries are copied before the next call.
+        let ent = unsafe { libc::readdir(d) };
+        if ent.is_null() {
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let name = name.to_string_lossy().into_owned();
+        if name != "." && name != ".." {
+            out.push(name);
+        }
+    }
+    // SAFETY: closes the DIR* and its fd.
+    unsafe { libc::closedir(d) };
+    Ok(out)
+}
+
 /// One entry of a folder listing.
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -133,8 +162,7 @@ pub fn list(root: &Path, comps: &[String]) -> io::Result<Vec<Entry>> {
     let dir = walk(root, comps, false)?;
     // The descriptor's /proc entry names this exact folder, not a path.
     let mut out = Vec::new();
-    for e in std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
+    for name in names_in(&dir)? {
         if name.starts_with('.') {
             continue;
         }
@@ -267,14 +295,10 @@ fn notes_in(
     head: usize,
     out: &mut Vec<Note>,
 ) {
-    let Ok(rd) = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())) else {
+    let Ok(all) = names_in(dir) else {
         return;
     };
-    let mut names: Vec<String> = rd
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| !n.starts_with('.'))
-        .collect();
+    let mut names: Vec<String> = all.into_iter().filter(|n| !n.starts_with('.')).collect();
     names.sort();
     for name in names {
         let rel = if prefix.is_empty() {
