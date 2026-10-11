@@ -202,9 +202,9 @@ async fn discuss_feed_post(
     ok(json!({"conversation": conv}))
 }
 
+/// Run the caller's own feed job now.
 async fn refresh_feed(State(state): State<AppState>, user: AuthUser) -> Result<Response, ApiError> {
-    user.require_owner()?;
-    let started = crate::jobs::trigger(&state, crate::jobs::Job::Feed);
+    let started = crate::jobs::trigger(&state, crate::jobs::Job::Feed, user.id());
     Ok((
         StatusCode::ACCEPTED,
         axum::Json(json!({"started": started})),
@@ -212,8 +212,8 @@ async fn refresh_feed(State(state): State<AppState>, user: AuthUser) -> Result<R
         .into_response())
 }
 
-async fn get_feed_prompt(State(state): State<AppState>, _user: AuthUser) -> ApiResult {
-    ok(json!({"feed_prompt": state.feed_prompt().await}))
+async fn get_feed_prompt(State(state): State<AppState>, user: AuthUser) -> ApiResult {
+    ok(json!({"feed_prompt": state.feed_prompt_for(&user.user).await}))
 }
 
 #[derive(Deserialize)]
@@ -221,30 +221,29 @@ struct FeedPrompt {
     feed_prompt: String,
 }
 
+/// Each person steers their own feed.
 async fn put_feed_prompt(
     State(state): State<AppState>,
     user: AuthUser,
     JsonBody(body): JsonBody<FeedPrompt>,
 ) -> ApiResult {
-    user.require_owner()?;
     check_text("feed_prompt", &body.feed_prompt, 4000, false)?;
     let v = body.feed_prompt.trim().to_string();
+    let key = crate::state::person_key(user.id(), user.user.is_owner, "feed_prompt");
     state
         .db
         .call(move |c| {
             if v.is_empty() {
-                db::delete_setting(c, "feed_prompt")
+                db::delete_setting(c, &key)
             } else {
-                db::set_setting(c, "feed_prompt", &v)
+                db::set_setting(c, &key, &v)
             }
         })
         .await?;
-    let settings = state.settings_json().await;
-    state.hub.send(
-        crate::events::Audience::All,
-        json!({"type": "settings.changed", "settings": settings}),
-    );
-    ok(json!({"feed_prompt": state.feed_prompt().await}))
+    state
+        .broadcast_settings(std::slice::from_ref(&user.user))
+        .await;
+    ok(json!({"feed_prompt": state.feed_prompt_for(&user.user).await}))
 }
 
 // -------------------------------------------------------------------- ideas
@@ -547,11 +546,10 @@ fn modified_ms(meta: &std::fs::Metadata) -> Option<i64> {
 }
 
 async fn list_files(State(state): State<AppState>, user: AuthUser) -> ApiResult {
-    user.require_owner()?;
     let files: Vec<_> = SYSTEM_FILES
         .iter()
         .map(|f| {
-            let meta = std::fs::metadata(system_file_path(&state.paths, f)).ok();
+            let meta = std::fs::metadata(system_file_path(&state.dirs_for(&user.user), f)).ok();
             json!({
                 "name": f.name,
                 "description": f.description,
@@ -577,9 +575,8 @@ async fn read_system_file(
     user: AuthUser,
     Path(name): Path<String>,
 ) -> ApiResult {
-    user.require_owner()?;
     let f = system_file(&name).ok_or_else(|| ApiError::not_found("system file"))?;
-    let content = tokio::fs::read_to_string(system_file_path(&state.paths, f))
+    let content = tokio::fs::read_to_string(system_file_path(&state.dirs_for(&user.user), f))
         .await
         .unwrap_or_default();
     ok(json!({"name": f.name, "description": f.description, "content": content}))
@@ -596,20 +593,24 @@ async fn write_system_file(
     Path(name): Path<String>,
     JsonBody(body): JsonBody<FileContent>,
 ) -> ApiResult {
-    user.require_owner()?;
     let f = system_file(&name).ok_or_else(|| ApiError::not_found("system file"))?;
     if body.content.len() > MAX_TEXT_FILE {
         return Err(ApiError::bad_request("file is too large"));
     }
-    crate::config::write_private_file(&system_file_path(&state.paths, f), body.content.as_bytes())?;
+    crate::config::write_private_file(
+        &system_file_path(&state.dirs_for(&user.user), f),
+        body.content.as_bytes(),
+    )?;
     ok(json!({"ok": true, "name": f.name}))
 }
 
-fn area_root(state: &AppState, area: &str) -> Result<PathBuf, ApiError> {
+/// The caller's own Iris folders; nobody can open another person's.
+fn area_root(state: &AppState, user: &AuthUser, area: &str) -> Result<PathBuf, ApiError> {
+    let dirs = state.dirs_for(&user.user);
     match area {
-        "memory" => Ok(state.paths.memory_dir()),
-        "workspace" => Ok(state.paths.workspace_dir()),
-        "persona" => Ok(state.paths.persona_dir()),
+        "memory" => Ok(dirs.memory),
+        "workspace" => Ok(dirs.workspace),
+        "persona" => Ok(dirs.persona),
         _ => Err(ApiError::not_found("folder")),
     }
 }
@@ -651,8 +652,7 @@ async fn browse(
     Path(area): Path<String>,
     Query(q): Query<PathQuery>,
 ) -> ApiResult {
-    user.require_owner()?;
-    let dir = safe_join(&area_root(&state, &area)?, &q.path)?;
+    let dir = safe_join(&area_root(&state, &user, &area)?, &q.path)?;
     let mut entries = Vec::new();
     let mut rd = tokio::fs::read_dir(&dir)
         .await
@@ -688,8 +688,7 @@ async fn read_file(
     Path(area): Path<String>,
     Query(q): Query<PathQuery>,
 ) -> ApiResult {
-    user.require_owner()?;
-    let path = safe_join(&area_root(&state, &area)?, &q.path)?;
+    let path = safe_join(&area_root(&state, &user, &area)?, &q.path)?;
     let meta = tokio::fs::metadata(&path)
         .await
         .map_err(|_| ApiError::not_found("file"))?;
@@ -713,14 +712,13 @@ async fn write_file(
     Query(q): Query<PathQuery>,
     JsonBody(body): JsonBody<FileContent>,
 ) -> ApiResult {
-    user.require_owner()?;
     if q.path.trim().is_empty() {
         return Err(ApiError::bad_request("path is required"));
     }
     if body.content.len() > MAX_TEXT_FILE {
         return Err(ApiError::bad_request("file is too large"));
     }
-    let path = safe_join(&area_root(&state, &area)?, &q.path)?;
+    let path = safe_join(&area_root(&state, &user, &area)?, &q.path)?;
     if let Some(parent) = path.parent() {
         crate::config::ensure_private_dir(parent)?;
     }
@@ -734,11 +732,10 @@ async fn delete_file(
     Path(area): Path<String>,
     Query(q): Query<PathQuery>,
 ) -> ApiResult {
-    user.require_owner()?;
     if q.path.trim().is_empty() {
         return Err(ApiError::bad_request("path is required"));
     }
-    let path = safe_join(&area_root(&state, &area)?, &q.path)?;
+    let path = safe_join(&area_root(&state, &user, &area)?, &q.path)?;
     let meta = tokio::fs::symlink_metadata(&path)
         .await
         .map_err(|_| ApiError::not_found("file"))?;

@@ -51,6 +51,7 @@ pub static ASSETS: &[Asset] = assets![
     "js/status.js" => JS,
     "js/store.js" => JS,
     "js/ui.js" => JS,
+    "js/voice.js" => JS,
     "vendor/hooks.js" => JS,
     "vendor/htm.js" => JS,
     "vendor/preact.js" => JS,
@@ -94,7 +95,7 @@ fn app_csp(headers: &HeaderMap) -> String {
     // Feed photos and favicons are the source sites' own images (https).
     format!(
         "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
-         img-src 'self' blob: data: https:; connect-src 'self'{}; manifest-src 'self'; \
+         img-src 'self' blob: data: https:; media-src 'self' blob:; connect-src 'self'{}; manifest-src 'self'; \
          worker-src 'self'; font-src 'self'; base-uri 'none'; form-action 'self'; \
          frame-ancestors 'none'",
         ws_sources(headers)

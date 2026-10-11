@@ -21,6 +21,7 @@ const SHELL = [
   '/js/status.js',
   '/js/store.js',
   '/js/ui.js',
+  '/js/voice.js',
   '/vendor/hooks.js',
   '/vendor/htm.js',
   '/vendor/preact.js',

@@ -129,9 +129,8 @@ async fn create_conversation(
         return Err(ApiError::bad_request("kind must be 'side' or 'group'"));
     }
     check_text("title", &body.title, 200, false)?;
-    if body.kind == "group" {
-        user.require_owner()?;
-    } else if !body.member_ids.is_empty() {
+    // Anyone may start a Together chat; their Iris hosts it.
+    if body.kind != "group" && !body.member_ids.is_empty() {
         return Err(ApiError::bad_request(
             "side chats cannot have other members",
         ));
@@ -314,11 +313,53 @@ async fn send_message(
         &owner,
     )
     .await?;
+    if conv.member_count > 1 {
+        notify_members(&state, &user, &conv, &body.text, &user_message).await;
+    }
     Ok((
         StatusCode::ACCEPTED,
         axum::Json(json!({"user_message": user_message, "assistant_message": assistant_message})),
     )
         .into_response())
+}
+
+/// In a Together chat, tell the other people (when their app is closed)
+/// what was said, like any group chat would.
+async fn notify_members(
+    state: &AppState,
+    user: &AuthUser,
+    conv: &Conversation,
+    text: &str,
+    msg: &db::Message,
+) {
+    let cid = conv.id.clone();
+    let others: Vec<String> = state
+        .db
+        .call(move |c| db::conversation_member_ids(c, &cid))
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|u| u != user.id() && !state.hub.is_online(u))
+        .collect();
+    if others.is_empty() || !state.cfg.push.notify_replies_when_offline {
+        return;
+    }
+    let body = if text.trim().is_empty() {
+        "Sent a photo".to_string()
+    } else {
+        crate::util::truncate_chars(text.trim(), 180)
+    };
+    let title = if conv.title.trim().is_empty() {
+        user.user.display_name.clone()
+    } else {
+        format!("{} · {}", user.user.display_name, conv.title.trim())
+    };
+    crate::notify::push_users(
+        state,
+        &others,
+        json!({"title": title, "body": body, "conversation_id": conv.id,
+               "message_id": msg.id, "kind": "together"}),
+    );
 }
 
 async fn conv_owner(state: &AppState, conv_id: &str) -> Option<String> {
@@ -342,7 +383,19 @@ async fn list_members(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> ApiResult {
-    member_conversation(&state, &user, &id).await?;
+    let conv = member_conversation(&state, &user, &id).await?;
+    // Whose Iris answers here: the creator's.
+    let agent = match conv.created_by.as_deref() {
+        Some(host) => match state.user(host).await {
+            Some(u) => {
+                let (avatar_url, avatar_custom) = state.avatar_url_for(&u).await;
+                json!({"user_id": u.id, "name": state.agent_name_for(&u).await,
+                       "avatar_url": avatar_url, "avatar_custom": avatar_custom})
+            }
+            None => serde_json::Value::Null,
+        },
+        None => serde_json::Value::Null,
+    };
     let members = state
         .db
         .call(move |c| {
@@ -362,7 +415,7 @@ async fn list_members(
             .collect::<rusqlite::Result<Vec<_>>>()
         })
         .await?;
-    ok(json!({"members": members}))
+    ok(json!({"members": members, "agent": agent}))
 }
 
 #[derive(Deserialize)]

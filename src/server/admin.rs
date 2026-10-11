@@ -1,5 +1,5 @@
-//! Settings, harness status, models, connectors, credentials, push, jobs,
-//! and the voice placeholder.
+//! Settings and avatars, harness status, models, connectors, credentials,
+//! push, and jobs.
 
 use super::chat::{file_response, store_upload};
 use super::{
@@ -10,11 +10,11 @@ use crate::entities::{self, ConnectorConfig, check_text};
 use crate::events::Audience;
 use crate::harness::valid_server_name;
 use crate::ranking::{Pin, Slot};
-use crate::state::{AppState, slot_pins_json};
+use crate::state::{AppState, person_key, slot_pins_json};
 use crate::util::{new_id, now_ms};
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -68,13 +68,12 @@ pub fn routes() -> Router<AppState> {
         .route("/push/test", post(test_push))
         .route("/jobs", get(list_jobs))
         .route("/jobs/{name}/run", post(run_job))
-        .route("/voice/speak", post(voice_speak))
 }
 
 // ----------------------------------------------------------------- settings
 
-async fn get_settings(State(state): State<AppState>, _user: AuthUser) -> ApiResult {
-    ok(state.settings_json().await)
+async fn get_settings(State(state): State<AppState>, user: AuthUser) -> ApiResult {
+    ok(state.settings_json_for(&user.user).await)
 }
 
 #[derive(Deserialize)]
@@ -82,15 +81,19 @@ struct SettingsBody {
     agent_name: Option<String>,
     feed_prompt: Option<String>,
     allow_claude_for_shared: Option<bool>,
+    voice_replies: Option<bool>,
 }
 
+/// Each person changes their own Iris (name, feed prompt, voice replies);
+/// the shared-chat policy is the owner's.
 async fn put_settings(
     State(state): State<AppState>,
     user: AuthUser,
     JsonBody(body): JsonBody<SettingsBody>,
 ) -> ApiResult {
-    user.require_owner()?;
-    let mut writes: Vec<(&'static str, Option<String>)> = Vec::new();
+    let me = &user.user;
+    let key = |k: &str| person_key(&me.id, me.is_owner, k);
+    let mut writes: Vec<(String, Option<String>)> = Vec::new();
     if let Some(name) = &body.agent_name {
         check_text("agent_name", name, 40, true)?;
         if name.contains(['\n', '\r', '<', '>', '`']) {
@@ -98,17 +101,25 @@ async fn put_settings(
                 "agent_name contains invalid characters",
             ));
         }
-        writes.push(("agent_name", Some(name.trim().to_string())));
+        writes.push((key("agent_name"), Some(name.trim().to_string())));
     }
+    let policy_changed = body.allow_claude_for_shared.is_some();
     if let Some(allow) = body.allow_claude_for_shared {
-        writes.push(("allow_claude_for_shared", allow.then(|| "true".to_string())));
+        user.require_owner()?;
+        writes.push((
+            "allow_claude_for_shared".into(),
+            allow.then(|| "true".to_string()),
+        ));
     }
     if let Some(p) = &body.feed_prompt {
         check_text("feed_prompt", p, 4000, false)?;
         writes.push((
-            "feed_prompt",
+            key("feed_prompt"),
             (!p.trim().is_empty()).then(|| p.trim().to_string()),
         ));
+    }
+    if let Some(on) = body.voice_replies {
+        writes.push((key("voice_replies"), on.then(|| "true".to_string())));
     }
     state
         .db
@@ -122,51 +133,119 @@ async fn put_settings(
             Ok(())
         })
         .await?;
-    let settings = state.settings_json().await;
-    state.hub.send(
-        Audience::All,
-        json!({"type": "settings.changed", "settings": settings}),
-    );
-    ok(settings)
+    if policy_changed {
+        let users = state.all_users().await;
+        state.broadcast_settings(&users).await;
+    } else {
+        state
+            .broadcast_settings(std::slice::from_ref(&user.user))
+            .await;
+    }
+    ok(state.settings_json_for(&user.user).await)
 }
 
+/// Upload a picture for the caller's own Iris.
 async fn put_avatar(State(state): State<AppState>, user: AuthUser, body: Bytes) -> ApiResult {
-    user.require_owner()?;
     let att = store_upload(&state, user.id(), &body).await?;
+    let me = user.user.clone();
+    let (k_avatar, k_updated) = (
+        person_key(&me.id, me.is_owner, "agent_avatar"),
+        person_key(&me.id, me.is_owner, "agent_avatar_updated"),
+    );
     let id = att.id.clone();
+    let old = state.person_setting(&me, "agent_avatar").await;
     state
         .db
         .call(move |c| {
-            db::set_setting(c, "agent_avatar", &id)?;
-            db::set_setting(c, "agent_avatar_updated", &now_ms().to_string())
+            db::set_setting(c, &k_avatar, &id)?;
+            db::set_setting(c, &k_updated, &now_ms().to_string())
         })
         .await?;
-    let settings = state.settings_json().await;
-    state.hub.send(
-        Audience::All,
-        json!({"type": "settings.changed", "settings": settings}),
-    );
-    ok(settings)
+    if let Some(old) = old {
+        remove_avatar_file(&state, &old).await;
+    }
+    state.broadcast_settings(std::slice::from_ref(&me)).await;
+    ok(state.settings_json_for(&me).await)
 }
 
+/// Back to the built-in picture.
 async fn delete_avatar(State(state): State<AppState>, user: AuthUser) -> ApiResult {
-    user.require_owner()?;
-    state
+    let me = user.user.clone();
+    let old = state.person_setting(&me, "agent_avatar").await;
+    let k = person_key(&me.id, me.is_owner, "agent_avatar");
+    state.db.call(move |c| db::delete_setting(c, &k)).await?;
+    if let Some(old) = old {
+        remove_avatar_file(&state, &old).await;
+    }
+    state.broadcast_settings(std::slice::from_ref(&me)).await;
+    ok(state.settings_json_for(&me).await)
+}
+
+/// Delete a replaced avatar upload (it is never part of a message).
+async fn remove_avatar_file(state: &AppState, attachment_id: &str) {
+    let id = attachment_id.to_string();
+    let att = state
         .db
-        .call(|c| db::delete_setting(c, "agent_avatar"))
-        .await?;
-    let settings = state.settings_json().await;
-    state.hub.send(
-        Audience::All,
-        json!({"type": "settings.changed", "settings": settings}),
-    );
-    ok(settings)
+        .call(move |c| {
+            let used: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages m, json_each(m.attachments) j
+                 WHERE j.value = ?1)",
+                [&id],
+                |r| r.get(0),
+            )?;
+            if used {
+                return Ok(None);
+            }
+            let att = db::get_attachment(c, &id)?;
+            c.execute("DELETE FROM attachments WHERE id = ?1", [&id])?;
+            Ok(att)
+        })
+        .await
+        .ok()
+        .flatten();
+    if let Some(a) = att {
+        let _ = tokio::fs::remove_file(state.paths.uploads_dir().join(a.file_name)).await;
+    }
 }
 
 const DEFAULT_AVATAR: &str = include_str!("avatar.svg");
 
-async fn get_avatar(State(state): State<AppState>, _user: AuthUser) -> Result<Response, ApiError> {
-    if let Some(id) = state.setting("agent_avatar").await {
+#[derive(Deserialize)]
+struct AvatarQuery {
+    /// Whose Iris (default: the caller's). Allowed for people the caller
+    /// shares a conversation with, so Together chats show the host's Iris.
+    user: Option<String>,
+}
+
+async fn get_avatar(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(q): Query<AvatarQuery>,
+) -> Result<Response, ApiError> {
+    let whose = match q.user.filter(|u| u != user.id()) {
+        None => user.user.clone(),
+        Some(other) => {
+            let me = user.id().to_string();
+            let o = other.clone();
+            let shares: bool = state
+                .db
+                .call(move |c| {
+                    c.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM conversation_members a
+                         JOIN conversation_members b ON a.conversation_id = b.conversation_id
+                         WHERE a.user_id = ?1 AND b.user_id = ?2)",
+                        rusqlite::params![me, o],
+                        |r| r.get(0),
+                    )
+                })
+                .await?;
+            match state.user(&other).await {
+                Some(u) if shares => u,
+                _ => return Err(ApiError::not_found("avatar")),
+            }
+        }
+    };
+    if let Some(id) = state.person_setting(&whose, "agent_avatar").await {
         let att = state.db.call(move |c| db::get_attachment(c, &id)).await?;
         if let Some(att) = att
             && let Ok(bytes) = tokio::fs::read(state.paths.uploads_dir().join(&att.file_name)).await
@@ -937,7 +1016,7 @@ async fn unsubscribe_push(
 }
 
 async fn test_push(State(state): State<AppState>, user: AuthUser) -> ApiResult {
-    let name = state.agent_name().await;
+    let name = state.agent_name_for(&user.user).await;
     let (delivered, failed) = crate::notify::push_users_now(
         &state,
         &[user.id().to_string()],
@@ -961,25 +1040,12 @@ async fn run_job(
 ) -> Result<Response, ApiError> {
     user.require_owner()?;
     let job = crate::jobs::Job::parse(&name).ok_or_else(|| ApiError::not_found("job"))?;
-    let started = crate::jobs::trigger(&state, job);
+    let started = crate::jobs::trigger(&state, job, user.id());
     Ok((
         StatusCode::ACCEPTED,
         axum::Json(json!({"started": started})),
     )
         .into_response())
-}
-
-// -------------------------------------------------------------------- voice
-
-/// TODO(voice): text-to-speech for agent replies. Planned shape:
-/// `POST /api/voice/speak {"message_id"}` -> `audio/mpeg`, using a local
-/// TTS engine so audio never leaves the machine. Not implemented yet.
-async fn voice_speak(_user: AuthUser) -> Result<Response, ApiError> {
-    Err(ApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "not_implemented",
-        "voice replies are not implemented yet",
-    ))
 }
 
 #[cfg(test)]

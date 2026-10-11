@@ -24,6 +24,9 @@ export const S = {
   sheet: null,         // bottom sheet render function
   toast: null,
   drafts: {},          // conversation id -> composer text
+  members: {},         // conversation id -> {members, agent} (Together chats)
+  voice: null,         // voice-note player: {id, playing, t, dur, mode}
+  voiceAuto: null,     // {cid, at}: play the next reply in this chat aloud
 };
 
 const subs = new Set();
@@ -140,6 +143,20 @@ export async function loadLibrary() {
   ]);
   set({ library: { items, photos, saved } });
 }
+/** Members of a Together chat and whose Iris hosts it. */
+export async function loadMembers(cid) {
+  const r = await get(`/conversations/${cid}/members`);
+  set({ members: { ...S.members, [cid]: r } });
+  return r;
+}
+
+/** The Iris answering in a conversation when it is not the caller's own
+ *  (a Together chat someone else started): {name, avatar_url, ...}. */
+export function hostAgent(cid) {
+  const a = S.members[cid]?.agent;
+  return a && a.user_id !== S.me?.user?.id ? a : null;
+}
+
 export async function loadSlots() { set({ slots: (await get('/models/slots')).slots }); }
 export async function loadEngines() {
   if (!isOwner()) return;

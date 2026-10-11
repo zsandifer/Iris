@@ -45,6 +45,28 @@ pub fn mcp_config_json(servers: &[super::McpServer]) -> Value {
     json!({ "mcpServers": map })
 }
 
+/// Permission deny rules for paths the agent must not touch. Claude Code
+/// writes absolute paths as `//abs/path`; folders get `/**`. Paths with
+/// characters the rule syntax cannot carry (commas, parentheses) are
+/// skipped rather than mangled.
+pub fn deny_rules(paths: &[std::path::PathBuf]) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in paths {
+        let s = p.to_string_lossy();
+        if !s.starts_with('/') || s.contains([',', '(', ')', '\n']) {
+            continue;
+        }
+        let target = if p.is_dir() {
+            format!("/{}/**", s.trim_end_matches('/'))
+        } else {
+            format!("/{s}")
+        };
+        out.push(format!("Read({target})"));
+        out.push(format!("Edit({target})"));
+    }
+    out
+}
+
 /// One `--input-format stream-json` user message.
 pub fn user_message_line(spec: &TurnSpec) -> Result<Vec<u8>> {
     let mut content = vec![json!({"type": "text", "text": spec.prompt})];
@@ -135,6 +157,12 @@ impl Harness for Claude {
             // stdin, so no positional argument can be swallowed).
             a.push("--allowedTools".into());
             a.push(allowed.join(","));
+        }
+        let denied = deny_rules(&spec.private_paths);
+        if !denied.is_empty() {
+            // Variadic like --allowedTools; only flags follow.
+            a.push("--disallowedTools".into());
+            a.push(denied.join(","));
         }
         for dir in &spec.writable_dirs {
             a.push("--add-dir".into());
@@ -646,11 +674,26 @@ mod tests {
             writable_dirs: vec![tmp.path().join("memory")],
             run_dir: tmp.path().into(),
             scope: "c1".into(),
+            private_paths: vec![tmp.path().join("other"), tmp.path().join("vault.key")],
         };
+        std::fs::create_dir_all(tmp.path().join("other")).unwrap();
         let inv = Claude::new(HarnessConfig::claude_default())
             .build(&spec)
             .unwrap();
         let args = inv.args.join(" ");
+        let i = inv
+            .args
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .unwrap();
+        let other = tmp.path().join("other").display().to_string();
+        let key = tmp.path().join("vault.key").display().to_string();
+        assert_eq!(
+            inv.args[i + 1],
+            format!("Read(/{other}/**),Edit(/{other}/**),Read(/{key}),Edit(/{key})")
+        );
+        assert!(inv.args[i + 2].starts_with("--"), "followed by a flag");
+        assert!(deny_rules(&["/a,b".into(), "rel".into()]).is_empty());
         assert!(args.starts_with("-p --output-format stream-json --verbose"));
         assert!(args.contains("--model haiku --effort low --resume sess-1"));
         assert!(args.contains("--system-prompt-snapshot off"));

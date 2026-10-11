@@ -1,12 +1,15 @@
 // Chat: messages, live status phrases, receipts, cards, and the composer.
 import { html, useEffect, useLayoutEffect, useRef, useState } from './h.js';
 import { post, api } from './api.js';
-import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId } from './store.js';
-import { Icon, Img, Avatar, agentName, stamp, Spinner } from './ui.js';
+import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId, isOwner, loadMembers, hostAgent, loadEngines } from './store.js';
+import { Icon, Img, Avatar, agentName, stamp, Spinner, openSheet, closeSheet } from './ui.js';
 import { md } from './md.js';
 import { Card } from './cards.js';
 import { statusPhrase, receipt, seconds } from './status.js';
 import { pushState, enablePush } from './push.js';
+import {
+  VoiceNote, voiceReplies, serverListen, canRecord, record, transcribe, unlockAudio, play, prefetch, Speech,
+} from './voice.js';
 
 const GAP = 30 * 60 * 1000;
 
@@ -61,7 +64,9 @@ function Assistant({ m, list }) {
   const failed = m.status === 'error' || m.status === 'interrupted';
   let content = m.content;
   if (m.status === 'interrupted' && !content) content = 'I got interrupted before I could finish.';
+  const spoken = voiceReplies() && m.status === 'complete' && m.kind === 'text' && content.trim();
   return html`<${Receipt} meta=${m.meta} />
+    ${spoken && html`<${VoiceNote} m=${m} />`}
     ${content ? html`<div class=${'b' + (failed ? ' b-err' : '')} dangerouslySetInnerHTML=${{ __html: md(content) }} />`
       : m.status === 'cancelled' ? html`<div class="note">Stopped.</div>` : null}
     ${failed && retryFor(list, m) && html`<button class="retry" onClick=${retry}><${Icon} name="refresh" size=${15} /> Try again</button>`}`;
@@ -107,6 +112,18 @@ function Welcome() {
   </div>`;
 }
 
+function TogetherWelcome({ cid }) {
+  const info = S.members[cid];
+  const host = hostAgent(cid);
+  const others = (info?.members || []).filter((x) => x.user_id !== S.me?.user?.id).map((x) => x.display_name);
+  return html`<div class="welcome">
+    <${Avatar} size=${64} agent=${host} />
+    <h2 class="serif">${others.length ? `You and ${others.join(', ')}` : 'Together'}</h2>
+    <p class="mu">${host?.name || agentName()} is here too. Everyone sees every message.
+    Nobody's private memory or files are used in this chat.</p>
+  </div>`;
+}
+
 export function ChatScreen({ cid }) {
   useStore();
   const scr = useRef();
@@ -123,13 +140,27 @@ export function ChatScreen({ cid }) {
     post(`/conversations/${cid}/read`).catch(() => {});
   }, [cid]);
 
+  const shared = conv && (conv.kind === 'group' || conv.member_count > 1);
   useEffect(() => {
-    if (conv && conv.member_count > 1) {
-      api('GET', `/conversations/${cid}/members`).then((r) => {
+    if (shared) {
+      loadMembers(cid).then((r) => {
         setMembers(Object.fromEntries(r.members.map((x) => [x.user_id, x.display_name])));
       }).catch(() => {});
     } else setMembers(null);
-  }, [cid, conv?.member_count]);
+  }, [cid, conv?.member_count, shared]);
+
+  // Voice replies: fetch the voice note as soon as a reply is done, and
+  // play it when it answers something sent from this device.
+  const last = list.at(-1);
+  useEffect(() => {
+    if (!last || last.role !== 'assistant' || last.status !== 'complete' || last.kind !== 'text' || !voiceReplies()) return;
+    prefetch(last);
+    const auto = S.voiceAuto;
+    if (auto && auto.cid === cid && last.created_at >= auto.at - 2000) {
+      set({ voiceAuto: null });
+      if (document.visibilityState === 'visible') play(last);
+    }
+  }, [last?.id, last?.status]);
 
   // Keep the newest message in view unless the user scrolled up.
   useLayoutEffect(() => {
@@ -169,17 +200,16 @@ export function ChatScreen({ cid }) {
   return html`<div class="chat">
     <div class="scr" ref=${scr} onScroll=${onScroll}>
       ${box?.loading && box?.hasMore && html`<${Spinner} />`}
-      ${!box ? html`<${Spinner} />` : !list.length && isMain ? html`<${Welcome} />` : null}
+      ${!box ? html`<${Spinner} />` : !list.length && isMain ? html`<${Welcome} />` : !list.length && shared ? html`<${TogetherWelcome} cid=${cid} />` : null}
       ${isMain && box && !box.hasMore && html`<${NotifyPrompt} />`}
       ${rows}
     </div>
-    <${Composer} cid=${cid} running=${running} />
+    <${Composer} cid=${cid} running=${running} name=${hostAgent(cid)?.name || agentName()} />
   </div>`;
 }
 
 // ---------------------------------------------------------------- composer
 
-const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
 const touch = matchMedia('(pointer: coarse)').matches;
 
 /** Downscale big photos before upload (keeps uploads fast on cellular). */
@@ -198,12 +228,42 @@ async function shrink(file) {
   }
 }
 
-function Composer({ cid, running }) {
+/** How voice input works here: recorded and transcribed on the server
+ *  (private, works on every phone), else the browser's own recognition,
+ *  else it needs setting up on the server. */
+function micMode() {
+  if (serverListen() && canRecord()) return 'server';
+  if (Speech) return 'browser';
+  if (canRecord()) return 'setup';
+  return null;
+}
+
+function VoiceSetupSheet() {
+  useStore();
+  const e = (S.engines?.engines || []).find((x) => x.name === 'stt');
+  const busy = e?.operation?.state === 'running';
+  const install = async () => {
+    try { await api('POST', '/engines/stt/install'); toast('Setting up voice input on your server…'); closeSheet(); } catch (err) { toast(err.message); }
+  };
+  return html`<div class="sheet-body"><h3>Voice input</h3>
+    <p class="mu">${isOwner()
+      ? `To talk instead of type, your server needs speech recognition. It runs on your server with an open-source model (Whisper), so your voice never leaves it.${e?.download_mb ? ` It's a one-time ${e.download_mb} MB download.` : ''}`
+      : 'Voice input needs speech recognition on your server. Ask the person who runs your Iris to turn on voice input in Settings.'}</p>
+    <div class="btns"><button class="b2" onClick=${closeSheet}>Not now</button>
+      ${isOwner() && html`<button class="b1" disabled=${busy} onClick=${install}>${busy ? 'Setting up…' : 'Set it up'}</button>`}</div></div>`;
+}
+
+function Composer({ cid, running, name }) {
   const [text, setText] = useState('');
   const [atts, setAtts] = useState([]);
-  const [rec, setRec] = useState(null);
+  const [rec, setRec] = useState(null);       // browser recognition
+  const [recording, setRecording] = useState(null); // server recording handle
+  const [secs, setSecs] = useState(0);
+  const [hearing, setHearing] = useState(false); // transcribing
   const ta = useRef();
   const file = useRef();
+  const textRef = useRef('');
+  textRef.current = text;
 
   useEffect(() => {
     const d = S.drafts[cid];
@@ -220,6 +280,14 @@ function Composer({ cid, running }) {
     el.style.height = 'auto';
     el.style.height = Math.min(el.scrollHeight, 132) + 'px';
   }, [text]);
+
+  // Recording timer; stop recording when leaving the chat.
+  useEffect(() => {
+    if (!recording) return undefined;
+    const t = setInterval(() => setSecs(Math.floor((Date.now() - recording.started) / 1000)), 250);
+    return () => clearInterval(t);
+  }, [recording]);
+  useEffect(() => () => recording?.cancel(), [recording]);
 
   const pick = async (e) => {
     const files = [...e.target.files].slice(0, 4 - atts.length);
@@ -240,7 +308,7 @@ function Composer({ cid, running }) {
   };
 
   const ready = atts.every((a) => !a.uploading);
-  const canSend = (text.trim() || atts.length) && ready;
+  const canSend = (text.trim() || atts.length) && ready && !recording && !hearing;
 
   const send = async () => {
     if (!canSend) return;
@@ -249,10 +317,14 @@ function Composer({ cid, running }) {
     rec?.stop();
     setText('');
     setAtts([]);
+    if (voiceReplies()) {
+      unlockAudio();
+      set({ voiceAuto: { cid, at: Date.now() } });
+    }
     try { await sendMessage(cid, t, ids); } catch (e) { toast(e.message); setText(t); }
   };
 
-  const mic = () => {
+  const listenBrowser = () => {
     if (rec) { rec.stop(); return; }
     const r = new Speech();
     r.lang = navigator.language || 'en-US';
@@ -269,27 +341,74 @@ function Composer({ cid, running }) {
     try { r.start(); setRec(r); } catch { toast("Voice input isn't available here."); }
   };
 
+  const listenServer = async () => {
+    if (recording) {
+      const handle = recording;
+      setRecording(null);
+      setHearing(true);
+      try {
+        const blob = await handle.stop();
+        if (Date.now() - handle.started < 600) { toast('Hold on a little longer, then tap stop.'); return; }
+        const heard = await transcribe(blob);
+        if (!heard) toast("I didn't catch anything. Try again a little closer to the mic.");
+        else {
+          const cur = textRef.current;
+          setText(cur ? `${cur.replace(/\s*$/, ' ')}${heard}` : heard);
+          setTimeout(() => ta.current?.focus(), 30);
+        }
+      } catch (e) {
+        toast(e.code === 'voice_unavailable' ? 'Voice input was turned off on the server.' : e.message || "I couldn't hear that.");
+      } finally {
+        setHearing(false);
+      }
+      return;
+    }
+    unlockAudio();
+    try {
+      setSecs(0);
+      setRecording(await record());
+    } catch (e) {
+      toast(e?.name === 'NotAllowedError' ? 'Allow microphone access to talk to me.' : "I can't use the microphone here.");
+    }
+  };
+
+  const mic = () => {
+    const mode = micMode();
+    if (mode === 'server') listenServer();
+    else if (mode === 'browser') listenBrowser();
+    else if (mode === 'setup') {
+      if (isOwner()) loadEngines().catch(() => {});
+      openSheet(() => html`<${VoiceSetupSheet} />`);
+    }
+  };
+
   const stop = () => post(`/conversations/${cid}/cancel`).catch((e) => toast(e.message));
 
   let action;
-  if (canSend) action = html`<button class="send" aria-label="Send" onClick=${send}><${Icon} name="send" size=${20} /></button>`;
+  if (recording) action = html`<button class="send rec" aria-label="Stop recording" onClick=${listenServer}><${Icon} name="stop" size=${18} fill /></button>`;
+  else if (hearing) action = html`<button class="send" aria-label="Transcribing" disabled><span class="vn-spin light" /></button>`;
+  else if (canSend) action = html`<button class="send" aria-label="Send" onClick=${send}><${Icon} name="send" size=${20} /></button>`;
   else if (rec) action = html`<button class="send rec" aria-label="Stop listening" onClick=${mic}><${Icon} name="stop" size=${18} fill /></button>`;
   else if (running && !text.trim()) action = html`<button class="send stop" aria-label="Stop" onClick=${stop}><${Icon} name="stop" size=${18} fill /></button>`;
-  else if (Speech && !text.trim()) action = html`<button class="send" aria-label="Talk" onClick=${mic}><${Icon} name="mic" size=${20} /></button>`;
+  else if (micMode() && !text.trim()) action = html`<button class="send" aria-label="Talk" onClick=${mic}><${Icon} name="mic" size=${20} /></button>`;
   else action = html`<button class="send" aria-label="Send" disabled><${Icon} name="send" size=${20} /></button>`;
 
+  const listening = rec || recording;
+  const placeholder = recording ? `Listening… ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`
+    : hearing ? 'Writing down what you said…' : rec ? 'Listening…' : `Talk to ${name}…`;
   return html`<div class="composer">
     ${atts.length > 0 && html`<div class="att-row">${atts.map((a) => html`<div class="att" key=${a.key}>
       <img src=${a.preview} alt="" />${a.uploading && html`<div class="att-busy"><${Spinner} /></div>`}
       <button class="att-x" aria-label="Remove photo" onClick=${() => setAtts(atts.filter((x) => x.key !== a.key))}><${Icon} name="x" size=${12} /></button>
     </div>`)}</div>`}
-    <div class=${'inp' + (rec ? ' listening' : '')}>
-      <button class="pl" aria-label="Add photos" onClick=${() => file.current.click()} disabled=${atts.length >= 4}><${Icon} name="plus" size=${20} /></button>
+    <div class=${'inp' + (listening ? ' listening' : '')}>
+      <button class="pl" aria-label="Add photos" onClick=${() => file.current.click()} disabled=${atts.length >= 4 || !!recording}><${Icon} name="plus" size=${20} /></button>
       <input ref=${file} type="file" accept="image/*" multiple hidden onChange=${pick} />
-      <textarea ref=${ta} rows="1" value=${text} placeholder=${rec ? 'Listening…' : `Talk to ${agentName()}…`}
-        aria-label="Message" enterkeyhint=${touch ? 'enter' : 'send'}
+      ${recording ? html`<div class="rec-line" aria-live="polite"><span class="rec-dot" />${placeholder}</div>`
+      : html`<textarea ref=${ta} rows="1" value=${text} placeholder=${placeholder}
+        aria-label="Message" enterkeyhint=${touch ? 'enter' : 'send'} disabled=${hearing}
         onInput=${(e) => setText(e.target.value)}
-        onKeyDown=${(e) => { if (e.key === 'Enter' && !e.shiftKey && !touch && !e.isComposing) { e.preventDefault(); send(); } }} />
+        onKeyDown=${(e) => { if (e.key === 'Enter' && !e.shiftKey && !touch && !e.isComposing) { e.preventDefault(); send(); } }} />`}
       ${action}
     </div>
   </div>`;

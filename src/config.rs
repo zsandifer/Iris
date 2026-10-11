@@ -478,6 +478,72 @@ impl Paths {
     pub fn vapid_key_file(&self) -> PathBuf {
         self.data_dir.join("vapid.json")
     }
+    /// The other people's own Iris folders (`people/<user id>/`).
+    pub fn people_dir(&self) -> PathBuf {
+        self.data_dir.join("people")
+    }
+    /// Working folders of shared ("Together") conversations, one per
+    /// conversation so no group sees another's files.
+    pub fn together_dir(&self, conversation_id: &str) -> PathBuf {
+        self.data_dir
+            .join("together")
+            .join(safe_id(conversation_id))
+    }
+    /// Cached voice notes (synthesized replies).
+    pub fn voice_dir(&self) -> PathBuf {
+        self.data_dir.join("voice")
+    }
+    /// The owner's Iris: the top-level persona, memory, and workspace.
+    pub fn owner_dirs(&self) -> PersonDirs {
+        PersonDirs {
+            persona: self.persona_dir(),
+            memory: self.memory_dir(),
+            workspace: self.workspace_dir(),
+        }
+    }
+    /// Where one person's Iris keeps its persona, memory, and working
+    /// folder. The owner keeps the top-level folders (so single-person
+    /// installs never move); everyone else gets `people/<user id>/`.
+    pub fn person_dirs(&self, user_id: &str, is_owner: bool) -> PersonDirs {
+        if is_owner {
+            return self.owner_dirs();
+        }
+        let root = self.people_dir().join(safe_id(user_id));
+        PersonDirs {
+            persona: root.join("persona"),
+            memory: root.join("memory"),
+            workspace: root.join("workspace"),
+        }
+    }
+}
+
+/// One person's Iris folders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonDirs {
+    pub persona: PathBuf,
+    pub memory: PathBuf,
+    pub workspace: PathBuf,
+}
+
+impl PersonDirs {
+    pub fn all(&self) -> [&PathBuf; 3] {
+        [&self.persona, &self.memory, &self.workspace]
+    }
+}
+
+/// Ids are generated hex strings; anything else is reduced to hex digits
+/// so a path built from one can never leave its parent folder.
+fn safe_id(id: &str) -> String {
+    let clean: String = id
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(64)
+        .collect();
+    if clean.is_empty() {
+        "invalid".into()
+    } else {
+        clean.to_ascii_lowercase()
+    }
 }
 
 fn absolutize(p: PathBuf) -> PathBuf {
@@ -580,6 +646,25 @@ mod tests {
         assert_eq!(parse_hhmm("23:59"), Some(1439));
         assert_eq!(parse_hhmm("24:00"), None);
         assert_eq!(parse_hhmm("8"), None);
+    }
+
+    #[test]
+    fn person_dirs_are_separate_and_contained() {
+        let p = Paths {
+            config_file: PathBuf::from("/x/config.toml"),
+            data_dir: PathBuf::from("/x/data"),
+        };
+        assert_eq!(p.person_dirs("abc", true), p.owner_dirs());
+        let other = p.person_dirs("0a1B", false);
+        assert_eq!(other.memory, PathBuf::from("/x/data/people/0a1b/memory"));
+        assert_ne!(other.persona, p.persona_dir());
+        let evil = p.person_dirs("../../etc", false);
+        assert!(evil.persona.starts_with("/x/data/people/"));
+        assert!(!evil.persona.to_string_lossy().contains(".."));
+        assert_eq!(
+            p.together_dir("../c0"),
+            PathBuf::from("/x/data/together/c0")
+        );
     }
 
     #[test]

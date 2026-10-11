@@ -505,6 +505,7 @@ mod tests {
             writable_dirs: vec!["/m".into()],
             run_dir: "/r".into(),
             scope: "c1".into(),
+            private_paths: Vec::new(),
         };
         let mut cfg = HarnessConfig::codex_default();
         cfg.sandbox = "workspace-write".into();

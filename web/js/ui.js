@@ -43,6 +43,8 @@ const P = {
   card: 'M5 5h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2zM3 10h18M7 15h4',
   refresh: 'M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7',
   pause: 'M9 5v14M15 5v14',
+  play: 'M8 5.5v13l10.5-6.5z',
+  pausefill: 'M7 5h3.5v14H7zM13.5 5H17v14h-3.5z',
   eye: 'M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z',
   edit: 'M4 20h4L19 9l-4-4L4 16zM13.5 6.5l4 4',
   globe: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM3 12h18M12 3c2.5 2.6 3.7 5.6 3.7 9s-1.2 6.4-3.7 9c-2.5-2.6-3.7-5.6-3.7-9S9.5 5.6 12 3z',
@@ -75,10 +77,11 @@ export function Img({ src, alt = '', cls = '', onLoad, onError, ...rest }) {
     onError=${() => { setFailed(true); onError?.(); }} ...${rest} />`;
 }
 
-/** Iris's avatar: the uploaded picture, or the built-in placeholder. */
-export function Avatar({ size = 36 }) {
-  const custom = S.settings?.avatar_custom;
-  const src = custom ? S.settings.avatar_url : null;
+/** Iris's avatar: the uploaded picture, or the built-in placeholder.
+ *  `agent` shows another person's Iris (the host of a Together chat). */
+export function Avatar({ size = 36, agent }) {
+  const a = agent || S.settings;
+  const src = a?.avatar_custom ? a.avatar_url : null;
   return html`<div class="avatar" style=${`width:${size}px;height:${size}px`}>
     ${src ? html`<${Img} src=${src} alt="" />` : html`<div class="orb" />`}
   </div>`;

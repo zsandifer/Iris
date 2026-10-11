@@ -480,7 +480,15 @@ impl Bridge {
     /// Only files inside the agent's workspace or memory folders can be
     /// saved, and never through symlinks.
     fn resolve_agent_file(&self, path: &str) -> std::result::Result<PathBuf, String> {
-        let workspace = self.paths.workspace_dir();
+        // The person's own Iris folders (the owner's are the top-level ones).
+        let is_owner = self
+            .db
+            .with(|c| crate::db::get_user(c, &self.user_id))
+            .ok()
+            .flatten()
+            .is_some_and(|u| u.is_owner);
+        let dirs = self.paths.person_dirs(&self.user_id, is_owner);
+        let workspace = dirs.workspace.clone();
         let candidate = if Path::new(path).is_absolute() {
             PathBuf::from(path)
         } else {
@@ -489,7 +497,7 @@ impl Bridge {
         let real = candidate
             .canonicalize()
             .map_err(|_| "file not found".to_string())?;
-        let allowed = [workspace, self.paths.memory_dir()]
+        let allowed = [workspace, dirs.memory]
             .iter()
             .filter_map(|d| d.canonicalize().ok())
             .any(|d| real.starts_with(d));

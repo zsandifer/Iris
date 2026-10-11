@@ -2,11 +2,12 @@
 // people, and the activity log.
 import { html, useEffect, useState, useRef } from './h.js';
 import { api, get, post, put, del, setToken } from './api.js';
-import { S, set, useStore, go, toast, isOwner, loadSlots, loadEngines } from './store.js';
+import { S, set, useStore, go, toast, isOwner, loadSlots, loadEngines, loadConvs } from './store.js';
 import {
-  Icon, Row, Group, Page, Spinner, Toggle, LetterTile, Empty,
+  Icon, Row, Group, Page, Spinner, Toggle, LetterTile, Empty, Avatar,
   agentName, ago, since, stamp, confirmSheet, promptSheet, openSheet, closeSheet,
 } from './ui.js';
+import { unlockAudio, Speech } from './voice.js';
 import { SignIn } from './cards.js';
 import { pushState, enablePush, disablePush, isIOS } from './push.js';
 import { activityTitle, placeLabel } from './hub.js';
@@ -64,6 +65,58 @@ function Notifications() {
   <//>`;
 }
 
+/** Center-crop a picture to a square and shrink it (avatars stay light
+ *  and look the same everywhere). */
+async function squareAvatar(file) {
+  try {
+    const bmp = await createImageBitmap(file);
+    const side = Math.min(bmp.width, bmp.height);
+    const size = Math.min(512, side);
+    const c = document.createElement('canvas');
+    c.width = size;
+    c.height = size;
+    c.getContext('2d').drawImage(bmp, (bmp.width - side) / 2, (bmp.height - side) / 2, side, side, 0, 0, size, size);
+    return await new Promise((r) => c.toBlob((b) => r(b || file), 'image/jpeg', 0.9));
+  } catch {
+    return file;
+  }
+}
+
+function VoiceRows() {
+  useStore();
+  const owner = isOwner();
+  const v = S.settings?.voice || {};
+  const eng = (name) => (S.engines?.engines || []).find((e) => e.name === name);
+  const setup = async (name, what) => {
+    try { await post(`/engines/${name}/install`); loadEngines(); toast(`Setting up ${what} on your server…`); } catch (e) { toast(e.message); }
+  };
+  const toggle = async (on) => {
+    if (on) unlockAudio();
+    try { set({ settings: await put('/settings', { voice_replies: on }) }); } catch (e) { toast(e.message); }
+  };
+  const status = (name, ready, what) => {
+    const e = eng(name);
+    if (ready) return html`<span class="ok">● ready</span>`;
+    if (e?.operation?.state === 'running') return html`<span class="rv shimmer">Setting up…</span>`;
+    if (!owner || !e) return null;
+    if (e.unsupported) return html`<span class="rv">Not available</span>`;
+    if (e.requires) return html`<span class="rv">Needs ${e.requires}</span>`;
+    return html`<button class="cn" onClick=${() => setup(name, what)}>Set up</button>`;
+  };
+  const failed = ['tts', 'stt'].map(eng).find((e) => e?.operation?.state === 'failed');
+  const sub = v.enabled ? (v.tts ? 'Replies come as voice notes plus text' : "Using this device's voice for now") : 'Hear replies as voice notes, plus text';
+  const note = failed ? `Setup failed: ${failed.operation.error}`
+    : !v.tts || !v.stt ? (owner ? `Voice runs on your server with open-source models (a Piper voice and Whisper), so audio never leaves it. One-time downloads: about ${eng('tts')?.download_mb || 95} MB for the voice and ${eng('stt')?.download_mb || 240} MB for listening.`
+      : 'For the best voice, ask the person who runs your Iris to set up voice on the server.')
+      : 'Voice runs on your server; audio never leaves it.';
+  return html`<${Group} label="Voice" note=${note}>
+    <${Row} icon="volume" title="Voice replies" sub=${sub}
+      right=${html`<${Toggle} on=${!!v.enabled} onChange=${toggle} label="Voice replies" />`} />
+    <${Row} icon="volume" title=${`${agentName()}'s voice`} sub=${v.tts ? 'A natural voice, made on your server' : "This device's built-in voice for now"} right=${status('tts', v.tts, 'the voice')} chevron=${false} />
+    <${Row} icon="mic" title="Voice input" sub=${v.stt ? 'Talk instead of type; transcribed on your server' : Speech ? "Uses your browser's speech recognition for now" : 'Talk instead of type'} right=${status('stt', v.stt, 'voice input')} chevron=${false} />
+  <//>`;
+}
+
 export function Settings() {
   useStore();
   const owner = isOwner();
@@ -75,6 +128,7 @@ export function Settings() {
     get('/devices').then((r) => setCounts((c) => ({ ...c, devices: r.devices.filter((d) => !d.revoked_at).length }))).catch(() => {});
     if (owner) get('/users').then((r) => setCounts((c) => ({ ...c, people: r.users.length }))).catch(() => {});
     if (owner && !S.slots) loadSlots().catch(() => {});
+    if (owner) loadEngines().catch(() => {});
   }, []);
   const rename = async () => {
     const name = await promptSheet({ title: `Rename ${agentName()}`, value: agentName(), yes: 'Save' });
@@ -87,6 +141,7 @@ export function Settings() {
     try { await put('/me', { display_name: name.trim() }); set({ me: { ...S.me, user: { ...S.me.user, display_name: name.trim() } } }); } catch (e) { toast(e.message); }
   };
   const picture = () => openSheet(() => html`<div class="sheet-body"><h3>Picture</h3>
+    <div class="pic-preview"><${Avatar} size=${96} /></div>
     <div class="grp">
       <div class="r tap" onClick=${() => { closeSheet(); file.current.click(); }}><div class="rt">Choose a photo</div></div>
       ${S.settings?.avatar_custom && html`<div class="r tap danger" onClick=${async () => { closeSheet(); try { set({ settings: await del('/settings/avatar') }); } catch (e) { toast(e.message); } }}><div class="rt">Use the default</div></div>`}
@@ -95,7 +150,7 @@ export function Settings() {
     const f = e.target.files[0];
     e.target.value = '';
     if (!f) return;
-    try { set({ settings: await api('PUT', '/settings/avatar', f) }); toast('Picture updated'); } catch (err) { toast(err.message); }
+    try { set({ settings: await api('PUT', '/settings/avatar', await squareAvatar(f)) }); toast('Picture updated'); } catch (err) { toast(err.status === 415 ? 'That picture type is not supported. Try a JPEG or PNG.' : err.message); }
   };
   const chat = S.slots?.find((s) => s.slot === 'chat');
   const engineSub = !S.slots ? ' ' : chat?.selection?.mode === 'pinned' ? `Chat pinned to ${chat.models.find((m) => m.id === chat.effective)?.label || 'a model'}` : 'Automatic';
@@ -108,11 +163,10 @@ export function Settings() {
   return html`<${Page} title="Settings" sub=${`${agentName()} on your home server · ${S.online ? 'online' : 'offline'}`}>
     <input ref=${file} type="file" accept="image/*" hidden onChange=${upload} />
     <${Group} label=${agentName()}>
-      <${Row} icon="edit" title="Name" value=${agentName()} onClick=${owner ? rename : undefined} chevron=${owner} />
-      <${Row} icon="user" title="Picture" value=${S.settings?.avatar_custom ? 'Custom' : 'Default'} onClick=${owner ? picture : undefined} chevron=${owner} />
-      <${Row} icon="volume" title="Voice replies" sub="Coming soon: replies as voice notes plus text"
-        right=${html`<${Toggle} on=${false} disabled onChange=${() => {}} label="Voice replies" />`} />
+      <${Row} icon="edit" title="Name" value=${agentName()} onClick=${rename} />
+      <${Row} icon="user" title="Picture" value=${S.settings?.avatar_custom ? 'Custom' : 'Default'} onClick=${picture} />
     <//>
+    <${VoiceRows} />
     <${Group} label="You">
       <${Row} icon="user" title="Your name" value=${S.me?.user?.display_name} onClick=${renameMe} />
     <//>
@@ -211,16 +265,16 @@ export function AiEngine() {
   const bg = slots.filter((s) => ['background', 'feed'].includes(s.slot));
   const claudeBg = bg.some((s) => String(s.effective || '').startsWith('claude:'));
   const engines = S.engines?.engines || [];
-  const names = [...new Set([...engines.map((e) => e.name), ...S.harnesses.map((h) => h.name)])];
+  const names = [...new Set([...engines.filter((e) => e.kind !== 'voice').map((e) => e.name), ...S.harnesses.map((h) => h.name)])];
   const allow = async (on) => {
     try { set({ settings: await put('/settings', { allow_claude_for_shared: on }) }); loadSlots(); } catch (e) { toast(e.message); }
   };
   return html`<${Page} title="AI engine" sub="Only models installed on your server are shown. Automatic picks the best one for each job.">
     ${!S.slots ? html`<${Spinner} />` : slots.map((s) => html`<${Slot} slot=${s} key=${s.slot} />`)}
     ${claudeBg && html`<div class="warn">Claude plans are meant for personal use. Running background jobs on them can use up your limits faster.</div>`}
-    ${chat?.shared && html`<${Group} label="Shared chats" note=${chat.shared.paused ? 'Shared chats are paused because Claude is the only engine available.' : `Shared chats use ${chat.models.find((m) => m.id === chat.shared.effective)?.label || 'the next allowed model'}.`}>
-      <${Row} title="Allow Claude in shared chats" sub="Claude subscriptions are for one person"
-        right=${html`<${Toggle} on=${!!S.settings?.allow_claude_for_shared} onChange=${allow} label="Allow Claude in shared chats" />`} />
+    ${chat?.shared && html`<${Group} label="Other people and group chats" note=${chat.shared.paused ? "Other people's Iris and group chats are paused because Claude is the only engine available." : `Other people's Iris and group chats use ${chat.models.find((m) => m.id === chat.shared.effective)?.label || 'the next allowed model'}.`}>
+      <${Row} title="Allow Claude for other people" sub="Claude subscriptions are for one person. Only turn this on if your plan allows it."
+        right=${html`<${Toggle} on=${!!S.settings?.allow_claude_for_shared} onChange=${allow} label="Allow Claude for other people" />`} />
     <//>`}
     <${Group} label="Engines on this server">
       ${names.map((n) => html`<${EngineRow} e=${engines.find((e) => e.name === n)} h=${S.harnesses.find((h) => h.name === n)} />`)}
@@ -272,21 +326,34 @@ export function People() {
     } catch (e) { toast(e.message); }
   };
   const add = async () => {
-    const name = await promptSheet({ title: 'Add a person', body: `They get their own ${agentName()} with separate memory, and you can chat together.`, placeholder: 'Their name', yes: 'Add' });
+    const name = await promptSheet({ title: 'Add a person', body: `They get their own ${agentName()} with separate memory, feed, goals, and settings, and you can chat together.`, placeholder: 'Their name', yes: 'Add' });
     if (!name?.trim()) return;
     try { const r = await post('/users', { display_name: name.trim() }); await load(); code(r.user); } catch (e) { toast(e.message); }
   };
   const together = async (u) => {
     try {
-      const r = await post('/conversations', { kind: 'group', title: `You and ${u.display_name}`, member_ids: [u.id] });
+      const r = await post('/conversations', { kind: 'group', title: `${S.me.user.display_name} and ${u.display_name}`, member_ids: [u.id] });
+      await loadConvs();
       go(`chat/${r.conversation.id}`);
     } catch (e) { toast(e.message); }
   };
+  const remove = async (u) => {
+    closeSheet();
+    if (!(await confirmSheet({ title: `Remove ${u.display_name}?`, body: `Their ${agentName()}, chats, memory, feed, goals, and devices are deleted. This can't be undone.`, yes: 'Remove', danger: true }))) return;
+    try { await del(`/users/${u.id}`); load(); toast(`${u.display_name} was removed`); } catch (e) { toast(e.message); }
+  };
+  const menu = (u) => openSheet(() => html`<div class="sheet-body"><h3>${u.display_name}</h3>
+    <p class="mu">${u.devices ? `${u.devices} device${u.devices === 1 ? '' : 's'} paired` : 'No device paired yet'} · added ${since(u.created_at)}</p>
+    <div class="grp">
+      <div class="r tap" onClick=${() => { closeSheet(); together(u); }}><div class="rt">Chat together</div></div>
+      <div class="r tap" onClick=${() => { closeSheet(); code(u); }}><div class="rt">Pairing code for their phone</div></div>
+      <div class="r tap danger" onClick=${() => remove(u)}><div class="rt">Remove ${u.display_name}</div></div>
+    </div></div>`);
   return html`<${Page} title="People" sub=${`Everyone with their own ${agentName()} on this server`}>
-    ${!users ? html`<${Spinner} />` : html`<${Group}>${users.map((u) => html`<${Row} icon=${html`<${LetterTile} name=${u.display_name} radius=${15} />`}
-      title=${u.display_name} sub=${u.is_owner ? 'Owner' : `Added ${since(u.created_at)}`} chevron=${false}
-      right=${!u.is_owner && html`<span class="row-btns"><button class="cn" onClick=${() => together(u)}>Chat together</button>
-        <button class="cn" onClick=${() => code(u)}>Pair</button></span>`} />`)}
+    ${!users ? html`<${Spinner} />` : html`<${Group} note="Each person's Iris keeps its own memory and files. Together chats never use anyone's private memory.">${users.map((u) => html`<${Row} icon=${html`<${LetterTile} name=${u.display_name} radius=${15} />`}
+      title=${u.display_name} sub=${u.is_owner ? 'Owner' : u.devices ? `${u.devices} device${u.devices === 1 ? '' : 's'}` : 'Not paired yet'}
+      onClick=${u.is_owner ? undefined : () => menu(u)} chevron=${!u.is_owner}
+      right=${!u.is_owner && !u.devices && html`<span class="row-btns"><button class="cn" onClick=${(e) => { e.stopPropagation(); code(u); }}>Pair</button></span>`} />`)}
       <${Row} icon="plus" title="Add a person" accent onClick=${add} chevron=${false} /><//>`}
   <//>`;
 }

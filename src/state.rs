@@ -3,7 +3,7 @@
 
 use crate::auth::PairLimiter;
 use crate::catalog::{Catalog, codex_cache_path};
-use crate::config::{Config, HarnessConfig, Paths};
+use crate::config::{Config, HarnessConfig, Paths, PersonDirs};
 use crate::db::{self, Db};
 use crate::events::Hub;
 use crate::harness::runner::{self, Limiter};
@@ -119,6 +119,8 @@ pub struct Inner {
     serving: std::sync::atomic::AtomicBool,
     /// Last broadcast recommendation per slot (to announce changes).
     last_recommended: Mutex<BTreeMap<Slot, Option<String>>>,
+    /// Voice synthesis and transcription run one at a time.
+    pub voice_jobs: tokio::sync::Semaphore,
 }
 
 /// Catalog cache key: (codex cache mtime, discovery generation).
@@ -169,6 +171,7 @@ impl AppState {
             engine_ops: crate::setup::EngineOps::default(),
             serving: std::sync::atomic::AtomicBool::new(false),
             last_recommended: Mutex::default(),
+            voice_jobs: tokio::sync::Semaphore::new(1),
             limiter: Limiter::new(cfg.max_concurrent_turns),
             cfg,
             paths,
@@ -537,6 +540,7 @@ impl AppState {
             .flatten()
     }
 
+    /// The owner's Iris name (server-level messages such as push tests).
     pub async fn agent_name(&self) -> String {
         self.setting("agent_name")
             .await
@@ -544,28 +548,102 @@ impl AppState {
             .unwrap_or_else(|| self.cfg.agent_name.clone())
     }
 
-    pub async fn feed_prompt(&self) -> String {
-        self.setting("feed_prompt")
+    pub async fn user(&self, id: &str) -> Option<db::User> {
+        let id = id.to_string();
+        self.db
+            .call(move |c| db::get_user(c, &id))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub async fn owner_id(&self) -> Option<String> {
+        self.db.call(db::owner_user_id).await.ok().flatten()
+    }
+
+    /// One person's Iris folders (persona, memory, workspace).
+    pub fn dirs_for(&self, user: &db::User) -> PersonDirs {
+        self.paths.person_dirs(&user.id, user.is_owner)
+    }
+
+    /// A per-person setting (each person's Iris has its own name, picture,
+    /// feed prompt, and voice choice).
+    pub async fn person_setting(&self, user: &db::User, key: &str) -> Option<String> {
+        let k = person_key(&user.id, user.is_owner, key);
+        self.db
+            .call(move |c| db::get_setting(c, &k))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub async fn agent_name_for(&self, user: &db::User) -> String {
+        self.person_setting(user, "agent_name")
+            .await
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| self.cfg.agent_name.clone())
+    }
+
+    pub async fn feed_prompt_for(&self, user: &db::User) -> String {
+        self.person_setting(user, "feed_prompt")
             .await
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_FEED_PROMPT.to_string())
     }
 
-    /// Settings as exposed to clients.
-    pub async fn settings_json(&self) -> Value {
-        let avatar = self.setting("agent_avatar").await;
-        let updated = self
-            .setting("agent_avatar_updated")
-            .await
-            .unwrap_or_default();
+    /// The person turned on voice replies.
+    pub async fn voice_replies_for(&self, user: &db::User) -> bool {
+        self.person_setting(user, "voice_replies").await.as_deref() == Some("true")
+    }
+
+    /// `avatar_url` for a person's Iris (the `v` parameter busts caches).
+    pub async fn avatar_url_for(&self, user: &db::User) -> (String, bool) {
+        let custom = self.person_setting(user, "agent_avatar").await.is_some();
+        let v = if custom {
+            self.person_setting(user, "agent_avatar_updated")
+                .await
+                .unwrap_or_default()
+        } else {
+            "default".into()
+        };
+        // Always names whose Iris it is, so the URL means the same thing to
+        // everyone in a Together chat.
+        (format!("/api/avatar?user={}&v={v}", user.id), custom)
+    }
+
+    /// Settings as exposed to one person: their own Iris (name, picture,
+    /// feed prompt, voice) plus the server-wide policy flag.
+    pub async fn settings_json_for(&self, user: &db::User) -> Value {
+        let (avatar_url, avatar_custom) = self.avatar_url_for(user).await;
+        let root = self.cfg.engines_dir(&self.paths);
         json!({
-            "agent_name": self.agent_name().await,
-            "avatar_url": format!("/api/avatar?v={}", if avatar.is_some() { updated } else { "default".into() }),
-            "avatar_custom": avatar.is_some(),
+            "agent_name": self.agent_name_for(user).await,
+            "avatar_url": avatar_url,
+            "avatar_custom": avatar_custom,
             "allow_claude_for_shared": self.allow_claude_for_shared().await,
-            "feed_prompt": self.feed_prompt().await,
-            "voice": {"enabled": false, "status": "not_implemented"},
+            "feed_prompt": self.feed_prompt_for(user).await,
+            "voice": {
+                "enabled": self.voice_replies_for(user).await,
+                "tts": crate::voice::installed(&root, crate::voice::Component::Tts),
+                "stt": crate::voice::installed(&root, crate::voice::Component::Stt),
+            },
         })
+    }
+
+    /// Send each listed person their own `settings.changed`.
+    pub async fn broadcast_settings(&self, users: &[db::User]) {
+        for u in users {
+            let settings = self.settings_json_for(u).await;
+            self.hub.to_users(
+                std::slice::from_ref(&u.id),
+                json!({"type": "settings.changed", "settings": settings}),
+            );
+        }
+    }
+
+    /// Everyone on this server, oldest first.
+    pub async fn all_users(&self) -> Vec<db::User> {
+        self.db.call(db::list_users).await.unwrap_or_default()
     }
 
     /// Per-conversation turn lock.
@@ -574,6 +652,16 @@ impl AppState {
         // Drop locks nobody holds to keep the map small.
         map.retain(|_, l| Arc::strong_count(l) > 1);
         map.entry(conversation_id.to_string()).or_default().clone()
+    }
+}
+
+/// Settings key for one person's Iris. The owner keeps the original
+/// top-level keys (`agent_name`, `agent_avatar`, ...).
+pub fn person_key(user_id: &str, is_owner: bool, key: &str) -> String {
+    if is_owner {
+        key.to_string()
+    } else {
+        format!("person.{user_id}.{key}")
     }
 }
 

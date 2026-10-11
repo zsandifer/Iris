@@ -76,6 +76,11 @@ pub struct TurnSpec {
     /// Stable key for per-conversation state some CLIs keep on disk
     /// (the conversation id).
     pub scope: String,
+    /// Folders and files the agent must not read or edit this turn: other
+    /// people's Iris folders and Iris's own state. Enforced by CLIs with
+    /// path deny rules (Claude Code); the others rely on folder separation
+    /// and the prompt.
+    pub private_paths: Vec<PathBuf>,
 }
 
 /// A fully built command line.

@@ -346,6 +346,60 @@ pub fn get_user(conn: &Connection, id: &str) -> rusqlite::Result<Option<User>> {
     .optional()
 }
 
+/// Everyone on this server, oldest first.
+pub fn list_users(conn: &Connection) -> rusqlite::Result<Vec<User>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, display_name, is_owner, created_at FROM users ORDER BY created_at, rowid",
+    )?;
+    stmt.query_map([], |r| {
+        Ok(User {
+            id: r.get(0)?,
+            display_name: r.get(1)?,
+            is_owner: r.get(2)?,
+            created_at: r.get(3)?,
+        })
+    })?
+    .collect()
+}
+
+/// Remove a person (never the owner) and everything that is only theirs:
+/// devices, pairing codes, push subscriptions, feed, ideas, goals, library
+/// rows, credentials, their own chats, and Together chats they created.
+/// Returns the library file names and conversation ids to clean up.
+pub fn delete_person(
+    conn: &Connection,
+    id: &str,
+) -> rusqlite::Result<Option<(Vec<String>, Vec<String>)>> {
+    let Some(u) = get_user(conn, id)? else {
+        return Ok(None);
+    };
+    if u.is_owner {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare("SELECT file_name FROM library_items WHERE user_id = ?1")?;
+    let files: Vec<String> = stmt
+        .query_map([id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut stmt = conn.prepare("SELECT id FROM conversations WHERE created_by = ?1")?;
+    let convs: Vec<String> = stmt
+        .query_map([id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for c in &convs {
+        conn.execute("DELETE FROM conversations WHERE id = ?1", [c])?;
+    }
+    conn.execute(
+        "DELETE FROM settings WHERE key LIKE ?1",
+        [format!("person.{id}.%")],
+    )?;
+    conn.execute(
+        "DELETE FROM settings WHERE key = ?1",
+        [format!("quiet_hours:{id}")],
+    )?;
+    // Devices, codes, members, subscriptions, and entities cascade.
+    conn.execute("DELETE FROM users WHERE id = ?1 AND is_owner = 0", [id])?;
+    Ok(Some((files, convs)))
+}
+
 pub fn rename_user(conn: &Connection, id: &str, name: &str) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE users SET display_name = ?2 WHERE id = ?1",
@@ -514,6 +568,8 @@ pub struct Conversation {
     pub updated_at: i64,
     pub archived_at: Option<i64>,
     pub member_count: i64,
+    /// The person whose Iris answers here (the creator).
+    pub created_by: Option<String>,
 }
 
 fn conversation_from_row(r: &rusqlite::Row) -> rusqlite::Result<Conversation> {
@@ -527,6 +583,7 @@ fn conversation_from_row(r: &rusqlite::Row) -> rusqlite::Result<Conversation> {
         updated_at: r.get("updated_at")?,
         archived_at: r.get("archived_at")?,
         member_count: r.get("member_count")?,
+        created_by: r.get("created_by")?,
     })
 }
 

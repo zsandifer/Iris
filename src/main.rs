@@ -26,6 +26,7 @@ mod setup;
 mod state;
 mod turn;
 mod util;
+mod voice;
 
 use config::{Config, Paths};
 use std::path::PathBuf;
@@ -45,7 +46,8 @@ Usage:
                                    Iris MCP bridge (launched by harnesses)
   iris engines <install|update|uninstall> <NAME> [--dir PATH]
   iris engines list [--dir PATH]   Install/update the official CLIs (claude,
-                                   codex, gemini, opencode) into the engines
+                                   codex, gemini, opencode) and the local
+                                   voice (tts, stt) into the engines
                                    directory; prints JSON. Also the entry
                                    point of the privileged helper.
   iris demo-seed --assets DIR       Fill a fresh data directory with fake demo

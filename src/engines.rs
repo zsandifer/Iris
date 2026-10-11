@@ -40,6 +40,9 @@ pub enum Method {
         package: &'static str,
         launcher: Launcher,
     },
+    /// Local voice (not an AI engine): sherpa-onnx plus a model, see
+    /// `voice.rs`.
+    Voice(crate::voice::Component),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,10 +95,32 @@ pub const ENGINES: &[EngineSource] = &[
         },
         source: "npm: opencode-ai",
     },
+    EngineSource {
+        name: "tts",
+        label: "Voice replies",
+        method: Method::Voice(crate::voice::Component::Tts),
+        source: "github.com/k2-fsa/sherpa-onnx releases: Piper voice (SHA-256 pinned)",
+    },
+    EngineSource {
+        name: "stt",
+        label: "Voice input",
+        method: Method::Voice(crate::voice::Component::Stt),
+        source: "github.com/k2-fsa/sherpa-onnx releases: Whisper base.en (SHA-256 pinned)",
+    },
 ];
 
 pub fn source(name: &str) -> Option<&'static EngineSource> {
     ENGINES.iter().find(|e| e.name == name)
+}
+
+impl EngineSource {
+    /// The voice component, for the two voice entries.
+    pub fn voice(&self) -> Option<crate::voice::Component> {
+        match self.method {
+            Method::Voice(c) => Some(c),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -117,11 +142,17 @@ pub fn launcher(root: &Path, name: &str) -> PathBuf {
 }
 
 pub fn is_installed(root: &Path, name: &str) -> bool {
-    launcher(root, name).exists()
+    match source(name).and_then(EngineSource::voice) {
+        Some(c) => crate::voice::installed(root, c),
+        None => launcher(root, name).exists(),
+    }
 }
 
 /// Version recorded at install time.
 pub fn installed_version(root: &Path, name: &str) -> Option<String> {
+    if let Some(c) = source(name).and_then(EngineSource::voice) {
+        return crate::voice::installed_version(root, c);
+    }
     std::fs::read_to_string(root.join(name).join("VERSION"))
         .ok()
         .map(|s| s.trim().to_string())
@@ -419,12 +450,16 @@ pub fn install(root: &Path, name: &str) -> Result<Report> {
     match src.method {
         Method::ClaudeNative => install_claude(root),
         Method::Npm { package, launcher } => install_npm(root, name, package, launcher),
+        Method::Voice(c) => crate::voice::install(root, c),
     }
 }
 
 /// Remove an engine Iris installed (never anything else).
 pub fn uninstall(root: &Path, name: &str) -> Result<()> {
-    source(name).ok_or_else(|| format!("unknown engine {name}"))?;
+    let src = source(name).ok_or_else(|| format!("unknown engine {name}"))?;
+    if let Some(c) = src.voice() {
+        return crate::voice::uninstall(root, c);
+    }
     let _ = std::fs::remove_file(launcher(root, name));
     let dir = root.join(name);
     if dir.exists() {
@@ -436,6 +471,12 @@ pub fn uninstall(root: &Path, name: &str) -> Result<()> {
 /// `iris engines <install|update|uninstall|list> [name] --dir <root>`:
 /// the privileged helper entry point. Prints one JSON object.
 pub fn cli(args: &[String], root: &Path) -> Result<()> {
+    // Engines must stay readable and runnable by the agent user, whatever
+    // umask sudo or the service gave this helper process.
+    // SAFETY: umask only changes this process's file creation mask.
+    unsafe {
+        libc::umask(0o022);
+    }
     let out = match (args.first().map(String::as_str), args.get(1)) {
         (Some("install" | "update"), Some(name)) => serde_json::to_value(install(root, name)?)?,
         (Some("uninstall"), Some(name)) => {
@@ -456,7 +497,7 @@ pub fn cli(args: &[String], root: &Path) -> Result<()> {
         ),
         _ => {
             return Err(
-                "usage: iris engines <install|update|uninstall> <claude|codex|gemini|opencode> --dir <path> | iris engines list --dir <path>"
+                "usage: iris engines <install|update|uninstall> <claude|codex|gemini|opencode|tts|stt> --dir <path> | iris engines list --dir <path>"
                     .into(),
             );
         }

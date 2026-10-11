@@ -74,13 +74,36 @@ pub fn engines_root(state: &AppState) -> PathBuf {
     state.cfg.engines_dir(&state.paths)
 }
 
-/// Engines for the Settings screen.
+/// Engines for the Settings screen (the AI engines, then the two voice
+/// components with `"kind": "voice"`).
 pub fn engines_json(state: &AppState) -> Vec<Value> {
     let root = engines_root(state);
     let npm = crate::harness::resolve_command("npm").is_some();
     ENGINES
         .iter()
         .map(|e| {
+            if let Some(c) = e.voice() {
+                let installed = crate::voice::installed(&root, c);
+                let unsupported = crate::voice::runtime_artifact()
+                    .err()
+                    .map(|e| e.to_string());
+                return json!({
+                    "name": e.name,
+                    "kind": "voice",
+                    "label": e.label,
+                    "source": e.source,
+                    "installed": installed,
+                    "managed": installed,
+                    "external": false,
+                    "version": crate::voice::installed_version(&root, c),
+                    "managed_version": crate::voice::installed_version(&root, c),
+                    "auth": null,
+                    "requires": crate::voice::missing_tools(),
+                    "unsupported": unsupported,
+                    "download_mb": crate::voice::download_mb(c),
+                    "operation": state.engine_ops.get(e.name),
+                });
+            }
             let status = state.harness(e.name).map(|h| h.status());
             let managed = engines::is_installed(&root, e.name);
             let installed = status.as_ref().is_some_and(|s| s.installed);
@@ -90,6 +113,7 @@ pub fn engines_json(state: &AppState) -> Vec<Value> {
             };
             json!({
                 "name": e.name,
+                "kind": "engine",
                 "label": e.label,
                 "source": e.source,
                 "installed": installed,
@@ -219,7 +243,12 @@ async fn run_op(state: &AppState, name: &str, op: &'static str) {
         }
     }
     state.engine_ops.set(name, entry);
-    if result.is_ok() {
+    let voice = engines::source(name).and_then(|e| e.voice()).is_some();
+    if result.is_ok() && voice {
+        // Voice availability is part of everyone's settings.
+        let users = state.all_users().await;
+        state.broadcast_settings(&users).await;
+    } else if result.is_ok() {
         let auth = state.probe_auth(name).await;
         if op == "install" && auth != AuthState::Ok {
             crate::login::post_signin_card(state, name, true).await;
@@ -320,6 +349,7 @@ pub async fn post_setup_card_if_needed(state: &AppState) {
 fn setup_options(state: &AppState) -> Vec<Value> {
     engines_json(state)
         .into_iter()
+        .filter(|e| e["kind"] == "engine")
         .map(|e| {
             let name = e["name"].as_str().unwrap_or("").to_string();
             json!({

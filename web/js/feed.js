@@ -1,7 +1,7 @@
 // For you: story cards per topic, Instagram-like posts, full-screen stories.
 import { html, useEffect, useRef, useState } from './h.js';
 import { post as apiPost } from './api.js';
-import { S, set, useStore, loadFeed, go, toast, isOwner } from './store.js';
+import { S, set, useStore, loadFeed, go, toast } from './store.js';
 import { Icon, Img, LetterTile, Empty, Spinner, ago, hostOf, safeUrl } from './ui.js';
 import { md, plain } from './md.js';
 
@@ -115,7 +115,7 @@ export function FeedScreen() {
     ${posts.map((p) => html`<${Post} p=${p} key=${p.id} />`)}
     ${!posts.length && html`<${Empty} icon="sparkles" title="Your feed is warming up">
       I'll add a few things a day that fit what you like. Tap ♡ on what you enjoy and I'll learn.
-      ${isOwner() && html`<div><button class="b1 sm" disabled=${busy} onClick=${refresh}>Find something now</button></div>`}
+      <div><button class="b1 sm" disabled=${busy} onClick=${refresh}>Find something now</button></div>
     <//>`}
     ${posts.length > 0 && !S.feed.hasMore && html`<div class="end mu">You're all caught up.</div>`}
   </div>`;

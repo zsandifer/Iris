@@ -2,7 +2,7 @@
 import { html, render, useEffect, useRef, useState } from './h.js';
 import { api, get, post, patch, del, setToken, hasToken, onUnauthorized, connectEvents, ApiError } from './api.js';
 import {
-  S, set, useStore, go, toast, handleEvent, loadConvs, mainId, isOwner,
+  S, set, useStore, go, toast, handleEvent, loadConvs, mainId, isOwner, hostAgent,
 } from './store.js';
 import { Icon, Avatar, Img, Sheet, agentName, promptSheet, confirmSheet, openSheet, closeSheet, LetterTile } from './ui.js';
 import { ChatScreen } from './chat.js';
@@ -62,7 +62,7 @@ function Pair() {
     <div class="pair-in">
       <div class="avatar" style="width:84px;height:84px"><div class="orb" /></div>
       <h1 class="serif">Pair this ${/iPhone|Android/.test(navigator.userAgent) ? 'phone' : 'device'}</h1>
-      <p class="mu">Run <code>iris pair</code> on your server and type the code it shows.</p>
+      <p class="mu">Type the code from <code>iris pair</code> on your server, or the one the owner made for you under Settings, People.</p>
       <form onSubmit=${submit}>
         <input ref=${ref} class="code-in" value=${code} onInput=${onInput} placeholder="XXXX-XXXX"
           autocomplete="one-time-code" autocapitalize="characters" spellcheck=${false} aria-label="Pairing code" />
@@ -89,12 +89,15 @@ function Drawer() {
   const newTogether = async () => {
     try {
       const { users } = await get('/users');
-      const others = users.filter((u) => !u.is_owner);
-      if (!others.length) { go('settings/people'); toast('Add a person first'); return; }
+      const others = users.filter((u) => u.id !== S.me?.user?.id);
+      if (!others.length) {
+        if (isOwner()) { go('settings/people'); toast('Add a person first'); } else toast('Nobody else is on this Iris yet.');
+        return;
+      }
       openSheet(() => html`<div class="sheet-body"><h3>Chat together</h3><p class="mu">Pick who to chat with. ${agentName()} joins too.</p>
         <div class="grp">${others.map((u) => html`<div class="r tap" onClick=${async () => {
           closeSheet();
-          try { const r = await post('/conversations', { kind: 'group', title: `You and ${u.display_name}`, member_ids: [u.id] }); go(`chat/${r.conversation.id}`); } catch (e) { toast(e.message); }
+          try { const r = await post('/conversations', { kind: 'group', title: `${S.me.user.display_name} and ${u.display_name}`, member_ids: [u.id] }); await loadConvs(); go(`chat/${r.conversation.id}`); } catch (e) { toast(e.message); }
         }}><${LetterTile} name=${u.display_name} radius=${15} /><div class="rt">${u.display_name}</div></div>`)}</div></div>`);
     } catch (e) { toast(e.message); }
   };
@@ -107,9 +110,9 @@ function Drawer() {
         <div class="sm">Chats</div>
         ${chats.map((c) => html`<${Item} c=${c} icon=${c.kind === 'main' ? 'chat' : c.seed?.type === 'feed_post' ? 'sparkles' : c.seed?.type === 'idea' ? 'bulb' : 'chat'} />`)}
         <button class="it ac" onClick=${newSide}><${Icon} name="plus" size=${18} /><span>New side chat</span></button>
-        ${(together.length > 0 || isOwner()) && html`<div class="sm">Together</div>`}
+        <div class="sm">Together</div>
         ${together.map((c) => html`<${Item} c=${c} icon="users" />`)}
-        ${isOwner() && html`<button class="it ac" onClick=${newTogether}><${Icon} name="plus" size=${18} /><span>New together chat</span></button>`}
+        <button class="it ac" onClick=${newTogether}><${Icon} name="plus" size=${18} /><span>New together chat</span></button>
       </div>
       <button class="profile" onClick=${() => go('iris')}>
         <${Avatar} size=${38} /><div class="grow"><b>${agentName()}</b><small>Connections, logins, settings</small></div>
@@ -153,14 +156,17 @@ function TopBar() {
   const cid = currentChat();
   const conv = (S.convs || []).find((c) => c.id === cid);
   const busy = Object.keys(S.live).length > 0;
+  // In a Together chat someone else started, their Iris answers.
+  const host = S.route.tab === 'chat' ? hostAgent(cid) : null;
+  const name = host?.name || agentName();
   let line = 'here for you';
   if (!S.online) line = 'reconnecting…';
   else if (S.route.tab === 'chat' && conv && conv.kind !== 'main') line = title(conv);
   else if (busy) line = 'working on it';
   return html`<header class="top">
     <button class="btn" aria-label="Menu" onClick=${() => set({ drawer: true })}><${Icon} name="menu" /></button>
-    <button class="who-btn" onClick=${() => go('iris')} aria-label=${`${agentName()} profile`}><${Avatar} size=${36} /></button>
-    <div class="grow"><div class="nm">${agentName()}</div><div class=${'st' + (!S.online ? ' warn' : '')}>${line}</div></div>
+    <button class="who-btn" onClick=${() => go('iris')} aria-label=${`${name} profile`}><${Avatar} size=${36} agent=${host} /></button>
+    <div class="grow"><div class="nm">${name}</div><div class=${'st' + (!S.online ? ' warn' : '')}>${line}</div></div>
     ${S.route.tab === 'chat' && conv && conv.kind !== 'main' && html`<button class="btn" aria-label="Chat options" onClick=${() => chatMenu(conv)}><${Icon} name="more" cls="ic-more" /></button>`}
   </header>`;
 }
@@ -196,7 +202,7 @@ function Screen() {
     case 'iris': {
       const [, sub, a, ...rest] = parts;
       if (!sub) return html`<${Hub} />`;
-      if (!owner) return html`<${Settings} />`;
+      if (!owner && sub !== 'files') return html`<${Settings} />`;
       if (sub === 'connections') return a ? html`<${ConnectorForm} id=${a} key=${a} />` : html`<${Connections} />`;
       if (sub === 'logins') return html`<${Logins} />`;
       if (sub === 'computer') return html`<${Computer} />`;

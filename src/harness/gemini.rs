@@ -522,6 +522,7 @@ mod tests {
             writable_dirs: vec!["/data/memory".into()],
             run_dir: tmp.path().into(),
             scope: "conv/../1".into(),
+            private_paths: Vec::new(),
         };
         let inv = Gemini::new(HarnessConfig::gemini_default())
             .build(&spec)

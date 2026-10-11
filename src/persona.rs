@@ -6,7 +6,7 @@
 //! (`--append-system-prompt-file` / `developer_instructions`), before the
 //! user's message.
 
-use crate::config::{Paths, ensure_private_dir, write_private_file};
+use crate::config::{Paths, PersonDirs, ensure_private_dir, write_private_file};
 use crate::router::Purpose;
 use crate::util::{Result, truncate_chars};
 use std::path::{Path, PathBuf};
@@ -84,10 +84,10 @@ pub fn system_file(name: &str) -> Option<&'static SystemFile> {
     SYSTEM_FILES.iter().find(|f| f.name == name)
 }
 
-pub fn system_file_path(paths: &Paths, f: &SystemFile) -> PathBuf {
+pub fn system_file_path(dirs: &PersonDirs, f: &SystemFile) -> PathBuf {
     match f.area {
-        Area::Persona => paths.persona_dir().join(f.name),
-        Area::Memory => paths.memory_dir().join(f.name),
+        Area::Persona => dirs.persona.join(f.name),
+        Area::Memory => dirs.memory.join(f.name),
     }
 }
 
@@ -99,23 +99,25 @@ const MAX_MEMORY_DEPTH: usize = 4;
 /// for codex where it travels as a `-c developer_instructions=...` value.
 pub const MAX_PROMPT_CHARS: usize = 100_000;
 
-/// Create the data directory layout and seed missing persona files.
-/// Returns the files that were created.
+/// Create the data directory layout and seed the owner's missing persona
+/// files. Returns the files that were created.
 pub fn seed(paths: &Paths) -> Result<Vec<String>> {
     ensure_private_dir(&paths.data_dir)?;
-    for dir in [
-        paths.persona_dir(),
-        paths.memory_dir(),
-        paths.workspace_dir(),
-        paths.uploads_dir(),
-        paths.library_dir(),
-        paths.run_dir(),
-    ] {
+    for dir in [paths.uploads_dir(), paths.library_dir(), paths.run_dir()] {
         ensure_private_dir(&dir)?;
+    }
+    seed_person(&paths.owner_dirs())
+}
+
+/// Create one person's Iris folders and seed missing persona files from
+/// the generic templates. Returns the files that were created.
+pub fn seed_person(dirs: &PersonDirs) -> Result<Vec<String>> {
+    for dir in dirs.all() {
+        ensure_private_dir(dir)?;
     }
     let mut created = Vec::new();
     for f in SYSTEM_FILES {
-        let path = system_file_path(paths, f);
+        let path = system_file_path(dirs, f);
         if !path.exists() {
             write_private_file(&path, f.template.as_bytes())?;
             created.push(f.name.to_string());
@@ -135,15 +137,19 @@ pub struct PromptContext<'a> {
     pub participants: &'a [String],
     /// Whether the `iris` MCP bridge is attached to this turn.
     pub app_tools: bool,
-    /// More than one person in the conversation: the owner's private
-    /// persona (USER.md) and memory are left out of the prompt.
+    /// More than one person in the conversation: only who the agent is
+    /// (IDENTITY.md, SOUL.md) is included; everyone's private files
+    /// (USER.md, TOOLS.md, PROACTIVE_PREFERENCES.md) and memory are left
+    /// out.
     pub shared: bool,
+    /// Display name of the person this Iris works for (personal chats).
+    pub user_name: Option<&'a str>,
     /// Short notes such as "the Claude engine needs the owner to sign in".
     pub notices: &'a [String],
 }
 
 /// Assemble the system prompt appended to the harness's own system prompt.
-pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
+pub fn assemble(dirs: &PersonDirs, ctx: &PromptContext) -> String {
     let name = ctx.agent_name;
     let mut out = String::new();
     out.push_str(&format!(
@@ -155,6 +161,16 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
          not bring up AI models, tokens, or reasoning settings unless the \
          user asks.\n"
     ));
+    // "Owner" is the placeholder name before the person sets their own.
+    if let Some(user) = ctx
+        .user_name
+        .map(str::trim)
+        .filter(|u| !u.is_empty() && *u != "Owner" && !ctx.shared)
+    {
+        out.push_str(&format!(
+            "\nThe person you work for is called {user} in the app.\n"
+        ));
+    }
 
     match (ctx.purpose, ctx.conversation_kind) {
         (Purpose::Scheduled, _) => out.push_str(
@@ -178,9 +194,9 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
 
     for f in SYSTEM_FILES
         .iter()
-        .filter(|f| f.in_prompt && !(ctx.shared && f.name == "USER.md"))
+        .filter(|f| f.in_prompt && (!ctx.shared || SHARED_FILES.contains(&f.name)))
     {
-        let Ok(body) = std::fs::read_to_string(system_file_path(paths, f)) else {
+        let Ok(body) = std::fs::read_to_string(system_file_path(dirs, f)) else {
             continue;
         };
         let body = body.replace("{{agent_name}}", name);
@@ -203,12 +219,12 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
 
     if ctx.shared {
         out.push_str(
-            "\n## Memory\n\nThe owner's personal memory is not available in shared \
-             conversations. Do not look for it or reveal personal details about anyone \
+            "\n## Memory\n\nNobody's personal memory or files are available in shared \
+             conversations. Do not look for them or reveal personal details about anyone \
              that were not shared in this conversation.\n",
         );
     } else {
-        let memory_dir = paths.memory_dir();
+        let memory_dir = dirs.memory.clone();
         let mut entries = Vec::new();
         collect_memory(&memory_dir, &memory_dir, 0, &mut entries);
         entries.retain(|(rel, _, _)| rel != "MEMORY.md");
@@ -261,6 +277,10 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
     truncate_chars(&out, MAX_PROMPT_CHARS)
 }
 
+/// Persona files used in shared conversations: who the agent is, never
+/// facts about anyone.
+const SHARED_FILES: &[&str] = &["IDENTITY.md", "SOUL.md"];
+
 const SHARED_TOOLS_GUIDE: &str = "
 ## The Iris app
 
@@ -298,7 +318,7 @@ when it genuinely helps, and never mention tool names to the user.
 /// Hash of the inputs that define who the agent is (name, conversation
 /// kind, persona files, MEMORY.md). The memory index and notices are left
 /// out so routine memory writes do not invalidate sessions.
-pub fn persona_hash(paths: &Paths, agent_name: &str, conversation_kind: &str) -> String {
+pub fn persona_hash(dirs: &PersonDirs, agent_name: &str, conversation_kind: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(agent_name.as_bytes());
@@ -309,7 +329,7 @@ pub fn persona_hash(paths: &Paths, agent_name: &str, conversation_kind: &str) ->
         .filter(|f| f.in_prompt || f.name == "MEMORY.md")
     {
         h.update([0]);
-        h.update(std::fs::read(system_file_path(paths, f)).unwrap_or_default());
+        h.update(std::fs::read(system_file_path(dirs, f)).unwrap_or_default());
     }
     crate::util::hex(&h.finalize()[..12])
 }
@@ -393,6 +413,7 @@ mod tests {
             participants: &[],
             app_tools: true,
             shared: false,
+            user_name: None,
             notices: &[],
         }
     }
@@ -434,7 +455,7 @@ mod tests {
         std::fs::write(p.memory_dir().join("photo.jpg"), [0u8; 4]).unwrap();
         std::os::unix::fs::symlink("/etc/hostname", p.memory_dir().join("link.md")).unwrap();
 
-        let prompt = assemble(&p, &ctx("Nova"));
+        let prompt = assemble(&p.owner_dirs(), &ctx("Nova"));
         assert!(prompt.starts_with("# You are Nova"));
         assert!(prompt.contains("I am Nova, a personal agent"));
         assert!(!prompt.contains("{{agent_name}}"));
@@ -463,21 +484,26 @@ mod tests {
         c.participants = &people;
         c.notices = &notices;
         c.app_tools = false;
-        let prompt = assemble(&p, &c);
+        let prompt = assemble(&p.owner_dirs(), &c);
         assert!(prompt.contains("group conversation with: Sam, Riley"));
         let mut g = ctx("Iris");
         g.shared = true;
         std::fs::write(p.persona_dir().join("USER.md"), "secret-user-fact").unwrap();
         std::fs::write(p.memory_dir().join("MEMORY.md"), "secret-memory-fact").unwrap();
-        let shared = assemble(&p, &g);
+        std::fs::write(p.persona_dir().join("TOOLS.md"), "secret-tools-fact").unwrap();
+        std::fs::write(p.persona_dir().join("SOUL.md"), "warm-and-brief").unwrap();
+        let shared = assemble(&p.owner_dirs(), &g);
         assert!(!shared.contains("secret-user-fact") && !shared.contains("secret-memory-fact"));
+        assert!(!shared.contains("secret-tools-fact"));
+        assert!(shared.contains("warm-and-brief"), "who the agent is stays");
+        assert!(!shared.contains(&p.memory_dir().display().to_string()));
         assert!(shared.contains("only offers `create_card`"));
         assert!(prompt.contains("## Notices\n\n- The Claude engine"));
         assert!(!prompt.contains("create_goal"));
         let mut c = ctx("Iris");
         c.purpose = Purpose::Scheduled;
-        assert!(assemble(&p, &c).contains("scheduled background job"));
-        assert!(assemble(&p, &ctx("Iris")).contains("(No other memory files yet.)"));
+        assert!(assemble(&p.owner_dirs(), &c).contains("scheduled background job"));
+        assert!(assemble(&p.owner_dirs(), &ctx("Iris")).contains("(No other memory files yet.)"));
     }
 
     #[test]
@@ -485,18 +511,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = paths(tmp.path());
         seed(&p).unwrap();
-        let base = persona_hash(&p, "Iris", "main");
-        assert_eq!(base, persona_hash(&p, "Iris", "main"));
-        assert_ne!(base, persona_hash(&p, "Nova", "main"));
-        assert_ne!(base, persona_hash(&p, "Iris", "group"));
+        let base = persona_hash(&p.owner_dirs(), "Iris", "main");
+        assert_eq!(base, persona_hash(&p.owner_dirs(), "Iris", "main"));
+        assert_ne!(base, persona_hash(&p.owner_dirs(), "Nova", "main"));
+        assert_ne!(base, persona_hash(&p.owner_dirs(), "Iris", "group"));
         std::fs::write(p.memory_dir().join("trip.md"), "# Trip").unwrap();
         assert_eq!(
             base,
-            persona_hash(&p, "Iris", "main"),
+            persona_hash(&p.owner_dirs(), "Iris", "main"),
             "memory index ignored"
         );
         std::fs::write(p.memory_dir().join("MEMORY.md"), "new fact").unwrap();
-        assert_ne!(base, persona_hash(&p, "Iris", "main"));
+        assert_ne!(base, persona_hash(&p.owner_dirs(), "Iris", "main"));
     }
 
     #[test]
@@ -513,7 +539,33 @@ mod tests {
         ] {
             std::fs::write(p.persona_dir().join(f), "x".repeat(30_000)).unwrap();
         }
-        let prompt = assemble(&p, &ctx("Iris"));
+        let prompt = assemble(&p.owner_dirs(), &ctx("Iris"));
         assert!(prompt.chars().count() <= MAX_PROMPT_CHARS + 1);
+    }
+
+    #[test]
+    fn each_person_gets_their_own_persona_and_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        seed(&p).unwrap();
+        let other = p.person_dirs("0123456789abcdef0123456789abcdef", false);
+        assert_eq!(seed_person(&other).unwrap().len(), SYSTEM_FILES.len());
+        std::fs::write(p.memory_dir().join("MEMORY.md"), "owner-secret").unwrap();
+        std::fs::write(other.memory.join("MEMORY.md"), "partner-fact").unwrap();
+        std::fs::write(other.persona.join("USER.md"), "partner-user").unwrap();
+        let mut c = ctx("Juno");
+        c.user_name = Some("Riley");
+        let prompt = assemble(&other, &c);
+        assert!(prompt.contains("partner-fact") && prompt.contains("partner-user"));
+        assert!(prompt.contains("called Riley"));
+        assert!(!prompt.contains("owner-secret"));
+        assert!(!prompt.contains(&p.memory_dir().display().to_string()));
+        let owner = assemble(&p.owner_dirs(), &ctx("Iris"));
+        assert!(owner.contains("owner-secret") && !owner.contains("partner-fact"));
+        assert!(!owner.contains("called "), "no placeholder name");
+        assert_ne!(
+            persona_hash(&other, "Iris", "main"),
+            persona_hash(&p.owner_dirs(), "Iris", "main")
+        );
     }
 }

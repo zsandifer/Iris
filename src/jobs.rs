@@ -1,9 +1,11 @@
 //! Scheduled background jobs. They run as `Purpose::Scheduled` turns on the
-//! `background` (heartbeat) and `feed` slots. They are the owner's own
-//! individual use, so any signed-in engine may run them.
+//! `background` (heartbeat) and `feed` slots, for every person's own Iris.
+//! The owner's jobs are the owner's own individual use, so any signed-in
+//! engine may run them; other people's jobs follow the individual-use
+//! policy like their chats (Claude only with the owner's opt-in).
 //!
-//! - heartbeat: reads HEARTBEAT.md and, only when something needs
-//!   attention, posts a message in the owner's Main chat (and pushes it).
+//! - heartbeat: reads the person's HEARTBEAT.md and, only when something
+//!   needs attention, posts a message in their Main chat (and pushes it).
 //! - feed: asks the agent to publish feed posts (and maybe ideas) through
 //!   the Iris MCP bridge, guided by the user-editable feed prompt.
 
@@ -15,13 +17,18 @@ use crate::state::AppState;
 use crate::turn::{TurnInput, run_turn};
 use crate::util::{now_ms, truncate_chars};
 use serde_json::{Value, json};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::time::Duration;
 
 pub const HEARTBEAT_OK: &str = "HEARTBEAT_OK";
 
-static HEARTBEAT_RUNNING: AtomicBool = AtomicBool::new(false);
-static FEED_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Jobs running now, by (job, person).
+static RUNNING: Mutex<BTreeSet<(&'static str, String)>> = Mutex::new(BTreeSet::new());
+
+fn running() -> std::sync::MutexGuard<'static, BTreeSet<(&'static str, String)>> {
+    RUNNING.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Job {
@@ -51,43 +58,49 @@ impl Job {
             Job::Feed => &state.cfg.feed,
         }
     }
-    fn flag(self) -> &'static AtomicBool {
-        match self {
-            Job::Heartbeat => &HEARTBEAT_RUNNING,
-            Job::Feed => &FEED_RUNNING,
-        }
-    }
-    fn last_run_key(self) -> &'static str {
-        match self {
-            Job::Heartbeat => "job.heartbeat.last_run",
-            Job::Feed => "job.feed.last_run",
-        }
+    /// Per person; the owner keeps the original key.
+    fn last_run_key(self, user: &db::User) -> String {
+        crate::state::person_key(
+            &user.id,
+            user.is_owner,
+            &format!("job.{}.last_run", self.name()),
+        )
     }
 }
 
-/// Start a job in the background unless it is already running.
-pub fn trigger(state: &AppState, job: Job) -> bool {
-    if job.flag().swap(true, Ordering::SeqCst) {
+async fn last_run(state: &AppState, job: Job, user: &db::User) -> Option<i64> {
+    state
+        .person_setting(user, &format!("job.{}.last_run", job.name()))
+        .await
+        .and_then(|s| s.parse::<i64>().ok())
+}
+
+/// Start a person's job in the background unless it is already running.
+pub fn trigger(state: &AppState, job: Job, user_id: &str) -> bool {
+    if !running().insert((job.name(), user_id.to_string())) {
         return false;
     }
-    let state = state.clone();
+    let (state, uid) = (state.clone(), user_id.to_string());
     tokio::spawn(async move {
-        if let Err(e) = run_job(&state, job).await {
+        if let Err(e) = run_job(&state, job, &uid).await {
             crate::warn!("{} job failed: {e}", job.name());
         }
-        job.flag().store(false, Ordering::SeqCst);
+        running().remove(&(job.name(), uid));
     });
     true
 }
 
+/// The owner's job status (the operator view).
 pub async fn status(state: &AppState) -> Vec<Value> {
+    let owner = state.owner_id().await.unwrap_or_default();
+    let owner_user = state.user(&owner).await;
     let mut out = Vec::new();
     for job in Job::ALL {
         let cfg = job.cfg(state);
-        let last = state
-            .setting(job.last_run_key())
-            .await
-            .and_then(|s| s.parse::<i64>().ok());
+        let last = match &owner_user {
+            Some(u) => last_run(state, job, u).await,
+            None => None,
+        };
         out.push(json!({
             "name": job.name(),
             "enabled": cfg.enabled,
@@ -95,7 +108,7 @@ pub async fn status(state: &AppState) -> Vec<Value> {
             "active_start": cfg.active_start,
             "active_end": cfg.active_end,
             "last_run_at": last,
-            "running": job.flag().load(Ordering::SeqCst),
+            "running": running().contains(&(job.name(), owner.clone())),
         }));
     }
     out
@@ -172,24 +185,35 @@ pub fn spawn_scheduler(state: AppState) {
             // automatic slots; announce it.
             state.check_recommendations().await;
             crate::setup::maybe_auto_update(&state).await;
-            for job in Job::ALL {
-                let last = state
-                    .setting(job.last_run_key())
-                    .await
-                    .and_then(|s| s.parse::<i64>().ok());
-                if due(job.cfg(&state), last, now_ms(), local_minutes_now()) {
-                    trigger(&state, job);
+            if n % 1440 == 1 {
+                crate::voice::prune_cache(
+                    &state.paths.voice_dir(),
+                    Duration::from_secs(30 * 24 * 3600),
+                );
+            }
+            if !Job::ALL.iter().any(|j| j.cfg(&state).enabled) {
+                continue;
+            }
+            // Every person's Iris runs its own jobs.
+            for user in state.all_users().await {
+                for job in Job::ALL {
+                    let last = last_run(&state, job, &user).await;
+                    if due(job.cfg(&state), last, now_ms(), local_minutes_now()) {
+                        trigger(&state, job, &user.id);
+                    }
                 }
             }
         }
     });
 }
 
-async fn job_prompt(state: &AppState, job: Job, owner: &str) -> String {
+async fn job_prompt(state: &AppState, job: Job, user: &db::User) -> String {
+    let owner = user.id.as_str();
     match job {
         Job::Heartbeat => {
-            let checklist = std::fs::read_to_string(state.paths.persona_dir().join("HEARTBEAT.md"))
-                .unwrap_or_default();
+            let checklist =
+                std::fs::read_to_string(state.dirs_for(user).persona.join("HEARTBEAT.md"))
+                    .unwrap_or_default();
             format!(
                 "Scheduled heartbeat check at {}.\n\nWork through this checklist. Use your \
                  memory files and connected tools as needed.\n\n<heartbeat>\n{}\n</heartbeat>\n\n\
@@ -201,7 +225,7 @@ async fn job_prompt(state: &AppState, job: Job, owner: &str) -> String {
             )
         }
         Job::Feed => {
-            let feed_prompt = state.feed_prompt().await;
+            let feed_prompt = state.feed_prompt_for(user).await;
             let o = owner.to_string();
             let (liked, recent) = state
                 .db
@@ -238,13 +262,11 @@ async fn job_prompt(state: &AppState, job: Job, owner: &str) -> String {
     }
 }
 
-pub async fn run_job(state: &AppState, job: Job) -> crate::util::Result<()> {
-    let owner = state
-        .db
-        .call(db::owner_user_id)
-        .await?
-        .ok_or("no owner user")?;
-    let prompt = job_prompt(state, job, &owner).await;
+/// Run one job for one person's Iris.
+pub async fn run_job(state: &AppState, job: Job, user_id: &str) -> crate::util::Result<()> {
+    let user = state.user(user_id).await.ok_or("no such person")?;
+    let owner = user.id.clone();
+    let prompt = job_prompt(state, job, &user).await;
     let (o, name) = (owner.clone(), job.name());
     let (conv_id, user_msg, assistant_msg) = state
         .db
@@ -298,10 +320,10 @@ pub async fn run_job(state: &AppState, job: Job) -> crate::util::Result<()> {
         },
     )
     .await;
-    let key = job.last_run_key();
+    let key = job.last_run_key(&user);
     state
         .db
-        .call(move |c| db::set_setting(c, key, &started.to_string()))
+        .call(move |c| db::set_setting(c, &key, &started.to_string()))
         .await?;
     crate::info!(
         "{} job finished: {}",
@@ -368,7 +390,10 @@ pub async fn post_to_main(
         &[user_id.to_string()],
         json!({"type": "message.created", "conversation_id": msg.conversation_id, "message": msg}),
     );
-    let title = state.agent_name().await;
+    let title = match state.user(user_id).await {
+        Some(u) => state.agent_name_for(&u).await,
+        None => state.agent_name().await,
+    };
     crate::notify::push_users(
         state,
         &[user_id.to_string()],

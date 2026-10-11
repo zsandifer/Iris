@@ -687,6 +687,7 @@ anthropic/claude-haiku-4-5
             writable_dirs: vec!["/data/memory".into()],
             run_dir: tmp.path().into(),
             scope: "c1".into(),
+            private_paths: Vec::new(),
         };
         let inv = OpenCode::new(HarnessConfig::opencode_default())
             .build(&spec)

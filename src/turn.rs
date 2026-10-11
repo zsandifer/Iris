@@ -155,6 +155,27 @@ async fn run_locked(
         ctx.members.clone()
     };
     let shared = ctx.members.len() > 1;
+    // Whose Iris answers: the conversation's creator (for jobs, the person
+    // the job runs for). Their persona, memory, name, and folders are used.
+    let host = state.user(&input.owner_user_id).await;
+    let host_is_owner = host.as_ref().is_some_and(|u| u.is_owner);
+    // Individual-use policy: Claude is the owner's own subscription, so
+    // anything that is not the owner's personal use (a chat with more than
+    // one person, or another person's own Iris) needs the owner's opt-in.
+    let for_others = shared || !host_is_owner;
+    let dirs = host
+        .as_ref()
+        .map(|u| state.dirs_for(u))
+        .unwrap_or_else(|| state.paths.owner_dirs());
+    let cwd = if shared {
+        state.paths.together_dir(conv_id)
+    } else {
+        dirs.workspace.clone()
+    };
+    if let Err(e) = crate::config::ensure_private_dir(&cwd) {
+        crate::warn!("turn {msg_id}: cannot prepare working folder: {e}");
+    }
+    let private_paths = private_paths(state, host.as_ref(), shared, &cwd).await;
 
     if state.limiter.saturated() {
         state.hub.to_users(
@@ -177,7 +198,7 @@ async fn run_locked(
     let pins = state.slot_pins().await;
     let allow_shared = state.allow_claude_for_shared().await;
     let has_images = !input.user_message.attachments.is_empty();
-    let assessment = assess_turn(state, input).await;
+    let assessment = assess_turn(state, input, for_others).await;
     let mut excluded: Vec<String> = Vec::new();
     let mut fresh_session = !input.continuity;
     let mut routing_notes: Vec<String> = Vec::new();
@@ -204,7 +225,7 @@ async fn run_locked(
             let route_input = RouteInput {
                 slot: input.slot,
                 has_images,
-                shared,
+                shared: for_others,
                 assessment: &assessment,
             };
             select_engine(&route_input, &env)
@@ -212,15 +233,19 @@ async fn run_locked(
         let d = match routed {
             Ok(d) => d,
             Err(NoEngine::PausedPolicy) => {
-                post_policy_card_once(state, conv_id).await;
+                post_policy_card_once(state, conv_id, shared).await;
                 outcome = Outcome::Failed {
                     kind: "paused_policy",
-                    detail: "only Claude is available and this conversation is shared".into(),
+                    detail: if shared {
+                        "only Claude is available and this conversation is shared".into()
+                    } else {
+                        "only Claude is available and this is not the owner's own Iris".into()
+                    },
                 };
                 break;
             }
             Err(NoEngine::NoModel) => {
-                let (kind, detail) = no_engine_reason(state, shared, allow_shared);
+                let (kind, detail) = no_engine_reason(state, for_others, allow_shared);
                 outcome = Outcome::Failed { kind, detail };
                 break;
             }
@@ -241,8 +266,11 @@ async fn run_locked(
         };
 
         // Session continuity and replay of unseen messages.
-        let agent_name = state.agent_name().await;
-        let persona_hash = persona::persona_hash(&state.paths, &agent_name, &ctx.kind);
+        let agent_name = match &host {
+            Some(u) => state.agent_name_for(u).await,
+            None => state.agent_name().await,
+        };
+        let persona_hash = persona::persona_hash(&dirs, &agent_name, &ctx.kind);
         let mut session = if fresh_session {
             None
         } else {
@@ -290,13 +318,14 @@ async fn run_locked(
             );
         }
         let mcp_servers = if caps.mcp {
-            mcp_servers(state, &input.owner_user_id, conv_id, shared).await
+            mcp_servers(state, &input.owner_user_id, conv_id, shared, host_is_owner).await
         } else {
             Vec::new()
         };
-        let participants: Vec<String> = ctx.names.values().cloned().collect();
+        let mut participants: Vec<String> = ctx.names.values().cloned().collect();
+        participants.sort();
         let system_prompt = persona::assemble(
-            &state.paths,
+            &dirs,
             &PromptContext {
                 agent_name: &agent_name,
                 conversation_kind: &ctx.kind,
@@ -304,6 +333,7 @@ async fn run_locked(
                 participants: &participants,
                 app_tools: !mcp_servers.is_empty(),
                 shared,
+                user_name: host.as_ref().map(|u| u.display_name.as_str()),
                 notices: &notices,
             },
         );
@@ -316,15 +346,16 @@ async fn run_locked(
             effort: d.effort.clone(),
             resume: session.as_ref().map(|s| s.session_id.clone()),
             mcp_servers,
-            cwd: state.paths.workspace_dir(),
-            // The owner's memory is only writable in personal conversations.
+            cwd: cwd.clone(),
+            // A person's memory is only writable in their personal chats.
             writable_dirs: if shared {
                 Vec::new()
             } else {
-                vec![state.paths.memory_dir()]
+                vec![dirs.memory.clone()]
             },
             run_dir: state.paths.run_dir(),
             scope: conv_id.to_string(),
+            private_paths: private_paths.clone(),
         };
         let invocation = match entry.harness.build(&spec) {
             Ok(mut i) => {
@@ -502,7 +533,7 @@ fn no_engine_reason(state: &AppState, shared: bool, allow_shared: bool) -> (&'st
 }
 
 /// Classify the message (chat) or use the job default (low effort).
-async fn assess_turn(state: &AppState, input: &TurnInput) -> Assessment {
+async fn assess_turn(state: &AppState, input: &TurnInput, for_others: bool) -> Assessment {
     if input.purpose != Purpose::Chat {
         return Assessment {
             effort: Effort::Low,
@@ -535,7 +566,8 @@ async fn assess_turn(state: &AppState, input: &TurnInput) -> Assessment {
     let mut a = classifier::assess(&input.user_message.content, &turns, &thresholds);
     if state.cfg.router.classifier_model
         && a.ambiguous
-        && let Some(effort) = refine_with_model(state, &input.user_message.content).await
+        && let Some(effort) =
+            refine_with_model(state, &input.user_message.content, for_others).await
     {
         a.signals.push("model_classifier");
         a.effort = effort;
@@ -546,8 +578,8 @@ async fn assess_turn(state: &AppState, input: &TurnInput) -> Assessment {
 
 /// Optional: ask the `classifier` slot's model about an ambiguous message.
 /// One short, tool-less, session-less run; None on any failure.
-async fn refine_with_model(state: &AppState, text: &str) -> Option<Effort> {
-    let (res, pin) = state.resolve_slot(Slot::Classifier, false).await;
+async fn refine_with_model(state: &AppState, text: &str, for_others: bool) -> Option<Effort> {
+    let (res, pin) = state.resolve_slot(Slot::Classifier, for_others).await;
     let model_id = res.effective?;
     let catalog = state.catalog();
     let m = catalog.get(&model_id)?;
@@ -569,6 +601,7 @@ async fn refine_with_model(state: &AppState, text: &str) -> Option<Effort> {
         writable_dirs: Vec::new(),
         run_dir: state.paths.run_dir(),
         scope: "classifier".into(),
+        private_paths: Vec::new(),
     };
     let invocation = entry.harness.build(&spec).ok()?;
     let strip = state.strip_env(entry);
@@ -600,33 +633,121 @@ async fn refine_with_model(state: &AppState, text: &str) -> Option<Effort> {
     classifier::parse_model_reply(&reply)
 }
 
-/// In a shared conversation where Claude is the only engine, explain once
-/// (per conversation) with a one-tap opt-in card for the owner.
-async fn post_policy_card_once(state: &AppState, conv_id: &str) {
+/// Claude is the only engine and this turn is not the owner's own use:
+/// explain once per conversation. In a shared chat the card carries the
+/// owner's one-tap opt-in; for another person's own Iris the owner gets
+/// the opt-in card in their Main chat instead.
+async fn post_policy_card_once(state: &AppState, conv_id: &str, shared: bool) {
     let key = format!("notice.policy_card.{conv_id}");
     let c = conv_id.to_string();
-    let _ = state
+    let allow = json!({"method": "PUT", "path": "/api/settings",
+                       "body": {"allow_claude_for_shared": true}});
+    let posted = state
         .db
         .call(move |db| {
             if db::get_setting(db, &key)?.is_some() {
-                return Ok(());
+                return Ok(None);
+            }
+            db::set_setting(db, &key, &crate::util::now_ms().to_string())?;
+            if shared {
+                let card = json!({
+                    "type": "action",
+                    "title": "Allow Claude in group chats",
+                    "body": "Claude is the only AI engine on this server, and Claude \
+                        subscriptions are meant for one person, so I stay out of chats with \
+                        more than one person. If your plan allows shared use, the owner can turn \
+                        this on. Another engine (Codex, Gemini, or OpenCode) also fixes it.",
+                    "action_label": "Allow",
+                    "action": allow,
+                    "owner_only": true,
+                });
+                crate::entities::insert_card(db, &c, &card, "assistant")?;
+                return Ok(None);
             }
             let card = json!({
-                "type": "action",
-                "title": "Allow Claude in group chats",
-                "body": "Claude is the only AI engine on this server, and Claude \
-                    subscriptions are meant for one person, so I stay out of chats with \
-                    more than one person. If your plan allows shared use, the owner can turn \
-                    this on. Another engine (Codex, Gemini, or OpenCode) also fixes it.",
-                "action_label": "Allow",
-                "action": {"method": "PUT", "path": "/api/settings",
-                           "body": {"allow_claude_for_shared": true}},
-                "owner_only": true,
+                "type": "info",
+                "title": "Waiting for the owner",
+                "body": "Claude is the only AI engine on this server, and Claude subscriptions \
+                    are meant for one person, so I can't use it for you. I've asked the owner: \
+                    they can allow it, or add another engine (Codex, Gemini, or OpenCode).",
             });
             crate::entities::insert_card(db, &c, &card, "assistant")?;
-            db::set_setting(db, &key, &crate::util::now_ms().to_string())
+            // Tell the owner, in their Main chat, who is waiting.
+            let person: Option<String> = db
+                .query_row(
+                    "SELECT u.display_name FROM conversations c JOIN users u ON u.id = c.created_by
+                     WHERE c.id = ?1",
+                    [&c],
+                    |r| r.get(0),
+                )
+                .ok();
+            let Some(owner) = db::owner_user_id(db)? else {
+                return Ok(None);
+            };
+            let main = db::ensure_main_conversation(db, &owner)?;
+            let name = person.unwrap_or_else(|| "Someone".into());
+            let owner_card = json!({
+                "type": "action",
+                "title": format!("Let {name} use Claude?"),
+                "body": format!("{name}'s Iris can't answer: Claude is the only AI engine on \
+                    this server, and Claude subscriptions are meant for one person. If your plan \
+                    allows it, you can let other people (and group chats) use it. Adding another \
+                    engine (Codex, Gemini, or OpenCode) in Settings also fixes it."),
+                "action_label": "Allow",
+                "action": allow,
+                "owner_only": true,
+            });
+            let m = crate::entities::insert_card(db, &main, &owner_card, "assistant")?;
+            Ok(Some((owner, m)))
         })
-        .await;
+        .await
+        .ok()
+        .flatten();
+    if let Some((owner, m)) = posted {
+        state.hub.to_users(
+            std::slice::from_ref(&owner),
+            json!({"type": "message.created", "conversation_id": m.conversation_id, "message": m}),
+        );
+        crate::notify::push_users(
+            state,
+            &[owner],
+            json!({"title": state.agent_name().await, "body": "Someone's Iris is waiting for your OK to use Claude.",
+                   "conversation_id": m.conversation_id, "message_id": m.id, "kind": "policy"}),
+        );
+    }
+}
+
+/// Paths the agent must not read or edit this turn (enforced by CLIs with
+/// deny rules): Iris's own state, everyone else's Iris folders, and, in a
+/// shared chat, the host's personal folders too.
+async fn private_paths(
+    state: &AppState,
+    host: Option<&db::User>,
+    shared: bool,
+    cwd: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let p = &state.paths;
+    let mut out = vec![
+        p.db_file(),
+        p.data_dir.join("iris.db-wal"),
+        p.data_dir.join("iris.db-shm"),
+        p.vault_key_file(),
+        p.vapid_key_file(),
+        p.run_dir(),
+        p.uploads_dir(),
+        p.library_dir(),
+        p.voice_dir(),
+    ];
+    for u in state.all_users().await {
+        if shared || host.is_none_or(|h| h.id != u.id) {
+            out.extend(state.dirs_for(&u).all().into_iter().cloned());
+        }
+    }
+    // Other Together chats' folders.
+    if let Ok(rd) = std::fs::read_dir(p.data_dir.join("together")) {
+        out.extend(rd.flatten().map(|e| e.path()).filter(|d| d != cwd));
+    }
+    out
 }
 
 fn routing_json(d: &RouteDecision, notes: &[String]) -> Value {
@@ -760,6 +881,10 @@ fn failure_text(kind: &str, detail: &str) -> String {
                  To fix it, {fix}, then send your message again."
             )
         }
+        "paused_policy" if detail.contains("not the owner's own") => "I can't reply yet. The \
+            only AI engine on the server is Claude, and Claude subscriptions are for one person, \
+            so I can only use it for the owner unless they allow it. I've let them know."
+            .into(),
         "paused_policy" => "I can't reply in this group chat yet. The only AI engine on the \
             server is Claude, and Claude subscriptions are for one person, so I stay out of \
             shared conversations unless the owner turns that on."
@@ -867,7 +992,10 @@ async fn finish(
             .cloned()
             .collect();
         if !offline.is_empty() {
-            let title = state.agent_name().await;
+            let title = match state.user(&input.owner_user_id).await {
+                Some(u) => state.agent_name_for(&u).await,
+                None => state.agent_name().await,
+            };
             crate::notify::push_users(
                 state,
                 &offline,
@@ -884,6 +1012,9 @@ async fn finish(
                 }),
             );
         }
+    }
+    if ok && input.purpose == Purpose::Chat {
+        crate::server::voice::prepare_for(state, audience, &message);
     }
     TurnResult { message, ok }
 }
@@ -985,14 +1116,16 @@ async fn load_images(state: &AppState, m: &Message) -> Vec<ImageInput> {
 
 /// The Iris MCP bridge plus every enabled connector (secrets unsealed).
 ///
-/// In shared conversations (more than one person) the owner's connectors
-/// are withheld and the bridge only offers cards, so other members cannot
-/// reach the owner's accounts, goals, feed, or library through the agent.
+/// Connectors are the owner's accounts, so they are only passed in the
+/// owner's personal chats. In shared conversations (more than one person)
+/// the bridge only offers cards, so no member can reach anyone's accounts,
+/// goals, feed, or library through the agent.
 async fn mcp_servers(
     state: &AppState,
     user_id: &str,
     conv_id: &str,
     shared: bool,
+    host_is_owner: bool,
 ) -> Vec<McpServer> {
     let mut args = vec![
         "mcp".into(),
@@ -1014,7 +1147,7 @@ async fn mcp_servers(
             env: BTreeMap::new(),
         },
     }];
-    if shared {
+    if shared || !host_is_owner {
         return servers;
     }
     let connectors = state

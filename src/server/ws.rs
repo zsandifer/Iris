@@ -93,7 +93,7 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
         "type": "ready",
         "user_id": uid,
         "device_id": user.device.id,
-        "settings": state.settings_json().await,
+        "settings": state.settings_json_for(&user.user).await,
         "harnesses": super::admin::harnesses_for(&state, &user),
     });
     if !send_json(&mut socket, &ready).await {

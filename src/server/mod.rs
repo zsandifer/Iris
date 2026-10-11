@@ -5,6 +5,9 @@
 pub(crate) mod admin;
 mod chat;
 mod content;
+#[cfg(test)]
+mod people_tests;
+pub(crate) mod voice;
 mod web;
 mod ws;
 
@@ -171,8 +174,10 @@ pub fn router(state: AppState) -> Router {
         .route("/devices", get(list_devices))
         .route("/devices/{id}", delete(revoke_device))
         .route("/users", get(list_users).post(create_user))
+        .route("/users/{id}", delete(delete_user))
         .route("/users/{id}/pairing-code", post(user_pairing_code))
         .merge(chat::routes())
+        .merge(voice::routes())
         .merge(content::routes())
         .merge(admin::routes())
         .route("/ws", get(ws::handler))
@@ -339,18 +344,27 @@ async fn revoke_device(
     ok(json!({"ok": true}))
 }
 
+/// Everyone on this server (for Together chats). The owner also sees
+/// each person's device count.
 async fn list_users(State(state): State<AppState>, user: AuthUser) -> ApiResult {
-    user.require_owner()?;
+    let owner = user.user.is_owner;
     let users = state
         .db
-        .call(|c| {
-            let mut stmt = c.prepare("SELECT id FROM users ORDER BY created_at")?;
-            let ids: Vec<String> = stmt
-                .query_map([], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            ids.iter()
-                .filter_map(|id| db::get_user(c, id).transpose())
-                .collect::<rusqlite::Result<Vec<_>>>()
+        .call(move |c| {
+            let mut out = Vec::new();
+            for u in db::list_users(c)? {
+                let mut v = serde_json::to_value(&u).unwrap_or(Value::Null);
+                if owner {
+                    let n: i64 = c.query_row(
+                        "SELECT COUNT(*) FROM devices WHERE user_id = ?1 AND revoked_at IS NULL",
+                        [&u.id],
+                        |r| r.get(0),
+                    )?;
+                    v["devices"] = n.into();
+                }
+                out.push(v);
+            }
+            Ok(out)
         })
         .await?;
     ok(json!({"users": users}))
@@ -361,8 +375,9 @@ struct CreateUser {
     display_name: String,
 }
 
-/// Create another person (for group conversations). They pair their own
-/// device with a code from `POST /api/users/{id}/pairing-code`.
+/// Add a person. They get their own Iris (persona, memory, feed, goals,
+/// ideas, library, settings) and pair their phone with a code from
+/// `POST /api/users/{id}/pairing-code`.
 async fn create_user(
     State(state): State<AppState>,
     user: AuthUser,
@@ -382,8 +397,49 @@ async fn create_user(
             db::ensure_main_conversation(c, &id)?;
             db::get_user(c, &id)
         })
-        .await?;
+        .await?
+        .ok_or_else(|| ApiError::not_found("user"))?;
+    crate::persona::seed_person(&state.dirs_for(&created))?;
+    crate::info!("added person {}", created.id);
     ok(json!({"user": created}))
+}
+
+/// Remove a person and everything that is only theirs (their Iris's
+/// files, chats, feed, goals, ideas, library, devices). Not the owner.
+async fn delete_user(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> ApiResult {
+    user.require_owner()?;
+    let target = state
+        .user(&id)
+        .await
+        .ok_or_else(|| ApiError::not_found("user"))?;
+    if target.is_owner {
+        return Err(ApiError::bad_request("the owner cannot be removed"));
+    }
+    let tid = id.clone();
+    let (files, convs) = state
+        .db
+        .call(move |c| db::delete_person(c, &tid))
+        .await?
+        .ok_or_else(|| ApiError::not_found("user"))?;
+    for c in &convs {
+        crate::turn::cancel(&state, c);
+        let _ = tokio::fs::remove_dir_all(state.paths.together_dir(c)).await;
+    }
+    for f in files {
+        let _ = tokio::fs::remove_file(state.paths.library_dir().join(f)).await;
+    }
+    let dirs = state.dirs_for(&target);
+    if let Some(root) = dirs.persona.parent()
+        && root.starts_with(state.paths.people_dir())
+    {
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+    crate::info!("removed person {id}");
+    ok(json!({"ok": true}))
 }
 
 async fn user_pairing_code(
@@ -758,7 +814,6 @@ mod tests {
         for (method, uri) in [
             ("GET", "/api/credentials"),
             ("GET", "/api/connectors"),
-            ("GET", "/api/files"),
             ("POST", "/api/harnesses/refresh"),
             ("POST", "/api/jobs/feed/run"),
         ] {
@@ -1155,7 +1210,9 @@ esac
 
         let (s, list) = send(&h.app, "GET", "/api/engines", Some(&t), None).await;
         assert_eq!(s, StatusCode::OK, "{list}");
-        assert_eq!(list["engines"].as_array().unwrap().len(), 4);
+        let all = list["engines"].as_array().unwrap();
+        assert_eq!(all.len(), 6);
+        assert_eq!(all.iter().filter(|e| e["kind"] == "voice").count(), 2);
         assert_eq!(list["privileged_helper"], true);
         // Unknown engines and removing what Iris did not install.
         let (s, _) = send(&h.app, "POST", "/api/engines/evil/install", Some(&t), None).await;
