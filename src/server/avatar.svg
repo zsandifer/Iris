@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- Neutral placeholder until Iris's character is designed. -->
+  <defs>
+    <linearGradient id="base" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#a996ff"/>
+      <stop offset="0.55" stop-color="#7c5cf6"/>
+      <stop offset="1" stop-color="#b46ae8"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.72" cy="0.78" r="0.55">
+      <stop offset="0" stop-color="#c06cf0" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#c06cf0" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="shine" cx="0.34" cy="0.3" r="0.32">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.75"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <circle cx="64" cy="64" r="64" fill="url(#base)"/>
+  <circle cx="64" cy="64" r="64" fill="url(#glow)"/>
+  <circle cx="64" cy="64" r="64" fill="url(#shine)"/>
+</svg>
