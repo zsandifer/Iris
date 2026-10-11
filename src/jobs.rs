@@ -171,7 +171,10 @@ pub fn spawn_scheduler(state: AppState) {
             // New models (codex cache, CLI lists) and sign-in changes move
             // automatic slots; announce it.
             state.check_recommendations().await;
-            crate::setup::maybe_auto_update(&state).await;
+            // Updates download for minutes; never hold up jobs or the next
+            // tick (at most one runs a day, and each engine only once).
+            let st = state.clone();
+            tokio::spawn(async move { crate::setup::maybe_auto_update(&st).await });
             for job in Job::ALL {
                 let last = state
                     .setting(job.last_run_key())

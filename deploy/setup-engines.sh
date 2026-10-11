@@ -57,17 +57,36 @@ fi
 #    executable by everyone (so the agent user can run engines).
 install -d -m 0755 -o "$ADMIN_USER" -g "$ADMIN_USER" "$ENGINES_DIR"
 
-# 3. Let the agent user run exactly `iris engines ...` as the admin user.
-#    `iris engines` accepts only the four known engine names and fetches
-#    only from their official sources.
+# 3. Let the agent user run exactly `iris engines <op> <name> --dir
+#    <engines-dir>` as the admin user. `iris engines` accepts only the four
+#    known engine names, fetches only from their official sources, and
+#    refuses an engines directory the agent user could tamper with.
 SUDOERS=/etc/sudoers.d/iris-engines
-cat > "$SUDOERS.tmp" <<EOF
-# Installed by Iris deploy/setup-engines.sh
-Defaults:$AGENT_USER!requiretty
-$AGENT_USER ALL=($ADMIN_USER) NOPASSWD: $IRIS_BIN engines *
-EOF
-chmod 0440 "$SUDOERS.tmp"
-if command -v visudo >/dev/null 2>&1; then
+write_rule() {
+    rm -f "$SUDOERS.tmp"
+    {
+        echo "# Installed by Iris deploy/setup-engines.sh"
+        # Classic sudo on some distributions requires a terminal by default;
+        # sudo-rs has no such setting and rejects the line.
+        if [ "${1:-}" = tty ]; then
+            echo "Defaults:$AGENT_USER !requiretty"
+        fi
+        # Every allowed command spelled out: no wildcards, so the engines
+        # directory cannot be swapped for another one.
+        printf '%s ALL=(%s) NOPASSWD: %s engines list --dir %s' \
+            "$AGENT_USER" "$ADMIN_USER" "$IRIS_BIN" "$ENGINES_DIR"
+        for op in install update uninstall; do
+            for engine in claude codex gemini opencode; do
+                printf ', %s engines %s %s --dir %s' "$IRIS_BIN" "$op" "$engine" "$ENGINES_DIR"
+            done
+        done
+        echo
+    } > "$SUDOERS.tmp"
+    chmod 0440 "$SUDOERS.tmp"
+}
+write_rule tty
+if command -v visudo >/dev/null 2>&1 && ! visudo -cf "$SUDOERS.tmp" >/dev/null 2>&1; then
+    write_rule
     visudo -cf "$SUDOERS.tmp" >/dev/null
 fi
 mv "$SUDOERS.tmp" "$SUDOERS"

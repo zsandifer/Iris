@@ -337,6 +337,65 @@ fn opencode_binary(prefix: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// How long one `npm install` may take before it is stopped.
+const NPM_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// Run a command to completion within `limit`, capturing its output. On
+/// timeout the whole process group is killed.
+fn output_with_timeout(
+    mut cmd: std::process::Command,
+    limit: Duration,
+) -> Result<std::process::Output> {
+    use std::os::unix::process::CommandExt;
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0);
+    let mut child = cmd.spawn()?;
+    let drain = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        if let Some(s) = child.try_wait()? {
+            break s;
+        }
+        if std::time::Instant::now() >= deadline {
+            if let Ok(pid) = i32::try_from(child.id()) {
+                // SAFETY: plain syscall on the process group created above.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+            let _ = child.wait();
+            return Err(format!("timed out after {} seconds", limit.as_secs()).into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
 fn install_npm(root: &Path, name: &str, package: &str, launcher_kind: Launcher) -> Result<Report> {
     let npm = crate::harness::resolve_command("npm").ok_or_else(|| {
         format!("Node.js (npm) is needed to install {name}; install Node.js on the server first")
@@ -344,22 +403,23 @@ fn install_npm(root: &Path, name: &str, package: &str, launcher_kind: Launcher) 
     let prefix = root.join(name);
     std::fs::create_dir_all(&prefix)?;
     let before = installed_version(root, name);
-    let out = std::process::Command::new(&npm)
-        .args([
-            "install",
-            "--prefix",
-            &prefix.to_string_lossy(),
-            &format!("{package}@latest"),
-            "--no-fund",
-            "--no-audit",
-            "--ignore-scripts",
-            "--omit=dev",
-            "--no-update-notifier",
-        ])
-        .env("npm_config_cache", root.join(".npm-cache"))
-        .env("npm_config_update_notifier", "false")
-        .stdin(std::process::Stdio::null())
-        .output()?;
+    let mut cmd = std::process::Command::new(&npm);
+    cmd.args([
+        "install",
+        "--prefix",
+        &prefix.to_string_lossy(),
+        &format!("{package}@latest"),
+        "--no-fund",
+        "--no-audit",
+        "--ignore-scripts",
+        "--omit=dev",
+        "--no-update-notifier",
+    ])
+    .env("npm_config_cache", root.join(".npm-cache"))
+    .env("npm_config_update_notifier", "false")
+    .stdin(std::process::Stdio::null());
+    let out = output_with_timeout(cmd, NPM_TIMEOUT)
+        .map_err(|e| format!("npm install of {package} failed: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let line = err
@@ -433,9 +493,54 @@ pub fn uninstall(root: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The helper writes as a separate, privileged user, so it refuses an
+/// engines directory that anyone else could swap out or plant symlinks in:
+/// the directory and every ancestor must be real directories owned by root
+/// or the current user and not writable by others (sticky ancestors such
+/// as /tmp excepted). Otherwise the agent user could point `--dir` at a
+/// tree it controls whose `bin` links into the protected engines directory.
+pub fn check_trusted_root(root: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if !root.is_absolute() || root.canonicalize()? != root {
+        return Err(format!(
+            "{} must be an absolute path without symlinks",
+            root.display()
+        )
+        .into());
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let mut dir = Some(root);
+    while let Some(d) = dir {
+        let m = std::fs::symlink_metadata(d)?;
+        let shared_write = m.mode() & 0o022 != 0;
+        let sticky = m.mode() & 0o1000 != 0;
+        if !m.is_dir()
+            || (m.uid() != 0 && m.uid() != euid)
+            || (shared_write && (d == root || !sticky))
+        {
+            return Err(format!(
+                "refusing engines directory {}: {} must be owned by root or this user and not writable by others",
+                root.display(),
+                d.display()
+            )
+            .into());
+        }
+        dir = d.parent();
+    }
+    Ok(())
+}
+
 /// `iris engines <install|update|uninstall|list> [name] --dir <root>`:
 /// the privileged helper entry point. Prints one JSON object.
 pub fn cli(args: &[String], root: &Path) -> Result<()> {
+    if matches!(
+        args.first().map(String::as_str),
+        Some("install" | "update" | "uninstall")
+    ) {
+        std::fs::create_dir_all(root)?;
+        check_trusted_root(root)?;
+    }
     let out = match (args.first().map(String::as_str), args.get(1)) {
         (Some("install" | "update"), Some(name)) => serde_json::to_value(install(root, name)?)?,
         (Some("uninstall"), Some(name)) => {
@@ -519,5 +624,52 @@ mod tests {
         assert!(uninstall(root, "../etc").is_err());
         assert!(install(root, "../etc").is_err());
         assert_eq!(sh_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn commands_are_stopped_at_their_time_limit() {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "echo out; echo err >&2"]);
+        let out = output_with_timeout(cmd, Duration::from_secs(10)).unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            (&out.stdout[..], &out.stderr[..]),
+            (&b"out\n"[..], &b"err\n"[..])
+        );
+        let start = std::time::Instant::now();
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30 & sleep 30"]);
+        let err = output_with_timeout(cmd, Duration::from_millis(300)).unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn helper_only_writes_into_a_trusted_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("engines");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        check_trusted_root(&root).unwrap();
+        // Writable by others: anyone could plant a `bin` symlink.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check_trusted_root(&root).is_err());
+        let args = ["uninstall".to_string(), "codex".to_string()];
+        assert!(cli(&args, &root).is_err());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A writable, non-sticky ancestor could swap the whole tree.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check_trusted_root(&root).is_err());
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        check_trusted_root(&root).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Paths through symlinks are refused.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        assert!(check_trusted_root(&link).is_err());
+        assert!(check_trusted_root(Path::new("relative")).is_err());
     }
 }
