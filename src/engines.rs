@@ -538,6 +538,12 @@ pub fn cli(args: &[String], root: &Path) -> Result<()> {
         args.first().map(String::as_str),
         Some("install" | "update" | "uninstall")
     ) {
+        // The helper may inherit the service's UMask=0077 through sudo, but
+        // the agent user must be able to read and run what it installs.
+        // SAFETY: umask has no preconditions and cannot fail.
+        unsafe {
+            libc::umask(0o022);
+        }
         std::fs::create_dir_all(root)?;
         check_trusted_root(root)?;
     }

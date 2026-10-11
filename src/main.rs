@@ -319,8 +319,10 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
             probe.refresh_harnesses().await;
             probe.check_recommendations().await;
             setup::post_setup_card_if_needed(&probe).await;
+            // Jobs start once engines are known; before the first probe
+            // every engine looks missing and a due job would fail.
+            jobs::spawn_scheduler(probe);
         });
-        jobs::spawn_scheduler(state.clone());
         server::serve(state).await
     })
 }

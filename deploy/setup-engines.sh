@@ -42,10 +42,27 @@ if [ ! -x "$IRIS_BIN" ]; then
     echo "$IRIS_BIN is missing. Install it first, e.g.: install -Dm755 target/release/iris $IRIS_BIN" >&2
     exit 1
 fi
-if [ "$(stat -c %u "$IRIS_BIN")" != "0" ]; then
-    echo "$IRIS_BIN must be owned by root so the agent user cannot replace it." >&2
+# The sudo rule runs this file as the admin user, so nobody else may be able
+# to change it: a real file (no symlinks anywhere in its path), owned by
+# root and not writable by group or others, in directories that are all
+# owned by root and not writable by group or others.
+case "$IRIS_BIN" in
+    /*) ;;
+    *) echo "Give the iris binary as an absolute path." >&2; exit 1 ;;
+esac
+if [ "$(readlink -f "$IRIS_BIN")" != "$IRIS_BIN" ]; then
+    echo "$IRIS_BIN must be a real path without symlinks (use $(readlink -f "$IRIS_BIN"))." >&2
     exit 1
 fi
+p="$IRIS_BIN"
+while :; do
+    if [ "$(stat -c %u "$p")" != "0" ] || [ $(( 0$(stat -c %a "$p") & 022 )) -ne 0 ]; then
+        echo "$p must be owned by root and not writable by group or others, so the agent user cannot replace $IRIS_BIN." >&2
+        exit 1
+    fi
+    [ "$p" = / ] && break
+    p="$(dirname "$p")"
+done
 
 # 1. The admin user: no login shell, owns the engines.
 if ! id "$ADMIN_USER" >/dev/null 2>&1; then
