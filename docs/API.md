@@ -752,7 +752,7 @@ already exists makes it yours and turns it on. Response
 
 A photo or icon the pipeline cached from the source (its original image,
 never a generated one). `file` is `<32 hex>.<jpg|png|gif|webp|avif|ico>`
-(else `404`). Sent with `Content-Security-Policy: default-src 'none';
+and must belong to one of the caller's own posts (else `404`). Sent with `Content-Security-Policy: default-src 'none';
 sandbox`, `nosniff`, and `Cache-Control: private, max-age=604800, immutable`.
 
 #### `POST /api/feed/refresh` (Owner)
@@ -796,7 +796,8 @@ checked.
 Response `{"ok": true, "liked": true}`. Emits `entities.changed` `["feed"]`.
 Likes raise the post's topic and source in ranking and steer the daily
 interests call. Liking a post whose page lists a product price starts a
-price watch (see [urgent pushes](#for-you-pipeline)); unliking stops it.
+price watch (see [urgent pushes](#for-you-pipeline)); it stays active while
+any liked post links to that product (for example its price-drop post).
 
 #### `POST /api/feed/{id}/discuss`
 
@@ -1831,13 +1832,16 @@ once for summaries (later runs that day use the last interests and the
 posts' own descriptions). Each call goes through the owner's own CLI as a
 single prompt with no session, no Iris persona, and tools turned off with
 the CLI's own controls: Claude Code `--tools "" --strict-mcp-config`;
-Codex `sandbox_mode="read-only"`, `approval_policy="never"`,
-`tools.web_search=false`, `mcp_servers={}` (Codex cannot remove its shell
-tool; the read-only sandbox has no writes or network); Gemini CLI
-workspace settings excluding every built-in tool and all MCP servers, with
-`--approval-mode default`; OpenCode `tools: {"*": false}` and every
-permission denied. The activity log shows each run, in the hidden `feed`
-job conversation, with the engine that wrote the text.
+Codex `--ignore-user-config --ignore-rules --ephemeral` with
+`sandbox_mode="read-only"`, `approval_policy="never"`, and
+`web_search="disabled"` (Codex cannot remove its shell tool; the read-only
+sandbox has no writes or network); OpenCode `tools: {"*": false}` and every
+permission denied. Gemini CLI cannot reliably drop MCP servers and tools
+from the user's own settings, so these calls skip it (with only Gemini
+signed in, the feed uses the posts' own text). Each call is one real model
+run: a signed-out CLI falls through to the next engine, a failure does not.
+The activity log shows each run, in the hidden `feed` job conversation,
+with the engine that wrote the text.
 
 1. **Interests** (once a day, `background` slot): `USER.md`,
    `PROACTIVE_PREFERENCES.md`, the feed prompt, recently liked posts, the
@@ -2061,7 +2065,7 @@ changes are re-sent as `message.updated`.
 | `source_name` | string or null | Display name of the source (site or creator), max 100. |
 | `image_url` | string or null | Cover photo: the first of `images`. |
 | `images` | string[] | The source page's original photos, in order (http(s), at most 10). |
-| `photos` | string[] | What to display for each of `images`, same order: `/api/feed/images/<file>` when Iris cached the photo, else the original URL. |
+| `photos` | string[] | What to display for `images`, in order: `/api/feed/images/<file>` for photos Iris cached; for posts the agent wrote, uncached photos keep their original URL. Pipeline posts list cached copies only. |
 | `why` | string or null | One line on why the user would like this post, max 300. |
 | `hook` | string or null | A short line for the story viewer (pipeline posts the model summarized). |
 | `favicon_url` | string or null | The source's icon (original URL). |
@@ -2581,9 +2585,11 @@ in the background as soon as the quiet hours end (or are turned off): one
 held notification is sent as-is; several become one digest, `"While it was
 quiet: N updates. <latest few>"`, opening their chat when they all came
 from one. Held replies from chats the user has read since are left out.
+Notifications from chats the user is no longer a member of are dropped.
 The held rows are removed once the digest reaches at least one device (or
 the user has none); if every device fails, the next tick tries again, and
-notifications still undelivered after 48 hours are dropped.
+notifications still undelivered after 48 hours are dropped. While push is
+turned off in the config nothing is delivered or dropped.
 
 ### Payload
 

@@ -255,10 +255,26 @@ async fn delete_source(
 /// locally so the phone does not contact third-party sites).
 async fn feed_image(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(name): Path<String>,
 ) -> Result<Response, ApiError> {
     if !crate::feed::images::valid_name(&name) {
+        return Err(ApiError::not_found("image"));
+    }
+    // Only images of the caller's own posts (names are hex, so the LIKE
+    // pattern has no wildcards of its own).
+    let (uid, pattern) = (user.id().to_string(), format!("%\"{name}\"%"));
+    let mine: bool = state
+        .db
+        .call(move |c| {
+            c.query_row(
+                "SELECT EXISTS (SELECT 1 FROM feed_posts WHERE user_id = ?1 AND cached LIKE ?2)",
+                rusqlite::params![uid, pattern],
+                |r| r.get(0),
+            )
+        })
+        .await?;
+    if !mine {
         return Err(ApiError::not_found("image"));
     }
     let mime = crate::feed::images::mime_for(&name).ok_or_else(|| ApiError::not_found("image"))?;

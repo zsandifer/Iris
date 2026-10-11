@@ -158,6 +158,7 @@ impl Harness for Codex {
             effort: true,
             mcp: true,
             resume: true,
+            tool_less: true,
         }
     }
 
@@ -172,7 +173,11 @@ impl Harness for Codex {
             a.push("-i".into());
             a.push(img.path.to_string_lossy().into_owned());
         }
-        a.extend(["--json", "--skip-git-repo-check", "-m"].map(String::from));
+        a.extend(["--json", "--skip-git-repo-check"].map(String::from));
+        if !spec.tools {
+            a.extend(["--ignore-user-config", "--ignore-rules", "--ephemeral"].map(String::from));
+        }
+        a.push("-m".into());
         a.push(spec.model.clone());
         let mut overrides = Vec::new();
         if let Some(e) = &spec.effort {
@@ -180,15 +185,15 @@ impl Harness for Codex {
         }
         overrides.push(developer_instructions_arg(&spec.system_prompt));
         if !spec.tools {
-            // Codex cannot remove its shell tool; a read-only sandbox (no
-            // writes, no network), no approvals, no web search, and no MCP
-            // servers from the user's config is as close as it gets.
+            // `--ignore-user-config` (below) drops the user's MCP servers and
+            // settings; Codex cannot remove its shell tool, so it runs in a
+            // read-only sandbox (no writes, no network) with no approvals
+            // and web search off.
             overrides.extend(
                 [
                     "sandbox_mode=\"read-only\"",
                     "approval_policy=\"never\"",
-                    "tools.web_search=false",
-                    "mcp_servers={}",
+                    "web_search=\"disabled\"",
                 ]
                 .map(String::from),
             );

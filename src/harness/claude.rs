@@ -78,6 +78,7 @@ impl Harness for Claude {
             effort: true,
             mcp: true,
             resume: true,
+            tool_less: true,
         }
     }
 

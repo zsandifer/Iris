@@ -1523,8 +1523,39 @@ esac
         .await;
         assert_eq!(s, StatusCode::OK);
 
-        // Cached images: only well-formed names, served with safe headers.
         let name = "0123456789abcdef0123456789abcdef.png";
+        // A pipeline post shows its cached photo; liking a priced post
+        // watches it, and Talk about it carries the link.
+        let post = h
+            .state
+            .db
+            .with(|c| {
+                crate::entities::insert_pipeline_post(
+                    c,
+                    &owner,
+                    &crate::entities::PipelinePost {
+                        title: "Trail shoe".into(),
+                        body: "Light and grippy.".into(),
+                        source_url: "https://shop.example/shoe".into(),
+                        source_name: "Shop".into(),
+                        source_kind: "rss".into(),
+                        images: vec!["https://shop.example/shoe.jpg".into()],
+                        cached: [(
+                            "https://shop.example/shoe.jpg".to_string(),
+                            name.to_string(),
+                        )]
+                        .into(),
+                        facts: json!({"price": {"amount": 120.0, "currency": "USD"}}),
+                        why: Some("You run trails.".into()),
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(post.photos, vec![format!("/api/feed/images/{name}")]);
+        assert_eq!(post.images, vec!["https://shop.example/shoe.jpg"]);
+
+        // Cached images: only well-formed names, served with safe headers.
         let dir = crate::feed::images::dir(&h.state.paths.data_dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(name), b"\x89PNG\r\n\x1a\nrest").unwrap();
@@ -1561,36 +1592,26 @@ esac
         .await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
 
-        // A pipeline post shows its cached photo; liking a priced post
-        // watches it, and Talk about it carries the link.
-        let post = h
-            .state
-            .db
-            .with(|c| {
-                crate::entities::insert_pipeline_post(
-                    c,
-                    &owner,
-                    &crate::entities::PipelinePost {
-                        title: "Trail shoe".into(),
-                        body: "Light and grippy.".into(),
-                        source_url: "https://shop.example/shoe".into(),
-                        source_name: "Shop".into(),
-                        source_kind: "rss".into(),
-                        images: vec!["https://shop.example/shoe.jpg".into()],
-                        cached: [(
-                            "https://shop.example/shoe.jpg".to_string(),
-                            name.to_string(),
-                        )]
-                        .into(),
-                        facts: json!({"price": {"amount": 120.0, "currency": "USD"}}),
-                        why: Some("You run trails.".into()),
-                        ..Default::default()
-                    },
-                )
-            })
-            .unwrap();
-        assert_eq!(post.photos, vec![format!("/api/feed/images/{name}")]);
-        assert_eq!(post.images, vec!["https://shop.example/shoe.jpg"]);
+        // Another person cannot read the owner's cached images.
+        let (_, u) = send(
+            &h.app,
+            "POST",
+            "/api/users",
+            Some(&t),
+            Some(json!({"display_name": "Sam"})),
+        )
+        .await;
+        let sam = pair_as(&h, u["user"]["id"].as_str()).await;
+        let (s, _) = send(
+            &h.app,
+            "GET",
+            &format!("/api/feed/images/{name}"),
+            Some(&sam),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+
         let (s, _) = send(
             &h.app,
             "POST",

@@ -88,6 +88,7 @@ impl Harness for OpenCode {
             effort: true,
             mcp: true,
             resume: true,
+            tool_less: true,
         }
     }
 

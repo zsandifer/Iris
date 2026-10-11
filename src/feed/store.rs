@@ -342,6 +342,7 @@ pub fn prune(conn: &Connection, user_id: &str) -> rusqlite::Result<()> {
         "DELETE FROM feed_days WHERE user_id = ?1 AND day < ?2",
         params![user_id, crate::jobs::local_day(now - 60 * 86_400_000)],
     )?;
+    prune_watches(conn, user_id)?;
     Ok(())
 }
 
@@ -540,19 +541,36 @@ pub fn watch_post(conn: &Connection, user_id: &str, post_id: &str) -> rusqlite::
     Ok(true)
 }
 
+/// Stop watching the product of an unliked post, unless another liked post
+/// (say, its price-drop post) still links to it.
 pub fn unwatch_post(conn: &Connection, user_id: &str, post_id: &str) -> rusqlite::Result<()> {
     conn.execute(
-        "DELETE FROM feed_watches WHERE user_id = ?1 AND post_id = ?2",
+        "DELETE FROM feed_watches WHERE user_id = ?1
+            AND url = (SELECT source_url FROM feed_posts WHERE id = ?2 AND user_id = ?1)
+            AND NOT EXISTS (SELECT 1 FROM feed_posts p WHERE p.user_id = ?1
+                            AND p.source_url = feed_watches.url AND p.liked = 1)",
         params![user_id, post_id],
     )?;
     Ok(())
 }
 
+/// Drop watches no liked post links to any more (posts deleted).
+pub fn prune_watches(conn: &Connection, user_id: &str) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM feed_watches WHERE user_id = ?1 AND NOT EXISTS (
+             SELECT 1 FROM feed_posts p WHERE p.user_id = ?1
+             AND p.source_url = feed_watches.url AND p.liked = 1)",
+        [user_id],
+    )
+}
+
 /// Watches not checked in the last 20 hours, oldest check first.
 pub fn due_watches(conn: &Connection, user_id: &str, limit: usize) -> rusqlite::Result<Vec<Watch>> {
     let mut stmt = conn.prepare(
-        "SELECT id, url, title, price, currency FROM feed_watches
+        "SELECT id, url, title, price, currency FROM feed_watches w
          WHERE user_id = ?1 AND (checked_at IS NULL OR checked_at < ?2)
+           AND EXISTS (SELECT 1 FROM feed_posts p WHERE p.user_id = ?1
+                       AND p.source_url = w.url AND p.liked = 1)
          ORDER BY COALESCE(checked_at, 0) LIMIT ?3",
     )?;
     stmt.query_map(
@@ -667,10 +685,31 @@ mod tests {
                 },
             )?;
             assert!(watch_post(c, u, &post.id)?);
+            assert!(due_watches(c, u, 10)?.is_empty(), "only while liked");
+            crate::entities::set_feed_liked(c, u, &post.id, true)?;
             let due = due_watches(c, u, 10)?;
             assert_eq!(due.len(), 1);
             checked_watch(c, &due[0].id, Some(99.0))?;
             assert!(due_watches(c, u, 10)?.is_empty());
+            // A second saved post for the same product (its price-drop
+            // post) keeps the watch when the first is unliked.
+            let drop = crate::entities::insert_pipeline_post(
+                c,
+                u,
+                &crate::entities::PipelinePost {
+                    title: "Price drop: Trail shoe".into(),
+                    body: "b".into(),
+                    source_url: "https://shop.example/p".into(),
+                    source_kind: "price_drop".into(),
+                    ..Default::default()
+                },
+            )?;
+            crate::entities::set_feed_liked(c, u, &drop.id, true)?;
+            crate::entities::set_feed_liked(c, u, &post.id, false)?;
+            unwatch_post(c, u, &post.id)?;
+            assert_eq!(prune_watches(c, u)?, 0);
+            crate::entities::set_feed_liked(c, u, &drop.id, false)?;
+            assert_eq!(prune_watches(c, u)?, 1, "no saved post left");
             crate::entities::set_feed_liked(c, u, &post.id, true)?;
             let e = engagement(c, u)?;
             assert_eq!(e.topic_likes.get("running"), Some(&1.0));

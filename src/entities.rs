@@ -46,8 +46,9 @@ pub struct FeedPost {
     pub image_url: Option<String>,
     /// The source page's original photos, in order.
     pub images: Vec<String>,
-    /// What the app shows for each of `images`, same order: the local copy
-    /// (`/api/feed/images/<file>`) when Iris cached it, else the original.
+    /// What the app shows for `images`, in order: the local copy
+    /// (`/api/feed/images/<file>`) when Iris cached it; otherwise the
+    /// original, except for pipeline posts, which show cached copies only.
     pub photos: Vec<String>,
     /// One line on why the user would like this post.
     pub why: Option<String>,
@@ -79,10 +80,13 @@ fn feed_from_row(r: &rusqlite::Row) -> rusqlite::Result<FeedPost> {
         serde_json::from_str(&r.get::<_, String>("images")?).unwrap_or_default();
     let cached: BTreeMap<String, String> =
         serde_json::from_str(&r.get::<_, String>("cached")?).unwrap_or_default();
-    let shown = |u: &String| {
-        cached
-            .get(u)
-            .map_or_else(|| u.clone(), |f| feed_image_path(f))
+    let source_kind: Option<String> = r.get("source_kind")?;
+    // Pipeline posts only ever show copies Iris fetched and checked; posts
+    // the agent wrote show their original https URLs.
+    let pipeline = source_kind.is_some();
+    let shown = |u: &String| match cached.get(u) {
+        Some(f) => Some(feed_image_path(f)),
+        None => (!pipeline).then(|| u.clone()),
     };
     let favicon_url: Option<String> = r.get("favicon_url")?;
     Ok(FeedPost {
@@ -93,13 +97,13 @@ fn feed_from_row(r: &rusqlite::Row) -> rusqlite::Result<FeedPost> {
         source_url: r.get("source_url")?,
         source_name: r.get("source_name")?,
         image_url: r.get("image_url")?,
-        photos: images.iter().map(shown).collect(),
+        photos: images.iter().filter_map(shown).collect(),
         images,
         why: r.get("why")?,
         hook: r.get("hook")?,
-        favicon: favicon_url.as_ref().map(shown),
+        favicon: favicon_url.as_ref().and_then(shown),
         favicon_url,
-        source_kind: r.get("source_kind")?,
+        source_kind,
         facts: serde_json::from_str(&r.get::<_, String>("facts")?).unwrap_or_else(|_| json!({})),
         liked: r.get("liked")?,
         discuss_conversation_id: r.get("discuss_conversation_id")?,

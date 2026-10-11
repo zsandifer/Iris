@@ -134,6 +134,10 @@ const MAX_HOLD_MS: i64 = 48 * 3_600_000;
 /// are removed only once the digest was delivered (or the user has no
 /// device to deliver to); a failed delivery is retried on the next tick.
 pub async fn flush_quiet(state: &AppState) {
+    // Push turned off (or no keys): keep everything for when it is back.
+    if !state.cfg.push.enabled || state.vapid.is_none() {
+        return;
+    }
     let users: Vec<String> = state
         .db
         .call(|c| {
@@ -147,7 +151,7 @@ pub async fn flush_quiet(state: &AppState) {
             continue;
         }
         let uid = u.clone();
-        let (held, reads) = state
+        let Ok((held, reads, devices)) = state
             .db
             .call(move |c| {
                 let mut stmt = c.prepare(
@@ -167,26 +171,37 @@ pub async fn flush_quiet(state: &AppState) {
                     .query_map([&uid], |r| Ok((r.get(0)?, r.get(1)?)))?
                     .filter_map(|r| r.ok())
                     .collect();
-                Ok((held, reads))
+                let devices = entities::list_push_subscriptions(c, &uid)?.len();
+                Ok((held, reads, devices))
             })
             .await
-            .unwrap_or_default();
+        else {
+            continue;
+        };
         if held.is_empty() {
             continue;
         }
         let name = state.agent_name().await;
         let read = |conv: &str, at: i64| reads.get(conv).is_some_and(|r| *r >= at);
+        // Chats the user has left since (or was removed from) are dropped:
+        // no previews after access ends.
         let items: Vec<(Value, i64)> = held
             .iter()
             .filter(|(_, p, _)| p.is_object())
+            .filter(|(_, p, _)| {
+                p["conversation_id"]
+                    .as_str()
+                    .is_none_or(|c| reads.contains_key(c))
+            })
             .map(|(_, p, at)| (p.clone(), *at))
             .collect();
         let done = match digest(&name, &items, &read) {
             None => true,
+            Some(_) if devices == 0 => true,
             Some(payload) => {
-                let (delivered, failed) =
+                let (delivered, _) =
                     push_users_now(state, std::slice::from_ref(&u), &payload).await;
-                if delivered > 0 || failed == 0 {
+                if delivered > 0 {
                     crate::info!(
                         "delivered {} held notification(s) after quiet hours",
                         held.len()
@@ -435,5 +450,22 @@ mod tests {
             .unwrap();
         flush_quiet(&state).await;
         assert_eq!(queued(&state), 0);
+
+        // A reply from a chat the user is no longer in is never delivered.
+        let other = state
+            .db
+            .with(|c| {
+                let conv = crate::db::create_conversation(c, &owner, "side", "x", None)?;
+                c.execute(
+                    "DELETE FROM conversation_members WHERE conversation_id = ?1",
+                    [&conv.id],
+                )?;
+                Ok(conv.id)
+            })
+            .unwrap();
+        let held = json!({"title": "Iris", "body": "secret", "conversation_id": other});
+        enqueue(&state, &owner, &held).await;
+        flush_quiet(&state).await;
+        assert_eq!(queued(&state), 0, "dropped without a push");
     }
 }

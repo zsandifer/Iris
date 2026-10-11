@@ -18,6 +18,11 @@ pub enum Token {
     Text(String),
 }
 
+/// Longest tag name Iris reads.
+const MAX_NAME: usize = 64;
+/// Longest URL Iris keeps (anything longer is not a real link).
+const MAX_URL: usize = 2048;
+
 /// HTML elements whose content is raw text (never parsed as markup).
 const RAW_TEXT: &[&str] = &["script", "style", "textarea", "noscript", "template"];
 
@@ -56,19 +61,35 @@ pub fn tokenize(src: &str, html: bool) -> Vec<Token> {
             flush(&mut out, text_start, i);
             i = rest.find('>').map_or(b.len(), |e| i + e + 1);
             text_start = i;
-        } else if rest.starts_with("</") {
-            let Some(end) = rest.find('>') else {
-                break;
-            };
-            let name = rest[2..end].trim().to_ascii_lowercase();
-            if name.is_empty() || !name.bytes().next().is_some_and(|c| c.is_ascii_alphabetic()) {
-                i += 2;
-                continue;
+        } else if let Some(after) = rest.strip_prefix("</") {
+            // A closing tag is a short name, optional spaces, and `>`; look
+            // no further than that, so junk like `</</</` stays linear.
+            let ab = after.as_bytes();
+            let name_len = ab
+                .iter()
+                .take(MAX_NAME)
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b':' | b'-' | b'_' | b'.'))
+                .count();
+            let close = ab[name_len..]
+                .iter()
+                .take(32)
+                .position(|c| *c == b'>')
+                .filter(|&p| {
+                    ab[name_len..name_len + p]
+                        .iter()
+                        .all(u8::is_ascii_whitespace)
+                });
+            match close {
+                Some(p) if name_len > 0 && ab[0].is_ascii_alphabetic() => {
+                    flush(&mut out, text_start, i);
+                    out.push(Token::End {
+                        name: after[..name_len].to_ascii_lowercase(),
+                    });
+                    i += 2 + name_len + p + 1;
+                    text_start = i;
+                }
+                _ => i += 2,
             }
-            flush(&mut out, text_start, i);
-            out.push(Token::End { name });
-            i += end + 1;
-            text_start = i;
         } else if rest.len() > 1 && rest.as_bytes()[1].is_ascii_alphabetic() {
             // An unterminated tag runs to the end of the input: the rest is
             // text (stopping here keeps malformed input linear).
@@ -550,7 +571,7 @@ pub fn origin_of(url: &str) -> Option<String> {
 /// Resolve `href` against `base`. Only http(s) results are returned.
 pub fn resolve(base: &str, href: &str) -> Option<String> {
     let href = href.trim();
-    if href.is_empty() || href.contains(['\n', '\r', '\t']) {
+    if href.is_empty() || href.len() > MAX_URL || href.contains(['\n', '\r', '\t']) {
         return None;
     }
     let lower = href.to_ascii_lowercase();
@@ -693,12 +714,18 @@ mod tests {
             collapse_ws(&root.child("content").unwrap().all_text()),
             "A bright comet tonight"
         );
-        // 200k unterminated tags: must not rescan the rest at every `<`.
-        let junk = "<a".repeat(200_000);
-        let t0 = std::time::Instant::now();
-        let toks = tokenize(&junk, true);
-        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
-        assert_eq!(toks.len(), 1);
+        // 200k unterminated tags, or broken closing tags: must not rescan
+        // the rest at every `<`.
+        for junk in ["<a".repeat(200_000), format!("{}>", "</".repeat(200_000))] {
+            let t0 = std::time::Instant::now();
+            let toks = tokenize(&junk, true);
+            assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+            assert_eq!(toks.len(), 1);
+        }
+        assert_eq!(
+            resolve("https://a.example/", &format!("/{}", "x".repeat(3000))),
+            None
+        );
     }
 
     #[test]

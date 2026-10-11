@@ -111,6 +111,10 @@ pub struct Capabilities {
     pub mcp: bool,
     /// Can resume a previous session.
     pub resume: bool,
+    /// Can run a helper prompt with every tool turned off, including MCP
+    /// servers from the user's own CLI config (`TurnSpec.tools = false`).
+    /// Helper calls (the feed's) skip CLIs that cannot.
+    pub tool_less: bool,
 }
 
 /// How the CLI's own login command works headless.
@@ -460,14 +464,24 @@ mod tests {
         for o in [
             "sandbox_mode=\"read-only\"",
             "approval_policy=\"never\"",
-            "tools.web_search=false",
-            "mcp_servers={}",
+            "web_search=\"disabled\"",
+            "--ignore-user-config",
+            "--ephemeral",
         ] {
             assert!(x.args.iter().any(|a| a == o), "{o}");
         }
         assert!(!x.args.iter().any(|a| a.contains("workspace-write")));
 
-        let g = args(&gemini::Gemini::new(HarnessConfig::gemini_default()));
+        let gem = gemini::Gemini::new(HarnessConfig::gemini_default());
+        assert!(!gem.capabilities().tool_less, "helper calls skip Gemini");
+        for h in [
+            &claude::Claude::new(HarnessConfig::claude_default()) as &dyn Harness,
+            &codex::Codex::new(HarnessConfig::codex_default()),
+            &opencode::OpenCode::new(HarnessConfig::opencode_default()),
+        ] {
+            assert!(h.capabilities().tool_less, "{}", h.name());
+        }
+        let g = args(&gem);
         let pos = g.args.iter().position(|a| a == "--approval-mode").unwrap();
         assert_eq!(g.args[pos + 1], "default");
         let settings: Value = serde_json::from_slice(

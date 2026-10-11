@@ -469,8 +469,7 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
             .map(|i| (rank::score(&i, &t2, &e2, now), i))
             .collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-        scored.truncate((size as usize * 3).clamp(15, 60));
-        scored.into_iter().map(|(_, i)| i).collect()
+        shortlist(scored, (size as usize * 3).clamp(15, 60))
     })
     .await?;
     let f = fetcher.clone();
@@ -523,7 +522,8 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
                 prompt: &prompt,
                 timeout: Duration::from_secs(300),
                 scope: "feed-summaries",
-                max_attempts: 2,
+                // One real model call; a signed-out CLI falls through to the next.
+                max_attempts: 1,
                 take_slot: true,
             },
         )
@@ -560,21 +560,7 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
     // Original URL -> cached file.
     let cached: Vec<BTreeMap<String, String>> = tokio::task::spawn_blocking(move || {
         parallel(to_cache, WORKERS, |(imgs, icon)| {
-            let mut map = BTreeMap::new();
-            for u in imgs {
-                if map.len() >= 3 {
-                    break;
-                }
-                if let Ok(name) = images::cache(&f, &data_dir, &u, false) {
-                    map.insert(u, name);
-                }
-            }
-            if let Some(icon) = icon
-                && let Ok(name) = images::cache(&f, &data_dir, &icon, true)
-            {
-                map.insert(icon, name);
-            }
-            map
+            cache_assets(&f, &data_dir, &imgs, icon.as_deref())
         })
     })
     .await?;
@@ -885,7 +871,8 @@ async fn refresh_interests(
             prompt: &prompt,
             timeout: Duration::from_secs(180),
             scope: "feed-interests",
-            max_attempts: 2,
+            // One real model call; a signed-out CLI falls through to the next.
+            max_attempts: 1,
             take_slot: true,
         },
     )
@@ -910,10 +897,20 @@ async fn refresh_interests(
         } else {
             crate::warn!("feed: interests reply was not usable JSON");
         }
-        let fallback = st
-            .interests
-            .clone()
-            .unwrap_or_else(|| fallback_interests(&liked));
+        let fallback = match st.interests.clone() {
+            Some(i) => i,
+            None => {
+                // Keep the derived topics for later runs today (no second
+                // model call).
+                let f = fallback_interests(&liked);
+                let (uid, keep) = (user_id.to_string(), f.clone());
+                state
+                    .db
+                    .call(move |c| store::update_state(c, &uid, |s| s.interests = Some(keep)))
+                    .await?;
+                f
+            }
+        };
         return Ok((fallback, None));
     };
     let uid = user_id.to_string();
@@ -1044,6 +1041,25 @@ fn clean(items: Vec<Item>, now: i64, lang: &str) -> Vec<Item> {
     items
 }
 
+/// The best `n` candidates by score, at most twice the per-source cap from
+/// any one source, so the final pick (3 per source) can still fill the day.
+fn shortlist(scored: Vec<(f64, Item)>, n: usize) -> Vec<Item> {
+    const PER_SOURCE: usize = 6;
+    let mut per_source: HashMap<String, usize> = HashMap::new();
+    let mut out = Vec::with_capacity(n);
+    for (_, it) in scored {
+        if out.len() >= n {
+            break;
+        }
+        let c = per_source.entry(it.source_name.clone()).or_default();
+        if *c < PER_SOURCE {
+            *c += 1;
+            out.push(it);
+        }
+    }
+    out
+}
+
 /// Without a model: one topic per liked-post topic.
 fn topics_from_likes(liked: &[(String, Option<String>)]) -> Vec<Topic> {
     let mut by_topic: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -1115,71 +1131,114 @@ async fn check_price_watches(state: &AppState, user_id: &str, fetcher: &Arc<Fetc
         return;
     }
     let f = fetcher.clone();
-    let checked = tokio::task::spawn_blocking(move || {
+    let data_dir = state.paths.data_dir.clone();
+    // (watch, new price if read, drop post if urgent)
+    type Checked = (store::Watch, Option<parse::Price>, Option<PipelinePost>);
+    let checked: Vec<Checked> = tokio::task::spawn_blocking(move || {
         parallel(due, WORKERS, |w| {
             let mut req = Request::new(&w.url, Mode::Crawl, "text/html", PAGE_BYTES);
             req.truncate = true;
-            let meta = f
+            let Some(meta) = f
                 .get(&req)
                 .ok()
-                .map(|r| extract::extract(&r.text(), &r.final_url));
-            (w, meta)
+                .map(|r| extract::extract(&r.text(), &r.final_url))
+            else {
+                return (w, None, None);
+            };
+            let old = parse::Price {
+                amount: w.price,
+                currency: w.currency.clone(),
+            };
+            let Some(new) = meta.price.clone() else {
+                return (w, None, None);
+            };
+            if urgent::price_drop_score(&old, &new) < urgent::URGENT_AT {
+                return (w, Some(new), None);
+            }
+            // Same photo rules as every post: only copies Iris checked.
+            let images: Vec<String> = meta.images.iter().take(4).cloned().collect();
+            let cached = cache_assets(&f, &data_dir, &images, meta.favicon.as_deref());
+            let post = PipelinePost {
+                title: format!("Price drop: {}", truncate_chars(&w.title, 200)),
+                body: urgent::price_drop_text(&w.title, &old, &new),
+                hook: Some("Something you saved got cheaper".into()),
+                why: Some("You saved this, and the price just dropped.".into()),
+                topic: None,
+                source_url: w.url.clone(),
+                source_name: meta
+                    .site_name
+                    .clone()
+                    .or_else(|| markup::host_of(&w.url))
+                    .unwrap_or_default(),
+                source_kind: "price_drop".into(),
+                url_key: format!("price:{}:{}", rank::url_key(&w.url), new.amount),
+                images: images
+                    .into_iter()
+                    .filter(|u| cached.contains_key(u))
+                    .collect(),
+                favicon_url: meta.favicon.clone().filter(|u| cached.contains_key(u)),
+                cached,
+                facts: json!({"price": new, "was": old}),
+            };
+            (w, Some(new), Some(post))
         })
     })
     .await
     .unwrap_or_default();
-    for (w, meta) in checked {
-        let old = parse::Price {
-            amount: w.price,
-            currency: w.currency.clone(),
-        };
-        let new_price = meta.as_ref().and_then(|m| m.price.clone());
-        let score = new_price
-            .as_ref()
-            .map_or(0, |p| urgent::price_drop_score(&old, p));
-        let id = w.id.clone();
-        let drop_to = (score >= urgent::URGENT_AT)
-            .then(|| new_price.as_ref().map(|p| p.amount))
-            .flatten();
-        let _ = state
-            .db
-            .call(move |c| store::checked_watch(c, &id, drop_to))
-            .await;
-        let (Some(new), true) = (new_price, score >= urgent::URGENT_AT) else {
-            continue;
-        };
-        let text = urgent::price_drop_text(&w.title, &old, &new);
-        let meta = meta.unwrap_or_default();
+    for (w, _new, post) in checked {
         let uid = user_id.to_string();
-        let post = PipelinePost {
-            title: format!("Price drop: {}", truncate_chars(&w.title, 200)),
-            body: text.clone(),
-            hook: Some("Something you saved got cheaper".into()),
-            why: Some("You saved this, and the price just dropped.".into()),
-            topic: None,
-            source_url: w.url.clone(),
-            source_name: meta
-                .site_name
-                .clone()
-                .or_else(|| markup::host_of(&w.url))
-                .unwrap_or_default(),
-            source_kind: "price_drop".into(),
-            url_key: format!("price:{}:{}", rank::url_key(&w.url), new.amount),
-            images: meta.images.iter().take(3).cloned().collect(),
-            favicon_url: meta.favicon.clone(),
-            cached: BTreeMap::new(),
-            facts: json!({"price": new, "was": old}),
-        };
-        let _ = state
+        let push = post.as_ref().map(|p| p.body.clone());
+        // The lower reference price and the alert post commit together, so
+        // an interruption never loses the drop.
+        let ok = state
             .db
-            .call(move |c| entities::insert_pipeline_post(c, &uid, &post))
-            .await;
-        state.hub.to_users(
-            &[user_id.to_string()],
-            json!({"type": "entities.changed", "kinds": ["feed"]}),
-        );
-        push_urgent(state, user_id, "Price drop", &text).await;
+            .call(move |c| {
+                crate::db::write_tx(c, |c| {
+                    let drop_to = post
+                        .as_ref()
+                        .and_then(|p| p.facts["price"]["amount"].as_f64());
+                    store::checked_watch(c, &w.id, drop_to)?;
+                    if let Some(p) = &post {
+                        entities::insert_pipeline_post(c, &uid, p)?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .is_ok();
+        if let (true, Some(text)) = (ok, push) {
+            state.hub.to_users(
+                &[user_id.to_string()],
+                json!({"type": "entities.changed", "kinds": ["feed"]}),
+            );
+            push_urgent(state, user_id, "Price drop", &text).await;
+        }
     }
+}
+
+/// Download up to 3 photos and the icon into the cache (robots.txt, public
+/// addresses, photo checks); returns original URL -> cached file.
+fn cache_assets(
+    f: &Fetcher,
+    data_dir: &std::path::Path,
+    images: &[String],
+    icon: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for u in images {
+        if map.len() >= 3 {
+            break;
+        }
+        if let Ok(name) = images::cache(f, data_dir, u, false) {
+            map.insert(u.clone(), name);
+        }
+    }
+    if let Some(icon) = icon
+        && let Ok(name) = images::cache(f, data_dir, icon, true)
+    {
+        map.insert(icon.to_string(), name);
+    }
+    map
 }
 
 /// Keep a record of the run in the hidden feed job conversation, so the
@@ -1408,6 +1467,20 @@ mod tests {
             .map(|i| i.title.as_str())
             .collect();
         assert_eq!(a, vec!["A fresh story here"]);
+    }
+
+    #[test]
+    fn shortlist_leaves_room_for_other_sources() {
+        let it = |src: &str, i: usize| Item {
+            title: format!("{src} {i}"),
+            source_name: src.into(),
+            ..Default::default()
+        };
+        let mut scored: Vec<(f64, Item)> = (0..40).map(|i| (1.0, it("big", i))).collect();
+        scored.extend((0..10).map(|i| (0.5, it(&format!("s{i}"), i))));
+        let out = shortlist(scored, 30);
+        assert_eq!(out.iter().filter(|i| i.source_name == "big").count(), 6);
+        assert_eq!(out.len(), 16);
     }
 
     #[test]

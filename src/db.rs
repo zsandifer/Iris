@@ -281,11 +281,12 @@ CREATE TABLE feed_days (
     PRIMARY KEY (user_id, day)
 );
 
--- Prices of saved (liked) products, checked daily for drops.
+-- Prices of saved (liked) products, checked daily for drops. A watch is
+-- active while any liked post links to its URL (post_id is the first).
 CREATE TABLE feed_watches (
     id          TEXT PRIMARY KEY,
     user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    post_id     TEXT NOT NULL REFERENCES feed_posts(id) ON DELETE CASCADE,
+    post_id     TEXT,
     url         TEXT NOT NULL,
     title       TEXT NOT NULL,
     price       REAL NOT NULL,

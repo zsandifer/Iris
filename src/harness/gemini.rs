@@ -119,6 +119,7 @@ impl Harness for Gemini {
             effort: false,
             mcp: true,
             resume: true,
+            tool_less: false,
         }
     }
 
@@ -144,8 +145,10 @@ impl Harness for Gemini {
             .collect();
         let mut body = json!({"mcpServers": mcp_settings(&servers)});
         if !spec.tools {
-            // Workspace settings: every built-in tool excluded, no MCP
-            // server from the user's settings allowed.
+            // Best effort only: user-level MCP servers and discovered tools
+            // can survive workspace settings, so the capability says
+            // `tool_less: false` and helper calls skip Gemini. These
+            // settings still narrow anything built this way.
             body["tools"] = json!({"exclude": GEMINI_BUILTIN_TOOLS});
             body["excludeTools"] = json!(GEMINI_BUILTIN_TOOLS);
             body["mcp"] = json!({"allowed": []});

@@ -224,6 +224,9 @@ fn parse_iso(s: &str) -> Option<i64> {
 
 // --------------------------------------------------------------------- feeds
 
+/// Entries read from one feed (feeds list newest first).
+const MAX_ENTRIES: usize = 200;
+
 /// A parsed RSS/Atom document.
 #[derive(Debug, Default)]
 pub struct FeedDoc {
@@ -431,6 +434,7 @@ pub fn parse_feed(xml: &str, feed_url: &str) -> Option<FeedDoc> {
         let base = doc.site_url.clone().unwrap_or_else(|| feed_url.to_string());
         doc.items = feed
             .children_named("entry")
+            .take(MAX_ENTRIES)
             .filter_map(|e| feed_item(e, &base, true))
             .collect();
         return Some(doc);
@@ -449,6 +453,7 @@ pub fn parse_feed(xml: &str, feed_url: &str) -> Option<FeedDoc> {
     let mut items: Vec<Item> = channel
         .map(|ch| {
             ch.children_named("item")
+                .take(MAX_ENTRIES)
                 .filter_map(|e| feed_item(e, &base, false))
                 .collect()
         })
@@ -456,6 +461,7 @@ pub fn parse_feed(xml: &str, feed_url: &str) -> Option<FeedDoc> {
     // RSS 1.0 puts items next to the channel.
     items.extend(
         top.children_named("item")
+            .take(MAX_ENTRIES)
             .filter_map(|e| feed_item(e, &base, false)),
     );
     doc.items = items;
@@ -594,6 +600,7 @@ pub fn reddit_feed_items(xml: &str, feed_url: &str, subreddit_label: &str) -> Ve
         return Vec::new();
     };
     feed.children_named("entry")
+        .take(MAX_ENTRIES)
         .filter_map(|e| {
             let mut item = feed_item(e, feed_url, true)?;
             let content = e.child("content").map(html_of).unwrap_or_default();

@@ -733,9 +733,11 @@ pub async fn one_shot(
         }
     }
     let mut tried_harnesses: Vec<String> = Vec::new();
+    // Runs that reached a model (a signed-out CLI does not count).
+    let mut attempts = 0;
     let mut last_error = "no usable engine".to_string();
     for model_id in candidates {
-        if tried_harnesses.len() >= req.max_attempts.max(1) {
+        if attempts >= req.max_attempts.max(1) {
             break;
         }
         let Some(m) = catalog.get(&model_id) else {
@@ -751,6 +753,11 @@ pub async fn one_shot(
         let Some(entry) = state.harness(&m.harness).filter(|e| e.usable()) else {
             continue;
         };
+        // Helper prompts carry untrusted text: only CLIs that can really
+        // turn every tool off.
+        if !entry.harness.capabilities().tool_less {
+            continue;
+        }
         let Some(program) = entry.program() else {
             continue;
         };
@@ -818,6 +825,9 @@ pub async fn one_shot(
                 _ => {}
             }
         }
+        if !matches!(terminal, Some(Terminal::Auth(_))) {
+            attempts += 1;
+        }
         match (run, terminal) {
             (Ok(out), _) if out.timed_out => {
                 last_error = format!("no result after {}s", req.timeout.as_secs());
@@ -842,7 +852,7 @@ pub async fn one_shot(
             (Err(e), _) => last_error = format!("could not start {}: {e}", m.harness),
         }
     }
-    Err(if tried_harnesses.is_empty() {
+    Err(if attempts == 0 {
         OneShotError::NoEngine
     } else {
         OneShotError::Failed(last_error)
