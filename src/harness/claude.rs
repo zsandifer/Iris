@@ -124,6 +124,9 @@ impl Harness for Claude {
         }
         // Nobody can answer an interactive approval in a headless turn.
         a.extend(["--permission-prompts", "none"].map(String::from));
+        // Only Iris's servers: services the operator configured in Claude
+        // Code itself would bypass Iris's gateway and approvals.
+        a.push("--strict-mcp-config".into());
 
         let mut allowed = self.cfg.allowed_tools.clone();
         if !spec.mcp_servers.is_empty() {
@@ -666,6 +669,7 @@ mod tests {
             run_dir: tmp.path().into(),
             scope: "c1".into(),
             key_env: vec![],
+            foreign_mcp: vec![],
         };
         let inv = Claude::new(HarnessConfig::claude_default())
             .build(&spec)
@@ -675,6 +679,7 @@ mod tests {
         assert!(args.contains("--model haiku --effort low --resume sess-1"));
         assert!(args.contains("--system-prompt-snapshot off"));
         assert!(args.contains("--permission-prompts none"));
+        assert!(args.contains("--strict-mcp-config"));
         assert!(args.contains("--allowedTools Read,Glob,Grep,WebSearch,WebFetch,mcp__iris"));
         assert_eq!(inv.temp_files.len(), 2);
         let mcp: Value =

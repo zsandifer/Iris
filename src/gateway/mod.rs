@@ -97,8 +97,18 @@ struct Session {
     last_used: AtomicI64,
     /// Calls running right now (an idle reaper must not stop them).
     inflight: std::sync::atomic::AtomicUsize,
-    /// Secret values it was started with, to scrub from diagnostics.
-    secrets: Vec<String>,
+    /// Secret values it was given (including every bearer token swapped
+    /// in since), to scrub from diagnostics.
+    secrets: Mutex<Vec<String>>,
+}
+
+impl Session {
+    fn scrub(&self, text: &str) -> String {
+        redact(
+            text,
+            &self.secrets.lock().unwrap_or_else(|p| p.into_inner()),
+        )
+    }
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<Arc<Session>>>>;
@@ -115,6 +125,8 @@ pub struct Gateway {
     pending: Mutex<HashMap<String, (String, oneshot::Sender<bool>)>>,
     /// Last start failure per connector id (owner diagnostics).
     errors: Mutex<HashMap<String, String>>,
+    /// Wakes a connector start that `stop` wants abandoned.
+    stops: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
 }
 
 impl Gateway {
@@ -127,7 +139,16 @@ impl Gateway {
             .clone()
     }
 
-    fn grant(&self, token: &str) -> Option<Arc<Grant>> {
+    fn stopper(&self, id: &str) -> Arc<tokio::sync::Notify> {
+        self.stops
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    pub(crate) fn grant(&self, token: &str) -> Option<Arc<Grant>> {
         self.grants
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -361,6 +382,8 @@ pub async fn handle(state: &AppState, msg: &Value) -> Value {
         _ => return rpc_error(id, -32001, "this connection was removed"),
     };
     let result = match req["method"].as_str().unwrap_or("") {
+        // Listing never starts a connector that may not run now.
+        "tools/list" if refusal(state, &grant, &con).await.is_some() => json!({"tools": []}),
         "tools/list" => match list_tools(state, &con).await {
             Ok(tools) => json!({"tools": tools}),
             Err(e) => return rpc_error(id, -32002, &e),
@@ -442,7 +465,13 @@ fn launch_for(
     {
         secrets.push(plain);
     }
-    let cwd = connector_dir(state, &con.id);
+    // Connectors saved before the gateway ran in the agent's workspace and
+    // may use paths relative to it; new ones get a private folder.
+    let cwd = if con.workspace_cwd {
+        state.paths.workspace_dir()
+    } else {
+        connector_dir(state, &con.id)
+    };
     crate::config::ensure_private_dir(&cwd).map_err(|e| e.to_string())?;
     let token_env = con.config.oauth.as_ref().and_then(|o| o.token_env.clone());
     match (con.transport.as_str(), &con.config.command) {
@@ -483,8 +512,35 @@ fn launch_for(
 }
 
 /// The running session for a connector, started (or restarted) as needed.
+/// A token the server refuses at startup is refreshed and tried once more.
 async fn session(state: &AppState, con: &Connector) -> Result<Arc<Session>, CallError> {
-    let bearer = crate::oauth::bearer(state, con).await?;
+    let mut con = con.clone();
+    for attempt in 0..2 {
+        match session_once(state, &con).await {
+            Err(Started::Refused(used)) if attempt == 0 && con.config.oauth.is_some() => {
+                crate::oauth::invalidate(state, &con.id, used.as_deref()).await;
+                con = current(state, &con.id)
+                    .await
+                    .ok_or_else(|| CallError::Other("the connection was removed".into()))?;
+            }
+            Err(Started::Refused(_)) => return Err(CallError::Auth),
+            Err(Started::Failed(e)) => return Err(e),
+            Ok(s) => return Ok(s),
+        }
+    }
+    Err(CallError::Auth)
+}
+
+enum Started {
+    /// The server refused this bearer token at startup.
+    Refused(Option<String>),
+    Failed(CallError),
+}
+
+async fn session_once(state: &AppState, con: &Connector) -> Result<Arc<Session>, Started> {
+    let bearer = crate::oauth::bearer(state, con)
+        .await
+        .map_err(|e| Started::Failed(e.into()))?;
     let fp = fingerprint(con);
     let slot = state.gateway.slot(&con.id);
     let mut guard = slot.lock().await;
@@ -505,15 +561,16 @@ async fn session(state: &AppState, con: &Connector) -> Result<Arc<Session>, Call
                     .errors
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .insert(
-                        con.id.clone(),
-                        truncate_chars(&redact(last.trim(), &s.secrets), 300),
-                    );
+                    .insert(con.id.clone(), truncate_chars(&s.scrub(last.trim()), 300));
             }
         }
         if s.upstream.alive() && s.fingerprint == fp && (same_bearer || !token_env) {
             if !same_bearer {
                 if let Some(t) = &bearer {
+                    s.secrets
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(t.clone());
                     s.upstream
                         .set_header("Authorization", &format!("Bearer {t}"));
                 }
@@ -525,9 +582,17 @@ async fn session(state: &AppState, con: &Connector) -> Result<Arc<Session>, Call
         s.upstream.close().await;
         *guard = None;
     }
-    let (launch, secrets) = launch_for(state, con, bearer.as_deref()).map_err(CallError::Other)?;
+    let (launch, secrets) = launch_for(state, con, bearer.as_deref())
+        .map_err(|e| Started::Failed(CallError::Other(e)))?;
     crate::info!("connector {}: starting", con.name);
-    let upstream = match Upstream::start(launch, START_TIMEOUT).await {
+    let stopper = state.gateway.stopper(&con.id);
+    let started = tokio::select! {
+        r = Upstream::start(launch, START_TIMEOUT) => r,
+        // `stop` (turned off, paused, removed) abandons a slow start; the
+        // half-started program is stopped when the future is dropped.
+        _ = stopper.notified() => Err(UpstreamError::Transport("stopped while starting".into())),
+    };
+    let upstream = match started {
         Ok(u) => u,
         Err(e) => {
             // The detail (which may quote the program's output) is only
@@ -541,11 +606,11 @@ async fn session(state: &AppState, con: &Connector) -> Result<Arc<Session>, Call
                 .insert(con.id.clone(), msg);
             crate::warn!("connector {}: failed to start", con.name);
             return Err(match e {
-                UpstreamError::Auth(_) => CallError::Auth,
-                _ => CallError::Other(format!(
+                UpstreamError::Auth(_) => Started::Refused(bearer),
+                _ => Started::Failed(CallError::Other(format!(
                     "{} could not start (the owner can see why on its page in the app)",
                     con.name
-                )),
+                ))),
             });
         }
     };
@@ -561,15 +626,29 @@ async fn session(state: &AppState, con: &Connector) -> Result<Arc<Session>, Call
         bearer: Mutex::new(bearer),
         last_used: AtomicI64::new(now_ms()),
         inflight: Default::default(),
-        secrets,
+        secrets: Mutex::new(secrets),
     });
     *guard = Some(s.clone());
     Ok(s)
 }
 
+/// Stop this exact session if it is still the connector's current one (a
+/// late failure must not tear down a newer session).
+async fn stop_session(state: &AppState, connector_id: &str, s: &Arc<Session>) {
+    let slot = state.gateway.slot(connector_id);
+    let mut guard = slot.lock().await;
+    if guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, s)) {
+        guard.take();
+        drop(guard);
+        s.upstream.close().await;
+    }
+}
+
 /// Stop a connector's program or session (it was edited, turned off, or
 /// removed). The next call starts it again if allowed.
 pub async fn stop(state: &AppState, connector_id: &str) {
+    // Abandon a start in progress first (it holds the slot).
+    state.gateway.stopper(connector_id).notify_waiters();
     let slot = state.gateway.slot(connector_id);
     let old = slot.lock().await.take();
     if let Some(s) = old {
@@ -628,32 +707,66 @@ impl From<crate::oauth::TokenError> for CallError {
     }
 }
 
-/// The connector's tools, from cache or the running server.
-async fn upstream_tools(state: &AppState, con: &Connector) -> Result<Vec<Value>, CallError> {
+/// Cached tools for the connector's current settings, if any.
+fn cached_tools(state: &AppState, con: &Connector) -> Option<Vec<Value>> {
     let fp = fingerprint(con);
-    if let Some((f, tools)) = state
-        .gateway
-        .tools
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(&con.id)
-        && *f == fp
-    {
-        return Ok(tools.clone());
-    }
-    let s = session(state, con).await?;
-    let tools = match s.upstream.list_tools(START_TIMEOUT).await {
-        Ok(t) => t,
-        Err(UpstreamError::Auth(_)) => return Err(CallError::Auth),
-        Err(e) => return Err(CallError::Other(e.to_string())),
-    };
     state
         .gateway
         .tools
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(con.id.clone(), (fp, tools.clone()));
-    Ok(tools)
+        .get(&con.id)
+        .filter(|(f, _)| *f == fp)
+        .map(|(_, t)| t.clone())
+}
+
+/// The connector's tools, from cache or the running server. A token
+/// refused while listing is refreshed and tried once more.
+async fn upstream_tools(state: &AppState, con: &Connector) -> Result<Vec<Value>, CallError> {
+    if let Some(t) = cached_tools(state, con) {
+        return Ok(t);
+    }
+    let mut con = con.clone();
+    for attempt in 0..2 {
+        let s = session(state, &con).await?;
+        match s.upstream.list_tools(START_TIMEOUT).await {
+            Ok(tools) => {
+                state
+                    .gateway
+                    .tools
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(con.id.clone(), (fingerprint(&con), tools.clone()));
+                return Ok(tools);
+            }
+            Err(UpstreamError::Auth(_)) if attempt == 0 && con.config.oauth.is_some() => {
+                let used = s.bearer.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                crate::oauth::invalidate(state, &con.id, used.as_deref()).await;
+                stop_session(state, &con.id, &s).await;
+                con = current(state, &con.id)
+                    .await
+                    .ok_or_else(|| CallError::Other("the connection was removed".into()))?;
+            }
+            Err(UpstreamError::Auth(_)) => return Err(CallError::Auth),
+            Err(e) => {
+                // Details (scrubbed) for the owner only.
+                state
+                    .gateway
+                    .errors
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(
+                        con.id.clone(),
+                        truncate_chars(&s.scrub(&e.to_string()), 300),
+                    );
+                return Err(CallError::Other(format!(
+                    "{} could not list its tools (the owner can see why on its page in the app)",
+                    con.name
+                )));
+            }
+        }
+    }
+    Err(CallError::Auth)
 }
 
 /// Tools as the agent sees them: refused ones left out, ones that wait for
@@ -694,7 +807,23 @@ pub async fn list_tools(state: &AppState, con: &Connector) -> Result<Vec<Value>,
 /// Tool list for the owner's connector page (with each tool's category
 /// and what the rules do with it). Starts the connector if needed.
 pub async fn describe_tools(state: &AppState, con: &Connector) -> Result<Vec<Value>, String> {
-    let tools = match upstream_tools(state, con).await {
+    let blocked = if state.is_paused().await {
+        Some("Iris is paused")
+    } else if !con.enabled {
+        Some("This connection is off")
+    } else if con.paused_reason.is_some() {
+        Some("This connection is paused")
+    } else if con.auth_state != "ok" {
+        Some("sign in first")
+    } else {
+        None
+    };
+    let found = match (blocked, cached_tools(state, con)) {
+        (None, _) => upstream_tools(state, con).await,
+        (Some(_), Some(t)) => Ok(t),
+        (Some(why), None) => return Err(why.into()),
+    };
+    let tools = match found {
         Ok(t) => t,
         Err(CallError::Auth) => return Err("sign in first".into()),
         Err(CallError::Other(e)) => return Err(e),
@@ -774,6 +903,84 @@ async fn refusal(state: &AppState, grant: &Grant, con: &Connector) -> Option<Str
     None
 }
 
+/// What an approval is bound to: where the call goes and as whom. Token
+/// refreshes keep it; a new sign-in, another client, or edited settings
+/// change it.
+fn target(con: &Connector) -> String {
+    let o = con.config.oauth.as_ref();
+    crate::util::sha256_hex(
+        &json!([
+            fingerprint(con),
+            o.and_then(|o| o.client_id.clone()),
+            o.and_then(|o| o.account.clone()),
+            o.and_then(|o| o.connected_at),
+        ])
+        .to_string(),
+    )
+}
+
+/// Everything needed to decide a call again right before it runs.
+struct Gate<'a> {
+    tool: &'a str,
+    category: Category,
+    recipients: &'a [String],
+    decided_by: &'static str,
+    target: String,
+}
+
+/// Re-decide a call against the connector and rules as they are now.
+/// `check_paused`: also refuse a tripwire-paused connector (not for calls
+/// already admitted within the limits).
+async fn gate_refusal(
+    state: &AppState,
+    grant: &Grant,
+    connector_id: &str,
+    gate: &Gate<'_>,
+    check_paused: bool,
+) -> Option<String> {
+    let Some(now) = current(state, connector_id).await else {
+        return Some("This connection was removed, so nothing was done.".into());
+    };
+    let probe = if check_paused {
+        now.clone()
+    } else {
+        Connector {
+            paused_reason: None,
+            ..now.clone()
+        }
+    };
+    if let Some(r) = refusal(state, grant, &probe).await {
+        return Some(r);
+    }
+    if gate.decided_by == "approved" && target(&now) != gate.target {
+        return Some(
+            "This connection was changed or signed in again after the owner approved, so \
+             nothing was done. Ask again if it is still wanted."
+                .into(),
+        );
+    }
+    let trusted = state.trusted_recipients().await;
+    let known = state
+        .db
+        .call(entities::known_recipients)
+        .await
+        .unwrap_or_default();
+    match policy::decide(
+        &now.policy,
+        gate.tool,
+        gate.category,
+        gate.recipients,
+        &|r| trusted.iter().any(|t| t == r),
+        &|r| known.iter().any(|k| k == r),
+    ) {
+        Verdict::Block(reason) => Some(format!("Not done: {reason}.")),
+        Verdict::Ask(_) if gate.decided_by != "approved" => {
+            Some("Not done: this connection's rules changed and now ask first. Try again.".into())
+        }
+        _ => None,
+    }
+}
+
 /// The connector as it is now (it may have been edited, turned off, or
 /// removed while a call waited).
 async fn current(state: &AppState, id: &str) -> Option<Connector> {
@@ -797,6 +1004,7 @@ pub async fn call_tool(
     if let Some(r) = refusal(state, grant, con).await {
         return tool_error(&r);
     }
+    let bound_target = target(con);
     let tools = upstream_tools(state, con).await;
     let annotations = tools
         .as_ref()
@@ -896,23 +1104,17 @@ pub async fn call_tool(
     }
 
     // Dispatch gate: things may have changed while the call waited. The
-    // connector must still exist, be on, unpaused, signed in, allowed by
-    // its current rules, the turn still running, and Iris not paused.
-    let refused = match current(state, &con.id).await {
-        None => Some("This connection was removed, so nothing was done.".to_string()),
-        Some(now) => match refusal(state, grant, &now).await {
-            Some(r) => Some(r),
-            None => match judge(&now.policy) {
-                Verdict::Block(reason) => Some(format!("Not done: {reason}.")),
-                Verdict::Ask(_) if decided_by != "approved" => Some(
-                    "Not done: this connection's rules changed and now ask first. Try again."
-                        .to_string(),
-                ),
-                _ => None,
-            },
-        },
+    // connector must still exist, be on, unpaused, signed in, the same
+    // target the owner approved, allowed by its current rules, the turn
+    // still running, and Iris not paused.
+    let gate = Gate {
+        tool,
+        category,
+        recipients: &recipients,
+        decided_by,
+        target: bound_target,
     };
-    if let Some(r) = refused {
+    if let Some(r) = gate_refusal(state, grant, &con.id, &gate, true).await {
         set_decision(state, &call.id, "cancelled").await;
         return tool_error(&r);
     }
@@ -929,7 +1131,7 @@ pub async fn call_tool(
             .await;
     }
 
-    let result = forward(state, grant, &con.id, tool, args).await;
+    let result = forward(state, grant, &con.id, &gate, args).await;
     let (outcome, bytes) = match &result {
         Ok(v) => (
             if v["isError"] == true { "error" } else { "ok" },
@@ -982,13 +1184,14 @@ async fn set_decision(state: &AppState, call_id: &str, decision: &'static str) {
 }
 
 /// Forward a call to the connector, retrying once on a stale session or a
-/// rejected token (after refreshing it). Gives up as soon as the turn is
-/// cancelled or Iris is paused.
+/// rejected token (after refreshing it). Right before each attempt the
+/// call is decided again (starting the connector can take a while), and
+/// it gives up as soon as the turn is cancelled or Iris is paused.
 async fn forward(
     state: &AppState,
     grant: &Grant,
     connector_id: &str,
-    tool: &str,
+    gate: &Gate<'_>,
     args: &Value,
 ) -> Result<Value, CallError> {
     for attempt in 0..2 {
@@ -997,29 +1200,17 @@ async fn forward(
             .await
             .ok_or_else(|| CallError::Other("the connection was removed".into()))?;
         let s = session(state, &con).await?;
-        // Starting it can take a while; check nothing changed meanwhile
-        // (a tripwire pause by another call does not stop one already
-        // admitted within the limits).
-        let con = current(state, connector_id)
-            .await
-            .ok_or_else(|| CallError::Other("the connection was removed".into()))?;
-        if let Some(r) = refusal(
-            state,
-            grant,
-            &Connector {
-                paused_reason: None,
-                ..con.clone()
-            },
-        )
-        .await
-        {
+        // A tripwire pause by another call does not stop one already
+        // admitted within the limits.
+        if let Some(r) = gate_refusal(state, grant, connector_id, gate, false).await {
             return Err(CallError::Other(r));
         }
+        let used = s.bearer.lock().unwrap_or_else(|p| p.into_inner()).clone();
         s.last_used.store(now_ms(), Ordering::SeqCst);
         s.inflight.fetch_add(1, Ordering::SeqCst);
         let mut cancel = grant.cancel.subscribe();
         let result = tokio::select! {
-            r = s.upstream.call_tool(tool, args, CALL_TIMEOUT) => r,
+            r = s.upstream.call_tool(gate.tool, args, CALL_TIMEOUT) => r,
             _ = cancel.wait_for(|c| *c) => {
                 Err(UpstreamError::Transport("the request was cancelled".into()))
             }
@@ -1039,19 +1230,18 @@ async fn forward(
                 return Ok(v);
             }
             Err(UpstreamError::SessionExpired) if attempt == 0 => {
-                stop(state, connector_id).await;
+                stop_session(state, connector_id, &s).await;
             }
             Err(UpstreamError::Auth(_)) if attempt == 0 && con.config.oauth.is_some() => {
                 // The token may have been revoked early: refresh and retry.
-                let used = s.bearer.lock().unwrap_or_else(|p| p.into_inner()).clone();
                 crate::oauth::invalidate(state, connector_id, used.as_deref()).await;
-                stop(state, connector_id).await;
+                stop_session(state, connector_id, &s).await;
             }
             Err(UpstreamError::Auth(_)) => return Err(CallError::Auth),
             Err(UpstreamError::Timeout) => {
                 return Err(CallError::Other("it did not answer in time".into()));
             }
-            Err(e) => return Err(CallError::Other(redact(&e.to_string(), &s.secrets))),
+            Err(e) => return Err(CallError::Other(s.scrub(&e.to_string()))),
         }
     }
     Err(CallError::Auth)
@@ -1162,6 +1352,10 @@ async fn admit(
                 }
                 None => {
                     entities::set_call_decision(c, &cid, decided_by, None)?;
+                    c.execute(
+                        "UPDATE connector_calls SET admitted_at = ?2 WHERE id = ?1",
+                        rusqlite::params![cid, now_ms()],
+                    )?;
                     Ok(None)
                 }
             }

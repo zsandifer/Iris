@@ -122,11 +122,18 @@ impl Harness for OpenCode {
         let prompt_file = spec.run_dir.join(format!("{}.prompt.md", spec.turn_id));
         write_private_file(&prompt_file, spec.system_prompt.as_bytes())?;
         inv.temp_files.push(prompt_file.clone());
+        let mut mcp = mcp_config(&spec.mcp_servers);
+        // Servers configured in OpenCode itself would bypass Iris's gateway.
+        for name in &spec.foreign_mcp {
+            if !mcp.as_object().is_some_and(|m| m.contains_key(name)) {
+                mcp[name] = json!({"enabled": false});
+            }
+        }
         let mut config = json!({
             "$schema": "https://opencode.ai/config.json",
             "instructions": [prompt_file.to_string_lossy()],
             "permission": self.permissions(&spec.writable_dirs),
-            "mcp": mcp_config(&spec.mcp_servers),
+            "mcp": mcp,
         });
         let providers = provider_keys(&spec.key_env);
         if !providers.is_null() {
@@ -200,6 +207,20 @@ impl Harness for OpenCode {
 
     fn api_key_env(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// Names of servers configured in OpenCode itself, from its resolved
+    /// configuration (`opencode debug config`); the rest is discarded.
+    fn foreign_mcp_probe_args(&self) -> Option<Vec<String>> {
+        Some(vec!["debug".into(), "config".into()])
+    }
+
+    fn parse_foreign_mcp(&self, stdout: &str) -> Vec<String> {
+        let start = stdout.find('{').unwrap_or(0);
+        serde_json::from_str::<Value>(&stdout[start..])
+            .ok()
+            .and_then(|v| v["mcp"].as_object().map(|m| m.keys().cloned().collect()))
+            .unwrap_or_default()
     }
 
     fn models_probe_args(&self) -> Option<Vec<String>> {
@@ -721,6 +742,7 @@ anthropic/claude-haiku-4-5
             run_dir: tmp.path().into(),
             scope: "c1".into(),
             key_env: vec!["OPENROUTER_API_KEY".into()],
+            foreign_mcp: vec!["mine".into()],
         };
         let inv = OpenCode::new(HarnessConfig::opencode_default())
             .build(&spec)
@@ -752,6 +774,12 @@ anthropic/claude-haiku-4-5
         assert_eq!(cfg["mcp"]["iris"]["timeout"], 420_000);
         assert!(cfg["mcp"]["web"].get("timeout").is_none());
         assert_eq!(cfg["mcp"]["web"]["type"], "local");
+        assert_eq!(cfg["mcp"]["mine"], json!({"enabled": false}));
+        assert_eq!(
+            OpenCode::new(HarnessConfig::opencode_default())
+                .parse_foreign_mcp("{\n  \"mcp\": {\"mine\": {\"type\": \"local\"}}\n}"),
+            ["mine"]
+        );
         assert_eq!(
             cfg["provider"]["openrouter"]["options"]["apiKey"],
             "{env:OPENROUTER_API_KEY}"

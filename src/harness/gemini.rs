@@ -161,6 +161,14 @@ impl Harness for Gemini {
             a.push("--approval-mode".into());
             a.push(self.cfg.permission_mode.clone());
         }
+        // Only Iris's servers (not ones configured in Gemini CLI itself or
+        // its extensions, which would bypass Iris's gateway).
+        a.push("--allowed-mcp-server-names".into());
+        if spec.mcp_servers.is_empty() {
+            a.push("iris".into());
+        } else {
+            a.extend(spec.mcp_servers.iter().map(|s| s.name.clone()));
+        }
         let mut include: Vec<String> = spec
             .writable_dirs
             .iter()
@@ -549,6 +557,7 @@ mod tests {
             run_dir: tmp.path().into(),
             scope: "conv/../1".into(),
             key_env: vec!["GEMINI_API_KEY".into()],
+            foreign_mcp: vec![],
         };
         let inv = Gemini::new(HarnessConfig::gemini_default())
             .build(&spec)
@@ -559,11 +568,12 @@ mod tests {
             "{args}"
         );
         assert!(args.contains("--approval-mode auto_edit"));
+        assert!(args.contains("--allowed-mcp-server-names iris"));
         assert!(args.contains(&format!(
             "--include-directories /data/memory,{}",
             tmp.path().join("uploads").display()
         )));
-        assert!(!args.contains("effort") && !args.contains("low"));
+        assert!(!inv.args.iter().any(|a| a == "low" || a.contains("effort")));
         let cwd = inv.cwd.clone().unwrap();
         assert_eq!(cwd, tmp.path().join("gemini/conv1"));
         let settings: Value =

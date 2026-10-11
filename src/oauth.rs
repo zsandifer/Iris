@@ -206,20 +206,67 @@ fn path_of(url: &str) -> String {
     path.trim_end_matches('/').to_string()
 }
 
-fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+/// Resolves names but only connects to public addresses, so a name that
+/// passed a check cannot later resolve to the owner's own network.
+#[derive(Debug)]
+struct PublicOnly;
+
+impl ureq::unversioned::resolver::Resolver for PublicOnly {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let all = ureq::unversioned::resolver::DefaultResolver::default()
+            .resolve(uri, config, timeout)?;
+        let mut out = self.empty();
+        for a in all.iter().filter(|a| !private_ip(a.ip())) {
+            out.push(*a);
+        }
+        if out.is_empty() {
+            return Err(ureq::Error::HostNotFound);
+        }
+        Ok(out)
+    }
+}
+
+/// HTTP client for signing in. `local`: the connector itself is on this
+/// machine or the owner's network, so private addresses are allowed.
+fn agent(local: bool) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         // Redirects could lead anywhere; metadata and token endpoints are
         // used exactly as published.
         .max_redirects(0)
         .timeout_global(Some(HTTP_TIMEOUT))
         .user_agent(format!("iris/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into()
+        .build();
+    if local {
+        config.into()
+    } else {
+        ureq::Agent::with_parts(
+            config,
+            ureq::unversioned::transport::DefaultConnector::default(),
+            PublicOnly,
+        )
+    }
 }
 
-fn get_json(url: &str) -> Option<Value> {
-    let mut resp = agent()
+/// The URL's host resolves to this machine or a private network.
+fn resolves_private(url: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    if is_loopback_url(url) {
+        return true;
+    }
+    let port = if url.starts_with("https://") { 443 } else { 80 };
+    (host_of(url), port)
+        .to_socket_addrs()
+        .is_ok_and(|mut a| a.any(|a| private_ip(a.ip())))
+}
+
+fn get_json(url: &str, local: bool) -> Option<Value> {
+    let mut resp = agent(local)
         .get(url)
         .header("Accept", "application/json")
         .call()
@@ -237,12 +284,12 @@ fn get_json(url: &str) -> Option<Value> {
 }
 
 /// POST a form and parse the JSON reply (status, body).
-fn post_form(url: &str, form: &[(&str, &str)]) -> Result<(u16, Value), String> {
+fn post_form(url: &str, form: &[(&str, &str)], local: bool) -> Result<(u16, Value), String> {
     let body: Vec<String> = form
         .iter()
         .map(|(k, v)| format!("{}={}", pct_encode(k), pct_encode(v)))
         .collect();
-    let mut resp = agent()
+    let mut resp = agent(local)
         .post(url)
         .header("Accept", "application/json")
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -274,6 +321,8 @@ pub struct Discovered {
     pub registration_endpoint: Option<String>,
     pub scopes: Vec<String>,
     pub resource: String,
+    /// The service is on this machine or the owner's network.
+    pub local: bool,
 }
 
 /// `resource_metadata` and `scope` from a `WWW-Authenticate: Bearer` header.
@@ -308,7 +357,7 @@ pub fn as_metadata_urls(issuer: &str) -> Vec<String> {
 /// Run discovery against a remote MCP server (blocking).
 pub fn discover(mcp_url: &str) -> Result<Discovered, String> {
     // An unauthenticated request tells us where the metadata lives.
-    let probe = agent()
+    let probe = agent(true)
         .post(mcp_url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
@@ -331,7 +380,9 @@ pub fn discover(mcp_url: &str) -> Result<Discovered, String> {
     let path = path_of(mcp_url);
     // Metadata addresses a server points us to must be https (or this
     // machine, for testing), like the endpoints themselves.
-    let allow_local = is_loopback_url(mcp_url);
+    // Private addresses only for a connector the owner put on their own
+    // machine or network.
+    let allow_local = resolves_private(mcp_url);
     let mut prm_urls: Vec<String> = rm
         .into_iter()
         .filter(|u| check_endpoint(u, allow_local).is_ok())
@@ -342,7 +393,7 @@ pub fn discover(mcp_url: &str) -> Result<Discovered, String> {
         ));
     }
     prm_urls.push(format!("{origin}/.well-known/oauth-protected-resource"));
-    let prm = prm_urls.iter().find_map(|u| get_json(u));
+    let prm = prm_urls.iter().find_map(|u| get_json(u, allow_local));
     let (issuer, resource, supported) = match &prm {
         Some(p) => (
             p["authorization_servers"][0]
@@ -359,7 +410,9 @@ pub fn discover(mcp_url: &str) -> Result<Discovered, String> {
         None => (origin.clone(), mcp_url.to_string(), Value::Null),
     };
     check_endpoint(&issuer, allow_local)?;
-    let meta = as_metadata_urls(&issuer).iter().find_map(|u| get_json(u));
+    let meta = as_metadata_urls(&issuer)
+        .iter()
+        .find_map(|u| get_json(u, allow_local));
     let (auth, token, reg, scopes_meta) = match &meta {
         Some(m) => {
             if let Some(methods) = m["code_challenge_methods_supported"].as_array()
@@ -415,12 +468,18 @@ pub fn discover(mcp_url: &str) -> Result<Discovered, String> {
         token_endpoint: token,
         registration_endpoint: reg,
         scopes,
-        resource: resource.trim_end_matches('/').to_string(),
+        // Exactly as published: a trailing slash can matter.
+        resource,
+        local: allow_local,
     })
 }
 
 /// Dynamic client registration (blocking). Returns (client_id, secret).
-fn register(endpoint: &str, redirect_uri: &str) -> Result<(String, Option<String>), String> {
+fn register(
+    endpoint: &str,
+    redirect_uri: &str,
+    local: bool,
+) -> Result<(String, Option<String>), String> {
     let body = json!({
         "client_name": "Iris",
         "redirect_uris": [redirect_uri],
@@ -428,7 +487,7 @@ fn register(endpoint: &str, redirect_uri: &str) -> Result<(String, Option<String
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
     });
-    let mut resp = agent()
+    let mut resp = agent(local)
         .post(endpoint)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
@@ -497,6 +556,12 @@ pub fn seal_client_secret(state: &AppState, id: &str, secret: &str) -> Result<St
 
 /// A fresh access token for the connector (refreshing it if needed), None
 /// for connectors without OAuth.
+/// Hold while changing a connector's sign-in (tokens, client, endpoints)
+/// so a refresh in flight cannot write back older credentials.
+pub async fn credentials_lock(state: &AppState) -> tokio::sync::MutexGuard<'_, ()> {
+    state.oauth.refresh.lock().await
+}
+
 pub async fn bearer(
     state: &AppState,
     con: &entities::Connector,
@@ -545,6 +610,7 @@ pub async fn bearer(
     };
     let secret = open(state, &con.id, "client_secret", &o.client_secret);
     let resource = (o.mode == "discover").then(|| o.resource.clone()).flatten();
+    let local = o.local;
     let reply = tokio::task::spawn_blocking(move || {
         let mut form = vec![
             ("grant_type", "refresh_token"),
@@ -557,7 +623,7 @@ pub async fn bearer(
         if let Some(r) = &resource {
             form.push(("resource", r.as_str()));
         }
-        post_form(&token_endpoint, &form)
+        post_form(&token_endpoint, &form, local)
     })
     .await
     .map_err(|_| TokenError::NeedsSignIn)?;
@@ -571,6 +637,20 @@ pub async fn bearer(
                 .map_err(|_| TokenError::NeedsSignIn)?;
             crate::info!("connector {}: token refreshed", con.name);
             Ok(Some(token))
+        }
+        Ok((status, v))
+            if status == 429
+                || status >= 500
+                || v["error"] == "temporarily_unavailable"
+                || v["error"] == "server_error" =>
+        {
+            // The provider is having trouble: fail this call, keep the
+            // connection signed in.
+            crate::warn!(
+                "connector {}: token refresh unavailable (HTTP {status})",
+                con.name
+            );
+            Err(TokenError::Unavailable(format!("HTTP {status}")))
         }
         Ok((status, v)) => {
             crate::warn!(
@@ -718,6 +798,16 @@ pub async fn start(
         .ok()
         .flatten()
         .ok_or_else(|| StartError::Other("connection not found".into()))?;
+    let _creds = credentials_lock(state).await;
+    // The latest stored sign-in state (a refresh may just have run).
+    let fresh_id = con.id.clone();
+    let con = state
+        .db
+        .call(move |c| entities::get_connector(c, &fresh_id))
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| StartError::Other("connection not found".into()))?;
     let mut o = con.config.oauth.clone().unwrap_or_else(|| OAuthConfig {
         mode: "discover".into(),
         ..Default::default()
@@ -741,14 +831,15 @@ pub async fn start(
             o.scopes = d.scopes;
         }
         o.resource = Some(d.resource);
+        o.local = d.local;
     }
     let reuse_client = o.client_id.is_some()
         && (o.client_source == "owner" || o.redirect_uri.as_deref() == Some(redirect.as_str()));
     if !reuse_client {
         match o.registration_endpoint.clone() {
             Some(reg) if o.client_source != "owner" => {
-                let r = redirect.clone();
-                let (cid, secret) = tokio::task::spawn_blocking(move || register(&reg, &r))
+                let (r, local) = (redirect.clone(), o.local);
+                let (cid, secret) = tokio::task::spawn_blocking(move || register(&reg, &r, local))
                     .await
                     .map_err(|e| StartError::Other(e.to_string()))?
                     .map_err(StartError::Other)?;
@@ -871,6 +962,7 @@ pub async fn finish(
     let client_id = o.client_id.clone().unwrap_or_default();
     let secret = open(state, &con.id, "client_secret", &o.client_secret);
     let resource = (o.mode == "discover").then(|| o.resource.clone()).flatten();
+    let local = o.local;
     let code = code.to_string();
     let reply = tokio::task::spawn_blocking(move || {
         let mut form = vec![
@@ -886,7 +978,7 @@ pub async fn finish(
         if let Some(r) = &resource {
             form.push(("resource", r.as_str()));
         }
-        post_form(&token_endpoint, &form)
+        post_form(&token_endpoint, &form, local)
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -908,12 +1000,29 @@ pub async fn finish(
             )
         ));
     }
+    let _creds = credentials_lock(state).await;
+    // Built on the latest stored state; a new sign-in replaces the old
+    // grant entirely (never keeps the previous account's refresh token).
+    let latest_id = con.id.clone();
+    let mut o = state
+        .db
+        .call(move |c| entities::get_connector(c, &latest_id))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|c| c.config.oauth)
+        .ok_or("That connection was removed.")?;
+    o.refresh_token = None;
+    o.account = None;
     let mut updated = apply_tokens(state, &con.id, o, &v)?;
     updated.connected_at = Some(now_ms());
     if let Some(email) = v["id_token"].as_str().and_then(id_token_email) {
         updated.account = Some(email);
     }
     save(state, &con.id, updated).await?;
+    drop(_creds);
+    // Approvals were for the previous sign-in.
+    crate::gateway::cancel_approvals(state, Some(&con.id));
     let id = con.id.clone();
     let _ = state
         .db

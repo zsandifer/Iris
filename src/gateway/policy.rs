@@ -56,8 +56,8 @@ impl Category {
             Category::Write => 2,
             Category::Unclear => 3,
             Category::Export => 4,
-            Category::Delete => 5,
-            Category::Send => 6,
+            Category::Send => 5,
+            Category::Delete => 6,
             Category::Purchase => 7,
         }
     }
@@ -300,6 +300,24 @@ const WRITE_VERBS: &[&str] = &[
     "unstar",
     "unlabel",
 ];
+/// Things that others see once created or changed (`create_pull_request`,
+/// `update_issue`, `create_release`).
+const PUBLISH_NOUNS: &[&str] = &[
+    "pull",
+    "pr",
+    "issue",
+    "issues",
+    "release",
+    "gist",
+    "discussion",
+    "comment",
+    "comments",
+    "post",
+    "tweet",
+    "story",
+    "announcement",
+    "wiki",
+];
 /// Arguments that choose what a multi-purpose tool does
 /// (`pull_request_review_write(method: "submit_pending")`).
 const SELECTOR_KEYS: &[&str] = &[
@@ -347,6 +365,10 @@ fn classify_words(w: &[String]) -> Option<Category> {
     }
     if read_first {
         return Some(Category::Read);
+    }
+    // Creating or changing something other people see is publishing.
+    if has(WRITE_VERBS) && has(PUBLISH_NOUNS) {
+        return Some(Category::Send);
     }
     if has(WRITE_VERBS) {
         return Some(Category::Write);
@@ -441,6 +463,19 @@ const RECIPIENT_KEYS: &[&str] = &[
     "collaborator",
     "grantee",
 ];
+/// Flags that make a server add recipients Iris cannot see in the
+/// arguments (reply-all fills in everyone on the thread).
+const IMPLICIT_RECIPIENT_FLAGS: &[&str] = &[
+    "replyall",
+    "replytoall",
+    "toall",
+    "includeall",
+    "allrecipients",
+    "replyalltosender",
+];
+/// Stands for recipients the server will add on its own; never trusted.
+pub const IMPLICIT_RECIPIENTS: &str = "everyone else on the thread";
+
 /// Fields of an object inside a recipient list that identify the person.
 const IDENTITY_FIELDS: &[&str] = &[
     "email",
@@ -550,6 +585,13 @@ fn walk_recipients(v: &Value, depth: usize, out: &mut Vec<String>) {
 pub fn recipients(args: &Value) -> Vec<String> {
     let mut out = Vec::new();
     walk_recipients(args, 0, &mut out);
+    if let Some(obj) = args.as_object()
+        && obj.iter().any(|(k, v)| {
+            IMPLICIT_RECIPIENT_FLAGS.contains(&norm_key(k).as_str()) && (v == true || v == "true")
+        })
+    {
+        out.push(IMPLICIT_RECIPIENTS.to_string());
+    }
     let mut seen = std::collections::HashSet::new();
     out.retain(|r| seen.insert(r.clone()));
     out
@@ -826,10 +868,15 @@ mod tests {
                 &json!({"method": method, "owner": "o", "repo": "r", "pullNumber": 1}),
             )
         };
-        assert_eq!(review("create"), Category::Write);
+        // Reviews are seen by others: every operation on them asks.
+        assert_eq!(review("create"), Category::Send);
         assert_eq!(review("submit_pending"), Category::Send);
         assert_eq!(review("delete_pending"), Category::Delete);
-        assert_eq!(review("frobnicate"), Category::Unclear);
+        assert_eq!(review("frobnicate"), Category::Send);
+        assert_eq!(
+            classify_call("repo_admin_write", &none, &json!({"method": "frobnicate"})),
+            Category::Unclear
+        );
         assert_eq!(
             classify_call(
                 "pull_request_review_write",
@@ -901,6 +948,32 @@ mod tests {
         let r = recipients(&json!({"phone_number": "+1 (555) 010-2000"}));
         assert_eq!(r, ["+15550102000"]);
         assert!(recipients(&json!({"query": "from:x@y.com"})).is_empty());
+    }
+
+    #[test]
+    fn publishing_and_reply_all() {
+        let none = Value::Null;
+        assert_eq!(c("create_pull_request"), Category::Send);
+        assert_eq!(c("update_issue"), Category::Send);
+        assert_eq!(c("create_branch"), Category::Write);
+        assert_eq!(c("list_issues"), Category::Read);
+        // Reply-all reaches people Iris cannot see: never "all trusted".
+        let args =
+            json!({"to": "sam@example.com", "thread_id": "t1", "reply_all": true, "body": "ok"});
+        let r = recipients(&args);
+        assert!(r.contains(&IMPLICIT_RECIPIENTS.to_string()));
+        let tr = |x: &str| x == "sam@example.com";
+        assert!(matches!(
+            decide(
+                &Policy::default(),
+                "send_gmail_message",
+                classify_call("send_gmail_message", &none, &args),
+                &r,
+                &tr,
+                &tr
+            ),
+            Verdict::Ask(_)
+        ));
     }
 
     #[test]

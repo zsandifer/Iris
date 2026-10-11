@@ -456,6 +456,11 @@ async fn run_locked(
             run_dir: state.paths.run_dir(),
             scope: conv_id.to_string(),
             key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
+            foreign_mcp: entry
+                .foreign_mcp
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
         };
         let invocation = match entry.harness.build(&spec) {
             Ok(mut i) => {
@@ -707,6 +712,7 @@ async fn refine_with_model(state: &AppState, text: &str, shared: bool) -> Option
         run_dir: state.paths.run_dir(),
         scope: "classifier".into(),
         key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
+        foreign_mcp: vec![],
     };
     let mut invocation = entry.harness.build(&spec).ok()?;
     invocation.env.extend(keys);

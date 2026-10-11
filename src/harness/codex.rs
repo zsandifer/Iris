@@ -186,7 +186,14 @@ impl Harness for Codex {
             }
         }
         let exe = std::env::current_exe()?;
-        let mcp = mcp_setup(&spec.mcp_servers, &exe, &spec.run_dir, &spec.turn_id)?;
+        let mut mcp = mcp_setup(&spec.mcp_servers, &exe, &spec.run_dir, &spec.turn_id)?;
+        // Servers configured in Codex itself would bypass Iris's gateway.
+        for name in &spec.foreign_mcp {
+            if bare_key(name) && !spec.mcp_servers.iter().any(|s| &s.name == name) {
+                mcp.overrides
+                    .push(format!("mcp_servers.{name}.enabled=false"));
+            }
+        }
         overrides.extend(mcp.overrides);
         for o in overrides {
             a.push("-c".into());
@@ -243,6 +250,22 @@ impl Harness for Codex {
 
     fn manual_login_hint(&self) -> String {
         "Run `codex login --device-auth` on the Iris server.".into()
+    }
+
+    /// Names of servers configured in Codex itself (`codex mcp list
+    /// --json`); everything else in that output is discarded.
+    fn foreign_mcp_probe_args(&self) -> Option<Vec<String>> {
+        Some(vec!["mcp".into(), "list".into(), "--json".into()])
+    }
+
+    fn parse_foreign_mcp(&self, stdout: &str) -> Vec<String> {
+        serde_json::from_str::<Value>(stdout.trim())
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|s| s["name"].as_str().map(String::from))
+            .collect()
     }
 
     fn api_key_env(&self) -> &'static [&'static str] {
@@ -588,6 +611,7 @@ mod tests {
             run_dir: run.path().into(),
             scope: "c1".into(),
             key_env: vec![],
+            foreign_mcp: vec!["mine".into(), "notes".into()],
         };
         let mut cfg = HarnessConfig::codex_default();
         cfg.sandbox = "workspace-write".into();
@@ -657,6 +681,20 @@ mod tests {
         assert_eq!(mode & 0o077, 0, "env file is private");
         assert!(inv.temp_files.contains(&env_file));
         assert!(inv.env.is_empty(), "nothing secret in Codex's environment");
+        assert!(
+            inv.args
+                .contains(&"mcp_servers.mine.enabled=false".to_string())
+        );
+        assert!(
+            !inv.args
+                .contains(&"mcp_servers.notes.enabled=false".to_string())
+        );
+        assert_eq!(
+            h.parse_foreign_mcp(
+                r#"[{"name": "mine", "enabled": true, "transport": {"env": {"K": "v"}}}]"#
+            ),
+            ["mine"]
+        );
         assert!(
             inv.args
                 .contains(&"mcp_servers.notes.tool_timeout_sec=420".to_string())

@@ -342,11 +342,41 @@ export function ConnectorPage({ id }) {
     <${Group} label="Recently">
       ${!recent ? html`<${Spinner} />` : recent.length ? recent.map((it) => callRow(it, false)) : html`<div class="r"><div class="rt mu">Not used yet</div></div>`}
     <//>
+    ${con.oauth && html`<${Group} label="Signing in">
+      <${Row} title="Sign in again" sub=${con.oauth.account ? `Now signed in as ${con.oauth.account}` : 'Use another account or refresh access'}
+        onClick=${() => openSheet(() => html`<div class="sheet-body"><h3>Sign in to ${label}</h3><${ServiceSignIn} con=${con} label=${label} onDone=${closeSheet} /></div>`)} />
+      <${Row} title="Sign-in app" sub=${con.oauth.client_configured ? (con.oauth.client_source === 'dcr' ? 'Registered by Iris automatically' : 'Your own OAuth client') : 'Not set up yet'}
+        onClick=${() => (con.service === 'custom' ? openSheet(() => html`<${ClientSheet} con=${con} />`) : go(`iris/connections/add/${con.service}`))} />
+    <//>`}
     <${Group}>
       <${Row} title="Advanced settings" sub=${con.transport === 'stdio' ? 'Program, arguments, secrets' : 'Web address, headers'} onClick=${() => go(`iris/connections/${id}/edit`)} />
       <${Row} title="Remove connection" danger onClick=${remove} chevron=${false} />
     <//>
   <//>`;
+}
+
+/** Replace the OAuth client of a custom connection (for services that
+ * don't let apps register themselves, or a client that stopped working). */
+function ClientSheet({ con }) {
+  const [cid, setCid] = useState('');
+  const [secret, setSecret] = useState('');
+  const [busy, setBusy] = useState(false);
+  const save = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await post(`/connectors/${seg(con.id)}/oauth/client`, { client_id: cid.trim(), client_secret: secret.trim() || undefined });
+      await loadConnectors();
+      closeSheet();
+      toast('Saved. Sign in again to use it.');
+    } catch (err) { toast(err.message); }
+    setBusy(false);
+  };
+  return html`<form class="sheet-body form" onSubmit=${save}><h3>Sign-in app</h3>
+    <p class="mu">The Client ID (and secret) of an OAuth app you created on the service. Its callback address must be ${con.oauth?.redirect_uri || 'the one shown when you sign in'}.</p>
+    <label class="lbl">Client ID</label><input class="field mono" required value=${cid} autocapitalize="off" spellcheck=${false} onInput=${(e) => setCid(e.target.value)} />
+    <label class="lbl">Client secret (if it has one)</label><input class="field mono" type="password" autocomplete="off" value=${secret} onInput=${(e) => setSecret(e.target.value)} />
+    <button class="b1 wide" disabled=${busy || !cid.trim()}>Save</button></form>`;
 }
 
 // ---------------------------------------------------- custom / advanced form

@@ -82,6 +82,9 @@ pub struct TurnSpec {
     /// Names of API-key variables Iris passes to this run (keys the owner
     /// added in the app; values are added to the environment by the turn).
     pub key_env: Vec<String>,
+    /// MCP servers configured in the CLI itself (outside Iris), turned off
+    /// for this run so every service goes through Iris's gateway.
+    pub foreign_mcp: Vec<String>,
 }
 
 /// A fully built command line.
@@ -276,6 +279,15 @@ pub trait Harness: Send + Sync {
         None
     }
     fn parse_models(&self, _stdout: &str) -> Vec<DiscoveredModel> {
+        Vec::new()
+    }
+    /// A cheap local command listing MCP servers configured in the CLI
+    /// itself, for CLIs that cannot be told to use only Iris's servers.
+    fn foreign_mcp_probe_args(&self) -> Option<Vec<String>> {
+        None
+    }
+    /// Server names only (the rest of the output is discarded).
+    fn parse_foreign_mcp(&self, _stdout: &str) -> Vec<String> {
         Vec::new()
     }
     /// The CLI's own login command when it can run without a terminal, so

@@ -1230,14 +1230,23 @@ CLI's calls and enforces the owner's rules on them.
 
 Who gets them: turns in the **owner's** own conversations (the owner is the
 only member) and the owner's scheduled jobs, for connectors that are on,
-not paused, and signed in. All routes are **owner-only**. Shared conversations (more than one member) and other people's
+not paused, and signed in. All routes are **owner-only**. MCP servers
+configured in a CLI itself (outside Iris) are turned off in Iris's turns so
+nothing bypasses the gateway: Claude Code runs with `--strict-mcp-config`,
+Gemini CLI with `--allowed-mcp-server-names`, and Codex and OpenCode get
+`enabled = false` for the servers their own listings report (`codex mcp
+list --json`, `opencode debug config`; names only). Connectors saved before
+the gateway existed keep running in the workspace folder (they may use
+paths relative to it); new ones run in a private folder. Shared conversations (more than one member) and other people's
 conversations get none. Programs stop after `safety.idle_minutes` without
 use and start again on the next call.
 
 **The approval gate.** Every call is classified from the real tool name,
 the server's own annotations (`readOnlyHint`, `destructiveHint`; risky words
 in the name win), and the real arguments: `read`, `draft`, `write`, `send`
-(email, messages, posts, replies, sharing, invites, approving or merging),
+(email, messages, posts, replies, sharing, invites, approving or merging,
+and creating or changing things others see such as pull requests, issues,
+releases, and comments),
 `purchase` (buying, paying, ordering, booking), `delete`, `export`, or
 `unclear`. Operation arguments of multi-purpose tools (`method`, `action`,
 `operation`, `op`, `verb`, `command`, `event`) count too: the riskier
@@ -1250,7 +1259,7 @@ the arguments (`to`, `cc`, `bcc`, `recipients`, `attendees`, `email`,
 |---|---|
 | read, draft | Runs. |
 | write | Runs, unless it reaches someone new (a recipient not trusted and never approved before), which asks. |
-| send | Runs without asking only when every recipient is a [trusted person](#318-safety-pause-disconnect-trusted-people); otherwise asks. |
+| send | Runs without asking only when every recipient is a [trusted person](#318-safety-pause-disconnect-trusted-people) and the server cannot add others (a reply-all flag counts as "everyone else on the thread"); otherwise asks. |
 | purchase | Always asks, whatever the rules. |
 | delete, export, unclear | Asks. |
 
@@ -1262,10 +1271,12 @@ within `safety.approval_timeout_secs` (default 300, and at most a minute
 less than `turn_timeout_secs`; the card becomes `expired`), or the turn
 ended, Iris was paused, or the connector was turned off, removed, or paused
 (the card becomes `cancelled`): it never runs, and the agent gets an error
-result saying so. Right before any call runs, Iris checks again that the
-connector still exists, is on, unpaused, and signed in, that its current
-rules still allow the call, that the turn is still running, and that Iris
-is not paused. A request too large to show in full on the card (over 64,000
+result saying so. Right before any call runs (and again after starting the
+connector), Iris checks that the connector still exists, is on, unpaused,
+and signed in, that it is the same target and account the owner approved,
+that its current rules and trusted people still allow the call, that the
+turn is still running, and that Iris is not paused. Editing a connector's
+settings or signing it in again cancels its waiting approvals. A request too large to show in full on the card (over 64,000
 characters) is refused rather than approved unseen. Tools that would ask are marked in their description; tools the
 rules turn off are left out of `tools/list`.
 
@@ -1278,7 +1289,7 @@ connector: the call is refused, an `action` card "I paused <service>" with a
 Resume button is posted in the Main chat, and the owner gets a push (`kind:
 "safety"`). Calls already admitted finish; waiting approvals for that
 connector are cancelled. The data limit is also checked right after each
-result. Every call (ran, asked, refused) is recorded in the
+result. The hour counts from when calls ran, not when they were asked. Every call (ran, asked, refused) is recorded in the
 [connector activity log](#get-apiconnectorsactivity).
 
 **Sign-in (OAuth 2.1 + PKCE).** A connector with `auth: "oauth"` signs in on
@@ -1305,10 +1316,13 @@ redirect goes to `http://127.0.0.1:<port>/api/oauth/callback` instead; the
 browser lands on a page that does not load, and the owner pastes that
 address into the app (`POST /api/oauth/complete`). Tokens are sealed with the
 vault, refreshed a minute before they expire, and sent only to the
-connector. A refused token (401/403 after one refresh and retry, or a
-refused refresh) marks the connector `needs_reconnect` and posts a
-`connector_reconnect` card (`auth: "oauth"`) whose button signs in again. A
-sign-in server that cannot be reached fails only that call.
+connector. A refused token (401/403 at startup, while listing, or on a
+call, after one refresh and retry, or a refused refresh) marks the
+connector `needs_reconnect` and posts a `connector_reconnect` card (`auth:
+"oauth"`) whose button signs in again. A sign-in server that cannot be
+reached or is having trouble (HTTP 429/5xx, `temporarily_unavailable`)
+fails only that call. A new sign-in replaces the previous grant entirely;
+changing a connector's web address clears its sign-in.
 
 Secret values (`env` values, `headers` values, OAuth client secrets and
 tokens) are encrypted at rest and **never returned**; responses list only

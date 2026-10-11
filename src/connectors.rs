@@ -139,6 +139,7 @@ pub async fn setup(
     let entry = catalog_entry(service)
         .filter(|e| e.id != "custom")
         .ok_or("unknown service")?;
+    let _creds = crate::oauth::credentials_lock(state).await;
     let existing = {
         let name = entry.id.to_string();
         state
@@ -322,6 +323,8 @@ pub async fn setup(
         })
         .await
         .map_err(|e| e.to_string())?;
+    drop(_creds);
+    crate::gateway::cancel_approvals(state, Some(&id));
     crate::gateway::stop(state, &id).await;
     if !needs_sign_in {
         crate::login::on_connector_updated(state, &id).await;

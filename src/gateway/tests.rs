@@ -5,19 +5,26 @@ use super::*;
 use crate::config::{Config, Paths};
 use std::time::Duration;
 
-/// A fake MCP server: lists five tools, records every call it really runs
-/// in `calls.log` (in its private working directory), and echoes the
-/// secret it was given through its environment.
+/// A fake MCP server: lists six tools, records every call it really runs
+/// in `calls.log` and the exact request in `requests.log` (in its private
+/// working directory), and echoes the secret it was given through its
+/// environment. `read_archive` returns about 1.1 MB.
 const FAKE_SERVER: &str = r#"while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\)[,}].*/\1/p')
   case "$line" in
     *'"method":"initialize"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
     *'"method":"tools/list"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"search_messages","description":"Search messages","inputSchema":{"type":"object"}},{"name":"send_message","description":"Send a message","inputSchema":{"type":"object"}},{"name":"delete_message","inputSchema":{"type":"object"}},{"name":"create_event","inputSchema":{"type":"object"}},{"name":"export_everything","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"search_messages","description":"Search messages","inputSchema":{"type":"object"}},{"name":"send_message","description":"Send a message","inputSchema":{"type":"object"}},{"name":"delete_message","inputSchema":{"type":"object"}},{"name":"create_event","inputSchema":{"type":"object"}},{"name":"export_everything","inputSchema":{"type":"object"}},{"name":"read_archive","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]}}\n' "$id" ;;
     *'"method":"tools/call"'*)
       tool=$(printf '%s' "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
       echo "$tool" >> calls.log
+      printf '%s\n' "$line" >> requests.log
+      if [ "$tool" = read_archive ]; then
+        big=$(head -c 1100000 /dev/zero | tr '\0' a)
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$big"
+        continue
+      fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok %s secret=%s"}]}}\n' "$id" "$tool" "$FAKE_SECRET" ;;
   esac
 done"#;
@@ -106,6 +113,14 @@ impl T {
             .unwrap_or_default()
     }
 
+    fn last_request(&self) -> Value {
+        let log = std::fs::read_to_string(
+            connector_dir(&self.state, &self.connector_id).join("requests.log"),
+        )
+        .unwrap_or_default();
+        serde_json::from_str(log.lines().last().unwrap_or("null")).unwrap()
+    }
+
     fn calls(&self) -> Vec<ConnectorCall> {
         self.state
             .db
@@ -181,7 +196,7 @@ async fn secrets_stay_on_irises_side_and_reads_run_freely() {
     )
     .await;
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), 6);
     let send = tools.iter().find(|t| t["name"] == "send_message").unwrap();
     assert!(send["description"].as_str().unwrap().contains("approve"));
     let search = tools
@@ -241,6 +256,11 @@ async fn a_send_waits_for_approval_then_runs() {
     let r = call.await.unwrap()["result"].clone();
     assert_eq!(text(&r), "ok send_message secret=vaultsecret42");
     assert!(t.calls_log().contains("send_message"));
+    // Exactly what was approved reached the connector, unchanged.
+    assert_eq!(
+        t.last_request()["params"]["arguments"],
+        json!({"to": "Sam <sam@example.com>", "text": "Running late, 10 min"})
+    );
     let calls = t.calls();
     assert_eq!(calls[0].decision, "approved");
     assert_eq!(calls[0].card_message_id.as_deref(), Some(card.id.as_str()));
@@ -685,4 +705,139 @@ fn redacts_secret_values() {
         redact("token=abcd1234 ok", &["abcd1234".into(), "ab".into()]),
         "token=[hidden] ok"
     );
+}
+
+#[tokio::test]
+async fn the_call_count_tripwire_pauses() {
+    let t = setup(|c| c.safety.max_calls_per_hour = 2);
+    let (token, _guard, _) = t.grant().await;
+    for _ in 0..2 {
+        let r = t
+            .call(&token, "search_messages", json!({"query": "x"}))
+            .await;
+        assert_eq!(text(&r), "ok search_messages secret=vaultsecret42");
+    }
+    let r = t
+        .call(&token, "search_messages", json!({"query": "x"}))
+        .await;
+    assert!(text(&r).contains("used more than 2 times"), "{r}");
+    assert_eq!(t.calls_log().matches("search_messages").count(), 2);
+    assert!(t.connector().paused_reason.is_some());
+}
+
+#[tokio::test]
+async fn a_result_crossing_the_data_limit_pauses_right_away() {
+    let t = setup(|c| c.safety.max_read_mb_per_hour = 1);
+    let (token, _guard, _) = t.grant().await;
+    let r = t.call(&token, "read_archive", json!({"page": 1})).await;
+    // The result itself is delivered (it was within the limit when asked)...
+    assert!(text(&r).len() > 1_000_000);
+    let calls = t.calls();
+    assert!(calls[0].result_bytes > 1_048_576);
+    // ...and the connection is paused at once, with the owner told.
+    let con = t.connector();
+    assert!(con.paused_reason.unwrap().contains("bulk export"));
+    let notice = t
+        .state
+        .db
+        .with(|c| db::list_messages(c, &t.main, None, 50))
+        .unwrap()
+        .into_iter()
+        .any(|m| m.card.is_some_and(|c| c["type"] == "action"));
+    assert!(notice);
+    let r = t.call(&token, "search_messages", json!({})).await;
+    assert!(text(&r).contains("paused"));
+    assert_eq!(t.calls_log().matches("search_messages").count(), 0);
+}
+
+/// Owner-facing controls, through the real routes, cancel a held call.
+#[tokio::test]
+async fn safety_routes_cancel_held_calls() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+    for (method, path) in [
+        ("POST", "/api/connectors/{id}/disconnect"),
+        ("DELETE", "/api/connectors/{id}"),
+        ("POST", "/api/safety/disconnect-all"),
+        ("PUT", "/api/safety"),
+    ] {
+        let t = setup(|c| c.safety.approval_timeout_secs = 60);
+        let app = crate::server::router(t.state.clone());
+        let code = t
+            .state
+            .db
+            .with(|c| Ok(crate::auth::create_pairing_code(c, &t.owner)))
+            .unwrap()
+            .unwrap()
+            .0;
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/pair")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"code": code}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let device = serde_json::from_slice::<Value>(&bytes).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (token, _guard, _) = t.grant().await;
+        let (state, tok) = (t.state.clone(), token.clone());
+        let call = tokio::spawn(async move {
+            handle(
+                &state,
+                &json!({"token": tok, "connector": "chat", "request": {
+                    "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": "send_message", "arguments": {"to": "kim@example.com", "text": "hi"}}}}),
+            )
+            .await
+        });
+        let card = t.pending_card().await;
+        let body = if path == "/api/safety" {
+            Body::from(json!({"paused": true}).to_string())
+        } else {
+            Body::empty()
+        };
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(path.replace("{id}", &t.connector_id))
+                    .header("authorization", format!("Bearer {device}"))
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            res.status().is_success(),
+            "{method} {path}: {}",
+            res.status()
+        );
+        let r = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("the held call ends promptly")
+            .unwrap()["result"]
+            .clone();
+        assert!(
+            text(&r).contains("cancelled") || text(&r).contains("paused"),
+            "{path}: {r}"
+        );
+        let m = t
+            .state
+            .db
+            .with(|c| db::get_message(c, &card.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.card.unwrap()["state"], "cancelled", "{path}");
+        assert!(!t.calls_log().contains("send_message"), "{path}");
+    }
 }

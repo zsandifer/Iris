@@ -473,6 +473,15 @@ async fn shutdown_signal(state: AppState) {
     {
         let _ = tx.send(true);
     }
+    // Connector programs Iris started run in their own process groups:
+    // end them (TERM, then KILL shortly after) before exiting.
+    crate::gateway::cancel_all_grants(&state);
+    crate::gateway::cancel_approvals(&state, None);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::gateway::stop_all(&state),
+    )
+    .await;
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         std::process::exit(0);

@@ -286,6 +286,7 @@ pub async fn verify(
         run_dir: state.paths.run_dir(),
         scope: "keycheck".into(),
         key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
+        foreign_mcp: vec![],
     };
     let Ok(mut invocation) = entry.harness.build(&spec) else {
         return AuthState::Unknown;

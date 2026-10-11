@@ -767,6 +767,10 @@ pub struct OAuthConfig {
     /// When the owner last finished signing in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connected_at: Option<i64>,
+    /// The service is on this machine or the owner's network (sign-in may
+    /// then use private addresses).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
     /// The account signed in (email from the OpenID ID token), shown to
     /// the owner and told to the agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -811,6 +815,9 @@ pub struct Connector {
     pub paused_at: Option<i64>,
     /// ok | needs_sign_in | needs_reconnect
     pub auth_state: String,
+    /// Saved before the gateway: its program runs in the workspace.
+    #[serde(skip)]
+    pub workspace_cwd: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -876,6 +883,7 @@ fn connector_from_row(r: &rusqlite::Row) -> rusqlite::Result<Connector> {
         paused_reason: r.get("paused_reason")?,
         paused_at: r.get("paused_at")?,
         auth_state: r.get("auth_state")?,
+        workspace_cwd: r.get("workspace_cwd")?,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
     })
@@ -892,8 +900,9 @@ pub fn insert_connector(
 ) -> rusqlite::Result<Connector> {
     let now = now_ms();
     conn.execute(
-        "INSERT INTO connectors (id, name, description, transport, config, enabled, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        "INSERT INTO connectors (id, name, description, transport, config, enabled, created_at, updated_at,
+                                 workspace_cwd)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 0)",
         params![
             id,
             name,
@@ -1134,7 +1143,7 @@ pub fn connector_usage_since(
                 COALESCE(SUM(category = 'send'), 0),
                 COALESCE(SUM(result_bytes), 0)
          FROM connector_calls
-         WHERE connector_id = ?1 AND created_at >= ?2
+         WHERE connector_id = ?1 AND admitted_at >= ?2
            AND decision IN ('auto', 'trusted', 'approved')",
         params![connector_id, since],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),

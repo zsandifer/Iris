@@ -125,6 +125,7 @@ async fn oauth_client(
     JsonBody(body): JsonBody<ClientBody>,
 ) -> ApiResult {
     user.require_owner()?;
+    let _creds = crate::oauth::credentials_lock(&state).await;
     let con = connector(&state, &id).await?;
     let client_id = body.client_id.trim().to_string();
     if client_id.is_empty() || client_id.len() > 500 {
@@ -157,6 +158,9 @@ async fn oauth_client(
         .call(move |c| entities::update_connector(c, &cid, None, Some(&cfg), None))
         .await?
         .ok_or_else(|| ApiError::not_found("connector"))?;
+    drop(_creds);
+    crate::gateway::cancel_approvals(&state, Some(&updated.id));
+    crate::gateway::stop(&state, &updated.id).await;
     ok(json!({"connector": updated.public_json()}))
 }
 
@@ -566,6 +570,11 @@ mod tests {
         /// Issue a long-lived token, then refuse it on tool calls (a token
         /// revoked early): Iris must refresh and retry.
         strict: bool,
+        /// How the token endpoint answers refreshes: "" (works), "refuse"
+        /// (invalid_grant), or "down" (503).
+        refresh_mode: &'static str,
+        /// Refuse the first token on every request, initialize included.
+        refuse_at_start: bool,
         challenge: Option<String>,
         refreshed: bool,
         last_auth: Option<String>,
@@ -590,8 +599,9 @@ mod tests {
             let base = p.lock().unwrap().base.clone();
             p.lock().unwrap().last_auth = auth.clone();
             let strict = p.lock().unwrap().strict;
-            let revoked =
-                strict && auth.as_deref() == Some("Bearer at-1") && body.contains("tools/call");
+            let refuse_all = p.lock().unwrap().refuse_at_start;
+            let revoked = (refuse_all || (strict && body.contains("tools/call")))
+                && auth.as_deref() == Some("Bearer at-1");
             if revoked || !matches!(auth.as_deref(), Some("Bearer at-1" | "Bearer at-2")) {
                 let mut r = (StatusCode::UNAUTHORIZED, "").into_response();
                 r.headers_mut().insert(
@@ -670,8 +680,12 @@ mod tests {
                                     .into_response()
                             }
                         }
+                        Some("refresh_token") if g.refresh_mode == "down" => {
+                            (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response()
+                        }
                         Some("refresh_token")
-                            if form.get("refresh_token").map(String::as_str) == Some("rt-1") =>
+                            if form.get("refresh_token").map(String::as_str) == Some("rt-1")
+                                && g.refresh_mode != "refuse" =>
                         {
                             g.refreshed = true;
                             axum::Json(json!({"access_token": "at-2", "expires_in": 3600}))
@@ -729,9 +743,34 @@ mod tests {
         oauth_flow(true).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_refresh_asks_to_sign_in_again() {
+        oauth_flow_with(false, "refuse").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_provider_fails_only_the_call() {
+        oauth_flow_with(false, "down").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_refused_at_startup_is_refreshed() {
+        oauth_flow_with(true, "start").await;
+    }
+
     async fn oauth_flow(strict: bool) {
+        oauth_flow_with(strict, "").await;
+    }
+
+    async fn oauth_flow_with(strict: bool, refresh_mode: &'static str) {
         let provider = fake_provider().await;
         provider.lock().unwrap().strict = strict;
+        provider.lock().unwrap().refresh_mode = if refresh_mode == "start" {
+            ""
+        } else {
+            refresh_mode
+        };
+        provider.lock().unwrap().refuse_at_start = refresh_mode == "start";
         let base = provider.lock().unwrap().base.clone();
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths {
@@ -877,7 +916,44 @@ mod tests {
                 "params": {"name": "list_inbox", "arguments": {}}}}),
         )
         .await;
-        assert_eq!(r["result"]["content"][0]["text"], "3 unread", "{r}");
+        let text = r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let reconnect_cards = || {
+            state
+                .db
+                .with(|c| crate::db::list_messages(c, &main, None, 50))
+                .unwrap()
+                .into_iter()
+                .filter(|m| {
+                    m.card
+                        .as_ref()
+                        .is_some_and(|c| c["type"] == "connector_reconnect")
+                })
+                .count()
+        };
+        let auth_state = || {
+            state
+                .db
+                .with(|c| crate::entities::get_connector(c, &id))
+                .unwrap()
+                .unwrap()
+                .auth_state
+        };
+        if refresh_mode == "refuse" {
+            assert!(text.contains("refused the sign-in"), "{r}");
+            assert_eq!(auth_state(), "needs_reconnect");
+            assert_eq!(reconnect_cards(), 1);
+            return;
+        }
+        if refresh_mode == "down" {
+            assert!(text.contains("could not be reached"), "{r}");
+            assert_eq!(auth_state(), "ok", "a provider outage is not a sign-out");
+            assert_eq!(reconnect_cards(), 0);
+            return;
+        }
+        assert_eq!(text, "3 unread", "{r}");
         {
             let p = provider.lock().unwrap();
             assert!(p.refreshed);

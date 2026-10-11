@@ -237,6 +237,9 @@ ALTER TABLE connectors ADD COLUMN service TEXT NOT NULL DEFAULT 'custom';
 ALTER TABLE connectors ADD COLUMN paused_reason TEXT;
 ALTER TABLE connectors ADD COLUMN paused_at INTEGER;
 ALTER TABLE connectors ADD COLUMN auth_state TEXT NOT NULL DEFAULT 'ok';
+-- Connectors saved before the gateway keep running in the workspace (they
+-- may use paths relative to it); new ones get a private folder.
+ALTER TABLE connectors ADD COLUMN workspace_cwd INTEGER NOT NULL DEFAULT 1;
 
 -- Every connector tool call that went through the gateway (activity log,
 -- rate limits). `summary` is a short preview (recipients, subject).
@@ -255,6 +258,7 @@ CREATE TABLE connector_calls (
     card_message_id TEXT,
     result_bytes    INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL,
+    admitted_at     INTEGER,
     finished_at     INTEGER
 );
 CREATE INDEX connector_calls_recent ON connector_calls(connector_id, created_at);

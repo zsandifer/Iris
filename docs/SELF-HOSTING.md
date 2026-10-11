@@ -300,16 +300,20 @@ connection's secrets in its environment (in a private folder outside the
 agent's workspace), or a remote server it calls with the connection's
 token. Secrets and tokens live in the encrypted vault and never reach the
 agent. This works the same with Claude Code, Codex, Gemini CLI, and
-OpenCode. Only your own personal chats and your scheduled jobs use
-connections; shared chats and other people's chats never do. Idle
+OpenCode, and MCP servers you configured in a CLI yourself are switched
+off in Iris's turns so nothing goes around the gateway. Only your own
+personal chats and your scheduled jobs use connections; shared chats and
+other people's chats never do. Idle
 connection programs stop after `safety.idle_minutes`.
 
 **The approval gate.** Iris looks at every call's real tool name, the
 server's own hints, and the real arguments:
 
 - Reading, searching, and drafting run on their own.
-- Sending email or messages (and posting, replying, sharing, inviting) asks
-  first, unless every recipient is on your **trusted people** list.
+- Sending email or messages (and posting, replying, sharing, inviting,
+  publishing pull requests, issues, or comments) asks first, unless every
+  recipient is on your **trusted people** list and the service cannot add
+  others (reply-all always asks).
 - Buying or paying always asks. Deleting and bulk exports ask.
 - Anything else that reaches someone new (for example a calendar invite to a
   new address) asks; once you approve someone, they are no longer new.

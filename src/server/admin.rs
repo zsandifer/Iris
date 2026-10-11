@@ -625,11 +625,74 @@ async fn update_connector(
     };
     let (desc, enabled) = (body.description.clone(), body.enabled);
     let cid = id.clone();
+    // A new address means a different service: its sign-in starts over.
+    let url_changed = touches_config
+        && existing.config.oauth.is_some()
+        && body
+            .url
+            .as_deref()
+            .is_some_and(|u| Some(u) != existing.config.url.as_deref());
+    let _creds = crate::oauth::credentials_lock(&state).await;
     let con = state
         .db
-        .call(move |c| entities::update_connector(c, &id, desc.as_deref(), cfg.as_ref(), enabled))
+        .call(move |c| {
+            // Keep the latest sign-in state (a refresh may have rotated
+            // tokens since `existing` was read), unless the address moved.
+            let mut cfg = cfg;
+            if let Some(cfg) = cfg.as_mut() {
+                let latest = entities::get_connector(c, &id)?.and_then(|x| x.config.oauth);
+                cfg.oauth = match latest {
+                    // Fixed provider endpoints: only the grant goes.
+                    Some(o) if url_changed && o.mode == "preset" => Some(entities::OAuthConfig {
+                        access_token: None,
+                        refresh_token: None,
+                        expires_at: None,
+                        account: None,
+                        connected_at: None,
+                        ..o
+                    }),
+                    Some(o) if url_changed => Some(entities::OAuthConfig {
+                        mode: o.mode,
+                        client_id: (o.client_source == "owner")
+                            .then_some(o.client_id)
+                            .flatten(),
+                        client_secret: (o.client_source == "owner")
+                            .then_some(o.client_secret)
+                            .flatten(),
+                        client_source: if o.client_source == "owner" {
+                            o.client_source
+                        } else {
+                            String::new()
+                        },
+                        ..Default::default()
+                    }),
+                    other => other,
+                };
+            }
+            let con = entities::update_connector(c, &id, desc.as_deref(), cfg.as_ref(), enabled)?;
+            if url_changed {
+                entities::set_connector_state(
+                    c,
+                    &id,
+                    &entities::ConnectorState {
+                        auth_state: Some("needs_sign_in"),
+                        ..Default::default()
+                    },
+                )?;
+                return entities::get_connector(c, &id);
+            }
+            Ok(con)
+        })
         .await?
         .ok_or_else(|| ApiError::not_found("connector"))?;
+    drop(_creds);
+    if touches_config {
+        // Approvals were for the old settings.
+        crate::gateway::cancel_approvals(&state, Some(&cid));
+    }
+    if url_changed {
+        crate::oauth::forget_flows(&state, Some(&cid));
+    }
     if enabled == Some(false) {
         crate::gateway::cancel_approvals(&state, Some(&cid));
         crate::oauth::forget_flows(&state, Some(&cid));

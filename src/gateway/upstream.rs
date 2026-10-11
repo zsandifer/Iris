@@ -96,14 +96,35 @@ pub struct Upstream {
 
 /// A program serving HTTP for one connector.
 struct ServerProc {
-    pid: Option<u32>,
+    reaper: Arc<Reaper>,
     alive: Arc<AtomicBool>,
     stderr: Arc<Mutex<String>>,
 }
 
 impl ServerProc {
     fn kill(&self) {
-        if self.alive.swap(false, Ordering::SeqCst) {
+        self.alive.store(false, Ordering::SeqCst);
+        self.reaper.terminate();
+    }
+}
+
+/// Ends a connector's process group exactly once: on close, on drop, and
+/// when its program exits or closes its output (descendants included).
+struct Reaper {
+    pid: Option<u32>,
+    done: AtomicBool,
+}
+
+impl Reaper {
+    fn new(pid: Option<u32>) -> Arc<Self> {
+        Arc::new(Self {
+            pid,
+            done: AtomicBool::new(false),
+        })
+    }
+
+    fn terminate(&self) {
+        if !self.done.swap(true, Ordering::SeqCst) {
             terminate_group(self.pid);
         }
     }
@@ -206,14 +227,17 @@ async fn serve(
     let stderr = Arc::new(Mutex::new(String::new()));
     keep_tail(child.stderr.take().expect("piped"), stderr.clone());
     let alive = Arc::new(AtomicBool::new(true));
+    let reaper = Reaper::new(child.id());
     let proc = ServerProc {
-        pid: child.id(),
+        reaper: reaper.clone(),
         alive: alive.clone(),
         stderr: stderr.clone(),
     };
     tokio::spawn(async move {
         let _ = child.wait().await;
         alive.store(false, Ordering::SeqCst);
+        // Whatever it started goes with it.
+        reaper.terminate();
     });
     let addr = format!("127.0.0.1:{port}");
     let deadline = tokio::time::Instant::now() + timeout;
@@ -429,7 +453,7 @@ struct StdioConn {
     alive: Arc<AtomicBool>,
     tools_changed: Arc<AtomicBool>,
     stderr: Arc<Mutex<String>>,
-    pid: Option<u32>,
+    reaper: Arc<Reaper>,
 }
 
 impl StdioConn {
@@ -454,11 +478,13 @@ impl StdioConn {
         let pending: Pending = Arc::default();
         let alive = Arc::new(AtomicBool::new(true));
         let tools_changed = Arc::new(AtomicBool::new(false));
-        let (p, a, tc, w) = (
+        let reaper = Reaper::new(pid);
+        let (p, a, tc, w, r2) = (
             pending.clone(),
             alive.clone(),
             tools_changed.clone(),
             stdin.clone(),
+            reaper.clone(),
         );
         tokio::spawn(async move {
             let mut r = tokio::io::BufReader::new(stdout);
@@ -508,6 +534,9 @@ impl StdioConn {
             }
             a.store(false, Ordering::SeqCst);
             p.lock().unwrap_or_else(|x| x.into_inner()).clear();
+            // Output closed: the connection is over even if the program
+            // keeps running, so end it.
+            r2.terminate();
             let _ = child.wait().await;
         });
         Ok(Self {
@@ -517,20 +546,24 @@ impl StdioConn {
             alive,
             tools_changed,
             stderr,
-            pid,
+            reaper,
         })
     }
 
     async fn write(&self, msg: &Value) -> Result<(), UpstreamError> {
         let mut line = msg.to_string().into_bytes();
         line.push(b'\n');
-        let mut w = self.stdin.lock().await;
-        w.write_all(&line)
-            .await
-            .map_err(|_| UpstreamError::Transport("the connector program stopped".into()))?;
-        w.flush()
-            .await
-            .map_err(|_| UpstreamError::Transport("the connector program stopped".into()))
+        // Written by its own task, so a caller that gives up halfway never
+        // leaves half a message in the pipe.
+        let w = self.stdin.clone();
+        tokio::spawn(async move {
+            let mut w = w.lock().await;
+            w.write_all(&line).await?;
+            w.flush().await
+        })
+        .await
+        .map_err(|_| UpstreamError::Transport("the connector program stopped".into()))?
+        .map_err(|_| UpstreamError::Transport("the connector program stopped".into()))
     }
 
     async fn request(
@@ -550,6 +583,18 @@ impl StdioConn {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(id, tx);
+        // Forgets the request however this future ends (answered, timed
+        // out, or dropped by a cancelled caller).
+        struct Forget(Pending, i64);
+        impl Drop for Forget {
+            fn drop(&mut self) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&self.1);
+            }
+        }
+        let _forget = Forget(self.pending.clone(), id);
         // One deadline for sending and answering: a program that stops
         // reading its input must not hang the call.
         let deadline = tokio::time::Instant::now() + timeout;
@@ -590,9 +635,8 @@ impl StdioConn {
     }
 
     fn kill(&self) {
-        if self.alive.swap(false, Ordering::SeqCst) {
-            terminate_group(self.pid);
-        }
+        self.alive.store(false, Ordering::SeqCst);
+        self.reaper.terminate();
     }
 }
 

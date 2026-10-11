@@ -46,6 +46,9 @@ pub struct HarnessEntry {
     pub status: RwLock<HarnessStatus>,
     /// Models the CLI listed at the last probe (OpenCode).
     pub models: RwLock<Vec<DiscoveredModel>>,
+    /// MCP servers configured in the CLI itself (names only), turned off in
+    /// Iris's turns.
+    pub foreign_mcp: RwLock<Vec<String>>,
 }
 
 impl HarnessEntry {
@@ -65,6 +68,7 @@ impl HarnessEntry {
             cfg,
             status: RwLock::new(status),
             models: RwLock::default(),
+            foreign_mcp: RwLock::default(),
         }
     }
 
@@ -324,6 +328,13 @@ impl AppState {
                     // Without a status command the state comes from turns
                     // and is kept (see `recheck_harnesses`).
                     self.probe_models(entry, &program).await;
+                    if let Some(args) = entry.harness.foreign_mcp_probe_args()
+                        && let Ok((true, out, _)) =
+                            runner::probe(&program, &args, &cwd, &strip, &keys).await
+                    {
+                        *entry.foreign_mcp.write().unwrap_or_else(|p| p.into_inner()) =
+                            entry.harness.parse_foreign_mcp(&out);
+                    }
                 }
             }
             let changed = before.installed != next.installed

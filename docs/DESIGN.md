@@ -63,7 +63,7 @@ own personality. It is not a clone.
   "Waiting for your OK…" meanwhile. Afterwards it reads "You approved
   this", "You said no, so I didn't do it", "No answer in time, so I didn't
   do it", or "Cancelled. Nothing was done." Messages only to trusted people
-  go out without a card.
+  go out without a card (reply-all always asks).
 - **Rich result cards:** for example a restaurant with an image, details and
   one action.
 - **Long tasks:** Iris says "I'll ping you when it's done", then sends a push.
@@ -122,8 +122,9 @@ own personality. It is not a clone.
   connect (Google, GitHub, Custom MCP server) with step-by-step guides and
   sign-in on the service's own page, and Trusted people. Each connection
   has an On switch, its rules (four plain choices), its actions (each can
-  be set to run, ask, or never), recent use, and advanced settings. A
-  connection a tripwire paused shows why, with Resume.
+  be set to run, ask, or never), recent use, Sign in again (shows the
+  account), its sign-in app, and advanced settings. A connection a
+  tripwire paused shows why, with Resume.
 - **Logins & wallet:** an encrypted store. The app explains that Iris can use
   these but never sees them. Cards always ask before paying.
 - **Iris's computer:** a live screen with Watch / Take over, recent activity,
