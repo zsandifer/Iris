@@ -172,7 +172,11 @@ Iris is **early** and moving fast. What works today:
 - ✅ Reconnect cards for Claude and Codex sign-ins; installing and
   auto-updating engines from the app
 - ✅ For you feed with stories, Ideas, Goals, Library, system file editing
-- ✅ Push notifications, quiet hours, an encrypted credentials vault
+- ✅ Automatic feed sources (RSS, YouTube, Reddit, Hacker News, Bluesky,
+  Mastodon) with rule-based ranking, adaptive size, and two small model
+  calls a day
+- ✅ Push notifications, quiet hours with a digest afterwards, an encrypted
+  credentials vault
 - 🧪 Shared chats with more than one person (preview)
 
 On the way:
@@ -180,7 +184,6 @@ On the way:
 - 🚧 Approval cards on every risky action (the card and API exist; routing
   actions through them is next)
 - 🚧 "Sign in with Google" style connector setup from the chat
-- 🚧 Automatic feed sources (RSS, YouTube, Reddit) with adaptive size
 - 🚧 Watching and taking over Iris's browser
 - 🚧 Voice replies, and Iris using saved logins for you
 - 🚧 A character for Iris

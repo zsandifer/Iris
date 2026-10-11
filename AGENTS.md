@@ -78,12 +78,14 @@ src/
 ├── demo.rs          `iris demo-seed`: fake demo data for screenshots
 ├── mcp.rs           `iris mcp` stdio MCP bridge (CRUD into the DB)
 ├── jobs.rs          heartbeat and feed jobs, scheduler
+├── feed/            For you pipeline: sources, polite fetching, page extraction,
+│                    ranking, adaptive size, urgent pushes (two model calls a day)
 ├── login.rs         engine sign-in from the app, reconnect cards
 ├── engines.rs       install/update the official CLIs (official sources only)
 ├── setup.rs         engine operations, setup card, daily update
 ├── secrets.rs       XChaCha20-Poly1305 vault
 ├── push.rs          Web Push: VAPID + RFC 8291 encryption
-├── notify.rs        push fan-out
+├── notify.rs        push fan-out, quiet-hours queue and digest
 └── import.rs        OpenClaw import
 templates/           persona templates, config template, model rankings
 docs/API.md          REST, WebSocket, data model, MCP reference

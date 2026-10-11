@@ -139,7 +139,8 @@ Edit the persona files in `~/.local/share/iris/persona/` (or through
 | `[harness.*]` | | `command`, `models`, `efforts`, permission mode, sandbox, extra args. |
 | `[router]` | | Shared-chat opt-in, rankings override, optional model classifier (below). |
 | `[engines]` | | Engines directory, privileged install helper, daily auto-update. |
-| `[heartbeat]`, `[feed]` | disabled | Scheduled jobs with active hours. |
+| `[heartbeat]` | disabled | Proactive check-in with active hours. |
+| `[feed]` | enabled | The For you pipeline: checks hourly between 06:00 and 22:00, publishes one batch a day. |
 | `[push]` | enabled | Web Push (VAPID); set `vapid_subject` to a `mailto:` URL. |
 
 Paths follow XDG: `$XDG_CONFIG_HOME/iris/config.toml` and
@@ -239,13 +240,38 @@ engines but cannot modify them, and never needs download or install rights.
 - **Heartbeat** (`[heartbeat]`): on a schedule, the agent works through
   `HEARTBEAT.md`. If something needs your attention it posts in your Main
   chat and sends a push notification; otherwise it stays silent.
-- **Feed** (`[feed]`): the agent writes posts about your interests, guided by
-  an editable feed prompt and the posts you liked. "Discuss" on a post opens
-  a side chat seeded with it. It may also propose **Ideas**; tapping one
+- **For you** (`[feed]`, on by default): once a day Iris reads your
+  sources (RSS/Atom feeds, YouTube channels, subreddits, Hacker News,
+  Bluesky and Mastodon), ranks what is new with plain rules (your likes,
+  topics, freshness, variety), and publishes about 10 posts with the
+  pages' own photos. Only two small model calls a day: one on the
+  `background` slot turns your notes, likes, and recent chats into topics
+  and source suggestions, and one batched call on the `feed` slot writes
+  short summaries for the posts that need them. Add or remove sources in
+  the app (Settings, For you). The size grows toward 30 if you keep
+  reaching the end and shrinks if you rarely look; after two weeks unused
+  the feed pauses itself and tells you once in chat. It only notifies you
+  for big personal things: a real price drop on something you saved, or an
+  event soon near you. "Talk about it" on a post opens a side chat seeded
+  with it.
+  - Fetching is polite: Iris names itself in its User-Agent, follows
+    robots.txt for pages and photos, waits between requests to a site,
+    honors rate limits, caps sizes and times, and never fetches private or
+    tailnet addresses. Photos and icons are cached under
+    `<data dir>/feed-images` so your phone does not contact those sites.
+  - Reddit lets unauthenticated readers make about one request a minute,
+    so Iris reads at most 4 subreddits a run, rotating through them.
+  - YouTube subscriptions and likes are used when the Google connector has
+    stored a token; otherwise add channels as sources.
+- **Ideas**: the agent may propose things it could do for you; tapping one
   starts a chat that does it.
 
-Both are off by default, respect active hours, and can be triggered manually
-(`POST /api/jobs/{heartbeat|feed}/run`).
+The heartbeat is off by default. Both jobs respect active hours and can be
+triggered manually (`POST /api/jobs/{heartbeat|feed}/run`, or "Find
+something now" in the app).
+
+**Quiet hours** (Settings, Notifications) hold notifications instead of
+dropping them; when they end you get one summary notification.
 
 ## Security model
 

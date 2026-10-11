@@ -224,8 +224,17 @@ All paths are under `/api`. "Any" means any authenticated user.
 | GET | `/attachments/{id}` | Uploader or member | Download an image |
 | POST | `/messages/{id}/decision` | Approver | Approve or deny an approval card |
 | GET | `/activity` | Any | What Iris did with tools, newest first |
-| GET | `/feed` | Any | List feed posts (`?liked=true`: saved posts) |
-| POST | `/feed/refresh` | **Owner** | Run the feed job now (`202`) |
+| GET | `/feed` | Any | List feed posts (`?liked=true`: saved posts) and the feed status |
+| GET | `/feed/status` | Any | The feed status alone |
+| POST | `/feed/activity` | Any | Report that the feed was opened or read to the end |
+| POST | `/feed/pause` | Any | Pause the daily posts |
+| POST | `/feed/resume` | Any | Resume the daily posts |
+| GET | `/feed/sources` | Any | List your feed sources |
+| POST | `/feed/sources` | Any | Add a source (link, `r/name`, `@handle`, ...) |
+| PATCH | `/feed/sources/{id}` | Any | Turn a source on or off |
+| DELETE | `/feed/sources/{id}` | Any | Remove a source |
+| GET | `/feed/images/{file}` | Any | A cached feed photo or icon |
+| POST | `/feed/refresh` | **Owner** | Run the feed pipeline now (`202`) |
 | GET | `/feed/prompt` | Any | Read the feed prompt |
 | PUT | `/feed/prompt` | **Owner** | Set the feed prompt |
 | DELETE | `/feed/{id}` | Any | Delete a post |
@@ -347,9 +356,10 @@ not set.
 
 or `{"quiet_hours": null}` to turn them off. Times are `HH:MM` in the
 server's local time (`400` otherwise); the window may wrap past midnight.
-During quiet hours no push notification is sent to the caller (the messages
-still arrive in the app); test pushes are not affected. Per user. Response:
-`{"quiet_hours": {...} | null}`.
+During quiet hours notifications to the caller are held, not dropped (the
+messages still arrive in the app at once); when the quiet hours end they go
+out as one digest (see [section 9](#9-push-notifications)). Test pushes are
+not affected. Per user. Response: `{"quiet_hours": {...} | null}`.
 
 #### `PUT /api/me`
 
@@ -631,8 +641,9 @@ of any conversation with a message that references it; otherwise `404`.
 
 ### 3.5 Feed
 
-Posts are written by the agent (feed job or the `create_feed_post` bridge
-tool). Users read, like, delete, and discuss them.
+Posts come from the For you pipeline (see
+[For you pipeline](#for-you-pipeline) below) or from the agent (the
+`create_feed_post` bridge tool). Users read, like, delete, and discuss them.
 
 #### `GET /api/feed`
 
@@ -643,22 +654,107 @@ tool). Users read, like, delete, and discuss them.
 | `liked` | bool | `false` | Only saved (liked) posts. |
 
 ```json
-{"posts": [{FeedPost}], "has_more": false}
+{"posts": [{FeedPost}], "has_more": false, "status": {FeedStatus}}
 ```
 
 Newest first. To page, pass the `created_at` of the last (oldest) post as
-`before`. `has_more` is `true` exactly when older posts exist.
+`before`. `has_more` is `true` exactly when older posts exist. Within one
+day's batch the best-ranked post is the newest.
+
+`FeedStatus` (also from `GET /api/feed/status` as `{"status": {...}}`):
+
+| Field | Type | Notes |
+|---|---|---|
+| `pipeline` | bool | The daily pipeline runs for this user (the owner; it reads the owner's persona files). |
+| `enabled` | bool | `pipeline` and `[feed] enabled` in the config. |
+| `running` | bool | A run is in progress. |
+| `paused` | bool | Daily posts are paused. |
+| `paused_at` | int or null | |
+| `paused_reason` | string or null | `unused` (two weeks without opening the feed) or `user`. |
+| `daily_size` | int | About how many posts a day (5 to 30, adapts; default 10). |
+| `last_batch_at` | int or null | When the latest batch was published. Posts with `created_at >= last_batch_at` are that batch. |
+| `last_batch_count` | int | |
+| `topics` | string[] | Today's topics from the interests call. |
+| `sources` | int | Enabled sources. |
+| `last_run` | object or null | `{"at", "sources_checked", "items_found", "published", "summarized", "model_used", "requests", "robots_blocked"}`. |
+
+#### `POST /api/feed/activity`
+
+```json
+{"event": "opened"}
+```
+
+`event` is `opened` (the feed screen was shown) or `reached_end` (the user
+scrolled past the last post of the latest batch); anything else is `400`.
+Counts are kept per local day and drive the adaptive daily size and the
+two-week pause. Response `{"ok": true}`.
+
+#### `POST /api/feed/pause`, `POST /api/feed/resume`
+
+Pause or resume the daily posts. Resuming starts today's batch right away
+when there is none yet (and the feed job is enabled). Responses:
+`{"ok": true, "status": {FeedStatus}}`, plus `was_paused` for resume. Both
+emit `entities.changed` `["feed"]` to the caller.
+
+#### `GET /api/feed/sources`
+
+`{"sources": [{FeedSource}]}`, the user's own first.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string | |
+| `kind` | string | `rss`, `youtube`, `reddit`, `hn`, `bluesky`, or `mastodon`. |
+| `value` | string | Feed URL, channel id or `@handle`, subreddit, `front_page`, Bluesky handle or `at://` feed, `user@instance` or `#tag[@instance]`. |
+| `label` | string or null | Display name override. |
+| `title` | string or null | The feed's own title, once fetched. |
+| `topic` | string or null | Topic it was suggested for. |
+| `origin` | string | `user`, `suggested` (by the daily interests call), or `google` (YouTube subscriptions). |
+| `enabled` | bool | Suggested sources that fail 3 runs in a row turn off by themselves. |
+| `last_fetch_at`, `last_ok_at` | int or null | |
+| `last_error` | string or null | Short reason, e.g. `HTTP 404`. |
+| `fail_count` | int | |
+| `created_at` | int | |
+
+#### `POST /api/feed/sources`
+
+```json
+{"input": "r/espresso", "topic": "Coffee"}
+```
+
+`input` is what a person would type: a website or feed link (a page's
+advertised feed is found automatically), `r/name` or a subreddit link, a
+YouTube channel link or `@handle` link, a Bluesky handle (`@name.bsky.social`)
+or profile/feed link, `@user@instance` or a Mastodon profile link, `#tag`
+(Mastodon hashtag), or `hn`. `topic` is optional (max 40). `400` with a
+friendly message when the input is not recognized. Adding a source that
+already exists makes it yours and turns it on. Response
+`{"source": {FeedSource}}`.
+
+#### `PATCH /api/feed/sources/{id}`
+
+`{"enabled": false}`. Response `{"source": {FeedSource}}`.
+
+#### `DELETE /api/feed/sources/{id}`
+
+`{"ok": true}`.
+
+#### `GET /api/feed/images/{file}`
+
+A photo or icon the pipeline cached from the source (its original image,
+never a generated one). `file` is `<32 hex>.<jpg|png|gif|webp|avif|ico>`
+(else `404`). Sent with `Content-Security-Policy: default-src 'none';
+sandbox`, `nosniff`, and `Cache-Control: private, max-age=604800, immutable`.
 
 #### `POST /api/feed/refresh` (Owner)
 
-Starts the feed job now. Response **`202`**: `{"started": true}`; `started` is
-`false` if the feed job was already running. Runs even if the feed job is
-disabled in config.
+Runs the feed pipeline now, even if today's batch exists, the feed is
+paused (it resumes), or the job is disabled in config. Response **`202`**:
+`{"started": true}`; `started` is `false` if a run is already in progress.
 
 #### `GET /api/feed/prompt`
 
 ```json
-{"feed_prompt": "Write a few short, genuinely interesting posts ..."}
+{"feed_prompt": "News, ideas, and finds that fit what I care about ..."}
 ```
 
 Returns the built-in default when none is set.
@@ -688,7 +784,9 @@ checked.
 | `liked` | bool | `true` |
 
 Response `{"ok": true, "liked": true}`. Emits `entities.changed` `["feed"]`.
-Liked titles steer later feed generation.
+Likes raise the post's topic and source in ranking and steer the daily
+interests call. Liking a post whose page lists a product price starts a
+price watch (see [urgent pushes](#for-you-pipeline)); unliking stops it.
 
 #### `POST /api/feed/{id}/discuss`
 
@@ -704,8 +802,9 @@ post title as its title, and a first message with `role: "system"`,
 ```
 
 The card `body` is the post body cut to 4,000 characters (with `…`
-appended when cut); the message `content` (`Feed post "<title>": <body>`)
-carries the full post and becomes context for the first turn. No turn is
+appended when cut); the message `content` (`Feed post "<title>": <body>`,
+then `Source: ...`, `Link: ...`, and `Why it was picked: ...` lines when
+known) carries the full post and becomes context for the first turn. No turn is
 started.
 
 Response `200`: `{"conversation": {Conversation}}`. Emits
@@ -1515,8 +1614,8 @@ Event details:
 - **`entities.changed`**: refetch the listed collections. Sent after REST
   changes (to the caller), after a turn in which the agent successfully
   changed data through the bridge (to the conversation creator; see
-  [section 8](#8-the-iris-mcp-bridge)), and after a successful feed job
-  (`["feed", "ideas"]`, to the owner).
+  [section 8](#8-the-iris-mcp-bridge)), and when a feed pipeline run
+  publishes or finishes (`["feed"]`).
 - **`conversation.created`**: sent by `POST /api/conversations`,
   `POST /api/feed/{id}/discuss` (only when a new discussion is created),
   `POST /api/ideas/{id}/start`, and to the added user by
@@ -1681,13 +1780,14 @@ CLI model name.
 
 ### Scheduled jobs
 
-The `heartbeat` and `feed` jobs run as turns with `purpose: "scheduled"` in
-hidden per-job conversations owned by the owner, on the `background` and
-`feed` slots (low effort). They are the owner's own use, so any signed-in
-engine may run them, Claude included. Each run starts a fresh CLI
-session (no resume, no replay), and each job conversation is trimmed to its
-last 20 messages before every run. Job turns are not streamed: no
-`turn.status`, `message.*`, or card events are sent for them. The scheduler
+The `heartbeat` job runs as a turn with `purpose: "scheduled"` in a hidden
+job conversation owned by the owner, on the `background` slot (low effort);
+the `feed` job is the For you pipeline (below). Both are the owner's own
+use, so any signed-in engine may run them, Claude included. Each heartbeat
+run starts a fresh CLI session (no resume, no replay), and each job
+conversation is trimmed to its last 20 messages before every run. Job turns
+are not streamed: no `turn.status`, `message.*`, or card events are sent for
+them. The scheduler
 checks every minute and runs a job when it is enabled, the local time is
 inside `[active_start, active_end)` (windows may wrap past midnight; equal
 start and end means all day), and at least `interval_mins` have passed since
@@ -1699,11 +1799,95 @@ the last start. Manual runs (`POST /api/jobs/{name}/run`,
   Otherwise the reply is posted as a new assistant message in the owner's Main
   chat (`message.created`, `meta.initiated_by: "heartbeat"`) and pushed to all
   of the owner's subscriptions.
-- **feed**: the agent publishes 1 to 3 feed posts and up to 2 ideas through
-  the bridge, guided by the feed prompt and recently liked posts. When the
-  turn succeeds, the owner receives `entities.changed` `["feed", "ideas"]`.
+- **feed**: the For you pipeline for the owner. It publishes at most one
+  batch per local day; scheduled runs after that (every `interval_mins`,
+  default 60, between `active_start` 06:00 and `active_end` 22:00) do
+  nothing. Its last-run time is recorded even when a run fails, so a
+  network outage is retried after `interval_mins`, not every minute.
 
 Failed job turns are only logged.
+
+### For you pipeline
+
+Deterministic code does nearly everything; the model is used at most twice
+per daily run, through the owner's own CLI, as a single prompt with no
+tools, no MCP servers, and no session (the activity log shows each run, in
+the hidden `feed` job conversation, with the engine that wrote the text).
+
+1. **Interests** (once a day, `background` slot): `USER.md`,
+   `PROACTIVE_PREFERENCES.md`, the feed prompt, recently liked posts, the
+   owner's own recent chat messages (main and side chats, last 14 days,
+   never shared chats), and liked YouTube videos (when Google is connected)
+   become 3 to 8 topics with keywords and search queries, the user's home
+   city and language, and up to 8 source suggestions (added as
+   `suggested` sources; at most 40 kept). Without a usable reply the last
+   interests are kept, or topics are derived from liked posts.
+2. **Fetch**: enabled sources (at most 40 per run; at most 4 subreddits,
+   least recently read first), plus one Hacker News search per topic and
+   one Mastodon hashtag per topic. YouTube channel feeds come from the
+   user's sources and, when a Google token is available, their
+   subscriptions (`origin: google`).
+3. **Clean**: posts older than 7 days, recurring "weekly thread" posts,
+   posts in another language (when the source says), and anything already
+   shown (same canonical link or title, kept 120 days) are dropped;
+   near-duplicate titles across sources are merged.
+4. **Rank**: likes-weighted topic affinity (a topic's stated weight, raised
+   by likes and discussions over 60 days, lowered when its posts are
+   ignored), keyword match, recency (36-hour half-life), the source's own
+   popularity numbers, photos, and liked sources and words. Topic-search
+   results score a little below followed sources. The best 3x the daily
+   size are enriched from their pages (OpenGraph, Twitter cards, JSON-LD:
+   title, description, site name, icon, original photos, price, event);
+   then the day's posts are picked: each competitive topic's best post
+   first, then by score with diminishing returns for repeats, at most 3 per
+   source, 5 per topic (story groups), and about a third from searches.
+5. **Blurbs** (one batched call, `feed` slot): posts whose own description
+   is 110 to 600 characters, complete, and not link soup keep it; the rest
+   get a model-written `hook`, summary (`body`), and `why`. Without a model
+   the description (or title) is used and `why` is rule-based ("Because
+   you're into ...").
+6. **Publish**: up to 3 photos and the icon per post are downloaded and
+   stored locally (`<data dir>/feed-images`, images under 200 px wide are
+   skipped); posts are published; seen keys are recorded.
+
+**Adaptive size.** Default 10 a day, between 5 and 30. Once a day, over
+the last 7 days with a batch (at least 3): if the feed was opened on 3 or
+more and the user reached the end on at least 60% of those, the size grows
+by a quarter (at least 2); if it was opened on at most 2 of 7, it shrinks
+by a fifth (at least 2).
+
+**Pause.** When the feed has been published for 14 days and not opened (or
+resumed) in 14 days, the daily run pauses it instead and posts one message
+in the Main chat with an `action` card (`POST /api/feed/resume`). No push.
+
+**Urgent pushes** (`kind: "feed_urgent"`, at most 2 a day, delayed by
+quiet hours): a deterministic score of at least 70. Price drops on saved
+products (re-checked daily, up to 10 a run): 50 + 2 x percent off, for drops
+of at least 5% and 1 unit in the same currency, so 10% off pushes; the drop
+also becomes a `price_drop` post. Events from today's posts: 25, +15 within
+7 days (+8 within 14), +15 for a core topic (+8 for a moderate one), +25
+when the event's location names the user's city, +5 from a followed source,
+for events in the next 30 days. Without the city match an event cannot
+reach 70.
+
+**Polite fetching.** `User-Agent: IrisFeed/<version> (self-hosted personal feed
+reader)`. robots.txt is honored for every page
+read for a preview and every photo downloaded (`5xx` or unreachable
+robots.txt means "not this run"). Feeds and documented APIs the user
+subscribed to are read like a feed reader reads them: once a day, with
+`If-None-Match`/`If-Modified-Since`. One request per host per second (more
+with `Crawl-delay`, up to 10 s; rate-limit headers such as Reddit's
+`x-ratelimit-reset` and `Retry-After` are honored); 8 s connect and 20 s
+overall timeouts; size caps of 4 MB for feeds and JSON, 1.5 MB for pages
+(truncated), and 6 MB for photos. Only http(s) to public addresses:
+hostnames that resolve to loopback, private, link-local, or carrier-grade
+NAT (tailnet) addresses are refused on every redirect hop.
+
+**Google (YouTube).** When the Google connector has stored a token for the
+owner (vault-sealed setting `connector_token.google:<user id>`, JSON
+`{"access_token", "expires_at"}`), the run reads `subscriptions.list` and
+`videos.list?myRating=like` from the YouTube Data API. Without one, YouTube
+works through channel sources.
 
 ---
 
@@ -1840,7 +2024,13 @@ changes are re-sent as `message.updated`.
 | `source_name` | string or null | Display name of the source (site or creator), max 100. |
 | `image_url` | string or null | Cover photo: the first of `images`. |
 | `images` | string[] | The source page's original photos, in order (http(s), at most 10). |
+| `photos` | string[] | What to display for each of `images`, same order: `/api/feed/images/<file>` when Iris cached the photo, else the original URL. |
 | `why` | string or null | One line on why the user would like this post, max 300. |
+| `hook` | string or null | A short line for the story viewer (pipeline posts the model summarized). |
+| `favicon_url` | string or null | The source's icon (original URL). |
+| `favicon` | string or null | What to display for the icon (cached copy when available). |
+| `source_kind` | string or null | `rss`, `youtube`, `reddit`, `hn`, `bluesky`, `mastodon`, `price_drop`, or null for posts the agent wrote. |
+| `facts` | object | Read from the page: `{"price": {"amount", "currency"}}`, `{"event": {"start_ms", "location"}}`, price drops add `was`; else `{}`. |
 | `liked` | bool | |
 | `discuss_conversation_id` | string or null | Set by `POST /discuss`. |
 | `created_at`, `updated_at` | int | |
@@ -2330,10 +2520,22 @@ generated on first use.
 | A chat turn fails (`status: "error"`), same setting | Same | `stuck` (body "I got stuck on that. Tap to try again.") |
 | A CLI the owner used went signed out (reconnect card posted) | The owner | `engine_signin` |
 | A connector refused its sign-in (reconnect card posted) | The owner | `connector_reconnect` |
+| An urgent personal feed item: a price drop of 10% or more on a saved product, or an event soon near the user that matches a core interest (at most 2 a day) | The owner | `feed_urgent` |
+| Quiet hours ended with notifications held | The user | `digest` (or the single held notification with `digest: true`) |
 | `POST /api/push/test` | The caller | `test` |
 
-Cancelled and scheduled turns do not trigger reply pushes. Users inside
-their [quiet hours](#put-apimequiet-hours) get no pushes except test pushes.
+Ordinary feed posts never push. Cancelled and scheduled turns do not
+trigger reply pushes.
+
+### Quiet hours
+
+Notifications for a user inside their
+[quiet hours](#put-apimequiet-hours) are held in the database (at most 50
+per user; test pushes are sent at once). The minute scheduler delivers them
+as soon as the quiet hours end (or are turned off): one held notification
+is sent as-is; several become one digest, `"While it was quiet: N updates.
+<latest few>"`, opening their chat when they all came from one. Held replies
+from chats the user has read since are left out.
 
 ### Payload
 
@@ -2354,7 +2556,9 @@ The decrypted payload is a JSON object:
 | `title` | The agent name. |
 | `body` | Message text cut to 180 characters (with `…` when cut). Test: `Notifications are working.` |
 | `conversation_id`, `message_id` | Omitted in test pushes. |
-| `kind` | `reply`, `stuck`, `heartbeat`, `engine_signin`, `connector_reconnect`, or `test`. |
+| `kind` | `reply`, `stuck`, `heartbeat`, `engine_signin`, `connector_reconnect`, `feed_urgent`, `digest`, or `test`. |
+| `url` | Optional app path to open (`/#/foryou` for feed pushes). |
+| `digest`, `count` | Present on notifications delivered after quiet hours. |
 
 Requests use `TTL: 86400` and `Urgency: normal`.
 
