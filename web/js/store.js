@@ -82,7 +82,7 @@ export function back(fallback = 'chat') {
 
 window.addEventListener('hashchange', () => {
   sessionStorage.setItem('iris.nav', '1');
-  set({ route: parseRoute(), drawer: false });
+  set({ route: parseRoute(), drawer: false, sheet: null });
 });
 
 let toastTimer;
@@ -252,6 +252,15 @@ export function handleEvent(ev) {
     case 'settings.changed':
       set({ settings: ev.settings });
       break;
+    case 'agent.changed': {
+      // A Together chat's host renamed their Iris or changed its picture.
+      const members = { ...S.members };
+      for (const [cid, m] of Object.entries(members)) {
+        if (m?.agent?.user_id === ev.agent.user_id) members[cid] = { ...m, agent: ev.agent };
+      }
+      set({ members });
+      break;
+    }
     case 'harness.status':
       set({ harnesses: S.harnesses.map((h) => (h.name === ev.harness.name ? { ...h, ...ev.harness, path: h.path } : h)) });
       break;
@@ -273,6 +282,7 @@ export function handleEvent(ev) {
 export function refreshAll() {
   loadConvs().catch(() => {});
   for (const cid of Object.keys(S.msgs)) loadMessages(cid).catch(() => {});
+  for (const cid of Object.keys(S.members)) loadMembers(cid).catch(() => {});
   for (const k of Object.keys(loaders)) if (S[k]) loaders[k]().catch(() => {});
   if (S.slots) loadSlots().catch(() => {});
   if (S.engines) loadEngines().catch(() => {});

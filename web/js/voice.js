@@ -64,10 +64,17 @@ function setVoice(patch) { set({ voice: { ...(S.voice || {}), ...patch } }); }
 function tick(t) { if (S.voice?.playing) setVoice({ t }); }
 function stopped() { setVoice({ playing: false, t: 0, id: null }); }
 
+// A few recent voice notes stay in memory (least recently used first out;
+// their object URLs are revoked unless one is playing).
+const KEEP_NOTES = 6;
 const notes = new Map(); // message id -> Promise<{url, dur}>
 const durs = new Map();  // message id -> length in ms, once known
 function serverNote(id) {
-  if (!notes.has(id)) {
+  if (notes.has(id)) {
+    const p = notes.get(id);
+    notes.delete(id);
+    notes.set(id, p);
+  } else {
     const p = api('POST', '/voice/speak', { message_id: id }, { raw: true, timeout: 180000 })
       .then(async (r) => {
         const n = { dur: Number(r.headers.get('x-voice-duration-ms')) || 0, url: URL.createObjectURL(await r.blob()) };
@@ -77,6 +84,11 @@ function serverNote(id) {
       });
     p.catch(() => notes.delete(id));
     notes.set(id, p);
+    while (notes.size > KEEP_NOTES) {
+      const [oldId, old] = notes.entries().next().value;
+      notes.delete(oldId);
+      old.then((n) => { if (!audio || audio.src !== n.url) URL.revokeObjectURL(n.url); }).catch(() => {});
+    }
   }
   return notes.get(id);
 }
@@ -113,12 +125,17 @@ function stopAll() {
   if (synth?.speaking) synth.cancel();
 }
 
+// Bumped by every play or pause, so a note that finishes loading after the
+// person paused (or picked another) never starts.
+let playGen = 0;
+
 /** Play (or pause) a reply's voice note. */
 export async function play(m) {
   const v = S.voice || {};
+  const my = ++playGen;
   if (v.id === m.id && v.playing) {
     stopAll();
-    setVoice({ playing: false });
+    setVoice({ playing: false, loading: false });
     return;
   }
   stopAll();
@@ -126,12 +143,13 @@ export async function play(m) {
     setVoice({ id: m.id, playing: true, loading: true, t: v.id === m.id ? v.t || 0 : 0, mode: 'server', dur: 0 });
     try {
       const n = await serverNote(m.id);
-      if (S.voice?.id !== m.id) return;
+      if (playGen !== my || S.voice?.id !== m.id || !S.voice.playing) return;
       const a = player();
       if (a.src !== n.url) a.src = n.url;
       setVoice({ loading: false, dur: n.dur });
       await a.play();
     } catch (e) {
+      if (playGen !== my) return;
       if (S.voice?.id === m.id) stopped();
       toast(e?.name === 'NotAllowedError' ? 'Tap play to hear it.' : e?.message || "I couldn't play that.");
     }

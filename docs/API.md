@@ -1439,7 +1439,10 @@ Response `200`:
 private temporary file, transcribed, and deleted; it is never stored or
 logged.
 
-Errors: `415 unsupported_media_type` (not 16-bit PCM WAV), `413
+Every length in the header must fit inside the uploaded bytes (no
+truncated or oversized chunks, whole frames only).
+
+Errors: `415 unsupported_media_type` (not a valid 16-bit PCM WAV), `413
 too_large`, `503 voice_unavailable` (no speech-to-text on the server),
 `502 voice_failed`.
 
@@ -1582,6 +1585,7 @@ was emitted). Events are delivered only to the users listed under
 | `models.changed` | `{"slots": [{Slot}]}` | All users |
 | `harness.login` | `{"login": {LoginStatus}}` | The owner |
 | `engines.changed` | `{"engines": [...]}` (as in `GET /api/engines`) | All users |
+| `agent.changed` | `{"agent": {"user_id", "name", "avatar_url", "avatar_custom"}}` | The other members of Together chats that person's Iris hosts, when they rename it or change its picture |
 
 Example:
 
@@ -1682,11 +1686,16 @@ After `POST /api/conversations/{id}/messages` (or `POST
    their `memory/` writable. In shared conversations (more than one member)
    the bridge runs in cards-only mode, no connectors are passed, the CLI
    works in `<data dir>/together/<conversation id>`, and nothing is
-   writable outside it. Claude Code also gets permission deny rules for
-   every other person's folders and for Iris's own state (database, keys,
-   per-turn files, uploads, library, voice cache), and in shared chats for
-   the host's folders too; the other CLIs have no such rules and rely on the
-   separate folders and the prompt.
+   writable outside it. The CLI is also kept out of every other person's
+   folders, Iris's own state (database, keys, per-turn files, uploads,
+   library, voice cache), and the CLIs' own data folders (`~/.claude`,
+   `~/.codex`, ... which hold every session's transcript), and in shared
+   chats the host's folders too: Claude Code through permission deny rules,
+   Codex through a permission profile with `deny` entries (instead of
+   `sandbox_mode`). Gemini CLI and OpenCode keep their file tools inside the
+   turn's own folders and reject shell commands headless. A turn still
+   waiting in the queue when its conversation or person is deleted is
+   dropped without running.
 5. While the CLI runs, Iris emits `message.delta` and `message.activity`.
 6. On a "not signed in" error with no text yet, the harness is marked
    `auth_required` (a `harness.status` event, plus a reconnect card if the

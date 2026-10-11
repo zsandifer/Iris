@@ -641,6 +641,35 @@ impl AppState {
         }
     }
 
+    /// A person's Iris name or picture changed: tell the other members of
+    /// the Together chats it hosts (`agent.changed`), so their phones show
+    /// the new host identity. Nothing else about the person is sent.
+    pub async fn broadcast_agent(&self, user: &db::User) {
+        let uid = user.id.clone();
+        let others: Vec<String> = self
+            .db
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT DISTINCT m.user_id FROM conversations v
+                     JOIN conversation_members m ON m.conversation_id = v.id
+                     WHERE v.created_by = ?1 AND m.user_id != ?1",
+                )?;
+                stmt.query_map([&uid], |r| r.get(0))?.collect()
+            })
+            .await
+            .unwrap_or_default();
+        if others.is_empty() {
+            return;
+        }
+        let (avatar_url, avatar_custom) = self.avatar_url_for(user).await;
+        self.hub.to_users(
+            &others,
+            json!({"type": "agent.changed", "agent": {
+                "user_id": user.id, "name": self.agent_name_for(user).await,
+                "avatar_url": avatar_url, "avatar_custom": avatar_custom}}),
+        );
+    }
+
     /// Everyone on this server, oldest first.
     pub async fn all_users(&self) -> Vec<db::User> {
         self.db.call(db::list_users).await.unwrap_or_default()

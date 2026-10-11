@@ -108,6 +108,8 @@ pub fn cancel(state: &AppState, conversation_id: &str) -> bool {
 }
 
 struct Ctx {
+    /// The conversation still exists (it may be deleted while a turn waits).
+    exists: bool,
     kind: String,
     members: Vec<String>,
     names: HashMap<String, String>,
@@ -127,6 +129,7 @@ async fn load_ctx(state: &AppState, conv_id: &str) -> Ctx {
                 }
             }
             Ok(Ctx {
+                exists: conv.is_some(),
                 kind: conv.map(|c| c.kind).unwrap_or_else(|| "side".into()),
                 members,
                 names,
@@ -134,6 +137,7 @@ async fn load_ctx(state: &AppState, conv_id: &str) -> Ctx {
         })
         .await
         .unwrap_or(Ctx {
+            exists: false,
             kind: "side".into(),
             members: Vec::new(),
             names: HashMap::new(),
@@ -155,18 +159,39 @@ async fn run_locked(
         ctx.members.clone()
     };
     let shared = ctx.members.len() > 1;
+    // A queued turn whose conversation was deleted meanwhile (for example
+    // its person was removed) has nothing left to answer.
+    if !ctx.exists {
+        crate::info!("turn {msg_id}: conversation is gone; dropped");
+        return TurnResult {
+            message: input.assistant_message.clone(),
+            ok: false,
+        };
+    }
     // Whose Iris answers: the conversation's creator (for jobs, the person
     // the job runs for). Their persona, memory, name, and folders are used.
     let host = state.user(&input.owner_user_id).await;
+    let Some(host_user) = host.clone() else {
+        // Never fall back to someone else's Iris (folders, memory).
+        return finish(
+            state,
+            input,
+            &audience,
+            &Acc::default(),
+            json!(null),
+            Outcome::Failed {
+                kind: "internal",
+                detail: "the person this Iris belongs to was removed".into(),
+            },
+        )
+        .await;
+    };
     let host_is_owner = host.as_ref().is_some_and(|u| u.is_owner);
     // Individual-use policy: Claude is the owner's own subscription, so
     // anything that is not the owner's personal use (a chat with more than
     // one person, or another person's own Iris) needs the owner's opt-in.
     let for_others = shared || !host_is_owner;
-    let dirs = host
-        .as_ref()
-        .map(|u| state.dirs_for(u))
-        .unwrap_or_else(|| state.paths.owner_dirs());
+    let dirs = state.dirs_for(&host_user);
     let cwd = if shared {
         state.paths.together_dir(conv_id)
     } else {
@@ -233,7 +258,7 @@ async fn run_locked(
         let d = match routed {
             Ok(d) => d,
             Err(NoEngine::PausedPolicy) => {
-                post_policy_card_once(state, conv_id, shared).await;
+                post_policy_card_once(state, conv_id, shared, &ctx.members).await;
                 outcome = Outcome::Failed {
                     kind: "paused_policy",
                     detail: if shared {
@@ -637,9 +662,10 @@ async fn refine_with_model(state: &AppState, text: &str, for_others: bool) -> Op
 /// explain once per conversation. In a shared chat the card carries the
 /// owner's one-tap opt-in; for another person's own Iris the owner gets
 /// the opt-in card in their Main chat instead.
-async fn post_policy_card_once(state: &AppState, conv_id: &str, shared: bool) {
+async fn post_policy_card_once(state: &AppState, conv_id: &str, shared: bool, members: &[String]) {
     let key = format!("notice.policy_card.{conv_id}");
     let c = conv_id.to_string();
+    let members = members.to_vec();
     let allow = json!({"method": "PUT", "path": "/api/settings",
                        "body": {"allow_claude_for_shared": true}});
     let posted = state
@@ -649,8 +675,12 @@ async fn post_policy_card_once(state: &AppState, conv_id: &str, shared: bool) {
                 return Ok(None);
             }
             db::set_setting(db, &key, &crate::util::now_ms().to_string())?;
-            if shared {
-                let card = json!({
+            let Some(owner) = db::owner_user_id(db)? else {
+                return Ok(None);
+            };
+            let owner_here = members.contains(&owner);
+            let card = if shared && owner_here {
+                json!({
                     "type": "action",
                     "title": "Allow Claude in group chats",
                     "body": "Claude is the only AI engine on this server, and Claude \
@@ -660,39 +690,62 @@ async fn post_policy_card_once(state: &AppState, conv_id: &str, shared: bool) {
                     "action_label": "Allow",
                     "action": allow,
                     "owner_only": true,
-                });
-                crate::entities::insert_card(db, &c, &card, "assistant")?;
+                })
+            } else {
+                json!({
+                    "type": "info",
+                    "title": "Waiting for the owner",
+                    "body": if shared {
+                        "Claude is the only AI engine on this server, and Claude subscriptions \
+                         are meant for one person, so I stay out of group chats. I've asked the \
+                         owner: they can allow it, or add another engine (Codex, Gemini, or \
+                         OpenCode)."
+                    } else {
+                        "Claude is the only AI engine on this server, and Claude subscriptions \
+                         are meant for one person, so I can't use it for you. I've asked the \
+                         owner: they can allow it, or add another engine (Codex, Gemini, or \
+                         OpenCode)."
+                    },
+                })
+            };
+            crate::entities::insert_card(db, &c, &card, "assistant")?;
+            if owner_here {
                 return Ok(None);
             }
-            let card = json!({
-                "type": "info",
-                "title": "Waiting for the owner",
-                "body": "Claude is the only AI engine on this server, and Claude subscriptions \
-                    are meant for one person, so I can't use it for you. I've asked the owner: \
-                    they can allow it, or add another engine (Codex, Gemini, or OpenCode).",
-            });
-            crate::entities::insert_card(db, &c, &card, "assistant")?;
-            // Tell the owner, in their Main chat, who is waiting.
-            let person: Option<String> = db
+            // The owner is not in this chat: ask in their Main chat.
+            let (person, title): (Option<String>, String) = db
                 .query_row(
-                    "SELECT u.display_name FROM conversations c JOIN users u ON u.id = c.created_by
-                     WHERE c.id = ?1",
+                    "SELECT u.display_name, c.title FROM conversations c
+                     LEFT JOIN users u ON u.id = c.created_by WHERE c.id = ?1",
                     [&c],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
-                .ok();
-            let Some(owner) = db::owner_user_id(db)? else {
-                return Ok(None);
-            };
+                .unwrap_or((None, String::new()));
             let main = db::ensure_main_conversation(db, &owner)?;
             let name = person.unwrap_or_else(|| "Someone".into());
+            let (heading, whose) = if shared {
+                let chat = if title.trim().is_empty() {
+                    "a group chat".to_string()
+                } else {
+                    format!("the group chat \"{}\"", title.trim())
+                };
+                (
+                    format!("Let {name}'s group chat use Claude?"),
+                    format!("I can't answer in {chat}"),
+                )
+            } else {
+                (
+                    format!("Let {name} use Claude?"),
+                    format!("{name}'s Iris can't answer"),
+                )
+            };
             let owner_card = json!({
                 "type": "action",
-                "title": format!("Let {name} use Claude?"),
-                "body": format!("{name}'s Iris can't answer: Claude is the only AI engine on \
-                    this server, and Claude subscriptions are meant for one person. If your plan \
-                    allows it, you can let other people (and group chats) use it. Adding another \
-                    engine (Codex, Gemini, or OpenCode) in Settings also fixes it."),
+                "title": heading,
+                "body": format!("{whose}: Claude is the only AI engine on this server, and \
+                    Claude subscriptions are meant for one person. If your plan allows it, you \
+                    can let other people (and group chats) use it. Adding another engine (Codex, \
+                    Gemini, or OpenCode) in Settings also fixes it."),
                 "action_label": "Allow",
                 "action": allow,
                 "owner_only": true,
@@ -747,7 +800,31 @@ async fn private_paths(
     if let Ok(rd) = std::fs::read_dir(p.data_dir.join("together")) {
         out.extend(rd.flatten().map(|e| e.path()).filter(|d| d != cwd));
     }
+    out.extend(cli_data_paths());
     out
+}
+
+/// Where the CLIs keep their own data, including every past session's
+/// transcript (everyone's, since all turns run as one account) and their
+/// sign-ins. The agent's file tools have no business there. Only the
+/// locations are named; nothing in them is read.
+fn cli_data_paths() -> Vec<std::path::PathBuf> {
+    let env_dir = |k: &str| {
+        std::env::var_os(k)
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    let Some(home) = env_dir("HOME") else {
+        return Vec::new();
+    };
+    vec![
+        env_dir("CLAUDE_CONFIG_DIR").unwrap_or_else(|| home.join(".claude")),
+        home.join(".claude.json"),
+        env_dir("CODEX_HOME").unwrap_or_else(|| home.join(".codex")),
+        home.join(".gemini"),
+        home.join(".local/share/opencode"),
+        home.join(".config/opencode"),
+    ]
 }
 
 fn routing_json(d: &RouteDecision, notes: &[String]) -> Value {
@@ -1259,6 +1336,7 @@ mod tests {
         names.insert("u1".to_string(), "Sam".to_string());
         names.insert("u2".to_string(), "Riley".to_string());
         Ctx {
+            exists: true,
             kind: kind.into(),
             members: vec!["u1".into(), "u2".into()],
             names,

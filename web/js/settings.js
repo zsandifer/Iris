@@ -309,15 +309,25 @@ export function Devices() {
 // ------------------------------------------------------------------ people
 
 function CodeSheet({ name, code, expires }) {
+  const url = location.origin;
+  const mins = Math.max(1, Math.round((expires - Date.now()) / 60000));
+  const invite = async () => {
+    const text = `Your own Iris is ready. On your phone, open ${url} and enter this code: ${code} (it works once, for ${mins} minutes).`;
+    if (navigator.share) {
+      try { await navigator.share({ text }); return; } catch { /* closed or unavailable */ }
+    }
+    navigator.clipboard?.writeText(text).then(() => toast('Invite copied'), () => toast(text));
+  };
   return html`<div class="sheet-body"><h3>Pairing code for ${name}</h3>
-    <p class="mu">On their phone, open this Iris address and enter the code. It works once, for ${Math.max(1, Math.round((expires - Date.now()) / 60000))} minutes.</p>
+    <p class="mu">On ${name}'s phone, open <b>${url}</b> and enter this code. It works once, for ${mins} minutes.</p>
     <button class="big-code wide" onClick=${() => navigator.clipboard?.writeText(code).then(() => toast('Code copied'))}>${code} <${Icon} name="copy" size=${16} /></button>
-    <div class="btns"><button class="b1" onClick=${closeSheet}>Done</button></div></div>`;
+    <div class="btns"><button class="b2" onClick=${invite}>Send invite</button><button class="b1" onClick=${closeSheet}>Done</button></div></div>`;
 }
 
 export function People() {
   const [users, setUsers] = useState(null);
-  const load = () => get('/users').then((r) => setUsers(r.users)).catch((e) => toast(e.message));
+  // The owner first, then everyone else in the order they were added.
+  const load = () => get('/users').then((r) => setUsers([...r.users].sort((a, b) => b.is_owner - a.is_owner))).catch((e) => toast(e.message));
   useEffect(() => { load(); }, []);
   const code = async (u) => {
     try {

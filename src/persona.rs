@@ -109,6 +109,16 @@ pub fn seed(paths: &Paths) -> Result<Vec<String>> {
     seed_person(&paths.owner_dirs())
 }
 
+/// Seed every person already in the database (folders and missing
+/// templates; existing files are kept). Run at startup so people added
+/// before they had their own Iris, or whose folders went missing, work.
+pub fn seed_people(paths: &Paths, db: &crate::db::Db) -> Result<()> {
+    for u in db.with(crate::db::list_users)? {
+        seed_person(&paths.person_dirs(&u.id, u.is_owner))?;
+    }
+    Ok(())
+}
+
 /// Create one person's Iris folders and seed missing persona files from
 /// the generic templates. Returns the files that were created.
 pub fn seed_person(dirs: &PersonDirs) -> Result<Vec<String>> {
@@ -277,6 +287,10 @@ pub fn assemble(dirs: &PersonDirs, ctx: &PromptContext) -> String {
     truncate_chars(&out, MAX_PROMPT_CHARS)
 }
 
+/// Version of the system prompt's shape (see `persona_hash`). 2: per-person
+/// Iris; shared chats carry only IDENTITY.md and SOUL.md.
+const PROMPT_VERSION: &str = "2";
+
 /// Persona files used in shared conversations: who the agent is, never
 /// facts about anyone.
 const SHARED_FILES: &[&str] = &["IDENTITY.md", "SOUL.md"];
@@ -321,6 +335,10 @@ when it genuinely helps, and never mention tool names to the user.
 pub fn persona_hash(dirs: &PersonDirs, agent_name: &str, conversation_kind: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
+    // Bumped when the prompt's shape changes, so CLIs that keep their first
+    // instructions on resume (Codex) start over with the new prompt.
+    h.update(PROMPT_VERSION.as_bytes());
+    h.update([0]);
     h.update(agent_name.as_bytes());
     h.update([0]);
     h.update(conversation_kind.as_bytes());

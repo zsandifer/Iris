@@ -38,20 +38,18 @@ UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY CODEX_API
 # only its own home, and cannot change the engines: @ENGINES_DIR@ is listed
 # below only so the admin account's install helper (run through sudo, in this
 # same sandbox) can write it; file permissions keep the agent out.
+#
+# Only mount-based protections are used. Options that install seccomp
+# filters (SystemCallFilter, LockPersonality, RestrictRealtime,
+# PrivateDevices, ProtectKernel*, ProtectClock, ProtectHostname, ...) make
+# systemd set no_new_privs for a non-root service on some versions (for
+# example systemd 252), which would stop sudo, and so every install from
+# the app. deploy/verify-split.sh checks the helper inside this sandbox.
 UMask=0077
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=@AGENT_HOME@ @ENGINES_DIR@ -/run/sudo -/run/sudo-rs
 PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
-RestrictRealtime=yes
-LockPersonality=yes
 # sudo (the engine helper) is setuid, so new privileges must stay allowed;
 # the sudoers rule limits it to exact `iris engines ...` commands.
 NoNewPrivileges=no

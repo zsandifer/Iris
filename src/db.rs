@@ -362,45 +362,62 @@ pub fn list_users(conn: &Connection) -> rusqlite::Result<Vec<User>> {
     .collect()
 }
 
+/// What removing a person leaves for the caller to delete on disk.
+#[derive(Debug, Default)]
+pub struct RemovedPerson {
+    /// Library file names.
+    pub library_files: Vec<String>,
+    /// Upload file names.
+    pub upload_files: Vec<String>,
+    /// Conversations that were deleted (their working folders).
+    pub conversations: Vec<String>,
+    /// Messages that were deleted (their cached voice notes).
+    pub messages: Vec<String>,
+}
+
 /// Remove a person (never the owner) and everything that is only theirs:
 /// devices, pairing codes, push subscriptions, feed, ideas, goals, library
-/// rows, credentials, their own chats, and Together chats they created.
-/// Returns the files to delete (library file names, and `uploads/<name>`
-/// for uploads) and the conversation ids to clean up.
-pub fn delete_person(
-    conn: &Connection,
-    id: &str,
-) -> rusqlite::Result<Option<(Vec<String>, Vec<String>)>> {
+/// rows, credentials, their own chats, Together chats they created, and
+/// their uploads no remaining message shows. `None` for the owner or an
+/// unknown id.
+pub fn delete_person(conn: &Connection, id: &str) -> rusqlite::Result<Option<RemovedPerson>> {
     let Some(u) = get_user(conn, id)? else {
         return Ok(None);
     };
     if u.is_owner {
         return Ok(None);
     }
-    let mut stmt = conn.prepare("SELECT file_name FROM library_items WHERE user_id = ?1")?;
-    let mut files: Vec<String> = stmt
-        .query_map([id], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    let mut stmt = conn.prepare("SELECT id FROM conversations WHERE created_by = ?1")?;
-    let convs: Vec<String> = stmt
-        .query_map([id], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    for c in &convs {
+    let strings = |sql: &str| -> rusqlite::Result<Vec<String>> {
+        let mut stmt = conn.prepare(sql)?;
+        stmt.query_map([id], |r| r.get(0))?.collect()
+    };
+    let mut out = RemovedPerson {
+        library_files: strings("SELECT file_name FROM library_items WHERE user_id = ?1")?,
+        conversations: strings("SELECT id FROM conversations WHERE created_by = ?1")?,
+        messages: strings(
+            "SELECT m.id FROM messages m JOIN conversations c ON c.id = m.conversation_id
+             WHERE c.created_by = ?1",
+        )?,
+        ..Default::default()
+    };
+    for c in &out.conversations {
         conn.execute("DELETE FROM conversations WHERE id = ?1", [c])?;
     }
     // Their uploads that no remaining message shows (their Iris's picture,
     // photos from their own chats) go too; photos they sent into other
-    // people's chats stay with those chats.
-    let mut stmt = conn.prepare(
-        "SELECT id, file_name FROM attachments a WHERE user_id = ?1 AND NOT EXISTS (
-             SELECT 1 FROM messages m, json_each(m.attachments) j WHERE j.value = a.id)",
-    )?;
+    // people's chats stay with those chats. One pass over the messages.
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT j.value FROM messages m, json_each(m.attachments) j")?;
+    let shown: std::collections::HashSet<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut stmt = conn.prepare("SELECT id, file_name FROM attachments WHERE user_id = ?1")?;
     let uploads: Vec<(String, String)> = stmt
         .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    for (att, file) in uploads {
+    for (att, file) in uploads.into_iter().filter(|(a, _)| !shown.contains(a)) {
         conn.execute("DELETE FROM attachments WHERE id = ?1", [&att])?;
-        files.push(format!("uploads/{file}"));
+        out.upload_files.push(file);
     }
     conn.execute(
         "DELETE FROM settings WHERE key LIKE ?1",
@@ -412,7 +429,7 @@ pub fn delete_person(
     )?;
     // Devices, codes, members, subscriptions, and entities cascade.
     conn.execute("DELETE FROM users WHERE id = ?1 AND is_owner = 0", [id])?;
-    Ok(Some((files, convs)))
+    Ok(Some(out))
 }
 
 pub fn rename_user(conn: &Connection, id: &str, name: &str) -> rusqlite::Result<()> {

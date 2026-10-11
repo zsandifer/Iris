@@ -293,11 +293,16 @@ for other people (see [Subscription terms](#subscription-terms)).
 Privacy between people: a person's Iris only gets their own files and
 memory. Together chats get nobody's private files or memory (only the
 host Iris's `IDENTITY.md` and `SOUL.md`), a working folder of their own,
-and a cards-only app bridge. With Claude Code, Iris also denies the agent's
-file tools access to everyone else's folders and to Iris's own database and
-keys. All people's CLIs still run as one operating-system account, so for a
-hard boundary between people run them on separate Iris servers (or
-accounts).
+and a cards-only app bridge. The engines are also kept out of other
+people's folders, Iris's database and keys, and the CLIs' own session
+transcripts: Claude Code with permission deny rules, Codex with a
+permission profile that denies those paths (this replaces its
+`sandbox_mode` for those turns; avoid setting `sandbox_mode` in
+`~/.codex/config.toml`, which makes Codex ignore profiles), and Gemini CLI
+and OpenCode keep their file tools inside the turn's own folders. All
+people's CLIs still run as one operating-system account, and the Iris app
+bridge they launch reads Iris's database, so for a hard boundary between
+people who do not trust each other, run separate Iris servers.
 
 To remove someone, tap them in People, then **Remove**: their Iris, chats,
 memory, feed, goals, and devices are deleted.

@@ -38,6 +38,16 @@ async function call(page, method, path, body) {
     return { status: r.status, body: await r.json().catch(() => null) };
   }, [method, path, body]);
 }
+// Record real audio playback (the app's <audio> is not in the DOM).
+const watchAudio = () => {
+  const orig = HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.play = function play(...args) {
+    window.__audio = this;
+    const r = orig.apply(this, args);
+    r.catch(() => { window.__playRejected = (window.__playRejected || 0) + 1; });
+    return r;
+  };
+};
 function watchErrors(page, who) {
   page.on('pageerror', (e) => failures.push(`${who} page error: ${e.message}`));
   page.on('console', (m) => { if (m.type() === 'error') console.log(`   [${who} console] ${m.text()}`); });
@@ -174,6 +184,7 @@ const browser2 = await chromium.launch({
   args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', `--use-file-for-fake-audio-capture=${fixture}%noloop`],
 });
 const ownerCtx2 = await browser2.newContext({ ...phone, colorScheme: 'light', storageState: ownerState, permissions: ['microphone'] });
+await ownerCtx2.addInitScript(watchAudio);
 owner = await ownerCtx2.newPage();
 watchErrors(owner, 'owner');
 await owner.goto(base + `/#/chat/${ownerMe.main_conversation_id}`);
@@ -197,7 +208,11 @@ check(/paris/i.test(m.content), 'Iris answered the spoken question');
 step('Voice reply plays by itself as a server voice note');
 await owner.waitForSelector('.row:last-child .vn', { timeout: 60000 });
 await owner.waitForSelector('.vn.on', { timeout: 60000 });
-check(true, 'voice note started playing after the reply');
+const heardAudio = await owner.waitForFunction(() => {
+  const a = window.__audio;
+  return a && a.src.startsWith('blob:') && a.currentTime > 0.2 ? a.currentTime : false;
+}, null, { timeout: 60000 }).then((h) => h.jsonValue()).catch(() => 0);
+check(heardAudio > 0.2 && !(await owner.evaluate(() => window.__playRejected || 0)), `the voice note really played (${Number(heardAudio).toFixed(2)} s in)`);
 check(!(await owner.isVisible('.row:last-child .vn-lbl')), 'server voice (no device label)');
 const audioOk = (await owner.evaluate(async (id) => {
   const r = await fetch('/api/voice/speak', { method: 'POST', headers: { Authorization: 'Bearer ' + localStorage.getItem('iris.token'), 'Content-Type': 'application/json' }, body: JSON.stringify({ message_id: id }) });
@@ -228,7 +243,7 @@ step("Sam's own chat: their memory, not the owner's");
 t0 = Date.now();
 await typeAndSend(sam, 'Two quick questions: what is my favorite food, and do you know any secret code word? Answer in one sentence.');
 m = await reply(sam, samMe.main_conversation_id, t0 - 2000);
-check(m.status === 'complete', `Sam's Iris answered (engine: ${m.harness})`);
+check(m.status === 'complete' && m.content.trim().length > 0, `Sam's Iris answered (engine: ${m.harness})`);
 check(m.harness !== 'claude', "Sam's own Iris does not use the owner's Claude (individual-use policy)");
 check(/dumpling/i.test(m.content), "Sam's Iris knows Sam's memory");
 check(!/periwinkle/i.test(m.content), "Sam's Iris does not know the owner's memory");
@@ -272,6 +287,7 @@ check(await sam.isVisible('.top .nm:has-text("Iris")'), "Alex's Iris hosts the c
 t0 = Date.now();
 await typeAndSend(sam, "Do you know Alex's secret code word or my favorite food? Answer in one sentence.");
 m = await reply(sam, together.id, t0 - 2000);
+check(m.status === 'complete' && m.content.trim().length > 0, `Iris answered Sam's question in the Together chat (engine: ${m.harness})`);
 check(!/periwinkle/i.test(m.content) && !/dumpling/i.test(m.content), 'no private memory from either person in the Together chat');
 await owner.waitForSelector(`.umsg.other .who:has-text("Sam")`);
 check(true, "Alex sees Sam's message");

@@ -597,10 +597,11 @@ async fn write_system_file(
     if body.content.len() > MAX_TEXT_FILE {
         return Err(ApiError::bad_request("file is too large"));
     }
-    crate::config::write_private_file(
-        &system_file_path(&state.dirs_for(&user.user), f),
-        body.content.as_bytes(),
-    )?;
+    let path = system_file_path(&state.dirs_for(&user.user), f);
+    if let Some(parent) = path.parent() {
+        crate::config::ensure_private_dir(parent)?;
+    }
+    crate::config::write_private_file(&path, body.content.as_bytes())?;
     ok(json!({"ok": true, "name": f.name}))
 }
 

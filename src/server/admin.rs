@@ -141,6 +141,9 @@ async fn put_settings(
             .broadcast_settings(std::slice::from_ref(&user.user))
             .await;
     }
+    if body.agent_name.is_some() {
+        state.broadcast_agent(&user.user).await;
+    }
     ok(state.settings_json_for(&user.user).await)
 }
 
@@ -165,6 +168,7 @@ async fn put_avatar(State(state): State<AppState>, user: AuthUser, body: Bytes) 
         remove_avatar_file(&state, &old).await;
     }
     state.broadcast_settings(std::slice::from_ref(&me)).await;
+    state.broadcast_agent(&me).await;
     ok(state.settings_json_for(&me).await)
 }
 
@@ -178,6 +182,7 @@ async fn delete_avatar(State(state): State<AppState>, user: AuthUser) -> ApiResu
         remove_avatar_file(&state, &old).await;
     }
     state.broadcast_settings(std::slice::from_ref(&me)).await;
+    state.broadcast_agent(&me).await;
     ok(state.settings_json_for(&me).await)
 }
 

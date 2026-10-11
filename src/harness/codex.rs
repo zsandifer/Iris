@@ -7,6 +7,10 @@
 //! - Resume: `codex exec resume <thread_id>`. `resume` does not accept
 //!   `-s`/`--add-dir`, so sandbox settings are always passed as `-c`
 //!   overrides, identically for new and resumed threads.
+//! - Private paths: with `workspace-write` or `read-only`, a turn that has
+//!   paths to keep out runs under a permission profile (`default_permissions`
+//!   extending `:workspace`/`:read-only`, verified with codex 0.162) whose
+//!   `filesystem` rules deny them and grant the writable folders.
 //! - MCP: `-c mcp_servers.<name>.<key>=<toml value>` per server.
 //! - Prompt on stdin (`-`); images via `-i <file>`.
 
@@ -106,7 +110,31 @@ impl Harness for Codex {
             "developer_instructions={}",
             toml_str(&spec.system_prompt)
         ));
-        if !self.cfg.sandbox.is_empty() {
+        let profile_base = match self.cfg.sandbox.as_str() {
+            "workspace-write" => Some(":workspace"),
+            "read-only" => Some(":read-only"),
+            _ => None,
+        };
+        if let Some(base) = profile_base.filter(|_| !spec.private_paths.is_empty()) {
+            // A permission profile: the same sandbox as `sandbox_mode`, plus
+            // read-and-write denies for other people's folders and Iris's
+            // own state (deny wins over the broader read access).
+            overrides.push(r#"default_permissions="iris""#.into());
+            overrides.push(format!("permissions.iris.extends={}", toml_str(base)));
+            let mut rules: Vec<String> = Vec::new();
+            if base == ":workspace" {
+                for d in &spec.writable_dirs {
+                    rules.push(format!("{}=\"write\"", toml_str(&d.to_string_lossy())));
+                }
+            }
+            for p in &spec.private_paths {
+                rules.push(format!("{}=\"deny\"", toml_str(&p.to_string_lossy())));
+            }
+            overrides.push(format!(
+                "permissions.iris.filesystem={{{}}}",
+                rules.join(",")
+            ));
+        } else if !self.cfg.sandbox.is_empty() {
             overrides.push(format!("sandbox_mode={}", toml_str(&self.cfg.sandbox)));
             if self.cfg.sandbox == "workspace-write" && !spec.writable_dirs.is_empty() {
                 let roots: Vec<String> = spec
@@ -556,6 +584,29 @@ mod tests {
         assert_eq!(&inv.args[..3], ["exec", "resume", "--json"]);
         let n = inv.args.len();
         assert_eq!(&inv.args[n - 2..], ["th-1", "-"]);
+
+        // Paths to keep out switch to a permission profile with denies.
+        spec.private_paths = vec!["/data/people/x".into(), "/data/a \"b\"".into()];
+        let inv = h.build(&spec).unwrap();
+        assert!(!inv.args.iter().any(|a| a.starts_with("sandbox_mode=")));
+        assert!(
+            inv.args
+                .contains(&r#"default_permissions="iris""#.to_string())
+        );
+        assert!(
+            inv.args
+                .contains(&r#"permissions.iris.extends=":workspace""#.to_string())
+        );
+        let fs = inv
+            .args
+            .iter()
+            .find_map(|a| a.strip_prefix("permissions.iris.filesystem="))
+            .unwrap();
+        let parsed: toml::Table = toml::from_str(&format!("x = {fs}")).unwrap();
+        let rules = parsed["x"].as_table().unwrap();
+        assert_eq!(rules["/m"].as_str(), Some("write"));
+        assert_eq!(rules["/data/people/x"].as_str(), Some("deny"));
+        assert_eq!(rules["/data/a \"b\""].as_str(), Some("deny"));
     }
 
     #[test]

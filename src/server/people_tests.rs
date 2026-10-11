@@ -45,7 +45,8 @@ for a in "$@"; do
   if [ "$prev" = "--mcp-config" ]; then cp "$a" "$out/mcp"; fi
   prev="$a"
 done
-cat > /dev/null
+input=$(cat)
+case "$input" in *slow-please*) sleep 2;; esac
 echo '{{"type":"system","subtype":"init","session_id":"fake-session"}}'
 echo '{{"type":"assistant","message":{{"id":"m1","role":"assistant","content":[{{"type":"text","text":"Hello from the fake."}}]}}}}'
 echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hello from the fake.","session_id":"fake-session"}}'
@@ -458,12 +459,39 @@ async fn turns_use_the_right_iris_and_keep_memory_private() {
     )
     .await;
 
+    // The owner's accounts: only the owner's own chats may use them.
+    let (s, c) = send(
+        &h,
+        "POST",
+        "/api/connectors",
+        &owner,
+        Some(json!({"name": "notes", "transport": "stdio", "command": "/bin/true"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{c}");
+    let servers = |mcp: &str| -> Vec<String> {
+        let v: Value = serde_json::from_str(mcp).unwrap();
+        let mut k: Vec<String> = v["mcpServers"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        k.sort();
+        k
+    };
+
     // The owner's own chat: Claude may answer (individual use).
     let owner_main = main_of(&h, &owner).await;
     let m = turn(&h, &owner, &owner_main, "hi").await;
     assert_eq!(m["status"], "complete", "{m}");
-    let (args, cwd, prompt, _mcp) = last_turn(&h);
+    let (args, cwd, prompt, mcp) = last_turn(&h);
     assert!(prompt.contains("owner-secret-fact") && !prompt.contains("sam-private-fact"));
+    assert_eq!(
+        servers(&mcp),
+        ["iris", "notes"],
+        "owner's chat gets the connector"
+    );
     assert_eq!(cwd, h.state.paths.workspace_dir().display().to_string());
     // Sam's folders and Iris's own state are off limits to the tools.
     assert!(
@@ -519,7 +547,8 @@ async fn turns_use_the_right_iris_and_keep_memory_private() {
     .await;
     let m = turn(&h, &sam, &sam_main, "hi again").await;
     assert_eq!(m["status"], "complete", "{m}");
-    let (args, cwd, prompt, _mcp) = last_turn(&h);
+    let (args, cwd, prompt, mcp) = last_turn(&h);
+    assert_eq!(servers(&mcp), ["iris"], "no owner connectors for Sam");
     assert!(prompt.contains("sam-private-fact") && !prompt.contains("owner-secret-fact"));
     assert!(prompt.contains("# You are Juno") && prompt.contains("called Sam"));
     assert_eq!(cwd, sam_dirs.workspace.display().to_string());
@@ -557,6 +586,7 @@ async fn turns_use_the_right_iris_and_keep_memory_private() {
         !args.contains("--add-dir"),
         "no writable memory in shared chats"
     );
+    assert_eq!(servers(&mcp), ["iris"], "no connectors in Together chats");
     let mcp: Value = serde_json::from_str(&mcp).unwrap();
     let bridge = mcp["mcpServers"]["iris"]["args"].to_string();
     assert!(
@@ -632,4 +662,116 @@ async fn voice_routes() {
     assert_eq!(v["duration_ms"], 1000);
     let leftovers = std::fs::read_dir(h.state.paths.run_dir()).unwrap().count();
     assert_eq!(leftovers, 0, "recordings are deleted after transcription");
+}
+
+#[tokio::test]
+async fn removing_a_person_drops_their_queued_turns() {
+    let h = setup(true).await;
+    let (owner, sam_id, sam) = owner_and_sam(&h).await;
+    send(
+        &h,
+        "PUT",
+        "/api/settings",
+        &owner,
+        Some(json!({"allow_claude_for_shared": true})),
+    )
+    .await;
+    let sam_main = main_of(&h, &sam).await;
+    let uri = format!("/api/conversations/{sam_main}/messages");
+    let (s, _) = send(&h, "POST", &uri, &sam, Some(json!({"text": "slow-please"}))).await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let (s, _) = send(
+        &h,
+        "POST",
+        &uri,
+        &sam,
+        Some(json!({"text": "queued behind it"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let turns = h.tmp.path().join("turns");
+    for _ in 0..100 {
+        if std::fs::read_dir(&turns).unwrap().count() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (s, _) = send(&h, "DELETE", &format!("/api/users/{sam_id}"), &owner, None).await;
+    assert_eq!(s, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    assert_eq!(
+        std::fs::read_dir(&turns).unwrap().count(),
+        1,
+        "the queued turn never ran (and never as the owner's Iris)"
+    );
+}
+
+#[tokio::test]
+async fn owner_is_asked_about_claude_for_groups_they_are_not_in() {
+    let h = setup(true).await;
+    let (owner, _sam_id, sam) = owner_and_sam(&h).await;
+    let (_, kim) = send(
+        &h,
+        "POST",
+        "/api/users",
+        &owner,
+        Some(json!({"display_name": "Kim"})),
+    )
+    .await;
+    let kim_id = kim["user"]["id"].as_str().unwrap().to_string();
+    let (_, g) = send(
+        &h,
+        "POST",
+        "/api/conversations",
+        &sam,
+        Some(json!({"kind": "group", "title": "Movie night", "member_ids": [kim_id]})),
+    )
+    .await;
+    let gid = g["conversation"]["id"].as_str().unwrap().to_string();
+    let m = turn(&h, &sam, &gid, "hi").await;
+    assert_eq!(m["meta"]["error"]["kind"], "paused_policy");
+    let (_, msgs) = send(
+        &h,
+        "GET",
+        &format!("/api/conversations/{gid}/messages"),
+        &sam,
+        None,
+    )
+    .await;
+    let card = msgs["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["kind"] == "card")
+        .unwrap()
+        .clone();
+    assert_eq!(card["card"]["type"], "info", "nobody here can approve it");
+    let owner_main = main_of(&h, &owner).await;
+    let (_, msgs) = send(
+        &h,
+        "GET",
+        &format!("/api/conversations/{owner_main}/messages"),
+        &owner,
+        None,
+    )
+    .await;
+    let ask = msgs["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["card"]["type"] == "action")
+        .expect("the owner is asked in their Main chat")
+        .clone();
+    assert!(
+        ask["card"]["title"]
+            .as_str()
+            .unwrap()
+            .contains("Sam's group chat")
+    );
+    assert!(
+        ask["card"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("Movie night")
+    );
 }

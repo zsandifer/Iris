@@ -97,8 +97,8 @@ if printf '%s\n' "$LIST" | grep -Eq '\((ALL|root)[^)]*\)'; then
 else
     pass "$AGENT_USER may not run anything as root"
 fi
-if printf '%s\n' "$LIST" | grep -q "$IRIS_BIN engines install claude --dir $ENGINES_DIR"; then
-    pass "$AGENT_USER may run exact 'iris engines' commands as $ADMIN_USER"
+if printf '%s\n' "$LIST" | grep -Eq "$IRIS_BIN engines install claude --dir $ENGINES_DIR|IRIS_ENGINES"; then
+    pass "$AGENT_USER may run the 'iris engines' commands as $ADMIN_USER"
 else
     fail "sudo -l -U $AGENT_USER does not show the iris engines commands"
 fi
@@ -108,7 +108,19 @@ case "$OUT" in
     *) fail "the helper failed: $OUT" ;;
 esac
 if as_agent sudo -n -u "$ADMIN_USER" /bin/true 2>/dev/null; then fail "$AGENT_USER can run arbitrary commands as $ADMIN_USER"; else pass "$AGENT_USER cannot run other commands as $ADMIN_USER"; fi
-if as_agent sudo -n -u "$ADMIN_USER" "$IRIS_BIN" engines install claude --dir /tmp 2>/dev/null; then fail "$AGENT_USER can point the helper at another directory"; else pass "the helper only accepts $ENGINES_DIR"; fi
+# Every allowed command must be an exact `iris engines ... --dir <engines dir>`
+# (checked from the rule list, without running anything).
+CMDS=$(sed -n '/^Cmnd_Alias IRIS_ENGINES/,/[^\\]$/p' "$SUDOERS" | sed 's/^Cmnd_Alias IRIS_ENGINES = //; s/\\$//' \
+    | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$')
+if grep -v '^#' "$SUDOERS" | grep -v '^Cmnd_Alias' | grep -v '^ ' | grep -v '^$' | grep -qv "^$AGENT_USER ALL=($ADMIN_USER) NOPASSWD: IRIS_ENGINES\$"; then
+    fail "$SUDOERS has rules other than the IRIS_ENGINES alias for $AGENT_USER"
+fi
+BAD=$(printf '%s\n' "$CMDS" | grep -v "^$IRIS_BIN engines [a-z]* *[a-z]* *--dir $ENGINES_DIR\$" | head -3)
+if [ -n "$CMDS" ] && [ -z "$BAD" ]; then
+    pass "every command $AGENT_USER may run as $ADMIN_USER is an exact 'iris engines ... --dir $ENGINES_DIR'"
+else
+    fail "unexpected sudo rule for $AGENT_USER: ${BAD:-none found}"
+fi
 if as_agent sudo -n true 2>/dev/null; then fail "$AGENT_USER can run commands as root"; else pass "$AGENT_USER cannot sudo to root"; fi
 
 # --- what the agent can see
@@ -134,17 +146,30 @@ fi
 if [ "$AGENT_USER" = "iris-agent" ] || systemctl cat iris >/dev/null 2>&1; then
     if [ "$(systemctl show iris -p User --value 2>/dev/null)" = "$AGENT_USER" ]; then pass "iris.service runs as $AGENT_USER"; else fail "iris.service does not run as $AGENT_USER"; fi
     if [ "$(systemctl show iris -p ProtectHome --value 2>/dev/null)" = yes ]; then pass "iris.service hides /home (ProtectHome=yes)"; else warn "iris.service does not set ProtectHome=yes"; fi
+    if [ "$(systemctl show iris -p NoNewPrivileges --value 2>/dev/null)" = no ]; then pass "iris.service allows sudo for the helper (NoNewPrivileges=no)"; else fail "iris.service sets NoNewPrivileges, which blocks the engine helper"; fi
     if systemctl is-active --quiet iris; then
         pass "iris.service is running"
         PID=$(systemctl show iris -p MainPID --value)
         if [ "$(stat -c %U "/proc/$PID")" = "$AGENT_USER" ]; then pass "the running process belongs to $AGENT_USER (pid $PID)"; else fail "the running process does not belong to $AGENT_USER"; fi
-        # The helper must also work inside the service's sandbox.
-        if systemd-run --wait --quiet --collect --pipe -p User="$AGENT_USER" -p ProtectSystem=strict -p ProtectHome=yes \
-            -p ReadWritePaths="$AGENT_HOME $ENGINES_DIR -/run/sudo -/run/sudo-rs" -p PrivateTmp=yes \
+        # The helper must also work inside the service's own sandbox: run it
+        # in a transient unit with every sandboxing property the service has.
+        PROPS=""
+        for p in User ProtectSystem ProtectHome PrivateTmp PrivateDevices ProtectKernelTunables \
+            ProtectKernelModules ProtectKernelLogs ProtectClock ProtectHostname ProtectControlGroups \
+            RestrictRealtime RestrictNamespaces LockPersonality MemoryDenyWriteExecute \
+            NoNewPrivileges RestrictSUIDSGID SystemCallArchitectures; do
+            v=$(systemctl show iris -p "$p" --value 2>/dev/null)
+            [ -n "$v" ] && PROPS="$PROPS -p $p=$v"
+        done
+        RW=$(systemctl show iris -p ReadWritePaths --value 2>/dev/null)
+        FILTER=$(systemctl show iris -p SystemCallFilter --value 2>/dev/null)
+        [ -n "$FILTER" ] && warn "iris.service has a SystemCallFilter; it can block sudo for the engine helper"
+        # shellcheck disable=SC2086
+        if systemd-run --wait --quiet --collect --pipe $PROPS -p ReadWritePaths="$RW" \
             sudo -n -u "$ADMIN_USER" "$IRIS_BIN" engines list --dir "$ENGINES_DIR" 2>/dev/null | grep -q '^\['; then
-            pass "the helper works inside the service sandbox"
+            pass "the helper works inside the service's sandbox"
         else
-            fail "the helper fails inside the service sandbox (ProtectSystem/ReadWritePaths)"
+            fail "the helper fails inside the service's sandbox (check NoNewPrivileges and seccomp options)"
         fi
     else
         fail "iris.service is not running: journalctl -u iris -n 50"

@@ -420,22 +420,22 @@ async fn delete_user(
         return Err(ApiError::bad_request("the owner cannot be removed"));
     }
     let tid = id.clone();
-    let (files, convs) = state
+    let removed = state
         .db
         .call(move |c| db::delete_person(c, &tid))
         .await?
         .ok_or_else(|| ApiError::not_found("user"))?;
-    for c in &convs {
+    for c in &removed.conversations {
         crate::turn::cancel(&state, c);
         let _ = tokio::fs::remove_dir_all(state.paths.together_dir(c)).await;
     }
-    for f in files {
-        let path = match f.strip_prefix("uploads/") {
-            Some(upload) => state.paths.uploads_dir().join(upload),
-            None => state.paths.library_dir().join(f),
-        };
-        let _ = tokio::fs::remove_file(path).await;
+    for f in &removed.library_files {
+        let _ = tokio::fs::remove_file(state.paths.library_dir().join(f)).await;
     }
+    for f in &removed.upload_files {
+        let _ = tokio::fs::remove_file(state.paths.uploads_dir().join(f)).await;
+    }
+    voice::forget_notes(&state, &removed.messages).await;
     let dirs = state.dirs_for(&target);
     if let Some(root) = dirs.persona.parent()
         && root.starts_with(state.paths.people_dir())

@@ -527,21 +527,35 @@ pub struct WavInfo {
     pub duration_ms: u64,
 }
 
-/// Parse a RIFF/WAVE header (PCM only). Used to validate uploads and to
-/// report a voice note's length.
+/// Parse and validate a RIFF/WAVE file (16-bit PCM only). Every length the
+/// header declares must fit inside the bytes actually present, so a tiny
+/// upload cannot claim gigabytes of audio (the decoder allocates from the
+/// declared size). Used to check uploads and to report a voice note's
+/// length.
 pub fn wav_info(bytes: &[u8]) -> Option<WavInfo> {
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return None;
     }
     let u16_at = |i: usize| Some(u16::from_le_bytes(bytes.get(i..i + 2)?.try_into().ok()?));
     let u32_at = |i: usize| Some(u32::from_le_bytes(bytes.get(i..i + 4)?.try_into().ok()?));
+    let riff_end = (u32_at(4)? as usize).checked_add(8)?;
+    if riff_end > bytes.len() {
+        return None;
+    }
     let mut pos = 12;
     let mut fmt: Option<(u16, u16, u32, u16)> = None;
-    while pos + 8 <= bytes.len() {
+    while pos + 8 <= riff_end {
         let id = &bytes[pos..pos + 4];
         let len = u32_at(pos + 4)? as usize;
         let body = pos + 8;
+        let end = body.checked_add(len)?;
+        if end > riff_end {
+            return None;
+        }
         if id == b"fmt " {
+            if len < 16 {
+                return None;
+            }
             fmt = Some((
                 u16_at(body)?,
                 u16_at(body + 2)?,
@@ -551,22 +565,23 @@ pub fn wav_info(bytes: &[u8]) -> Option<WavInfo> {
         } else if id == b"data" {
             let (format, channels, sample_rate, bits) = fmt?;
             // 1 = PCM, 0xFFFE = extensible (PCM in practice for 16-bit).
-            if !(format == 1 || format == 0xFFFE) || channels == 0 || sample_rate == 0 {
+            if !(format == 1 || format == 0xFFFE) || channels == 0 || sample_rate == 0 || bits != 16
+            {
                 return None;
             }
-            if bits != 16 {
+            let frame = channels as usize * 2;
+            if len == 0 || len % frame != 0 {
                 return None;
             }
-            let data_len = len.min(bytes.len() - body) as u64;
-            let per_sec = sample_rate as u64 * channels as u64 * (bits as u64 / 8);
+            let per_sec = sample_rate as u64 * frame as u64;
             return Some(WavInfo {
                 channels,
                 sample_rate,
                 bits,
-                duration_ms: data_len * 1000 / per_sec.max(1),
+                duration_ms: len as u64 * 1000 / per_sec,
             });
         }
-        pos = body + len + (len & 1);
+        pos = end + (len & 1);
     }
     None
 }
@@ -782,6 +797,18 @@ mod tests {
             1000
         );
         assert!(wav_info(&wav(1, 16000, 8, 100)).is_none());
+        // Declared lengths beyond the bytes present are refused.
+        let mut lying = wav(1, 16000, 16, 0);
+        lying[40..44].copy_from_slice(&0x7fff_fffeu32.to_le_bytes());
+        assert!(
+            wav_info(&lying).is_none(),
+            "data chunk larger than the file"
+        );
+        let mut riff = wav(1, 16000, 16, 320);
+        riff[4..8].copy_from_slice(&0x7fff_fffeu32.to_le_bytes());
+        assert!(wav_info(&riff).is_none(), "RIFF size larger than the file");
+        assert!(wav_info(&wav(2, 16000, 16, 3)).is_none(), "partial frame");
+        assert!(wav_info(&wav(1, 16000, 16, 0)).is_none(), "no audio");
         assert!(wav_info(b"RIFF\0\0\0\0WAVE").is_none());
         assert!(wav_info(b"\x89PNG....").is_none());
     }

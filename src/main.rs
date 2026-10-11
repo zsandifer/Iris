@@ -237,7 +237,8 @@ fn init(paths: &Paths) -> Result<()> {
         println!("config:   {} (created)", paths.config_file.display());
     }
     let created = persona::seed(paths)?;
-    db::Db::open(&paths.db_file())?;
+    let db = db::Db::open(&paths.db_file())?;
+    persona::seed_people(paths, &db)?;
     secrets::Vault::open(&paths.vault_key_file())?;
     push::VapidKeys::load_or_create(&paths.vapid_key_file())?;
     println!("data:     {}", paths.data_dir.display());
@@ -273,6 +274,7 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
         }
     }
     let db = db::Db::open(&paths.db_file())?;
+    persona::seed_people(&paths, &db)?;
     let interrupted = db.with(db::mark_interrupted)?;
     if interrupted > 0 {
         warn!("{interrupted} turn(s) were interrupted by the last shutdown");

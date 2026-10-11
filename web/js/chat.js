@@ -151,7 +151,8 @@ export function ChatScreen({ cid }) {
 
   // Voice replies: fetch the voice note as soon as a reply is done, and
   // play it when it answers something sent from this device.
-  const last = list.at(-1);
+  // The newest text reply (cards Iris made during the turn come after it).
+  const last = list.findLast((m) => m.role === 'assistant' && m.kind === 'text');
   useEffect(() => {
     if (!last || last.role !== 'assistant' || last.status !== 'complete' || last.kind !== 'text' || !voiceReplies()) return;
     prefetch(last);
@@ -266,6 +267,9 @@ function Composer({ cid, running, name }) {
   textRef.current = text;
   const recRef = useRef(null);
   recRef.current = recording;
+  const mounted = useRef(true);
+  const starting = useRef(false);
+  useEffect(() => () => { mounted.current = false; }, []);
 
   useEffect(() => {
     const d = S.drafts[cid];
@@ -366,12 +370,19 @@ function Composer({ cid, running, name }) {
       }
       return;
     }
+    if (starting.current) return;
+    starting.current = true;
     unlockAudio();
     try {
       setSecs(0);
-      setRecording(await record());
+      const handle = await record();
+      // The chat closed while the microphone was starting: let it go.
+      if (!mounted.current) handle.cancel();
+      else setRecording(handle);
     } catch (e) {
-      toast(e?.name === 'NotAllowedError' ? 'Allow microphone access to talk to me.' : "I can't use the microphone here.");
+      if (mounted.current) toast(e?.name === 'NotAllowedError' ? 'Allow microphone access to talk to me.' : "I can't use the microphone here.");
+    } finally {
+      starting.current = false;
     }
   };
 

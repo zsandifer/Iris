@@ -142,6 +142,24 @@ pub async fn voice_note(state: &AppState, msg: &Message) -> Result<(Vec<u8>, u64
     Ok(out)
 }
 
+/// Delete the cached voice notes of these messages (their chats were
+/// deleted). Notes are named `<message id>-<hash>.wav`.
+pub async fn forget_notes(state: &AppState, message_ids: &[String]) {
+    if message_ids.is_empty() {
+        return;
+    }
+    let ids: std::collections::HashSet<&str> = message_ids.iter().map(String::as_str).collect();
+    let Ok(mut rd) = tokio::fs::read_dir(state.paths.voice_dir()).await else {
+        return;
+    };
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.split_once('-').is_some_and(|(id, _)| ids.contains(id)) {
+            let _ = tokio::fs::remove_file(e.path()).await;
+        }
+    }
+}
+
 /// After a reply: if anyone in the conversation wants voice replies and
 /// the server can speak, make the voice note now so it plays instantly.
 pub fn prepare_for(state: &AppState, members: &[String], msg: &Message) {
