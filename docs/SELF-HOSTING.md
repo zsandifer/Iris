@@ -85,7 +85,7 @@ See [docs/API.md](API.md) for every route, event, and data type.
 ## Requirements
 
 - Linux (macOS should work but is untested)
-- Rust 1.85 or newer to build
+- Rust 1.88 or newer to build
 - Any one of these CLIs, or none yet (you can install them from the app):
   - Claude Code 2.1 or newer
   - Codex CLI 0.162 or newer

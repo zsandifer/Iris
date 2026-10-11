@@ -165,7 +165,7 @@ pub fn spawn_scheduler(state: AppState) {
         loop {
             tick.tick().await;
             n += 1;
-            if n % 15 == 0 {
+            if n.is_multiple_of(15) {
                 state.refresh_harnesses().await;
             }
             // New models (codex cache, CLI lists) and sign-in changes move

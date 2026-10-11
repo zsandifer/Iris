@@ -2,7 +2,7 @@
 name = "iris"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Self-hosted personal AI agent that wraps the official Claude Code, Codex, Gemini CLI, and OpenCode CLIs"
 license = "Apache-2.0 OR MIT"
 readme = "README.md"
