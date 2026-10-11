@@ -794,8 +794,17 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
     );
     // Switching tabs and back: the app's status shows no echoed secret.
     outputs.push(call("tabs", json!({"action": "new"})).await.text);
+    // Tab order is the browser's; pick the tricky page's tab by its address.
+    let list = call("tabs", json!({"action": "list"})).await.text;
+    outputs.push(list.clone());
+    let index: u64 = list
+        .lines()
+        .find(|l| l.contains("/tricky"))
+        .and_then(|l| l.split(':').next())
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no tricky tab in {list}"));
     outputs.push(
-        call("tabs", json!({"action": "select", "index": 0}))
+        call("tabs", json!({"action": "select", "index": index}))
             .await
             .text,
     );
