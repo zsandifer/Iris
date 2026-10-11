@@ -164,6 +164,38 @@ pub fn is_loopback_url(url: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// Credentials may cross the network only over TLS. HTTP is reserved
+/// for a server on this machine, with a parsed authority (no userinfo).
+pub fn check_secure_url(url: &str) -> Result<(), String> {
+    let safe = url.parse::<ureq::http::Uri>().ok().is_some_and(|uri| {
+        let Some(authority) = uri.authority() else {
+            return false;
+        };
+        if authority.as_str().contains('@') || url.contains('\\') {
+            return false;
+        }
+        let host = authority
+            .host()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        match uri.scheme_str() {
+            Some("https") => !host.is_empty(),
+            Some("http") => {
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            }
+            _ => false,
+        }
+    });
+    if safe {
+        Ok(())
+    } else {
+        Err("I need an HTTPS address for a connection with credentials (HTTP is allowed only on localhost or a loopback IP).".into())
+    }
+}
+
 fn private_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v) => {
@@ -189,23 +221,22 @@ fn private_ip(ip: std::net::IpAddr) -> bool {
 /// link-local destination, so a remote server cannot point Iris at the
 /// owner's local network.
 fn check_endpoint(url: &str, allow_local: bool) -> Result<(), String> {
+    check_secure_url(url)?;
     let local = is_loopback_url(url);
     let scheme_ok = url.starts_with("https://") || (url.starts_with("http://") && local);
     if !scheme_ok || (local && !allow_local) {
-        return Err(format!(
-            "the sign-in server uses an address Iris won't use ({url})"
-        ));
+        return Err("I can't use that sign-in server address.".into());
     }
     if !allow_local {
         use std::net::ToSocketAddrs;
         let port = if url.starts_with("https://") { 443 } else { 80 };
         let addrs = (host_of(url), port)
             .to_socket_addrs()
-            .map_err(|_| format!("could not find the sign-in server ({url})"))?;
+            .map_err(|_| "I could not find the sign-in server.".to_string())?;
         if addrs.into_iter().any(|a| private_ip(a.ip())) {
-            return Err(format!(
-                "the sign-in server points to a private address ({url})"
-            ));
+            return Err(
+                "I can't use a sign-in server at a private address for this connection.".into(),
+            );
         }
     }
     Ok(())
@@ -311,7 +342,13 @@ fn get_json(url: &str, local: bool) -> Option<Value> {
 }
 
 /// POST a form and parse the JSON reply (status, body).
-fn post_form(url: &str, form: &[(&str, &str)], local: bool) -> Result<(u16, Value), String> {
+fn post_form(
+    url: &str,
+    form: &[(&str, &str)],
+    local: bool,
+    secrets: &[String],
+) -> Result<(u16, Value), String> {
+    check_endpoint(url, local)?;
     let body: Vec<String> = form
         .iter()
         .map(|(k, v)| format!("{}={}", pct_encode(k), pct_encode(v)))
@@ -321,7 +358,7 @@ fn post_form(url: &str, form: &[(&str, &str)], local: bool) -> Result<(u16, Valu
         .header("Accept", "application/json")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .send(body.join("&").as_bytes())
-        .map_err(|e| format!("could not reach the sign-in server: {e}"))?;
+        .map_err(|_| "I could not reach the sign-in server.".to_string())?;
     let status = resp.status().as_u16();
     let text = resp
         .body_mut()
@@ -329,12 +366,66 @@ fn post_form(url: &str, form: &[(&str, &str)], local: bool) -> Result<(u16, Valu
         .limit(1024 * 1024)
         .read_to_string()
         .unwrap_or_default();
-    let v = serde_json::from_str(&text).unwrap_or_else(|_| {
+    let mut v = serde_json::from_str(&text).unwrap_or_else(|_| {
         // Some servers answer form-encoded despite Accept.
         let q = parse_query(&text);
         json!(q)
     });
+    let mut known = secrets.to_vec();
+    known.extend(
+        form.iter()
+            .filter(|(k, _)| {
+                matches!(
+                    *k,
+                    "client_secret" | "code" | "code_verifier" | "refresh_token" | "access_token"
+                )
+            })
+            .map(|(_, v)| v.to_string()),
+    );
+    known.extend(
+        ["access_token", "refresh_token", "client_secret", "id_token"]
+            .iter()
+            .filter_map(|k| v[*k].as_str().map(String::from)),
+    );
+    for key in ["error", "error_description"] {
+        if let Some(text) = v[key].as_str() {
+            v[key] = sanitize_provider_error(text, &known).into();
+        }
+    }
     Ok((status, v))
+}
+
+fn sanitize_provider_error(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    // Redact before truncation, including short secrets and form encoding.
+    let mut patterns: Vec<String> = secrets
+        .iter()
+        .filter(|s| !s.is_empty())
+        .flat_map(|s| [s.clone(), pct_encode(s)])
+        .collect();
+    // A token can be a prefix of another token. Hide the longest first.
+    patterns.sort_unstable_by_key(|s| std::cmp::Reverse(s.len()));
+    patterns.dedup();
+    for secret in patterns {
+        out = out.replace(&secret, "[hidden]");
+    }
+    let out: String = out.chars().filter(|c| !c.is_control()).collect();
+    truncate_chars(&out, 120)
+}
+
+/// Only fixed protocol codes go to logs, never provider-supplied prose.
+fn provider_error_code(v: &Value) -> &'static str {
+    match v["error"].as_str() {
+        Some("invalid_request") => "invalid_request",
+        Some("invalid_client") => "invalid_client",
+        Some("invalid_grant") => "invalid_grant",
+        Some("unauthorized_client") => "unauthorized_client",
+        Some("unsupported_grant_type") => "unsupported_grant_type",
+        Some("invalid_scope") => "invalid_scope",
+        Some("temporarily_unavailable") => "temporarily_unavailable",
+        Some("server_error") => "server_error",
+        _ => "unknown_error",
+    }
 }
 
 // ------------------------------------------------------------- discovery
@@ -383,6 +474,7 @@ pub fn as_metadata_urls(issuer: &str) -> Vec<String> {
 
 /// Run discovery against a remote MCP server (blocking).
 pub fn discover(mcp_url: &str) -> Result<Discovered, String> {
+    check_secure_url(mcp_url)?;
     // An unauthenticated request tells us where the metadata lives.
     let probe = agent(true)
         .post(mcp_url)
@@ -557,6 +649,17 @@ fn open(state: &AppState, id: &str, field: &str, v: &Option<String>) -> Option<S
         .and_then(|s| state.vault.open_str(s, &aad(id, field)).ok())
 }
 
+fn known_secrets(state: &AppState, id: &str, o: &OAuthConfig) -> Vec<String> {
+    [
+        ("client_secret", &o.client_secret),
+        ("access_token", &o.access_token),
+        ("refresh_token", &o.refresh_token),
+    ]
+    .into_iter()
+    .filter_map(|(field, value)| open(state, id, field, value))
+    .collect()
+}
+
 async fn save(state: &AppState, id: &str, oauth: OAuthConfig) -> Result<(), String> {
     let id = id.to_string();
     state
@@ -593,6 +696,8 @@ pub async fn bearer(
     state: &AppState,
     con: &entities::Connector,
 ) -> Result<Option<String>, TokenError> {
+    crate::connectors::check_transport_security(&con.transport, &con.config)
+        .map_err(TokenError::Unavailable)?;
     let Some(o) = &con.config.oauth else {
         return Ok(None);
     };
@@ -617,9 +722,18 @@ pub async fn bearer(
         .call(move |c| entities::get_connector(c, &id))
         .await
         .ok()
-        .flatten()
-        .and_then(|c| c.config.oauth);
-    let Some(o) = fresh else {
+        .flatten();
+    let Some(fresh) = fresh else {
+        return Err(TokenError::NeedsSignIn);
+    };
+    crate::connectors::check_transport_security(&fresh.transport, &fresh.config)
+        .map_err(TokenError::Unavailable)?;
+    if crate::gateway::target(&fresh) != crate::gateway::target(con) {
+        return Err(TokenError::Unavailable(
+            "This connection changed while I was refreshing its sign-in. Try again.".into(),
+        ));
+    }
+    let Some(o) = fresh.config.oauth else {
         return Err(TokenError::NeedsSignIn);
     };
     if let (Some(_), Some(exp)) = (&o.access_token, o.expires_at)
@@ -638,6 +752,7 @@ pub async fn bearer(
     let secret = open(state, &con.id, "client_secret", &o.client_secret);
     let resource = (o.mode == "discover").then(|| o.resource.clone()).flatten();
     let local = o.local;
+    let secrets = known_secrets(state, &con.id, &o);
     let reply = tokio::task::spawn_blocking(move || {
         let mut form = vec![
             ("grant_type", "refresh_token"),
@@ -650,7 +765,7 @@ pub async fn bearer(
         if let Some(r) = &resource {
             form.push(("resource", r.as_str()));
         }
-        post_form(&token_endpoint, &form, local)
+        post_form(&token_endpoint, &form, local, &secrets)
     })
     .await
     .map_err(|_| TokenError::NeedsSignIn)?;
@@ -683,14 +798,14 @@ pub async fn bearer(
             crate::warn!(
                 "connector {}: token refresh refused (HTTP {status}, {})",
                 con.name,
-                truncate_chars(v["error"].as_str().unwrap_or("unknown"), 60)
+                provider_error_code(&v)
             );
             Err(TokenError::NeedsSignIn)
         }
         Err(e) => {
             // The sign-in server is unreachable: not the owner's problem
             // yet; fail this call without asking them to sign in again.
-            crate::warn!("connector {}: token refresh failed: {e}", con.name);
+            crate::warn!("connector {}: token refresh failed", con.id);
             Err(TokenError::Unavailable(e))
         }
     }
@@ -840,6 +955,9 @@ pub async fn start(
         mode: "discover".into(),
         ..Default::default()
     });
+    if con.transport == "http" {
+        crate::connectors::check_credential_url(&con.config).map_err(StartError::Other)?;
+    }
     let (redirect, direct) = redirect_uri(state, origin);
     if o.mode == "discover" && (o.authorization_endpoint.is_none() || o.token_endpoint.is_none()) {
         let url = con
@@ -968,10 +1086,7 @@ pub async fn finish(
     if let Some(e) = error {
         return Err(match e {
             "access_denied" => "You declined, so nothing was connected.".to_string(),
-            other => format!(
-                "The service reported a problem ({}).",
-                truncate_chars(other, 80)
-            ),
+            _ => "The service reported a sign-in problem. Try again.".to_string(),
         });
     }
     let code = code
@@ -991,11 +1106,13 @@ pub async fn finish(
         .oauth
         .clone()
         .ok_or("That connection does not use sign-in.")?;
+    crate::connectors::check_transport_security(&con.transport, &con.config)?;
     let token_endpoint = o.token_endpoint.clone().ok_or("No token address known.")?;
     let client_id = o.client_id.clone().unwrap_or_default();
     let secret = open(state, &con.id, "client_secret", &o.client_secret);
     let resource = (o.mode == "discover").then(|| o.resource.clone()).flatten();
     let local = o.local;
+    let secrets = known_secrets(state, &con.id, &o);
     let code = code.to_string();
     let reply = tokio::task::spawn_blocking(move || {
         let mut form = vec![
@@ -1011,7 +1128,7 @@ pub async fn finish(
         if let Some(r) = &resource {
             form.push(("resource", r.as_str()));
         }
-        post_form(&token_endpoint, &form, local)
+        post_form(&token_endpoint, &form, local, &secrets)
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -1020,7 +1137,7 @@ pub async fn finish(
         crate::warn!(
             "connector {}: code exchange refused (HTTP {status}, {})",
             con.name,
-            truncate_chars(v["error"].as_str().unwrap_or("unknown"), 60)
+            provider_error_code(&v)
         );
         return Err(format!(
             "The service refused the sign-in ({}). Try again.",
@@ -1107,6 +1224,72 @@ pub async fn finish_from_url(state: &AppState, url: &str) -> Result<String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_errors_hide_every_known_secret_and_only_log_protocol_codes() {
+        let secrets = [
+            "client/secret",
+            "code42",
+            "verifier42",
+            "refresh42",
+            "access42",
+            "x",
+        ]
+        .map(String::from);
+        let text = format!(
+            "<script>client/secret client%2Fsecret code42 verifier42 refresh42 access42 x</script>\n{}",
+            "界".repeat(200)
+        );
+        let clean = sanitize_provider_error(&text, &secrets);
+        for secret in &secrets {
+            assert!(!clean.contains(secret), "{clean}");
+        }
+        assert!(!clean.contains("client%2Fsecret"));
+        assert_eq!(
+            sanitize_provider_error(
+                "access42-longer",
+                &["access42".into(), "access42-longer".into()]
+            ),
+            "[hidden]"
+        );
+        assert!(clean.chars().count() <= 121);
+        assert_eq!(
+            provider_error_code(&json!({"error": "invalid_grant"})),
+            "invalid_grant"
+        );
+        assert_eq!(
+            provider_error_code(&json!({"error": "invalid_grant secret\n<script>"})),
+            "unknown_error"
+        );
+    }
+
+    #[test]
+    fn credential_urls_require_tls_or_parsed_loopback_authorities() {
+        for url in [
+            "http://connector.example/mcp",
+            "http://192.168.1.2/mcp",
+            "http://localhost.example/mcp",
+            "http://127.0.0.1.example/mcp",
+            "http://localhost@evil.example/mcp",
+            "http://evil.example@localhost/mcp",
+            "http://localhost\\@evil.example/mcp",
+            "ftp://localhost/mcp",
+        ] {
+            assert!(check_secure_url(url).is_err(), "{url}");
+            assert!(
+                discover(url).is_err(),
+                "discovery must refuse before connecting: {url}"
+            );
+        }
+        for url in [
+            "https://connector.example/mcp",
+            "http://localhost:7999/mcp",
+            "http://127.0.0.2:7999/mcp",
+            "http://[::1]:7999/mcp",
+        ] {
+            assert!(check_secure_url(url).is_ok(), "{url}");
+        }
+    }
 
     #[test]
     fn query_round_trip() {

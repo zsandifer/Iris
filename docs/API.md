@@ -1381,6 +1381,11 @@ key names. See [Connector](#connector).
 | `enabled` | bool | `true` | |
 
 Keys in `env` and `headers` must be 1 to 100 characters of `A-Z a-z 0-9 _ -`.
+HTTP connectors with OAuth or saved headers require an `https://` URL.
+Plain HTTP is allowed only for `localhost` or a loopback IP (such as
+`127.0.0.1` or `[::1]`). Creation and configuration updates reject unsafe
+addresses; the gateway also refuses to attach credentials to unsafe
+addresses saved by older versions. OAuth discovery follows the same rule.
 
 ```json
 {

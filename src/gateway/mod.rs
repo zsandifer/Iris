@@ -460,6 +460,7 @@ fn fingerprint(con: &Connector) -> String {
     crate::util::sha256_hex(
         &json!([
             con.transport,
+            con.workspace_cwd,
             c.command,
             c.args,
             c.env,
@@ -485,6 +486,10 @@ fn launch_for(
     con: &Connector,
     bearer: Option<&str>,
 ) -> Result<(Launch, Vec<String>), String> {
+    crate::connectors::check_transport_security(&con.transport, &con.config)?;
+    if con.transport == "http" && bearer.is_some() {
+        crate::connectors::check_credential_url(&con.config)?;
+    }
     let mut env = open_secrets(state, con, "env", &con.config.env)?;
     let mut headers = open_secrets(state, con, "headers", &con.config.headers)?;
     let mut secrets: Vec<String> = env.values().chain(headers.values()).cloned().collect();
@@ -994,20 +999,19 @@ async fn refusal(state: &AppState, grant: &Grant, con: &Connector) -> Option<Str
     None
 }
 
-/// What an approval is bound to: where the call goes and as whom. Token
+/// What every classified call is bound to: where it goes and as whom. Token
 /// refreshes keep it; a new sign-in, another client, or edited settings
 /// change it.
-fn target(con: &Connector) -> String {
-    let o = con.config.oauth.as_ref();
-    crate::util::sha256_hex(
-        &json!([
-            fingerprint(con),
-            o.and_then(|o| o.client_id.clone()),
-            o.and_then(|o| o.account.clone()),
-            o.and_then(|o| o.connected_at),
-        ])
-        .to_string(),
-    )
+pub(crate) fn target(con: &Connector) -> String {
+    let o = con.config.oauth.as_ref().map(|o| entities::OAuthConfig {
+        // Refreshes rotate credentials without changing the classified
+        // target. All other OAuth settings participate in the binding.
+        access_token: None,
+        refresh_token: None,
+        expires_at: None,
+        ..o.clone()
+    });
+    crate::util::sha256_hex(&json!([fingerprint(con), o,]).to_string())
 }
 
 /// Everything needed to decide a call again right before it runs.
@@ -1043,10 +1047,10 @@ async fn gate_refusal(
     if let Some(r) = refusal(state, grant, &probe).await {
         return Some(r);
     }
-    if gate.decided_by == "approved" && target(&now) != gate.target {
+    if target(&now) != gate.target {
         return Some(
-            "This connection was changed or signed in again after the owner approved, so \
-             nothing was done. Ask again if it is still wanted."
+            "This connection was changed or signed in again after this action was checked, so \
+             nothing was done. Try again if it is still wanted."
                 .into(),
         );
     }
@@ -1234,7 +1238,7 @@ pub async fn call_tool(
 
     // Dispatch gate: things may have changed while the call waited. The
     // connector must still exist, be on, unpaused, signed in, the same
-    // target the owner approved, allowed by its current rules, the turn
+    // target classified, allowed by its current rules, the turn
     // still running, and Iris not paused.
     let gate = Gate {
         tool,
@@ -1338,7 +1342,17 @@ async fn forward(
         let con = current(state, connector_id)
             .await
             .ok_or_else(|| CallError::Other("the connection was removed".into()))?;
+        if target(&con) != gate.target {
+            return Err(CallError::Other(
+                "This connection changed after this action was checked. Try again.".into(),
+            ));
+        }
         let s = session(state, &con).await?;
+        if s.fingerprint != fingerprint(&con) {
+            return Err(CallError::Other(
+                "This connection changed while it was starting. Try again.".into(),
+            ));
+        }
         // A tripwire pause by another call does not stop one already
         // admitted within the limits.
         if let Some(r) = gate_refusal(state, grant, connector_id, gate, false).await {

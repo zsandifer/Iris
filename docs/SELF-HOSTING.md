@@ -362,6 +362,11 @@ for others you paste the client ID and secret of an app you create there.
 Tokens are refreshed automatically; when a service refuses them, a
 Reconnect card signs you in again.
 
+Use HTTPS for connector URLs that receive OAuth tokens or saved headers.
+Plain HTTP is allowed only for local servers at `localhost` or a loopback
+IP (`127.0.0.1`, `[::1]`). This also applies to OAuth discovery; a server
+elsewhere on your private network needs HTTPS to receive credentials.
+
 - **Google** (Gmail, Calendar, Drive) runs the open-source
   [Google Workspace MCP server](https://github.com/taylorwilsdon/google_workspace_mcp)
   (`uvx workspace-mcp`) on this machine, in its mode where Iris does the

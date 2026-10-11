@@ -603,6 +603,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connector_credentials_require_https_except_on_loopback() {
+        let h = setup();
+        let token = pair_as(&h, None).await;
+        for credential in [
+            json!({"auth": "oauth"}),
+            json!({"headers": {"Authorization": "Bearer synthetic-token"}}),
+        ] {
+            let mut body = json!({"name": "unsafe", "transport": "http", "url": "http://connector.example/mcp"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(credential.as_object().unwrap().clone());
+            let (s, _) = send(&h.app, "POST", "/api/connectors", Some(&token), Some(body)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+        }
+        let (s, b) = send(&h.app, "POST", "/api/connectors", Some(&token), Some(json!({"name": "local", "transport": "http", "url": "http://[::1]:7999/mcp", "auth": "oauth"}))).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let id = b["connector"]["id"].as_str().unwrap();
+        let (s, _) = send(
+            &h.app,
+            "PATCH",
+            &format!("/api/connectors/{id}"),
+            Some(&token),
+            Some(json!({"url": "http://connector.example/mcp"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        // Unauthenticated HTTP is still permitted; adding credentials is not.
+        let (s, b) = send(&h.app, "POST", "/api/connectors", Some(&token), Some(json!({"name": "public", "transport": "http", "url": "http://connector.example/mcp"}))).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let id = b["connector"]["id"].as_str().unwrap();
+        let (s, _) = send(
+            &h.app,
+            "PATCH",
+            &format!("/api/connectors/{id}"),
+            Some(&token),
+            Some(json!({"headers": {"X-Api-Key": "synthetic-key"}})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/connectors/{id}/oauth/start"),
+            Some(&token),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn routes_require_auth_except_public_ones() {
         let h = setup();
         for (m, uri) in [

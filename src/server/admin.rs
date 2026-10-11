@@ -492,6 +492,7 @@ fn build_config(
         check_keys("header", h)?;
         cfg.headers = seal_connector_secrets(state, id, "headers", h)?;
     }
+    crate::connectors::check_transport_security(transport, &cfg).map_err(ApiError::bad_request)?;
     match transport {
         "stdio" if cfg.command.is_none() => {
             Err(ApiError::bad_request("stdio connectors need a command"))
@@ -545,6 +546,7 @@ async fn create_connector(
             ..Default::default()
         });
     }
+    crate::connectors::check_transport_security(&transport, &cfg).map_err(ApiError::bad_request)?;
     let enabled = body.enabled.unwrap_or(true);
     let res = state
         .db

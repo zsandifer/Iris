@@ -123,6 +123,8 @@ pub fn unclaimed_servers(servers: &[McpServer], own: &[String]) -> Vec<McpServer
 #[derive(Debug, Clone, Default)]
 pub struct Invocation {
     pub args: Vec<String>,
+    /// Actual MCP names when the adapter allocates aliases during build.
+    pub mcp_server_names: Option<Vec<String>>,
     pub stdin: Vec<u8>,
     /// Private files to delete when the turn ends.
     pub temp_files: Vec<PathBuf>,

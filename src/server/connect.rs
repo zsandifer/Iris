@@ -152,6 +152,8 @@ async fn oauth_client(
     o.expires_at = None;
     let mut cfg = con.config.clone();
     cfg.oauth = Some(o);
+    crate::connectors::check_transport_security(&con.transport, &cfg)
+        .map_err(ApiError::bad_request)?;
     let cid = con.id.clone();
     let updated = state
         .db
@@ -580,6 +582,7 @@ mod tests {
         refuse_at_start: bool,
         /// Hold code exchanges this long (a slow provider).
         exchange_delay_ms: u64,
+        echo_errors: bool,
         challenge: Option<String>,
         refreshed: bool,
         last_auth: Option<String>,
@@ -670,6 +673,14 @@ mod tests {
                     }
                     let mut g = p.lock().unwrap();
                     g.token_requests.push(form.clone());
+                    if g.echo_errors {
+                        let echoed = form.values().cloned().collect::<Vec<_>>().join(" ");
+                        return (StatusCode::BAD_REQUEST, axum::Json(json!({
+                            "error": format!("invalid_grant {echoed}"),
+                            "error_description": format!("<script>{echoed} previous-at previous-rt new-at new-rt</script>{}", "界".repeat(200)),
+                            "access_token": "new-at", "refresh_token": "new-rt"
+                        }))).into_response();
+                    }
                     match form.get("grant_type").map(String::as_str) {
                         Some("authorization_code") => {
                             let verifier = form.get("code_verifier").cloned().unwrap_or_default();
@@ -740,6 +751,11 @@ mod tests {
             .await
             .unwrap();
         (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn echoed_oauth_secrets_never_reach_complete_callback_or_refresh_errors() {
+        oauth_flow_with(false, "echo").await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -837,6 +853,132 @@ mod tests {
         let con: Value = serde_json::from_str(&b).unwrap();
         let id = con["connector"]["id"].as_str().unwrap().to_string();
         assert_eq!(con["connector"]["auth_state"], "needs_sign_in");
+
+        if refresh_mode == "echo" {
+            provider.lock().unwrap().echo_errors = true;
+            let (s, b) = send(
+                &app,
+                "POST",
+                &format!("/api/connectors/{id}/oauth/client"),
+                &token,
+                Some(json!({"client_id": "test-client", "client_secret": "client-secret42"})),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+            for callback in [false, true] {
+                // Existing grant secrets must be hidden as well as the
+                // credentials sent in this code exchange.
+                state
+                    .db
+                    .with(|c| {
+                        let mut con = crate::entities::get_connector(c, &id)?.unwrap();
+                        let o = con.config.oauth.as_mut().unwrap();
+                        o.access_token = Some(
+                            state
+                                .vault
+                                .seal_str(
+                                    "previous-at",
+                                    &format!("connector:{id}:oauth:access_token"),
+                                )
+                                .unwrap(),
+                        );
+                        o.refresh_token = Some(
+                            state
+                                .vault
+                                .seal_str(
+                                    "previous-rt",
+                                    &format!("connector:{id}:oauth:refresh_token"),
+                                )
+                                .unwrap(),
+                        );
+                        crate::entities::update_connector(c, &id, None, Some(&con.config), None)?;
+                        Ok(())
+                    })
+                    .unwrap();
+                let (s, b) = send(
+                    &app,
+                    "POST",
+                    &format!("/api/connectors/{id}/oauth/start"),
+                    &token,
+                    Some(json!({"origin": "http://127.0.0.1:7999"})),
+                )
+                .await;
+                assert_eq!(s, StatusCode::OK, "{b}");
+                let started: Value = serde_json::from_str(&b).unwrap();
+                let q = crate::oauth::parse_query(started["authorize_url"].as_str().unwrap());
+                let url = format!(
+                    "http://127.0.0.1:7999/api/oauth/callback?state={}&code=the-code",
+                    q["state"]
+                );
+                let (_, b) = if callback {
+                    send(&app, "GET", &url[url.find("/api/").unwrap()..], "", None).await
+                } else {
+                    send(
+                        &app,
+                        "POST",
+                        "/api/oauth/complete",
+                        &token,
+                        Some(json!({"url": url})),
+                    )
+                    .await
+                };
+                assert!(b.contains("refused the sign-in"), "{b}");
+                if callback {
+                    assert!(b.contains("&lt;script&gt;"), "{b}");
+                    assert!(!b.contains("<script>"), "{b}");
+                }
+                let verifier =
+                    provider.lock().unwrap().token_requests.last().unwrap()["code_verifier"]
+                        .clone();
+                for secret in [
+                    "client-secret42",
+                    "the-code",
+                    verifier.as_str(),
+                    "previous-at",
+                    "previous-rt",
+                    "new-at",
+                    "new-rt",
+                ] {
+                    assert!(!b.contains(secret), "leaked {secret}: {b}");
+                }
+                assert!(b.len() < 2500, "provider prose must be capped");
+            }
+            let con = state
+                .db
+                .with(|c| crate::entities::get_connector(c, &id))
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                crate::oauth::bearer(&state, &con).await,
+                Err(crate::oauth::TokenError::NeedsSignIn)
+            ));
+            // Callback errors are untrusted too; reflect only fixed text.
+            let (_, b) = send(
+                &app,
+                "POST",
+                &format!("/api/connectors/{id}/oauth/start"),
+                &token,
+                Some(json!({})),
+            )
+            .await;
+            let started: Value = serde_json::from_str(&b).unwrap();
+            let q = crate::oauth::parse_query(started["authorize_url"].as_str().unwrap());
+            let (_, b) = send(
+                &app,
+                "GET",
+                &format!(
+                    "/api/oauth/callback?state={}&error={}",
+                    q["state"],
+                    crate::oauth::pct_encode("client-secret42 <script>")
+                ),
+                "",
+                None,
+            )
+            .await;
+            assert!(!b.contains("client-secret42"));
+            assert!(!b.contains("<script>"));
+            return;
+        }
 
         let (s, b) = send(
             &app,

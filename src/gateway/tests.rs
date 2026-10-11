@@ -748,6 +748,132 @@ async fn turning_a_connector_off_cancels_its_held_calls() {
 }
 
 #[tokio::test]
+async fn auto_and_trusted_calls_cannot_dispatch_to_a_changed_target() {
+    for tool in ["search_messages", "send_message"] {
+        let t = setup(|_| {});
+        t.state
+            .db
+            .with(|c| db::set_setting(c, "safety.trusted_recipients", r#"["friend@example.com"]"#))
+            .unwrap();
+        let (token, _guard, _) = t.grant().await;
+        let grant = t.state.gateway.grant(&token).unwrap();
+        let con = t.connector();
+        // Discovery describes the old server. Retarget before dispatch;
+        // the new server exports the same tool names.
+        list_tools(&t.state, &con).await.unwrap();
+        let mut changed = con.config.clone();
+        changed.args[1].push_str("\n# different target");
+        t.state
+            .db
+            .with(|c| entities::update_connector(c, &con.id, None, Some(&changed), None))
+            .unwrap();
+        let result = call_tool(
+            &t.state,
+            &grant,
+            &con,
+            tool,
+            &json!({"to": "friend@example.com"}),
+        )
+        .await;
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(text(&result).contains("changed"), "{result}");
+        assert!(t.calls_log().is_empty());
+        assert_eq!(t.calls()[0].decision, "cancelled");
+        stop_all(&t.state).await;
+    }
+}
+
+#[tokio::test]
+async fn dispatch_checks_the_target_again_after_startup() {
+    let t = setup(|_| {});
+    let (token, _guard, _) = t.grant().await;
+    let grant = t.state.gateway.grant(&token).unwrap();
+    let con = t.connector();
+    let gate = Gate {
+        tool: "search_messages",
+        category: Category::Read,
+        recipients: &[],
+        decided_by: "auto",
+        target: target(&con),
+    };
+    assert!(
+        gate_refusal(&t.state, &grant, &con.id, &gate, true)
+            .await
+            .is_none()
+    );
+    let mut changed = con.config.clone();
+    changed.args[1].push_str("\n# target changed before startup");
+    t.state
+        .db
+        .with(|c| entities::update_connector(c, &con.id, None, Some(&changed), None))
+        .unwrap();
+    assert!(
+        forward(&t.state, &grant, &con.id, &gate, &json!({}))
+            .await
+            .is_err()
+    );
+    assert!(t.calls_log().is_empty());
+}
+
+#[test]
+fn call_targets_bind_oauth_settings_but_survive_token_refresh() {
+    let t = setup(|_| {});
+    let mut con = t.connector();
+    con.config.oauth = Some(entities::OAuthConfig {
+        client_id: Some("client".into()),
+        token_endpoint: Some("https://auth.example/token".into()),
+        ..Default::default()
+    });
+    let before = target(&con);
+    let o = con.config.oauth.as_mut().unwrap();
+    o.access_token = Some("rotated-access-ciphertext".into());
+    o.refresh_token = Some("rotated-refresh-ciphertext".into());
+    o.expires_at = Some(1000);
+    assert_eq!(target(&con), before);
+    con.config.oauth.as_mut().unwrap().token_endpoint = Some("https://other.example/token".into());
+    assert_ne!(target(&con), before);
+}
+
+#[tokio::test]
+async fn credentials_are_never_attached_to_nonlocal_http() {
+    let t = setup(|_| {});
+    let mut con = t.connector();
+    con.transport = "http".into();
+    con.config.command = None;
+    con.config.url = Some("http://connector.example.com/mcp".into());
+    assert!(launch_for(&t.state, &con, Some("synthetic-token")).is_err());
+    con.config.headers = crate::server::seal_connector_secrets(
+        &t.state,
+        &con.id,
+        "headers",
+        &BTreeMap::from([("X-Api-Key".into(), "synthetic-key".into())]),
+    )
+    .unwrap();
+    assert!(launch_for(&t.state, &con, None).is_err());
+    con.config.oauth = Some(entities::OAuthConfig::default());
+    assert!(crate::oauth::bearer(&t.state, &con).await.is_err());
+    for url in [
+        "https://connector.example.com/mcp",
+        "http://127.0.0.1:7999/mcp",
+        "http://[::1]:7999/mcp",
+        "http://localhost:7999/mcp",
+    ] {
+        con.config.url = Some(url.into());
+        assert!(
+            launch_for(&t.state, &con, Some("synthetic-token")).is_ok(),
+            "{url}"
+        );
+    }
+    con.config.command = Some("local-server".into());
+    con.config.url = Some("http://127.0.0.1:{port}/mcp".into());
+    assert!(launch_for(&t.state, &con, Some("synthetic-token")).is_ok());
+    con.config.url = Some("http://remote.example:{port}/mcp".into());
+    assert!(launch_for(&t.state, &con, Some("synthetic-token")).is_err());
+    con.config.url = Some("http://127.0.0.{port}/mcp".into());
+    assert!(launch_for(&t.state, &con, Some("synthetic-token")).is_err());
+}
+
+#[tokio::test]
 async fn an_approval_released_after_the_connector_changed_does_not_run() {
     let t = setup(|c| c.safety.approval_timeout_secs = 60);
     let (token, _guard, _) = t.grant().await;

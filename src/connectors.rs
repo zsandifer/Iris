@@ -69,6 +69,41 @@ pub const GOOGLE_SCOPES: &[&str] = &[
 ];
 pub const GITHUB_MCP_URL: &str = "https://api.githubcopilot.com/mcp/";
 
+/// Check both newly saved settings and old settings at dispatch.
+pub fn check_transport_security(transport: &str, cfg: &ConnectorConfig) -> Result<(), String> {
+    if transport == "http" && (cfg.oauth.is_some() || !cfg.headers.is_empty()) {
+        check_credential_url(cfg)?;
+    }
+    Ok(())
+}
+
+pub fn check_credential_url(cfg: &ConnectorConfig) -> Result<(), String> {
+    let url = cfg.url.as_deref().unwrap_or_default();
+    // Iris chooses a numeric port for an HTTP server it starts locally.
+    // Validate the same authority before the server has been started.
+    let url = if cfg.command.is_some() {
+        let authority = url
+            .split_once("://")
+            .map_or("", |(_, rest)| rest)
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or("");
+        if authority.contains("{port}")
+            && !authority
+                .strip_suffix(":{port}")
+                .is_some_and(|host| !host.contains("{port}"))
+        {
+            return Err(
+                "I can use a port placeholder only in the address's port, not its host.".into(),
+            );
+        }
+        url.replace("{port}", "1")
+    } else {
+        url.to_string()
+    };
+    crate::oauth::check_secure_url(&url)
+}
+
 /// Tell the owner's apps the connector list changed.
 pub async fn broadcast_changed(state: &AppState) {
     if let Ok(Some(owner)) = state.db.call(crate::db::owner_user_id).await {
@@ -300,6 +335,7 @@ pub async fn setup(
         }
         _ => return Err("unknown service".into()),
     };
+    check_transport_security(transport, &cfg)?;
     let (cid, svc, name) = (id.clone(), entry.id.to_string(), entry.id.to_string());
     let is_new = existing.is_none();
     state
