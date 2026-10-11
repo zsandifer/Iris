@@ -83,11 +83,14 @@ pub async fn run_turn(state: &AppState, input: TurnInput) -> TurnResult {
     let lock = state.conversation_lock(&conv_id);
     let _turn_guard = lock.lock().await;
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    state
-        .running
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(conv_id.clone(), cancel_tx);
+    {
+        let mut running = state.running.lock().unwrap_or_else(|p| p.into_inner());
+        if state.stopping.load(Ordering::SeqCst) {
+            // Shutting down: never start a CLI that cleanup would not wait for.
+            let _ = cancel_tx.send(true);
+        }
+        running.insert(conv_id.clone(), cancel_tx);
+    }
     let result = run_locked(state, &input, cancel_rx).await;
     state
         .running
@@ -327,7 +330,7 @@ async fn run_locked(
     let pins = state.slot_pins().await;
     let allow_shared = state.allow_claude_for_shared().await;
     let has_images = !input.user_message.attachments.is_empty();
-    let assessment = assess_turn(state, input, shared).await;
+    let assessment = assess_turn(state, input, shared, cancel.clone()).await;
     let mut excluded: Vec<String> = Vec::new();
     let mut fresh_session = !input.continuity;
     let mut routing_notes: Vec<String> = Vec::new();
@@ -724,7 +727,12 @@ fn no_engine_reason(state: &AppState, shared: bool, allow_shared: bool) -> (&'st
 /// Classify the message (chat) or use the job default (low effort).
 /// `shared` applies the individual-use policy to the optional model
 /// classifier too: it sees the message, so it is an engine use.
-async fn assess_turn(state: &AppState, input: &TurnInput, shared: bool) -> Assessment {
+async fn assess_turn(
+    state: &AppState,
+    input: &TurnInput,
+    shared: bool,
+    cancel: watch::Receiver<bool>,
+) -> Assessment {
     if input.purpose != Purpose::Chat {
         return Assessment {
             effort: Effort::Low,
@@ -757,7 +765,8 @@ async fn assess_turn(state: &AppState, input: &TurnInput, shared: bool) -> Asses
     let mut a = classifier::assess(&input.user_message.content, &turns, &thresholds);
     if state.cfg.router.classifier_model
         && a.ambiguous
-        && let Some(effort) = refine_with_model(state, &input.user_message.content, shared).await
+        && let Some(effort) =
+            refine_with_model(state, &input.user_message.content, shared, cancel).await
     {
         a.signals.push("model_classifier");
         a.effort = effort;
@@ -768,7 +777,16 @@ async fn assess_turn(state: &AppState, input: &TurnInput, shared: bool) -> Asses
 
 /// Optional: ask the `classifier` slot's model about an ambiguous message.
 /// One short, tool-less, session-less run; None on any failure.
-async fn refine_with_model(state: &AppState, text: &str, shared: bool) -> Option<Effort> {
+/// Stops with the turn (Stop, deletion, shutdown).
+async fn refine_with_model(
+    state: &AppState,
+    text: &str,
+    shared: bool,
+    cancel: watch::Receiver<bool>,
+) -> Option<Effort> {
+    if *cancel.borrow() {
+        return None;
+    }
     let (res, pin) = state.resolve_slot(Slot::Classifier, shared).await;
     let model_id = res.effective?;
     let catalog = state.catalog();
@@ -801,7 +819,6 @@ async fn refine_with_model(state: &AppState, text: &str, shared: bool) -> Option
     invocation.env.extend(keys);
     let strip = state.strip_env(entry);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
     let run = runner::run(
         RunRequest {
             program: &program,
@@ -811,7 +828,7 @@ async fn refine_with_model(state: &AppState, text: &str, shared: bool) -> Option
             timeout: Duration::from_secs(30),
         },
         entry.harness.parser(&[]),
-        cancel_rx,
+        cancel,
         tx,
     )
     .await;
@@ -1073,35 +1090,13 @@ async fn finish(
     }
     let duration_ms = crate::util::now_ms() - input.assistant_message.created_at;
     meta["duration_ms"] = duration_ms.into();
-    // A reply made with the owner's private context is never kept once
-    // someone else has joined the conversation.
     audience.current(state).await;
-    let outcome = if audience.privacy_lost {
-        meta["withheld"] = "people changed during a private reply".into();
-        meta["activity"] = json!([]);
-        // Cards the agent showed during this turn came from the same
-        // private context.
-        let (c, after) = (conv_id.clone(), input.assistant_message.created_at);
-        let _ = state
-            .db
-            .call(move |db| {
-                db.execute(
-                    "DELETE FROM messages WHERE conversation_id = ?1 AND kind = 'card'
-                     AND role = 'assistant' AND created_at > ?2",
-                    rusqlite::params![c, after],
-                )
-            })
-            .await;
-        Outcome::Cancelled
-    } else {
-        outcome
-    };
     let text = if audience.privacy_lost {
         ""
     } else {
         acc.text.trim()
     };
-    let (status, content, ok) = match &outcome {
+    let (status, content, mut ok) = match &outcome {
         Outcome::Complete => ("complete", text.to_string(), true),
         Outcome::Cancelled => ("cancelled", text.to_string(), false),
         Outcome::Failed { kind, detail } => {
@@ -1114,13 +1109,45 @@ async fn finish(
             ("error", text, false)
         }
     };
-    let (m, c, s, mt) = (msg_id.clone(), content, status, meta);
-    let message = match state
+    // Who is in the conversation is checked in the same database call that
+    // saves the reply (one connection, so no one can join in between). A
+    // reply made with the owner's private context is never kept once
+    // someone else is in the conversation, nor are the cards it created
+    // (held back as `pending` until now).
+    let (m, c, s, mut mt) = (msg_id.clone(), content, status, meta);
+    let (conv, private_owner) = (conv_id.clone(), audience.private_owner.clone());
+    let saved = state
         .db
-        .call(move |db| db::finish_message(db, &m, &c, s, &mt))
-        .await
-    {
-        Ok(m) => m,
+        .call(move |db| {
+            let members = db::conversation_member_ids(db, &conv)?;
+            let lost = private_owner.is_some_and(|o| members != [o]);
+            if lost {
+                mt["withheld"] = "people changed during a private reply".into();
+                mt["activity"] = json!([]);
+                db.execute(
+                    "DELETE FROM messages WHERE conversation_id = ?1 AND kind = 'card'
+                     AND status = 'pending'",
+                    [&conv],
+                )?;
+                return Ok((db::finish_message(db, &m, "", "cancelled", &mt)?, true));
+            }
+            db.execute(
+                "UPDATE messages SET status = 'complete' WHERE conversation_id = ?1
+                 AND kind = 'card' AND status = 'pending'",
+                [&conv],
+            )?;
+            Ok((db::finish_message(db, &m, &c, s, &mt)?, false))
+        })
+        .await;
+    let message = match saved {
+        Ok((m, lost)) => {
+            if lost {
+                audience.privacy_lost = true;
+                audience.users.clear();
+                ok = false;
+            }
+            m
+        }
         Err(e) => {
             crate::warn!("turn {msg_id}: failed to save reply: {e}");
             input.assistant_message.clone()

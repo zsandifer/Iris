@@ -991,6 +991,7 @@ pub fn list_messages(
     let mut stmt = conn.prepare(
         "SELECT * FROM (
              SELECT * FROM messages WHERE conversation_id = ?1 AND created_at < ?2
+               AND status != 'pending'
              ORDER BY created_at DESC LIMIT ?3
          ) ORDER BY created_at",
     )?;
@@ -1030,7 +1031,7 @@ pub fn replay_messages(
         "SELECT * FROM (
              SELECT * FROM messages
              WHERE conversation_id = ?1 AND created_at > ?2 AND created_at < ?3
-               AND status != 'streaming' AND trim(content) != ''
+               AND status NOT IN ('streaming', 'pending') AND trim(content) != ''
              ORDER BY created_at DESC LIMIT ?4
          ) ORDER BY created_at",
     )?;
@@ -1064,7 +1065,13 @@ pub fn synced_watermark(
 }
 
 /// Mark turns that were streaming when the daemon stopped.
+/// Cards still held back by a private turn that never finished are dropped
+/// (nothing decided whether they may be shown).
 pub fn mark_interrupted(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM messages WHERE kind = 'card' AND status = 'pending'",
+        [],
+    )?;
     conn.execute(
         "UPDATE messages SET status = 'interrupted', updated_at = ?1 WHERE status = 'streaming'",
         [now_ms()],

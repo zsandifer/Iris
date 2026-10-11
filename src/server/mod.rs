@@ -483,14 +483,16 @@ async fn shutdown_signal(state: AppState) {
     }
     crate::info!("shutting down");
     // Stop running turns (kills their CLI process groups); open WebSockets
-    // would otherwise keep graceful shutdown waiting forever.
-    for tx in state
-        .running
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .values()
+    // would otherwise keep graceful shutdown waiting forever. Turns still
+    // queued behind them are cancelled as they start (`stopping`).
     {
-        let _ = tx.send(true);
+        let running = state.running.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for tx in running.values() {
+            let _ = tx.send(true);
+        }
     }
     // Connector programs Iris started run in their own process groups:
     // end them (TERM, then KILL shortly after) before exiting.
@@ -1246,6 +1248,47 @@ esac
         )
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_cards_reach_the_main_chat() {
+        let h = setup();
+        let owner = h.state.db.with(db::owner_user_id).unwrap().unwrap();
+        let (reply, main) = h
+            .state
+            .db
+            .with(|c| {
+                let job = db::ensure_job_conversation(c, &owner, "heartbeat")?;
+                let reply = db::insert_message(
+                    c,
+                    &db::NewMessage {
+                        conversation_id: &job,
+                        role: "assistant",
+                        content: "Your package arrives today.",
+                        ..Default::default()
+                    },
+                )?;
+                crate::entities::insert_card(
+                    c,
+                    &job,
+                    &json!({"type": "link", "title": "Tracking", "url": "https://example.com/t"}),
+                    "assistant",
+                )?;
+                Ok((reply, db::ensure_main_conversation(c, &owner)?))
+            })
+            .unwrap();
+        crate::jobs::move_cards_to_main(&h.state, &owner, &reply)
+            .await
+            .unwrap();
+        let msgs = h
+            .state
+            .db
+            .with(|c| db::list_messages(c, &main, None, 10))
+            .unwrap();
+        assert!(
+            msgs.iter()
+                .any(|m| m.kind == "card" && m.content == "Tracking")
+        );
     }
 
     #[tokio::test]
@@ -2310,6 +2353,108 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert_eq!(reply["content"], "");
         assert_eq!(reply["meta"]["activity"], json!([]));
         assert_eq!(t.runs(), 1, "no retry with the private context");
+    }
+
+    #[tokio::test]
+    async fn private_turn_cards_show_only_once_the_reply_is_kept() {
+        let t = turn_setup(|c| c.router.allow_claude_for_shared = true).await;
+        let messages = |token: String, conv: String| {
+            let app = t.h.app.clone();
+            async move {
+                let (_, b) = send(
+                    &app,
+                    "GET",
+                    &format!("/api/conversations/{conv}/messages"),
+                    Some(&token),
+                    None,
+                )
+                .await;
+                b["messages"].as_array().unwrap().clone()
+            }
+        };
+        // What the bridge does in the owner's own chat: a held-back card.
+        let pending_card = |conv: &str, title: &str| {
+            let (conv, title) = (conv.to_string(), title.to_string());
+            t.h.state
+                .db
+                .with(move |c| {
+                    crate::entities::insert_card_with_status(
+                        c,
+                        &conv,
+                        &json!({"type": "info", "title": title}),
+                        "assistant",
+                        "pending",
+                    )
+                })
+                .unwrap()
+        };
+        for (run, joins) in [false, true].into_iter().enumerate() {
+            let gid = t.create("group", &[]).await;
+            std::fs::write(t.dir.join("hold"), "").unwrap();
+            let (s, _) = send(
+                &t.h.app,
+                "POST",
+                &format!("/api/conversations/{gid}/messages"),
+                Some(&t.owner_t),
+                Some(json!({"text": "hi"})),
+            )
+            .await;
+            assert_eq!(s, StatusCode::ACCEPTED);
+            let started = t.run_dir(run).join("started");
+            t.wait_for("run", || started.exists()).await;
+            let card = pending_card(&gid, "owner-memory-card");
+            let shown = |msgs: &[Value]| msgs.iter().any(|m| m["id"] == card.id.as_str());
+            assert!(
+                !shown(&messages(t.owner_t.clone(), gid.clone()).await),
+                "hidden while running"
+            );
+            if joins {
+                let (s, _) = send(
+                    &t.h.app,
+                    "POST",
+                    &format!("/api/conversations/{gid}/members"),
+                    Some(&t.owner_t),
+                    Some(json!({"user_id": t.guest_id})),
+                )
+                .await;
+                assert_eq!(s, StatusCode::OK);
+                assert!(!shown(&messages(t.guest_t.clone(), gid.clone()).await));
+            }
+            std::fs::remove_file(t.dir.join("hold")).unwrap();
+            let reply = loop {
+                let msgs = messages(t.owner_t.clone(), gid.clone()).await;
+                if let Some(m) = msgs.iter().find(|m| {
+                    m["role"] == "assistant" && m["kind"] == "text" && m["status"] != "streaming"
+                }) {
+                    break (m.clone(), msgs);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            if joins {
+                assert_eq!(reply.0["status"], "cancelled");
+                assert!(
+                    !shown(&reply.1),
+                    "a private card never reaches the newcomer"
+                );
+                let gone = t.h.state.db.with(|c| db::get_message(c, &card.id)).unwrap();
+                assert!(gone.is_none());
+            } else {
+                assert_eq!(reply.0["status"], "complete");
+                assert!(shown(&reply.1), "published with the reply");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn turns_starting_during_shutdown_never_run() {
+        let t = turn_setup(|_| {}).await;
+        t.h.state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let main = t.main_of(&t.owner_t).await;
+        let reply = t.chat(&t.owner_t, &main, "hello").await;
+        assert_eq!(reply["status"], "cancelled", "{reply}");
+        assert_eq!(t.runs(), 0);
     }
 
     #[tokio::test]

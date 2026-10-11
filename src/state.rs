@@ -117,6 +117,9 @@ pub struct Inner {
     pub pair_limiter: PairLimiter,
     /// Cancel handles of running turns, by conversation id.
     pub running: Mutex<HashMap<String, watch::Sender<bool>>>,
+    /// Set once shutdown begins: turns that start afterwards (queued behind
+    /// another in the same chat) are cancelled before running a CLI.
+    pub stopping: std::sync::atomic::AtomicBool,
     /// Serializes turns within one conversation.
     pub conv_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Bumped after anyone joins or leaves a conversation (or it is
@@ -200,6 +203,7 @@ impl AppState {
             pair_limiter: PairLimiter::default(),
             running: Mutex::default(),
             conv_locks: Mutex::default(),
+            stopping: std::sync::atomic::AtomicBool::new(false),
             membership_generation: AtomicU64::new(0),
             catalog: Mutex::new((None, Arc::new(Catalog::default()))),
             models_generation: AtomicU64::new(0),

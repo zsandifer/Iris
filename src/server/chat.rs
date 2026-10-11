@@ -606,6 +606,9 @@ pub fn file_response(mime: &str, bytes: Vec<u8>) -> Response {
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, max-age=3600"),
     );
+    // Cached per device token: after re-pairing as someone else, the
+    // browser must ask the server again rather than reuse these bytes.
+    headers.insert(header::VARY, HeaderValue::from_static("Authorization"));
     (headers, bytes).into_response()
 }
 
@@ -729,6 +732,19 @@ async fn decide_approval(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_files_are_cached_per_token() {
+        let res = file_response("image/png", vec![1]);
+        let h = res.headers();
+        assert_eq!(h[header::VARY], "Authorization");
+        assert!(
+            h[header::CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .starts_with("private")
+        );
+    }
 
     #[test]
     fn sniffs_images() {
