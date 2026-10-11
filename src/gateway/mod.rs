@@ -311,8 +311,15 @@ pub async fn connector_notices(state: &AppState, user_id: &str) -> Vec<String> {
             ));
         } else if let Some(account) = con.config.oauth.as_ref().and_then(|o| o.account.as_ref()) {
             out.push(format!(
-                "{label} (the `{}` tools) is connected as {account}; when one of its tools asks \
-                 for the user's email address, use that one.",
+                "{label} (the `{}` tools) is available now, connected as {account}; when one of \
+                 its tools asks for the user's email address, use that one.",
+                con.name
+            ));
+        } else {
+            // The current state, so an earlier pause or sign-out in the
+            // conversation is not mistaken for the present.
+            out.push(format!(
+                "{label} (the `{}` tools) is available now.",
                 con.name
             ));
         }

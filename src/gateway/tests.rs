@@ -251,6 +251,13 @@ async fn a_send_waits_for_approval_then_runs() {
     assert!(c["details"].as_str().unwrap().contains("Running late"));
     // Nothing went out yet.
     assert!(!t.calls_log().contains("send_message"));
+    // The call waits on the card (registered right after it is posted).
+    for _ in 0..200 {
+        if t.state.gateway.pending_count() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(t.state.gateway.pending_count(), 1);
     t.decide(&card.id, true);
     let r = call.await.unwrap()["result"].clone();
