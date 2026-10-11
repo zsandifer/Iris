@@ -1,0 +1,41 @@
+# Iris as a systemd *user* service.
+#
+# Install:
+#   install -Dm755 target/release/iris ~/.local/bin/iris
+#   install -Dm644 deploy/iris.service ~/.config/systemd/user/iris.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now iris
+#   loginctl enable-linger "$USER"   # keep running while logged out
+#
+# Logs: journalctl --user -u iris -f
+
+[Unit]
+Description=Iris personal AI agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/iris serve
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+# Iris runs the official CLIs (claude, codex, gemini, opencode). Engines
+# installed from the app are found automatically. For CLIs you installed
+# yourself, a systemd service gets a minimal PATH, so list where they live
+# (for nvm installs, add its bin directory), or set an absolute `command`
+# under [harness.<name>] in ~/.config/iris/config.toml.
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+
+# Iris never needs API keys: the CLIs use their own subscription sign-in.
+UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY CODEX_API_KEY GEMINI_API_KEY GOOGLE_API_KEY
+
+# Light hardening that still lets the CLIs work in your home directory.
+# deploy/setup-engines.sh relaxes NoNewPrivileges with a drop-in when you
+# enable the engine-install privilege split (it uses sudo).
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target
