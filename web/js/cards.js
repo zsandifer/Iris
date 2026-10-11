@@ -2,7 +2,7 @@
 // feed_post) and server cards (action, engine_signin, engine_setup,
 // connector_reconnect, approval).
 import { html, useEffect, useState } from './h.js';
-import { api, get, post, put, patch } from './api.js';
+import { api, get, post, put, patch, seg, isId } from './api.js';
 import { S, set, go, isOwner, toast, loadGoals, loadEngines, loadConnectors } from './store.js';
 import { Icon, Img, LetterTile, hostOf, safeUrl } from './ui.js';
 import { plain } from './md.js';
@@ -68,10 +68,10 @@ function InfoCard({ c }) {
 function IdeaCard({ c }) {
   const [busy, setBusy] = useState(false);
   const start = async () => {
-    if (!c.ref_id) return go('ideas');
+    if (!isId(c.ref_id)) return go('ideas');
     setBusy(true);
     try {
-      const r = await post(`/ideas/${c.ref_id}/start`);
+      const r = await post(`/ideas/${seg(c.ref_id)}/start`);
       go(`chat/${r.conversation.id}`);
     } catch (e) { toast(e.message); setBusy(false); }
   };
@@ -84,7 +84,7 @@ function IdeaCard({ c }) {
 function GoalCard({ c }) {
   const goal = (S.goals || []).find((g) => g.id === c.ref_id);
   const confirm = async () => {
-    try { await patch(`/goals/${c.ref_id}`, { suggested: false }); await loadGoals(); toast('Added to your goals'); } catch (e) { toast(e.message); }
+    try { await patch(`/goals/${seg(c.ref_id)}`, { suggested: false }); await loadGoals(); toast('Added to your goals'); } catch (e) { toast(e.message); }
   };
   return html`<div class="card-x"><span class="tag">${goal?.suggested ? 'Suggested goal' : 'Goal'}</span><b>${c.title}</b>
     ${c.body && html`<p>${c.body}</p>`}
@@ -131,7 +131,7 @@ export function SignIn({ card, harness, flow, instructions, keyOptions }) {
   const start = async () => {
     setBusy(true);
     try {
-      const r = await post(`/harnesses/${harness}/login`);
+      const r = await post(`/harnesses/${seg(harness)}/login`);
       if (r.login) set({ logins: { ...S.logins, [harness]: r.login } });
       else if (r.manual) toast(r.auth === 'ok' ? 'Signed in. Thanks!' : 'Still signed out. Follow the step above, then check again.');
     } catch (e) { toast(e.message); }
@@ -142,7 +142,7 @@ export function SignIn({ card, harness, flow, instructions, keyOptions }) {
     if (!code.trim()) return;
     setBusy(true);
     try {
-      const r = await post(`/harnesses/${harness}/login/code`, { code: code.trim() });
+      const r = await post(`/harnesses/${seg(harness)}/login/code`, { code: code.trim() });
       set({ logins: { ...S.logins, [harness]: r.login } });
       setCode('');
     } catch (err) { toast(err.message); }
@@ -203,7 +203,7 @@ export function ApiKeyForm({ harness, options = [], onDone }) {
     setBusy(true);
     setMsg(null);
     try {
-      const r = await put(`/harnesses/${harness}/keys/${opt.env}`, { value: value.trim() });
+      const r = await put(`/harnesses/${seg(harness)}/keys/${seg(opt.env)}`, { value: value.trim() });
       setValue('');
       if (r.auth === 'ok') { setMsg(['ok', 'Connected. I can use it now.']); onDone?.(); }
       else if (r.auth === 'auth_required') setMsg(['err', "That key didn't work, so I didn't keep it. Check it and try again."]);
@@ -273,7 +273,8 @@ function ConnectorReconnectCard({ c }) {
     ${done ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> Connected</div>`
       : !isOwner() ? html`<small class="mu">Only the owner can reconnect this.</small>`
       : c.auth === 'oauth' && con ? html`<${ServiceSignIn} con=${con} label=${labelOf(con)} />`
-      : html`<div class="act"><button onClick=${() => go(`iris/connections/${c.connector_id}${c.auth === 'oauth' ? '' : '/edit'}`)}>${c.action_label || 'Reconnect'}</button></div>`}
+      : isId(c.connector_id) ? html`<div class="act"><button onClick=${() => go(`iris/connections/${c.connector_id}${c.auth === 'oauth' ? '' : '/edit'}`)}>${c.action_label || 'Reconnect'}</button></div>`
+      : null}
   </div>`;
 }
 
@@ -300,7 +301,7 @@ function ApprovalCard({ c, m }) {
   const mine = c.approver_user_id === S.me?.user?.id;
   const decide = async (approve) => {
     setBusy(true);
-    try { await post(`/messages/${m.id}/decision`, { approve }); } catch (e) { toast(e.message); }
+    try { await post(`/messages/${seg(m.id)}/decision`, { approve }); } catch (e) { toast(e.message); }
     setBusy(false);
   };
   const p = c.preview || {};

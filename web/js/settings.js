@@ -1,7 +1,7 @@
 // Settings, AI engine (the only place model names appear), devices,
 // people, and the activity log.
 import { html, useEffect, useState, useRef } from './h.js';
-import { api, get, post, put, del, setToken } from './api.js';
+import { api, get, post, put, del, setToken, seg } from './api.js';
 import { S, set, useStore, go, toast, isOwner, loadSlots, loadEngines } from './store.js';
 import {
   Icon, Row, Group, Page, Spinner, Toggle, LetterTile, Empty,
@@ -102,7 +102,7 @@ export function Settings() {
   const engineSub = !S.slots ? ' ' : chat?.selection?.mode === 'pinned' ? `Chat pinned to ${chat.models.find((m) => m.id === chat.effective)?.label || 'a model'}` : 'Automatic';
   const signOut = async () => {
     if (!(await confirmSheet({ title: 'Forget this device?', body: "You'll need a new pairing code to use it again.", yes: 'Forget', danger: true }))) return;
-    try { await del(`/devices/${S.me.device.id}`); } catch { /* already gone */ }
+    try { await del(`/devices/${seg(S.me.device.id)}`); } catch { /* already gone */ }
     setToken('');
     location.reload();
   };
@@ -146,7 +146,7 @@ function Slot({ slot }) {
   const [label, desc] = SLOT_LABEL[slot.slot];
   const pinned = slot.selection.mode === 'pinned' ? slot.selection : null;
   const choose = async (body) => {
-    try { set({ slots: (await put(`/models/slots/${slot.slot}`, body)).slots }); } catch (e) { toast(e.message); }
+    try { set({ slots: (await put(`/models/slots/${seg(slot.slot)}`, body)).slots }); } catch (e) { toast(e.message); }
   };
   const pinnedModel = pinned && slot.models.find((m) => m.id === pinned.model);
   return html`<div class="gl">${label}</div>
@@ -179,7 +179,7 @@ function EngineRow({ e, h }) {
   let right;
   if (installing) right = html`<span class="rv shimmer">${op.op === 'uninstall' ? 'Removing…' : 'Installing…'}</span>`;
   else if (!h?.installed && !e?.installed) {
-    right = e?.requires ? html`<span class="rv">Needs Node.js</span>` : html`<button class="cn" onClick=${(ev) => { ev.stopPropagation(); act(`/engines/${e.name}/install`, 'Install'); }}>Set up</button>`;
+    right = e?.requires ? html`<span class="rv">Needs Node.js</span>` : html`<button class="cn" onClick=${(ev) => { ev.stopPropagation(); act(`/engines/${seg(e.name)}/install`, 'Install'); }}>Set up</button>`;
   } else if (h?.auth === 'auth_required') right = html`<button class="cn" onClick=${signIn}>${usesKeys(h) && !h.keys?.length ? 'Add key' : 'Reconnect'}</button>`;
   else if (h?.auth === 'ok') right = html`<button class="cn ok" onClick=${signIn}>● ${h.keys?.length ? 'key added' : 'signed in'}</button>`;
   else if (usesKeys(h) && !h?.keys?.length) right = html`<button class="cn" onClick=${signIn}>Add key</button>`;
@@ -189,8 +189,8 @@ function EngineRow({ e, h }) {
   return html`<${Row} icon=${html`<${LetterTile} name=${e?.name || h?.name} />`} title=${e?.label || h?.label} sub=${sub || ' '} right=${right} chevron=${false}
     onClick=${e?.managed && !installing ? () => openSheet(() => html`<div class="sheet-body"><h3>${e.label}</h3>
       <p class="mu">${e.source}</p><div class="grp">
-      <div class="r tap" onClick=${() => { closeSheet(); act(`/engines/${e.name}/update`, 'Update'); }}><div class="rt">Update now</div></div>
-      <div class="r tap danger" onClick=${async () => { closeSheet(); if (await confirmSheet({ title: `Remove ${e.label}?`, yes: 'Remove', danger: true })) { try { await del(`/engines/${e.name}`); loadEngines(); } catch (er) { toast(er.message); } } }}><div class="rt">Remove</div></div>
+      <div class="r tap" onClick=${() => { closeSheet(); act(`/engines/${seg(e.name)}/update`, 'Update'); }}><div class="rt">Update now</div></div>
+      <div class="r tap danger" onClick=${async () => { closeSheet(); if (await confirmSheet({ title: `Remove ${e.label}?`, yes: 'Remove', danger: true })) { try { await del(`/engines/${seg(e.name)}`); loadEngines(); } catch (er) { toast(er.message); } } }}><div class="rt">Remove</div></div>
       </div></div>`) : undefined} />`;
 }
 
@@ -201,7 +201,7 @@ function SavedKeys({ h }) {
   const remove = async (env) => {
     if (!(await confirmSheet({ title: 'Remove this key?', body: "I'll stop using it right away.", yes: 'Remove', danger: true }))) return;
     try {
-      await del(`/harnesses/${h.name}/keys/${env}`);
+      await del(`/harnesses/${seg(h.name)}/keys/${seg(env)}`);
       set({ harnesses: (await get('/harnesses')).harnesses });
     } catch (e) { toast(e.message); }
   };
@@ -267,7 +267,7 @@ export function Devices() {
     const me = d.id === data.current_device_id;
     if (!(await confirmSheet({ title: `Remove ${d.name}?`, body: me ? 'This is the device you are using. You will need a new pairing code.' : 'It will be signed out right away.', yes: 'Remove', danger: true }))) return;
     try {
-      await del(`/devices/${d.id}`);
+      await del(`/devices/${seg(d.id)}`);
       if (me) { setToken(''); location.reload(); } else load();
     } catch (e) { toast(e.message); }
   };
@@ -295,12 +295,12 @@ export function People() {
   useEffect(() => { load(); }, []);
   const code = async (u) => {
     try {
-      const r = await post(`/users/${u.id}/pairing-code`);
+      const r = await post(`/users/${seg(u.id)}/pairing-code`);
       openSheet(() => html`<${CodeSheet} name=${u.display_name} code=${r.code} expires=${r.expires_at} />`);
     } catch (e) { toast(e.message); }
   };
   const add = async () => {
-    const name = await promptSheet({ title: 'Add a person', body: `They get their own ${agentName()} with separate memory, and you can chat together.`, placeholder: 'Their name', yes: 'Add' });
+    const name = await promptSheet({ title: 'Add a person', body: `They get their own chats with ${agentName()}, and you can chat together. Your memory, files, and connections stay yours.`, placeholder: 'Their name', yes: 'Add' });
     if (!name?.trim()) return;
     try { const r = await post('/users', { display_name: name.trim() }); await load(); code(r.user); } catch (e) { toast(e.message); }
   };

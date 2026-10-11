@@ -225,6 +225,11 @@ CREATE INDEX feed_posts_liked ON feed_posts(user_id, liked);
 ALTER TABLE goals ADD COLUMN suggested INTEGER NOT NULL DEFAULT 0;
 "#,
     r#"
+-- Message timestamps are unique across conversations (they are the
+-- activity log's page cursor); this keeps finding the newest one cheap.
+CREATE INDEX messages_created ON messages(created_at);
+"#,
+    r#"
 -- Connector gateway: per-connector approval rules, catalog service, the
 -- tripwire pause, and sign-in state for OAuth connectors.
 ALTER TABLE connectors ADD COLUMN policy TEXT NOT NULL DEFAULT '{}';
@@ -272,6 +277,33 @@ CREATE TABLE engine_keys (
 );
 "#,
 ];
+
+/// Run `f` in a write transaction taken up front (`BEGIN IMMEDIATE`), so a
+/// read-then-insert cannot interleave with another connection (the server
+/// and `iris mcp` both write). Inside a caller's transaction, `f` just runs.
+pub fn write_tx<R>(
+    conn: &Connection,
+    f: impl FnOnce(&Connection) -> rusqlite::Result<R>,
+) -> rusqlite::Result<R> {
+    if !conn.is_autocommit() {
+        return f(conn);
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let out = f(&tx)?;
+    tx.commit()?;
+    Ok(out)
+}
+
+/// A creation time for a new row of `table`: now, or just after the newest
+/// existing row, so timestamps stay unique and usable as page cursors even
+/// within one millisecond. Call inside [`write_tx`].
+pub fn next_timestamp(conn: &Connection, table: &str) -> rusqlite::Result<i64> {
+    let last: Option<i64> =
+        conn.query_row(&format!("SELECT MAX(created_at) FROM {table}"), [], |r| {
+            r.get(0)
+        })?;
+    Ok(now_ms().max(last.map_or(0, |l| l + 1)))
+}
 
 #[derive(Clone)]
 pub struct Db {
@@ -784,15 +816,14 @@ pub struct NewMessage<'a> {
 }
 
 pub fn insert_message(conn: &Connection, m: &NewMessage) -> rusqlite::Result<Message> {
+    write_tx(conn, |conn| insert_message_locked(conn, m))
+}
+
+fn insert_message_locked(conn: &Connection, m: &NewMessage) -> rusqlite::Result<Message> {
     let id = new_id();
-    // Strictly increasing timestamps within a conversation keep ordering
-    // stable even when two rows land in the same millisecond.
-    let last: Option<i64> = conn.query_row(
-        "SELECT MAX(created_at) FROM messages WHERE conversation_id = ?1",
-        [m.conversation_id],
-        |r| r.get(0),
-    )?;
-    let now = now_ms().max(last.map_or(0, |l| l + 1));
+    // Strictly increasing, unique timestamps keep ordering stable and page
+    // cursors exact even when two rows land in the same millisecond.
+    let now = next_timestamp(conn, "messages")?;
     let kind = if m.kind.is_empty() { "text" } else { m.kind };
     let status = if m.status.is_empty() {
         "complete"
@@ -913,6 +944,53 @@ pub fn messages_between(
     )?;
     stmt.query_map(params![conversation_id, after, before], message_from_row)?
         .collect()
+}
+
+/// The newest `limit` finished, non-empty messages strictly between `after`
+/// and `before`, oldest first: the replay for a harness session. Limited in
+/// SQL so a long unsynced history is never loaded whole.
+pub fn replay_messages(
+    conn: &Connection,
+    conversation_id: &str,
+    after: i64,
+    before: i64,
+    limit: usize,
+) -> rusqlite::Result<Vec<Message>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM (
+             SELECT * FROM messages
+             WHERE conversation_id = ?1 AND created_at > ?2 AND created_at < ?3
+               AND status != 'streaming' AND trim(content) != ''
+             ORDER BY created_at DESC LIMIT ?4
+         ) ORDER BY created_at",
+    )?;
+    stmt.query_map(
+        params![conversation_id, after, before, limit as i64],
+        message_from_row,
+    )?
+    .collect()
+}
+
+/// The newest message a harness session has seen once the turn whose reply
+/// placeholder was created at `placeholder` is done: the placeholder, plus
+/// the cards the agent created right after it, but never past the first
+/// message the session did not see (a queued user message, a heartbeat
+/// post), so that one is still replayed later.
+pub fn synced_watermark(
+    conn: &Connection,
+    conversation_id: &str,
+    placeholder: i64,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(created_at), ?2) FROM messages
+         WHERE conversation_id = ?1 AND kind = 'card' AND created_at > ?2
+           AND created_at < COALESCE(
+               (SELECT MIN(created_at) FROM messages
+                WHERE conversation_id = ?1 AND created_at > ?2 AND kind != 'card'),
+               9223372036854775807)",
+        params![conversation_id, placeholder],
+        |r| r.get(0),
+    )
 }
 
 /// Mark turns that were streaming when the daemon stopped.
@@ -1246,6 +1324,127 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn watermark_stops_at_the_first_unseen_message() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            let owner = owner_user_id(c)?.unwrap();
+            let conv = create_conversation(c, &owner, "side", "", None)?.id;
+            let card = |c: &Connection| {
+                crate::entities::insert_card(
+                    c,
+                    &conv,
+                    &serde_json::json!({"type": "info", "title": "x"}),
+                    "assistant",
+                )
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))
+            };
+            let placeholder = insert_message(c, &text(&conv, &owner, "reply"))?.created_at;
+            assert_eq!(synced_watermark(c, &conv, placeholder)?, placeholder);
+            let c1 = card(c)?.created_at;
+            assert_eq!(
+                synced_watermark(c, &conv, placeholder)?,
+                c1,
+                "the turn's card"
+            );
+            // A heartbeat post lands, then the turn creates another card.
+            let heartbeat = insert_message(c, &text(&conv, &owner, "heartbeat"))?.created_at;
+            card(c)?;
+            assert_eq!(synced_watermark(c, &conv, placeholder)?, c1);
+            assert!(c1 < heartbeat);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn replay_is_limited_in_sql() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            let owner = owner_user_id(c)?.unwrap();
+            let conv = create_conversation(c, &owner, "side", "", None)?.id;
+            for i in 0..100 {
+                insert_message(c, &text(&conv, &owner, &format!("m{i}")))?;
+            }
+            insert_message(c, &text(&conv, &owner, "   "))?;
+            let got = replay_messages(c, &conv, 0, i64::MAX, 40)?;
+            assert_eq!(got.len(), 40);
+            assert_eq!(got[0].content, "m60");
+            assert_eq!(got[39].content, "m99");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn timestamps_are_unique_across_connections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        let first = Db::open(&path).unwrap();
+        let (owner, convs) = first
+            .with(|c| {
+                let owner = owner_user_id(c)?.unwrap();
+                let a = create_conversation(c, &owner, "side", "", None)?.id;
+                let b = create_conversation(c, &owner, "side", "", None)?.id;
+                Ok((owner, [a, b]))
+            })
+            .unwrap();
+        let workers: Vec<_> = (0..4)
+            .map(|w| {
+                let (path, owner, conv) = (path.clone(), owner.clone(), convs[w % 2].clone());
+                std::thread::spawn(move || {
+                    let db = Db::open(&path).unwrap();
+                    for i in 0..50 {
+                        db.with(|c| {
+                            insert_message(c, &text(&conv, &owner, &format!("{w}-{i}")))?;
+                            crate::entities::create_feed_post(
+                                c,
+                                &owner,
+                                &crate::entities::NewFeedPost {
+                                    title: format!("{w}-{i}"),
+                                    body: "b".into(),
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        first
+            .with(|c| {
+                for table in ["messages", "feed_posts"] {
+                    let dupes: i64 = c.query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM (SELECT created_at FROM {table}
+                             GROUP BY created_at HAVING COUNT(*) > 1)"
+                        ),
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    assert_eq!(dupes, 0, "{table}");
+                }
+                // Paging by timestamp walks every post exactly once.
+                let mut before = None;
+                let mut seen = 0;
+                loop {
+                    let page = crate::entities::list_feed(c, &owner, before, 7)?;
+                    if page.is_empty() {
+                        break;
+                    }
+                    seen += page.len();
+                    before = page.last().map(|p| p.created_at);
+                }
+                assert_eq!(seen, 200);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

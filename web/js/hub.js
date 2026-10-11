@@ -1,6 +1,6 @@
 // The Iris hub: Connections, Logins & wallet, Iris's computer, System files.
 import { html, useEffect, useState } from './h.js';
-import { get, post, patch, put, del } from './api.js';
+import { get, post, patch, put, del, seg } from './api.js';
 import { S, set, useStore, go, toast, isOwner } from './store.js';
 import {
   Icon, Avatar, Row, Group, Page, Empty, Spinner, Toggle, LetterTile,
@@ -81,7 +81,7 @@ export function Logins() {
   const list = data?.credentials || [];
   const remove = async (c) => {
     if (!(await confirmSheet({ title: `Delete ${c.label}?`, yes: 'Delete', danger: true }))) return;
-    try { await del(`/credentials/${c.id}`); reload(); } catch (e) { toast(e.message); }
+    try { await del(`/credentials/${seg(c.id)}`); reload(); } catch (e) { toast(e.message); }
   };
   if (adding) {
     return html`<${Page} title=${adding === 'card' ? 'Add card' : 'Add login'} sub="Stored encrypted on your server. You won't see the secret again." onBack=${() => setAdding(null)}>
@@ -201,7 +201,7 @@ export function Files() {
 
 export function FileEditor({ area, path }) {
   const system = area === 'system';
-  const url = system ? `/files/system/${encodeURIComponent(path)}` : `/files/content/${area}?path=${encodeURIComponent(path)}`;
+  const url = system ? `/files/system/${seg(path)}` : `/files/content/${seg(area)}?path=${encodeURIComponent(path)}`;
   const [text, setText] = useState(null);
   const [orig, setOrig] = useState('');
   const [busy, setBusy] = useState(false);
@@ -228,7 +228,7 @@ export function FileEditor({ area, path }) {
 }
 
 export function Folder({ area, path = '' }) {
-  const [data, , err] = useData(`/files/browse/${area}${path ? `?path=${encodeURIComponent(path)}` : ''}`, [area, path]);
+  const [data, , err] = useData(`/files/browse/${seg(area)}${path ? `?path=${encodeURIComponent(path)}` : ''}`, [area, path]);
   const sub = path ? `${area}/${path}` : area;
   const open = (e) => go(`iris/files/${area}/${[path, e.name].filter(Boolean).join('/')}${e.type === 'dir' ? '' : '?edit=1'}`);
   return html`<${Page} title=${path ? path.split('/').pop() : fill(AREA[area] || area)} sub=${sub}>

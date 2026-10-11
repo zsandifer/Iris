@@ -1,7 +1,7 @@
 // App state: one plain object, a change counter, and loaders that keep it
 // in sync with the REST API and the WebSocket event stream.
 import { useEffect, useReducer, useRef } from './h.js';
-import { get, post } from './api.js';
+import { get, post, seg } from './api.js';
 
 export const S = {
   me: null,            // GET /api/me
@@ -60,10 +60,16 @@ export function useStore() {
 
 // ------------------------------------------------------------------ routes
 
+// A malformed escape (`%E0`) must not throw while parsing the route.
+// (A declaration: `S` above calls parseRoute before consts initialize.)
+function decodeSeg(p) {
+  try { return decodeURIComponent(p); } catch { return p; }
+}
+
 export function parseRoute() {
   const raw = location.hash.replace(/^#\/?/, '');
   const [path, query = ''] = raw.split('?');
-  const parts = path.split('/').filter(Boolean).map(decodeURIComponent);
+  const parts = path.split('/').filter(Boolean).map(decodeSeg);
   return { parts, query: new URLSearchParams(query), tab: parts[0] || 'chat' };
 }
 
@@ -100,29 +106,84 @@ export async function loadConvs() {
   set({ convs: conversations });
 }
 
+// A reply only ever moves from streaming to a final status, and every
+// change bumps updated_at. Keep whichever copy is further along (ties go to
+// `a`).
+const settled = (m) => (m.status === 'streaming' ? 0 : 1);
+function newer(a, b) {
+  if (settled(a) !== settled(b)) return settled(a) > settled(b) ? a : b;
+  return (b.updated_at || 0) > (a.updated_at || 0) ? b : a;
+}
+
+/**
+ * Apply the latest-page REST snapshot to the list we have now. Events may
+ * have landed while the request was in flight: never regress a message the
+ * events already moved on, and keep messages created after the snapshot.
+ * Older pages we already loaded stay when they join up with the snapshot.
+ * Returns the merged list and whether the snapshot joined the old list.
+ */
+function mergeSnapshot(list, snap) {
+  const have = new Map(list.map((m) => [m.id, m]));
+  const ids = new Set(snap.map((m) => m.id));
+  let oldest = snap[0];
+  for (const m of snap) if (m.created_at < oldest.created_at) oldest = m;
+  const newest = snap.reduce((t, m) => Math.max(t, m.created_at), -Infinity);
+  const joined = !!oldest && have.has(oldest.id);
+  const out = snap.map((m) => (have.has(m.id) ? newer(m, have.get(m.id)) : m));
+  for (const m of list) {
+    if (ids.has(m.id)) continue;
+    if (m.created_at >= newest || (joined && m.created_at <= oldest.created_at)) out.push(m);
+  }
+  return { list: out.sort((x, y) => x.created_at - y.created_at), joined };
+}
+
+function patchBox(cid, patch) {
+  set({ msgs: { ...S.msgs, [cid]: { ...(S.msgs[cid] || { list: [] }), ...patch } } });
+}
+
+/** End a load; a refresh asked for meanwhile runs now. */
+function doneLoading(cid, patch) {
+  const again = S.msgs[cid]?.stale;
+  patchBox(cid, { ...patch, loading: false, stale: false });
+  if (again) loadMessages(cid);
+}
+
 export async function loadMessages(cid) {
-  const cur = S.msgs[cid];
-  if (cur?.loading) return;
-  set({ msgs: { ...S.msgs, [cid]: { ...(cur || { list: [] }), loading: true } } });
+  if (S.msgs[cid]?.loading) {
+    patchBox(cid, { stale: true });
+    return;
+  }
+  patchBox(cid, { loading: true, stale: false });
   try {
-    const r = await get(`/conversations/${cid}/messages?limit=60`);
+    const r = await get(`/conversations/${seg(cid)}/messages?limit=60`);
+    const cur = S.msgs[cid] || { list: [] };
+    const { list, joined } = mergeSnapshot(cur.list, r.messages);
     const live = { ...S.live };
-    for (const m of r.messages) {
-      if (m.status === 'streaming' && !live[m.id]) live[m.id] = { text: '', acts: [] };
+    for (const m of list) {
+      if (m.status !== 'streaming') delete live[m.id];
+      else if (!live[m.id]) live[m.id] = { text: '', acts: [] };
     }
-    set({ live, msgs: { ...S.msgs, [cid]: { list: r.messages, hasMore: r.has_more, loading: false } } });
+    set({ live });
+    doneLoading(cid, { list, hasMore: joined ? (cur.hasMore ?? r.has_more) : r.has_more, error: undefined });
   } catch (e) {
-    set({ msgs: { ...S.msgs, [cid]: { ...(cur || { list: [] }), loading: false, error: e.message } } });
+    doneLoading(cid, { error: e.message });
   }
 }
 
 export async function loadOlder(cid) {
   const cur = S.msgs[cid];
   if (!cur || !cur.hasMore || cur.loading || !cur.list.length) return;
-  set({ msgs: { ...S.msgs, [cid]: { ...cur, loading: true } } });
-  const r = await get(`/conversations/${cid}/messages?limit=60&before=${cur.list[0].created_at}`);
-  const now = S.msgs[cid];
-  set({ msgs: { ...S.msgs, [cid]: { list: [...r.messages, ...now.list], hasMore: r.has_more, loading: false } } });
+  patchBox(cid, { loading: true });
+  try {
+    const r = await get(`/conversations/${seg(cid)}/messages?limit=60&before=${cur.list[0].created_at}`);
+    const now = S.msgs[cid]?.list || [];
+    const ids = new Set(now.map((m) => m.id));
+    doneLoading(cid, { list: [...r.messages.filter((m) => !ids.has(m.id)), ...now], hasMore: r.has_more });
+  } catch (e) {
+    // Release the flag so paging and reconnect refreshes keep working.
+    doneLoading(cid, {});
+    throw e;
+  }
 }
 
 export async function loadFeed(more = false) {
@@ -272,7 +333,7 @@ export function refreshAll() {
 
 /** Send a message (text and/or attachment ids) and track the reply. */
 export async function sendMessage(cid, text, attachments = []) {
-  const r = await post(`/conversations/${cid}/messages`, { text, attachments });
+  const r = await post(`/conversations/${seg(cid)}/messages`, { text, attachments });
   upsert(cid, r.user_message);
   // The events can beat the HTTP response; never regress a newer state.
   const known = S.msgs[cid]?.list.find((m) => m.id === r.assistant_message.id);

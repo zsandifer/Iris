@@ -115,7 +115,22 @@ impl Harness for Gemini {
         let dir = scope_dir(&spec.cwd, &spec.scope);
         ensure_private_dir(&dir.join(".gemini"))?;
         let settings = dir.join(".gemini").join("settings.json");
-        let mut body = json!({"mcpServers": mcp_settings(&spec.mcp_servers)});
+        // The Iris bridge resolves Library paths against this folder.
+        let servers: Vec<super::McpServer> = spec
+            .mcp_servers
+            .iter()
+            .cloned()
+            .map(|mut s| {
+                if let (true, McpTransport::Stdio { args, .. }) =
+                    (s.name == "iris", &mut s.transport)
+                {
+                    args.push("--workdir".into());
+                    args.push(dir.to_string_lossy().into_owned());
+                }
+                s
+            })
+            .collect();
+        let mut body = json!({"mcpServers": mcp_settings(&servers)});
         if spec.key_env.iter().any(|k| k == "GEMINI_API_KEY") {
             // An API key the owner added in the app: use it even if a
             // Google sign-in was saved before (a saved auth type would
@@ -559,6 +574,10 @@ mod tests {
         assert_eq!(
             settings["security"]["auth"]["selectedType"],
             "gemini-api-key"
+        );
+        assert_eq!(
+            settings["mcpServers"]["iris"]["args"],
+            json!(["mcp", "--workdir", cwd.to_string_lossy()])
         );
         assert_eq!(inv.env[0].0, "GEMINI_SYSTEM_MD");
         let system = std::fs::read_to_string(&inv.env[0].1).unwrap();

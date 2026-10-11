@@ -1,10 +1,10 @@
 // Ideas, Goals, and Library tabs.
 import { html, useEffect, useState } from './h.js';
-import { post, patch, del, api, blobUrl } from './api.js';
+import { post, patch, del, api, seg } from './api.js';
 import { S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary } from './store.js';
-import { Icon, Img, Empty, Spinner, ago, since, openSheet, closeSheet, confirmSheet, hostOf } from './ui.js';
+import { Icon, Img, Empty, Spinner, ago, since, openSheet, closeSheet, confirmSheet, hostOf, useBlob } from './ui.js';
 import { md } from './md.js';
-import { Post } from './feed.js';
+import { Post, findPost } from './feed.js';
 
 function Head({ title, sub }) {
   return html`<h1 class="ttl">${title}</h1>${sub && html`<div class="sub">${sub}</div>`}`;
@@ -22,7 +22,7 @@ export function IdeasScreen() {
   const start = async (i) => {
     setBusy(i.id);
     try {
-      const r = await post(`/ideas/${i.id}/start`);
+      const r = await post(`/ideas/${seg(i.id)}/start`);
       await loadIdeas();
       go(`chat/${r.conversation.id}`);
     } catch (e) { toast(e.message); }
@@ -30,7 +30,7 @@ export function IdeasScreen() {
   };
   const later = async (i) => {
     set({ ideas: S.ideas.map((x) => (x.id === i.id ? { ...x, status: 'dismissed' } : x)) });
-    try { await patch(`/ideas/${i.id}`, { status: 'dismissed' }); } catch (e) { toast(e.message); loadIdeas(); }
+    try { await patch(`/ideas/${seg(i.id)}`, { status: 'dismissed' }); } catch (e) { toast(e.message); loadIdeas(); }
   };
   return html`<div class="scr tabscr">
     <${Head} title="Ideas" sub="Things I could do for you. Tap Do it and I'll get started." />
@@ -61,12 +61,12 @@ export function GoalsScreen() {
   const done = S.goals.filter((g) => g.done);
   const update = async (g, body) => {
     set({ goals: S.goals.map((x) => (x.id === g.id ? { ...x, ...body } : x)) });
-    try { await patch(`/goals/${g.id}`, body); } catch (e) { toast(e.message); }
+    try { await patch(`/goals/${seg(g.id)}`, body); } catch (e) { toast(e.message); }
     loadGoals().catch(() => {});
   };
   const remove = async (g) => {
     set({ goals: S.goals.filter((x) => x.id !== g.id) });
-    try { await del(`/goals/${g.id}`); } catch (e) { toast(e.message); loadGoals(); }
+    try { await del(`/goals/${seg(g.id)}`); } catch (e) { toast(e.message); loadGoals(); }
   };
   const add = async (e) => {
     e.preventDefault();
@@ -106,10 +106,16 @@ export function GoalsScreen() {
 
 const KIND_ICON = (mime) => (mime.startsWith('image/') ? 'image' : mime.includes('html') ? 'globe' : 'file');
 
+function Download({ src, name }) {
+  const [url, failed] = useBlob(src);
+  if (failed) return html`<button class="b1" disabled>Download</button>`;
+  return html`<a class="b1" href=${url || undefined} download=${name} aria-disabled=${url ? undefined : 'true'}>Download</a>`;
+}
+
 async function openItem(it) {
   openSheet(() => html`<div class="sheet-body"><${Spinner} /></div>`);
   try {
-    const path = `/library/${it.id}/content`;
+    const path = `/library/${seg(it.id)}/content`;
     let view;
     if (it.mime.startsWith('image/')) view = html`<${Img} src=${`/api${path}`} cls="lib-full" alt=${it.title} />`;
     else if (it.mime.startsWith('text/') || it.mime === 'application/json') {
@@ -117,13 +123,12 @@ async function openItem(it) {
       view = it.mime === 'text/markdown' ? html`<div class="md doc" dangerouslySetInnerHTML=${{ __html: md(text) }} />`
         : html`<pre class="doc">${text}</pre>`;
     } else view = html`<p class="mu">I can't show this kind of file here, but you can download it.</p>`;
-    const url = await blobUrl(`/api${path}`);
     openSheet(() => html`<div class="sheet-body tall">
       <h3>${it.title}</h3>${it.description && html`<p class="mu">${it.description}</p>`}
       ${view}
       <div class="btns">
         ${it.conversation_id && html`<button class="b2" onClick=${() => { closeSheet(); go(`chat/${it.conversation_id}`); }}>Open chat</button>`}
-        <a class="b1" href=${url} download=${it.title}>Download</a>
+        <${Download} src=${`/api${path}`} name=${it.title} />
       </div></div>`);
   } catch (e) { closeSheet(); toast(e.message); }
 }
@@ -133,7 +138,7 @@ function MadeByIris({ items, limit }) {
   const docs = items.filter((i) => !i.mime.startsWith('image/'));
   const shown = limit ? docs.slice(0, limit) : docs;
   return html`${media.length > 0 && html`<div class="grid">${(limit ? media.slice(0, 6) : media).map((it) => html`
-      <button class="gi" onClick=${() => openItem(it)}><${Img} src=${`/api/library/${it.id}/content`} alt=${it.title} /></button>`)}</div>`}
+      <button class="gi" onClick=${() => openItem(it)}><${Img} src=${`/api/library/${seg(it.id)}/content`} alt=${it.title} /></button>`)}</div>`}
     ${shown.length > 0 && html`<div class="grp">${shown.map((it) => html`<div class="r tap" onClick=${() => openItem(it)}>
       <div class="ri"><${Icon} name=${KIND_ICON(it.mime)} size=${17} /></div>
       <div class="rt">${it.title}<small>${it.description || it.mime} · ${ago(it.created_at)}</small></div>
@@ -142,13 +147,20 @@ function MadeByIris({ items, limit }) {
 
 function PhotoGrid({ photos, limit }) {
   const list = limit ? photos.slice(0, limit) : photos;
-  return html`<div class="grid">${list.map((p) => html`<button class="gi" onClick=${() => set({ lightbox: `/api/attachments/${p.id}`, lightboxChat: p.conversation_id })}>
-    <${Img} src=${`/api/attachments/${p.id}`} alt="Photo you sent" /></button>`)}</div>`;
+  return html`<div class="grid">${list.map((p) => html`<button class="gi" onClick=${() => set({ lightbox: `/api/attachments/${seg(p.id)}`, lightboxChat: p.conversation_id })}>
+    <${Img} src=${`/api/attachments/${seg(p.id)}`} alt="Photo you sent" /></button>`)}</div>`;
 }
 
 function Saved({ posts, limit }) {
   const list = limit ? posts.slice(0, limit) : posts;
-  const show = (p) => openSheet(() => html`<div class="sheet-body tall flush"><${Post} p=${p} /></div>`);
+  const show = (p) => {
+    // Follow the post's live state (like/unlike) while the sheet is open.
+    let cur = p;
+    openSheet(() => {
+      cur = findPost(p.id) || cur;
+      return html`<div class="sheet-body tall flush"><${Post} p=${cur} /></div>`;
+    });
+  };
   return html`<div class="grp">${list.map((p) => html`<div class="r tap" onClick=${() => show(p)}>
     <div class="ri thumb">${(p.images?.[0] || p.image_url) ? html`<${Img} src=${p.images?.[0] || p.image_url} alt="" />` : html`<${Icon} name="heart" size=${16} />`}</div>
     <div class="rt">${p.title}<small>${p.source_name || hostOf(p.source_url) || p.topic || 'Saved post'}</small></div>

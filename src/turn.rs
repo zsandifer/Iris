@@ -18,13 +18,14 @@ use crate::harness::runner::{self, RunRequest};
 use crate::harness::{
     Activity, AuthState, HarnessEvent, ImageInput, McpServer, McpTransport, TurnSpec,
 };
-use crate::persona::{self, PromptContext};
+use crate::persona::{self, PromptContext, Scope};
 use crate::ranking::Slot;
 use crate::router::{EngineEnv, NoEngine, Purpose, RouteDecision, RouteInput, select_engine};
 use crate::state::AppState;
 use crate::util::{new_id, truncate_chars};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
@@ -108,9 +109,26 @@ pub fn cancel(state: &AppState, conversation_id: &str) -> bool {
 }
 
 struct Ctx {
+    /// False when the conversation was deleted while this turn waited.
+    exists: bool,
     kind: String,
     members: Vec<String>,
     names: HashMap<String, String>,
+    /// The server owner's user id.
+    owner: Option<String>,
+}
+
+impl Ctx {
+    /// Only the owner alone sees their private files, memory, and
+    /// connectors; anyone else's chat (or a chat with several people) gets
+    /// none of them.
+    fn scope(&self) -> Scope {
+        match self.members.as_slice() {
+            [only] if self.owner.as_deref() == Some(only.as_str()) => Scope::Private,
+            [] | [_] => Scope::Personal,
+            _ => Scope::Shared,
+        }
+    }
 }
 
 async fn load_ctx(state: &AppState, conv_id: &str) -> Ctx {
@@ -127,17 +145,63 @@ async fn load_ctx(state: &AppState, conv_id: &str) -> Ctx {
                 }
             }
             Ok(Ctx {
+                exists: conv.is_some(),
                 kind: conv.map(|c| c.kind).unwrap_or_else(|| "side".into()),
                 members,
                 names,
+                owner: db::owner_user_id(c)?,
             })
         })
         .await
         .unwrap_or(Ctx {
+            exists: false,
             kind: "side".into(),
             members: Vec::new(),
             names: HashMap::new(),
+            owner: None,
         })
+}
+
+/// Call after someone leaves a conversation or it is deleted.
+pub fn membership_changed(state: &AppState) {
+    state.membership_generation.fetch_add(1, Ordering::SeqCst);
+}
+
+/// The people a turn streams to: its conversation's members when it
+/// started, minus anyone who has left since. Nobody is added mid-turn (a
+/// newcomer sees the finished reply through the API).
+struct Audience {
+    conv_id: String,
+    users: Vec<String>,
+    generation: u64,
+}
+
+impl Audience {
+    fn new(state: &AppState, conv_id: &str, users: Vec<String>) -> Self {
+        Self {
+            conv_id: conv_id.to_string(),
+            users,
+            generation: state.membership_generation.load(Ordering::SeqCst),
+        }
+    }
+
+    async fn current(&mut self, state: &AppState) -> &[String] {
+        let generation = state.membership_generation.load(Ordering::SeqCst);
+        if generation != self.generation && !self.users.is_empty() {
+            let id = self.conv_id.clone();
+            match state
+                .db
+                .call(move |c| db::conversation_member_ids(c, &id))
+                .await
+            {
+                Ok(members) => self.users.retain(|u| members.contains(u)),
+                // Fail closed: stop streaming rather than risk a leak.
+                Err(_) => self.users.clear(),
+            }
+            self.generation = generation;
+        }
+        &self.users
+    }
 }
 
 async fn run_locked(
@@ -148,19 +212,33 @@ async fn run_locked(
     let conv_id = input.conversation_id.as_str();
     let msg_id = input.assistant_message.id.as_str();
     let ctx = load_ctx(state, conv_id).await;
+    if !ctx.exists {
+        // Deleted while this turn waited in line: never run the CLI for it.
+        crate::info!("turn {msg_id}: conversation is gone; skipped");
+        return TurnResult {
+            message: input.assistant_message.clone(),
+            ok: false,
+        };
+    }
     // Job conversations are hidden; their turns are not streamed to anyone.
-    let audience = if ctx.kind == "job" {
-        Vec::new()
-    } else {
-        ctx.members.clone()
-    };
+    let mut audience = Audience::new(
+        state,
+        conv_id,
+        if ctx.kind == "job" {
+            Vec::new()
+        } else {
+            ctx.members.clone()
+        },
+    );
+    // Engine policy: more than one human. Privacy: see `Ctx::scope`.
     let shared = ctx.members.len() > 1;
+    let scope = ctx.scope();
 
     if state.is_paused().await {
         return finish(
             state,
             input,
-            &audience,
+            &mut audience,
             &Acc::default(),
             json!(null),
             Outcome::Failed {
@@ -172,18 +250,18 @@ async fn run_locked(
     }
     if state.limiter.saturated() {
         state.hub.to_users(
-            &audience,
+            audience.current(state).await,
             json!({"type": "turn.status", "conversation_id": conv_id, "message_id": msg_id, "status": "queued"}),
         );
     }
     let _permit = tokio::select! {
         p = state.limiter.acquire() => p,
         _ = async { let _ = cancel.wait_for(|c| *c).await; } => {
-            return finish(state, input, &audience, &Acc::default(), json!(null), Outcome::Cancelled).await;
+            return finish(state, input, &mut audience, &Acc::default(), json!(null), Outcome::Cancelled).await;
         }
     };
     state.hub.to_users(
-        &audience,
+        audience.current(state).await,
         json!({"type": "turn.status", "conversation_id": conv_id, "message_id": msg_id, "status": "running"}),
     );
 
@@ -191,7 +269,7 @@ async fn run_locked(
     let pins = state.slot_pins().await;
     let allow_shared = state.allow_claude_for_shared().await;
     let has_images = !input.user_message.attachments.is_empty();
-    let assessment = assess_turn(state, input).await;
+    let assessment = assess_turn(state, input, shared).await;
     let mut excluded: Vec<String> = Vec::new();
     let mut fresh_session = !input.continuity;
     let mut routing_notes: Vec<String> = Vec::new();
@@ -256,7 +334,12 @@ async fn run_locked(
 
         // Session continuity and replay of unseen messages.
         let agent_name = state.agent_name().await;
-        let persona_hash = persona::persona_hash(&state.paths, &agent_name, &ctx.kind);
+        let persona_hash = {
+            let (paths, name, kind) = (state.paths.clone(), agent_name.clone(), ctx.kind.clone());
+            tokio::task::spawn_blocking(move || persona::persona_hash(&paths, &name, &kind, scope))
+                .await
+                .unwrap_or_default()
+        };
         let mut session = if fresh_session {
             None
         } else {
@@ -268,21 +351,27 @@ async fn run_locked(
                 .ok()
                 .flatten()
         };
-        if session
-            .as_ref()
-            .is_some_and(|s| s.persona_hash != persona_hash)
-            && !entry.harness.resume_updates_system_prompt()
+        if let Some(s) = &session
+            && s.persona_hash != persona_hash
         {
-            // The CLI would keep the old persona; start over with replay.
-            routing_notes.push("persona changed; started a new session".into());
-            session = None;
+            if persona::hash_scope(&s.persona_hash) != Some(scope.name()) {
+                // Who is in the conversation changed (for example a group
+                // got its second person): the old session may hold the
+                // owner's private context, so never resume it.
+                routing_notes.push("people changed; started a new session".into());
+                session = None;
+            } else if !entry.harness.resume_updates_system_prompt() {
+                // The CLI would keep the old persona; start over with replay.
+                routing_notes.push("persona changed; started a new session".into());
+                session = None;
+            }
         }
         let replay = if input.continuity {
             let after = session.as_ref().map_or(0, |s| s.synced_at);
             let (c, before) = (conv_id.to_string(), input.user_message.created_at);
             state
                 .db
-                .call(move |db| db::messages_between(db, &c, after, before))
+                .call(move |db| db::replay_messages(db, &c, after, before, MAX_REPLAY_MESSAGES))
                 .await
                 .unwrap_or_default()
         } else {
@@ -310,29 +399,44 @@ async fn run_locked(
                 conv_id,
                 &ctx.kind,
                 msg_id,
-                shared,
+                scope,
             )
             .await
         } else {
             (Vec::new(), None)
         };
-        if !shared {
+        if scope == Scope::Private {
             notices.extend(crate::gateway::connector_notices(state, &input.owner_user_id).await);
         }
         let keys = crate::keys::env_for(state, &harness_name).await;
         let participants: Vec<String> = ctx.names.values().cloned().collect();
-        let system_prompt = persona::assemble(
-            &state.paths,
-            &PromptContext {
-                agent_name: &agent_name,
-                conversation_kind: &ctx.kind,
-                purpose: input.purpose,
-                participants: &participants,
-                app_tools: !mcp_servers.is_empty(),
-                shared,
-                notices: &notices,
-            },
-        );
+        // Reads persona files and indexes the memory tree: blocking I/O.
+        let system_prompt = {
+            let (paths, name, kind, purpose, app_tools) = (
+                state.paths.clone(),
+                agent_name.clone(),
+                ctx.kind.clone(),
+                input.purpose,
+                !mcp_servers.is_empty(),
+            );
+            let notices = notices.clone();
+            tokio::task::spawn_blocking(move || {
+                persona::assemble(
+                    &paths,
+                    &PromptContext {
+                        agent_name: &name,
+                        conversation_kind: &kind,
+                        purpose,
+                        participants: &participants,
+                        app_tools,
+                        scope,
+                        notices: &notices,
+                    },
+                )
+            })
+            .await
+            .unwrap_or_default()
+        };
         let spec = TurnSpec {
             turn_id: new_id(),
             prompt,
@@ -343,11 +447,11 @@ async fn run_locked(
             resume: session.as_ref().map(|s| s.session_id.clone()),
             mcp_servers,
             cwd: state.paths.workspace_dir(),
-            // The owner's memory is only writable in personal conversations.
-            writable_dirs: if shared {
-                Vec::new()
-            } else {
+            // The owner's memory is only writable in the owner's own chats.
+            writable_dirs: if scope == Scope::Private {
                 vec![state.paths.memory_dir()]
+            } else {
+                Vec::new()
             },
             run_dir: state.paths.run_dir(),
             scope: conv_id.to_string(),
@@ -409,7 +513,7 @@ async fn run_locked(
             cancel.clone(),
             tx,
         );
-        let consume_fut = consume(state, &audience, conv_id, msg_id, rx);
+        let consume_fut = consume(state, &mut audience, conv_id, msg_id, rx);
         let (run_res, attempt) = tokio::join!(run_fut, consume_fut);
         for f in &invocation.temp_files {
             let _ = std::fs::remove_file(f);
@@ -510,7 +614,7 @@ async fn run_locked(
         .as_ref()
         .map(|d| routing_json(d, &routing_notes))
         .unwrap_or(json!(null));
-    finish(state, input, &audience, &acc, routing, outcome).await
+    finish(state, input, &mut audience, &acc, routing, outcome).await
 }
 
 /// Why no engine could run the turn: harnesses allowed here that are
@@ -532,7 +636,9 @@ fn no_engine_reason(state: &AppState, shared: bool, allow_shared: bool) -> (&'st
 }
 
 /// Classify the message (chat) or use the job default (low effort).
-async fn assess_turn(state: &AppState, input: &TurnInput) -> Assessment {
+/// `shared` applies the individual-use policy to the optional model
+/// classifier too: it sees the message, so it is an engine use.
+async fn assess_turn(state: &AppState, input: &TurnInput, shared: bool) -> Assessment {
     if input.purpose != Purpose::Chat {
         return Assessment {
             effort: Effort::Low,
@@ -565,7 +671,7 @@ async fn assess_turn(state: &AppState, input: &TurnInput) -> Assessment {
     let mut a = classifier::assess(&input.user_message.content, &turns, &thresholds);
     if state.cfg.router.classifier_model
         && a.ambiguous
-        && let Some(effort) = refine_with_model(state, &input.user_message.content).await
+        && let Some(effort) = refine_with_model(state, &input.user_message.content, shared).await
     {
         a.signals.push("model_classifier");
         a.effort = effort;
@@ -576,8 +682,8 @@ async fn assess_turn(state: &AppState, input: &TurnInput) -> Assessment {
 
 /// Optional: ask the `classifier` slot's model about an ambiguous message.
 /// One short, tool-less, session-less run; None on any failure.
-async fn refine_with_model(state: &AppState, text: &str) -> Option<Effort> {
-    let (res, pin) = state.resolve_slot(Slot::Classifier, false).await;
+async fn refine_with_model(state: &AppState, text: &str, shared: bool) -> Option<Effort> {
+    let (res, pin) = state.resolve_slot(Slot::Classifier, shared).await;
     let model_id = res.effective?;
     let catalog = state.catalog();
     let m = catalog.get(&model_id)?;
@@ -678,7 +784,7 @@ fn routing_json(d: &RouteDecision, notes: &[String]) -> Value {
 
 async fn consume(
     state: &AppState,
-    audience: &[String],
+    audience: &mut Audience,
     conv_id: &str,
     msg_id: &str,
     mut rx: mpsc::UnboundedReceiver<HarnessEvent>,
@@ -690,7 +796,7 @@ async fn consume(
             HarnessEvent::TextDelta { text } => {
                 acc.text.push_str(&text);
                 state.hub.to_users(
-                    audience,
+                    audience.current(state).await,
                     json!({"type": "message.delta", "conversation_id": conv_id, "message_id": msg_id, "text": text}),
                 );
             }
@@ -712,7 +818,7 @@ async fn consume(
                     }
                 };
                 state.hub.to_users(
-                    audience,
+                    audience.current(state).await,
                     json!({"type": "message.activity", "conversation_id": conv_id, "message_id": msg_id, "activity": merged}),
                 );
             }
@@ -728,19 +834,12 @@ async fn consume(
 /// Newest message this harness session has now seen: everything up to this
 /// turn's reply, plus cards the agent created during the turn. Messages
 /// that arrived meanwhile (queued user messages, heartbeat posts) stay
-/// unsynced so they are replayed if another harness answers them.
+/// unsynced so they are replayed later (see `db::synced_watermark`).
 async fn synced_through(state: &AppState, conv_id: &str, placeholder_created_at: i64) -> i64 {
     let c = conv_id.to_string();
     state
         .db
-        .call(move |db| {
-            db.query_row(
-                "SELECT COALESCE(MAX(created_at), 0) FROM messages
-                 WHERE conversation_id = ?1 AND (created_at <= ?2 OR kind = 'card')",
-                rusqlite::params![c, placeholder_created_at],
-                |r| r.get(0),
-            )
-        })
+        .call(move |db| db::synced_watermark(db, &c, placeholder_created_at))
         .await
         .unwrap_or(placeholder_created_at)
 }
@@ -812,7 +911,7 @@ fn failure_text(kind: &str, detail: &str) -> String {
 async fn finish(
     state: &AppState,
     input: &TurnInput,
-    audience: &[String],
+    audience: &mut Audience,
     acc: &Acc,
     routing: Value,
     outcome: Outcome,
@@ -855,8 +954,9 @@ async fn finish(
         }
     };
     crate::info!("turn {msg_id}: {} in {duration_ms}ms", message.status);
+    let audience = audience.current(state).await.to_vec();
     state.hub.to_users(
-        audience,
+        &audience,
         json!({"type": "message.completed", "conversation_id": conv_id, "message": message}),
     );
 
@@ -879,7 +979,7 @@ async fn finish(
             .filter(|m| m.kind == "card" && agent_card(m))
         {
             state.hub.to_users(
-                audience,
+                &audience,
                 json!({"type": "message.created", "conversation_id": conv_id, "message": m}),
             );
         }
@@ -1032,18 +1132,20 @@ async fn load_images(state: &AppState, m: &Message) -> Vec<ImageInput> {
 /// The Iris MCP bridge plus one gateway proxy per connector the turn may
 /// use (with the guard that ends that access when the attempt ends).
 ///
-/// Connectors belong to the owner: only the owner's personal
-/// conversations and jobs get them. In shared conversations (more than one
-/// person) the bridge only offers cards, so other members cannot reach the
-/// owner's accounts, goals, feed, or library through the agent.
+/// Connectors are the owner's accounts, so they are only attached to the
+/// owner's own chats and jobs (the gateway checks this again). In shared
+/// conversations (more than one person) the bridge also only offers cards,
+/// so other members cannot reach the owner's goals, feed, or library
+/// through the agent.
 async fn mcp_servers(
     state: &AppState,
     user_id: &str,
     conv_id: &str,
     conv_kind: &str,
     message_id: &str,
-    shared: bool,
+    scope: Scope,
 ) -> (Vec<McpServer>, Option<crate::gateway::GrantGuard>) {
+    let shared = scope == Scope::Shared;
     let mut args = vec![
         "mcp".into(),
         "--data-dir".into(),
@@ -1065,7 +1167,7 @@ async fn mcp_servers(
         },
         timeout_secs: None,
     }];
-    if shared {
+    if scope != Scope::Private {
         return (servers, None);
     }
     match crate::gateway::grant_for_turn(state, user_id, conv_id, conv_kind, message_id).await {
@@ -1172,9 +1274,11 @@ mod tests {
         names.insert("u1".to_string(), "Sam".to_string());
         names.insert("u2".to_string(), "Riley".to_string());
         Ctx {
+            exists: true,
             kind: kind.into(),
             members: vec!["u1".into(), "u2".into()],
             names,
+            owner: Some("u1".into()),
         }
     }
 

@@ -3,7 +3,7 @@
 // each connection's rules ("Reads freely · asks before sending"), its
 // actions, recent use, and the trusted people list.
 import { html, useEffect, useState } from './h.js';
-import { get, post, put, patch, del, ApiError } from './api.js';
+import { get, post, put, patch, del, seg, ApiError } from './api.js';
 import { S, set, useStore, go, toast, loadConnectors } from './store.js';
 import {
   Icon, Row, Group, Page, Spinner, Toggle, LetterTile, Empty,
@@ -103,7 +103,7 @@ export function ServiceSignIn({ con, label, onDone }) {
   const start = async () => {
     setBusy(true);
     try {
-      setFlow(await post(`/connectors/${con.id}/oauth/start`, { origin: location.origin }));
+      setFlow(await post(`/connectors/${seg(con.id)}/oauth/start`, { origin: location.origin }));
       setClient(null);
     } catch (e) {
       if (e instanceof ApiError && e.code === 'needs_client') setClient(e.message);
@@ -127,7 +127,7 @@ export function ServiceSignIn({ con, label, onDone }) {
     e.preventDefault();
     setBusy(true);
     try {
-      await post(`/connectors/${con.id}/oauth/client`, { client_id: cid.trim(), client_secret: secret.trim() || undefined });
+      await post(`/connectors/${seg(con.id)}/oauth/client`, { client_id: cid.trim(), client_secret: secret.trim() || undefined });
       await start();
     } catch (err) { toast(err.message); }
     setBusy(false);
@@ -284,7 +284,7 @@ function ToolSheet({ con, tool, onSaved }) {
   const choose = async (rule) => {
     closeSheet();
     try {
-      const r = await put(`/connectors/${con.id}/policy`, { tools: { [tool.name]: rule } });
+      const r = await put(`/connectors/${seg(con.id)}/policy`, { tools: { [tool.name]: rule } });
       onSaved(r.connector);
     } catch (e) { toast(e.message); }
   };
@@ -300,27 +300,27 @@ export function ConnectorPage({ id }) {
   const [tools, setTools] = useState(null);
   const [recent, setRecent] = useState(null);
   const con = (S.connectors || []).find((c) => c.id === id);
-  const loadTools = () => get(`/connectors/${id}/tools`).then(setTools).catch((e) => setTools({ tools: [], error: e.message }));
+  const loadTools = () => get(`/connectors/${seg(id)}/tools`).then(setTools).catch((e) => setTools({ tools: [], error: e.message }));
   useEffect(() => {
     if (!S.connectors) loadConnectors().catch(() => {});
-    get(`/connectors/activity?connector_id=${id}&limit=8`).then((r) => setRecent(r.items)).catch(() => setRecent([]));
+    get(`/connectors/activity?connector_id=${encodeURIComponent(id)}&limit=8`).then((r) => setRecent(r.items)).catch(() => setRecent([]));
   }, [id]);
   useEffect(() => { if (con?.enabled && con.auth_state === 'ok') loadTools(); }, [id, con?.enabled, con?.auth_state, con?.updated_at]);
   if (!con) return html`<${Page} title="Connection">${S.connectors ? html`<${Empty} icon="plug" title="Not found">That connection is gone.<//>` : html`<${Spinner} />`}<//>`;
   const label = labelOf(con);
   const replace = (c) => set({ connectors: S.connectors.map((x) => (x.id === c.id ? c : x)) });
   const toggle = async (on) => {
-    try { replace((await post(`/connectors/${id}/${on ? 'connect' : 'disconnect'}`)).connector); } catch (e) { toast(e.message); }
+    try { replace((await post(`/connectors/${seg(id)}/${on ? 'connect' : 'disconnect'}`)).connector); } catch (e) { toast(e.message); }
   };
   const resume = async () => {
-    try { replace((await post(`/connectors/${id}/resume`)).connector); toast(`${label} is back on`); } catch (e) { toast(e.message); }
+    try { replace((await post(`/connectors/${seg(id)}/resume`)).connector); toast(`${label} is back on`); } catch (e) { toast(e.message); }
   };
   const mode = async (m) => {
-    try { replace((await put(`/connectors/${id}/policy`, { mode: m })).connector); loadTools(); } catch (e) { toast(e.message); }
+    try { replace((await put(`/connectors/${seg(id)}/policy`, { mode: m })).connector); loadTools(); } catch (e) { toast(e.message); }
   };
   const remove = async () => {
     if (!(await confirmSheet({ title: `Remove ${label}?`, body: `${agentName()} won't be able to use it anymore. Its saved secrets and sign-in are deleted from this server.`, yes: 'Remove', danger: true }))) return;
-    try { await del(`/connectors/${id}`); await loadConnectors(); go('iris/connections'); } catch (e) { toast(e.message); }
+    try { await del(`/connectors/${seg(id)}`); await loadConnectors(); go('iris/connections'); } catch (e) { toast(e.message); }
   };
   const needsSignIn = con.oauth && con.auth_state !== 'ok';
   return html`<${Page} title=${label} sub=${con.oauth?.account ? `Connected as ${con.oauth.account}` : con.description || 'A connected service'}>
@@ -393,7 +393,7 @@ export function ConnectorForm({ id }) {
         toast('Added');
         go(`iris/connections/${r.connector.id}`);
       } else {
-        await patch(`/connectors/${id}`, body);
+        await patch(`/connectors/${seg(id)}`, body);
         await loadConnectors();
         toast('Saved');
         go(`iris/connections/${id}`);

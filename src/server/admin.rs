@@ -292,7 +292,7 @@ async fn start_login(
     if entry.harness.login().is_none() {
         // No headless login: re-check (the owner may have signed in on the
         // server) and return the manual step.
-        let auth = state.probe_auth(&name).await;
+        let auth = state.recheck_auth(&name).await;
         return ok(json!({
             "login": null,
             "manual": entry.harness.manual_login_hint(),
@@ -741,7 +741,7 @@ pub fn luhn_ok(digits: &str) -> bool {
             }
         })
         .sum();
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 /// Secret fields supplied in a request (only those present).
@@ -863,52 +863,62 @@ async fn update_credential(
     JsonBody(body): JsonBody<CredentialBody>,
 ) -> ApiResult {
     user.require_owner()?;
-    let (uid, cid) = (user.id().to_string(), id.clone());
-    let existing = state
-        .db
-        .call(move |c| entities::get_credential(c, &uid, &cid))
-        .await?
-        .ok_or_else(|| ApiError::not_found("credential"))?;
     if let Some(l) = &body.label {
         check_text("label", l, 200, true)?;
     }
-    let (mut meta, secret) = credential_parts(&existing.kind, &body)?;
-    // Keep metadata fields that were not supplied.
-    if let (Some(new), Some(old)) = (meta.as_object_mut(), existing.metadata.as_object()) {
-        for (k, v) in old {
-            if new.get(k).is_none_or(Value::is_null) {
-                new.insert(k.clone(), v.clone());
-            }
-        }
-    }
-    // Merge supplied secret fields into the stored secret so a partial
-    // update (e.g. only notes) keeps the rest. Decrypted only in memory.
-    let ct = if secret.is_empty() {
-        None
-    } else {
-        let (uid, cid) = (user.id().to_string(), id.clone());
-        let stored = state
-            .db
-            .call(move |c| entities::get_credential_ciphertext(c, &uid, &cid))
-            .await?
-            .ok_or_else(|| ApiError::not_found("credential"))?;
-        let plain = state.vault.decrypt(&stored, &id)?;
-        let mut merged: SecretFields = serde_json::from_slice(&plain).unwrap_or_default();
-        merged.extend(secret);
-        Some(
-            state
-                .vault
-                .encrypt(Value::Object(merged).to_string().as_bytes(), &id)?,
-        )
-    };
-    let (uid, label) = (user.id().to_string(), body.label.clone());
+    let (uid, st) = (user.id().to_string(), state.clone());
+    // Read, merge, and write in one database call (one connection, one
+    // lock), so concurrent partial updates cannot overwrite each other.
     let cred = state
         .db
         .call(move |c| {
-            entities::update_credential(c, &uid, &id, label.as_deref(), Some(&meta), ct.as_deref())
+            let Some(existing) = entities::get_credential(c, &uid, &id)? else {
+                return Ok(Err(ApiError::not_found("credential")));
+            };
+            let (mut meta, secret) = match credential_parts(&existing.kind, &body) {
+                Ok(parts) => parts,
+                Err(e) => return Ok(Err(e)),
+            };
+            // Keep metadata fields that were not supplied.
+            if let (Some(new), Some(old)) = (meta.as_object_mut(), existing.metadata.as_object()) {
+                for (k, v) in old {
+                    if new.get(k).is_none_or(Value::is_null) {
+                        new.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            // Merge supplied secret fields into the stored secret so a
+            // partial update (e.g. only notes) keeps the rest. Decrypted
+            // only in memory.
+            let ct = if secret.is_empty() {
+                None
+            } else {
+                let Some(stored) = entities::get_credential_ciphertext(c, &uid, &id)? else {
+                    return Ok(Err(ApiError::not_found("credential")));
+                };
+                let sealed = st.vault.decrypt(&stored, &id).and_then(|plain| {
+                    let mut merged: SecretFields =
+                        serde_json::from_slice(&plain).unwrap_or_default();
+                    merged.extend(secret);
+                    st.vault
+                        .encrypt(Value::Object(merged).to_string().as_bytes(), &id)
+                });
+                match sealed {
+                    Ok(ct) => Some(ct),
+                    Err(e) => return Ok(Err(e.into())),
+                }
+            };
+            Ok(entities::update_credential(
+                c,
+                &uid,
+                &id,
+                body.label.as_deref(),
+                Some(&meta),
+                ct.as_deref(),
+            )?
+            .ok_or_else(|| ApiError::not_found("credential")))
         })
-        .await?
-        .ok_or_else(|| ApiError::not_found("credential"))?;
+        .await??;
     ok(json!({"credential": cred}))
 }
 

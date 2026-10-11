@@ -90,6 +90,33 @@ fn signal_group(pid: Option<u32>, sig: libc::c_int) {
     }
 }
 
+/// Whether any process is left in the group (zombies awaiting their
+/// reaper still count, so callers bound how long they wait).
+fn group_alive(pid: Option<u32>) -> bool {
+    match pid.and_then(|p| i32::try_from(p).ok()) {
+        // SAFETY: signal 0 only checks for existence and permission.
+        Some(pid) if pid > 0 => unsafe { libc::kill(-pid, 0) == 0 },
+        _ => false,
+    }
+}
+
+/// Stop everything left in the CLI's process group (MCP servers, shell
+/// commands): SIGTERM, a short grace period, then SIGKILL for anything
+/// that ignored it.
+async fn reap_group(pid: Option<u32>) {
+    if !group_alive(pid) {
+        return;
+    }
+    signal_group(pid, libc::SIGTERM);
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !group_alive(pid) {
+            return;
+        }
+    }
+    signal_group(pid, libc::SIGKILL);
+}
+
 async fn read_tail(mut r: impl tokio::io::AsyncRead + Unpin) -> String {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -134,7 +161,7 @@ pub async fn run(
         let _ = stdin.shutdown().await;
     });
     let stderr = child.stderr.take().expect("piped stderr");
-    let stderr_task = tokio::spawn(read_tail(stderr));
+    let mut stderr_task = tokio::spawn(read_tail(stderr));
     let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
 
     let mut outcome = RunOutcome::default();
@@ -184,14 +211,19 @@ pub async fn run(
             child.wait().await.ok()
         }
     };
-    // Reap anything the CLI left behind in its group (e.g. MCP servers).
-    signal_group(pid, libc::SIGTERM);
+    // Stop anything the CLI left behind in its group (e.g. MCP servers),
+    // even if it ignores SIGTERM, before this run's slot is released.
+    reap_group(pid).await;
     outcome.exit_ok = status.is_some_and(|s| s.success());
-    outcome.stderr_tail = tokio::time::timeout(Duration::from_secs(2), stderr_task)
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or_default();
+    outcome.stderr_tail = match tokio::time::timeout(Duration::from_secs(2), &mut stderr_task).await
+    {
+        Ok(r) => r.unwrap_or_default(),
+        Err(_) => {
+            // Something outside the group still holds stderr open.
+            stderr_task.abort();
+            String::new()
+        }
+    };
     if !outcome.timed_out && !outcome.cancelled {
         for ev in parser.finish(outcome.exit_ok, &outcome.stderr_tail) {
             let _ = events.send(ev);
@@ -283,12 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn streams_stdin_through_and_finishes() {
-        let (out, evs) = sh(
-            "cat; echo \"k=${IRIS_TEST_SECRET:-unset} pwd=$PWD\"",
-            b"a\nb\n",
-            5000,
-        )
-        .await;
+        let (out, evs) = sh("cat; echo \"done pwd=$PWD\"", b"a\nb\n", 5000).await;
         assert!(out.exit_ok && !out.timed_out);
         assert_eq!(
             evs,
@@ -297,11 +324,96 @@ mod tests {
                 HarnessEvent::TextDelta { text: "b".into() },
                 // PWD is the run's directory, not the daemon's.
                 HarnessEvent::TextDelta {
-                    text: "k=unset pwd=/".into()
+                    text: "done pwd=/".into()
                 },
                 HarnessEvent::Done
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn strips_inherited_variables() {
+        // A variable this process really has (stand-in for an inherited API
+        // key such as ANTHROPIC_API_KEY); setting one here would race other
+        // tests.
+        assert!(std::env::var_os("HOME").is_some(), "test needs HOME set");
+        let inv = Invocation {
+            args: vec!["-c".into(), "echo \"k=${HOME:-unset}\"".into()],
+            ..Default::default()
+        };
+        for (strip, want_unset) in [(&["HOME"][..], true), (&[][..], false)] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (_ctx, crx) = watch::channel(false);
+            run(
+                RunRequest {
+                    program: Path::new("/bin/sh"),
+                    invocation: &inv,
+                    cwd: Path::new("/"),
+                    env_remove: strip,
+                    timeout: Duration::from_secs(10),
+                },
+                Box::new(Echo),
+                crx,
+                tx,
+            )
+            .await
+            .unwrap();
+            let first = rx.recv().await.unwrap();
+            assert_eq!(
+                first
+                    == (HarnessEvent::TextDelta {
+                        text: "k=unset".into()
+                    }),
+                want_unset,
+                "{first:?}"
+            );
+        }
+    }
+
+    /// Whether `pid` is a live (non-zombie) process.
+    fn running(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, rest)| !rest.starts_with('Z')),
+            Err(_) => false,
+        }
+    }
+
+    async fn wait_gone(pid: i32) -> bool {
+        for _ in 0..50 {
+            if !running(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    fn read_pid(path: &Path) -> i32 {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn leftover_processes_that_ignore_sigterm_are_killed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("pid");
+        // The CLI exits right away; its child ignores SIGTERM.
+        let script = format!(
+            "(trap '' TERM; exec sleep 30) >/dev/null 2>&1 </dev/null & echo $! > {}; echo hi",
+            pidfile.display()
+        );
+        let start = std::time::Instant::now();
+        let (out, evs) = sh(&script, b"", 10_000).await;
+        assert!(out.exit_ok && !out.timed_out);
+        assert_eq!(evs.last(), Some(&HarnessEvent::Done));
+        let pid = read_pid(&pidfile);
+        assert!(wait_gone(pid).await, "descendant {pid} survived the run");
+        assert!(start.elapsed() < Duration::from_secs(8));
     }
 
     #[tokio::test]
@@ -348,11 +460,22 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_kills_process_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("pid");
         let start = std::time::Instant::now();
-        let (out, evs) = sh("sleep 30 & sleep 30; echo never", b"", 300).await;
+        let script = format!(
+            "(trap '' TERM; exec sleep 30) & echo $! > {}; sleep 30; echo never",
+            pidfile.display()
+        );
+        let (out, evs) = sh(&script, b"", 300).await;
         assert!(out.timed_out);
         assert!(evs.is_empty());
         assert!(start.elapsed() < Duration::from_secs(10));
+        let pid = read_pid(&pidfile);
+        assert!(
+            wait_gone(pid).await,
+            "descendant {pid} survived the timeout"
+        );
     }
 
     #[tokio::test]
