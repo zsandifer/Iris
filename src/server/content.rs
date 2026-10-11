@@ -473,6 +473,9 @@ async fn delete_goal(
 #[derive(Deserialize)]
 struct LibraryQuery {
     kind: Option<String>,
+    limit: Option<usize>,
+    before: Option<i64>,
+    before_id: Option<String>,
 }
 
 async fn list_library(
@@ -483,9 +486,19 @@ async fn list_library(
     let uid = user.id().to_string();
     let items = state
         .db
-        .call(move |c| entities::list_library(c, &uid, q.kind.as_deref()))
+        .call(move |c| {
+            let limit = q.limit.unwrap_or(100).clamp(1, 500);
+            let before = q
+                .before
+                .map(|at| (at, q.before_id.as_deref().unwrap_or("")));
+            entities::list_library_page(c, &uid, q.kind.as_deref(), before, limit + 1)
+                .map(|items| (items, limit))
+        })
         .await?;
-    ok(json!({"items": items}))
+    let (mut items, limit) = items;
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    ok(json!({"items": items, "has_more": has_more}))
 }
 
 async fn get_library_item(

@@ -392,9 +392,19 @@ impl Bridge {
                     .as_deref()
                     .ok_or("no current conversation")?;
                 let card = entities::validate_card(a)?;
+                // In the owner's own chat the card may carry private context:
+                // it stays hidden until the turn is saved, which publishes it
+                // only if nobody else has joined meanwhile.
+                let status = if self.owner_context() {
+                    "pending"
+                } else {
+                    "complete"
+                };
                 let m = self
                     .db
-                    .with(|c| entities::insert_card(c, conv, &card, "assistant"))
+                    .with(|c| {
+                        entities::insert_card_with_status(c, conv, &card, "assistant", status)
+                    })
                     .map_err(db_err)?;
                 Ok(json!({"card_message_id": m.id, "shown": true}))
             }
@@ -733,10 +743,26 @@ mod tests {
         );
         assert_eq!(r["structuredContent"]["shown"], true);
         let conv = b.conversation_id.clone().unwrap();
+        // The owner's own chat: held back until the turn is saved.
+        let card_id = r["structuredContent"]["card_message_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let card =
+            b.db.with(|c| db::get_message(c, &card_id))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            (card.kind.as_str(), card.status.as_str()),
+            ("card", "pending")
+        );
         let msgs =
             b.db.with(|c| db::list_messages(c, &conv, None, 10))
                 .unwrap();
-        assert_eq!(msgs.last().unwrap().kind, "card");
+        assert!(
+            msgs.iter().all(|m| m.id != card_id),
+            "hidden until published"
+        );
 
         let r = call(
             &b,

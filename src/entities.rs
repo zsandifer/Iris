@@ -578,12 +578,29 @@ pub fn list_library(
     user_id: &str,
     kind: Option<&str>,
 ) -> rusqlite::Result<Vec<LibraryItem>> {
+    list_library_page(conn, user_id, kind, None, 500)
+}
+
+/// Newest first by (created_at, id); `before` is the previous page's last
+/// item as `(created_at, id)`.
+pub fn list_library_page(
+    conn: &Connection,
+    user_id: &str,
+    kind: Option<&str>,
+    before: Option<(i64, &str)>,
+    limit: usize,
+) -> rusqlite::Result<Vec<LibraryItem>> {
+    let (before_at, before_id) = before.unwrap_or((i64::MAX, ""));
     let mut stmt = conn.prepare(&format!(
         "{LIBRARY_SELECT} WHERE l.user_id = ?1 AND (?2 IS NULL OR l.kind = ?2)
-         ORDER BY l.created_at DESC LIMIT 500"
+           AND (l.created_at < ?3 OR (l.created_at = ?3 AND (?4 = '' OR l.id < ?4)))
+         ORDER BY l.created_at DESC, l.id DESC LIMIT ?5"
     ))?;
-    stmt.query_map(params![user_id, kind], library_from_row)?
-        .collect()
+    stmt.query_map(
+        params![user_id, kind, before_at, before_id, limit as i64],
+        library_from_row,
+    )?
+    .collect()
 }
 
 /// Returns the deleted item's file name so the caller can remove the file.
@@ -660,6 +677,18 @@ pub fn insert_card(
     card: &Value,
     role: &str,
 ) -> rusqlite::Result<Message> {
+    insert_card_with_status(conn, conversation_id, card, role, "complete")
+}
+
+/// `pending` cards (made during a turn with the owner's private context)
+/// are hidden until the turn is saved, which publishes or deletes them.
+pub fn insert_card_with_status(
+    conn: &Connection,
+    conversation_id: &str,
+    card: &Value,
+    role: &str,
+    status: &str,
+) -> rusqlite::Result<Message> {
     let fallback = card["title"].as_str().unwrap_or("").to_string();
     insert_message(
         conn,
@@ -669,6 +698,7 @@ pub fn insert_card(
             kind: "card",
             content: &fallback,
             card: Some(card),
+            status,
             ..Default::default()
         },
     )
@@ -1124,6 +1154,13 @@ mod tests {
                 get_library_item(c, &owner, "a2")?.unwrap().conversation_id,
                 None
             );
+            // Paging by (created_at, id) walks every item once, ties included.
+            c.execute("UPDATE library_items SET created_at = 42", [])?;
+            let first = list_library_page(c, &owner, None, None, 1)?;
+            let last = first.last().unwrap();
+            let second = list_library_page(c, &owner, None, Some((last.created_at, &last.id)), 1)?;
+            assert_eq!(first.len() + second.len(), 2);
+            assert_ne!(first[0].id, second[0].id);
             Ok(())
         })
         .unwrap();

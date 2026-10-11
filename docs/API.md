@@ -423,8 +423,10 @@ policy keeps Claude out unless the owner opts in
 ([section 8](#8-the-iris-mcp-bridge)). In all conversations, bridge tools
 act on the creator's data.
 
-The Iris owner's **private context** (`USER.md`, `MEMORY.md` and the memory
-notes, write access to `memory/`, and connectors) is only given to turns in
+The Iris owner's **private context** (`USER.md`, `TOOLS.md`,
+`PROACTIVE_PREFERENCES.md`, `MEMORY.md` and the memory notes, write access
+to `memory/`, and connectors; only the agent's character in `IDENTITY.md`
+and `SOUL.md` is shared) is only given to turns in
 a conversation whose single member is the Iris owner, and to scheduled jobs.
 Other people's own chats and all shared conversations get none of it, and
 there the CLI also runs without the MCP servers, memory, and account
@@ -872,12 +874,15 @@ Items are saved by the agent through `save_to_library`. Kinds: `artifact`
 | Query | Type | Notes |
 |---|---|---|
 | `kind` | string | Optional exact filter (`artifact` or `media`; not validated). |
+| `limit` | int | Default 100, clamped to 1..500. |
+| `before` | int | Next page: the previous page's last `created_at`. |
+| `before_id` | string | With `before`: the previous page's last `id` (ties on `created_at`). |
 
 ```json
-{"items": [{LibraryItem}]}
+{"items": [{LibraryItem}], "has_more": false}
 ```
 
-Newest first, at most 500.
+Newest first, by `created_at` then `id`.
 
 #### `GET /api/library/{id}`
 
@@ -2167,8 +2172,10 @@ slot in a shared chat falls back to the next allowed model (`router:
 
 Shared conversations are also isolated from the owner's data: their turns
 get no connectors, a cards-only bridge (see
-[section 8](#8-the-iris-mcp-bridge)), a system prompt without `USER.md`,
-`MEMORY.md`, or the memory index, and no write access to the memory folder.
+[section 8](#8-the-iris-mcp-bridge)), a system prompt with only `IDENTITY.md`
+and `SOUL.md` of the persona files (no `USER.md`, `TOOLS.md`,
+`PROACTIVE_PREFERENCES.md`, `MEMORY.md`, or memory index), and no write
+access to the memory folder.
 The CLI's own read tools are governed by its permission settings, so treat
 group chat as a preview until it gets its own access model.
 

@@ -330,6 +330,9 @@ pub async fn run_job(state: &AppState, job: Job) -> crate::util::Result<()> {
                 return Ok(());
             }
             post_to_main(state, &owner, &text, &result.message, "heartbeat").await?;
+            // Cards the heartbeat showed went to its hidden conversation;
+            // the user only sees Main.
+            move_cards_to_main(state, &owner, &result.message).await?;
         }
         Job::Feed => {
             state.hub.to_users(
@@ -337,6 +340,40 @@ pub async fn run_job(state: &AppState, job: Job) -> crate::util::Result<()> {
                 json!({"type": "entities.changed", "kinds": ["feed", "ideas"]}),
             );
         }
+    }
+    Ok(())
+}
+
+/// Copy the cards a job turn created (after its reply placeholder, in the
+/// hidden job conversation) into the user's Main chat, and broadcast them.
+pub async fn move_cards_to_main(
+    state: &AppState,
+    user_id: &str,
+    reply: &db::Message,
+) -> crate::util::Result<()> {
+    let (uid, job_conv, after) = (
+        user_id.to_string(),
+        reply.conversation_id.clone(),
+        reply.created_at,
+    );
+    let moved = state
+        .db
+        .call(move |c| {
+            let main = db::ensure_main_conversation(c, &uid)?;
+            let mut moved = Vec::new();
+            for m in db::messages_between(c, &job_conv, after, i64::MAX)? {
+                if let (true, Some(card)) = (m.kind == "card", m.card) {
+                    moved.push(entities::insert_card(c, &main, &card, "assistant")?);
+                }
+            }
+            Ok(moved)
+        })
+        .await?;
+    for m in moved {
+        state.hub.to_users(
+            &[user_id.to_string()],
+            json!({"type": "message.created", "conversation_id": m.conversation_id, "message": m}),
+        );
     }
     Ok(())
 }
