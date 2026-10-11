@@ -458,12 +458,7 @@ impl AppState {
     }
 
     pub async fn slot_pins(&self) -> BTreeMap<Slot, Pin> {
-        match self.setting("slots").await {
-            Some(raw) => parse_slot_pins(&raw),
-            // Earlier versions stored one pinned engine; it becomes the
-            // chat slot's pin.
-            None => legacy_engine_pin(&self.setting("engine").await.unwrap_or_default()),
-        }
+        self.db.call(stored_slot_pins).await.unwrap_or_default()
     }
 
     /// Owner opt-in (config or app setting) to use Claude in conversations
@@ -604,6 +599,15 @@ pub fn parse_slot_pins(raw: &str) -> BTreeMap<Slot, Pin> {
 pub fn slot_pins_json(pins: &BTreeMap<Slot, Pin>) -> String {
     let m: BTreeMap<&str, &Pin> = pins.iter().map(|(s, p)| (s.name(), p)).collect();
     serde_json::to_string(&m).unwrap_or_else(|_| "{}".into())
+}
+
+/// The slot pins as stored. Earlier versions stored one pinned engine; it
+/// becomes the chat slot's pin.
+pub fn stored_slot_pins(c: &rusqlite::Connection) -> rusqlite::Result<BTreeMap<Slot, Pin>> {
+    Ok(match crate::db::get_setting(c, "slots")? {
+        Some(raw) => parse_slot_pins(&raw),
+        None => legacy_engine_pin(&crate::db::get_setting(c, "engine")?.unwrap_or_default()),
+    })
 }
 
 fn legacy_engine_pin(raw: &str) -> BTreeMap<Slot, Pin> {

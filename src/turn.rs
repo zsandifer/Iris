@@ -177,12 +177,20 @@ struct Audience {
 }
 
 impl Audience {
-    fn new(state: &AppState, conv_id: &str, users: Vec<String>) -> Self {
+    /// `generation` must be read before `users` was loaded, so a removal
+    /// that lands in between is still noticed.
+    fn new(conv_id: &str, users: Vec<String>, generation: u64) -> Self {
         Self {
             conv_id: conv_id.to_string(),
             users,
-            generation: state.membership_generation.load(Ordering::SeqCst),
+            generation,
         }
+    }
+
+    /// Narrow to a fresher member list read after `generation`.
+    fn refresh(&mut self, members: &[String], generation: u64) {
+        self.users.retain(|u| members.contains(u));
+        self.generation = generation;
     }
 
     async fn current(&mut self, state: &AppState) -> &[String] {
@@ -211,6 +219,7 @@ async fn run_locked(
 ) -> TurnResult {
     let conv_id = input.conversation_id.as_str();
     let msg_id = input.assistant_message.id.as_str();
+    let generation = state.membership_generation.load(Ordering::SeqCst);
     let ctx = load_ctx(state, conv_id).await;
     if !ctx.exists {
         // Deleted while this turn waited in line: never run the CLI for it.
@@ -222,17 +231,14 @@ async fn run_locked(
     }
     // Job conversations are hidden; their turns are not streamed to anyone.
     let mut audience = Audience::new(
-        state,
         conv_id,
         if ctx.kind == "job" {
             Vec::new()
         } else {
             ctx.members.clone()
         },
+        generation,
     );
-    // Engine policy: more than one human. Privacy: see `Ctx::scope`.
-    let shared = ctx.members.len() > 1;
-    let scope = ctx.scope();
 
     if state.limiter.saturated() {
         state.hub.to_users(
@@ -246,6 +252,37 @@ async fn run_locked(
             return finish(state, input, &mut audience, &Acc::default(), json!(null), Outcome::Cancelled).await;
         }
     };
+    // Waiting for a slot can take long: decide who is in the conversation
+    // (privacy scope, engine policy) only now that the CLI is about to run.
+    let generation = state.membership_generation.load(Ordering::SeqCst);
+    let ctx = load_ctx(state, conv_id).await;
+    if !ctx.exists {
+        crate::info!("turn {msg_id}: conversation is gone; skipped");
+        return TurnResult {
+            message: input.assistant_message.clone(),
+            ok: false,
+        };
+    }
+    audience.refresh(&ctx.members, generation);
+    if let Some(author) = &input.user_message.author_user_id
+        && !ctx.members.contains(author)
+    {
+        // The sender left (or was removed) before the turn started; never
+        // answer them, least of all with whatever context remains.
+        crate::info!("turn {msg_id}: sender is no longer a member; skipped");
+        return finish(
+            state,
+            input,
+            &mut audience,
+            &Acc::default(),
+            json!(null),
+            Outcome::Cancelled,
+        )
+        .await;
+    }
+    // Engine policy: more than one human. Privacy: see `Ctx::scope`.
+    let shared = ctx.members.len() > 1;
+    let scope = ctx.scope();
     state.hub.to_users(
         audience.current(state).await,
         json!({"type": "turn.status", "conversation_id": conv_id, "message_id": msg_id, "status": "running"}),

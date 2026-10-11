@@ -430,7 +430,9 @@ Other people's own chats and all shared conversations get none of it. When
 the people in a conversation change (for example a group gets its second
 member), the CLI session is restarted rather than resumed, so nothing from
 a private session carries over; a member who leaves stops receiving a
-running turn's events at once.
+running turn's events at once. Membership is read when a turn actually
+starts (after any wait for a CLI slot), and a queued message whose sender
+has left by then is not answered (its reply ends `cancelled`).
 
 #### `GET /api/conversations`
 
