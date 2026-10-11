@@ -63,9 +63,17 @@ pub fn fetch(f: &Fetcher, src: &Source, now_ms: i64) -> Result<Fetched, String> 
 
 fn fetch_rss(f: &Fetcher, url: &str, state: &Value) -> Result<Fetched, String> {
     let feed_url = state["feed_url"].as_str().unwrap_or(url).to_string();
-    // Read whole once a day (no conditional request): items not picked
-    // today stay candidates tomorrow.
-    let req = Request::new(&feed_url, Mode::Feed, FEED_ACCEPT, MAX_FEED_BYTES);
+    // Until the address has proven to be a feed it may be a web page Iris
+    // would be crawling (to find its feed), so robots.txt applies; a
+    // confirmed feed is read like a feed reader reads it. Read whole once a
+    // day (no conditional request): items not picked today stay candidates
+    // tomorrow.
+    let mode = if state["confirmed"].as_bool() == Some(true) {
+        Mode::Feed
+    } else {
+        Mode::Crawl
+    };
+    let req = Request::new(&feed_url, mode, FEED_ACCEPT, MAX_FEED_BYTES);
     let res = f.get(&req).map_err(|e| e.to_string())?;
     let text = res.text();
     let (doc, feed_url) = match parse::parse_feed(&text, &res.final_url) {
@@ -77,7 +85,7 @@ fn fetch_rss(f: &Fetcher, url: &str, state: &Value) -> Result<Fetched, String> {
             let r2 = f
                 .get(&Request::new(
                     &link,
-                    Mode::Feed,
+                    Mode::Crawl,
                     FEED_ACCEPT,
                     MAX_FEED_BYTES,
                 ))
@@ -102,7 +110,7 @@ fn fetch_rss(f: &Fetcher, url: &str, state: &Value) -> Result<Fetched, String> {
             it.source_kind = "rss".into();
         }
     }
-    let mut st = json!({});
+    let mut st = json!({"confirmed": true});
     if feed_url != url {
         st["feed_url"] = feed_url.into();
     }
@@ -334,11 +342,27 @@ pub type YoutubeAccount = (Vec<(String, String)>, Vec<String>);
 /// (with titles) and the titles of recently liked videos.
 pub fn youtube_account(f: &Fetcher, token: &str) -> Result<YoutubeAccount, String> {
     let base = "https://www.googleapis.com/youtube/v3";
-    let subs = get_json(
-        f,
-        &format!("{base}/subscriptions?part=snippet&mine=true&maxResults=50&order=relevance"),
-        Some(token),
-    )?;
+    // Every subscription (up to 250); the run's source rotation then reads
+    // them a few at a time.
+    let mut subs = Vec::new();
+    let mut page = String::new();
+    for _ in 0..5 {
+        let v = get_json(
+            f,
+            &format!(
+                "{base}/subscriptions?part=snippet&mine=true&maxResults=50&order=alphabetical{page}"
+            ),
+            Some(token),
+        )?;
+        subs.extend(parse::youtube_subscriptions(&v));
+        match v["nextPageToken"].as_str().filter(|t| {
+            t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        }) {
+            Some(t) => page = format!("&pageToken={t}"),
+            None => break,
+        }
+    }
     let likes = get_json(
         f,
         &format!("{base}/videos?part=snippet&myRating=like&maxResults=25"),
@@ -347,7 +371,7 @@ pub fn youtube_account(f: &Fetcher, token: &str) -> Result<YoutubeAccount, Strin
     .map(|v| parse::youtube_likes(&v))
     .unwrap_or_default();
     Ok((
-        parse::youtube_subscriptions(&subs),
+        subs,
         likes
             .into_iter()
             .map(|(t, c)| format!("{t} ({c})"))
@@ -383,10 +407,9 @@ pub fn parse_input(input: &str) -> Result<(String, String), String> {
         .strip_prefix("r/")
         .or_else(|| lower.strip_prefix("/r/"))
     {
-        let name = &t[t.len() - r.len()..];
-        let name = name.trim_matches('/');
+        let name = r.trim_matches('/');
         return if subreddit(name) {
-            Ok(("reddit".into(), name.into()))
+            Ok(("reddit".into(), name.to_ascii_lowercase()))
         } else {
             Err(bad())
         };
@@ -481,7 +504,8 @@ pub fn parse_input(input: &str) -> Result<(String, String), String> {
                 .map(|r| r.split('/').next().unwrap_or(""))
                 .unwrap_or("");
             if subreddit(name) {
-                Ok(("reddit".into(), name.into()))
+                // One spelling per subreddit, so removals and choices stick.
+                Ok(("reddit".into(), name.to_ascii_lowercase()))
             } else {
                 Err(bad())
             }
@@ -579,7 +603,7 @@ mod tests {
         assert_eq!(p("r/space").unwrap(), "reddit:space");
         assert_eq!(
             p("https://www.reddit.com/r/AskScience/").unwrap(),
-            "reddit:AskScience"
+            "reddit:askscience"
         );
         assert_eq!(
             p("https://www.youtube.com/@SomeCreator").unwrap(),

@@ -170,10 +170,11 @@ function useEndTracking(posts, status) {
 }
 
 /**
- * Report an open once the feed (and so the batch on screen) has loaded, and
- * whenever the app comes back to the front.
+ * Report an open once the feed (and so the batch on screen) has loaded,
+ * again whenever a new batch replaces it, and when the app comes back to
+ * the front.
  */
-function useOpenTracking(loaded) {
+function useOpenTracking(loaded, batchAt) {
   useEffect(() => {
     if (!loaded) return undefined;
     let last = 0;
@@ -185,7 +186,7 @@ function useOpenTracking(loaded) {
     opened();
     document.addEventListener('visibilitychange', opened);
     return () => document.removeEventListener('visibilitychange', opened);
-  }, [loaded]);
+  }, [loaded, batchAt]);
 }
 
 function PausedCard({ status }) {
@@ -207,7 +208,7 @@ export function FeedScreen() {
   useStore();
   const [busy, setBusy] = useState(false);
   useEffect(() => { if (!S.feed) loadFeed().catch((e) => toast(e.message)); }, []);
-  useOpenTracking(!!S.feed);
+  useOpenTracking(!!S.feed, S.feed?.status?.last_batch_at ?? null);
   const posts = S.feed?.posts || [];
   const st = S.feed?.status;
   useEndTracking(posts, st);

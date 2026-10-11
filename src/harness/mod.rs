@@ -469,7 +469,20 @@ mod tests {
         };
         let args = |h: &dyn Harness| h.build(&spec).unwrap();
 
-        let c = args(&claude::Claude::new(HarnessConfig::claude_default()));
+        // Operator extra args (here: an MCP server and live web search)
+        // never reach a tool-less run.
+        let risky = vec![
+            "-c".to_string(),
+            "mcp_servers.mail.url=\"https://mcp.example.com\"".to_string(),
+            "-c".to_string(),
+            "web_search=\"live\"".to_string(),
+            "--mcp-config".to_string(),
+            "/tmp/x.json".to_string(),
+        ];
+        let mut ccfg = HarnessConfig::claude_default();
+        ccfg.extra_args = risky.clone();
+        let c = args(&claude::Claude::new(ccfg));
+        assert!(!c.args.iter().any(|a| risky.contains(a)), "{:?}", c.args);
         let pos = c.args.iter().position(|a| a == "--tools").unwrap();
         assert_eq!(c.args[pos + 1], "");
         assert!(c.args[pos + 2].starts_with("--"), "variadic flag is closed");
@@ -480,7 +493,14 @@ mod tests {
                 .any(|a| a == "--allowedTools" || a == "--permission-mode")
         );
 
-        let x = args(&codex::Codex::new(HarnessConfig::codex_default()));
+        let mut xcfg = HarnessConfig::codex_default();
+        xcfg.extra_args = risky.clone();
+        let x = args(&codex::Codex::new(xcfg));
+        assert!(
+            !x.args
+                .iter()
+                .any(|a| a.contains("mcp_servers.mail") || a.contains("\"live\""))
+        );
         for o in [
             "sandbox_mode=\"read-only\"",
             "approval_policy=\"never\"",

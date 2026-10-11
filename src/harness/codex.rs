@@ -260,7 +260,11 @@ impl Harness for Codex {
             a.push("-c".into());
             a.push(o);
         }
-        a.extend(self.cfg.extra_args.iter().cloned());
+        // Operator `extra_args` could add MCP servers or tools back, so
+        // tool-less runs leave them out.
+        if spec.tools {
+            a.extend(self.cfg.extra_args.iter().cloned());
+        }
         if let Some(id) = &spec.resume {
             a.push(id.clone());
         }

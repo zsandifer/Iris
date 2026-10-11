@@ -33,6 +33,9 @@ const MAX_CRAWL_DELAY: Duration = Duration::from_secs(10);
 /// Longest wait Iris accepts from a rate-limit header before giving up on
 /// a host for this run.
 const MAX_RATE_WAIT: Duration = Duration::from_secs(75);
+/// How far a host that asked for a longer pause is pushed back (beyond any
+/// run).
+const BLOCKED_FOR: Duration = Duration::from_secs(24 * 3600);
 
 /// Crawl (robots.txt applies) or Feed (a subscribed feed or API).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,8 +271,9 @@ impl Fetcher {
     }
 
     /// Wait for this host's next free slot. Re-checks after sleeping, since
-    /// a rate-limit header from another request may have moved it.
-    fn wait_turn(&self, host: &str, origin: &str) {
+    /// a rate-limit header from another request may have moved it. Fails
+    /// when the host asked for a longer pause than Iris waits.
+    fn wait_turn(&self, host: &str, origin: &str) -> Result<(), FetchError> {
         let gap = self.gap_for(host, origin);
         loop {
             let wait = {
@@ -279,10 +283,15 @@ impl Fetcher {
                     Some(at) if *at > now => *at - now,
                     _ => {
                         slots.insert(host.to_string(), now + gap);
-                        return;
+                        return Ok(());
                     }
                 }
             };
+            if wait > MAX_RATE_WAIT + Duration::from_secs(1) {
+                return Err(FetchError::Net(
+                    "the site asked Iris to come back later".into(),
+                ));
+            }
             std::thread::sleep(wait);
         }
     }
@@ -375,7 +384,7 @@ impl Fetcher {
     fn raw(&self, req: &Request) -> Result<Response, FetchError> {
         let host = markup::host_of(req.url).ok_or(FetchError::BadUrl)?;
         let origin = markup::origin_of(req.url).ok_or(FetchError::BadUrl)?;
-        self.wait_turn(&host, &origin);
+        self.wait_turn(&host, &origin)?;
         let mut r = self.agent.get(req.url).header("Accept", req.accept);
         if let Some(b) = req.bearer {
             r = r.header("Authorization", &format!("Bearer {b}"));
@@ -403,11 +412,17 @@ impl Fetcher {
             .and_then(|s| s.trim().parse::<f64>().ok())
             .filter(|s| s.is_finite() && *s >= 0.0)
             // Clamp before converting: huge values would panic.
-            .map(|s| Duration::from_secs_f64(s.min(MAX_RATE_WAIT.as_secs_f64() * 2.0)));
+            .map(|s| Duration::from_secs_f64(s.min(BLOCKED_FOR.as_secs_f64())));
         let mut retry = false;
         if let Some(wait) = reset {
-            let wait = wait.min(MAX_RATE_WAIT * 2);
             retry = status == 429 && wait <= MAX_RATE_WAIT;
+            // Longer than Iris will wait: the host is done for this run
+            // (`wait_turn` refuses further requests to it).
+            let wait = if wait > MAX_RATE_WAIT {
+                BLOCKED_FOR
+            } else {
+                wait
+            };
             let mut slots = self.next_slot.lock().unwrap_or_else(|p| p.into_inner());
             let at = Instant::now() + wait + Duration::from_millis(500);
             let cur = slots.entry(host.clone()).or_insert(at);
@@ -832,6 +847,13 @@ mod tests {
             Err(FetchError::Status(429))
         ));
         assert!(t0.elapsed() < Duration::from_secs(5));
+        // ...and the host is left alone for the rest of the run.
+        let t0 = Instant::now();
+        assert!(matches!(
+            f.get(&Request::new(&url, Mode::Feed, "*/*", 1000)),
+            Err(FetchError::Net(_))
+        ));
+        assert!(t0.elapsed() < Duration::from_secs(1));
         // The real resolver refuses loopback.
         let real = Fetcher::new();
         assert!(

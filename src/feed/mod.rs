@@ -70,7 +70,12 @@ pub fn next_size(current: u32, days: &[DayStat]) -> u32 {
     if published.len() < 3 {
         return current.clamp(store::MIN_DAILY_SIZE, store::MAX_DAILY_SIZE);
     }
-    let opened = published.iter().filter(|d| d.opened > 0).count();
+    // Reaching the end of a batch means it was opened, even if the open
+    // itself was not reported.
+    let opened = published
+        .iter()
+        .filter(|d| d.opened > 0 || d.reached_end > 0)
+        .count();
     let ended = published.iter().filter(|d| d.reached_end > 0).count();
     let next = if opened >= 3 && ended * 10 >= opened * 6 {
         current + (current / 4).max(2)
@@ -383,6 +388,7 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
         _ => {
             let (i, reply) = refresh_interests(state, user_id, &today, youtube_likes).await?;
             if let Some(r) = reply {
+                report.model_used = true;
                 model_notes.push((r, "interests"));
             }
             i
@@ -523,9 +529,12 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
         })
         .collect();
     // At most one summary call a day: later runs use the descriptions.
-    if !need.is_empty() && summaries_due(&st, &today) {
+    // The day is read again here: a run that started before midnight
+    // charges the call to the day it is actually made.
+    let call_day = crate::jobs::local_day(now_ms());
+    if !need.is_empty() && summaries_due(&st, &call_day) {
         let topic_names: Vec<String> = topics.iter().map(|t| t.name.clone()).collect();
-        let (b, reply) = write_blurbs(state, user_id, &today, &need, &topic_names).await;
+        let (b, reply) = write_blurbs(state, user_id, &call_day, &need, &topic_names).await;
         blurbs = b;
         if let Some(reply) = reply {
             report.model_used = true;
@@ -620,7 +629,8 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
         });
     }
     let uid = user_id.to_string();
-    let t = today.clone();
+    // Published today, by the clock now (not when the run started).
+    let t = crate::jobs::local_day(now_ms());
     let rep = report.clone().with_stats(fetcher.stats());
     let published: Vec<String> = state
         .db
@@ -1886,6 +1896,78 @@ esac
             })
             .collect();
         assert!(next_size(10, &days) >= 10);
+    }
+
+    #[test]
+    fn publication_is_atomic_ordered_and_skips_late_duplicates() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let post = |title: &str, url: &str| PipelinePost {
+            title: title.into(),
+            body: "b".into(),
+            source_url: url.into(),
+            source_name: "S".into(),
+            source_kind: "rss".into(),
+            url_key: rank::url_key(url),
+            seen_keys: vec![rank::url_key(url), rank::title_key(title)],
+            ..Default::default()
+        };
+        db.with(|c| {
+            let u = db::owner_user_id(c)?.unwrap();
+            let u = u.as_str();
+            // Nothing new: the day stays open.
+            let out = publish_batch(c, u, &[], &[], "2026-10-11", RunReport::default())?;
+            assert!(out.is_empty());
+            assert_eq!(store::get_state(c, u)?.last_batch_day, None);
+
+            // The agent posted one of these stories meanwhile.
+            entities::create_feed_post(
+                c,
+                u,
+                &entities::NewFeedPost {
+                    title: "Agent story".into(),
+                    body: "b".into(),
+                    source_url: Some("https://x.example/dup".into()),
+                    ..Default::default()
+                },
+            )?;
+            let batch = vec![
+                post("Best story of the day", "https://x.example/1"),
+                post("Different title, same link", "https://x.example/dup"),
+                post("Third story of the day", "https://x.example/3"),
+            ];
+            let keys: Vec<String> = batch.iter().flat_map(|p| p.seen_keys.clone()).collect();
+            let out = publish_batch(c, u, &batch, &keys, "2026-10-11", RunReport::default())?;
+            assert_eq!(out, vec!["Best story of the day", "Third story of the day"]);
+            let feed = entities::list_feed(c, u, None, 10)?;
+            assert_eq!(feed[0].title, "Best story of the day", "best is newest");
+            let st = store::get_state(c, u)?;
+            let end = feed
+                .iter()
+                .find(|p| p.title == "Third story of the day")
+                .unwrap();
+            assert_eq!(st.last_batch_end_id.as_deref(), Some(end.id.as_str()));
+            assert_eq!(st.last_batch_at, Some(end.created_at));
+            assert_eq!(
+                (st.last_batch_day.as_deref(), st.last_batch_count),
+                (Some("2026-10-11"), 2)
+            );
+
+            // A failure part-way rolls everything back.
+            // (feed_days is written after the posts, seen keys, and state.)
+            c.execute("DROP TABLE feed_days", [])?;
+            let before = entities::list_feed(c, u, None, 50)?.len();
+            let seen_before = store::seen_keys(c, u)?.len();
+            let more = vec![post("Fourth story here", "https://x.example/4")];
+            assert!(publish_batch(c, u, &more, &[], "2026-10-12", RunReport::default()).is_err());
+            assert_eq!(entities::list_feed(c, u, None, 50)?.len(), before);
+            assert_eq!(store::seen_keys(c, u)?.len(), seen_before);
+            assert_eq!(
+                store::get_state(c, u)?.last_batch_day.as_deref(),
+                Some("2026-10-11")
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

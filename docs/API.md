@@ -1851,7 +1851,8 @@ Codex `--ignore-user-config --ignore-rules --ephemeral`, every
 tool-providing feature disabled (`shell_tool`, `unified_exec`, `apps`,
 `plugins`, browser and computer use, `view_image`, `image_generation`,
 `code_mode_host`, ...), `sandbox_mode="read-only"`,
-`approval_policy="never"`, and `web_search="disabled"`. Gemini CLI and
+`approval_policy="never"`, and `web_search="disabled"`. The engine's `extra_args` from the config are
+left out of these calls (they could add tools back). Gemini CLI and
 OpenCode cannot reliably override tools, MCP servers, or agent permissions
 from the user's own settings, so these calls skip them (if only they are
 signed in, the feed uses the posts' own text). The day's call is reserved
@@ -1936,13 +1937,17 @@ reach 70.
 
 **Polite fetching.** `User-Agent: IrisFeed/<version> (self-hosted personal feed
 reader)`. robots.txt (redirects followed) is honored for every page read for a
-preview and every photo downloaded (`5xx` or unreachable robots.txt means
-"not this run"). Feeds and documented APIs the user
-subscribed to are read like a feed reader reads them, once a day (in full,
-so items not picked today are still candidates tomorrow). One request per
+preview, every photo downloaded, and a website address until it has proven
+to be a feed (finding a site's feed is crawling); `5xx` or unreachable
+robots.txt means "not this run". Confirmed feeds and the documented
+platform feeds and APIs (YouTube channel feeds, Reddit, Hacker News,
+Bluesky, Mastodon, the YouTube Data API) are read like a feed reader reads
+them, once a day (in full, so items not picked today are still candidates
+tomorrow). One request per
 host per second (more
 with `Crawl-delay`, up to 10 s; rate-limit headers such as Reddit's
-`x-ratelimit-reset` and `Retry-After` are honored); 8 s connect and 20 s
+`x-ratelimit-reset` and `Retry-After` are honored, and a host that asks for
+a pause longer than 75 s is left alone for the rest of the run); 8 s connect and 20 s
 overall timeouts; size caps of 4 MB for feeds and JSON, 1.5 MB for pages
 (truncated), and 6 MB for photos. Only http(s) to public addresses:
 no ambient proxy; hostnames that resolve to loopback, private, link-local, or carrier-grade
@@ -1951,7 +1956,8 @@ NAT (tailnet) addresses are refused on every redirect hop.
 **Google (YouTube).** When the Google connector has stored a token for the
 owner (vault-sealed setting `connector_token.google:<user id>`, JSON
 `{"access_token", "expires_at"}`), the run reads `subscriptions.list` and
-`videos.list?myRating=like` from the YouTube Data API. Without one, YouTube
+`videos.list?myRating=like` from the YouTube Data API (all subscriptions,
+up to 250, become `google` sources that the run reads in rotation). Without one, YouTube
 works through channel sources.
 
 ---

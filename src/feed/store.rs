@@ -658,19 +658,23 @@ mod tests {
             let s = add_source(
                 c,
                 u,
-                "rss",
-                "https://a.example/feed",
+                "reddit",
+                "spacepics",
                 None,
                 Some("Space"),
                 "suggested",
             )?
             .unwrap();
-            assert!(
-                add_source(c, u, "rss", "https://a.example/feed", None, None, "user")?.is_none()
-            );
-            for _ in 0..3 {
+            assert!(s.enabled, "fixed-host suggestions start on");
+            assert!(add_source(c, u, "reddit", "spacepics", None, None, "user")?.is_none());
+            for _ in 0..2 {
                 record_fetch(c, &s.id, Err("HTTP 404"))?;
             }
+            assert!(
+                get_source(c, u, &s.id)?.unwrap().enabled,
+                "two failures: still on"
+            );
+            record_fetch(c, &s.id, Err("HTTP 404"))?;
             let s2 = get_source(c, u, &s.id)?.unwrap();
             assert!(!s2.enabled, "failing suggested sources turn off");
             assert_eq!(s2.fail_count, 3);

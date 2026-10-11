@@ -127,7 +127,8 @@ impl Harness for Claude {
             // `--tools` is variadic, so a flag always follows it.
             a.extend(["--tools", "", "--strict-mcp-config"].map(String::from));
             a.extend(["--permission-prompts", "none"].map(String::from));
-            a.extend(self.cfg.extra_args.iter().cloned());
+            // No operator `extra_args` here: they could add MCP servers or
+            // tools back.
             inv.stdin = user_message_line(spec)?;
             return Ok(inv);
         }
