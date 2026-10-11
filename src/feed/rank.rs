@@ -210,8 +210,10 @@ pub fn assign_topics(items: &mut [Item], topics: &[Topic]) {
         let lower = text.to_lowercase();
         let ws: HashSet<String> = words(&text).into_iter().collect();
         if let Some(t) = &it.topic
-            && topics.iter().any(|x| x.name.eq_ignore_ascii_case(t))
+            && let Some(known) = topics.iter().find(|x| x.name.eq_ignore_ascii_case(t))
         {
+            // One spelling per topic, so story groups do not split.
+            it.topic = Some(known.name.clone());
             continue;
         }
         let best = topics
@@ -519,7 +521,9 @@ mod tests {
             item("Growing tomato plants indoors", "blog", None),
             item("Stock markets wobble", "biz", None),
         ];
+        items.push(item("Anything", "src", Some("space")));
         assign_topics(&mut items, &topics);
+        assert_eq!(items.pop().unwrap().topic.as_deref(), Some("Space"));
         assert_eq!(items[0].topic.as_deref(), Some("Space"));
         assert_eq!(items[1].topic.as_deref(), Some("Gardening"));
         assert_eq!(items[2].topic, None);

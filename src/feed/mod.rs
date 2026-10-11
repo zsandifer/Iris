@@ -551,23 +551,30 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
             )
         })
         .collect();
-    let cached: Vec<BTreeMap<String, String>> = tokio::task::spawn_blocking(move || {
+    // (original -> cached file, originals that turned out not to be photos)
+    type Cached = (BTreeMap<String, String>, Vec<String>);
+    let cached: Vec<Cached> = tokio::task::spawn_blocking(move || {
         parallel(to_cache, WORKERS, |(imgs, icon)| {
             let mut map = BTreeMap::new();
+            let mut unusable = Vec::new();
             for u in imgs {
                 if map.len() >= 3 {
                     break;
                 }
-                if let Some(name) = images::cache(&f, &data_dir, &u, false) {
-                    map.insert(u, name);
+                match images::cache(&f, &data_dir, &u, false) {
+                    Ok(name) => {
+                        map.insert(u, name);
+                    }
+                    Err(images::Miss::Unusable) => unusable.push(u),
+                    Err(images::Miss::Unavailable) => {}
                 }
             }
             if let Some(icon) = icon
-                && let Some(name) = images::cache(&f, &data_dir, &icon, true)
+                && let Ok(name) = images::cache(&f, &data_dir, &icon, true)
             {
                 map.insert(icon, name);
             }
-            map
+            (map, unusable)
         })
     })
     .await?;
@@ -576,7 +583,7 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
     let mut posts = Vec::with_capacity(n);
     let mut seen_new = Vec::new();
     let mut urgent_candidates: Vec<(String, parse::Event, Option<String>, bool)> = Vec::new();
-    for (rank_i, ((_, it), cache)) in picked.into_iter().zip(cached).enumerate() {
+    for (rank_i, ((_, it), (cache, unusable))) in picked.into_iter().zip(cached).enumerate() {
         let b = blurbs.remove(&format!("p{rank_i}")).unwrap_or_default();
         let good = rank::description_good_enough(&it);
         let body = if good {
@@ -607,7 +614,7 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
         } else {
             it.images
                 .iter()
-                .filter(|u| u.starts_with("https://"))
+                .filter(|u| u.starts_with("https://") && !unusable.contains(*u))
                 .take(3)
                 .cloned()
                 .collect()

@@ -113,16 +113,25 @@ fn file_name(url: &str, ext: &str) -> String {
     format!("{}.{ext}", &crate::util::sha256_hex(url)[..32])
 }
 
+/// Why an image was not cached.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Miss {
+    /// Could not fetch it (robots.txt, network, size cap).
+    Unavailable,
+    /// Fetched, but not a usable photo (too small, not an image).
+    Unusable,
+}
+
 /// Download `url` into the cache (robots.txt respected) and return the
 /// cached file name. `icon` relaxes the size checks for favicons.
-pub fn cache(fetcher: &Fetcher, data_dir: &Path, url: &str, icon: bool) -> Option<String> {
+pub fn cache(fetcher: &Fetcher, data_dir: &Path, url: &str, icon: bool) -> Result<String, Miss> {
     let dir = dir(data_dir);
     // Already cached under any extension?
     let stem = &crate::util::sha256_hex(url)[..32];
     for ext in ["jpg", "png", "gif", "webp", "avif", "ico"] {
         let name = format!("{stem}.{ext}");
         if dir.join(&name).exists() {
-            return Some(name);
+            return Ok(name);
         }
     }
     let req = Request::new(
@@ -135,25 +144,26 @@ pub fn cache(fetcher: &Fetcher, data_dir: &Path, url: &str, icon: bool) -> Optio
             MAX_IMAGE_BYTES
         },
     );
-    let res = fetcher.get(&req).ok()?;
+    let res = fetcher.get(&req).map_err(|_| Miss::Unavailable)?;
     if res.body.len() < 100 {
-        return None;
+        return Err(Miss::Unusable);
     }
-    let (_, ext) = sniff(&res.body)?;
+    let (_, ext) = sniff(&res.body).ok_or(Miss::Unusable)?;
     if !icon {
         if ext == "ico" {
-            return None;
+            return Err(Miss::Unusable);
         }
         if let Some((w, h)) = dimensions(&res.body)
             && (w < MIN_PHOTO_WIDTH || h < MIN_PHOTO_WIDTH / 2)
         {
-            return None;
+            return Err(Miss::Unusable);
         }
     }
-    crate::config::ensure_private_dir(&dir).ok()?;
+    crate::config::ensure_private_dir(&dir).map_err(|_| Miss::Unavailable)?;
     let name = file_name(url, ext);
-    crate::config::write_private_file(&dir.join(&name), &res.body).ok()?;
-    Some(name)
+    crate::config::write_private_file(&dir.join(&name), &res.body)
+        .map_err(|_| Miss::Unavailable)?;
+    Ok(name)
 }
 
 /// Delete cached files no post references, once they are a day old.
