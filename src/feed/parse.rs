@@ -19,6 +19,10 @@ pub struct Event {
     pub start_ms: i64,
     #[serde(default)]
     pub location: String,
+    /// The day as the event page states it (`YYYY-MM-DD`, local to the
+    /// event), for messages.
+    #[serde(default)]
+    pub local_date: String,
 }
 
 /// One candidate post, normalized from any source.
@@ -47,6 +51,9 @@ pub struct Item {
     pub needs_page: bool,
     /// Language code the source reported (Mastodon, Bluesky), if any.
     pub language: Option<String>,
+    /// Identity keys of other URLs for the same page (where the link
+    /// redirected to, the page's canonical URL).
+    pub aliases: Vec<String>,
 }
 
 impl Item {
@@ -386,18 +393,19 @@ fn feed_item(node: &Node, base: &str, atom: bool) -> Option<Item> {
                 .flatten()
         }) {
             let (text, h) = construct(n, atom);
-            if !text.is_empty() {
-                if first.is_none() {
-                    first = Some(text);
-                    html = h;
-                } else if item.description.is_empty() {
-                    // Prefer the shorter summary for the description.
-                    item.description = text;
-                    if html.is_empty() {
-                        html = h;
-                    }
-                }
-                collect_imgs(n, base, &mut item);
+            // Photos count even when the field has no text at all.
+            collect_imgs(n, base, &mut item);
+            if html.is_empty() && !h.trim().is_empty() {
+                html = h;
+            }
+            if text.is_empty() {
+                continue;
+            }
+            if first.is_none() {
+                first = Some(text);
+            } else if item.description.is_empty() {
+                // Prefer the shorter summary for the description.
+                item.description = text;
             }
         }
     }
@@ -1032,6 +1040,18 @@ mod tests {
         assert_eq!(e.url, "https://site.example/articles/post");
         assert_eq!(e.description, "A bold move");
         assert_eq!(doc.title.as_deref(), Some("Blog"));
+    }
+
+    #[test]
+    fn photo_only_entries_keep_their_photos() {
+        let rss = r#"<rss><channel><item><title>Just a photo</title><link>https://p.example/1</link>
+<description><![CDATA[<img src="https://p.example/a.jpg">]]></description></item></channel></rss>"#;
+        let doc = parse_feed(rss, "https://p.example/feed").unwrap();
+        assert_eq!(doc.items[0].images, vec!["https://p.example/a.jpg"]);
+        let atom = r#"<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>Pic</title><link href="https://p.example/2"/>
+<content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml"><img src="https://p.example/b.jpg"/></div></content></entry></feed>"#;
+        let doc = parse_feed(atom, "https://p.example/feed").unwrap();
+        assert_eq!(doc.items[0].images, vec!["https://p.example/b.jpg"]);
     }
 
     #[test]

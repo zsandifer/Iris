@@ -133,6 +133,7 @@ export function Post({ p }) {
         : html`<p>${preview}${long && html` <button class="more" onClick=${() => setMore(true)}>more</button>`}</p>`}
       ${p.why && html`<div class="why"><${Icon} name="sparkles" size=${13} /> ${p.why}</div>`}
     </div>
+    <i class="post-end" aria-hidden="true" />
   </article>`;
 }
 
@@ -149,15 +150,17 @@ function useEndTracking(posts, status) {
   useEffect(() => {
     const key = `iris.feedEnd.${endId}`;
     if (!loaded || sessionStorage.getItem(key) || !('IntersectionObserver' in window)) return undefined;
-    const el = document.querySelector(`.post[data-id="${endId}"]`);
+    // The bottom edge of the batch's last post: seeing it means the user
+    // scrolled through the whole post, not just its first pixels.
+    const el = document.querySelector(`.post[data-id="${endId}"] .post-end`);
     if (!el) return undefined;
     const io = new IntersectionObserver((entries) => {
-      if (entries.some((e) => e.isIntersecting)) {
+      if (entries.some((e) => e.isIntersecting && e.intersectionRatio > 0)) {
         sessionStorage.setItem(key, '1');
         report('reached_end');
         io.disconnect();
       }
-    }, { threshold: 0.6 });
+    }, { threshold: 1 });
     io.observe(el);
     return () => io.disconnect();
   }, [endId, loaded]);
@@ -389,7 +392,9 @@ export function FeedSettings() {
     ${!sources ? html`<${Spinner} />` : html`<${Group} label="Sources">
       ${sources.length ? sources.map((s) => html`<${Row} icon=${html`<${LetterTile} name=${KIND_LABEL[s.kind] || s.kind} />`}
           title=${sourceTitle(s)}
-          sub=${[KIND_LABEL[s.kind], ORIGIN_LABEL[s.origin], s.last_error && s.fail_count ? "couldn't reach it lately" : s.topic].filter(Boolean).join(' · ')}
+          sub=${[KIND_LABEL[s.kind], ORIGIN_LABEL[s.origin],
+            s.origin === 'suggested' && !s.enabled && !s.last_fetch_at ? 'turn on to use'
+              : s.last_error && s.fail_count ? "couldn't reach it lately" : s.topic].filter(Boolean).join(' · ')}
           right=${html`<span class="src-ac"><${Toggle} on=${s.enabled} onChange=${(on) => toggle(s, on)} label="On" />
             <button class="btn" aria-label="Remove" onClick=${() => remove(s)}><${Icon} name="trash" size=${17} /></button></span>`} />`)
         : html`<div class="r"><div class="rt mu">None yet. I'll suggest some after my first look at what you like.</div></div>`}

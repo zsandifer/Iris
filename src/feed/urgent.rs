@@ -146,6 +146,7 @@ mod tests {
         let e = |days: i64, loc: &str| Event {
             start_ms: now + days * day,
             location: loc.into(),
+            local_date: String::new(),
         };
         // Soon, core interest, in the user's city: push.
         assert!(

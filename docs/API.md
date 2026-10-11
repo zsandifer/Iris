@@ -706,8 +706,8 @@ day's batch the best-ranked post is the newest.
 ```
 
 `event` is `opened` (the feed screen was shown, or the app came back to
-the front on it) or `reached_end` (the user scrolled to
-`last_batch_end_id`); anything else is `400`. Counts are kept per local day
+the front on it) or `reached_end` (the bottom of the `last_batch_end_id`
+post came into view); anything else is `400`. Counts are kept per local day
 and drive the adaptive daily size; either event counts as use for the
 two-week pause. Response `{"ok": true}`.
 
@@ -731,7 +731,7 @@ emit `entities.changed` `["feed"]` to the caller.
 | `title` | string or null | The feed's own title, once fetched. |
 | `topic` | string or null | Topic it was suggested for. |
 | `origin` | string | `user`, `suggested` (by the daily interests call), or `google` (YouTube subscriptions). |
-| `enabled` | bool | Suggested sources that fail 3 runs in a row turn off by themselves. |
+| `enabled` | bool | Suggested sources on arbitrary hosts start off; suggested sources that fail 3 runs in a row turn off by themselves. |
 | `last_fetch_at`, `last_ok_at` | int or null | |
 | `last_error` | string or null | Short reason, e.g. `HTTP 404`. |
 | `fail_count` | int | |
@@ -1866,7 +1866,11 @@ with the engine that wrote the text.
    never shared chats), and liked YouTube videos (when Google is connected)
    become 3 to 8 topics with keywords and search queries, the user's home
    city and language, and up to 8 source suggestions (added as
-   `suggested` sources; at most 40 kept). Without a usable reply the last
+   `suggested` sources; at most 40 kept). Suggestions on fixed hosts
+   (subreddits, YouTube channels, Hacker News) start on; feeds on other
+   sites, Bluesky handles, and Mastodon accounts start off until the owner
+   turns them on, because the model saw private notes and untrusted titles
+   and must not be able to make Iris contact a host of its choosing. Without a usable reply the last
    interests are kept, or topics are derived from liked posts.
 2. **Fetch**: enabled sources (at most 40 per run; at most 4 subreddits,
    least recently read first), plus one Hacker News search per topic and
@@ -1888,7 +1892,9 @@ with the engine that wrote the text.
    every finalist except posts that live on Bluesky, Mastodon, Reddit,
    Hacker News, or YouTube), dropped if the page shows they are older
    than 7 days;
-   then the day's posts are picked: each competitive topic's best post
+   duplicates found only now (a link that redirects to, or names as
+   canonical, a page already shown or picked) are dropped; then the day's
+   posts are picked: each competitive topic's best post
    first, then by score with diminishing returns for repeats, at most 3 per
    source, 5 per topic (story groups), and about a third from searches.
 5. **Blurbs** (one batched call, `feed` slot): posts whose own description

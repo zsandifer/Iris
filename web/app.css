@@ -227,6 +227,7 @@ code { font-family: var(--mono); font-size: .88em; background: var(--sf2); borde
 .why.light { color: rgba(255,255,255,.85); } .why.light .ic { color: #fff; }
 .end { text-align: center; font-size: 13px; padding: 10px 0 20px; }
 .end + .end { padding-top: 0; }
+.post-end { display: block; height: 1px; }
 .linkish { background: none; border: 0; color: var(--ac); font-size: 13px; font-weight: 600; padding: 4px 8px; }
 .feed-note { margin-bottom: 16px; } .feed-note .act { margin-top: 8px; }
 .feed-run { text-align: center; font-size: 13px; font-weight: 600; margin: -4px 0 12px; }

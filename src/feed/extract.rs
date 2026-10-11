@@ -229,6 +229,10 @@ fn types(v: &Value) -> Vec<String> {
 }
 
 fn ld_images(v: &Value, base: &str, out: &mut Vec<String>) {
+    // One shared budget for the whole page, checked before any work.
+    if out.len() >= MAX_IMAGES {
+        return;
+    }
     match v {
         Value::String(s) => {
             if let Some(u) = resolve(base, s)
@@ -237,7 +241,10 @@ fn ld_images(v: &Value, base: &str, out: &mut Vec<String>) {
                 out.push(u);
             }
         }
-        Value::Array(a) => a.iter().take(6).for_each(|x| ld_images(x, base, out)),
+        Value::Array(a) => a
+            .iter()
+            .take(MAX_IMAGES)
+            .for_each(|x| ld_images(x, base, out)),
         Value::Object(o) => {
             if let Some(u) = o.get("url").or_else(|| o.get("contentUrl")) {
                 ld_images(u, base, out);
@@ -307,19 +314,21 @@ fn walk_ld(v: &Value, base: &str, ld: &mut LdData, depth: usize) {
                 }
             }
             if ts.iter().any(|t| t.ends_with("Event")) && ld.event.is_none() {
-                let start = v["startDate"].as_str().and_then(parse_date);
-                if let Some(start_ms) = start {
-                    let loc = &v["location"];
-                    let location = [
-                        text_of(&loc["name"]),
-                        text_of(&loc["address"]["addressLocality"]),
-                        loc["address"].as_str().and_then(non_empty),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                    ld.event = Some(Event { start_ms, location });
+                let raw_start = v["startDate"].as_str().unwrap_or("");
+                if let Some(start_ms) = parse_date(raw_start) {
+                    let location = location_text(&v["location"]);
+                    // The event's own calendar day, before any time zone
+                    // conversion.
+                    let local_date = raw_start
+                        .get(..10)
+                        .filter(|d| d.as_bytes().get(4) == Some(&b'-'))
+                        .unwrap_or("")
+                        .to_string();
+                    ld.event = Some(Event {
+                        start_ms,
+                        location,
+                        local_date,
+                    });
                     ld.headline = ld.headline.take().or_else(|| text_of(&v["name"]));
                     ld.description = ld.description.take().or_else(|| text_of(&v["description"]));
                     ld_images(&v["image"], base, &mut ld.images);
@@ -335,6 +344,37 @@ fn walk_ld(v: &Value, base: &str, ld: &mut LdData, depth: usize) {
         }
         _ => {}
     }
+}
+
+/// A schema.org `location`: text, a Place (name and address), a
+/// PostalAddress, or a list of them.
+fn location_text(loc: &Value) -> String {
+    let address = |a: &Value| -> Vec<String> {
+        match a {
+            Value::String(s) => non_empty(s).into_iter().collect(),
+            Value::Object(_) => ["streetAddress", "addressLocality", "addressRegion"]
+                .iter()
+                .filter_map(|k| a[*k].as_str().and_then(non_empty))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let parts: Vec<String> = match loc {
+        Value::String(s) => non_empty(s).into_iter().collect(),
+        Value::Array(a) => a
+            .iter()
+            .take(3)
+            .map(location_text)
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Value::Object(_) if types(loc).iter().any(|t| t == "PostalAddress") => address(loc),
+        Value::Object(_) => text_of(&loc["name"])
+            .into_iter()
+            .chain(address(&loc["address"]))
+            .collect(),
+        _ => Vec::new(),
+    };
+    parts.join(", ")
 }
 
 fn offer_price(offers: &Value) -> Option<Price> {
@@ -424,6 +464,37 @@ mod tests {
         );
         let e = m.event.unwrap();
         assert_eq!(e.location, "The Hall, Springfield");
+        assert_eq!(e.local_date, "2026-10-20", "the page's own day, not UTC");
+        // Text and PostalAddress locations count too.
+        for loc in [
+            r#""The Hall, Springfield""#,
+            r#"{"@type":"PostalAddress","addressLocality":"Springfield"}"#,
+        ] {
+            let page = format!(
+                r#"<script type="application/ld+json">{{"@type":"Event","name":"E","startDate":"2026-10-20","location":{loc}}}</script>"#
+            );
+            let ev = extract(&page, "https://e.example/").event.unwrap();
+            assert!(ev.location.contains("Springfield"), "{loc}");
+        }
+        // Image budget holds for deeply nested image arrays.
+        let nested = (0..6).fold(r#""https://i.example/x.jpg""#.to_string(), |acc, i| {
+            format!(
+                "[{}]",
+                (0..6)
+                    .map(|j| acc.replace("x.jpg", &format!("x{i}{j}.jpg")))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        });
+        let page = format!(
+            r#"<script type="application/ld+json">{{"@type":"Article","headline":"H","image":{nested}}}</script>"#
+        );
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            extract(&page, "https://e.example/").images.len(),
+            MAX_IMAGES
+        );
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(e.start_ms, parse_date("2026-10-21T03:00:00Z").unwrap());
         assert_eq!(
             m.favicon.as_deref(),

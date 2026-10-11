@@ -124,6 +124,9 @@ pub struct PipelinePost {
     pub source_name: String,
     pub source_kind: String,
     pub url_key: String,
+    /// Every key identifying the story (link, title, redirect and
+    /// canonical URLs), for the pipeline's duplicate checks; not stored.
+    pub seen_keys: Vec<String>,
     pub images: Vec<String>,
     pub favicon_url: Option<String>,
     /// Original URL -> cached file name.

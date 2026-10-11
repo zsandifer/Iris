@@ -160,21 +160,31 @@ pub fn dedupe(items: Vec<Item>, seen: &HashSet<String>) -> Vec<Item> {
     let mut kept_titles: Vec<HashSet<String>> = Vec::new();
     let mut out = Vec::new();
     for it in items {
-        let uk = url_key(&it.url);
-        let tk = title_key(&it.title);
-        if seen.contains(&uk) || seen.contains(&tk) || keys.contains(&uk) || keys.contains(&tk) {
+        let ids = identity_keys(&it);
+        if ids.iter().any(|k| seen.contains(k) || keys.contains(k)) {
             continue;
         }
         let tw: HashSet<String> = words(&it.title).into_iter().collect();
         if tw.len() >= 4 && kept_titles.iter().any(|k| jaccard(k, &tw) >= 0.7) {
             continue;
         }
-        keys.insert(uk);
-        keys.insert(tk);
+        keys.extend(ids);
         kept_titles.push(tw);
         out.push(it);
     }
     out
+}
+
+/// Every key that identifies an item's story: its link, its title, and the
+/// other URLs its page is known by.
+pub fn identity_keys(it: &Item) -> Vec<String> {
+    let mut keys = vec![url_key(&it.url), title_key(&it.title)];
+    for a in &it.aliases {
+        if !keys.contains(a) {
+            keys.push(a.clone());
+        }
+    }
+    keys
 }
 
 /// How many of a topic's keywords (and name words) appear in the text.
@@ -595,6 +605,23 @@ mod tests {
         assert!(titles.contains(&"Run"), "{titles:?}");
         assert_eq!(out.iter().filter(|(_, i)| i.source_id.is_none()).count(), 3);
         assert!(out.windows(2).all(|w| w[0].0 >= w[1].0), "score order");
+    }
+
+    #[test]
+    fn redirected_and_canonical_links_are_the_same_story() {
+        let mut short = item("Short link headline here", "a", None);
+        short.url = "https://lnk.example/x1".into();
+        short.aliases = vec![url_key("https://news.example/story")];
+        let mut direct = item("A rather different headline", "b", None);
+        direct.url = "https://www.news.example/story/?utm_source=x".into();
+        let out = dedupe(vec![short.clone(), direct], &HashSet::new());
+        assert_eq!(out.len(), 1);
+        let mut seen = HashSet::new();
+        seen.insert(url_key("https://news.example/story"));
+        assert!(
+            dedupe(vec![short], &seen).is_empty(),
+            "shown on an earlier day"
+        );
     }
 
     #[test]

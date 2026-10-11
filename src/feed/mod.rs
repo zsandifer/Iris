@@ -465,6 +465,7 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
     // finalists from their pages, then pick.
     let lang = interests.language.clone().unwrap_or_else(|| "en".into());
     let (t2, e2) = (topics.clone(), engagement.clone());
+    let seen_after = seen.clone();
     let finalists: Vec<Item> = tokio::task::spawn_blocking(move || {
         let items = rank::dedupe(clean(items, now, &lang), &seen);
         let mut items = items;
@@ -481,9 +482,11 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
     let mut enriched =
         tokio::task::spawn_blocking(move || parallel(finalists, WORKERS, |it| enrich(&f, it)))
             .await?;
-    // Pages can reveal an old publication date.
+    // Pages can reveal an old publication date, or that two links (or a
+    // link and an earlier post) are the same page.
     let min_time = now - MAX_AGE_DAYS * DAY_MS;
     enriched.retain(|i| i.published_ms.is_none_or(|t| t >= min_time));
+    let mut enriched = rank::dedupe(enriched, &seen_after);
     rank::assign_topics(&mut enriched, &topics);
     let rescored: Vec<(f64, Item)> = enriched
         .into_iter()
@@ -579,8 +582,8 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
             ));
         }
         let key = rank::url_key(&it.url);
-        seen_new.push(key.clone());
-        seen_new.push(rank::title_key(&it.title));
+        let ids = rank::identity_keys(&it);
+        seen_new.extend(ids.iter().cloned());
         posts.push(PipelinePost {
             title: it.title.clone(),
             body,
@@ -595,6 +598,7 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
             },
             source_kind: it.source_kind.clone(),
             url_key: key,
+            seen_keys: ids,
             images,
             favicon_url: favicon,
             cached: cache,
@@ -606,51 +610,7 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
     let rep = report.clone().with_stats(fetcher.stats());
     let published: Vec<String> = state
         .db
-        .call(move |c| {
-            crate::db::write_tx(c, |c| {
-                // Recheck inside the transaction: the agent may have posted
-                // the same story (through the bridge) while this run worked.
-                let seen_now = store::seen_keys(c, &uid)?;
-                let fresh: Vec<&PipelinePost> = posts
-                    .iter()
-                    .filter(|p| {
-                        !seen_now.contains(&p.url_key)
-                            && !seen_now.contains(&rank::title_key(&p.title))
-                    })
-                    .collect();
-                // Lowest ranked first: each insert gets a later unique
-                // timestamp, so the best post is the newest.
-                let mut first: Option<entities::FeedPost> = None;
-                for p in fresh.iter().rev() {
-                    let post = entities::insert_pipeline_post(c, &uid, p)?;
-                    first.get_or_insert(post);
-                }
-                store::add_seen(c, &uid, &seen_new)?;
-                let n = fresh.len();
-                let mut rep = rep;
-                rep.published = n as u32;
-                store::update_state(c, &uid, |s| {
-                    s.last_run = Some(rep);
-                    let Some(first) = &first else {
-                        // Nothing new: leave today open so the next
-                        // scheduled check tries again.
-                        return;
-                    };
-                    s.last_batch_at = Some(first.created_at);
-                    s.last_batch_end_id = Some(first.id.clone());
-                    s.last_batch_day = Some(t.clone());
-                    s.last_batch_count = n as u32;
-                    if s.first_batch_at.is_none() {
-                        s.first_batch_at = Some(first.created_at);
-                    }
-                })?;
-                if n > 0 {
-                    store::record_published(c, &uid, &t, n as i64)?;
-                }
-                store::prune(c, &uid)?;
-                Ok(fresh.iter().map(|p| p.title.clone()).collect())
-            })
-        })
+        .call(move |c| publish_batch(c, &uid, &posts, &seen_new, &t, rep))
         .await?;
     report.published = published.len() as u32;
     urgent_candidates.retain(|(title, ..)| published.contains(title));
@@ -668,8 +628,13 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
         let score =
             urgent::event_score(&ev, now, affinity, interests.location.as_deref(), followed);
         if score >= urgent::URGENT_AT {
-            let when = crate::util::rfc3339(ev.start_ms / 1000);
-            let body = format!("{} · {}", truncate_chars(&title, 90), &when[..10]);
+            // The day the event page states, not a UTC conversion of it.
+            let when = if ev.local_date.is_empty() {
+                crate::jobs::local_day(ev.start_ms)
+            } else {
+                ev.local_date.clone()
+            };
+            let body = format!("{} · {}", truncate_chars(&title, 90), when);
             push_urgent(state, user_id, "Something near you soon", &body).await;
         }
     }
@@ -695,6 +660,57 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
         report.requests
     );
     Ok(Some(report))
+}
+
+/// Publish a ranked batch (best first) in one transaction: posts that are
+/// not already in the feed, their seen keys, the day's count, and the batch
+/// bookkeeping. Returns the titles actually published. An empty batch
+/// leaves the day open for another try.
+fn publish_batch(
+    c: &rusqlite::Connection,
+    uid: &str,
+    posts: &[PipelinePost],
+    seen_new: &[String],
+    day: &str,
+    mut rep: RunReport,
+) -> rusqlite::Result<Vec<String>> {
+    crate::db::write_tx(c, |c| {
+        // Recheck inside the transaction: the agent may have posted the
+        // same story (through the bridge) while this run worked.
+        let seen_now = store::seen_keys(c, uid)?;
+        let fresh: Vec<&PipelinePost> = posts
+            .iter()
+            .filter(|p| !p.seen_keys.iter().any(|k| seen_now.contains(k)))
+            .collect();
+        // Lowest ranked first: each insert gets a later unique timestamp,
+        // so the best post is the newest.
+        let mut first: Option<entities::FeedPost> = None;
+        for p in fresh.iter().rev() {
+            let post = entities::insert_pipeline_post(c, uid, p)?;
+            first.get_or_insert(post);
+        }
+        store::add_seen(c, uid, seen_new)?;
+        let n = fresh.len();
+        rep.published = n as u32;
+        store::update_state(c, uid, |s| {
+            s.last_run = Some(rep);
+            let Some(first) = &first else {
+                return;
+            };
+            s.last_batch_at = Some(first.created_at);
+            s.last_batch_end_id = Some(first.id.clone());
+            s.last_batch_day = Some(day.to_string());
+            s.last_batch_count = n as u32;
+            if s.first_batch_at.is_none() {
+                s.first_batch_at = Some(first.created_at);
+            }
+        })?;
+        if n > 0 {
+            store::record_published(c, uid, day, n as i64)?;
+        }
+        store::prune(c, uid)?;
+        Ok(fresh.iter().map(|p| p.title.clone()).collect())
+    })
 }
 
 /// Topic queries to run: one Hacker News search per topic (its first
@@ -752,6 +768,17 @@ fn enrich(f: &Fetcher, mut it: Item) -> Item {
         return it;
     }
     let m = extract::extract(&res.text(), &res.final_url);
+    // The same page under other URLs (redirects, its canonical link).
+    let own = rank::url_key(&it.url);
+    for u in [Some(res.final_url.clone()), m.canonical.clone()]
+        .into_iter()
+        .flatten()
+    {
+        let k = rank::url_key(&u);
+        if k != own && !it.aliases.contains(&k) {
+            it.aliases.push(k);
+        }
+    }
     // The page's photos back up the feed's (thumbnails may be too small to
     // keep or fail to load).
     for u in m.images {
@@ -917,7 +944,7 @@ async fn refresh_interests(
             for s in &suggestions {
                 if let Some((kind, value)) = sources::from_suggestion(s) {
                     let topic = s["topic"].as_str().map(|t| truncate_chars(t, 40));
-                    if store::add_source(
+                    if let Some(src) = store::add_source(
                         c,
                         &uid,
                         &kind,
@@ -925,10 +952,14 @@ async fn refresh_interests(
                         None,
                         topic.as_deref(),
                         "suggested",
-                    )?
-                    .is_some()
-                    {
+                    )? {
                         added += 1;
+                        // The model saw private notes and untrusted titles, so
+                        // a suggestion that would contact a host of its
+                        // choosing waits for the owner to turn it on.
+                        if !auto_enable(&kind) {
+                            store::set_source_enabled(c, &uid, &src.id, false)?;
+                        }
                     }
                 }
             }
@@ -1130,6 +1161,14 @@ fn shortlist(scored: Vec<(f64, Item)>, n: usize) -> Vec<Item> {
     out
 }
 
+/// Suggested sources that only ever contact a fixed, well-known host
+/// (Reddit, YouTube, Hacker News) start enabled; feeds on arbitrary sites,
+/// Bluesky handles (resolved through their own domain), and Mastodon
+/// accounts (on any instance) wait for the owner.
+pub fn auto_enable(kind: &str) -> bool {
+    matches!(kind, "reddit" | "youtube" | "hn")
+}
+
 /// Without a model: one topic per liked-post topic.
 fn topics_from_likes(liked: &[(String, Option<String>)]) -> Vec<Topic> {
     let mut by_topic: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -1247,6 +1286,7 @@ async fn check_price_watches(state: &AppState, user_id: &str, fetcher: &Arc<Fetc
                     .unwrap_or_default(),
                 source_kind: "price_drop".into(),
                 url_key: format!("price:{}:{}", rank::url_key(&w.url), new.amount),
+                seen_keys: Vec::new(),
                 images: images
                     .into_iter()
                     .filter(|u| cached.contains_key(u))
@@ -1395,6 +1435,12 @@ mod tests {
     /// its runs and answers according to `<dir>/mode` (`ok`, `auth`,
     /// anything else fails) with the reply in `<dir>/reply`.
     async fn fake_engine() -> (AppState, tempfile::TempDir, String) {
+        fake_engines(false).await
+    }
+
+    /// Same, plus (with `codex`) a fake `codex` ranked after Claude whose
+    /// mode is `<dir>/cmode` and which counts runs in `<dir>/ccalls`.
+    async fn fake_engines(codex: bool) -> (AppState, tempfile::TempDir, String) {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
@@ -1418,6 +1464,28 @@ esac
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let codex_script = dir.join("codex");
+        std::fs::write(
+            &codex_script,
+            r#"#!/bin/sh
+D="$(dirname "$0")"
+case "$1" in
+  --version) echo "codex-cli 9.9.9"; exit 0;;
+  login) echo "Logged in using ChatGPT"; exit 0;;
+  mcp) echo "[]"; exit 0;;
+esac
+cat >/dev/null
+echo run >> "$D/ccalls"
+echo '{"type":"thread.started","thread_id":"t1"}'
+case "$(cat "$D/cmode")" in
+  ok) echo '{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"[{\"id\": \"p0\", \"summary\": \"From Codex\"}]"}}'
+      echo '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}';;
+  *) echo '{"type":"turn.failed","error":{"message":"boom"}}';;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex_script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let paths = crate::config::Paths {
             config_file: dir.join("config.toml"),
             data_dir: dir.join("data"),
@@ -1426,9 +1494,13 @@ esac
         let db = crate::db::Db::open(&paths.db_file()).unwrap();
         let mut cfg = crate::config::Config::default();
         for (name, h) in cfg.harness.iter_mut() {
-            h.enabled = name == "claude";
+            h.enabled = name == "claude" || (codex && name == "codex");
         }
         cfg.harness.get_mut("claude").unwrap().command = script.to_string_lossy().into_owned();
+        let cx = cfg.harness.get_mut("codex").unwrap();
+        cx.command = codex_script.to_string_lossy().into_owned();
+        // Only the configured models (not the real machine's Codex cache).
+        cx.discover_models = false;
         cfg.feed.enabled = false;
         cfg.push.enabled = false;
         let state = AppState::new(cfg, paths, db).unwrap();
@@ -1454,6 +1526,47 @@ esac
 
     fn feed_state(state: &AppState, owner: &str) -> FeedState {
         state.db.with(|c| store::get_state(c, owner)).unwrap()
+    }
+
+    fn codex_runs(tmp: &tempfile::TempDir) -> usize {
+        std::fs::read_to_string(tmp.path().join("ccalls"))
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_never_falls_through_to_another_engine() {
+        let (state, tmp, owner) = fake_engines(true).await;
+        let need = vec![model::SummaryInput {
+            id: "p0".into(),
+            title: "A comet".into(),
+            source: "Sky".into(),
+            topic: None,
+            text: "Short".into(),
+        }];
+        std::fs::write(tmp.path().join("cmode"), "ok").unwrap();
+
+        // Claude fails: that was the day's call; Codex never runs.
+        set(&tmp, "fail", "");
+        let (b, _) = write_blurbs(&state, &owner, "2026-10-11", &need, &[]).await;
+        assert!(b.is_empty());
+        assert_eq!((runs(&tmp), codex_runs(&tmp)), (1, 0));
+        assert_eq!(
+            feed_state(&state, &owner).summary_call_day.as_deref(),
+            Some("2026-10-11")
+        );
+
+        // Claude is signed out: no model ran there, so Codex makes the one
+        // real call.
+        set(&tmp, "auth", "");
+        let (b, reply) = write_blurbs(&state, &owner, "2026-10-12", &need, &[]).await;
+        assert_eq!(b["p0"].summary.as_deref(), Some("From Codex"));
+        assert_eq!(reply.unwrap().harness, "codex");
+        assert_eq!((runs(&tmp), codex_runs(&tmp)), (2, 1));
+        assert_eq!(
+            feed_state(&state, &owner).summary_call_day.as_deref(),
+            Some("2026-10-12")
+        );
     }
 
     #[tokio::test]
@@ -1686,6 +1799,117 @@ esac
         let out = shortlist(scored, 30);
         assert_eq!(out.iter().filter(|i| i.source_name == "big").count(), 6);
         assert_eq!(out.len(), 16);
+    }
+
+    #[test]
+    fn suggestions_on_arbitrary_hosts_wait_for_the_owner() {
+        // A model reply steered by an injected title cannot make Iris
+        // contact a host of the attacker's choosing on its own.
+        for (kind, auto) in [
+            ("rss", false),
+            ("mastodon", false),
+            ("bluesky", false),
+            ("reddit", true),
+            ("youtube", true),
+            ("hn", true),
+        ] {
+            assert_eq!(auto_enable(kind), auto, "{kind}");
+        }
+        let reply = r#"{"topics": [{"name": "Space", "keywords": ["nasa"]}],
+            "sources": [{"type": "rss", "url": "https://evil.example/leak?d=secret"}, {"type": "reddit", "name": "space"}]}"#;
+        let parsed = model::parse_interests(reply).unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.with(|c| {
+            let u = db::owner_user_id(c)?.unwrap();
+            for s in &parsed.sources {
+                let (kind, value) = sources::from_suggestion(s).unwrap();
+                let src =
+                    store::add_source(c, &u, &kind, &value, None, None, "suggested")?.unwrap();
+                if !auto_enable(&kind) {
+                    store::set_source_enabled(c, &u, &src.id, false)?;
+                }
+            }
+            let planned = plan_sources(
+                store::list_sources(c, &u)?
+                    .into_iter()
+                    .filter(|s| s.enabled)
+                    .collect(),
+            );
+            assert_eq!(planned.len(), 1);
+            assert_eq!(planned[0].kind, "reddit");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn publication_is_atomic_ordered_and_skips_late_duplicates() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let post = |title: &str, url: &str| PipelinePost {
+            title: title.into(),
+            body: "b".into(),
+            source_url: url.into(),
+            source_name: "S".into(),
+            source_kind: "rss".into(),
+            url_key: rank::url_key(url),
+            seen_keys: vec![rank::url_key(url), rank::title_key(title)],
+            ..Default::default()
+        };
+        db.with(|c| {
+            let u = db::owner_user_id(c)?.unwrap();
+            let u = u.as_str();
+            // Nothing new: the day stays open.
+            let out = publish_batch(c, u, &[], &[], "2026-10-11", RunReport::default())?;
+            assert!(out.is_empty());
+            assert_eq!(store::get_state(c, u)?.last_batch_day, None);
+
+            // The agent posted one of these stories meanwhile.
+            entities::create_feed_post(
+                c,
+                u,
+                &entities::NewFeedPost {
+                    title: "Agent story".into(),
+                    body: "b".into(),
+                    source_url: Some("https://x.example/dup".into()),
+                    ..Default::default()
+                },
+            )?;
+            let batch = vec![
+                post("Best story of the day", "https://x.example/1"),
+                post("Different title, same link", "https://x.example/dup"),
+                post("Third story of the day", "https://x.example/3"),
+            ];
+            let keys: Vec<String> = batch.iter().flat_map(|p| p.seen_keys.clone()).collect();
+            let out = publish_batch(c, u, &batch, &keys, "2026-10-11", RunReport::default())?;
+            assert_eq!(out, vec!["Best story of the day", "Third story of the day"]);
+            let feed = entities::list_feed(c, u, None, 10)?;
+            assert_eq!(feed[0].title, "Best story of the day", "best is newest");
+            let st = store::get_state(c, u)?;
+            let end = feed
+                .iter()
+                .find(|p| p.title == "Third story of the day")
+                .unwrap();
+            assert_eq!(st.last_batch_end_id.as_deref(), Some(end.id.as_str()));
+            assert_eq!(st.last_batch_at, Some(end.created_at));
+            assert_eq!(
+                (st.last_batch_day.as_deref(), st.last_batch_count),
+                (Some("2026-10-11"), 2)
+            );
+
+            // A failure part-way rolls everything back.
+            // (feed_days is written after the posts, seen keys, and state.)
+            c.execute("DROP TABLE feed_days", [])?;
+            let before = entities::list_feed(c, u, None, 50)?.len();
+            let more = vec![post("Fourth story here", "https://x.example/4")];
+            assert!(publish_batch(c, u, &more, &[], "2026-10-12", RunReport::default()).is_err());
+            assert_eq!(entities::list_feed(c, u, None, 50)?.len(), before);
+            assert_eq!(
+                store::get_state(c, u)?.last_batch_day.as_deref(),
+                Some("2026-10-11")
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

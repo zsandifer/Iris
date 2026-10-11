@@ -29,8 +29,18 @@ const RAW_TEXT: &[&str] = &["script", "style", "textarea", "noscript", "template
 /// Tokenize `src`. With `html`, the content of `<script>`, `<style>` and
 /// similar elements is one raw text token.
 pub fn tokenize(src: &str, html: bool) -> Vec<Token> {
-    let b = src.as_bytes();
     let mut out = Vec::new();
+    tokenize_into(src, html, &mut out);
+    out.truncate(MAX_TOKENS);
+    out
+}
+
+/// Most tokens read from one document (a real feed or page has far fewer;
+/// this bounds memory for hostile ones).
+pub const MAX_TOKENS: usize = 200_000;
+
+fn tokenize_into(src: &str, html: bool, out: &mut Vec<Token>) {
+    let b = src.as_bytes();
     let mut i = 0;
     let mut text_start = 0;
     let flush = |out: &mut Vec<Token>, from: usize, to: usize| {
@@ -42,23 +52,26 @@ pub fn tokenize(src: &str, html: bool) -> Vec<Token> {
         }
     };
     while i < b.len() {
+        if out.len() >= MAX_TOKENS {
+            return;
+        }
         if b[i] != b'<' {
             i += 1;
             continue;
         }
         let rest = &src[i..];
         if rest.starts_with("<!--") {
-            flush(&mut out, text_start, i);
+            flush(out, text_start, i);
             i = rest.find("-->").map_or(b.len(), |e| i + e + 3);
             text_start = i;
         } else if let Some(body) = rest.strip_prefix("<![CDATA[") {
-            flush(&mut out, text_start, i);
+            flush(out, text_start, i);
             let end = body.find("]]>").unwrap_or(body.len());
             out.push(Token::Text(body[..end].to_string()));
             i += 9 + (end + 3).min(body.len());
             text_start = i;
         } else if rest.starts_with("<!") || rest.starts_with("<?") {
-            flush(&mut out, text_start, i);
+            flush(out, text_start, i);
             i = rest.find('>').map_or(b.len(), |e| i + e + 1);
             text_start = i;
         } else if let Some(after) = rest.strip_prefix("</") {
@@ -81,7 +94,7 @@ pub fn tokenize(src: &str, html: bool) -> Vec<Token> {
                 });
             match close {
                 Some(p) if name_len > 0 && ab[0].is_ascii_alphabetic() => {
-                    flush(&mut out, text_start, i);
+                    flush(out, text_start, i);
                     out.push(Token::End {
                         name: after[..name_len].to_ascii_lowercase(),
                     });
@@ -96,7 +109,7 @@ pub fn tokenize(src: &str, html: bool) -> Vec<Token> {
             let Some((name, attrs, self_closing, len)) = parse_tag(rest) else {
                 break;
             };
-            flush(&mut out, text_start, i);
+            flush(out, text_start, i);
             i += len;
             let raw = html && !self_closing && RAW_TEXT.contains(&name.as_str());
             out.push(Token::Start {
@@ -122,8 +135,7 @@ pub fn tokenize(src: &str, html: bool) -> Vec<Token> {
             i += 1;
         }
     }
-    flush(&mut out, text_start, b.len());
-    out
+    flush(out, text_start, b.len());
 }
 
 fn find_ci(hay: &str, needle: &str) -> Option<usize> {
@@ -726,6 +738,14 @@ mod tests {
             resolve("https://a.example/", &format!("/{}", "x".repeat(3000))),
             None
         );
+    }
+
+    #[test]
+    fn token_budget_bounds_dense_documents() {
+        let dense = "<x/>".repeat(MAX_TOKENS + 50_000);
+        assert_eq!(tokenize(&dense, false).len(), MAX_TOKENS);
+        let root = parse_xml(&format!("<rss>{dense}</rss>"));
+        assert!(root.child("rss").unwrap().children.len() < MAX_TOKENS);
     }
 
     #[test]

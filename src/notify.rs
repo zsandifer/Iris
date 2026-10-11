@@ -288,6 +288,15 @@ pub async fn push_users_now(state: &AppState, users: &[String], payload: &Value)
             payload.clone(),
         );
         let (endpoint, p256dh, auth) = (sub.endpoint.clone(), sub.p256dh.clone(), sub.auth.clone());
+        #[cfg(test)]
+        if let Some(outcome) = test_sink::take(&endpoint, &payload) {
+            if outcome {
+                delivered += 1;
+            } else {
+                failed += 1;
+            }
+            continue;
+        }
         let res = tokio::task::spawn_blocking(move || {
             send_blocking(&keys, &subject, &endpoint, &p256dh, &auth, &payload)
         })
@@ -328,6 +337,33 @@ pub async fn push_users_now(state: &AppState, users: &[String], payload: &Value)
         }
     }
     (delivered, failed)
+}
+
+/// Tests record pushes to `https://sink.test/<name>/<ok|fail>` instead of
+/// sending them.
+#[cfg(test)]
+pub mod test_sink {
+    use serde_json::Value;
+    use std::sync::Mutex;
+
+    static SENT: Mutex<Vec<(String, Value)>> = Mutex::new(Vec::new());
+
+    pub fn take(endpoint: &str, payload: &Value) -> Option<bool> {
+        let rest = endpoint.strip_prefix("https://sink.test/")?;
+        SENT.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((endpoint.to_string(), payload.clone()));
+        Some(rest.ends_with("/ok"))
+    }
+
+    pub fn sent(prefix: &str) -> Vec<Value> {
+        SENT.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(e, _)| e.starts_with(prefix))
+            .map(|(_, p)| p.clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -398,6 +434,60 @@ mod tests {
             .db
             .with(|c| c.query_row("SELECT COUNT(*) FROM push_queue", [], |r| r.get(0)))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn digest_content_and_delivery() {
+        let (state, _tmp) = state_with_push();
+        let owner = state.db.with(crate::db::owner_user_id).unwrap().unwrap();
+        let (main, other) = state
+            .db
+            .with(|c| {
+                let main = crate::db::ensure_main_conversation(c, &owner)?;
+                let conv = crate::db::create_conversation(c, &owner, "side", "x", None)?;
+                c.execute(
+                    "DELETE FROM conversation_members WHERE conversation_id = ?1",
+                    [&conv.id],
+                )?;
+                Ok((main, conv.id))
+            })
+            .unwrap();
+        let add_device = |endpoint: &str| {
+            state
+                .db
+                .with(|c| {
+                    c.execute("DELETE FROM push_subscriptions", [])?;
+                    let d = crate::db::insert_device(c, &owner, "phone", &crate::util::new_id())?;
+                    entities::upsert_push_subscription(c, &owner, &d.id, endpoint, "k", "a")
+                })
+                .unwrap();
+        };
+        let held = |body: &str, conv: &str| json!({"title": "Iris", "body": body, "conversation_id": conv});
+
+        // The push service fails: nothing is lost.
+        add_device("https://sink.test/digest/fail");
+        enqueue(&state, &owner, &held("secret", &other)).await;
+        enqueue(&state, &owner, &held("hello", &main)).await;
+        enqueue(&state, &owner, &held("again", &main)).await;
+        flush_quiet(&state).await;
+        assert_eq!(
+            queued(&state),
+            2,
+            "member items kept; the other chat's dropped"
+        );
+
+        // It works now: one digest, without the other chat's text.
+        add_device("https://sink.test/digest/ok");
+        flush_quiet(&state).await;
+        assert_eq!(queued(&state), 0);
+        let sent = test_sink::sent("https://sink.test/digest/");
+        assert!(
+            sent.iter().all(|p| !p.to_string().contains("secret")),
+            "{sent:?}"
+        );
+        let last = sent.last().unwrap();
+        assert_eq!(last["count"], 2);
+        assert_eq!(last["conversation_id"], json!(main));
     }
 
     #[tokio::test]

@@ -886,7 +886,9 @@ pub async fn one_shot(
                 _ => {}
             }
         }
-        if !matches!(terminal, Some(Terminal::Auth(_))) {
+        // A run counts when it reached a model: not when the CLI could not
+        // start, and not when it said it is signed out.
+        if run.is_ok() && !matches!(terminal, Some(Terminal::Auth(_))) {
             attempts += 1;
         }
         match (run, terminal) {
