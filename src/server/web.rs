@@ -52,6 +52,7 @@ pub static ASSETS: &[Asset] = assets![
     "js/status.js" => JS,
     "js/store.js" => JS,
     "js/ui.js" => JS,
+    "js/viewport.js" => JS,
     "vendor/hooks.js" => JS,
     "vendor/htm.js" => JS,
     "vendor/preact.js" => JS,

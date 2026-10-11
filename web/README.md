@@ -27,6 +27,7 @@ js/
 ├── push.js           Web Push subscription
 ├── md.js             small, safe Markdown renderer
 ├── ui.js             icons, rows, sheets, time helpers
+├── viewport.js       visible viewport sizing and phone keyboard detection
 └── h.js              Preact + htm exports
 ```
 

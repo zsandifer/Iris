@@ -15,6 +15,7 @@ import { Hub, Logins, Computer, Files, FileEditor, Folder } from './hub.js';
 import { Connections, AddService, ConnectorPage, ConnectorForm, TrustedPeople } from './connect.js';
 import { Settings, AiEngine, Devices, People, ActivityLog } from './settings.js';
 import { isIOS, standalone, syncPush, resetPush } from './push.js';
+import { trackViewport } from './viewport.js';
 
 const TABS = [
   ['chat', 'Chat', 'chat'],
@@ -37,11 +38,12 @@ function deviceName() {
 }
 
 function Pair() {
+  const [install, setInstall] = useState(() => isIOS() && !standalone());
   const [code, setCode] = useState('');
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
   const ref = useRef();
-  useEffect(() => { ref.current?.focus(); }, []);
+  useEffect(() => { if (!install) ref.current?.focus({ preventScroll: true }); }, [install]);
   const onInput = (e) => {
     const raw = e.target.value.toUpperCase().replace(/[^0-9A-Z]/g, '').slice(0, 8);
     setCode(raw.length > 4 ? `${raw.slice(0, 4)}-${raw.slice(4)}` : raw);
@@ -62,7 +64,15 @@ function Pair() {
       setBusy(false);
     }
   };
-  const ios = isIOS() && !standalone();
+  if (install) return html`<div class="pair"><div class="pair-in">
+    <div class="avatar" style="width:84px;height:84px"><div class="orb" /></div>
+    <h1 class="serif">Add Iris to your Home Screen</h1>
+    <p class="mu">Pair inside the app. Safari and the Home Screen app keep separate sign-ins.</p>
+    <ol class="install-steps"><li>Tap <b>Share</b> in Safari.</li>
+      <li>Choose <b>Add to Home Screen</b>, then tap <b>Add</b>.</li>
+      <li>Open <b>Iris</b> from its icon and enter your pairing code.</li></ol>
+    <button class="safari-link" onClick=${() => setInstall(false)}>Continue in Safari anyway</button>
+  </div></div>`;
   return html`<div class="pair">
     <div class="pair-in">
       <div class="avatar" style="width:84px;height:84px"><div class="orb" /></div>
@@ -74,7 +84,6 @@ function Pair() {
         ${err && html`<div class="err-line">${err}</div>`}
         <button class="b1 wide" disabled=${busy || code.replace('-', '').length < 8}>${busy ? 'Pairing…' : 'Continue'}</button>
       </form>
-      ${ios && html`<p class="hint mu">Tip: tap Share, then <b>Add to Home Screen</b> so Iris opens like an app and can send you notifications.</p>`}
     </div>
   </div>`;
 }
@@ -106,8 +115,8 @@ function Drawer() {
   const Item = ({ c, icon }) => html`<button class=${'it' + (c.id === cid && S.route.tab === 'chat' ? ' on' : '')} onClick=${() => go(`chat/${c.id}`)}>
     <${Icon} name=${icon} size=${18} /><span>${title(c)}</span></button>`;
   return html`<div class=${'scrim' + (S.drawer ? ' on' : '')} onClick=${() => set({ drawer: false })} />
-    <nav class=${'drw' + (S.drawer ? ' on' : '')} aria-hidden=${S.drawer ? 'false' : 'true'}>
-      <label class="srch"><${Icon} name="search" size=${17} /><input value=${q} placeholder="Search chats" onInput=${(e) => setQ(e.target.value)} /></label>
+    <nav class=${'drw' + (S.drawer ? ' on' : '')} aria-hidden=${S.drawer ? 'false' : 'true'} inert=${!S.drawer}>
+      ${S.drawer && html`<label class="srch"><${Icon} name="search" size=${17} /><input value=${q} placeholder="Search chats" onInput=${(e) => setQ(e.target.value)} /></label>`}
       <div class="drw-scroll">
         <div class="sm">Chats</div>
         ${chats.map((c) => html`<${Item} c=${c} icon=${c.kind === 'main' ? 'chat' : c.seed?.type === 'feed_post' ? 'sparkles' : c.seed?.type === 'idea' ? 'bulb' : 'chat'} />`)}
@@ -281,7 +290,7 @@ function App() {
   const tabbed = TABS.some(([k]) => k === S.route.tab);
   return html`<div class=${'app' + (tabbed ? ' tabbed' : ' paged') + (S.route.tab === 'chat' ? ' is-chat' : '')}>
     ${tabbed && html`<${TopBar} />`}
-    <main class="main"><${Screen} /></main>
+    <main class="main" inert=${!!(S.drawer || S.sheet || S.story || S.lightbox)}><${Screen} /></main>
     ${tabbed && html`<${Tabs} />`}
     <${Drawer} />
     <${StoryViewer} />
@@ -336,5 +345,7 @@ if ('serviceWorker' in navigator) {
   });
 }
 
-render(html`<${App} />`, document.getElementById('app'));
+const root = document.getElementById('app');
+trackViewport(root);
+render(html`<${App} />`, root);
 boot();

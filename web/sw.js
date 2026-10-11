@@ -1,6 +1,6 @@
 // Iris service worker: offline app shell, push notifications, and opening
 // the right chat when a notification is tapped. API calls are never cached.
-const CACHE = 'iris-shell-v1';
+const CACHE = 'iris-shell-v2';
 const SHELL = [
   '/',
   '/app.css',
@@ -22,6 +22,7 @@ const SHELL = [
   '/js/status.js',
   '/js/store.js',
   '/js/ui.js',
+  '/js/viewport.js',
   '/vendor/hooks.js',
   '/vendor/htm.js',
   '/vendor/preact.js',
