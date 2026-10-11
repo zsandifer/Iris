@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { setToken } from '../../web/js/api.js';
 import {
   S, set, loadMessages, loadOlder, handleEvent, loadLibrary, loadMoreSaved, loadMorePhotos, loadMoreItems,
-  loadFeed, refreshAll,
+  loadFeed, refreshAll, loadGoals, loadIdeas, touchList,
   loginMark, applyLoginResponse,
 } from '../../web/js/store.js';
 
@@ -71,7 +71,7 @@ const photos = (hi, lo) => {
   for (let i = hi; i >= lo; i--) a.push({ id: pid(i), used_at: Math.floor(i / 2) });
   return a.sort((x, y) => y.used_at - x.used_at || (x.id < y.id ? 1 : -1));
 };
-let gate = null; // when set, page requests wait for it
+let gate = null; // when set, the next page request waits for it
 const page = (list, q, key = 'used_at') => {
   const lim = +q.get('limit');
   let l = list;
@@ -82,14 +82,16 @@ const page = (list, q, key = 'used_at') => {
   return [l.slice(0, lim), l.length > lim];
 };
 const libraryRoutes = {
+  // Pages are computed when asked and may be delivered late (`gate`): a
+  // delayed page carries the state from when it was requested.
   '/api/library': async (q, opts) => {
-    if (gate && q.get('before')) await gate;
     const [p, more] = page(server.items, q, 'created_at');
+    if (gate && q.get('before')) { const g = gate; gate = null; await g; } // one request only
     return reply(opts, { body: { items: p, has_more: more } });
   },
   '/api/feed': async (q, opts) => {
-    if (gate && q.get('before')) await gate;
     const [p, more] = page(q.get('liked') === 'true' ? server.posts.filter((x) => x.liked) : server.posts, q);
+    if (gate && q.get('before')) { const g = gate; gate = null; await g; } // one request only
     return reply(opts, { body: { posts: p, has_more: more } });
   },
   '/api/attachments': (q, opts) => {
@@ -275,4 +277,117 @@ test('after a reconnect, live replies in unopened chats are dropped once their t
   await tick(); await tick(); await tick();
   assert.equal(S.live.ra, undefined, 'finished turn: no longer shown as working');
   assert.ok(S.live.rb && S.live.rb2, 'running turn: kept');
+});
+
+test('a reload drops live entries of replies that finished and left the latest page', async () => {
+  const C = 'd'.repeat(32);
+  set({ live: {}, msgs: {} });
+  route({ [`/api/conversations/${C}/messages`]: (q, opts) => reply(opts, { body: { messages: [{ ...msg('old', 1, 'streaming'), conversation_id: C }], has_more: false } }) });
+  await loadMessages(C);
+  assert.ok(S.live.old, 'streaming reply shown as live');
+  // Offline: it finished, and 60 newer messages pushed it off the latest page.
+  const newer = Array.from({ length: 60 }, (_, i) => ({ ...msg('n' + i, 100 + i), conversation_id: C }));
+  route({ [`/api/conversations/${C}/messages`]: (q, opts) => reply(opts, { body: { messages: newer, has_more: true } }) });
+  await loadMessages(C);
+  assert.equal(S.live.old, undefined, 'no longer working on it');
+});
+
+// ------------------------------------------------- overlapping refreshes
+
+test('an older refresh that resolves last does not restore stale state', async () => {
+  const replies = [];
+  route({ '/api/goals': (q, opts) => new Promise((r) => replies.push((goals) => r(reply(opts, { body: { goals } })))) });
+  set({ goals: null });
+  const first = loadGoals();
+  const second = loadGoals();
+  await tick();
+  replies[1]([{ id: 'g', done: true }]); // newer
+  await second;
+  replies[0]([{ id: 'g', done: false }]); // older, late
+  await first;
+  assert.equal(S.goals[0].done, true);
+});
+
+test('a refresh that started before an optimistic change is dropped', async () => {
+  const replies = [];
+  route({ '/api/goals': (q, opts) => new Promise((r) => replies.push((goals) => r(reply(opts, { body: { goals } })))) });
+  set({ goals: [{ id: 'g', done: false }] });
+  const inflight = loadGoals();
+  await tick();
+  touchList('goals');
+  set({ goals: [{ id: 'g', done: true }] }); // optimistic
+  replies[0]([{ id: 'g', done: false }]); // computed before the change
+  await inflight;
+  assert.equal(S.goals[0].done, true);
+  const after = loadGoals(); // the change event's refresh applies
+  await tick();
+  replies[1]([{ id: 'g', done: true, note: 'server' }]);
+  await after;
+  assert.equal(S.goals[0].note, 'server');
+});
+
+test('a pending page is dropped after a refresh, even if the last item stayed the same', async () => {
+  route(libraryRoutes);
+  server.posts = posts(150, 1);
+  set({ library: null });
+  await loadLibrary();
+  await loadMoreSaved(); // 150..51 shown
+  let open;
+  gate = new Promise((r) => { open = r; });
+  const more = loadMoreSaved(); // cursor p51; computed now: 50..1 with p40 still liked
+  await tick();
+  server.posts.find((p) => p.id === 'p40').liked = false; // unliked elsewhere
+  await loadLibrary(); // same 100 shown, same last item p51
+  assert.equal(S.library.saved.at(-1).id, 'p51');
+  open(); gate = null;
+  await more;
+  assert.ok(!S.library.saved.some((p) => p.id === 'p40'), 'the stale page did not bring p40 back');
+  await loadMoreSaved();
+  assert.ok(!S.library.saved.some((p) => p.id === 'p40') && S.library.saved.some((p) => p.id === 'p39'), 'a fresh page loads instead');
+});
+
+test('a pending feed page is dropped after a refresh that kept the same last post', async () => {
+  route(libraryRoutes);
+  server.posts = posts(30, 1);
+  set({ feed: null });
+  await loadFeed(); // 30..1? no: limit 30 -> all 30, has_more false
+  server.posts = posts(60, 1);
+  await loadFeed(); // 60..31
+  let open;
+  gate = new Promise((r) => { open = r; });
+  const more = loadFeed(true); // cursor p31, computed now: 30..1 incl. p20
+  await tick();
+  server.posts = server.posts.filter((p) => p.id !== 'p20'); // deleted
+  await loadFeed(); // still 60..31
+  open(); gate = null;
+  await more;
+  assert.equal(S.feed.posts.length, 30, 'stale page dropped');
+  await loadFeed(true);
+  assert.ok(!S.feed.posts.some((p) => p.id === 'p20') && S.feed.posts.some((p) => p.id === 'p1'));
+});
+
+// ------------------------------------------------------------------ ideas
+
+test('Ideas asks only for open and started ideas', async () => {
+  const all = [
+    { id: 'a', status: 'open', created_at: 5 },
+    { id: 'b', status: 'started', created_at: 7 },
+    { id: 'c', status: 'dismissed', created_at: 9 },
+    { id: 'd', status: 'open', created_at: 7 },
+    { id: 'e', status: 'done', created_at: 8 },
+  ];
+  const asked = [];
+  route({
+    // Like the server: comma-separated statuses, newest first.
+    '/api/ideas': (q, opts) => {
+      asked.push(q.get('status'));
+      const want = (q.get('status') || '').split(',');
+      const ideas = all.filter((i) => !q.get('status') || want.includes(i.status)).sort((x, y) => y.created_at - x.created_at);
+      return reply(opts, { body: { ideas, has_more: false } });
+    },
+  });
+  set({ ideas: null });
+  await loadIdeas();
+  assert.deepEqual(asked, ['open,started']);
+  assert.deepEqual(S.ideas.map((i) => i.id).sort(), ['a', 'b', 'd']);
 });

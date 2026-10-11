@@ -209,6 +209,10 @@ export async function loadMessages(cid) {
       if (m.status !== 'streaming') delete live[m.id];
       else if (!live[m.id]) live[m.id] = { text: '', acts: [], cid };
     }
+    // A reply of this chat that is no longer streaming may also have left
+    // the latest page (it finished while we were away): drop its entry too.
+    const streaming = new Set(list.filter((m) => m.status === 'streaming').map((m) => m.id));
+    for (const [mid, l] of Object.entries(live)) if (l.cid === cid && !streaming.has(mid)) delete live[mid];
     set({ live });
     doneLoading(cid, { list, hasMore: joined ? (cur.hasMore ?? r.has_more) : r.has_more, error: undefined });
   } catch (e) {
@@ -232,22 +236,80 @@ export async function loadOlder(cid) {
   }
 }
 
+// Lists that are refreshed whole (feed, ideas, goals, library) can have
+// several refreshes and page loads in flight. Per list: `started` counts
+// refreshes begun, `applied` is the newest one shown (or the point a local
+// change made everything older stale), and `gen` changes whenever the list
+// is replaced or changed here, which invalidates pages still loading.
+const lists = {};
+const track = (k) => (lists[k] ||= { started: 0, applied: 0, gen: 0 });
+
+/** Begin a full refresh of list `k`; `apply(fn)` runs fn only if still newest. */
+function refreshOf(k) {
+  const t = track(k);
+  const n = ++t.started;
+  return (fn) => {
+    if (n <= t.applied) return false;
+    t.applied = n;
+    t.gen++;
+    fn();
+    return true;
+  };
+}
+
+/**
+ * A local (optimistic) change to list `k`: refreshes already in flight may
+ * carry the state from before it, and pages loading may no longer fit, so
+ * both are dropped. Call before or with the change.
+ */
+export function touchList(k) {
+  const t = track(k);
+  t.applied = t.started;
+  t.gen++;
+}
+
+/** A page was appended to list `k`: other pages in flight no longer fit. */
+const grew = (k) => { track(k).gen++; };
+
+/** For a page load: true while list `k` has not been replaced or changed since. */
+function pageOf(k) {
+  const t = track(k);
+  const gen = t.gen;
+  return () => t.gen === gen;
+}
+
 export async function loadFeed(more = false) {
   if (!more) {
+    const apply = refreshOf('feed');
     const r = await get('/feed?limit=30');
-    set({ feed: { posts: r.posts, hasMore: r.has_more } });
+    apply(() => set({ feed: { posts: r.posts, hasMore: r.has_more } }));
     return;
   }
   const last = S.feed?.posts?.at(-1);
   if (!last) return;
+  const fits = pageOf('feed');
   const r = await get(`/feed?limit=30&before=${last.created_at}`);
-  // A refresh may have replaced the list meanwhile: this page only follows
-  // the list it was asked for.
-  if (S.feed?.posts.at(-1)?.id !== last.id) return;
+  // This page only follows the list it was asked for.
+  if (!fits() || S.feed?.posts.at(-1)?.id !== last.id) return;
+  grew('feed');
   set({ feed: { posts: appendNew(S.feed.posts, r.posts), hasMore: r.has_more } });
 }
-export async function loadIdeas() { set({ ideas: (await get('/ideas')).ideas }); }
-export async function loadGoals() { set({ goals: (await get('/goals?include_done=true')).goals }); }
+
+/**
+ * The Ideas screen shows open and started ideas; asking for just those means
+ * the newest dismissed or done ones never crowd them out of the server's
+ * page (at most 200, newest first).
+ */
+export async function loadIdeas() {
+  const apply = refreshOf('ideas');
+  const r = await get('/ideas?status=open,started');
+  apply(() => set({ ideas: r.ideas }));
+}
+export async function loadGoals() {
+  const apply = refreshOf('goals');
+  const r = await get('/goals?include_done=true');
+  apply(() => set({ goals: r.goals }));
+}
 const SAVED_PAGE = 50;
 const PHOTO_PAGE = 60;
 const ITEM_PAGE = 60;
@@ -302,13 +364,14 @@ async function loadPages(kind, want) {
  * saved one shows up.
  */
 export async function loadLibrary() {
+  const apply = refreshOf('library');
   const cur = S.library;
   const [[items, itemsMore], [photos, photosMore], [saved, savedMore]] = await Promise.all([
     loadPages('items', cur?.items.length || 0),
     loadPages('photos', cur?.photos.length || 0),
     loadPages('saved', cur?.saved.length || 0),
   ]);
-  set({ library: { items, itemsMore, photos, photosMore, saved, savedMore } });
+  apply(() => set({ library: { items, itemsMore, photos, photosMore, saved, savedMore } }));
 }
 
 /**
@@ -319,9 +382,11 @@ export async function loadLibrary() {
 async function loadMore(kind) {
   const last = S.library?.[kind].at(-1);
   if (!last) return;
+  const fits = pageOf('library');
   const [items, more] = await PAGED[kind].page(last);
   const lib = S.library;
-  if (!lib || lib[kind].at(-1)?.id !== last.id) return;
+  if (!fits() || !lib || lib[kind].at(-1)?.id !== last.id) return;
+  grew('library');
   set({ library: { ...lib, [kind]: appendNew(lib[kind], items), [PAGED[kind].more]: more } });
 }
 

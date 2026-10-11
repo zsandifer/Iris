@@ -1,7 +1,7 @@
 // For you: story cards per topic, Instagram-like posts, full-screen stories.
 import { html, useEffect, useRef, useState } from './h.js';
 import { post as apiPost, seg } from './api.js';
-import { S, set, useStore, loadFeed, go, toast, isOwner } from './store.js';
+import { S, set, useStore, loadFeed, go, toast, isOwner, touchList } from './store.js';
 import { Icon, Img, LetterTile, Empty, Spinner, ago, hostOf, safeUrl } from './ui.js';
 import { md, plain } from './md.js';
 
@@ -25,6 +25,10 @@ export function topics(posts) {
 function markLiked(p, liked) {
   const swap = (x) => (x.id === p.id ? { ...x, liked } : x);
   const patch = {};
+  // Refreshes already in flight predate this; the server's change event
+  // brings a fresh one.
+  if (S.feed) touchList('feed');
+  if (S.library) touchList('library');
   if (S.feed) patch.feed = { ...S.feed, posts: S.feed.posts.map(swap) };
   if (S.library) {
     const saved = S.library.saved;
