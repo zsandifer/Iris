@@ -14,6 +14,10 @@
 //!   is removed after the turn. Sessions are scoped by directory, which also
 //!   keeps `--resume <session id>` per conversation.
 //! - `--skip-trust` trusts Iris's own workspace for headless runs.
+//! - API key: when the owner added one in the app, `GEMINI_API_KEY` is set
+//!   and the workspace settings select `gemini-api-key` auth.
+//! - Connector servers get a per-server `timeout` (ms) so a call waiting
+//!   for the owner's approval is not cut off.
 //! - Model: `-m` (aliases `flash`, `pro`, `flash-lite` resolve to the
 //!   newest version). No effort flag.
 //! - Images: `@<path>` references (the image directory is added with
@@ -26,6 +30,7 @@ use super::{
 };
 use crate::config::{HarnessConfig, ensure_private_dir, write_private_file};
 use crate::util::Result;
+use base64::Engine;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -65,18 +70,99 @@ fn scope_dir(cwd: &Path, scope: &str) -> PathBuf {
         .join(if safe.is_empty() { "default" } else { &safe })
 }
 
+/// Paths read by Gemini CLI 0.63. System overrides workspace; defaults
+/// live beside the (possibly overridden) system settings file.
+/// See packages/cli/src/config/settings.ts and core/src/utils/paths.ts at
+/// https://github.com/google-gemini/gemini-cli/tree/v0.63.0/packages
+fn settings_paths(workspace: &Path, env: impl Fn(&str) -> Option<PathBuf>) -> Vec<PathBuf> {
+    let system = env("GEMINI_CLI_SYSTEM_SETTINGS_PATH").unwrap_or_else(|| {
+        #[cfg(target_os = "macos")]
+        let path = "/Library/Application Support/GeminiCli/settings.json";
+        #[cfg(target_os = "windows")]
+        let path = r"C:\ProgramData\gemini-cli\settings.json";
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let path = "/etc/gemini-cli/settings.json";
+        PathBuf::from(path)
+    });
+    let defaults = env("GEMINI_CLI_SYSTEM_DEFAULTS_PATH")
+        .unwrap_or_else(|| system.with_file_name("system-defaults.json"));
+    // If HOME is unavailable, Node can use the OS account's home. An
+    // unknown path triggers random aliases rather than assuming no servers.
+    let home = env("GEMINI_CLI_HOME").or_else(|| env("HOME"));
+    let mut paths = vec![
+        defaults,
+        home.map(|h| h.join(".gemini/settings.json"))
+            .unwrap_or_default(),
+        system,
+    ];
+    for path in &mut paths {
+        if !path.as_os_str().is_empty() && path.is_relative() {
+            *path = workspace.join(&*path);
+        }
+    }
+    paths.push(workspace.join(".gemini/settings.json"));
+    paths
+}
+
+/// Deserialize only server keys. All settings and server values (which
+/// may contain credentials) are skipped, never retained or reported.
+fn proxy_servers(servers: &[super::McpServer], paths: &[PathBuf]) -> Vec<super::McpServer> {
+    #[derive(serde::Deserialize)]
+    struct Names {
+        #[serde(default, rename = "mcpServers")]
+        servers: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
+    }
+    let mut taken = Vec::new();
+    let mut uncertain = false;
+    for path in paths {
+        if path.as_os_str().is_empty() {
+            uncertain = true;
+            continue;
+        }
+        match std::fs::File::open(path) {
+            Ok(file) => match serde_json::from_reader::<_, Names>(std::io::BufReader::new(file)) {
+                Ok(names) => taken.extend(names.servers.into_keys()),
+                // JSON with comments is also valid in Gemini. If we cannot
+                // enumerate it, use unguessable per-turn names.
+                Err(_) => uncertain = true,
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => uncertain = true,
+        }
+    }
+    let servers = if uncertain {
+        servers
+            .iter()
+            .map(|s| super::McpServer {
+                // Keep mcp_<server>_ within Gemini's first 30 characters
+                // so its tool-name shortening preserves attribution.
+                name: format!(
+                    "iris_{}_{}",
+                    s.name.chars().take(3).collect::<String>(),
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode(crate::util::random_bytes::<12>())
+                ),
+                ..s.clone()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        servers.to_vec()
+    };
+    super::unclaimed_servers(&servers, &taken)
+}
+
 /// Gemini's `mcpServers` settings section.
 pub fn mcp_settings(servers: &[super::McpServer]) -> Value {
     let mut map = Map::new();
     for s in servers {
-        let v = match &s.transport {
+        let mut v = match &s.transport {
             McpTransport::Stdio { command, args, env } => {
                 json!({"command": command, "args": args, "env": env, "trust": true})
             }
-            McpTransport::Http { url, headers } => {
-                json!({"httpUrl": url, "headers": headers, "trust": true})
-            }
         };
+        if let Some(t) = s.timeout_secs {
+            v["timeout"] = (t * 1000).into();
+        }
         map.insert(s.name.clone(), v);
     }
     Value::Object(map)
@@ -126,7 +212,21 @@ impl Harness for Gemini {
                 s
             })
             .collect();
-        let body = json!({"mcpServers": mcp_settings(&servers)});
+        let paths = settings_paths(&dir, |key| {
+            std::env::var_os(key)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        });
+        let servers = proxy_servers(&servers, &paths);
+        let names: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+        inv.mcp_server_names = Some(names.clone());
+        let mut body = json!({"mcpServers": mcp_settings(&servers)});
+        if spec.key_env.iter().any(|k| k == "GEMINI_API_KEY") {
+            // An API key the owner added in the app: use it even if a
+            // Google sign-in was saved before (a saved auth type would
+            // otherwise win over the environment).
+            body["security"] = json!({"auth": {"selectedType": "gemini-api-key"}});
+        }
         write_private_file(&settings, &serde_json::to_vec_pretty(&body)?)?;
         inv.temp_files.push(settings);
 
@@ -141,14 +241,17 @@ impl Harness for Gemini {
         inv.cwd = Some(dir);
 
         let a = &mut inv.args;
+        // Only Iris's MCP servers in every turn (not ones configured in
+        // Gemini CLI itself or its extensions, which would bypass Iris's
+        // gateway). Someone else's chat also gets no extensions (they may
+        // carry the owner's accounts).
+        a.push("--allowed-mcp-server-names".into());
+        if names.is_empty() {
+            // A non-existent, unguessable name keeps an empty turn closed.
+            a.push(format!("iris_disabled_{}", crate::util::new_id()));
+        }
+        a.extend(names);
         if spec.isolated {
-            // Someone else's chat: only Iris's MCP servers, no extensions
-            // (both may carry the owner's accounts).
-            a.push("--allowed-mcp-server-names".into());
-            if spec.mcp_servers.is_empty() {
-                a.push("iris".into());
-            }
-            a.extend(spec.mcp_servers.iter().map(|s| s.name.clone()));
             a.extend(["-e", "none"].map(String::from));
         }
         a.extend(["--skip-trust", "-o", "stream-json", "-m"].map(String::from));
@@ -522,6 +625,77 @@ mod tests {
     }
 
     #[test]
+    fn proxies_avoid_names_in_every_settings_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = settings_paths(tmp.path(), |key| {
+            Some(tmp.path().join(match key {
+                "GEMINI_CLI_SYSTEM_SETTINGS_PATH" => "system/settings.json",
+                "GEMINI_CLI_SYSTEM_DEFAULTS_PATH" => "defaults.json",
+                "GEMINI_CLI_HOME" => "home",
+                _ => return None,
+            }))
+        });
+        let server = McpServer {
+            name: "github".into(),
+            transport: McpTransport::Stdio {
+                command: "iris".into(),
+                args: vec!["mcp-gateway".into()],
+                env: BTreeMap::new(),
+            },
+            timeout_secs: None,
+        };
+        for (path, name) in paths.iter().zip([
+            "github",
+            "iris_github",
+            "iris_iris_github",
+            "iris_iris_iris_github",
+        ]) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, json!({"mcpServers": {name: {"command": "native", "env": {"SECRET": "do-not-retain"}}}, "unrelated": {"secret": "also-ignored"}}).to_string()).unwrap();
+        }
+        let proxies = proxy_servers(std::slice::from_ref(&server), &paths);
+        assert_eq!(proxies[0].name, "iris_iris_iris_iris_github");
+        assert_eq!(mcp_settings(&proxies)[&proxies[0].name]["command"], "iris");
+        // Simulate an unreadable file without depending on uid/permissions.
+        std::fs::remove_file(&paths[2]).unwrap();
+        std::fs::create_dir(&paths[2]).unwrap();
+        let a = proxy_servers(std::slice::from_ref(&server), &paths);
+        let b = proxy_servers(&[server], &paths);
+        assert!(a[0].name.starts_with("iris_git_"));
+        assert_ne!(a[0].name, b[0].name);
+        assert_eq!(a[0].name.len(), 25);
+        let parser = GeminiParser {
+            servers: vec![a[0].name.clone()],
+            ..Default::default()
+        };
+        assert_eq!(
+            parser
+                .classify(&format!("mcp_{}_search_messages", a[0].name))
+                .0,
+            "mcp"
+        );
+    }
+
+    #[test]
+    fn settings_overrides_and_default_paths_match_gemini() {
+        let workspace = Path::new("/workspace");
+        let paths = settings_paths(workspace, |key| match key {
+            "GEMINI_CLI_SYSTEM_SETTINGS_PATH" => Some("/system/custom.json".into()),
+            "HOME" => Some("/user".into()),
+            _ => None,
+        });
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("/system/system-defaults.json"),
+                "/user/.gemini/settings.json".into(),
+                "/system/custom.json".into(),
+                "/workspace/.gemini/settings.json".into()
+            ]
+        );
+    }
+
+    #[test]
     fn builds_invocation() {
         let tmp = tempfile::tempdir().unwrap();
         let spec = TurnSpec {
@@ -542,11 +716,13 @@ mod tests {
                     args: vec!["mcp".into()],
                     env: BTreeMap::new(),
                 },
+                timeout_secs: Some(420),
             }],
             cwd: tmp.path().into(),
             writable_dirs: vec!["/data/memory".into()],
             run_dir: tmp.path().into(),
             scope: "conv/../1".into(),
+            key_env: vec!["GEMINI_API_KEY".into()],
             isolated: false,
             own_mcp_servers: Vec::new(),
         };
@@ -554,8 +730,11 @@ mod tests {
             .build(&spec)
             .unwrap();
         let args = inv.args.join(" ");
+        let name = &inv.mcp_server_names.as_ref().unwrap()[0];
         assert!(
-            args.starts_with("--skip-trust -o stream-json -m flash --resume sess-1"),
+            args.starts_with(
+                &format!("--allowed-mcp-server-names {name} --skip-trust -o stream-json -m flash --resume sess-1")
+            ),
             "{args}"
         );
         assert!(args.contains("--approval-mode auto_edit"));
@@ -563,15 +742,28 @@ mod tests {
             "--include-directories /data/memory,{}",
             tmp.path().join("uploads").display()
         )));
-        assert!(!args.contains("effort") && !args.contains("low"));
+        assert!(!inv.args.iter().any(|a| a == "low" || a.contains("effort")));
         let cwd = inv.cwd.clone().unwrap();
         assert_eq!(cwd, tmp.path().join("gemini/conv1"));
         let settings: Value =
             serde_json::from_slice(&std::fs::read(cwd.join(".gemini/settings.json")).unwrap())
                 .unwrap();
-        assert_eq!(settings["mcpServers"]["iris"]["trust"], true);
+        assert_eq!(settings["mcpServers"][name]["trust"], true);
+        assert_eq!(settings["mcpServers"][name]["timeout"], 420_000);
         assert_eq!(
-            settings["mcpServers"]["iris"]["args"],
+            settings["mcpServers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec![name]
+        );
+        assert_eq!(
+            settings["security"]["auth"]["selectedType"],
+            "gemini-api-key"
+        );
+        assert_eq!(
+            settings["mcpServers"][name]["args"],
             json!(["mcp", "--workdir", cwd.to_string_lossy()])
         );
         assert_eq!(inv.env[0].0, "GEMINI_SYSTEM_MD");
@@ -588,18 +780,23 @@ mod tests {
             .build(&iso)
             .unwrap();
         let args = inv.args.join(" ");
+        let name = &inv.mcp_server_names.as_ref().unwrap()[0];
         assert!(
-            args.starts_with("--allowed-mcp-server-names iris -e none --skip-trust"),
+            args.starts_with(&format!(
+                "--allowed-mcp-server-names {name} -e none --skip-trust"
+            )),
             "{args}"
         );
         let plain = Gemini::new(HarnessConfig::gemini_default())
             .build(&spec)
             .unwrap();
-        assert!(
-            !plain
-                .args
-                .iter()
-                .any(|a| a == "--allowed-mcp-server-names" || a == "-e")
-        );
+        assert!(!plain.args.iter().any(|a| a == "-e"));
+        let mut empty = spec;
+        empty.mcp_servers.clear();
+        let inv = Gemini::new(HarnessConfig::gemini_default())
+            .build(&empty)
+            .unwrap();
+        assert!(inv.args[1].starts_with("iris_disabled_"));
+        assert_ne!(inv.args[1], "iris");
     }
 }

@@ -204,6 +204,13 @@ async fn discuss_feed_post(
 
 async fn refresh_feed(State(state): State<AppState>, user: AuthUser) -> Result<Response, ApiError> {
     user.require_owner()?;
+    if state.is_paused().await {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "paused",
+            "Iris is paused; resume it first",
+        ));
+    }
     let started = crate::jobs::trigger(&state, crate::jobs::Job::Feed);
     Ok((
         StatusCode::ACCEPTED,

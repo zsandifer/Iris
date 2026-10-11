@@ -133,6 +133,10 @@ pub struct Inner {
     pub rankings: Rankings,
     pub logins: crate::login::LoginManager,
     pub engine_ops: crate::setup::EngineOps,
+    /// Connector gateway: turn grants, running connectors, approvals.
+    pub gateway: crate::gateway::Gateway,
+    /// Connector sign-ins (OAuth) in progress.
+    pub oauth: crate::oauth::Flows,
     serving: std::sync::atomic::AtomicBool,
     /// Last broadcast recommendation per slot (to announce changes).
     last_recommended: Mutex<BTreeMap<Slot, Option<String>>>,
@@ -184,6 +188,8 @@ impl AppState {
             rankings,
             logins: crate::login::LoginManager::default(),
             engine_ops: crate::setup::EngineOps::default(),
+            gateway: crate::gateway::Gateway::default(),
+            oauth: crate::oauth::Flows::default(),
             serving: std::sync::atomic::AtomicBool::new(false),
             last_recommended: Mutex::default(),
             limiter: Limiter::new(cfg.max_concurrent_turns),
@@ -291,25 +297,30 @@ impl AppState {
         let seq = entry.probe_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let mut version: Option<Option<String>> = None;
         let mut auth: Option<(AuthState, Option<String>)> = None;
+        let mut has_keys = false;
         if let (true, Some(program)) = (entry.cfg.enabled, &program) {
             let cwd = self.paths.workspace_dir();
             let strip = self.strip_env(entry);
+            let keys = crate::keys::env_for(self, entry.harness.name()).await;
+            has_keys = !keys.is_empty();
             if let Ok((_, out, _)) =
-                runner::probe(program, &["--version".into()], &cwd, &strip).await
+                runner::probe(program, &["--version".into()], &cwd, &strip, &[]).await
             {
                 let v = out.lines().next().unwrap_or("").trim();
                 version = Some((!v.is_empty()).then(|| v.chars().take(80).collect()));
             }
             if let Some(args) = entry.harness.auth_probe_args() {
-                auth = Some(match runner::probe(program, &args, &cwd, &strip).await {
-                    Ok((ok, out, err)) => {
-                        let state = entry.harness.parse_auth_probe(ok, &out, &err);
-                        let message = (state == AuthState::AuthRequired)
-                            .then(|| "The CLI reports it is not signed in".to_string());
-                        (state, message)
-                    }
-                    Err(_) => (AuthState::Unknown, None),
-                });
+                auth = Some(
+                    match runner::probe(program, &args, &cwd, &strip, &keys).await {
+                        Ok((ok, out, err)) => {
+                            let state = entry.harness.parse_auth_probe(ok, &out, &err);
+                            let message = (state == AuthState::AuthRequired)
+                                .then(|| "The CLI reports it is not signed in".to_string());
+                            (state, message)
+                        }
+                        Err(_) => (AuthState::Unknown, None),
+                    },
+                );
             }
             // Without a status command the state comes from turns and is
             // kept (see `recheck_auth`).
@@ -336,8 +347,18 @@ impl AppState {
                 && entry.auth_reports.load(Ordering::SeqCst) == reports
                 && entry.last_probe_applied.load(Ordering::SeqCst) < seq
             {
-                status.auth = state;
-                status.auth_message = message;
+                if has_keys && state == AuthState::AuthRequired {
+                    // The owner added an API key; some status commands
+                    // only know about the subscription sign-in. Keep what
+                    // the key check or turns learned instead.
+                    if status.auth != AuthState::Ok {
+                        status.auth = AuthState::Unknown;
+                    }
+                    status.auth_message = None;
+                } else {
+                    status.auth = state;
+                    status.auth_message = message;
+                }
                 entry.last_probe_applied.store(seq, Ordering::SeqCst);
             }
             (before, status.clone())
@@ -429,7 +450,8 @@ impl AppState {
         };
         let cwd = self.paths.workspace_dir();
         let strip = self.strip_env(entry);
-        match runner::probe(program, &args, &cwd, &strip).await {
+        let keys = crate::keys::env_for(self, entry.harness.name()).await;
+        match runner::probe(program, &args, &cwd, &strip, &keys).await {
             Ok((true, out, _)) => {
                 let models = entry.harness.parse_models(&out);
                 self.set_discovered_models(entry, models)
@@ -472,10 +494,12 @@ impl AppState {
                     owner can fix it by running `codex login` on the server."
                     .to_string(),
                 "gemini" => "The Gemini engine on the Iris server is signed out. The owner can \
-                    fix it by running `gemini` on the server and signing in."
+                    fix it by adding a Gemini API key in the app (Settings, AI engine), or by \
+                    running `gemini` on the server and signing in."
                     .to_string(),
                 "opencode" => "The OpenCode engine on the Iris server has no usable provider. \
-                    The owner can fix it with `opencode auth login` on the server."
+                    The owner can fix it by adding a provider key in the app (Settings, AI \
+                    engine), or with `opencode auth login` on the server."
                     .to_string(),
                 other => format!("The {other} engine on the Iris server needs to be signed in."),
             })
@@ -587,6 +611,20 @@ impl AppState {
             .unwrap_or_else(|| self.cfg.agent_name.clone())
     }
 
+    /// The owner paused Iris: no new turns or jobs, no connector calls.
+    pub async fn is_paused(&self) -> bool {
+        self.setting("paused").await.is_some()
+    }
+
+    /// Recipients the owner trusts: messages only to them need no
+    /// approval (normalized like the gate does).
+    pub async fn trusted_recipients(&self) -> Vec<String> {
+        self.setting("safety.trusted_recipients")
+            .await
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+            .unwrap_or_default()
+    }
+
     pub async fn feed_prompt(&self) -> String {
         self.setting("feed_prompt")
             .await
@@ -610,6 +648,7 @@ impl AppState {
             "allow_claude_for_shared": self.allow_claude_for_shared().await,
             "feed_prompt": if owner { Some(self.feed_prompt().await) } else { None },
             "voice": {"enabled": false, "status": "not_implemented"},
+            "paused": self.is_paused().await,
         })
     }
 

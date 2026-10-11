@@ -130,10 +130,10 @@ Your phone ──(your private network)──▶ Iris on your computer ──▶
 - Listens only on your private network, such as [Tailscale](https://tailscale.com),
   never the open internet. Each device pairs with a one-time code.
 - Secrets live in an encrypted vault the AI never reads.
-- Sending email or messages, buying things and contacting new people are
-  meant to wait for your tap on an approval card. The card is built by Iris
-  itself, so the AI can't disguise what it's sending. The card and API are
-  built; wiring every risky action through them is in progress (see below).
+- Connected services run through Iris, not the AI. Sending email or
+  messages, buying things, deleting and contacting new people wait for your
+  tap on an approval card. The card is built by Iris itself from the exact
+  request, so the AI can't disguise what it's sending.
 - Uses only the official, unmodified AI tools signed in through their own
   official flows. Iris never handles your subscription credentials.
 
@@ -172,17 +172,18 @@ Iris is **early** and moving fast. What works today:
   notifications
 - ✅ Claude Code, Codex, Gemini CLI and OpenCode (including local models),
   with ranked automatic defaults and effort that adapts to the conversation
-- ✅ Reconnect cards for Claude and Codex sign-ins; installing and
-  auto-updating engines from the app
+- ✅ Reconnect cards for Claude and Codex sign-ins; API keys for Gemini CLI
+  and OpenCode from the app; installing and auto-updating engines from the
+  app
+- ✅ Connections (Google, GitHub, any MCP server) through Iris's gateway:
+  approval cards for sends, purchases, deletions and new recipients,
+  trusted people, tripwires, Pause Iris and Disconnect everything
 - ✅ For you feed with stories, Ideas, Goals, Library, system file editing
 - ✅ Push notifications, quiet hours, an encrypted credentials vault
 - 🧪 Shared chats with more than one person (preview)
 
 On the way:
 
-- 🚧 Approval cards on every risky action (the card and API exist; routing
-  actions through them is next)
-- 🚧 "Sign in with Google" style connector setup from the chat
 - 🚧 Automatic feed sources (RSS, YouTube, Reddit) with adaptive size
 - 🚧 Watching and taking over Iris's browser
 - 🚧 Voice replies, and Iris using saved logins for you

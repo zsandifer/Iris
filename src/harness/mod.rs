@@ -35,8 +35,15 @@ pub struct McpServer {
     /// `[A-Za-z0-9_-]+`; also the tool prefix (`mcp__<name>__<tool>`).
     pub name: String,
     pub transport: McpTransport,
+    /// How long one tool call may take (connector calls can wait for the
+    /// owner's approval). None: the CLI's default.
+    pub timeout_secs: Option<u64>,
 }
 
+/// How the CLI starts an MCP server. Everything Iris passes is a local
+/// stdio program: its own bridge (`iris mcp`) and one connector gateway
+/// proxy per connector (`iris mcp-gateway`); remote connectors are reached
+/// by the gateway, never by the CLI.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 pub enum McpTransport {
@@ -44,10 +51,6 @@ pub enum McpTransport {
         command: String,
         args: Vec<String>,
         env: BTreeMap<String, String>,
-    },
-    Http {
-        url: String,
-        headers: BTreeMap<String, String>,
     },
 }
 
@@ -76,6 +79,9 @@ pub struct TurnSpec {
     /// Stable key for per-conversation state some CLIs keep on disk
     /// (the conversation id).
     pub scope: String,
+    /// Names of API-key variables Iris passes to this run (keys the owner
+    /// added in the app; values are added to the environment by the turn).
+    pub key_env: Vec<String>,
     /// Not the owner's own chat: the CLI may use only `mcp_servers`, none
     /// of the MCP servers, memory, or account integrations configured in
     /// the CLI itself (those are the owner's).
@@ -85,17 +91,47 @@ pub struct TurnSpec {
     pub own_mcp_servers: Vec<String>,
 }
 
+/// The names Iris's MCP servers get in a CLI whose own configuration
+/// already has servers called `own` (the CLI would merge same-named ones).
+/// Aliases are allocated across the CLI's names and every name already
+/// assigned, so no two servers end up sharing one.
+pub fn unclaimed_names(names: &[String], own: &[String]) -> Vec<String> {
+    let mut taken: std::collections::HashSet<String> = own.iter().cloned().collect();
+    let mut out = Vec::new();
+    for name in names {
+        let mut n = name.clone();
+        while taken.contains(&n) {
+            n.insert_str(0, "iris_");
+        }
+        taken.insert(n.clone());
+        out.push(n);
+    }
+    out
+}
+
+/// Rename `servers` per `unclaimed_names`.
+pub fn unclaimed_servers(servers: &[McpServer], own: &[String]) -> Vec<McpServer> {
+    let names: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+    unclaimed_names(&names, own)
+        .into_iter()
+        .zip(servers)
+        .map(|(name, s)| McpServer { name, ..s.clone() })
+        .collect()
+}
+
 /// A fully built command line.
 #[derive(Debug, Clone, Default)]
 pub struct Invocation {
     pub args: Vec<String>,
+    /// Actual MCP names when the adapter allocates aliases during build.
+    pub mcp_server_names: Option<Vec<String>>,
     pub stdin: Vec<u8>,
     /// Private files to delete when the turn ends.
     pub temp_files: Vec<PathBuf>,
     /// Extra environment variables for the CLI process: paths to private
-    /// per-turn files, or connector header values a CLI can only read by
-    /// variable name (Codex `env_http_headers`). Unlike argv, a process's
-    /// environment is readable only by its own user. Never logged.
+    /// per-turn files and settings; the turn adds the owner's engine API
+    /// keys, if any. Unlike argv, a process's environment is readable only
+    /// by its own user. Never logged.
     pub env: Vec<(String, String)>,
     /// Working directory override (defaults to `TurnSpec::cwd`).
     pub cwd: Option<PathBuf>,
@@ -448,5 +484,17 @@ mod tests {
         assert!(resolve_command("sh").is_some());
         assert!(resolve_command("/bin/sh").is_some());
         assert!(resolve_command("definitely-not-a-real-binary-xyz").is_none());
+    }
+
+    #[test]
+    fn aliases_never_collide_with_each_other_or_native_names() {
+        let own = vec!["mail".to_string()];
+        for order in [["mail", "iris_mail"], ["iris_mail", "mail"]] {
+            let names: Vec<String> = order.iter().map(|s| s.to_string()).collect();
+            let out = unclaimed_names(&names, &own);
+            let set: std::collections::HashSet<_> = out.iter().collect();
+            assert_eq!(set.len(), 2, "{out:?}");
+            assert!(!out.contains(&"mail".to_string()), "{out:?}");
+        }
     }
 }

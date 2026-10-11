@@ -663,10 +663,17 @@ pub fn validate_card(card: &Value) -> Result<Value, String> {
     check_text("card.service", s("service"), 60, false)?;
     check_url("card.url", s("url"))?;
     check_url("card.image_url", s("image_url"))?;
-    if matches!(ty, "link" | "connect") && s("url").is_empty() {
+    // A connect card for a service in Iris's catalog opens Iris's own
+    // setup; any other needs the url of the service's page.
+    let catalog_service =
+        ty == "connect" && crate::connectors::catalog_entry(&s("service").to_lowercase()).is_some();
+    if matches!(ty, "link" | "connect") && s("url").is_empty() && !catalog_service {
         return Err(format!("a {ty} card needs a url"));
     }
     let mut out = json!({"type": ty, "title": s("title").trim()});
+    if catalog_service {
+        out["service"] = s("service").to_lowercase().into();
+    }
     for k in [
         "body",
         "url",
@@ -675,7 +682,7 @@ pub fn validate_card(card: &Value) -> Result<Value, String> {
         "service",
         "ref_id",
     ] {
-        if !s(k).is_empty() {
+        if !s(k).is_empty() && !(k == "service" && catalog_service) {
             out[k] = s(k).into();
         }
     }
@@ -759,8 +766,68 @@ pub fn approval_card(r: &ApprovalRequest) -> Value {
 
 // --------------------------------------------------------------- connectors
 
+/// OAuth state of a connector (MCP authorization spec, or a catalog
+/// provider such as Google with the owner's own client). Secret fields
+/// (`client_secret`, `access_token`, `refresh_token`) are sealed with the
+/// vault (base64) and only opened in memory by the gateway.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OAuthConfig {
+    /// `discover`: endpoints come from the MCP server's metadata (and the
+    /// client may be registered dynamically). `preset`: endpoints come
+    /// from the catalog and the owner supplies the client.
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    /// RFC 8707 resource indicator (the MCP server's URL), discover mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+    /// Extra authorization parameters (e.g. `access_type=offline`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_params: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    /// `dcr` (registered by Iris) or `owner` (pasted in the app).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_source: String,
+    /// Redirect URI the client was registered (or used) with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// stdio connectors: environment variable that receives the access
+    /// token (http connectors get `Authorization: Bearer`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
+    /// When the owner last finished signing in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_at: Option<i64>,
+    /// The service is on this machine or the owner's network (sign-in may
+    /// then use private addresses).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
+    /// The account signed in (email from the OpenID ID token), shown to
+    /// the owner and told to the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+}
+
 /// Stored connector configuration. Values in `env` and `headers` are sealed
-/// with the vault (base64) and only opened when building a turn.
+/// with the vault (base64) and only opened by the gateway.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConnectorConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -773,6 +840,8 @@ pub struct ConnectorConfig {
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthConfig>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -785,6 +854,19 @@ pub struct Connector {
     #[serde(skip)]
     pub config: ConnectorConfig,
     pub enabled: bool,
+    /// Approval rules (see `gateway::policy::Policy`).
+    #[serde(skip)]
+    pub policy: crate::gateway::policy::Policy,
+    /// Catalog entry it was created from (`google`, `github`, `custom`).
+    pub service: String,
+    /// Set when a tripwire paused it.
+    pub paused_reason: Option<String>,
+    pub paused_at: Option<i64>,
+    /// ok | needs_sign_in | needs_reconnect
+    pub auth_state: String,
+    /// Saved before the gateway: its program runs in the workspace.
+    #[serde(skip)]
+    pub workspace_cwd: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -792,25 +874,52 @@ pub struct Connector {
 impl Connector {
     /// API view: command/url and secret *names* only.
     pub fn public_json(&self) -> Value {
+        let oauth = self.config.oauth.as_ref().map(|o| {
+            json!({
+                "mode": o.mode,
+                "client_configured": o.client_id.is_some(),
+                "client_source": o.client_source,
+                "connected": o.refresh_token.is_some() || o.access_token.is_some(),
+                "connected_at": o.connected_at,
+                "account": o.account,
+                "scopes": o.scopes,
+                "redirect_uri": o.redirect_uri,
+            })
+        });
         json!({
             "id": self.id,
             "name": self.name,
             "description": self.description,
             "transport": self.transport,
+            "service": self.service,
             "enabled": self.enabled,
             "command": self.config.command,
             "args": self.config.args,
             "url": self.config.url,
             "env_keys": self.config.env.keys().collect::<Vec<_>>(),
             "header_keys": self.config.headers.keys().collect::<Vec<_>>(),
+            "auth": if self.config.oauth.is_some() { "oauth" } else { "secrets" },
+            "oauth": oauth,
+            "auth_state": self.auth_state,
+            "policy": self.policy,
+            "rules": self.policy.mode.describe(),
+            "paused": self.paused_reason.is_some(),
+            "paused_reason": self.paused_reason,
+            "paused_at": self.paused_at,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         })
+    }
+
+    /// Usable by turns right now (on, not paused, signed in).
+    pub fn active(&self) -> bool {
+        self.enabled && self.paused_reason.is_none() && self.auth_state == "ok"
     }
 }
 
 fn connector_from_row(r: &rusqlite::Row) -> rusqlite::Result<Connector> {
     let config: String = r.get("config")?;
+    let policy: String = r.get("policy")?;
     Ok(Connector {
         id: r.get("id")?,
         name: r.get("name")?,
@@ -818,6 +927,12 @@ fn connector_from_row(r: &rusqlite::Row) -> rusqlite::Result<Connector> {
         transport: r.get("transport")?,
         config: serde_json::from_str(&config).unwrap_or_default(),
         enabled: r.get("enabled")?,
+        policy: crate::gateway::policy::Policy::parse(&policy),
+        service: r.get("service")?,
+        paused_reason: r.get("paused_reason")?,
+        paused_at: r.get("paused_at")?,
+        auth_state: r.get("auth_state")?,
+        workspace_cwd: r.get("workspace_cwd")?,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
     })
@@ -834,8 +949,9 @@ pub fn insert_connector(
 ) -> rusqlite::Result<Connector> {
     let now = now_ms();
     conn.execute(
-        "INSERT INTO connectors (id, name, description, transport, config, enabled, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        "INSERT INTO connectors (id, name, description, transport, config, enabled, created_at, updated_at,
+                                 workspace_cwd)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 0)",
         params![
             id,
             name,
@@ -853,6 +969,15 @@ pub fn get_connector(conn: &Connection, id: &str) -> rusqlite::Result<Option<Con
     conn.query_row(
         "SELECT * FROM connectors WHERE id = ?1",
         [id],
+        connector_from_row,
+    )
+    .optional()
+}
+
+pub fn get_connector_by_name(conn: &Connection, name: &str) -> rusqlite::Result<Option<Connector>> {
+    conn.query_row(
+        "SELECT * FROM connectors WHERE name = ?1",
+        [name],
         connector_from_row,
     )
     .optional()
@@ -892,8 +1017,263 @@ pub fn update_connector(
     get_connector(conn, id)
 }
 
+/// Gateway-side fields (rules, service, pause, sign-in state). `None`
+/// keeps a value; `paused` uses `Some(None)` to clear.
+#[derive(Default)]
+pub struct ConnectorState<'a> {
+    pub policy: Option<&'a crate::gateway::policy::Policy>,
+    pub service: Option<&'a str>,
+    pub paused: Option<Option<&'a str>>,
+    pub auth_state: Option<&'a str>,
+}
+
+pub fn set_connector_state(
+    conn: &Connection,
+    id: &str,
+    s: &ConnectorState,
+) -> rusqlite::Result<Option<Connector>> {
+    if let Some(p) = s.policy {
+        conn.execute(
+            "UPDATE connectors SET policy = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, serde_json::to_string(p).unwrap_or_default(), now_ms()],
+        )?;
+    }
+    if let Some(svc) = s.service {
+        conn.execute(
+            "UPDATE connectors SET service = ?2 WHERE id = ?1",
+            params![id, svc],
+        )?;
+    }
+    if let Some(paused) = s.paused {
+        conn.execute(
+            "UPDATE connectors SET paused_reason = ?2, paused_at = ?3 WHERE id = ?1",
+            params![id, paused, paused.map(|_| now_ms())],
+        )?;
+    }
+    if let Some(a) = s.auth_state {
+        conn.execute(
+            "UPDATE connectors SET auth_state = ?2 WHERE id = ?1",
+            params![id, a],
+        )?;
+    }
+    get_connector(conn, id)
+}
+
+/// Turn every connector off. Returns how many were on.
+pub fn disable_all_connectors(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE connectors SET enabled = 0, updated_at = ?1 WHERE enabled = 1",
+        [now_ms()],
+    )
+}
+
 pub fn delete_connector(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     Ok(conn.execute("DELETE FROM connectors WHERE id = ?1", [id])? > 0)
+}
+
+// ---------------------------------------------------------- connector calls
+
+/// One gated call, as recorded in the activity log.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ConnectorCall {
+    pub id: String,
+    pub connector_id: Option<String>,
+    pub connector_name: String,
+    pub tool: String,
+    /// read | draft | write | send | purchase | delete | export
+    pub category: String,
+    /// auto | trusted | approved | denied | expired | cancelled | blocked |
+    /// paused | pending
+    pub decision: String,
+    /// ok | error | null (not run, or still running)
+    pub outcome: Option<String>,
+    pub reason: String,
+    pub summary: String,
+    pub conversation_id: Option<String>,
+    pub message_id: Option<String>,
+    pub card_message_id: Option<String>,
+    pub result_bytes: i64,
+    pub created_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+fn call_from_row(r: &rusqlite::Row) -> rusqlite::Result<ConnectorCall> {
+    Ok(ConnectorCall {
+        id: r.get("id")?,
+        connector_id: r.get("connector_id")?,
+        connector_name: r.get("connector_name")?,
+        tool: r.get("tool")?,
+        category: r.get("category")?,
+        decision: r.get("decision")?,
+        outcome: r.get("outcome")?,
+        reason: r.get("reason")?,
+        summary: r.get("summary")?,
+        conversation_id: r.get("conversation_id")?,
+        message_id: r.get("message_id")?,
+        card_message_id: r.get("card_message_id")?,
+        result_bytes: r.get("result_bytes")?,
+        created_at: r.get("created_at")?,
+        finished_at: r.get("finished_at")?,
+    })
+}
+
+/// Record a call. Its `created_at` is assigned here, unique and increasing
+/// (it is the activity log's page cursor).
+pub fn insert_connector_call(conn: &Connection, c: &ConnectorCall) -> rusqlite::Result<()> {
+    let last: Option<i64> =
+        conn.query_row("SELECT MAX(created_at) FROM connector_calls", [], |r| {
+            r.get(0)
+        })?;
+    let created_at = now_ms().max(last.map_or(0, |l| l + 1));
+    conn.execute(
+        "INSERT INTO connector_calls (id, connector_id, connector_name, tool, category, decision,
+             outcome, reason, summary, conversation_id, message_id, card_message_id, result_bytes,
+             created_at, finished_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            c.id,
+            c.connector_id,
+            c.connector_name,
+            c.tool,
+            c.category,
+            c.decision,
+            c.outcome,
+            c.reason,
+            c.summary,
+            c.conversation_id,
+            c.message_id,
+            c.card_message_id,
+            c.result_bytes,
+            created_at,
+            c.finished_at
+        ],
+    )?;
+    Ok(())
+}
+
+/// Record the decision (and card) for a call.
+pub fn set_call_decision(
+    conn: &Connection,
+    id: &str,
+    decision: &str,
+    card_message_id: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE connector_calls SET decision = ?2,
+             card_message_id = COALESCE(?3, card_message_id) WHERE id = ?1",
+        params![id, decision, card_message_id],
+    )?;
+    Ok(())
+}
+
+/// Record how a call ended.
+pub fn finish_connector_call(
+    conn: &Connection,
+    id: &str,
+    outcome: Option<&str>,
+    result_bytes: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE connector_calls SET outcome = ?2, result_bytes = ?3, finished_at = ?4 WHERE id = ?1",
+        params![id, outcome, result_bytes, now_ms()],
+    )?;
+    Ok(())
+}
+
+/// Recent use of one connector, for the tripwires: (calls that ran,
+/// sends that ran, bytes returned) since `since`.
+pub fn connector_usage_since(
+    conn: &Connection,
+    connector_id: &str,
+    since: i64,
+) -> rusqlite::Result<(i64, i64, i64)> {
+    conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(category = 'send'), 0),
+                COALESCE(SUM(result_bytes), 0)
+         FROM connector_calls
+         WHERE connector_id = ?1 AND admitted_at >= ?2
+           AND decision IN ('auto', 'trusted', 'approved')",
+        params![connector_id, since],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+}
+
+pub fn list_connector_calls(
+    conn: &Connection,
+    connector_id: Option<&str>,
+    before: Option<i64>,
+    limit: usize,
+) -> rusqlite::Result<Vec<ConnectorCall>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM connector_calls
+         WHERE (?1 IS NULL OR connector_id = ?1) AND created_at < ?2
+         ORDER BY created_at DESC LIMIT ?3",
+    )?;
+    stmt.query_map(
+        params![connector_id, before.unwrap_or(i64::MAX), limit as i64],
+        call_from_row,
+    )?
+    .collect()
+}
+
+/// Calls still waiting for an answer (after a restart nothing waits).
+pub fn expire_pending_calls(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE connector_calls SET decision = 'expired', finished_at = ?1 WHERE decision = 'pending'",
+        [now_ms()],
+    )
+}
+
+pub fn add_known_recipients(conn: &Connection, addresses: &[String]) -> rusqlite::Result<()> {
+    for a in addresses {
+        conn.execute(
+            "INSERT OR IGNORE INTO known_recipients (address, created_at) VALUES (?1, ?2)",
+            params![a, now_ms()],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn known_recipients(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT address FROM known_recipients")?;
+    stmt.query_map([], |r| r.get(0))?.collect()
+}
+
+// --------------------------------------------------------------- engine keys
+
+pub fn set_engine_key(
+    conn: &Connection,
+    harness: &str,
+    env: &str,
+    sealed: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO engine_keys (harness, env, ciphertext, created_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (harness, env) DO UPDATE SET ciphertext = excluded.ciphertext,
+             created_at = excluded.created_at",
+        params![harness, env, sealed, now_ms()],
+    )?;
+    Ok(())
+}
+
+pub fn delete_engine_key(conn: &Connection, harness: &str, env: &str) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "DELETE FROM engine_keys WHERE harness = ?1 AND env = ?2",
+        params![harness, env],
+    )? > 0)
+}
+
+/// (env name, sealed value, created_at) for one harness.
+pub fn engine_keys(
+    conn: &Connection,
+    harness: &str,
+) -> rusqlite::Result<Vec<(String, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT env, ciphertext, created_at FROM engine_keys WHERE harness = ?1 ORDER BY env",
+    )?;
+    stmt.query_map([harness], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect()
 }
 
 // -------------------------------------------------------------- credentials
@@ -1135,6 +1515,26 @@ mod tests {
             f(c, &owner)
         })
         .unwrap();
+    }
+
+    #[test]
+    fn hourly_usage_is_an_index_lookup() {
+        with_db(|c, _| {
+            let plan: Vec<String> = c
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM connector_calls
+                     WHERE connector_id = ?1 AND admitted_at >= ?2
+                       AND decision IN ('auto', 'trusted', 'approved')",
+                )?
+                .query_map(params!["c", 0], |r| r.get::<_, String>(3))?
+                .collect::<rusqlite::Result<_>>()?;
+            assert!(
+                plan.iter().any(|p| p.contains("connector_calls_admitted")
+                    && p.contains("connector_id=? AND admitted_at>?")),
+                "{plan:?}"
+            );
+            Ok(())
+        });
     }
 
     #[test]

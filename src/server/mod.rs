@@ -4,6 +4,7 @@
 
 pub(crate) mod admin;
 mod chat;
+mod connect;
 mod content;
 mod web;
 mod ws;
@@ -12,8 +13,6 @@ pub use chat::sniff_image;
 
 use crate::auth::{self, PairError};
 use crate::db::{self, Device, User};
-use crate::entities::Connector;
-use crate::harness::{McpServer, McpTransport};
 use crate::state::AppState;
 use crate::util::Result;
 use axum::Router;
@@ -175,6 +174,7 @@ pub fn router(state: AppState) -> Router {
         .merge(chat::routes())
         .merge(content::routes())
         .merge(admin::routes())
+        .merge(connect::routes())
         .route("/ws", get(ws::handler))
         .layer(DefaultBodyLimit::max(upload_limit));
     Router::new()
@@ -413,7 +413,7 @@ async fn user_pairing_code(
 /// Reserved MCP server names (the built-in bridge).
 pub const RESERVED_CONNECTOR_NAMES: &[&str] = &["iris"];
 
-fn connector_aad(id: &str, field: &str, key: &str) -> String {
+pub(crate) fn connector_aad(id: &str, field: &str, key: &str) -> String {
     format!("connector:{id}:{field}:{key}")
 }
 
@@ -435,40 +435,6 @@ pub fn seal_connector_secrets(
         .collect()
 }
 
-/// Build the per-turn MCP server definition, unsealing secrets in memory.
-pub fn connector_to_mcp(state: &AppState, con: &Connector) -> Result<McpServer> {
-    let open = |field: &str, m: &BTreeMap<String, String>| -> Result<BTreeMap<String, String>> {
-        m.iter()
-            .map(|(k, v)| {
-                Ok((
-                    k.clone(),
-                    state.vault.open_str(v, &connector_aad(&con.id, field, k))?,
-                ))
-            })
-            .collect()
-    };
-    let transport = match con.transport.as_str() {
-        "stdio" => McpTransport::Stdio {
-            command: con
-                .config
-                .command
-                .clone()
-                .ok_or("stdio connector without command")?,
-            args: con.config.args.clone(),
-            env: open("env", &con.config.env)?,
-        },
-        "http" => McpTransport::Http {
-            url: con.config.url.clone().ok_or("http connector without url")?,
-            headers: open("headers", &con.config.headers)?,
-        },
-        other => return Err(format!("unknown transport {other}").into()),
-    };
-    Ok(McpServer {
-        name: con.name.clone(),
-        transport,
-    })
-}
-
 // ------------------------------------------------------------------- serve
 
 pub async fn serve(state: AppState) -> Result<()> {
@@ -488,6 +454,8 @@ pub async fn serve(state: AppState) -> Result<()> {
     // Cancelled turns are still stopping their CLIs' process groups (TERM,
     // grace, KILL); the runtime must outlive that cleanup.
     wait_for_turns(&state, std::time::Duration::from_secs(9)).await;
+    // Same for connector programs that were asked to stop.
+    crate::gateway::upstream::wait_for_reaping(std::time::Duration::from_secs(4)).await;
     Ok(())
 }
 
@@ -526,6 +494,15 @@ async fn shutdown_signal(state: AppState) {
             let _ = tx.send(true);
         }
     }
+    // Connector programs Iris started run in their own process groups:
+    // end them (TERM, then KILL shortly after) before exiting.
+    crate::gateway::cancel_all_grants(&state);
+    crate::gateway::cancel_approvals(&state, None);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::gateway::stop_all(&state),
+    )
+    .await;
     // Last resort if something still hangs (turn cleanup takes at most
     // about five seconds).
     tokio::spawn(async {
@@ -623,6 +600,57 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK, "{body}");
         body["token"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn connector_credentials_require_https_except_on_loopback() {
+        let h = setup();
+        let token = pair_as(&h, None).await;
+        for credential in [
+            json!({"auth": "oauth"}),
+            json!({"headers": {"Authorization": "Bearer synthetic-token"}}),
+        ] {
+            let mut body = json!({"name": "unsafe", "transport": "http", "url": "http://connector.example/mcp"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(credential.as_object().unwrap().clone());
+            let (s, _) = send(&h.app, "POST", "/api/connectors", Some(&token), Some(body)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+        }
+        let (s, b) = send(&h.app, "POST", "/api/connectors", Some(&token), Some(json!({"name": "local", "transport": "http", "url": "http://[::1]:7999/mcp", "auth": "oauth"}))).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let id = b["connector"]["id"].as_str().unwrap();
+        let (s, _) = send(
+            &h.app,
+            "PATCH",
+            &format!("/api/connectors/{id}"),
+            Some(&token),
+            Some(json!({"url": "http://connector.example/mcp"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        // Unauthenticated HTTP is still permitted; adding credentials is not.
+        let (s, b) = send(&h.app, "POST", "/api/connectors", Some(&token), Some(json!({"name": "public", "transport": "http", "url": "http://connector.example/mcp"}))).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let id = b["connector"]["id"].as_str().unwrap();
+        let (s, _) = send(
+            &h.app,
+            "PATCH",
+            &format!("/api/connectors/{id}"),
+            Some(&token),
+            Some(json!({"headers": {"X-Api-Key": "synthetic-key"}})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/connectors/{id}/oauth/start"),
+            Some(&token),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -2215,7 +2243,9 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let system = t.read(1, "system.md");
         assert!(system.contains("owner-user-fact") && system.contains("owner-memory-fact"));
         assert!(t.read(1, "args").contains(&memory));
-        assert!(!t.read(1, "args").contains("--strict-mcp-config"));
+        // Only Iris's MCP servers there too (the CLI's own would bypass the
+        // connector gateway).
+        assert!(t.read(1, "args").contains("--strict-mcp-config"));
         let mcp: Value = serde_json::from_str(&t.read(1, "mcp.json")).unwrap();
         assert!(mcp["mcpServers"]["notes"].is_object());
     }

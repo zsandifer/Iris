@@ -16,6 +16,7 @@ function initialState() {
     live: {},            // assistant message id -> {text, acts: Activity[], queued, cid}
     logins: {},          // harness -> LoginStatus (owner)
     engines: null,       // GET /api/engines (owner)
+    connectors: null,    // GET /api/connectors (owner)
     slots: null,         // Slot[]
     feed: null,          // {posts, hasMore}
     ideas: null,
@@ -54,6 +55,9 @@ export function set(patch) {
  * data, drafts, open sheets and overlays, and any ad hoc keys.
  */
 export function resetUserState() {
+  connectorsLoading = null;
+  connectorsTried = false;
+  userGen++;
   const fresh = initialState();
   for (const k of Object.keys(S)) if (!(k in fresh)) delete S[k];
   set(fresh);
@@ -372,6 +376,27 @@ async function loadPages(kind, want) {
   } while (more && list.length < Math.min(want, MAX_RELOAD));
   return [list, more];
 }
+let connectorsLoading = null;
+let userGen = 0;
+/** Load the owner's connectors; concurrent callers share one request. */
+export function loadConnectors() {
+  if (!isOwner()) return Promise.resolve();
+  const gen = userGen;
+  const req = connectorsLoading || get('/connectors')
+    // Dropped if the user signed out meanwhile.
+    .then((r) => { if (gen === userGen) set({ connectors: r.connectors }); })
+    .finally(() => { if (connectorsLoading === req) connectorsLoading = null; });
+  connectorsLoading = req;
+  return req;
+}
+
+let connectorsTried = false;
+/** Load connectors once for cards that only need them for display. */
+export function ensureConnectors() {
+  if (S.connectors || connectorsTried || !isOwner()) return;
+  connectorsTried = true;
+  loadConnectors().catch(() => {});
+}
 
 /**
  * (Re)load the Library. Each list (made by me, photos, saved) is reloaded
@@ -561,6 +586,9 @@ export function handleEvent(ev) {
     case 'engines.changed':
       if (S.engines) set({ engines: { ...S.engines, engines: ev.engines } });
       break;
+    case 'connectors.changed':
+      if (S.connectors) loadConnectors().catch(() => {});
+      break;
     default:
       break;
   }
@@ -598,6 +626,7 @@ export function refreshAll() {
   for (const k of Object.keys(loaders)) if (S[k]) loaders[k]().catch(() => {});
   if (S.slots) loadSlots().catch(() => {});
   if (S.engines) loadEngines().catch(() => {});
+  if (S.connectors) loadConnectors().catch(() => {});
 }
 
 /** Send a message (text and/or attachment ids) and track the reply. */

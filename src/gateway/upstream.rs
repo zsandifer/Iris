@@ -1,0 +1,1251 @@
+//! MCP client side of the gateway: talks to the real connector servers,
+//! which run on Iris's side (stdio programs Iris starts with their secrets
+//! in the environment, or remote Streamable HTTP servers Iris calls with
+//! their headers or OAuth token). The agent never sees those secrets.
+//!
+//! This is plumbing only: Iris forwards `tools/list` and `tools/call`; it
+//! never decides what to call.
+
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, HashMap};
+use std::io::{BufRead, BufReader, Read};
+use std::path::PathBuf;
+use std::process::Stdio as PStdio;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{ChildStdin, Command};
+use tokio::sync::oneshot;
+
+pub const PROTOCOL_VERSION: &str = "2025-06-18";
+/// Largest message accepted from a connector (tool results can be big).
+const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TOOL_PAGES: usize = 20;
+
+/// Environment variables never handed to connector programs.
+const STRIPPED_ENV: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "IRIS_GATEWAY_TOKEN",
+];
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpstreamError {
+    /// The server refused our credentials (HTTP 401/403).
+    Auth(String),
+    /// A JSON-RPC error from the server.
+    Rpc {
+        code: i64,
+        message: String,
+    },
+    /// The program died, the connection failed, or the reply was garbage.
+    Transport(String),
+    Timeout,
+    /// The HTTP session is gone (404 with a session id); start a new one.
+    SessionExpired,
+}
+
+impl std::fmt::Display for UpstreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpstreamError::Auth(m) => write!(f, "sign-in refused: {m}"),
+            UpstreamError::Rpc { code, message } => write!(f, "error {code}: {message}"),
+            UpstreamError::Transport(m) => write!(f, "{m}"),
+            UpstreamError::Timeout => write!(f, "no answer in time"),
+            UpstreamError::SessionExpired => write!(f, "session expired"),
+        }
+    }
+}
+
+/// How to reach one connector.
+#[derive(Debug, Clone)]
+pub enum Launch {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        cwd: PathBuf,
+    },
+    Http {
+        url: String,
+        headers: BTreeMap<String, String>,
+    },
+    /// A program Iris starts that serves MCP over HTTP on a loopback port.
+    /// `{port}` in the arguments, environment values, and URL is replaced
+    /// with a free port.
+    Serve {
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        cwd: PathBuf,
+        url: String,
+        headers: BTreeMap<String, String>,
+    },
+}
+
+pub struct Upstream {
+    inner: Inner,
+    /// The program behind a `Serve` connection (stopped on close/drop).
+    server: Option<ServerProc>,
+}
+
+/// A program serving HTTP for one connector.
+struct ServerProc {
+    reaper: Arc<Reaper>,
+    alive: Arc<AtomicBool>,
+    stderr: Arc<Mutex<String>>,
+}
+
+impl ServerProc {
+    fn kill(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+        self.reaper.terminate();
+    }
+}
+
+/// Ends a connector's process group exactly once: on close, on drop, and
+/// when its program exits or closes its output (descendants included).
+struct Reaper {
+    pid: Option<u32>,
+    done: AtomicBool,
+}
+
+impl Reaper {
+    fn new(pid: Option<u32>) -> Arc<Self> {
+        Arc::new(Self {
+            pid,
+            done: AtomicBool::new(false),
+        })
+    }
+
+    fn terminate(&self) {
+        if !self.done.swap(true, Ordering::SeqCst) {
+            terminate_group(self.pid);
+        }
+    }
+}
+
+impl Drop for ServerProc {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+fn free_port() -> Result<u16, UpstreamError> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .map_err(|e| UpstreamError::Transport(format!("no free port: {e}")))
+}
+
+/// Where a connector's program is, as it would be found when started in
+/// `cwd` with its own environment: relative paths from `cwd`, bare names
+/// on the connector's own `PATH` first, then the usual places.
+fn connector_program(
+    command: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let runnable = |p: &std::path::Path| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if command.contains('/') {
+        let p = cwd.join(command);
+        return runnable(&p).then_some(p);
+    }
+    if let Some(path) = env.get("PATH") {
+        let found = std::env::split_paths(path)
+            .map(|d| cwd.join(d).join(command))
+            .find(|c| runnable(c));
+        if found.is_some() {
+            return found;
+        }
+    }
+    crate::harness::resolve_command(command)
+}
+
+fn base_command(
+    command: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: &std::path::Path,
+) -> Result<Command, UpstreamError> {
+    let program = connector_program(command, env, cwd)
+        .ok_or_else(|| UpstreamError::Transport(format!("{command} is not installed")))?;
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .env("PWD", cwd)
+        .kill_on_drop(true)
+        .process_group(0);
+    for k in STRIPPED_ENV {
+        cmd.env_remove(k);
+    }
+    cmd.envs(env);
+    Ok(cmd)
+}
+
+/// Keep the last ~2 KB a program wrote to stderr.
+fn keep_tail(mut pipe: tokio::process::ChildStderr, tail: Arc<Mutex<String>>) {
+    tokio::spawn(async move {
+        // Fixed-size reads: a program that never prints a newline cannot
+        // make this grow.
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = match pipe.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let mut t = tail.lock().unwrap_or_else(|p| p.into_inner());
+            t.push_str(&String::from_utf8_lossy(&buf[..n]));
+            if t.len() > 2000 {
+                let cut = t.len() - 2000;
+                let cut = (cut..t.len()).find(|i| t.is_char_boundary(*i)).unwrap_or(0);
+                t.drain(..cut);
+            }
+        }
+    });
+}
+
+/// SIGTERM a connector's process group, then SIGKILL whatever is left a
+/// few seconds later.
+fn terminate_group(pid: Option<u32>) {
+    let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()).filter(|p| *p > 0) else {
+        return;
+    };
+    // SAFETY: plain syscalls on the process group we created.
+    unsafe {
+        libc::kill(-pid, libc::SIGTERM);
+    }
+    REAPING.fetch_add(1, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        // KILL only a group that is still there after the grace period.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && group_alive(pid) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if group_alive(pid) {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        REAPING.fetch_sub(1, Ordering::SeqCst);
+    });
+}
+
+/// Process groups asked to stop and not yet gone.
+static REAPING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn group_alive(pgid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the group exists.
+    unsafe { libc::kill(-pgid, 0) == 0 }
+}
+
+/// Wait (at most `limit`) until stopped connector programs are gone, so
+/// the daemon does not exit before escalating to KILL.
+pub async fn wait_for_reaping(limit: Duration) {
+    let deadline = tokio::time::Instant::now() + limit;
+    while REAPING.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Connector HTTP exchanges run on the blocking pool, which the database
+/// shares (16 threads): at most this many at once, so slow services can
+/// never starve it.
+const MAX_HTTP_EXCHANGES: usize = 6;
+
+fn http_permits() -> Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_EXCHANGES)));
+    PERMITS.clone()
+}
+
+async fn http_permit() -> Result<tokio::sync::OwnedSemaphorePermit, UpstreamError> {
+    http_permits()
+        .acquire_owned()
+        .await
+        .map_err(|_| UpstreamError::Transport("shutting down".into()))
+}
+
+/// Start a `Serve` program and wait until its port accepts connections.
+async fn serve(
+    command: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: &std::path::Path,
+    url: &str,
+    timeout: Duration,
+) -> Result<(ServerProc, String), UpstreamError> {
+    let port = free_port()?.to_string();
+    let sub = |s: &str| s.replace("{port}", &port);
+    let args: Vec<String> = args.iter().map(|a| sub(a)).collect();
+    let env: BTreeMap<String, String> = env.iter().map(|(k, v)| (k.clone(), sub(v))).collect();
+    let mut cmd = base_command(command, &args, &env, cwd)?;
+    cmd.stdin(PStdio::null())
+        .stdout(PStdio::null())
+        .stderr(PStdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| UpstreamError::Transport(format!("could not start {command}: {e}")))?;
+    let stderr = Arc::new(Mutex::new(String::new()));
+    keep_tail(child.stderr.take().expect("piped"), stderr.clone());
+    let alive = Arc::new(AtomicBool::new(true));
+    let reaper = Reaper::new(child.id());
+    let proc = ServerProc {
+        reaper: reaper.clone(),
+        alive: alive.clone(),
+        stderr: stderr.clone(),
+    };
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+        alive.store(false, Ordering::SeqCst);
+        // Whatever it started goes with it.
+        reaper.terminate();
+    });
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+            break;
+        }
+        if !proc.alive.load(Ordering::SeqCst) {
+            let tail = stderr.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let last = tail
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("");
+            return Err(UpstreamError::Transport(format!(
+                "{command} stopped while starting{}",
+                if last.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", last.trim())
+                }
+            )));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(UpstreamError::Timeout);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Ok((proc, sub(url)))
+}
+
+enum Inner {
+    Stdio(StdioConn),
+    Http(HttpConn),
+}
+
+impl Upstream {
+    /// Connect and complete the MCP handshake.
+    pub async fn start(launch: Launch, timeout: Duration) -> Result<Self, UpstreamError> {
+        let (inner, server) = match launch {
+            Launch::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => (
+                Inner::Stdio(StdioConn::spawn(&command, &args, &env, &cwd)?),
+                None,
+            ),
+            Launch::Http { url, headers } => (Inner::Http(HttpConn::new(url, headers)), None),
+            Launch::Serve {
+                command,
+                args,
+                env,
+                cwd,
+                url,
+                headers,
+            } => {
+                let (proc, url) = serve(&command, &args, &env, &cwd, &url, timeout).await?;
+                (Inner::Http(HttpConn::new(url, headers)), Some(proc))
+            }
+        };
+        let up = Self { inner, server };
+        let init = up
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "iris", "version": env!("CARGO_PKG_VERSION")},
+                }),
+                timeout,
+            )
+            .await?;
+        if let Inner::Http(h) = &up.inner {
+            let v = init["protocolVersion"]
+                .as_str()
+                .unwrap_or(PROTOCOL_VERSION)
+                .to_string();
+            *h.protocol.lock().unwrap_or_else(|p| p.into_inner()) = Some(v);
+        }
+        up.notify("notifications/initialized").await;
+        Ok(up)
+    }
+
+    pub fn alive(&self) -> bool {
+        let server_ok = self
+            .server
+            .as_ref()
+            .is_none_or(|p| p.alive.load(Ordering::SeqCst));
+        server_ok
+            && match &self.inner {
+                Inner::Stdio(s) => s.alive.load(Ordering::SeqCst),
+                Inner::Http(_) => true,
+            }
+    }
+
+    /// Replace one HTTP header (a refreshed OAuth token).
+    pub fn set_header(&self, name: &str, value: &str) {
+        if let Inner::Http(h) = &self.inner {
+            h.headers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(name.to_string(), value.to_string());
+        }
+    }
+
+    /// The server said its tool list changed since we last asked.
+    pub fn tools_changed(&self) -> bool {
+        match &self.inner {
+            Inner::Stdio(s) => s.tools_changed.swap(false, Ordering::SeqCst),
+            Inner::Http(_) => false,
+        }
+    }
+
+    /// Last lines the program wrote to stderr (owner diagnostics only).
+    pub fn stderr_tail(&self) -> String {
+        match (&self.inner, &self.server) {
+            (Inner::Stdio(s), _) => s.stderr.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+            (Inner::Http(_), Some(p)) => p.stderr.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+            (Inner::Http(_), None) => String::new(),
+        }
+    }
+
+    pub async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, UpstreamError> {
+        match &self.inner {
+            Inner::Stdio(s) => s.request(method, params, timeout).await,
+            Inner::Http(h) => h.request(method, params, timeout).await,
+        }
+    }
+
+    async fn notify(&self, method: &str) {
+        match &self.inner {
+            Inner::Stdio(s) => {
+                let _ = s.write(&json!({"jsonrpc": "2.0", "method": method})).await;
+            }
+            Inner::Http(h) => {
+                let _ = h.notify(method).await;
+            }
+        }
+    }
+
+    /// All tools, following pagination.
+    pub async fn list_tools(&self, timeout: Duration) -> Result<Vec<Value>, UpstreamError> {
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_TOOL_PAGES {
+            let params = match &cursor {
+                Some(c) => json!({"cursor": c}),
+                None => json!({}),
+            };
+            let r = self.request("tools/list", params, timeout).await?;
+            if let Some(list) = r["tools"].as_array() {
+                tools.extend(list.iter().cloned());
+            }
+            cursor = r["nextCursor"].as_str().map(String::from);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(tools)
+    }
+
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        arguments: &Value,
+        timeout: Duration,
+    ) -> Result<Value, UpstreamError> {
+        self.request(
+            "tools/call",
+            json!({"name": name, "arguments": arguments}),
+            timeout,
+        )
+        .await
+    }
+
+    /// Stop the program or end the HTTP session.
+    pub async fn close(&self) {
+        match &self.inner {
+            Inner::Stdio(s) => s.kill(),
+            // A program Iris started is ended right after (shortly, even if
+            // it is slow to end the session).
+            Inner::Http(h) if self.server.is_some() => {
+                let _ = tokio::time::timeout(Duration::from_secs(1), h.close()).await;
+            }
+            Inner::Http(h) => h.close().await,
+        }
+        if let Some(p) = &self.server {
+            p.kill();
+        }
+    }
+}
+
+// Keep upstream diagnostic text intact within the transport's size cap.
+// The gateway knows the secrets and scrubs them before display truncation.
+fn rpc_result(msg: Value) -> Result<Value, UpstreamError> {
+    if let Some(err) = msg.get("error") {
+        return Err(UpstreamError::Rpc {
+            code: err["code"].as_i64().unwrap_or(-32000),
+            message: err["message"].as_str().unwrap_or("error").to_string(),
+        });
+    }
+    Ok(msg.get("result").cloned().unwrap_or(Value::Null))
+}
+
+// -------------------------------------------------------------------- stdio
+
+type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>;
+
+struct StdioConn {
+    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
+    pending: Pending,
+    next_id: AtomicI64,
+    alive: Arc<AtomicBool>,
+    tools_changed: Arc<AtomicBool>,
+    stderr: Arc<Mutex<String>>,
+    reaper: Arc<Reaper>,
+}
+
+impl StdioConn {
+    fn spawn(
+        command: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        cwd: &std::path::Path,
+    ) -> Result<Self, UpstreamError> {
+        let mut cmd = base_command(command, args, env, cwd)?;
+        cmd.stdin(PStdio::piped())
+            .stdout(PStdio::piped())
+            .stderr(PStdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| UpstreamError::Transport(format!("could not start {command}: {e}")))?;
+        let pid = child.id();
+        let stdin = Arc::new(tokio::sync::Mutex::new(child.stdin.take().expect("piped")));
+        let stdout = child.stdout.take().expect("piped");
+        let stderr = Arc::new(Mutex::new(String::new()));
+        keep_tail(child.stderr.take().expect("piped"), stderr.clone());
+        let pending: Pending = Arc::default();
+        let alive = Arc::new(AtomicBool::new(true));
+        let tools_changed = Arc::new(AtomicBool::new(false));
+        let reaper = Reaper::new(pid);
+        let (p, a, tc, w, r2) = (
+            pending.clone(),
+            alive.clone(),
+            tools_changed.clone(),
+            stdin.clone(),
+            reaper.clone(),
+        );
+        tokio::spawn(async move {
+            let mut r = tokio::io::BufReader::new(stdout);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                let mut limited = (&mut r).take(MAX_MESSAGE_BYTES as u64);
+                match limited.read_until(b'\n', &mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let Ok(msg) = serde_json::from_slice::<Value>(&buf) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned();
+                match (msg.get("method").and_then(Value::as_str), id) {
+                    (Some(method), Some(id)) => {
+                        // A request from the server: answer the harmless
+                        // ones, refuse the rest (no sampling, no prompts).
+                        let reply = match method {
+                            "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                            "roots/list" => {
+                                json!({"jsonrpc": "2.0", "id": id, "result": {"roots": []}})
+                            }
+                            _ => json!({"jsonrpc": "2.0", "id": id,
+                                        "error": {"code": -32601, "message": "not supported"}}),
+                        };
+                        let mut line = reply.to_string().into_bytes();
+                        line.push(b'\n');
+                        let _ = w.lock().await.write_all(&line).await;
+                    }
+                    (Some(method), None) => {
+                        if method == "notifications/tools/list_changed" {
+                            tc.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    (None, Some(id)) => {
+                        if let Some(id) = id.as_i64()
+                            && let Some(tx) =
+                                p.lock().unwrap_or_else(|x| x.into_inner()).remove(&id)
+                        {
+                            let _ = tx.send(msg);
+                        }
+                    }
+                    (None, None) => {}
+                }
+            }
+            a.store(false, Ordering::SeqCst);
+            p.lock().unwrap_or_else(|x| x.into_inner()).clear();
+            // Output closed: the connection is over even if the program
+            // keeps running, so end it.
+            r2.terminate();
+            let _ = child.wait().await;
+        });
+        Ok(Self {
+            stdin,
+            pending,
+            next_id: AtomicI64::new(1),
+            alive,
+            tools_changed,
+            stderr,
+            reaper,
+        })
+    }
+
+    async fn write(&self, msg: &Value) -> Result<(), UpstreamError> {
+        let mut line = msg.to_string().into_bytes();
+        line.push(b'\n');
+        // Waiting for the pipe happens here, so a caller cancelled while
+        // another message is being written sends nothing. Once it has the
+        // pipe, its own task writes the whole message, so a caller that
+        // gives up halfway never leaves half a message in the pipe.
+        let mut w = self.stdin.clone().lock_owned().await;
+        tokio::spawn(async move {
+            w.write_all(&line).await?;
+            w.flush().await
+        })
+        .await
+        .map_err(|_| UpstreamError::Transport("the connector program stopped".into()))?
+        .map_err(|_| UpstreamError::Transport("the connector program stopped".into()))
+    }
+
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, UpstreamError> {
+        if !self.alive.load(Ordering::SeqCst) {
+            return Err(UpstreamError::Transport(
+                "the connector program stopped".into(),
+            ));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, tx);
+        // Forgets the request however this future ends (answered, timed
+        // out, or dropped by a cancelled caller).
+        struct Forget(Pending, i64);
+        impl Drop for Forget {
+            fn drop(&mut self) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&self.1);
+            }
+        }
+        let _forget = Forget(self.pending.clone(), id);
+        // One deadline for sending and answering: a program that stops
+        // reading its input must not hang the call.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        match tokio::time::timeout_at(deadline, self.write(&msg)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                self.forget(id);
+                return Err(e);
+            }
+            Err(_) => {
+                // A half-written message leaves the stream unusable.
+                self.forget(id);
+                self.kill();
+                return Err(UpstreamError::Timeout);
+            }
+        }
+        match tokio::time::timeout_at(deadline, rx).await {
+            Ok(Ok(msg)) => rpc_result(msg),
+            Ok(Err(_)) => Err(UpstreamError::Transport(
+                "the connector program stopped".into(),
+            )),
+            Err(_) => {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&id);
+                Err(UpstreamError::Timeout)
+            }
+        }
+    }
+
+    fn forget(&self, id: i64) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
+    }
+
+    fn kill(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+        self.reaper.terminate();
+    }
+}
+
+impl Drop for StdioConn {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+// --------------------------------------------------------------------- http
+
+struct HttpConn {
+    url: String,
+    headers: Mutex<BTreeMap<String, String>>,
+    session: Arc<Mutex<Option<String>>>,
+    protocol: Arc<Mutex<Option<String>>>,
+    next_id: AtomicI64,
+}
+
+/// One HTTP exchange, run on the blocking pool.
+struct Exchange {
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    timeout: Duration,
+    /// Wait for the response with this id (None: notification).
+    want_id: Option<i64>,
+}
+
+enum HttpReply {
+    Message(Value),
+    Accepted,
+    Status(u16, String),
+}
+
+fn http_agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        .max_redirects(0)
+        .user_agent(format!("iris/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into()
+}
+
+fn exchange(x: Exchange) -> Result<(HttpReply, Option<String>), UpstreamError> {
+    let agent = http_agent(x.timeout);
+    let mut req = agent.post(&x.url);
+    for (k, v) in &x.headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let resp = req.send(&x.body[..]).map_err(|e| match e {
+        ureq::Error::Timeout(_) => UpstreamError::Timeout,
+        e => UpstreamError::Transport(format!("could not reach the connector: {e}")),
+    })?;
+    let status = resp.status().as_u16();
+    let session = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let www_auth = resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if status == 401 || status == 403 {
+        return Err(UpstreamError::Auth(if www_auth.is_empty() {
+            format!("HTTP {status}")
+        } else {
+            www_auth
+        }));
+    }
+    if status == 202 || (x.want_id.is_none() && (200..300).contains(&status)) {
+        return Ok((HttpReply::Accepted, session));
+    }
+    let mut body = resp.into_body();
+    let mut reader = body.as_reader().take(MAX_MESSAGE_BYTES as u64);
+    if !(200..300).contains(&status) {
+        let mut text = String::new();
+        let _ = reader.read_to_string(&mut text);
+        return Ok((HttpReply::Status(status, text.trim().to_string()), session));
+    }
+    if ctype.starts_with("text/event-stream") {
+        let msg = read_sse(BufReader::new(reader), x.want_id)?;
+        return Ok((HttpReply::Message(msg), session));
+    }
+    let mut buf = Vec::new();
+    let mut reader = reader;
+    reader
+        .read_to_end(&mut buf)
+        .map_err(|e| UpstreamError::Transport(format!("bad reply: {e}")))?;
+    let v: Value = serde_json::from_slice(&buf)
+        .map_err(|_| UpstreamError::Transport("the connector sent an unreadable reply".into()))?;
+    // A batch reply: pick ours.
+    let msg = match v {
+        Value::Array(items) => items
+            .into_iter()
+            .find(|m| m["id"].as_i64() == x.want_id)
+            .unwrap_or(Value::Null),
+        v => v,
+    };
+    Ok((HttpReply::Message(msg), session))
+}
+
+/// Read Server-Sent Events until the JSON-RPC response with `want_id`.
+pub fn read_sse(r: impl BufRead, want_id: Option<i64>) -> Result<Value, UpstreamError> {
+    let mut data = String::new();
+    for line in r.lines() {
+        let line = line.map_err(|e| UpstreamError::Transport(format!("stream ended: {e}")))?;
+        if line.is_empty() {
+            if !data.is_empty() {
+                if let Ok(msg) = serde_json::from_str::<Value>(&data)
+                    && msg.get("method").is_none()
+                    && msg["id"].as_i64() == want_id
+                {
+                    return Ok(msg);
+                }
+                data.clear();
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    if !data.is_empty()
+        && let Ok(msg) = serde_json::from_str::<Value>(&data)
+        && msg["id"].as_i64() == want_id
+    {
+        return Ok(msg);
+    }
+    Err(UpstreamError::Transport(
+        "the connector closed the stream without answering".into(),
+    ))
+}
+
+impl HttpConn {
+    fn new(url: String, headers: BTreeMap<String, String>) -> Self {
+        Self {
+            url,
+            headers: Mutex::new(headers),
+            session: Arc::default(),
+            protocol: Arc::default(),
+            next_id: AtomicI64::new(1),
+        }
+    }
+
+    fn header_list(&self) -> Vec<(String, String)> {
+        let mut h: Vec<(String, String)> = vec![
+            ("Content-Type".into(), "application/json".into()),
+            (
+                "Accept".into(),
+                "application/json, text/event-stream".into(),
+            ),
+        ];
+        if let Some(s) = self
+            .session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            h.push(("Mcp-Session-Id".into(), s));
+        }
+        if let Some(v) = self
+            .protocol
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            h.push(("MCP-Protocol-Version".into(), v));
+        }
+        for (k, v) in self
+            .headers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
+            h.push((k.clone(), v.clone()));
+        }
+        h
+    }
+
+    async fn send(
+        &self,
+        body: Value,
+        want_id: Option<i64>,
+        timeout: Duration,
+    ) -> Result<HttpReply, UpstreamError> {
+        let had_session = self
+            .session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some();
+        let x = Exchange {
+            url: self.url.clone(),
+            headers: self.header_list(),
+            body: body.to_string().into_bytes(),
+            timeout,
+            want_id,
+        };
+        let permit = http_permit().await?;
+        let (reply, session) = tokio::task::spawn_blocking(move || {
+            // Held until the exchange really ends, even if the caller
+            // gave up on it.
+            let _permit = permit;
+            exchange(x)
+        })
+        .await
+        .map_err(|e| UpstreamError::Transport(e.to_string()))??;
+        if let Some(s) = session {
+            *self.session.lock().unwrap_or_else(|p| p.into_inner()) = Some(s);
+        }
+        if let HttpReply::Status(404, _) = reply
+            && had_session
+        {
+            return Err(UpstreamError::SessionExpired);
+        }
+        Ok(reply)
+    }
+
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, UpstreamError> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        match self.send(body, Some(id), timeout).await? {
+            HttpReply::Message(m) => rpc_result(m),
+            HttpReply::Accepted => Err(UpstreamError::Transport(
+                "the connector accepted the request but sent no answer".into(),
+            )),
+            HttpReply::Status(code, text) => Err(UpstreamError::Transport(format!(
+                "the connector answered HTTP {code}{}",
+                if text.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {text}")
+                }
+            ))),
+        }
+    }
+
+    async fn notify(&self, method: &str) -> Result<(), UpstreamError> {
+        self.send(
+            json!({"jsonrpc": "2.0", "method": method}),
+            None,
+            Duration::from_secs(30),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// End the session politely (DELETE with the session id).
+    async fn close(&self) {
+        let Some(sid) = self
+            .session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        else {
+            return;
+        };
+        let url = self.url.clone();
+        let mut headers = self.header_list();
+        headers.push(("Mcp-Session-Id".into(), sid));
+        // Closing is best effort: never wait long for a permit (Pause and
+        // Disconnect must not hang behind slow exchanges) or for the DELETE.
+        let Ok(Ok(permit)) = tokio::time::timeout(Duration::from_secs(2), http_permit()).await
+        else {
+            return;
+        };
+        let work = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let agent = http_agent(Duration::from_secs(5));
+            let mut req = agent.delete(&url);
+            for (k, v) in &headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            let _ = req.call();
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(7), work).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closing_does_not_wait_forever_for_a_permit() {
+        // Exercise close itself, with all exchange slots occupied. Holding
+        // them until close returns would deadlock without its timeout.
+        let _held = http_permits()
+            .acquire_many_owned(MAX_HTTP_EXCHANGES as u32)
+            .await
+            .unwrap();
+        let h = HttpConn::new("http://127.0.0.1:1/mcp".into(), BTreeMap::new());
+        *h.session.lock().unwrap() = Some("test-session".into());
+        tokio::time::timeout(Duration::from_secs(3), h.close())
+            .await
+            .expect("cleanup must not wait for busy exchanges");
+        assert!(h.session.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn sse_picks_our_response() {
+        let stream = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n\
+                      data: {\"jsonrpc\":\"2.0\",\"id\":3,\n\
+                      data: \"result\":{\"ok\":true}}\n\n";
+        let msg = read_sse(std::io::Cursor::new(stream), Some(3)).unwrap();
+        assert_eq!(msg["result"]["ok"], true);
+        let other = "data: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\n\n";
+        assert!(read_sse(std::io::Cursor::new(other), Some(3)).is_err());
+    }
+
+    #[test]
+    fn rpc_errors_are_reported() {
+        let e = rpc_result(
+            json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "bad"}}),
+        );
+        assert_eq!(
+            e,
+            Err(UpstreamError::Rpc {
+                code: -32602,
+                message: "bad".into()
+            })
+        );
+    }
+
+    /// A tiny MCP server written in shell (one tool), started over stdio.
+    #[tokio::test]
+    async fn stdio_handshake_list_and_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"t","version":"1"}}}\n' "$id" ;;
+    *'"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *'"tools/call"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$SECRET_VALUE" ;;
+  esac
+done"#;
+        let up = Upstream::start(
+            Launch::Stdio {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                env: BTreeMap::from([("SECRET_VALUE".into(), "from-the-vault".into())]),
+                cwd: tmp.path().to_path_buf(),
+            },
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        let tools = up.list_tools(Duration::from_secs(10)).await.unwrap();
+        assert_eq!(tools[0]["name"], "echo");
+        let r = up
+            .call_tool("echo", &json!({}), Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(r["content"][0]["text"], "from-the-vault");
+        up.close().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            up.call_tool("echo", &json!({}), Duration::from_secs(2))
+                .await
+                .is_err()
+        );
+    }
+
+    /// The process is gone (or only a zombie waiting to be reaped).
+    fn gone(pid: &str) -> bool {
+        match std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+        }
+    }
+
+    async fn wait_gone(pids: &[String]) -> bool {
+        for _ in 0..100 {
+            if pids.iter().all(|p| gone(p)) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn closing_ends_stubborn_programs_and_their_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Ignores TERM (so does its child) and leaves a child running.
+        let script = r#"trap '' TERM
+sleep 1000 &
+echo $! > child.pid
+echo $$ > main.pid
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"t","version":"1"}}}\n' "$id" ;;
+    *'"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}\n' "$id" ;;
+  esac
+done"#;
+        let up = Upstream::start(
+            Launch::Stdio {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                env: BTreeMap::new(),
+                cwd: tmp.path().to_path_buf(),
+            },
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        let read = |f: &str| std::fs::read_to_string(tmp.path().join(f)).unwrap();
+        let pids = [read("main.pid"), read("child.pid")];
+        assert!(!pids.iter().any(|p| gone(p)), "both running");
+        up.close().await;
+        assert!(wait_gone(&pids).await, "TERM, then KILL, ends the group");
+    }
+
+    #[tokio::test]
+    async fn a_program_that_closes_its_output_is_ended() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Closes stdout but keeps running (and ignores TERM).
+        let script = "trap '' TERM\necho $$ > main.pid\nexec 1>&-\nsleep 1000";
+        let started = Upstream::start(
+            Launch::Stdio {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                env: BTreeMap::new(),
+                cwd: tmp.path().to_path_buf(),
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(started.is_err());
+        let pid = std::fs::read_to_string(tmp.path().join("main.pid")).unwrap();
+        assert!(wait_gone(&[pid]).await, "ended once its output closed");
+    }
+
+    #[tokio::test]
+    async fn a_call_cancelled_while_waiting_for_the_pipe_is_never_sent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Answers the handshake, then stops reading for a while (the pipe
+        // fills up), then records everything it was sent.
+        let script = r#"IFS= read -r line
+id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"t","version":"1"}}}\n' "$id"
+sleep 2
+cat > requests.log"#;
+        let up = Arc::new(
+            Upstream::start(
+                Launch::Stdio {
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), script.into()],
+                    env: BTreeMap::new(),
+                    cwd: tmp.path().to_path_buf(),
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap(),
+        );
+        // Bigger than the pipe: its write blocks until the program reads.
+        let big = {
+            let up = up.clone();
+            tokio::spawn(async move {
+                let _ = up
+                    .call_tool(
+                        "big_one",
+                        &json!({"x": "a".repeat(300_000)}),
+                        Duration::from_secs(8),
+                    )
+                    .await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Queued behind it, then cancelled.
+        let r = tokio::time::timeout(
+            Duration::from_millis(300),
+            up.call_tool("cancelled_one", &json!({}), Duration::from_secs(8)),
+        )
+        .await;
+        assert!(r.is_err(), "still waiting for the pipe");
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        let log = std::fs::read_to_string(tmp.path().join("requests.log")).unwrap_or_default();
+        assert!(log.contains("big_one"), "the first call went out");
+        assert!(
+            !log.contains("cancelled_one"),
+            "the cancelled call never did"
+        );
+        big.abort();
+        up.close().await;
+    }
+
+    #[test]
+    fn programs_are_found_like_they_used_to_be() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = tmp.path().join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        for p in [tmp.path().join("mail-server"), tools.join("notes-server")] {
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Relative to the folder it runs in, not Iris's.
+        assert_eq!(
+            connector_program("./mail-server", &BTreeMap::new(), tmp.path()),
+            Some(tmp.path().join("./mail-server"))
+        );
+        // On the connector's own PATH (relative entries from its folder).
+        let env = BTreeMap::from([("PATH".to_string(), "tools:/nonexistent".to_string())]);
+        assert_eq!(
+            connector_program("notes-server", &env, tmp.path()),
+            Some(tmp.path().join("tools/notes-server"))
+        );
+        assert!(connector_program("notes-server", &BTreeMap::new(), tmp.path()).is_none());
+        assert!(connector_program("sh", &BTreeMap::new(), tmp.path()).is_some());
+    }
+}

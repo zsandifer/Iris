@@ -403,8 +403,10 @@ async fn add_member(
         return Err(ApiError::not_found("user"));
     }
     // A running turn re-checks who is in the chat: one that started with
-    // the owner's private context stops and withholds its reply.
+    // the owner's private context stops and withholds its reply, and its
+    // connector access (held approvals included) ends now.
     turn::membership_changed(&state);
+    crate::gateway::cancel_conversation_grants(&state, &conv.id);
     let conv = member_conversation(&state, &user, &conv.id).await?;
     state.hub.to_users(
         &[new_member],
@@ -715,8 +717,14 @@ async fn decide_approval(
         })
         .await?
         .ok_or_else(|| {
-            ApiError::new(StatusCode::CONFLICT, "conflict", "this was already decided")
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "conflict",
+                "this was already decided or has expired",
+            )
         })?;
+    // Release the held connector call, if one is waiting.
+    crate::gateway::decided(&state, &id, body.approve);
     crate::login::broadcast_updated(&state, &updated).await;
     ok(json!({"message": updated}))
 }

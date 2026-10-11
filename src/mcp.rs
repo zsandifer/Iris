@@ -185,7 +185,8 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "list_connectors",
-            "List connected services (MCP connectors) and whether they are enabled.",
+            "List connected services (MCP connectors), whether they are on and signed in, \
+             and the services the user can still connect (`available_to_connect`).",
             json!({}),
             &[],
         ),
@@ -420,11 +421,21 @@ impl Bridge {
                 let items: Vec<Value> = list
                     .iter()
                     .map(|c| {
-                        json!({"name": c.name, "description": c.description,
-                               "transport": c.transport, "enabled": c.enabled})
+                        json!({"name": c.name, "service": c.service,
+                               "description": c.description, "enabled": c.enabled,
+                               "signed_in": c.auth_state == "ok",
+                               "paused": c.paused_reason.is_some(),
+                               "rules": c.policy.mode.describe()})
                     })
                     .collect();
-                Ok(json!({"connectors": items}))
+                let available: Vec<Value> = crate::connectors::CATALOG
+                    .iter()
+                    .filter(|e| e.id == "custom" || !list.iter().any(|c| c.service == e.id))
+                    .map(
+                        |e| json!({"service": e.id, "name": e.label, "description": e.description}),
+                    )
+                    .collect();
+                Ok(json!({"connectors": items, "available_to_connect": available}))
             }
             other => Err(format!("unknown tool {other}")),
         }

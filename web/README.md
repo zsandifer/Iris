@@ -17,11 +17,12 @@ js/
 ├── store.js          state, loaders, WebSocket event handling
 ├── api.js            REST client, authed image URLs, WebSocket
 ├── chat.js           chat, status phrases, receipts, composer (photos, voice input)
-├── cards.js          chat cards (result, connect, sign-in, setup, approval, ...)
+├── cards.js          chat cards (result, connect, sign-in, API keys, approval, ...)
 ├── status.js         tool activity to plain-language phrases
 ├── feed.js           For you: story cards, posts, full-screen stories
 ├── lists.js          Ideas, Goals, Library
-├── hub.js            Iris hub: Connections, Logins & wallet, computer, files
+├── hub.js            Iris hub: Logins & wallet, computer (pause, disconnect), files
+├── connect.js        Connections: catalog, setup guides, sign-in, rules, trusted people
 ├── settings.js       Settings, AI engine, devices, people, activity log
 ├── push.js           Web Push subscription
 ├── md.js             small, safe Markdown renderer
