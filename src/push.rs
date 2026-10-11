@@ -195,6 +195,19 @@ pub enum SendResult {
     Failed(u16),
 }
 
+/// HTTP client for push services. Endpoints come from users' browsers, so
+/// it never follows redirects and never speaks plain HTTP: a hostile
+/// endpoint cannot bounce the request into the server's own network.
+fn push_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .https_only(true)
+        .max_redirects(0)
+        .timeout_global(Some(std::time::Duration::from_secs(15)))
+        .build()
+        .into()
+}
+
 /// Deliver one encrypted notification (blocking; call from spawn_blocking).
 pub fn send_blocking(
     keys: &VapidKeys,
@@ -206,12 +219,7 @@ pub fn send_blocking(
 ) -> Result<SendResult> {
     let body = encrypt(payload.to_string().as_bytes(), p256dh, auth)?;
     let authorization = keys.authorization(endpoint, subject, crate::util::now_ms() / 1000)?;
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(std::time::Duration::from_secs(15)))
-        .build()
-        .into();
-    let resp = agent
+    let resp = push_agent()
         .post(endpoint)
         .header("TTL", "86400")
         .header("Urgency", "normal")
@@ -269,6 +277,33 @@ mod tests {
         assert_eq!(decrypt(&body, &ua, &auth), br#"{"title":"hi"}"#);
         assert!(encrypt(b"x", &p256dh, &B64URL.encode([0u8; 3])).is_err());
         assert!(encrypt(&[b'a'; 5000], &p256dh, &B64URL.encode(auth)).is_err());
+    }
+
+    #[test]
+    fn push_requests_never_leave_https_or_follow_redirects() {
+        let cfg = push_agent();
+        assert_eq!(cfg.config().max_redirects(), 0);
+        assert!(cfg.config().https_only());
+        // A plain-HTTP endpoint (e.g. a redirect target on the local
+        // network) is refused before any connection is made.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let tmp = tempfile::tempdir().unwrap();
+        let keys = VapidKeys::load_or_create(&tmp.path().join("vapid")).unwrap();
+        let ua = random_secret_key();
+        let p256dh = B64URL.encode(public_bytes(&ua));
+        let auth = B64URL.encode(random_bytes::<16>());
+        let sent = send_blocking(
+            &keys,
+            "mailto:admin@example.com",
+            &format!("http://127.0.0.1:{port}/push"),
+            &p256dh,
+            &auth,
+            &serde_json::json!({"title": "x"}),
+        );
+        assert!(sent.is_err());
+        assert!(listener.accept().is_err(), "no connection was made");
     }
 
     /// RFC 8291 Appendix A test vector.
