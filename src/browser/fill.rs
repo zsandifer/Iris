@@ -76,14 +76,12 @@ pub fn secure_enough(scheme: &str, host: &str) -> bool {
     scheme == "https" || (scheme == "http" && is_loopback(host))
 }
 
-/// The page a fill was checked against: secrets are typed only while the
-/// same tab shows the same document, on a site that matches.
+/// The page a fill was checked against (its address was validated when
+/// the fill began): secrets go only into that tab's same document, whose
+/// origin cannot change. A new page load is a new document.
 struct Pin {
     target: String,
     doc: String,
-    /// Required host: the saved site (subdomains allowed) for logins, the
-    /// approved page's host for cards.
-    site: String,
 }
 
 struct PageInfo {
@@ -144,10 +142,11 @@ async fn load(
     Ok((cred, serde_json::from_slice(&plain).unwrap_or_default()))
 }
 
-/// Type `text` into the field `r`, replacing its content. Returns false if
-/// the field is not usable (or did not take the focus), and an error if the
-/// page changed, the turn ended, or the owner took over: nothing is typed
-/// then. Secrets are masked first and remembered for redaction.
+/// Fill the field `r` with `text`, in one step bound to that element (see
+/// `fillField` in page.js). Returns false if the field is not usable, and an
+/// error if the page changed, the turn ended, or the owner took over:
+/// nothing is filled then. Secrets are masked first and remembered for
+/// redaction.
 async fn type_into(
     b: &Browser,
     ctx: &TurnCtx,
@@ -157,36 +156,28 @@ async fn type_into(
     text: &str,
     secret: bool,
 ) -> Result<bool> {
-    b.check_agent(ctx)?;
-    let page = run.page();
-    if page.target_id != pin.target {
-        return Err(PAGE_CHANGED.into());
-    }
-    let p = eval(run, &format!("prepareInsert({}, {secret})", json!(r))).await?;
-    if p["ok"] != true {
-        return Ok(false);
-    }
-    let same_doc = p["doc"].as_str() == Some(pin.doc.as_str());
-    let right_site = p["href"]
-        .as_str()
-        .and_then(origin_of)
-        .is_some_and(|(scheme, host)| {
-            secure_enough(&scheme, &host) && host_matches(&host, &pin.site)
-        });
-    if !same_doc || !right_site || run.page().target_id != pin.target {
+    if run.page().target_id != pin.target {
         return Err(PAGE_CHANGED.into());
     }
     if secret {
         run.remember_secret(text);
     }
-    run.cdp
-        .call(
-            "Input.insertText",
-            json!({"text": text}),
-            Some(page.session_id.as_str()),
-        )
-        .await?;
-    Ok(true)
+    // Checked right before the single command that fills.
+    b.check_agent(ctx)?;
+    let p = eval(
+        run,
+        &format!(
+            "fillField({}, {}, {secret}, {})",
+            json!(r),
+            json!(text),
+            json!(pin.doc)
+        ),
+    )
+    .await?;
+    if p["changed"] == true {
+        return Err(PAGE_CHANGED.into());
+    }
+    Ok(p["ok"] == true)
 }
 
 /// Pick a dropdown option (not secret), on the pinned page only.
@@ -197,13 +188,17 @@ async fn choose(
     pin: &Pin,
     r: &str,
     options: Value,
-) -> Result<()> {
-    b.check_agent(ctx)?;
+) -> Result<bool> {
     if run.page().target_id != pin.target {
         return Err(PAGE_CHANGED.into());
     }
-    eval(run, &format!("choose({}, {options})", json!(r))).await?;
-    Ok(())
+    let info = eval(run, "info()").await?;
+    if info["doc"].as_str() != Some(pin.doc.as_str()) {
+        return Err(PAGE_CHANGED.into());
+    }
+    b.check_agent(ctx)?;
+    let r = eval(run, &format!("choose({}, {options})", json!(r))).await?;
+    Ok(r["ok"] == true)
 }
 
 fn not_found_for(e: crate::util::BoxError) -> Result<Output> {
@@ -250,17 +245,24 @@ pub async fn login(
         })
         .collect();
     matches.sort_by_key(|(c, _)| std::cmp::Reverse(c.last_used_at.unwrap_or(c.updated_at)));
-    let Some((cred, site)) = matches.into_iter().next() else {
+    let Some((cred, _)) = matches.into_iter().next() else {
         return Ok(Output::text("not found (no saved login for this site)"));
     };
+    // The site check uses the very revision whose password is filled.
+    let (cred, secret) = load(state, &ctx.user_id, &cred.id).await?;
+    if !cred.metadata["site"]
+        .as_str()
+        .and_then(site_host)
+        .is_some_and(|s| host_matches(&host, &s))
+    {
+        return Ok(Output::text("not found (no saved login for this site)"));
+    }
     let pin = Pin {
         target: pinned_target,
         doc: page.doc,
-        site,
     };
     let fields = eval(run, "loginFields()").await?;
     let (user_ref, pass_ref) = (fields["user"].as_str(), fields["pass"].as_str());
-    let (cred, secret) = load(state, &ctx.user_id, &cred.id).await?;
     let username = cred.metadata["username"].as_str().unwrap_or("").to_string();
     let password = secret
         .get("password")
@@ -427,7 +429,7 @@ pub async fn card(
             .as_ref()
             .is_some_and(|c| reusable(c, m.created_at, revision, now_ms()))
     }) {
-        approval = Some(ask_approval(state, ctx, card, &page, &origin).await?);
+        approval = Some(ask_approval(state, ctx, run, card, &page, &origin).await?);
     }
     let msg = approval.expect("set above");
     match wait_decision(state, ctx, &msg.id).await.as_deref() {
@@ -462,7 +464,8 @@ pub async fn card(
                 return Ok(false);
             };
             let mut card = m.card.unwrap_or_default();
-            if card["state"] != "approved" || !card["wallet"]["used_at"].is_null() {
+            // Still approved, unused, unexpired, and for this revision.
+            if card["state"] != "approved" || !reusable(&card, m.created_at, revision, now_ms()) {
                 return Ok(false);
             }
             card["wallet"]["used_at"] = now_ms().into();
@@ -471,13 +474,13 @@ pub async fn card(
         .await?;
     if !consumed {
         return Ok(Output::text(
-            "waiting for approval (that OK was already used; call fill_card again to ask)",
+            "waiting for approval (that OK was already used or has expired; call fill_card \
+             again to ask)",
         ));
     }
     let pin = Pin {
         target: pinned_target,
         doc: page.doc.clone(),
-        site: page.host.clone(),
     };
     let number = secret
         .get("number")
@@ -492,15 +495,15 @@ pub async fn card(
     drop(secret);
     let result = fill_card_fields(b, ctx, run, &pin, &fields, &card, &number, &cvc).await;
     drop((number, cvc));
-    let filled = match result {
-        Ok(f) => f,
+    let missing = match result {
+        Ok(Some(missing)) => missing,
+        Ok(None) => {
+            return Ok(Output::text(
+                "not found (the card number field could not be filled)",
+            ));
+        }
         Err(e) => return not_found_for(e),
     };
-    if !filled {
-        return Ok(Output::text(
-            "not found (the card number field could not be filled)",
-        ));
-    }
     let (uid, cid) = (ctx.user_id.clone(), card.id.clone());
     let _ = state
         .db
@@ -511,9 +514,19 @@ pub async fn card(
         card.id,
         msg.id
     );
-    Ok(Output::text("filled"))
+    if missing.is_empty() {
+        Ok(Output::text("filled"))
+    } else {
+        Ok(Output::text(format!(
+            "filled (but the {} could not be filled in; check the form, or ask the user to \
+             take over for it)",
+            missing.join(" and ")
+        )))
+    }
 }
 
+/// Fill the card form. None if the number could not be filled (then
+/// nothing else is); otherwise the parts that could not be filled.
 #[allow(clippy::too_many_arguments)]
 async fn fill_card_fields(
     b: &Browser,
@@ -524,50 +537,70 @@ async fn fill_card_fields(
     card: &Credential,
     number: &str,
     cvc: &str,
-) -> Result<bool> {
+) -> Result<Option<Vec<&'static str>>> {
     let m = &card.metadata;
     let Some(r) = fields["number"].as_str() else {
-        return Ok(false);
+        return Ok(None);
     };
     if !type_into(b, ctx, run, pin, r, number, true).await? {
-        return Ok(false);
+        return Ok(None);
     }
-    if let (Some(r), false) = (fields["cvc"].as_str(), cvc.is_empty()) {
-        type_into(b, ctx, run, pin, r, cvc, true).await?;
+    let mut missing = Vec::new();
+    match (fields["cvc"].as_str(), cvc.is_empty()) {
+        (Some(r), false) => {
+            if !type_into(b, ctx, run, pin, r, cvc, true).await? {
+                missing.push("security code");
+            }
+        }
+        (None, false) => {}
+        _ => {}
     }
     let month = m["exp_month"].as_u64().map(|v| format!("{v:02}"));
     let year = m["exp_year"].as_u64().map(|v| v.to_string());
+    let has_exp_field =
+        fields["exp"].is_string() || (fields["month"].is_string() && fields["year"].is_string());
     if let (Some(mm), Some(yyyy)) = (&month, &year) {
         let yy = &yyyy[yyyy.len().saturating_sub(2)..];
         let selects = &fields["selects"];
+        let mut ok = true;
         if let Some(r) = fields["exp"].as_str() {
-            if selects["exp"].as_bool() == Some(true) {
+            ok &= if selects["exp"].as_bool() == Some(true) {
                 let opts = json!([format!("{mm}/{yy}"), format!("{mm}/{yyyy}")]);
-                choose(b, ctx, run, pin, r, opts).await?;
+                choose(b, ctx, run, pin, r, opts).await?
             } else {
-                type_into(b, ctx, run, pin, r, &format!("{mm}/{yy}"), false).await?;
-            }
+                type_into(b, ctx, run, pin, r, &format!("{mm}/{yy}"), false).await?
+            };
         }
         if let (Some(rm), Some(ry)) = (fields["month"].as_str(), fields["year"].as_str()) {
-            if selects["month"].as_bool() == Some(true) {
+            ok &= if selects["month"].as_bool() == Some(true) {
                 let n = mm.trim_start_matches('0');
-                choose(b, ctx, run, pin, rm, json!([mm, n])).await?;
+                choose(b, ctx, run, pin, rm, json!([mm, n])).await?
             } else {
-                type_into(b, ctx, run, pin, rm, mm, false).await?;
-            }
-            if selects["year"].as_bool() == Some(true) {
-                choose(b, ctx, run, pin, ry, json!([yyyy, yy])).await?;
+                type_into(b, ctx, run, pin, rm, mm, false).await?
+            };
+            ok &= if selects["year"].as_bool() == Some(true) {
+                choose(b, ctx, run, pin, ry, json!([yyyy, yy])).await?
             } else {
-                type_into(b, ctx, run, pin, ry, yyyy, false).await?;
+                type_into(b, ctx, run, pin, ry, yyyy, false).await?
+            };
+        }
+        if has_exp_field && !ok {
+            missing.push("expiry date");
+        }
+    } else if has_exp_field {
+        missing.push("expiry date");
+    }
+    if let Some(r) = fields["name"].as_str() {
+        match m["cardholder"].as_str().filter(|n| !n.is_empty()) {
+            Some(name) => {
+                if !type_into(b, ctx, run, pin, r, name, false).await? {
+                    missing.push("name on the card");
+                }
             }
+            None => missing.push("name on the card"),
         }
     }
-    if let (Some(r), Some(name)) = (fields["name"].as_str(), m["cardholder"].as_str())
-        && !name.is_empty()
-    {
-        type_into(b, ctx, run, pin, r, name, false).await?;
-    }
-    Ok(true)
+    Ok(Some(missing))
 }
 
 /// Post an approval card (built from the real page and card, never from
@@ -575,11 +608,14 @@ async fn fill_card_fields(
 async fn ask_approval(
     state: &AppState,
     ctx: &TurnCtx,
+    run: &Running,
     card: &Credential,
     page: &PageInfo,
     origin: &str,
 ) -> Result<db::Message> {
     let name = card_name(card);
+    // Page-derived text is stored: a page may have echoed an earlier secret.
+    let (url, page_title) = (run.redact(&page.url), run.redact(&page.title));
     let exp = match (
         card.metadata["exp_month"].as_u64(),
         card.metadata["exp_year"].as_u64(),
@@ -590,7 +626,7 @@ async fn ask_approval(
     let preview = format!(
         "Fill your {name}{exp} (\"{}\") into the payment form on this page:\n{}\n\n\
          Approving lets me fill it in this once, to finish what you asked for.",
-        card.label, page.url
+        card.label, url
     );
     let host = &page.host;
     let title_text = format!("Use your {name} on {host}");
@@ -598,7 +634,7 @@ async fn ask_approval(
         title: &title_text,
         service: "wallet",
         to: host,
-        subject: &page.title,
+        subject: &page_title,
         preview: &preview,
         action_label: "Fill card",
         approver_user_id: &ctx.user_id,

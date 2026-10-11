@@ -25,8 +25,27 @@ if (!globalThis.__iris) {
       return r;
     };
 
+    // Secrets Iris typed in this browser session (sent by Iris with each
+    // call; this isolated world is invisible to the page). Everything read
+    // out of the page passes through redact() first, before any
+    // whitespace folding, cutting, or quoting could disguise a copy.
+    let secrets = [];
+    const setSecrets = (list) => {
+      const all = new Set();
+      for (const x of list || []) {
+        all.add(x);
+        all.add(x.replace(/\s+/g, ' ').trim());
+      }
+      secrets = [...all].filter((x) => x.length >= 3).sort((a, b) => b.length - a.length);
+    };
+    const redact = (s) => {
+      let out = String(s ?? '');
+      for (const x of secrets) if (out.includes(x)) out = out.split(x).join('••••');
+      return out;
+    };
+
     const clean = (s, n = 160) => {
-      s = String(s || '').replace(/\s+/g, ' ').trim();
+      s = redact(s).replace(/\s+/g, ' ').trim();
       return s.length > n ? s.slice(0, n - 1) + '…' : s;
     };
     const q = (s) => JSON.stringify(s);
@@ -207,7 +226,7 @@ if (!globalThis.__iris) {
       refs.clear();
       walk(document.body || document.documentElement, 0, true);
       flush();
-      return { text: lines.join('\n'), truncated: full, url: location.href, title: document.title };
+      return { text: lines.join('\n'), truncated: full, url: redact(location.href), title: clean(document.title, 300) };
     }
 
     function el(ref) {
@@ -277,24 +296,40 @@ if (!globalThis.__iris) {
       return true;
     }
 
-    // Before Iris types a saved secret: focus the field, mask it if asked,
-    // and report which document and page it is in. ok only if the field
-    // itself (not something a focus handler moved to) has focus.
-    function prepareInsert(ref, hide) {
+    // Fill one field in a single step, bound to the exact element: check
+    // it belongs to the expected document (and so origin), mask it first if
+    // it gets a secret, set the value through the native setter (so page
+    // frameworks see it), and fire the events a typing user would. Nothing
+    // goes through "whatever has focus", so a page cannot redirect it.
+    function fillField(ref, value, hide, expectDoc) {
+      if (expectDoc !== doc) return { ok: false, changed: true };
       const e = el(ref);
       if (!e) return { ok: false };
       const t = e.tagName.toLowerCase();
       if (!['input', 'textarea'].includes(t) || e.disabled || e.readOnly) return { ok: false };
+      if (e.ownerDocument.location.origin !== location.origin) return { ok: false, changed: true };
       if (hide) {
         secret.add(e);
         e.style.setProperty('-webkit-text-security', 'disc', 'important');
+        if (!maskedNow(e)) return { ok: false };
       }
-      e.scrollIntoView({ block: 'center', behavior: 'instant' });
       e.focus();
-      try { e.select(); } catch { /* some input types cannot select */ }
-      const masked = !hide || getComputedStyle(e).getPropertyValue('-webkit-text-security') === 'disc'
-        || (e.getAttribute('type') || '').toLowerCase() === 'password';
-      return { ok: focused(e) && masked, doc, href: e.ownerDocument.location.href };
+      const proto = t === 'input' ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+      setter.call(e, '');
+      setter.call(e, value);
+      e.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
+      e.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: e.value === value };
+    }
+
+    // The field shows dots right now (its type or style may have changed
+    // since Iris masked it).
+    function maskedNow(e) {
+      if ((e.type || '').toLowerCase() === 'password') return true;
+      const st = e.ownerDocument.defaultView.getComputedStyle(e);
+      const sec = st.getPropertyValue('-webkit-text-security');
+      return !!sec && sec !== 'none';
     }
 
     // Everything the page shows as text, for checking that no secret is
@@ -303,7 +338,7 @@ if (!globalThis.__iris) {
     function pageText() {
       return docs().map((d) => {
         const vals = [...d.querySelectorAll('input,textarea')]
-          .filter((e) => !secret.has(e) && (e.getAttribute('type') || '').toLowerCase() !== 'password')
+          .filter((e) => !maskedNow(e))
           .map((e) => e.value || '');
         return [d.title, d.location.href, d.body ? d.body.innerText : '', ...vals].join('\n');
       }).join('\n');
@@ -390,7 +425,7 @@ if (!globalThis.__iris) {
       return docs().some((d) => (d.body ? d.body.innerText : '').toLowerCase().includes(want));
     }
 
-    return { snapshot, point, focus, choose, loginFields, cardFields, prepareInsert, pageText, hasText,
+    return { snapshot, point, focus, choose, loginFields, cardFields, fillField, pageText, hasText, setSecrets,
       info: () => ({ url: location.href, title: document.title, doc }) };
   })();
 }

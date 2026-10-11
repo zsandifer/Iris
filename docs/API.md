@@ -1433,7 +1433,8 @@ Removes an engine Iris installed (`400` if Iris did not install it).
 
 With `engines.auto_update` (default `true`), the scheduler updates the
 engines Iris installed once a day, when no turn is running (and the browser
-only while it is closed). Claude Code
+only while it is closed). Any install, update, or removal of the browser
+closes it first and keeps it from starting until done. Claude Code
 updates swap a new verified binary in atomically, so running turns are not
 interrupted.
 
@@ -1483,6 +1484,7 @@ Playwright's browser cache (`$PLAYWRIGHT_BROWSERS_PATH` or
 | `busy` | bool | The agent is carrying out a browser action right now. |
 | `active` | array | `[{"conversation_id", "message_id"}]`: turns that have used the browser and are still running (show the chat peek for these). |
 | `watchers` | int | App sockets watching the live view. |
+| `streaming` | bool | The live-view screencast is running (only while someone watches). |
 | `sandbox` | bool or null | Chrome's sandbox is on (null while closed). |
 | `sandbox_unavailable` | bool | The last start failed only because this system cannot start Chrome's sandbox (for example Ubuntu's AppArmor restriction on unprivileged user namespaces). The app then offers [`POST /api/browser/sandbox`](#post-apibrowsersandbox-owner). |
 | `allow_no_sandbox` | bool | The owner allowed running without the sandbox on such a system. |
@@ -1523,7 +1525,8 @@ example a site's sign-in page). Only `http` and `https`; a bare domain gets
 sandbox; where the sandbox cannot start, the browser stays off until the
 owner either fixes the server (see the self-hosting guide) or allows
 running without it here. The choice is saved. `false` takes it back (and
-closes a browser running without the sandbox). Returns `{"browser":
+closes a browser running without the sandbox, including one that was
+starting). Returns `{"browser":
 {BrowserStatus}}`.
 
 #### `POST /api/browser/install` (Owner)
@@ -2469,7 +2472,7 @@ does all the deciding.
 | `wait` | `text?`, `seconds?` (max 30) | Snapshot once the text appears, or after the time |
 | `tabs` | `action` (`list`, `new`, `select`, `close`), `index?`, `url?` | Tab list or snapshot. Tabs a page opens become the current tab. |
 | `fill_login` | `site?` | `filled`, or `not found (<reason>)` |
-| `fill_card` | `card?` (name or last 4 digits) | `filled`, `denied (...)`, `waiting for approval (...)`, or `not found (...)` |
+| `fill_card` | `card?` (name or last 4 digits) | `filled` (or `filled (but ...)` naming parts that could not be filled), `denied (...)`, `waiting for approval (...)`, or `not found (...)` |
 
 Refs are valid until the page changes (they are unique per document, so an
 old ref never hits an element of a newer page); a stale ref gets an error
@@ -2477,10 +2480,13 @@ asking for a new snapshot. Values of password fields, card fields, and
 fields Iris filled from the vault are shown as `••••` in snapshots and
 masked on screen. JavaScript dialogs are answered (alerts and confirms
 accepted, prompts dismissed) and reported at the top of the next result.
-Every secret Iris typed in the current browser session is replaced with
+Every secret Iris filled in the current browser session is replaced with
 `••••` anywhere in a tool result (a page could echo it in a dialog, title,
-or other field), and `screenshot` refuses while the page shows one outside
-the masked fields.
+or other field). The page helpers do this on the raw text, before folding
+whitespace, cutting long values, or quoting, so no escaped or partial copy
+survives; dialogs and the live title are redacted the same way.
+`screenshot` refuses while the page shows a secret anywhere outside fields
+that are masked right now (a page that unmasks a filled field counts).
 
 Each call waits while the owner has taken over, and checks again once it
 holds the page, so a queued call never acts under the owner's control.
@@ -2490,11 +2496,15 @@ timeout for this server (its default is 60 s).
 
 `fill_login` takes the saved login whose `site` matches the current page's
 host (a subdomain matches too; the most recently used wins), finds the
-sign-in fields (also in same-origin frames), and types the username and
-password itself, each only into the field that really has the focus, while
-the same tab still shows the same document on the saved site. It answers `not found` when the page is not that site, not
-HTTPS (plain HTTP only on this machine), has no sign-in field, or nothing is
-saved for it.
+sign-in fields (also in same-origin frames), and fills the username and
+password itself. Each value is set on that exact element in one step from
+Iris's isolated script world (masked first, through the native value
+setter, with the input and change events a typing user causes), and only
+while the same tab shows the same document whose address was checked; focus
+changes the page makes cannot redirect it. The site check uses the very
+revision of the login whose password is filled. It answers `not found` when
+the page is not that site, not HTTPS (plain HTTP only on this machine), has
+no sign-in field, changed while filling, or nothing is saved for it.
 
 `fill_card` picks the card (the only one, or the one named), checks the
 page has a card number field, and posts an [approval card](#server-cards)
@@ -2504,9 +2514,13 @@ after that it answers `waiting for approval`, and calling it again on the
 same site later picks up the decision (the app sends "I approved the card.
 Go ahead." when the owner approves after the turn ended, which starts that
 call). An approval is for the card as it was: editing the card asks again.
-After approval, Iris types the card number, expiry, CVC, and name itself,
-on the approved page only; each approval fills once. Cards are never used in
-jobs (nobody could approve).
+After approval (still unexpired and unused when it is consumed), Iris fills
+the card number, expiry, CVC, and name itself the same way, on the approved
+page only; each approval fills once. If some part could not be filled (for
+example the expiry dropdown has no matching option) the answer is
+`filled (but the ... could not be filled in; ...)`. Page titles and
+addresses in the approval card are redacted like tool results. Cards are
+never used in jobs (nobody could approve).
 
 ### `save_to_library` details
 

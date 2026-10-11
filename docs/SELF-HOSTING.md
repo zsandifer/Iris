@@ -337,8 +337,8 @@ Both are off by default, respect active hours, and can be triggered manually
 - Iris's browser is driven over a private pipe (no DevTools port is opened),
   and its tools reach the server through a Unix socket in the private run
   directory, accepted only for a running turn. Saved secrets go from the
-  vault straight into the page (only into the field that really has focus,
-  on the same page and site that were checked); filled fields are masked on
+  vault straight into the page (set on the exact field, on the same page
+  and site that were checked); filled fields are masked on
   screen and in what the agent reads, any copy a page echoes (a dialog,
   another field) is redacted from tool results, and no screenshot is taken
   while a page shows one. Only `http`/`https` pages can be opened. When a

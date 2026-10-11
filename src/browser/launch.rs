@@ -124,7 +124,20 @@ pub struct Launched {
 fn pipe() -> Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0i32; 2];
     // SAFETY: pipe2 fills two new descriptors we immediately own.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    // macOS has no pipe2: create, then mark close-on-exec.
+    // SAFETY: pipe fills two new descriptors; fcntl only sets their flags.
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    let rc = unsafe {
+        let rc = libc::pipe(fds.as_mut_ptr());
+        if rc == 0 {
+            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        rc
+    };
+    if rc != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     // SAFETY: both descriptors were just created and are owned by nobody else.

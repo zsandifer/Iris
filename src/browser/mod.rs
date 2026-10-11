@@ -211,6 +211,10 @@ impl Running {
             return;
         }
         let mut forms = vec![secret.to_string()];
+        let folded = secret.split_whitespace().collect::<Vec<_>>().join(" ");
+        if folded.chars().count() >= 3 && folded != secret {
+            forms.push(folded);
+        }
         if secret.len() >= 12 && secret.bytes().all(|b| b.is_ascii_digit()) {
             let groups: Vec<&str> = secret
                 .as_bytes()
@@ -240,6 +244,16 @@ impl Running {
             }
         }
         out
+    }
+
+    /// The screencast running now, if any.
+    pub fn casting(&self) -> Option<Mode> {
+        lock(&self.cast).as_ref().map(|(_, m)| *m)
+    }
+
+    /// The remembered secrets (to hand to the page helpers' isolated world).
+    pub fn secrets(&self) -> Vec<String> {
+        lock(&self.secrets).clone()
     }
 
     /// Whether text contains a remembered secret.
@@ -284,6 +298,8 @@ pub struct Shared {
     /// The owner agreed (in the app) to run without Chrome's sandbox on a
     /// system where it cannot start.
     allow_no_sandbox: AtomicBool,
+    /// Chromium is being installed, updated, or removed.
+    maintenance: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -331,7 +347,13 @@ impl Browser {
             op_lock: tokio::sync::Mutex::new(()),
             paused: AtomicBool::new(false),
             allow_no_sandbox: AtomicBool::new(false),
+            maintenance: AtomicBool::new(false),
         }))
+    }
+
+    #[cfg(test)]
+    pub async fn launch_lock_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.launch_lock.lock().await
     }
 
     pub fn enabled(&self) -> bool {
@@ -363,12 +385,38 @@ impl Browser {
         self.allow_no_sandbox.load(Ordering::SeqCst)
     }
 
-    /// The owner's choice about running without Chrome's sandbox.
-    pub fn set_allow_no_sandbox(&self, allow: bool) {
+    /// The owner's choice about running without Chrome's sandbox. Taking
+    /// it back also closes an unsandboxed browser, including one that is
+    /// starting right now.
+    pub async fn set_allow_no_sandbox(&self, allow: bool) {
         self.allow_no_sandbox.store(allow, Ordering::SeqCst);
         if allow {
             lock(&self.view).sandbox_unavailable = false;
+            return;
         }
+        let unsandboxed = {
+            let _g = self.launch_lock.lock().await;
+            self.running().is_some_and(|r| r.no_sandbox)
+        };
+        if unsandboxed {
+            self.close().await;
+        }
+    }
+
+    /// Startup: restore the owner's sandbox choice.
+    pub fn init_allow_no_sandbox(&self, allow: bool) {
+        self.allow_no_sandbox.store(allow, Ordering::SeqCst);
+    }
+
+    /// While Chromium's files are being installed, updated, or removed, the
+    /// browser is closed and cannot start.
+    pub async fn begin_maintenance(&self) {
+        self.maintenance.store(true, Ordering::SeqCst);
+        self.close().await;
+    }
+
+    pub fn end_maintenance(&self) {
+        self.maintenance.store(false, Ordering::SeqCst);
     }
 
     /// Pause (or resume) Iris. Pausing closes the browser; the caller stops
@@ -494,6 +542,7 @@ impl Browser {
             "busy": v.busy && run.is_some(),
             "active": self.active_turns(),
             "watchers": lock(&self.watchers).len(),
+            "streaming": run.as_ref().and_then(|r| r.casting()).is_some(),
             "sandbox": run.as_ref().map(|r| !r.no_sandbox),
             "sandbox_unavailable": v.sandbox_unavailable,
             "allow_no_sandbox": self.allows_no_sandbox(),
@@ -549,6 +598,9 @@ impl Browser {
             return Ok(r);
         }
         let _g = self.launch_lock.lock().await;
+        if self.maintenance.load(Ordering::SeqCst) {
+            return Err("the browser is being updated; try again in a minute".into());
+        }
         if let Some(r) = self.running() {
             return Ok(r);
         }
@@ -624,10 +676,15 @@ impl Browser {
             Self::shut(&run).await;
             return Err(e);
         }
-        // Paused (or turned off) while starting: do not publish it.
+        // Paused, or the owner took back running without the sandbox,
+        // while it was starting: do not publish it.
         if self.is_paused() {
             Self::shut(&run).await;
             return Err("Iris is paused".into());
+        }
+        if run.no_sandbox && !self.allows_no_sandbox() {
+            Self::shut(&run).await;
+            return Err(launch::SANDBOX_UNAVAILABLE.into());
         }
         {
             let mut v = lock(&self.view);
@@ -814,8 +871,9 @@ impl Browser {
                 }
                 "Page.javascriptDialogOpening" if current => {
                     let kind = ev.params["type"].as_str().unwrap_or("alert");
+                    // Redact before cutting, so no prefix of a secret survives.
                     let msg = crate::util::truncate_chars(
-                        ev.params["message"].as_str().unwrap_or(""),
+                        &run.redact(ev.params["message"].as_str().unwrap_or("")),
                         200,
                     );
                     // Alerts and confirms follow from what was just clicked;
@@ -840,7 +898,9 @@ impl Browser {
                 "Target.targetInfoChanged" => {
                     let info = &ev.params["targetInfo"];
                     if info["targetId"].as_str() == Some(page.target_id.as_str()) {
-                        self.set_page_info(info["url"].as_str(), info["title"].as_str());
+                        let url = info["url"].as_str().map(|u| run.redact(u));
+                        let title = info["title"].as_str().map(|t| run.redact(t));
+                        self.set_page_info(url.as_deref(), title.as_deref());
                     }
                 }
                 "Target.targetCreated" => {

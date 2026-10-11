@@ -193,7 +193,15 @@ pub fn start_op(state: &AppState, name: &str, op: &'static str) -> Result<bool> 
 async fn run_op(state: &AppState, name: &str, op: &'static str) {
     broadcast(state);
     crate::info!("engine {name}: {op} started");
+    // Never change Chromium's files under a running browser.
+    let browser = name == engines::BROWSER.name;
+    if browser {
+        state.browser.begin_maintenance().await;
+    }
     let result = execute(state, op, name).await;
+    if browser {
+        state.browser.end_maintenance();
+    }
     let mut entry = state.engine_ops.get(name).unwrap_or(EngineOp {
         op,
         state: "running",

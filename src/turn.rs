@@ -191,7 +191,7 @@ async fn run_locked(
     let pins = state.slot_pins().await;
     let allow_shared = state.allow_claude_for_shared().await;
     let has_images = !input.user_message.attachments.is_empty();
-    let assessment = assess_turn(state, input).await;
+    let assessment = assess_turn(state, input, cancel.clone()).await;
     let mut excluded: Vec<String> = Vec::new();
     let mut fresh_session = !input.continuity;
     let mut routing_notes: Vec<String> = Vec::new();
@@ -315,18 +315,12 @@ async fn run_locked(
             );
         }
         let browser_token = browser_turn.as_ref().map(|g| g.token());
-        let mcp_servers = if caps.mcp {
+        let (mcp_servers, browser_server) = if caps.mcp {
             mcp_servers(state, &input.owner_user_id, conv_id, shared, browser_token).await
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
-        let browser = mcp_servers.iter().map(|s| s.name.as_str()).find(|n| {
-            [
-                crate::browser::tools::SERVER,
-                crate::browser::tools::SERVER_ALT,
-            ]
-            .contains(n)
-        });
+        let browser = browser_server.as_deref();
         let participants: Vec<String> = ctx.names.values().cloned().collect();
         let system_prompt = persona::assemble(
             &state.paths,
@@ -536,7 +530,11 @@ fn no_engine_reason(state: &AppState, shared: bool, allow_shared: bool) -> (&'st
 }
 
 /// Classify the message (chat) or use the job default (low effort).
-async fn assess_turn(state: &AppState, input: &TurnInput) -> Assessment {
+async fn assess_turn(
+    state: &AppState,
+    input: &TurnInput,
+    cancel: watch::Receiver<bool>,
+) -> Assessment {
     if input.purpose != Purpose::Chat {
         return Assessment {
             effort: Effort::Low,
@@ -569,7 +567,7 @@ async fn assess_turn(state: &AppState, input: &TurnInput) -> Assessment {
     let mut a = classifier::assess(&input.user_message.content, &turns, &thresholds);
     if state.cfg.router.classifier_model
         && a.ambiguous
-        && let Some(effort) = refine_with_model(state, &input.user_message.content).await
+        && let Some(effort) = refine_with_model(state, &input.user_message.content, cancel).await
     {
         a.signals.push("model_classifier");
         a.effort = effort;
@@ -580,7 +578,11 @@ async fn assess_turn(state: &AppState, input: &TurnInput) -> Assessment {
 
 /// Optional: ask the `classifier` slot's model about an ambiguous message.
 /// One short, tool-less, session-less run; None on any failure.
-async fn refine_with_model(state: &AppState, text: &str) -> Option<Effort> {
+async fn refine_with_model(
+    state: &AppState,
+    text: &str,
+    cancel: watch::Receiver<bool>,
+) -> Option<Effort> {
     let (res, pin) = state.resolve_slot(Slot::Classifier, false).await;
     let model_id = res.effective?;
     let catalog = state.catalog();
@@ -607,7 +609,8 @@ async fn refine_with_model(state: &AppState, text: &str) -> Option<Effort> {
     let invocation = entry.harness.build(&spec).ok()?;
     let strip = state.strip_env(entry);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    // The turn's own cancel (stop button, Pause Iris) also stops this.
+    let cancel_rx = cancel;
     let run = runner::run(
         RunRequest {
             program: &program,
@@ -1031,7 +1034,7 @@ async fn mcp_servers(
     conv_id: &str,
     shared: bool,
     browser_token: Option<&str>,
-) -> Vec<McpServer> {
+) -> (Vec<McpServer>, Option<String>) {
     let mut args = vec![
         "mcp".into(),
         "--data-dir".into(),
@@ -1053,24 +1056,29 @@ async fn mcp_servers(
         },
     }];
     if shared {
-        return servers;
+        return (servers, None);
     }
-    let connectors = state
+    let all = state
         .db
-        .call(|c| crate::entities::list_connectors(c, true))
+        .call(|c| crate::entities::list_connectors(c, false))
         .await
         .unwrap_or_default();
-    if let Some(token) = browser_token {
-        // Installs from before Iris had a browser may have a connector
-        // called "browser"; it keeps its name and Iris's server steps aside.
-        let name = if connectors
-            .iter()
-            .any(|c| c.name == crate::browser::tools::SERVER)
-        {
-            crate::browser::tools::SERVER_ALT
-        } else {
-            crate::browser::tools::SERVER
-        };
+    // Installs from before Iris had a browser may have connectors with
+    // these names; they keep them and Iris's server takes a free one (or
+    // stays out).
+    let browser_name = browser_token.and_then(|_| {
+        [
+            crate::browser::tools::SERVER,
+            crate::browser::tools::SERVER_ALT,
+        ]
+        .into_iter()
+        .find(|n| !all.iter().any(|c| c.name == *n))
+    });
+    if browser_token.is_some() && browser_name.is_none() {
+        crate::warn!("browser tools left out: connectors use both of their names");
+    }
+    let connectors: Vec<_> = all.into_iter().filter(|c| c.enabled).collect();
+    if let (Some(token), Some(name)) = (browser_token, browser_name) {
         servers.push(McpServer {
             name: name.into(),
             transport: McpTransport::Stdio {
@@ -1097,7 +1105,7 @@ async fn mcp_servers(
             Err(e) => crate::warn!("connector {} skipped: {e}", con.name),
         }
     }
-    servers
+    (servers, browser_name.map(String::from))
 }
 
 /// Whether this turn gets the browser tools: enabled, not paused, a
@@ -1252,6 +1260,48 @@ mod tests {
         assert!(p.contains("Sam: m99"));
         assert!(!p.contains("Sam: m10\n"));
         assert_eq!(p.matches("Sam: m").count(), MAX_REPLAY_MESSAGES);
+    }
+
+    #[tokio::test]
+    async fn browser_server_takes_a_free_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::browser::tools::tests::test_state(tmp.path());
+        let add = |name: &str, enabled: bool| {
+            let cfg = crate::entities::ConnectorConfig {
+                command: Some("x".into()),
+                ..Default::default()
+            };
+            state
+                .db
+                .with(|c| {
+                    crate::entities::insert_connector(
+                        c,
+                        &new_id(),
+                        name,
+                        "",
+                        "stdio",
+                        &cfg,
+                        enabled,
+                    )
+                })
+                .unwrap();
+        };
+        let names = |v: &[McpServer]| v.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
+        let (s, b) = mcp_servers(&state, "u", "c", false, Some("t")).await;
+        assert_eq!(b.as_deref(), Some("browser"));
+        assert_eq!(names(&s), ["iris", "browser"]);
+        // Shared chats and turns without a token never get it.
+        assert_eq!(mcp_servers(&state, "u", "c", true, Some("t")).await.1, None);
+        assert_eq!(mcp_servers(&state, "u", "c", false, None).await.1, None);
+        // An older connector named "browser" (even switched off) keeps it.
+        add("browser", false);
+        let (s, b) = mcp_servers(&state, "u", "c", false, Some("t")).await;
+        assert_eq!(b.as_deref(), Some("iris_browser"));
+        assert_eq!(names(&s), ["iris", "iris_browser"]);
+        add("iris_browser", true);
+        let (s, b) = mcp_servers(&state, "u", "c", false, Some("t")).await;
+        assert_eq!(b, None);
+        assert_eq!(names(&s), ["iris", "iris_browser"]);
     }
 
     #[test]

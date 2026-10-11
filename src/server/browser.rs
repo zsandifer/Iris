@@ -143,17 +143,12 @@ async fn sandbox(
             }
         })
         .await?;
-    state.browser.set_allow_no_sandbox(allow);
     crate::info!(
         "owner {} running the browser without Chrome's sandbox",
         if allow { "allowed" } else { "disallowed" }
     );
-    if !allow {
-        // A running unsandboxed browser must not outlive the choice.
-        if state.browser.running().is_some_and(|r| r.no_sandbox) {
-            state.browser.close().await;
-        }
-    }
+    // Taking it back also closes an unsandboxed browser (even one starting).
+    state.browser.set_allow_no_sandbox(allow).await;
     broadcast(&state);
     ok(json!({"browser": status_json(&state)}))
 }

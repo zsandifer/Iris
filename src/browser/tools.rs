@@ -238,6 +238,10 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Ou
         Ok(r) => r,
         Err(e) => return Output::error(format!("The browser could not start: {e}")),
     };
+    // Starting can take a while: the turn may have ended meanwhile.
+    if let Err(e) = b.check_agent(&ctx) {
+        return Output::error(e.to_string());
+    }
     b.set_busy(true);
     let started = std::time::Instant::now();
     let mut out = match run_tool(state, &ctx, &run, name, args).await {
@@ -586,11 +590,19 @@ pub async fn eval(run: &Running, call: &str) -> Result<Value> {
     let ctx = world["executionContextId"]
         .as_i64()
         .ok_or("the page is not ready")?;
+    // Secrets Iris typed go to its isolated world only, so the helpers can
+    // redact any copy before formatting it.
+    let secrets = run.secrets();
+    let prelude = if secrets.is_empty() {
+        String::new()
+    } else {
+        format!("__iris.setSecrets({});\n", json!(secrets))
+    };
     let r = run
         .cdp
         .call(
             "Runtime.evaluate",
-            json!({"expression": format!("{PAGE_JS}\n__iris.{call}"), "contextId": ctx,
+            json!({"expression": format!("{PAGE_JS}\n{prelude}__iris.{call}"), "contextId": ctx,
                    "returnByValue": true}),
             s,
         )

@@ -13,6 +13,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const PASSWORD: &str = "S3cret-Pa55-xyz!";
+/// Quotes, a backslash, doubled spaces, and longer than snapshot cuts.
+const TRICKY: &str =
+    "q\"uo  te\\back-slash-0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-end";
 const CARD: &str = "4242424242424242";
 const CVC: &str = "987";
 
@@ -50,6 +53,20 @@ const REFLECT_PAGE: &str = r#"<!doctype html><html><head><title>Echo sign in</ti
 <input id="copy" aria-label="Copy">
 <button type="button" onclick="pw.type = 'text'">Show password</button>
 </form><p id="echo"></p></body></html>"#;
+
+/// A password field the page later reveals and unmasks, with no other copy;
+/// a focus handler that tries to move focus elsewhere; the password
+/// echoed into the title; and a card form on the same page.
+const TRICKY_PAGE: &str = r#"<!doctype html><html><head><title>Tricky</title></head><body>
+<h1>Tricky</h1><form>
+<input name="email" type="email" autocomplete="username" aria-label="Email">
+<input id="pw" type="password" aria-label="Password"
+  onfocus="queueMicrotask(() => document.getElementById('other').focus())"
+  oninput="document.title = 'Hi ' + this.value">
+<input id="other" aria-label="Other">
+<button type="button" onclick="pw.type = 'text'; pw.style.removeProperty('-webkit-text-security')">Reveal</button>
+<input name="cardnumber" autocomplete="cc-number" aria-label="Card number">
+</form></body></html>"#;
 
 /// Card fields recognized by name only (no autocomplete hints).
 const PLAIN_CHECKOUT: &str = r#"<!doctype html><html><head><title>Plain checkout</title></head><body>
@@ -106,6 +123,8 @@ async fn test_site() -> (u16, Arc<Mutex<Vec<String>>>) {
                                 CHECKOUT_PAGE.to_string()
                             } else if line.starts_with("GET /plain-checkout") {
                                 PLAIN_CHECKOUT.to_string()
+                            } else if line.starts_with("GET /tricky") {
+                                TRICKY_PAGE.to_string()
                             } else if line.starts_with("GET /reflect") {
                                 REFLECT_PAGE.to_string()
                             } else if line.starts_with("GET / ") {
@@ -157,7 +176,7 @@ fn setup() -> Option<(tempfile::TempDir, AppState, String, String)> {
     }
     let state = AppState::new(cfg, paths, db).unwrap();
     // Test machines often cannot start Chrome's sandbox.
-    state.browser.set_allow_no_sandbox(true);
+    state.browser.init_allow_no_sandbox(true);
     let (owner, conv) = state
         .db
         .with(|c| {
@@ -177,7 +196,7 @@ fn setup() -> Option<(tempfile::TempDir, AppState, String, String)> {
             "cred-login-local",
             "login",
             json!({"site": "localhost", "username": "pat@example.com"}),
-            json!({"password": PASSWORD}),
+            json!({"password": TRICKY}),
         ),
         (
             "cred-card",
@@ -299,12 +318,32 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
         );
     }
 
-    // A frame of the live view arrived.
+    // The live view streams: a newer frame follows a visible change.
     tokio::time::timeout(Duration::from_secs(10), frames.wait_for(|f| f.is_some()))
         .await
         .expect("a frame")
         .unwrap();
+    let before = frames.borrow_and_update().as_ref().unwrap().json.clone();
+    call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/about")}),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), frames.changed())
+        .await
+        .expect("a newer frame")
+        .unwrap();
+    let after = frames.borrow().as_ref().unwrap().json.clone();
+    assert_ne!(before, after);
+    // Nobody watching: the screencast stops.
     drop(watch_guard);
+    for _ in 0..50 {
+        if state.browser.running().unwrap().casting().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(state.browser.running().unwrap().casting().is_none());
 
     // Take over: the agent waits until the owner hands back.
     state.browser.take_over(&owner, "dev-1").await.unwrap();
@@ -512,5 +551,100 @@ async fn reflected_secrets_pending_and_denied_cards_and_stale_refs() {
         assert!(!o.contains(PASSWORD) && !o.contains(CARD), "{o}");
     }
     drop(guard);
+    state.browser.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hostile_pages_cannot_extract_or_redirect_secrets() {
+    let Some((_tmp, state, owner, conv)) = setup() else {
+        return;
+    };
+    let (port, _posted) = test_site().await;
+    let guard = state
+        .browser
+        .begin_turn(&owner, &conv, "msg-3", std::slice::from_ref(&owner));
+    let token = guard.token().to_string();
+    let call = |name: &'static str, args: Value| {
+        let (st, tk) = (state.clone(), token.clone());
+        async move { tools::call(&st, &tk, name, &args).await }
+    };
+    let leaks = |text: &str| {
+        let escaped = serde_json::to_string(TRICKY).unwrap();
+        let folded = TRICKY.split_whitespace().collect::<Vec<_>>().join(" ");
+        text.contains(TRICKY)
+            || text.contains(&escaped[1..escaped.len() - 1])
+            || text.contains(&folded)
+            || text.contains(&TRICKY[..20])
+            || text.contains("0123456789-0123456789")
+    };
+    let mut outputs = Vec::new();
+    let url = format!("http://localhost:{port}/tricky");
+    outputs.push(call("navigate", json!({"url": url})).await.text);
+    let out = call("fill_login", json!({})).await;
+    assert_eq!(out.text, "filled");
+    // The focus handler could not redirect the secret into another field.
+    let run = state.browser.running().unwrap();
+    let probe = |expr: &'static str| {
+        let run = run.clone();
+        async move {
+            run.cdp
+                .call(
+                    "Runtime.evaluate",
+                    json!({"expression": expr, "returnByValue": true}),
+                    Some(&run.page().session_id),
+                )
+                .await
+                .unwrap()["result"]["value"]
+                .clone()
+        }
+    };
+    assert_eq!(probe("document.getElementById('other').value").await, "");
+    assert_eq!(
+        probe("document.getElementById('pw').value.length").await,
+        TRICKY.len()
+    );
+    // Snapshot and title: the long, quoted secret never shows, not even cut.
+    let snap = call("snapshot", json!({})).await;
+    outputs.push(snap.text.clone());
+    assert!(snap.text.starts_with("Page: Hi ••••"), "{}", snap.text);
+    // Revealed and unmasked by the page, with no other copy: no screenshot.
+    let reveal = ref_of(&snap.text, "button \"Reveal\"");
+    outputs.push(call("click", json!({"ref": reveal})).await.text);
+    let shot = call("screenshot", json!({})).await;
+    assert!(shot.is_error && shot.image.is_none(), "{}", shot.text);
+    // A card approval built from this page does not store the echoed secret.
+    let out = call("fill_card", json!({})).await;
+    assert!(out.text.starts_with("waiting for approval"), "{}", out.text);
+    let card = approvals(&state, &conv).await.pop().unwrap().card.unwrap();
+    assert!(!leaks(&card.to_string()), "{card}");
+    assert!(
+        card["preview"]["subject"]
+            .as_str()
+            .unwrap()
+            .contains("••••")
+    );
+    for o in &outputs {
+        assert!(!leaks(o), "{o}");
+    }
+
+    // A turn that ends while the browser is starting does nothing after.
+    state.browser.close().await;
+    let held = state.browser.launch_lock_for_test().await;
+    let (st, tk) = (state.clone(), token.clone());
+    let pending = tokio::spawn(async move {
+        tools::call(&st, &tk, "navigate", &json!({"url": "https://example.com"})).await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(guard);
+    drop(held);
+    let out = tokio::time::timeout(Duration::from_secs(20), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        out.is_error && out.text == super::TURN_ENDED,
+        "{}",
+        out.text
+    );
     state.browser.close().await;
 }
