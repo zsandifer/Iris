@@ -16,6 +16,14 @@ call model APIs directly, execute tools, or grow its own tool system. The
 CLI does all reasoning and tool use. Iris builds prompts and command lines,
 manages subprocesses, normalizes their output, and stores app state.
 
+Connectors (MCP servers the owner connects) are the one place Iris sits in
+the tool path, and only as a gateway: the CLI gets a stdio proxy per
+connector (`iris mcp-gateway`), and the daemon forwards its calls to the
+real servers with secrets from the vault, enforcing the owner's approval
+rules (`src/gateway/`). Never hand connector configs or secrets to a CLI,
+and never let the gateway decide what to call or rewrite a call: it may
+only run a call unchanged, hold it for approval, or refuse it.
+
 ## Invariants (do not break these)
 
 1. **No credential handling for subscriptions.** Never read, store, proxy,
@@ -54,7 +62,7 @@ manages subprocesses, normalizes their output, and stores app state.
 
 ```
 src/
-├── main.rs          CLI: init, serve, pair, status, mcp, import openclaw
+├── main.rs          CLI: init, serve, pair, status, mcp, mcp-gateway, import openclaw
 ├── config.rs        config.toml schema, defaults, XDG paths, private file helpers
 ├── db.rs            SQLite schema/migrations, users, devices, conversations, messages
 ├── entities.rs      feed, ideas, goals, library, cards, connectors, credentials, push subs
@@ -72,6 +80,14 @@ src/
 │   ├── opencode.rs  OpenCode adapter + run --format json parser
 │   └── runner.rs    subprocess runner: cap, stdin, timeout, process-group kill
 ├── turn.rs          the turn pipeline (routing, replay, fallback, persistence)
+├── gateway/
+│   ├── mod.rs       connector gateway: turn grants, socket, approvals, tripwires
+│   ├── policy.rs    approval rules: classify calls, recipients, previews
+│   ├── upstream.rs  MCP client to connector servers (stdio, Streamable HTTP)
+│   └── proxy.rs     `iris mcp-gateway` stdio proxy the CLIs start
+├── oauth.rs         connector sign-in: MCP auth discovery, DCR, PKCE, refresh
+├── connectors.rs    connector catalog (Google, GitHub, custom) and setup
+├── keys.rs          engine API keys (vault) passed to CLIs per turn
 ├── state.rs         shared state, harness registry, settings
 ├── events.rs        WebSocket event hub
 ├── server/          axum routes (chat, content, admin), WebSocket, app + /console
@@ -127,7 +143,9 @@ cargo test
 
 Unit tests cover the router and policy, persona assembly, stream parsing,
 pairing/auth, the vault, push encryption (RFC 8291 vector), the MCP bridge,
-import, and the subprocess runner.
+the connector gateway (approval gate, trusted people, tripwires, pause,
+disconnect, against a fake connector), connector sign-in (discovery, DCR,
+PKCE, refresh, against a fake provider), import, and the subprocess runner.
 
 End-to-end check against the real CLIs (uses a temp data dir; costs a few
 tiny requests on your subscriptions):
@@ -142,7 +160,11 @@ iris pair --config $T/config.toml --data-dir $T/data
 
 Things worth re-verifying when a CLI updates: stream event shapes, `--resume`
 and `codex exec resume`, `--system-prompt-snapshot`, `developer_instructions`,
-MCP approval (`default_tools_approval_mode`), and the auth-failure output.
+MCP approval (`default_tools_approval_mode`), MCP tool-call timeouts
+(Claude Code per-server `timeout` and `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`,
+Codex `tool_timeout_sec`, Gemini CLI and OpenCode `timeout`), and the
+auth-failure output. `scripts/e2e/connectors.sh <model>` checks the
+approval gate end to end with a fake messenger connector.
 
 ## Conventions
 
