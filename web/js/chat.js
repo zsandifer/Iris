@@ -240,15 +240,21 @@ function Composer({ cid, running }) {
   const pick = async (e) => {
     const files = [...e.target.files].slice(0, MAX_PHOTOS - atts.length);
     e.target.value = '';
+    // The loop awaits; stop once the composer is gone (its cleanup already
+    // ran, so revoke what this iteration made itself).
     for (const f of files) {
+      if (!mine.current.mounted) break;
       const key = Math.random().toString(36).slice(2);
       const preview = URL.createObjectURL(f);
       setAtts((a) => [...a, { key, preview, uploading: true }]);
       try {
         const blob = await shrink(f);
+        if (!mine.current.mounted) { URL.revokeObjectURL(preview); break; }
         const r = await api('POST', '/attachments', blob);
+        if (!mine.current.mounted) { URL.revokeObjectURL(preview); break; }
         setAtts((a) => a.map((x) => (x.key === key ? { ...x, id: r.attachment.id, uploading: false } : x)));
       } catch (err) {
+        if (!mine.current.mounted) { URL.revokeObjectURL(preview); break; }
         toast(err.status === 415 ? 'I can only take photos (JPEG, PNG, GIF, or WebP).' : err.message);
         setAtts((a) => a.filter((x) => x.key !== key));
         URL.revokeObjectURL(preview);

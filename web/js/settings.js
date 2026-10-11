@@ -2,7 +2,7 @@
 // people, and the activity log.
 import { html, useEffect, useState, useRef } from './h.js';
 import { api, get, post, put, del, setToken, seg } from './api.js';
-import { S, set, useStore, go, toast, isOwner, loadSlots, loadEngines } from './store.js';
+import { S, set, useStore, go, toast, isOwner, loadSlots, loadEngines, currentLogins } from './store.js';
 import {
   Icon, Row, Group, Page, Spinner, Toggle, LetterTile, Empty,
   agentName, ago, since, stamp, confirmSheet, promptSheet, openSheet, closeSheet,
@@ -55,10 +55,11 @@ function Notifications() {
   };
   const note = st === 'needs_install' ? 'On iPhone, add Iris to your Home Screen first (Share, then Add to Home Screen), then open it from there.'
     : st === 'denied' ? 'Notifications are blocked for Iris. Allow them in your phone settings.'
-    : st === 'unsupported' ? "This browser can't show notifications." : null;
+    : st === 'unsupported' ? "This browser can't show notifications."
+    : st === 'unavailable' ? `${agentName()}'s server can't send notifications to this browser, so they're off here.` : null;
   return html`<${Group} label="Notifications" note=${note}>
     <${Row} icon="bell" title=${`Messages from ${agentName()}`} sub="On this device"
-      right=${html`<${Toggle} on=${st === 'on'} disabled=${!st || ['needs_install', 'denied', 'unsupported'].includes(st)} onChange=${toggle} label="Notifications" />`} />
+      right=${html`<${Toggle} on=${st === 'on'} disabled=${!st || ['needs_install', 'denied', 'unsupported', 'unavailable'].includes(st)} onChange=${toggle} label="Notifications" />`} />
     <${QuietHours} />
     ${st === 'on' && html`<${Row} icon="send" title="Send a test notification" onClick=${test} chevron=${false} />`}
   <//>`;
@@ -204,7 +205,7 @@ export function AiEngine() {
   useEffect(() => {
     loadSlots().catch((e) => toast(e.message));
     loadEngines().catch(() => {});
-    get('/harnesses').then((r) => set({ harnesses: r.harnesses })).catch(() => {});
+    get('/harnesses').then((r) => set({ harnesses: r.harnesses, logins: currentLogins(r.harnesses) })).catch(() => {});
   }, []);
   const slots = (S.slots || []).filter((s) => SLOT_LABEL[s.slot]);
   const chat = slots.find((s) => s.slot === 'chat');

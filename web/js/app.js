@@ -13,7 +13,7 @@ import { FeedScreen, StoryViewer } from './feed.js';
 import { IdeasScreen, GoalsScreen, LibraryScreen } from './lists.js';
 import { Hub, Connections, ConnectorForm, Logins, Computer, Files, FileEditor, Folder } from './hub.js';
 import { Settings, AiEngine, Devices, People, ActivityLog } from './settings.js';
-import { isIOS, standalone } from './push.js';
+import { isIOS, standalone, syncPush, resetPush } from './push.js';
 
 const TABS = [
   ['chat', 'Chat', 'chat'],
@@ -291,6 +291,7 @@ async function boot() {
   try {
     const me = await api('GET', '/me', undefined, { timeout: 8000 });
     set({ me });
+    syncPush();
     await loadConvs();
     events?.close();
     events = connectEvents(handleEvent, (online) => set({ online }));
@@ -312,6 +313,7 @@ function signedOut() {
   events?.close();
   events = null;
   setToken('');
+  resetPush();
   if (location.hash && location.hash !== '#/') history.replaceState(null, '', '#/');
   resetUserState();
 }

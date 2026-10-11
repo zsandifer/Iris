@@ -121,7 +121,7 @@ async function openItem(it) {
     let view;
     if (it.mime.startsWith('image/')) view = html`<${Img} src=${`/api${path}`} cls="lib-full" alt=${it.title} />`;
     else if (it.mime.startsWith('text/') || it.mime === 'application/json') {
-      const text = await api('GET', path, undefined, { raw: true }).then((r) => r.text());
+      const text = await api('GET', path, undefined, { as: 'text' });
       view = it.mime === 'text/markdown' ? html`<div class="md doc" dangerouslySetInnerHTML=${{ __html: md(text) }} />`
         : html`<pre class="doc">${text}</pre>`;
     } else view = html`<p class="mu">I can't show this kind of file here, but you can download it.</p>`;
@@ -184,18 +184,21 @@ export function LibraryScreen() {
   const [tab, setTab] = useState('all');
   useEffect(() => { loadLibrary().catch((e) => toast(e.message)); }, []);
   const lib = S.library;
+  // Unliked posts stay loaded (so an open post and the paging cursor keep
+  // working) but leave the Saved views at once.
+  const saved = (lib?.saved || []).filter((p) => p.liked !== false);
   const tabs = [['all', 'All'], ['made', 'Made by me'], ['photos', 'Photos'], ['saved', 'Saved']];
   let body;
   if (!lib) body = html`<${Spinner} />`;
   else if (tab === 'made') body = lib.items.length ? html`<${MadeByIris} items=${lib.items} />` : html`<${Empty} icon="file" title="Nothing yet">Reports, drafts, and images I make for you land here.<//>`;
   else if (tab === 'photos') body = lib.photos.length ? html`<${PhotoGrid} photos=${lib.photos} />${lib.photosMore && html`<${ShowMore} load=${loadMorePhotos} />`}` : html`<${Empty} icon="image" title="No photos yet">Photos you send me show up here.<//>`;
-  else if (tab === 'saved') body = lib.saved.length ? html`<${Saved} posts=${lib.saved} />${lib.savedMore && html`<${ShowMore} load=${loadMoreSaved} />`}` : html`<${Empty} icon="heart" title="Nothing saved">Tap ♡ on a post in For you to keep it here.<//>`;
+  else if (tab === 'saved') body = saved.length || lib.savedMore ? html`<${Saved} posts=${saved} />${lib.savedMore && html`<${ShowMore} load=${loadMoreSaved} />`}` : html`<${Empty} icon="heart" title="Nothing saved">Tap ♡ on a post in For you to keep it here.<//>`;
   else {
-    const any = lib.items.length || lib.photos.length || lib.saved.length;
+    const any = lib.items.length || lib.photos.length || saved.length;
     body = any ? html`
       ${lib.items.length > 0 && html`<div class="gl">Made by me</div><${MadeByIris} items=${lib.items} limit=${4} />`}
       ${lib.photos.length > 0 && html`<div class="gl">Photos you sent</div><${PhotoGrid} photos=${lib.photos} limit=${6} />`}
-      ${lib.saved.length > 0 && html`<div class="gl">Saved posts</div><${Saved} posts=${lib.saved} limit=${4} />`}`
+      ${saved.length > 0 && html`<div class="gl">Saved posts</div><${Saved} posts=${saved} limit=${4} />`}`
       : html`<${Empty} icon="library" title="Your library is empty">Things I make for you, photos you send, and posts you save all collect here.<//>`;
   }
   return html`<div class="scr tabscr">

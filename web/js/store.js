@@ -247,12 +247,19 @@ const postOlder = (x, last) => x.created_at < last.created_at;
 const photoOlder = (x, last) => x.used_at < last.used_at || (x.used_at === last.used_at && x.id < last.id);
 const photoCursor = (p) => `&before=${p.used_at}&before_id=${encodeURIComponent(p.id)}`;
 
-/** A refreshed first page, keeping later pages that were already loaded. */
+/**
+ * A refreshed first page, keeping later pages that were already loaded, but
+ * only when the fresh page reaches back to them (so nothing in between is
+ * skipped); otherwise start over from the fresh page and its has_more.
+ */
 function keepOlder(fresh, freshMore, old, oldMore, older) {
   if (!freshMore || !old?.length || !fresh.length) return [fresh, !!freshMore];
   const last = fresh.at(-1);
+  const newestOld = old.reduce((n, x) => (older(n, x) ? x : n));
+  if (older(newestOld, last)) return [fresh, true]; // a gap: drop the old pages
   const ids = new Set(fresh.map((x) => x.id));
-  const tail = old.filter((x) => !ids.has(x.id) && older(x, last));
+  const tail = old.filter((x) => !ids.has(x.id) && older(x, last))
+    .sort((a, b) => (older(a, b) ? 1 : older(b, a) ? -1 : 0));
   return tail.length ? [[...fresh, ...tail], oldMore] : [fresh, true];
 }
 
@@ -326,10 +333,22 @@ function liveFor(mid) {
   return S.live[mid] || { text: '', acts: [] };
 }
 
+/**
+ * A finished sign-in ("connected") is stale once the CLI reports it is
+ * signed out again (`auth_required`); drop it so the UI offers Reconnect.
+ */
+export function currentLogins(harnesses) {
+  const logins = { ...S.logins };
+  for (const h of harnesses || []) {
+    if (h.auth === 'auth_required' && logins[h.name]?.state === 'connected') delete logins[h.name];
+  }
+  return logins;
+}
+
 export function handleEvent(ev) {
   switch (ev.type) {
     case 'ready':
-      set({ settings: ev.settings, harnesses: ev.harnesses });
+      set({ settings: ev.settings, harnesses: ev.harnesses, logins: currentLogins(ev.harnesses) });
       refreshAll();
       break;
     case 'resync':
@@ -386,7 +405,10 @@ export function handleEvent(ev) {
       set({ settings: ev.settings });
       break;
     case 'harness.status':
-      set({ harnesses: S.harnesses.map((h) => (h.name === ev.harness.name ? { ...h, ...ev.harness, path: h.path } : h)) });
+      set({
+        harnesses: S.harnesses.map((h) => (h.name === ev.harness.name ? { ...h, ...ev.harness, path: h.path } : h)),
+        logins: currentLogins([ev.harness]),
+      });
       break;
     case 'models.changed':
       set({ slots: ev.slots });

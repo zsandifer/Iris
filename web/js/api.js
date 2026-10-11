@@ -33,8 +33,15 @@ export class ApiError extends Error {
 // a caller that toasts errors shows nothing.
 const stale = () => new ApiError(0, 'stale', '');
 
-/** Call `/api<path>`. JSON bodies are serialized; Blobs are sent raw. */
-export async function api(method, path, body, { raw = false, timeout } = {}) {
+const offline = () => new ApiError(0, 'offline', "I can't reach your Iris server right now.");
+
+/**
+ * Call `/api<path>`. JSON bodies are serialized; Blobs are sent raw. The
+ * response body is read here, as `as` ('blob' or 'text'; by default JSON
+ * or text from the content type), so the deadline covers the whole body
+ * and a body that finishes after the signed-in user changed is dropped.
+ */
+export async function api(method, path, body, { as, timeout } = {}) {
   const gen = generation;
   const headers = {};
   if (token) headers.Authorization = 'Bearer ' + token;
@@ -44,35 +51,44 @@ export async function api(method, path, body, { raw = false, timeout } = {}) {
     headers['Content-Type'] = 'application/json';
     payload = JSON.stringify(body);
   }
-  // Uploads may take a while on cellular; everything else should be quick.
-  const ms = timeout ?? (payload instanceof Blob ? 120000 : 20000);
+  // Uploads and downloads may take a while on cellular; the rest is quick.
+  const ms = timeout ?? (payload instanceof Blob || as ? 120000 : 20000);
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), ms);
-  let res;
   try {
-    res = await fetch('/api' + path, { method, headers, body: payload, signal: ctl.signal });
-  } catch {
-    throw new ApiError(0, 'offline', "I can't reach your Iris server right now.");
+    let res;
+    try {
+      res = await fetch('/api' + path, { method, headers, body: payload, signal: ctl.signal });
+    } catch {
+      throw offline();
+    }
+    if (gen !== generation) throw stale();
+    if (res.status === 401 && path !== '/pair') unauthorizedHandler();
+    if (!res.ok) {
+      let code = 'error';
+      let message = res.statusText || 'Something went wrong';
+      try {
+        const j = await res.json();
+        code = j.error?.code || code;
+        message = j.error?.message || message;
+      } catch { /* not JSON, or the body stalled */ }
+      if (gen !== generation) throw stale();
+      throw new ApiError(res.status, code, message);
+    }
+    const kind = as || ((res.headers.get('content-type') || '').includes('json') ? 'json' : 'text');
+    let data;
+    try {
+      data = await res[kind]();
+    } catch (e) {
+      if (gen !== generation) throw stale();
+      if (ctl.signal.aborted || e?.name === 'AbortError' || e?.name === 'TypeError') throw offline();
+      throw e;
+    }
+    if (gen !== generation) throw stale();
+    return data;
   } finally {
     clearTimeout(timer);
   }
-  if (gen !== generation) throw stale();
-  if (res.status === 401 && path !== '/pair') unauthorizedHandler();
-  if (!res.ok) {
-    let code = 'error';
-    let message = res.statusText || 'Something went wrong';
-    try {
-      const j = await res.json();
-      code = j.error?.code || code;
-      message = j.error?.message || message;
-    } catch { /* not JSON */ }
-    throw new ApiError(res.status, code, message);
-  }
-  if (raw) return res;
-  const ct = res.headers.get('content-type') || '';
-  const data = await (ct.includes('json') ? res.json() : res.text());
-  if (gen !== generation) throw stale();
-  return data;
 }
 
 export const get = (p) => api('GET', p);
@@ -126,8 +142,7 @@ export function holdBlob(path) {
   else {
     e = { refs: 0 };
     const gen = generation;
-    e.p = api('GET', path.replace(/^\/api(?=\/)/, ''), undefined, { raw: true })
-      .then((r) => r.blob())
+    e.p = api('GET', path.replace(/^\/api(?=\/)/, ''), undefined, { as: 'blob' })
       .then((b) => {
         if (gen !== generation) throw stale();
         return URL.createObjectURL(b);
