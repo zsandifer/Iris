@@ -108,13 +108,33 @@ export function go(path, replace = false) {
   set({ drawer: false });
 }
 
-export function back(fallback = 'chat') {
-  if (history.length > 1 && sessionStorage.getItem('iris.nav')) history.back();
-  else go(fallback);
+// The screen one layer up from a route, like a file browser's Up: Back
+// always climbs toward the top (and out of Settings), never replays history.
+export function parentRoute(hash) {
+  const raw = hash.replace(/^#\/?/, '');
+  const [path, query = ''] = raw.split('?');
+  const parts = path.split('/').filter(Boolean);
+  const q = new URLSearchParams(query);
+  // A view of the same screen (?view=…, ?edit=…) sits one layer above it.
+  if (query && !(parts[1] === 'files' && q.has('edit'))) return parts.join('/') || 'chat';
+  const [tab, sub, a] = parts;
+  if (tab === 'iris') {
+    if (!sub) return 'chat';
+    if (sub === 'connections' && (a === 'add' || a === 'group' || a === 'google-help' || a === 'new' || a === 'trusted')) return 'iris/connections';
+    if (sub === 'files' && a === 'system') return 'iris/files';
+    if (parts.length > 2) return parts.slice(0, -1).join('/');
+    return 'iris';
+  }
+  if (tab === 'settings') return sub ? 'settings' : 'iris';
+  if (tab === 'chat') return 'chat';
+  return parts.length > 1 ? parts.slice(0, -1).join('/') : 'chat';
+}
+
+export function back() {
+  go(parentRoute(location.hash), true);
 }
 
 window.addEventListener('hashchange', () => {
-  sessionStorage.setItem('iris.nav', '1');
   set({ route: parseRoute(), drawer: false });
 });
 
