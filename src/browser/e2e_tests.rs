@@ -37,6 +37,22 @@ const LOGIN_PAGE: &str = r#"<!doctype html><html><head><title>Test Shop sign in<
 <p>New here? <a href="/about">About the shop</a></p>
 </body></html>"#;
 
+/// A one-page, two-step sign-in (like X): the username step swaps itself
+/// for a password step without a new document or path.
+const TWO_STEP_PAGE: &str = r#"<!doctype html><html><head><title>Two step</title></head><body>
+<form id="f" method="post" action="/login"><div id="step">
+<input name="email" autocomplete="username" aria-label="Phone, email, or username">
+</div><button>Next</button></form>
+<script>
+f.onsubmit = (e) => {
+  if (document.querySelector('input[type=password]')) return;
+  e.preventDefault();
+  const u = f.email.value;
+  step.innerHTML = '<input type="hidden" name="email"><input type="password" name="password" aria-label="Password">';
+  f.email.value = u;
+};
+</script></body></html>"#;
+
 const CHECKOUT_PAGE: &str = r#"<!doctype html><html><head><title>Checkout</title></head><body>
 <h1>Pay</h1>
 <form method="post" action="/pay">
@@ -160,6 +176,8 @@ async fn test_site() -> (u16, Arc<Mutex<Vec<String>>>) {
                                 r#"<!doctype html><title>Sign in</title><input name="password" type="password" aria-label="Password" oninput="location.href='/sink#'+Array.from(this.value).map(c=>c.charCodeAt(0).toString(16).padStart(2,'0')).join('')">"#.into()
                             } else if line.starts_with("GET /sink") {
                                 r#"<!doctype html><title>Sink</title><h1>Sink</h1><p id="echo"></p><script>echo.textContent=location.hash;document.title=location.hash</script>"#.into()
+                            } else if line.starts_with("GET /two-step") {
+                                TWO_STEP_PAGE.to_string()
                             } else if line.starts_with("GET /tricky") {
                                 TRICKY_PAGE.to_string()
                             } else if line.starts_with("GET /saved") {
@@ -649,7 +667,7 @@ async fn reflected_secrets_pending_and_denied_cards_and_stale_refs() {
     let out = call("click", json!({"ref": show})).await;
     outputs.push(out.text.clone());
     assert!(
-        out.is_error && out.text == tools::TAINTED_PAGE,
+        !out.is_error && out.text == tools::STILL_SIGNING_IN,
         "{}",
         out.text
     );
@@ -879,7 +897,7 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
     assert!(snap.is_error && snap.text == tools::TAINTED_PAGE);
     let after = call("click", json!({"ref": go})).await;
     assert!(
-        after.is_error && after.text == tools::TAINTED_PAGE,
+        !after.is_error && after.text == tools::STILL_SIGNING_IN,
         "{}",
         after.text
     );
@@ -1147,4 +1165,38 @@ async fn login_matching_uses_the_origin_even_when_the_display_port_is_redacted()
     let filled = tools::call(&state, guard.token(), "fill_login", &json!({})).await;
     assert_eq!(filled.text, "filled");
     state.browser.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_page_two_step_sign_in_submits_without_reading() {
+    let Some((_tmp, state, owner, conv)) = setup() else {
+        return;
+    };
+    let (port, posted) = test_site().await;
+    bind_logins(&state, &owner, port);
+    let guard = state
+        .browser
+        .begin_turn(&owner, &conv, "two-step", std::slice::from_ref(&owner));
+    let call = |name: &'static str, args: Value| {
+        let (st, token) = (state.clone(), guard.token().to_string());
+        async move { tools::call(&st, &token, name, &args).await }
+    };
+    let out = call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/two-step")}),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.text);
+    // Username step: filled and submitted, but the page stays locked.
+    let out = call("fill_login", json!({"submit": true})).await;
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains(tools::STILL_SIGNING_IN), "{}", out.text);
+    // Password step on the same page: signs in and the page reads again.
+    let out = call("fill_login", json!({"submit": true})).await;
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains("Welcome back"), "{}", out.text);
+    assert!(!out.text.contains(PASSWORD));
+    let p = posted.lock().unwrap();
+    let body = p.first().expect("the form was posted");
+    assert!(body.contains("password=S3cret-Pa55-xyz%21"), "{body}");
 }

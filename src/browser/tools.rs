@@ -154,9 +154,11 @@ pub fn definitions() -> Vec<Value> {
             "fill_login",
             "Sign in with the user's saved login for the current page's site. Iris types the \
              username and password into the page itself; you never see them. Answers \
-             `filled` or `not found`. Afterwards click the sign-in button (for two-step \
-             forms, call it again on the password step).",
-            json!({"site": s("Site the login is for, e.g. example.com (default: the current page)")}),
+             `filled` or `not found`. Set `submit` to press Enter in the filled field \
+             afterwards (best: the page cannot be read until the sign-in moves on). For \
+             two-step forms, call it again on the password step.",
+            json!({"site": s("Site the login is for, e.g. example.com (default: the current page)"),
+                   "submit": {"type": "boolean", "description": "Press Enter after filling to sign in"}}),
             &[],
         ),
         tool(
@@ -187,8 +189,10 @@ quick reading, ordinary web search or fetch tools are fine.
 - `navigate`, then work from the snapshot's refs (`click`, `type`,
   `select_option`, `press_key`); `screenshot` when you need to see the page.
 - Signing in: never ask the user for a password and never type one. Call
-  `fill_login` on the sign-in page; it answers `filled` or `not found`. If
-  `not found`, ask the user to add the login in Logins & wallet, or to take
+  `fill_login` with `submit: true` on the sign-in page. Until the sign-in
+  moves to a new page you cannot read the page; if it asks for a password
+  next, call `fill_login` again; for codes or checks, ask the user to take
+  over. If it answers `not found`, ask the user to add the login in Logins & wallet, or to take
   over the browser and sign in themselves.
 - Paying: call `fill_card` on the payment form. The user approves every use
   in the chat; tell them you are waiting for their OK. Do not place an order
@@ -364,7 +368,7 @@ async fn run_tool(
             click_at(cdp, s, x, y, &|| b.check_agent(ctx)).await?;
             settle(events, &page, Duration::from_millis(600)).await;
             release_after_action(run, &page, &before).await?;
-            let mut out = snapshot(run).await?;
+            let mut out = snapshot_after(run).await?;
             if let Some(c) = p["covered"].as_str() {
                 out.text = format!(
                     "(Note: the click landed on an element on top of it: \"{c}\".)\n\n{}",
@@ -422,7 +426,7 @@ async fn run_tool(
                 press_key(cdp, s, "Enter", &|| b.check_agent(ctx)).await?;
                 settle(events, &page, Duration::from_millis(800)).await;
                 release_after_action(run, &page, &before).await?;
-                return snapshot(run).await;
+                return snapshot_after(run).await;
             }
             Ok(Output::text("Typed it."))
         }
@@ -457,7 +461,7 @@ async fn run_tool(
             if arg("key") == "Enter" {
                 release_after_action(run, &page, &before).await?;
             }
-            snapshot(run).await
+            snapshot_after(run).await
         }
         "scroll" => {
             let pages = a["pages"].as_f64().unwrap_or(1.0).clamp(0.1, 10.0);
@@ -556,7 +560,36 @@ async fn run_tool(
         }
         "tabs" => tabs(state, ctx, run, a).await,
         "fill_login" => {
-            super::fill::login(state, ctx, run, a.get("site").and_then(Value::as_str)).await
+            let out =
+                super::fill::login(state, ctx, run, a.get("site").and_then(Value::as_str)).await?;
+            if out.text != "filled" || !a["submit"].as_bool().unwrap_or(false) {
+                return Ok(out);
+            }
+            // Enter goes to whatever has focus: only if it is still a
+            // field that was just filled (the last one filled keeps it).
+            let fields = eval(run, "loginFields()").await?;
+            let mut focused = false;
+            for r in [&fields["pass"], &fields["user"]]
+                .iter()
+                .filter_map(|v| v.as_str())
+            {
+                let f = eval_mut(run, b, ctx, &format!("hasFocus({})", json!(r))).await?;
+                focused |= f["ok"] == true;
+            }
+            if !focused {
+                return Ok(Output::text(
+                    "filled, but the page moved the focus elsewhere, so I did not press Enter. \
+                     Ask the user to take over and tap the sign-in button.",
+                ));
+            }
+            let before = eval(run, "navigationState()").await?;
+            let events = cdp.subscribe();
+            press_key(cdp, s, "Enter", &|| b.check_agent(ctx)).await?;
+            settle(events, &page, Duration::from_millis(1500)).await;
+            release_after_action(run, &page, &before).await?;
+            let mut out = snapshot_after(run).await?;
+            out.text = format!("filled and submitted.\n\n{}", out.text);
+            Ok(out)
         }
         "fill_card" => {
             super::fill::card(state, ctx, run, a.get("card").and_then(Value::as_str)).await
@@ -915,6 +948,22 @@ async fn eval_page(
         return Err(error.to_string().into());
     }
     Ok(result["value"].clone())
+}
+
+/// Still on a page Iris filled sign-in details into (sites like X keep every
+/// sign-in step on one page): the action ran, the page just cannot be read.
+pub(crate) const STILL_SIGNING_IN: &str = "Done. The page still has the user's sign-in details in it, so it \
+    cannot be read until the sign-in moves to a new page. If it now asks for the password, call \
+    fill_login again with submit; if it asks for a code or a check, ask the user to take over \
+    the browser. Use `wait` for a few seconds and try `snapshot` again if it may still be loading.";
+
+/// The snapshot after an action. A page that is still locked by a fill is
+/// not a failure of the action.
+async fn snapshot_after(run: &Running) -> Result<Output> {
+    match snapshot(run).await {
+        Err(e) if e.to_string() == TAINTED_PAGE => Ok(Output::text(STILL_SIGNING_IN)),
+        r => r,
+    }
 }
 
 pub async fn snapshot(run: &Running) -> Result<Output> {

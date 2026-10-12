@@ -3,7 +3,7 @@
 // scrolling and typing forwarded to the page, browser setup, and Pause.
 import { html, useEffect, useRef, useState } from './h.js';
 import { get, post, put, wsSend } from './api.js';
-import { S, set, useStore, go, toast, frames, loadBrowser } from './store.js';
+import { S, set, useStore, go, back, toast, frames, loadBrowser } from './store.js';
 import { Icon, Row, Group, Page, Spinner, Toggle, agentName, confirmSheet, stamp, hostOf } from './ui.js';
 import { activityTitle, placeLabel } from './hub.js';
 
@@ -55,10 +55,12 @@ const src = (f) => `data:image/jpeg;base64,${f.data}`;
 /** Small live thumbnail under Iris's status line while it browses. */
 export function BrowserPeek() {
   useStore();
+  // Opened from a chat: closing the browser returns to that chat.
+  const from = encodeURIComponent(S.route.parts.join('/'));
   const f = useFrame('peek');
   const b = S.browser || {};
   const host = hostOf(b.url);
-  return html`<button class="peek" onClick=${() => go('iris/computer?view=watch')} aria-label=${`Watch ${agentName()}'s browser`}>
+  return html`<button class="peek" onClick=${() => go(`iris/computer?view=watch&return=${from}`)} aria-label=${`Watch ${agentName()}'s browser`}>
     <div class="peek-shot">${f && b.running !== false ? html`<img src=${src(f)} alt="" />` : html`<div class="peek-ph shimmer-bg" />`}</div>
     <div class="peek-t">
       <b>${agentName()}'s browser</b>
@@ -78,6 +80,8 @@ function input(ev) { wsSend({ type: 'browser.input', ...ev }); }
 /** Full screen: Watch, or (in control) forward taps, drags and typing. */
 function Viewer({ control }) {
   useStore();
+  const from = S.route.query.get('return');
+  const view = (v) => `iris/computer?view=${v}${from ? `&return=${encodeURIComponent(from)}` : ''}`;
   const b = S.browser || {};
   const f = useFrame('full', !!b.running);
   const img = useRef();
@@ -96,15 +100,15 @@ function Viewer({ control }) {
   }, []);
 
   const takeOver = async () => {
-    try { if (S.browser?.disconnected) setBrowserState((await post('/browser/start')).browser); setBrowserState((await post('/browser/takeover')).browser); go('iris/computer?view=control'); } catch (e) { toast(e.message); }
+    try { if (S.browser?.disconnected) setBrowserState((await post('/browser/start')).browser); setBrowserState((await post('/browser/takeover')).browser); go(view('control'), true); } catch (e) { toast(e.message); }
   };
   const handBack = async () => {
     try { setBrowserState((await post('/browser/handback')).browser); } catch (e) { toast(e.message); }
-    go('iris/computer?view=watch');
+    go(view('watch'), true);
   };
   const close = async () => {
     if (mine) await post('/browser/handback').catch(() => {});
-    go('iris/computer');
+    back();
   };
   const start = async () => {
     try { setBrowserState((await post('/browser/start')).browser); } catch (e) { toast(e.message); }
