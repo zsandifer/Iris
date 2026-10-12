@@ -182,12 +182,31 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(upload_limit));
     Router::new()
         .route("/console", get(console))
+        .route("/privacy", get(privacy))
         .nest("/api", api)
         .fallback(get(web::serve).fallback(|| async { ApiError::not_found("route") }))
         .with_state(state)
 }
 
 const CONSOLE_HTML: &str = include_str!("console.html");
+const PRIVACY_HTML: &str = include_str!("privacy.html");
+
+/// A public privacy policy, so an owner's own Google OAuth app can be
+/// published (Google requires a privacy link on an authorized domain).
+async fn privacy() -> Response {
+    let mut res = Html(PRIVACY_HTML).into_response();
+    let h = res.headers_mut();
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'"),
+    );
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    res
+}
 
 async fn console() -> Response {
     let mut res = Html(CONSOLE_HTML).into_response();
@@ -2018,6 +2037,9 @@ esac
         let (s, _, body) = get_raw(&h.app, "/console", None).await;
         assert_eq!(s, StatusCode::OK);
         assert!(String::from_utf8_lossy(&body).contains("<html"));
+        let (s, _, body) = get_raw(&h.app, "/privacy", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&body).contains("privacy policy"));
         for missing in [
             "/js/nope.js",
             "/../Cargo.toml",
