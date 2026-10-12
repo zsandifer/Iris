@@ -404,6 +404,74 @@ async fn a_send_waits_for_approval_then_runs() {
 }
 
 #[tokio::test]
+async fn a_one_tap_service_reads_freely_and_asks_before_changes() {
+    let t = setup(|_| {});
+    // A hosted server that names its tools after itself, set up from the
+    // catalog with its default rules.
+    let script = FAKE_SERVER
+        .replace(r#""name":"search_messages""#, r#""name":"notion-search""#)
+        .replace(
+            r#""name":"create_event""#,
+            r#""name":"notion-create-pages""#,
+        );
+    let id = t.connector_id.clone();
+    let mode = crate::connectors::catalog_entry("notion").unwrap().mode;
+    t.state
+        .db
+        .with(move |c| {
+            let mut cfg = entities::get_connector(c, &id)?.unwrap().config;
+            cfg.args = vec!["-c".into(), script];
+            entities::update_connector(c, &id, None, Some(&cfg), None)?;
+            entities::set_connector_state(
+                c,
+                &id,
+                &ConnectorState {
+                    service: Some("notion"),
+                    policy: Some(&policy::Policy {
+                        mode,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let (token, _guard, _) = t.grant().await;
+    let r = t
+        .call(&token, "notion-search", json!({"query": "plans"}))
+        .await;
+    assert_eq!(text(&r), "ok notion-search secret=[hidden]", "{r}");
+    let calls = t.calls();
+    assert_eq!(calls[0].decision, "auto");
+    // The log keeps the real tool name.
+    assert_eq!(calls[0].tool, "notion-search");
+
+    // An ordinary change still waits for the owner on this service.
+    let (state, tok) = (t.state.clone(), token.clone());
+    let call = tokio::spawn(async move {
+        handle(
+            &state,
+            &json!({"token": tok, "connector": "chat", "request": {
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "notion-create-pages", "arguments": {"title": "Plans"}}}}),
+        )
+        .await
+    });
+    let card = t.pending_card().await;
+    assert!(
+        card.card.as_ref().unwrap()["title"]
+            .as_str()
+            .unwrap()
+            .contains("Notion")
+    );
+    t.decide(&card.id, false);
+    let r = call.await.unwrap()["result"].clone();
+    assert_eq!(r["isError"], true);
+    assert!(!t.calls_log().contains("notion-create-pages"));
+}
+
+#[tokio::test]
 async fn denial_and_timeout_never_run_the_call() {
     let t = setup(|c| c.safety.approval_timeout_secs = 1);
     let (token, _guard, _) = t.grant().await;

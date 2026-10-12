@@ -8,7 +8,7 @@ import {
 } from './store.js';
 import { Icon, Img, LetterTile, hostOf, safeUrl } from './ui.js';
 import { plain } from './md.js';
-import { ServiceSignIn, ServiceTile, labelOf } from './connect.js';
+import { CATALOG_IDS, ServiceSignIn, ServiceTile, labelOf } from './connect.js';
 
 import { ExternalLink } from './external-link.js';
 
@@ -42,11 +42,10 @@ function ResultCard({ c }) {
   </div>`;
 }
 
-const CATALOG = ['google', 'github', 'custom'];
 
 function ConnectCard({ c }) {
   const service = String(c.service || c.title || '');
-  const known = CATALOG.includes(service.toLowerCase()) ? service.toLowerCase() : null;
+  const known = CATALOG_IDS.includes(service.toLowerCase()) ? service.toLowerCase() : null;
   useEffect(() => { if (known) ensureConnectors(); }, [known]);
   const con = known && known !== 'custom' && (S.connectors || []).find((x) => x.service === known);
   const ready = c.state === 'done' || (con && con.enabled && con.auth_state === 'ok');

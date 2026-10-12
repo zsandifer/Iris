@@ -945,15 +945,18 @@ pub async fn start(
         .ok()
         .flatten()
         .ok_or_else(|| StartError::Other("connection not found".into()))?;
-    let mut o = con.config.oauth.clone().unwrap_or_else(|| OAuthConfig {
-        mode: "discover".into(),
-        ..Default::default()
-    });
+    let mut o = con
+        .config
+        .oauth
+        .clone()
+        .unwrap_or_else(OAuthConfig::discover);
     // Reconnecting an older Google grant must request today's scopes too.
+    // `o.scopes` keeps recording the current grant until this one lands.
+    let mut scopes = o.scopes.clone();
     if con.service == "google" && o.mode == "preset" {
         for scope in crate::connectors::GOOGLE_SCOPES {
-            if !o.scopes.iter().any(|s| s == scope) {
-                o.scopes.push((*scope).to_string());
+            if !scopes.iter().any(|s| s == scope) {
+                scopes.push((*scope).to_string());
             }
         }
     }
@@ -982,7 +985,8 @@ pub async fn start(
         o.token_endpoint = Some(d.token_endpoint);
         o.registration_endpoint = d.registration_endpoint;
         if o.scopes.is_empty() {
-            o.scopes = d.scopes;
+            o.scopes = d.scopes.clone();
+            scopes = d.scopes;
         }
         o.resource = Some(d.resource);
         o.local = d.local;
@@ -1024,7 +1028,7 @@ pub async fn start(
     let verifier = B64URL.encode(crate::util::random_bytes::<32>());
     let flow_state = crate::util::hex(&crate::util::random_bytes::<32>());
     let challenge = pkce_challenge(&verifier);
-    let scope = o.scopes.join(" ");
+    let scope = scopes.join(" ");
     let mut params: Vec<(&str, &str)> = vec![
         ("response_type", "code"),
         ("client_id", &client_id),
@@ -1233,7 +1237,7 @@ pub async fn finish(
         );
     }
     // Google allows people to deselect individual services on consent. A
-    // partial grant must not light up all four services in Connections.
+    // partial grant must not light up every service in Connections.
     if con.service == "google"
         && let Some(granted) = v["scope"].as_str()
     {
@@ -1249,7 +1253,7 @@ pub async fn finish(
                     .await
                     .map_err(|_| "I couldn't save the Google setup fix. Please try again.")?
                     .unwrap_or(
-                        "I need permission for all four Google services. Please sign in again.",
+                        "I need permission for all of the Google services. Please sign in again.",
                     )
                     .into(),
             );
@@ -1272,6 +1276,28 @@ pub async fn finish(
     updated.connected_at = Some(now_ms().max(updated.connected_at.unwrap_or(0).saturating_add(1)));
     if let Some(email) = v["id_token"].as_str().and_then(id_token_email) {
         updated.account = Some(email);
+    }
+    if con.service == "google" {
+        // Every Google service was granted (checked above): record it, and
+        // turn on the services an older default left out.
+        updated.scopes = crate::connectors::GOOGLE_SCOPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let id = con.id.clone();
+        state
+            .db
+            .call(move |c| {
+                if let Some(mut cfg) = entities::get_connector(c, &id)?.map(|c| c.config)
+                    && let Some(args) = crate::connectors::upgraded_google_args(&cfg.args)
+                {
+                    cfg.args = args;
+                    entities::update_connector(c, &id, None, Some(&cfg), None)?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| e.to_string())?;
     }
     save(state, &con.id, updated).await?;
     let id = con.id.clone();

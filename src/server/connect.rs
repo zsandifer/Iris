@@ -297,10 +297,7 @@ async fn oauth_client(
         .config
         .oauth
         .clone()
-        .unwrap_or_else(|| entities::OAuthConfig {
-            mode: "discover".into(),
-            ..Default::default()
-        });
+        .unwrap_or_else(entities::OAuthConfig::discover);
     o.client_id = Some(client_id);
     o.client_secret = match body.client_secret.as_deref().map(str::trim) {
         Some(s) if !s.is_empty() => Some(
@@ -1969,7 +1966,7 @@ mod tests {
             None,
         )
         .await;
-        assert!(partial.contains("all four services"));
+        assert!(partial.contains("every Google service"));
         let (_, setup) = call(&a, "GET", "/api/connectors/google/setup", None).await;
         assert_eq!(setup["progress"]["phase"], "sign_in");
         let current = a
@@ -2060,6 +2057,209 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_older_google_grant_keeps_working_and_adds_the_new_services_on_sign_in() {
+        use crate::connectors::{GOOGLE_SCOPES, google_args, google_needs_more_access};
+        let a = app_with_public_url("https://iris.example").await;
+        let (s, _) = call(
+            &a,
+            "POST",
+            "/api/connectors/google/setup/client",
+            Some(json!({"paste": "123-example.apps.googleusercontent.com GOCSPX-test-secret"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let get = |a: &App| {
+            a.state
+                .db
+                .with(|c| Ok(entities::list_connectors(c, false)?[0].clone()))
+                .unwrap()
+        };
+        let con = get(&a);
+        // A new Google connection turns on the whole suite.
+        assert_eq!(con.config.args, google_args());
+        for tool in ["docs", "sheets", "slides", "forms", "tasks", "contacts"] {
+            assert!(con.config.args.iter().any(|t| t == tool), "{tool}");
+        }
+        assert!(!con.config.args.iter().any(|t| t == "chat"));
+        assert!(!google_needs_more_access(&con));
+
+        // As an older Iris left it: signed in for Gmail, Calendar, Drive and
+        // YouTube only, with the old server arguments.
+        let old_scopes: Vec<String> = [
+            "openid",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/calendar",
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/youtube.readonly",
+        ]
+        .map(String::from)
+        .to_vec();
+        let old_args: Vec<String> = [
+            "workspace-mcp@1.30.1",
+            "--transport",
+            "streamable-http",
+            "--tools",
+            "gmail",
+            "calendar",
+            "drive",
+        ]
+        .map(String::from)
+        .to_vec();
+        {
+            let (con, old_scopes, old_args) = (con.clone(), old_scopes.clone(), old_args.clone());
+            let rt = a
+                .state
+                .vault
+                .seal_str(
+                    "old-rt",
+                    &format!("connector:{}:oauth:refresh_token", con.id),
+                )
+                .unwrap();
+            a.state
+                .db
+                .with(move |c| {
+                    let mut cfg = con.config.clone();
+                    cfg.args = old_args;
+                    let o = cfg.oauth.as_mut().unwrap();
+                    o.scopes = old_scopes;
+                    o.refresh_token = Some(rt);
+                    entities::update_connector(c, &con.id, None, Some(&cfg), None)?;
+                    entities::set_connector_state(
+                        c,
+                        &con.id,
+                        &ConnectorState {
+                            auth_state: Some("ok"),
+                            ..Default::default()
+                        },
+                    )?;
+                    crate::google_setup::save(
+                        c,
+                        &crate::google_setup::Progress {
+                            step: 6,
+                            sign_in: true,
+                            completed: true,
+                            issue: None,
+                            ..crate::google_setup::read(c)?
+                        },
+                    )
+                })
+                .unwrap();
+        }
+        // It keeps working, and the owner is asked to sign in again.
+        let con = get(&a);
+        assert!(con.active());
+        assert!(google_needs_more_access(&con));
+        let (_, list) = call(&a, "GET", "/api/connectors", None).await;
+        assert_eq!(list["connectors"][0]["oauth"]["needs_more_access"], true);
+        let (_, setup) = call(&a, "GET", "/api/connectors/google/setup", None).await;
+        assert_eq!(setup["progress"]["phase"], "connected");
+        assert_eq!(setup["progress"]["more_access"], true);
+        let owner = a.state.db.with(crate::db::owner_user_id).unwrap().unwrap();
+        let conv = a
+            .state
+            .db
+            .with(|c| crate::db::ensure_main_conversation(c, &owner))
+            .unwrap();
+        let req = crate::awareness::request(
+            &a.state,
+            &owner,
+            &conv,
+            "request_connector_setup",
+            &json!({"name": "google"}),
+        )
+        .await
+        .unwrap();
+        let card_id = req["card_id"]
+            .as_str()
+            .expect("a card, not already connected");
+        let card = |a: &App| {
+            a.state
+                .db
+                .with(|c| crate::db::get_message(c, card_id))
+                .unwrap()
+                .unwrap()
+                .card
+                .unwrap()
+        };
+        assert_eq!(card(&a)["type"], "connector_reconnect");
+        assert_eq!(card(&a)["connector_id"], con.id.as_str());
+
+        // Saving the same key again keeps the older grant's record.
+        let (s, _) = call(
+            &a,
+            "POST",
+            "/api/connectors/google/setup/client",
+            Some(json!({"paste": "123-example.apps.googleusercontent.com GOCSPX-test-secret"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let con = get(&a);
+        assert!(google_needs_more_access(&con));
+        assert_eq!(con.config.args, old_args);
+        // Neither that nor a restart's reconciliation closes the card.
+        crate::login::on_connector_updated(&a.state, &con.id).await;
+        assert_eq!(card(&a)["state"], "needs_reconnect");
+
+        // Signing in again asks for everything; until it lands, the record
+        // still shows the older grant.
+        let provider = fake_provider().await;
+        let base = provider.lock().unwrap().base.clone();
+        {
+            let con = con.clone();
+            a.state
+                .db
+                .with(move |c| {
+                    let mut cfg = con.config.clone();
+                    let o = cfg.oauth.as_mut().unwrap();
+                    o.authorization_endpoint = Some(format!("{base}/auth/authorize"));
+                    o.token_endpoint = Some(format!("{base}/auth/token"));
+                    o.local = true;
+                    entities::update_connector(c, &con.id, None, Some(&cfg), None)?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let (_, flow) = call(
+            &a,
+            "POST",
+            &format!("/api/connectors/{}/oauth/start", con.id),
+            Some(json!({})),
+        )
+        .await;
+        let q = crate::oauth::parse_query(flow["authorize_url"].as_str().unwrap());
+        for scope in GOOGLE_SCOPES {
+            assert!(
+                q["scope"].split_whitespace().any(|s| s == *scope),
+                "{scope}"
+            );
+        }
+        assert!(google_needs_more_access(&get(&a)));
+        assert_eq!(card(&a)["state"], "needs_reconnect");
+        {
+            let mut p = provider.lock().unwrap();
+            p.challenge = Some(q["code_challenge"].clone());
+            p.granted_scopes = Some(GOOGLE_SCOPES.join(" "));
+        }
+        let (_, html) = send(
+            &a.app,
+            "GET",
+            &format!("/api/oauth/callback?state={}&code=the-code", q["state"]),
+            "",
+            None,
+        )
+        .await;
+        assert!(html.contains("Google is connected"), "{html}");
+        let con = get(&a);
+        assert!(!google_needs_more_access(&con));
+        assert_eq!(con.config.args, google_args());
+        let (_, setup) = call(&a, "GET", "/api/connectors/google/setup", None).await;
+        assert_eq!(setup["progress"]["more_access"], false);
+        assert_eq!(card(&a)["state"], "done");
+    }
+
+    #[tokio::test]
     async fn google_and_github_setup_from_the_catalog() {
         let a = app_with_public_url("https://iris.example.ts.net").await;
         let (_, cat) = call(
@@ -2075,7 +2275,12 @@ mod tests {
             .iter()
             .map(|s| s["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, ["google", "github", "custom"]);
+        assert_eq!(
+            ids,
+            [
+                "google", "github", "notion", "todoist", "linear", "canva", "custom"
+            ]
+        );
         assert_eq!(
             cat["services"][0]["redirect_uri"],
             "https://iris.example.ts.net/api/oauth/callback"
@@ -2166,6 +2371,168 @@ mod tests {
         assert_eq!(v["connector"]["header_keys"], json!(["Authorization"]));
         assert_eq!(v["connector"]["auth_state"], "ok");
         assert!(!v.to_string().contains("github_pat_example"));
+    }
+
+    #[tokio::test]
+    async fn one_tap_services_sign_in_like_a_custom_server_and_ask_before_changes() {
+        let a = app().await;
+        let (_, cat) = call(&a, "GET", "/api/connectors/catalog", None).await;
+        let entry = |cat: &Value, id: &str| {
+            cat["services"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        for id in ["notion", "todoist", "linear", "canva"] {
+            let e = entry(&cat, id);
+            assert_eq!(e["setup"], "oauth_sign_in", "{id}");
+            assert_eq!(e["missing"], json!([]), "{id}");
+            assert_eq!(e["connected"], false, "{id}");
+            // Not on https here: the owner pastes the final address back.
+            assert_eq!(
+                e["redirect_uri"], "http://127.0.0.1:7420/api/oauth/callback",
+                "{id}"
+            );
+        }
+
+        // One tap: no fields, nothing to paste.
+        let (s, v) = call(
+            &a,
+            "POST",
+            "/api/connectors/catalog/notion",
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["needs_sign_in"], true);
+        let con = &v["connector"];
+        let id = con["id"].as_str().unwrap().to_string();
+        assert_eq!(con["name"], "notion");
+        assert_eq!(con["service"], "notion");
+        assert_eq!(con["transport"], "http");
+        assert_eq!(con["url"], "https://mcp.notion.com/mcp");
+        assert_eq!(con["auth"], "oauth");
+        assert_eq!(con["oauth"]["mode"], "discover");
+        assert_eq!(con["oauth"]["client_configured"], false);
+        assert_eq!(con["auth_state"], "needs_sign_in");
+        assert_eq!(con["description"], "Pages, notes, and databases");
+        // Reads run; every change asks first.
+        assert_eq!(con["policy"]["mode"], "careful");
+
+        // Exactly what the custom path stores for a server that follows the
+        // MCP sign-in standard, so the same discovery, registration and PKCE
+        // flow signs it in.
+        let (s, v) = call(
+            &a,
+            "POST",
+            "/api/connectors",
+            Some(json!({"name": "other", "transport": "http",
+                "url": "https://mcp.notion.com/mcp", "auth": "oauth"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let other = v["connector"]["id"].as_str().unwrap().to_string();
+        let (one_tap, custom) = {
+            let (id, other) = (id.clone(), other.clone());
+            a.state
+                .db
+                .with(move |c| {
+                    Ok((
+                        entities::get_connector(c, &id)?.unwrap(),
+                        entities::get_connector(c, &other)?.unwrap(),
+                    ))
+                })
+                .unwrap()
+        };
+        assert_eq!(one_tap.config, custom.config);
+        assert_eq!(custom.policy.mode, Mode::Standard);
+
+        // Setting it up again keeps the connection, the owner's rules and a
+        // sign-in under way.
+        let (s, _) = call(
+            &a,
+            "PUT",
+            &format!("/api/connectors/{id}/policy"),
+            Some(json!({"mode": "standard"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, v) = call(
+            &a,
+            "POST",
+            "/api/connectors/catalog/notion",
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["connector"]["id"], id.as_str());
+        assert_eq!(v["needs_sign_in"], true);
+        assert_eq!(v["connector"]["policy"]["mode"], "standard");
+        {
+            let id = id.clone();
+            a.state
+                .db
+                .with(move |c| {
+                    entities::set_connector_state(
+                        c,
+                        &id,
+                        &ConnectorState {
+                            auth_state: Some("ok"),
+                            ..Default::default()
+                        },
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let (_, v) = call(
+            &a,
+            "POST",
+            "/api/connectors/catalog/notion",
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(v["needs_sign_in"], false);
+        let (_, cat) = call(&a, "GET", "/api/connectors/catalog", None).await;
+        assert_eq!(entry(&cat, "notion")["connector_id"], id.as_str());
+        assert_eq!(entry(&cat, "notion")["connected"], true);
+
+        // A custom connection already named after the service is not taken
+        // over.
+        let (s, _) = call(
+            &a,
+            "POST",
+            "/api/connectors",
+            Some(json!({"name": "linear", "transport": "http",
+                "url": "https://linear.example.com/mcp", "auth": "oauth"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, v) = call(
+            &a,
+            "POST",
+            "/api/connectors/catalog/linear",
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(entry(&cat, "linear")["connector_id"], Value::Null);
+
+        // The agent can ask for any of them by name.
+        let tools = crate::mcp::tool_definitions();
+        let setup = tools
+            .iter()
+            .find(|t| t["name"] == "request_connector_setup")
+            .unwrap();
+        let names = &setup["inputSchema"]["properties"]["name"]["enum"];
+        for id in [
+            "google", "github", "notion", "todoist", "linear", "canva", "custom",
+        ] {
+            assert!(names.as_array().unwrap().iter().any(|n| n == id), "{names}");
+        }
     }
 
     #[tokio::test]

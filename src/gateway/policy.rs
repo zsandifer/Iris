@@ -490,6 +490,27 @@ fn classify_words(w: &[String]) -> Option<Category> {
     None
 }
 
+/// The part of a tool name that says what it does. Hosted servers often put
+/// their own name in front of every tool (`notion-search`,
+/// `notion-create-pages`); that word describes no action, but in first
+/// position it would hide the verb, so every read would ask. Only a catalog
+/// service's own name is dropped, never an owner-named custom connector's,
+/// and the result is classified exactly as if the server had named the tool
+/// without it.
+pub fn action_name<'a>(tool: &'a str, service: &str) -> &'a str {
+    if service.is_empty() || service == "custom" {
+        return tool;
+    }
+    let Some(head) = tool.get(..service.len()) else {
+        return tool;
+    };
+    let rest = &tool[service.len()..];
+    match rest.strip_prefix(['-', '_', '.']) {
+        Some(action) if head.eq_ignore_ascii_case(service) && !action.is_empty() => action,
+        _ => tool,
+    }
+}
+
 /// Classify a tool by its name and the MCP server's annotations
 /// (`readOnlyHint`, `destructiveHint`). Annotations may raise a name's risk,
 /// but never lower it. Unrecognized names ask even with a read-only hint.
@@ -1533,6 +1554,33 @@ mod tests {
         assert_eq!(words("sendEmail"), ["send", "email"]);
         assert_eq!(words("gmail.send_email"), ["gmail", "send", "email"]);
         assert_eq!(words("list-ToDos"), ["list", "to", "dos"]);
+    }
+
+    #[test]
+    fn a_catalog_service_prefix_does_not_hide_the_action() {
+        let n = |tool| c(action_name(tool, "notion"));
+        assert_eq!(action_name("notion-search", "notion"), "search");
+        assert_eq!(action_name("Notion_fetch", "notion"), "fetch");
+        assert_eq!(n("notion-search"), Category::Read);
+        assert_eq!(n("notion-fetch"), Category::Read);
+        assert_eq!(n("notion-get-users"), Category::Read);
+        assert_eq!(n("notion-create-pages"), Category::Write);
+        assert_eq!(n("notion-update-page"), Category::Write);
+        assert_eq!(n("notion-create-comment"), Category::Send);
+        assert_eq!(n("notion-delete-page"), Category::Delete);
+        // Without the service's own name the prefix stays (and asks).
+        assert_eq!(c("notion-search"), Category::Unclear);
+        assert_eq!(action_name("notion-search", "custom"), "notion-search");
+        assert_eq!(action_name("notion-search", ""), "notion-search");
+        // Only a whole leading word, never a longer word or the whole name.
+        assert_eq!(action_name("notionsearch", "notion"), "notionsearch");
+        assert_eq!(action_name("notion-", "notion"), "notion-");
+        assert_eq!(action_name("notion", "notion"), "notion");
+        assert_eq!(action_name("not", "notion"), "not");
+        assert_eq!(action_name("nötion-x", "notion"), "nötion-x");
+        // Risky words keep their risk after the prefix goes.
+        assert_eq!(n("notion-send-message"), Category::Send);
+        assert_eq!(n("notion-export-workspace"), Category::Export);
     }
 
     #[test]

@@ -81,13 +81,17 @@ own personality. It is not a clone.
   through waiting → connected ✓ / failed, retry. While it is down, Iris uses
   the next-ranked model and says so once.
 - **Setup by chat:** "help me set up Google" returns a Connect card that
-  opens a saved Google wizard: six setup screens (project, all four APIs,
+  opens a saved Google wizard: six setup screens (project, all ten APIs,
   branding/audience, Web application login key, publish, one paste box),
   then sign-in → Connected ✓. Each has progress dots, one sentence explaining
   why, big Open/Copy/Done buttons and Back. Progress lives on the server and
   appears in `system_status`; completion records a system note. Reported
   Google errors point to the step to fix. One Google sign-in lights up Gmail,
-  Calendar, Drive and YouTube read-only. Installing
+  Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts and YouTube
+  read-only; a connection from before the newer services shows “Sign in
+  again to add Docs, Sheets and more”. Notion, Todoist, Linear and
+  Canva are one Connect button, then approve on the service's page.
+  Installing
   a new engine works the same way: install → sign-in card → done. Engines
   that sign in with an API key (Gemini, OpenCode providers) get a key field
   right in the card, checked on save.

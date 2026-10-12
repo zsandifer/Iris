@@ -933,6 +933,17 @@ pub struct OAuthConfig {
     pub account: Option<String>,
 }
 
+impl OAuthConfig {
+    /// Sign-in by the MCP authorization spec: endpoints from the server's
+    /// metadata, a client registered dynamically when the service offers it.
+    pub fn discover() -> Self {
+        Self {
+            mode: "discover".into(),
+            ..Default::default()
+        }
+    }
+}
+
 /// Stored connector configuration. Values in `env` and `headers` are sealed
 /// with the vault (base64) and only opened by the gateway.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -964,7 +975,8 @@ pub struct Connector {
     /// Approval rules (see `gateway::policy::Policy`).
     #[serde(skip)]
     pub policy: crate::gateway::policy::Policy,
-    /// Catalog entry it was created from (`google`, `github`, `custom`).
+    /// Catalog entry it was created from (`google`, `github`, `notion`,
+    /// ..., `custom`).
     pub service: String,
     /// Set when a tripwire paused it.
     pub paused_reason: Option<String>,
@@ -991,6 +1003,7 @@ impl Connector {
                 "account": o.account,
                 "scopes": o.scopes,
                 "redirect_uri": o.redirect_uri,
+                "needs_more_access": crate::connectors::google_needs_more_access(self),
             })
         });
         json!({

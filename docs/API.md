@@ -1490,7 +1490,8 @@ connector was paused, off, or signed out) is recorded in the
 **Sign-in (OAuth 2.1 + PKCE).** A connector with `auth: "oauth"` signs in on
 the service's own page:
 
-- `discover` (custom remote MCP servers, GitHub): Iris follows the MCP
+- `discover` (custom remote MCP servers, GitHub, one-tap catalog services):
+  Iris follows the MCP
   authorization spec: the 401's `WWW-Authenticate` `resource_metadata`, or
   `/.well-known/oauth-protected-resource[/<path>]` (RFC 9728), then the
   authorization server's metadata (RFC 8414 path insertion, then OpenID
@@ -1503,8 +1504,16 @@ the service's own page:
   followed through redirects (loopback is allowed only when the connector
   itself is on this machine).
 - `preset` (Google): fixed endpoints and scopes, the owner's own OAuth
-  client (`access_type=offline`), requesting the existing Gmail/Calendar/Drive scope
-list plus `youtube.readonly` in one sign-in.
+  client (`access_type=offline`, `include_granted_scopes=true`), requesting
+  in one sign-in `gmail.modify`, `gmail.settings.basic` (Gmail filters),
+  `calendar`, `drive`, `documents`,
+  `spreadsheets`, `presentations`, `forms.body`, `forms.responses.readonly`,
+  `tasks`, `contacts`, and `youtube.readonly` (plus `openid`, email and
+  profile). A sign-in that does not grant every one is refused. The
+  connector's `oauth.scopes` records the last full grant; a Google
+  connection granted before a scope was added keeps working and reports
+  `oauth.needs_more_access: true` until the owner signs in again, which
+  requests every current scope.
 
 Google requires an HTTPS `public_url` and always uses its exact
 `<public_url>/api/oauth/callback`, regardless of the requesting app origin.
@@ -1612,7 +1621,7 @@ line the program printed, or null>"}`.
 ```json
 {
   "services": [{
-    "id": "google", "label": "Google", "description": "Gmail, Calendar, Drive, and YouTube read-only",
+    "id": "google", "label": "Google", "description": "Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts, and YouTube read-only",
     "setup": "google_client", "missing": [], "connector_id": null, "connected": false,
     "redirect_uri": "https://iris.example.ts.net/api/oauth/callback", "redirect_direct": true
   }],
@@ -1620,8 +1629,11 @@ line the program printed, or null>"}`.
 }
 ```
 
-`missing` lists programs the service needs on the server (Google needs
-`uvx`). `redirect_uri` is the address to register with the service;
+`setup` says how the owner connects it: `google_client` (the Google setup
+wizard), `token_or_oauth` (GitHub), `oauth_sign_in` (one tap: the service's
+own hosted MCP server, signed in with discovery and dynamic client
+registration), or `custom`. `missing` lists programs the service needs on
+the server (Google needs `uvx`). `redirect_uri` is the address to register with the service;
 `redirect_direct: false` means the owner will paste the final address back
 for other services. Google instead reports `redirect_uri: null` until an HTTPS
 `public_url` is configured.
@@ -1635,12 +1647,47 @@ Creates (or updates) the connector named after the service. Response
   project (a "Web application" OAuth client; the client ID must end in
   `.apps.googleusercontent.com`). Iris runs the open-source Google
   Workspace MCP server (`uvx workspace-mcp@2.1.0 --transport streamable-http
-  --tools gmail calendar drive`) on a loopback port in its external OAuth
-  mode and passes the owner's access token with every request. No client
-  secret ships with Iris.
+  --tools gmail calendar drive docs sheets slides forms tasks contacts`) on a
+  loopback port in its external OAuth mode and passes the owner's access
+  token with every request. The server's other services stay off: `chat`
+  (its API needs a Business or Enterprise Workspace account and a
+  configured Chat app), `search` (the Custom Search JSON API is closed to
+  new customers and needs its own key and engine), and `appscript` (running
+  arbitrary scripts in the owner's account would step around per-call
+  approval). No
+  client secret ships with Iris. Saving the same key again keeps the current
+  sign-in and its recorded scopes. When a Google sign-in completes, server
+  arguments that are exactly an older Iris default (`--tools gmail calendar
+  drive`) are replaced with today's; arguments the owner changed are kept.
 - `github`: `{"token"}` (a personal access token, sent as a bearer header to
   `https://api.githubcopilot.com/mcp/`), or `{"client_id",
   "client_secret"}` of the owner's GitHub OAuth app (then sign in).
+- One-tap services (`setup: "oauth_sign_in"`): `{}`. Iris saves an `http`
+  connector for the vendor's hosted MCP server with `auth: "oauth"` in
+  `discover` mode (exactly what `POST /api/connectors` stores for a custom
+  server with `auth: "oauth"`) and returns `needs_sign_in: true`; continue
+  with `POST /api/connectors/{id}/oauth/start`, which registers Iris with the
+  service and returns its sign-in page. A new connection starts with the
+  `careful` rules (reads run; every change, send, or deletion asks).
+  Setting one up again while it still points at the service's server
+  changes nothing (sign-in, rules, and a sign-in under way are kept) and
+  reports whether it still needs signing in.
+
+  | `service` | Server |
+  |---|---|
+  | `notion` | `https://mcp.notion.com/mcp` |
+  | `todoist` | `https://ai.todoist.net/mcp` |
+  | `linear` | `https://mcp.linear.app/mcp` |
+  | `canva` | `https://mcp.canva.com/mcp` |
+
+  Each was checked to publish OAuth metadata with a registration endpoint
+  that accepts Iris's callback addresses. Services whose hosted server only
+  accepts pre-registered apps (for example Asana's) are not in the catalog;
+  connect them as a custom connection with your own OAuth app.
+
+Tools of a catalog service are classified without the service's own name
+in front (`notion-search` reads like `search`); per-tool rules and the
+activity log keep the real name.
 
 #### Google setup wizard (owner only)
 
@@ -1649,12 +1696,12 @@ Creates (or updates) the connector named after the service. Response
 ```json
 {
   "progress": {
-    "step": 3, "total_steps": 6, "phase": "setup",
+    "step": 3, "total_steps": 6, "phase": "setup", "more_access": false,
     "summary": "Google setup: step 3 of 6", "project_id": "example-project-123456", "error": null
   },
   "pages": {
     "project": "https://console.cloud.google.com/projectcreate",
-    "apis": "https://console.cloud.google.com/flows/enableapi?apiid=gmail.googleapis.com,calendar-json.googleapis.com,drive.googleapis.com,youtube.googleapis.com&project=example-project-123456",
+    "apis": "https://console.cloud.google.com/flows/enableapi?apiid=gmail.googleapis.com,calendar-json.googleapis.com,drive.googleapis.com,youtube.googleapis.com,docs.googleapis.com,sheets.googleapis.com,slides.googleapis.com,forms.googleapis.com,tasks.googleapis.com,people.googleapis.com&project=example-project-123456",
     "branding": "https://console.cloud.google.com/auth/branding?project=example-project-123456",
     "audience": "https://console.cloud.google.com/auth/audience?project=example-project-123456",
     "client": "https://console.cloud.google.com/auth/clients/create?project=example-project-123456"
@@ -1666,6 +1713,12 @@ Creates (or updates) the connector named after the service. Response
 
 Steps 1–6 are project, APIs, branding/audience, login key, publish, paste.
 `phase` is `setup`, `sign_in` (after the key is saved), or `connected`.
+`more_access` is true when connected with a grant from before Docs,
+Sheets, Slides, Forms, Tasks and Contacts: the app asks the owner to turn
+on the new APIs (`pages.apis` turns on all ten; `pages.api_docs`,
+`api_sheets`, `api_slides`, `api_forms`, `api_tasks`, `api_people` and the
+older `api_gmail`, `api_calendar`, `api_drive`, `api_youtube` open one
+each) and sign in again.
 The Console URLs are defined together on the server. All later Console links,
 including the individual API fallbacks, are pinned with `project=<project_id>`
 when an ID is saved; otherwise they retain their unpinned URLs. `redirect_uri` is null
@@ -2715,7 +2768,7 @@ the top of a Discuss chat has `role: "system"`.
 
 | Field | Type | Notes |
 |---|---|---|
-| `type` | string | Agent cards: one of `link`, `connect` (with `service` `google`, `github`, or `custom` it opens Iris's own setup and needs no `url`), `info`, `feed_post`, `idea`, `goal`, `result` (one concrete result such as a place or product: image, details, one action). Server cards (below): `action`, `engine_signin`, `engine_setup`, `connector_reconnect`, `approval`. |
+| `type` | string | Agent cards: one of `link`, `connect` (with `service` set to a catalog id such as `google`, `github`, `notion`, or `custom` it opens Iris's own setup and needs no `url`), `info`, `feed_post`, `idea`, `goal`, `result` (one concrete result such as a place or product: image, details, one action). Server cards (below): `action`, `engine_signin`, `engine_setup`, `connector_reconnect`, `approval`. |
 | `title` | string | Required, non-blank, max 300. |
 | `body` | string | Optional, max 4,000. |
 | `url` | string | Optional; must be `http://` or `https://`, max 2,000. Required for `link` and `connect`. |
@@ -2832,7 +2885,7 @@ The API view (`public_json`); secret values are never included.
 | `name` | string | MCP server name and tool prefix. |
 | `description` | string | |
 | `transport` | string | `stdio` or `http`. |
-| `service` | string | Catalog entry: `google`, `github`, or `custom`. |
+| `service` | string | Catalog entry: `google`, `github`, a one-tap service (`notion`, `todoist`, `linear`, `canva`), or `custom`. |
 | `enabled` | bool | |
 | `command` | string or null | Program (stdio, or an http server Iris starts). |
 | `args` | string[] | |
@@ -2840,7 +2893,7 @@ The API view (`public_json`); secret values are never included.
 | `env_keys` | string[] | Names of stored env variables (values hidden). |
 | `header_keys` | string[] | Names of stored headers (values hidden). |
 | `auth` | string | `oauth` or `secrets`. |
-| `oauth` | object or null | `{"mode", "client_configured", "client_source", "connected", "connected_at", "account", "scopes", "redirect_uri"}`; `account` is the signed-in email when the service reports one. Never tokens or secrets. |
+| `oauth` | object or null | `{"mode", "client_configured", "client_source", "connected", "connected_at", "account", "scopes", "redirect_uri", "needs_more_access"}`; `account` is the signed-in email when the service reports one. `needs_more_access` is true for a signed-in Google connection whose grant predates scopes Iris now requests (it keeps working; signing in again adds them). Never tokens or secrets. |
 | `auth_state` | string | `ok`, `needs_sign_in`, or `needs_reconnect`. |
 | `policy` | object | `{"mode", "tools"?}` (see `PUT /api/connectors/{id}/policy`). |
 | `rules` | string | The mode in plain words, e.g. "Reads freely · asks before sending, buying, or deleting". |
@@ -3257,7 +3310,7 @@ Status reads cached official CLI probe results and current DB/runtime state; it
 never runs a CLI probe or operation. `signed_in: null` means not yet known.
 Status includes `iris_version` and `iris_build_id` (the same version/build values
 as `/api/health`, also supplied to shared and isolated turns), and
-`google_setup` (step, total_steps, phase, summary, authorized_domain, non-secret
+`google_setup` (step, total_steps, phase, more_access, summary, authorized_domain, non-secret
 project_id, and fixed
 error step/message only), engine names/install/sign-in/version, current engine and model,
 isolation, connector names/status/rules, saved login host names, wallet card count,
@@ -3281,7 +3334,7 @@ a new turn. Resolved cards are explicitly described as resolved in replay histor
 | `system_status` | none; owner private turn only | The allowlisted status object described above |
 | `request_engine_signin` | `engine: "claude" \| "codex" \| "gemini" \| "opencode"` | `{"outcome", "card_id"?}`; sign-in card or already signed in |
 | `request_engine_install` | `engine` (same names) | `{"outcome", "card_id"?}`; install card or already installed |
-| `request_connector_setup` | `name: "google" \| "github" \| "custom"` | `{"outcome", "card_id"?}`; connect/reconnect card or already connected; paused/disabled connectors return `connector paused by owner` / `connector disabled by owner` with a Resume action card |
+| `request_connector_setup` | `name`: a catalog id (`"google"`, `"github"`, `"notion"`, `"todoist"`, `"linear"`, `"canva"`, `"custom"`) | `{"outcome", "card_id"?}`; connect/reconnect card or already connected (a Google connection that `needs_more_access` gets an "Add more Google services" `connector_reconnect` card instead); paused/disabled connectors return `connector paused by owner` / `connector disabled by owner` with a Resume action card |
 | `list_goals` | `include_done?: bool` (default false) | `{"goals": [Goal]}` |
 | `create_goal` | `title: string` (required, max 300), `status_text?: string` (max 2,000), `suggested?: bool` (a proposal the user confirms; default false) | `{"goal": Goal}` |
 | `update_goal` | `id: string` (required), `title?` (non-blank, max 300), `status_text?` (max 2,000), `done?: bool` | `{"goal": Goal}`; error `no goal with that id` |

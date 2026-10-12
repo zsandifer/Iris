@@ -978,7 +978,7 @@ pub async fn list_tools(state: &AppState, con: &Connector) -> Result<Vec<Value>,
         .into_iter()
         .filter_map(|mut t| {
             let name = t["name"].as_str()?.to_string();
-            let cat = policy::classify(&name, &t["annotations"]);
+            let cat = policy::classify(policy::action_name(&name, &con.service), &t["annotations"]);
             match policy::decide(&con.policy, &name, cat, &[], &none, &none) {
                 Verdict::Block(_) => None,
                 Verdict::Ask(_) => {
@@ -1032,7 +1032,10 @@ pub async fn describe_tools(state: &AppState, con: &Connector) -> Result<Vec<Val
         .iter()
         .filter_map(|t| {
             let name = t["name"].as_str()?;
-            let cat = policy::classify(name, &t["annotations"]);
+            let cat = policy::classify(
+                policy::action_name(name, &con.service),
+                &t["annotations"],
+            );
             let verdict = policy::decide(&con.policy, name, cat, &[], &none, &none);
             Some(json!({
                 "name": name,
@@ -1218,7 +1221,8 @@ pub async fn call_tool(
 ) -> Value {
     if let Some(r) = refusal(state, grant, con).await {
         // Recorded too (without starting the connector to learn more).
-        let category = policy::classify_call(tool, &Value::Null, args);
+        let category =
+            policy::classify_call(policy::action_name(tool, &con.service), &Value::Null, args);
         let preview = policy::preview(&service_label(con), tool, category, args);
         record(
             state,
@@ -1253,7 +1257,9 @@ pub async fn call_tool(
     let annotations = found
         .map(|t| t["annotations"].clone())
         .unwrap_or(Value::Null);
-    let mut category = policy::classify_call(tool, &annotations, args);
+    // Classified by what it does; rules and records keep the real name.
+    let action = policy::action_name(tool, &con.service);
+    let mut category = policy::classify_call(action, &annotations, args);
     if found.is_none() {
         // Fail closed: without the tool's definition Iris cannot trust its
         // read-only hints, so the call asks.
@@ -1263,7 +1269,7 @@ pub async fn call_tool(
         );
         category = category.riskier(Category::Unclear);
     }
-    let recipients = policy::audience(tool, args);
+    let recipients = policy::audience(action, args);
     let label = service_label(con);
     let preview = policy::preview(&label, tool, category, args);
     let trusted = state.trusted_recipients().await;

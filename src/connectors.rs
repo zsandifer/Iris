@@ -1,5 +1,7 @@
 //! The small built-in catalog of services to connect: Google (Gmail,
-//! Calendar, Drive), GitHub, and a custom MCP server. Each entry says how
+//! Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts), GitHub,
+//! services with a hosted MCP server the owner just signs in to (Notion,
+//! Todoist, Linear, Canva), and a custom MCP server. Each entry says how
 //! the connector is set up; the app walks the owner through it.
 //!
 //! - Google runs the open-source Google Workspace MCP server
@@ -10,9 +12,17 @@
 //!   ships with Iris: the owner creates one in their Google Cloud project.
 //! - GitHub is GitHub's remote MCP server, reached with a personal access
 //!   token or the owner's own GitHub OAuth app.
+//! - One-tap services (`oauth_sign_in`) are the vendor's own hosted MCP
+//!   server at a fixed address. Signing in is the same MCP authorization
+//!   flow as a custom connection (discovery, dynamic client registration,
+//!   PKCE): Iris registers itself, so the owner only approves access on the
+//!   service's page. Each address was checked to publish a registration
+//!   endpoint that accepts Iris's callback; services that only allow
+//!   pre-registered apps are left to the custom path.
 
 use crate::entities::{self, ConnectorConfig, ConnectorState, OAuthConfig};
 use crate::events::Audience;
+use crate::gateway::policy::{Mode, Policy};
 use crate::state::AppState;
 use crate::util::new_id;
 use serde_json::{Value, json};
@@ -24,17 +34,44 @@ pub struct CatalogEntry {
     pub description: &'static str,
     /// Programs the server needs (checked on PATH).
     pub requires: &'static [&'static str],
-    /// How the owner signs in: `google_client`, `token_or_oauth`, `custom`.
+    /// How the owner signs in: `google_client`, `token_or_oauth`,
+    /// `oauth_sign_in`, `custom`.
     pub setup: &'static str,
+    /// `oauth_sign_in`: the service's hosted MCP server.
+    pub url: Option<&'static str>,
+    /// The approval rules a new connection starts with.
+    pub mode: Mode,
+}
+
+/// A service whose hosted MCP server the owner only signs in to. Its tools
+/// change shared work (pages, issues, tasks, designs), so every change asks
+/// first until the owner relaxes the rules.
+const fn sign_in(
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+    url: &'static str,
+) -> CatalogEntry {
+    CatalogEntry {
+        id,
+        label,
+        description,
+        requires: &[],
+        setup: "oauth_sign_in",
+        url: Some(url),
+        mode: Mode::Careful,
+    }
 }
 
 pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         id: "google",
         label: "Google",
-        description: "Gmail, Calendar, Drive, and YouTube read-only",
+        description: GOOGLE_DESCRIPTION,
         requires: &["uvx"],
         setup: "google_client",
+        url: None,
+        mode: Mode::Standard,
     },
     CatalogEntry {
         id: "github",
@@ -42,13 +79,41 @@ pub const CATALOG: &[CatalogEntry] = &[
         description: "Code, issues, and pull requests",
         requires: &[],
         setup: "token_or_oauth",
+        url: None,
+        mode: Mode::Standard,
     },
+    sign_in(
+        "notion",
+        "Notion",
+        "Pages, notes, and databases",
+        "https://mcp.notion.com/mcp",
+    ),
+    sign_in(
+        "todoist",
+        "Todoist",
+        "Tasks, projects, and due dates",
+        "https://ai.todoist.net/mcp",
+    ),
+    sign_in(
+        "linear",
+        "Linear",
+        "Issues, projects, and cycles",
+        "https://mcp.linear.app/mcp",
+    ),
+    sign_in(
+        "canva",
+        "Canva",
+        "Designs, folders, and brand templates",
+        "https://mcp.canva.com/mcp",
+    ),
     CatalogEntry {
         id: "custom",
         label: "Custom",
         description: "Any MCP server: a web address or a program on the server",
         requires: &[],
         setup: "custom",
+        url: None,
+        mode: Mode::Standard,
     },
 ];
 
@@ -56,18 +121,86 @@ pub fn catalog_entry(id: &str) -> Option<&'static CatalogEntry> {
     CATALOG.iter().find(|e| e.id == id)
 }
 
+pub const GOOGLE_DESCRIPTION: &str =
+    "Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts, and YouTube read-only";
+
 /// The Google Workspace MCP server release Iris is set up for (the owner
 /// can change it under the connection's advanced settings).
 pub const GOOGLE_MCP_PACKAGE: &str = "workspace-mcp@2.1.0";
+/// The server's services Iris turns on (`--tools`). Left out on purpose:
+/// - `chat`: Google Chat's API only works for Business or Enterprise
+///   Workspace accounts and needs a Chat app configured in the project.
+/// - `search`: the Custom Search JSON API is closed to new customers (and
+///   ends on 2027-01-01), and needs its own API key and search engine.
+/// - `appscript`: writing and running Apps Script is arbitrary code in the
+///   owner's account (it can send mail or fetch URLs itself), which would
+///   step around the gateway's per-call approval; running a script also
+///   needs it moved into the owner's Cloud project and deployed.
+pub const GOOGLE_TOOLS: &[&str] = &[
+    "gmail", "calendar", "drive", "docs", "sheets", "slides", "forms", "tasks", "contacts",
+];
+/// What Iris's server arguments used to turn on, before the full suite.
+const GOOGLE_TOOLS_BEFORE_SUITE: &[&str] = &["gmail", "calendar", "drive"];
+/// One sign-in for every service in `GOOGLE_TOOLS` (the broad scope of
+/// each, which the server accepts for its narrower checks), plus YouTube
+/// read-only for For you. Forms responses need their own read scope, and
+/// Gmail filters need `gmail.settings.basic` (not covered by `modify`).
 pub const GOOGLE_SCOPES: &[&str] = &[
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.settings.basic",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/youtube.readonly",
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/presentations",
+    "https://www.googleapis.com/auth/forms.body",
+    "https://www.googleapis.com/auth/forms.responses.readonly",
+    "https://www.googleapis.com/auth/tasks",
+    "https://www.googleapis.com/auth/contacts",
 ];
+
+/// The Google server's program arguments.
+pub fn google_args() -> Vec<String> {
+    let mut args: Vec<String> = [
+        GOOGLE_MCP_PACKAGE,
+        "--transport",
+        "streamable-http",
+        "--tools",
+    ]
+    .map(String::from)
+    .to_vec();
+    args.extend(GOOGLE_TOOLS.iter().map(|t| t.to_string()));
+    args
+}
+
+/// Arguments an older Iris saved by default (any `workspace-mcp` release,
+/// Gmail, Calendar and Drive only) become today's. Arguments the owner
+/// changed are theirs and stay.
+pub fn upgraded_google_args(args: &[String]) -> Option<Vec<String>> {
+    let (head, tools) = args.split_at_checked(4)?;
+    let old = head[0].starts_with("workspace-mcp@")
+        && head[1..] == ["--transport", "streamable-http", "--tools"]
+        && tools == GOOGLE_TOOLS_BEFORE_SUITE;
+    old.then(google_args)
+}
+
+/// A signed-in Google connection whose grant predates services Iris now
+/// uses: it keeps working, and the owner is asked to sign in again (after
+/// turning on the new APIs) to add them.
+pub fn google_needs_more_access(con: &entities::Connector) -> bool {
+    con.service == "google"
+        && con.config.oauth.as_ref().is_some_and(|o| {
+            o.mode == "preset"
+                && o.refresh_token.is_some()
+                && GOOGLE_SCOPES
+                    .iter()
+                    .any(|s| !o.scopes.iter().any(|g| g == s))
+        })
+}
 pub const GITHUB_MCP_URL: &str = "https://api.githubcopilot.com/mcp/";
 
 /// Check both newly saved settings and old settings at dispatch.
@@ -192,6 +325,14 @@ pub async fn setup(
             entry.id
         ));
     }
+    // Setting up a one-tap service again keeps its sign-in (and any sign-in
+    // under way) as long as it still points at the service's server.
+    if let (Some(url), Some(c)) = (entry.url, &existing)
+        && c.config.url.as_deref() == Some(url)
+        && c.config.oauth.is_some()
+    {
+        return Ok((c.id.clone(), c.auth_state != "ok"));
+    }
     let id = existing
         .as_ref()
         .map(|c| c.id.clone())
@@ -199,6 +340,19 @@ pub async fn setup(
     let seal_env =
         |m: BTreeMap<String, String>| crate::server::seal_connector_secrets(state, &id, "env", &m);
     let (transport, cfg, description, needs_sign_in) = match entry.id {
+        _ if entry.setup == "oauth_sign_in" => {
+            let url = entry.url.ok_or("unknown service")?;
+            (
+                "http",
+                ConnectorConfig {
+                    url: Some(url.into()),
+                    oauth: Some(OAuthConfig::discover()),
+                    ..Default::default()
+                },
+                entry.description,
+                true,
+            )
+        }
         "google" => {
             let old = existing.as_ref().and_then(|c| c.config.oauth.clone());
             let client_id = clean(&body.client_id)
@@ -264,7 +418,12 @@ pub async fn setup(
             o.mode = "preset".into();
             o.authorization_endpoint = Some("https://accounts.google.com/o/oauth2/v2/auth".into());
             o.token_endpoint = Some("https://oauth2.googleapis.com/token".into());
-            o.scopes = GOOGLE_SCOPES.iter().map(|s| s.to_string()).collect();
+            let signed_in = o.refresh_token.is_some();
+            // `scopes` records what the owner granted: a kept sign-in keeps
+            // its scopes until they sign in again.
+            if !signed_in {
+                o.scopes = GOOGLE_SCOPES.iter().map(|s| s.to_string()).collect();
+            }
             o.extra_params = BTreeMap::from([
                 ("access_type".into(), "offline".into()),
                 ("prompt".into(), "consent".into()),
@@ -273,24 +432,11 @@ pub async fn setup(
             o.client_id = Some(client_id);
             o.client_secret = Some(sealed_secret);
             o.client_source = "owner".into();
-            let signed_in = o.refresh_token.is_some();
             let args = existing
                 .as_ref()
                 .filter(|c| !c.config.args.is_empty())
                 .map(|c| c.config.args.clone())
-                .unwrap_or_else(|| {
-                    [
-                        GOOGLE_MCP_PACKAGE,
-                        "--transport",
-                        "streamable-http",
-                        "--tools",
-                        "gmail",
-                        "calendar",
-                        "drive",
-                    ]
-                    .map(String::from)
-                    .to_vec()
-                });
+                .unwrap_or_else(google_args);
             (
                 "http",
                 ConnectorConfig {
@@ -301,7 +447,7 @@ pub async fn setup(
                     headers: BTreeMap::new(),
                     oauth: Some(o),
                 },
-                "Gmail, Calendar, Drive, and YouTube read-only",
+                entry.description,
                 !signed_in,
             )
         }
@@ -321,7 +467,7 @@ pub async fn setup(
                         headers,
                         ..Default::default()
                     },
-                    "Code, issues, and pull requests",
+                    entry.description,
                     false,
                 )
             } else {
@@ -330,11 +476,10 @@ pub async fn setup(
                 let secret = clean(&body.client_secret)
                     .ok_or("paste your GitHub OAuth app's Client secret too")?;
                 let o = OAuthConfig {
-                    mode: "discover".into(),
                     client_id: Some(client_id),
                     client_secret: Some(crate::oauth::seal_client_secret(state, &id, &secret)?),
                     client_source: "owner".into(),
-                    ..Default::default()
+                    ..OAuthConfig::discover()
                 };
                 (
                     "http",
@@ -343,7 +488,7 @@ pub async fn setup(
                         oauth: Some(o),
                         ..Default::default()
                     },
-                    "Code, issues, and pull requests",
+                    entry.description,
                     true,
                 )
             }
@@ -353,6 +498,12 @@ pub async fn setup(
     check_transport_security(transport, &cfg)?;
     let (cid, svc, name) = (id.clone(), entry.id.to_string(), entry.id.to_string());
     let is_new = existing.is_none();
+    // A new connection starts with the service's rules; the owner's own
+    // choice is kept when it is set up again.
+    let policy = is_new.then(|| Policy {
+        mode: entry.mode,
+        ..Default::default()
+    });
     state
         .db
         .call(move |c| {
@@ -367,6 +518,7 @@ pub async fn setup(
                 &ConnectorState {
                     service: Some(&svc),
                     auth_state: Some(if needs_sign_in { "needs_sign_in" } else { "ok" }),
+                    policy: policy.as_ref(),
                     ..Default::default()
                 },
             )?;
@@ -405,10 +557,176 @@ mod tests {
     #[test]
     fn catalog_is_small_and_known() {
         let ids: Vec<&str> = CATALOG.iter().map(|e| e.id).collect();
-        assert_eq!(ids, ["google", "github", "custom"]);
+        assert_eq!(
+            ids,
+            [
+                "google", "github", "notion", "todoist", "linear", "canva", "custom"
+            ]
+        );
         assert!(catalog_entry("google").is_some());
         assert!(catalog_entry("spotify").is_none());
         // No client secret ships with Iris.
         assert!(GOOGLE_SCOPES.iter().all(|s| !s.contains("secret")));
+    }
+
+    #[test]
+    fn google_turns_on_the_suite_and_upgrades_only_old_default_arguments() {
+        let args = google_args();
+        assert_eq!(
+            args[..4],
+            [
+                GOOGLE_MCP_PACKAGE,
+                "--transport",
+                "streamable-http",
+                "--tools"
+            ]
+        );
+        assert_eq!(args[4..], *GOOGLE_TOOLS);
+        // Service names workspace-mcp@2.1.0 accepts for --tools.
+        let known = [
+            "gmail",
+            "drive",
+            "calendar",
+            "docs",
+            "sheets",
+            "chat",
+            "forms",
+            "slides",
+            "tasks",
+            "contacts",
+            "search",
+            "appscript",
+        ];
+        assert!(GOOGLE_TOOLS.iter().all(|t| known.contains(t)));
+        // Each service's broad scope is requested in the one sign-in.
+        for scope in [
+            "gmail.settings.basic",
+            "documents",
+            "spreadsheets",
+            "presentations",
+            "forms.body",
+            "forms.responses.readonly",
+            "tasks",
+            "contacts",
+        ] {
+            let full = format!("https://www.googleapis.com/auth/{scope}");
+            assert!(GOOGLE_SCOPES.contains(&full.as_str()), "{scope}");
+        }
+        assert!(!GOOGLE_SCOPES.iter().any(|s| s.contains("chat")));
+
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let base = ["--transport", "streamable-http", "--tools"];
+        for pkg in ["workspace-mcp@2.1.0", "workspace-mcp@1.30.1"] {
+            let old = v(&[&[pkg][..], &base, &["gmail", "calendar", "drive"]].concat());
+            assert_eq!(upgraded_google_args(&old), Some(google_args()), "{pkg}");
+        }
+        // Arguments the owner changed, or already current ones, stay.
+        for kept in [
+            v(&[&["workspace-mcp@2.1.0"][..], &base, &["gmail"]].concat()),
+            v(&[
+                &["workspace-mcp@2.1.0"][..],
+                &base,
+                &["gmail", "calendar", "drive", "chat"],
+            ]
+            .concat()),
+            v(&[
+                &["workspace-mcp@2.1.0"][..],
+                &base,
+                &["drive", "calendar", "gmail"],
+            ]
+            .concat()),
+            v(&[
+                &["workspace-mcp@2.1.0", "--single-user"][..],
+                &base[1..],
+                &["gmail", "calendar", "drive"],
+            ]
+            .concat()),
+            v(&[
+                &["other-mcp@1.0"][..],
+                &base,
+                &["gmail", "calendar", "drive"],
+            ]
+            .concat()),
+            v(&["workspace-mcp@2.1.0"]),
+            vec![],
+            google_args(),
+        ] {
+            assert_eq!(upgraded_google_args(&kept), None, "{kept:?}");
+        }
+    }
+
+    #[test]
+    fn any_missing_google_scope_asks_a_signed_in_connection_to_sign_in_again() {
+        let con = |scopes: Vec<String>, signed_in: bool, service: &str| entities::Connector {
+            id: "g".into(),
+            name: "google".into(),
+            description: String::new(),
+            transport: "http".into(),
+            config: ConnectorConfig {
+                oauth: Some(OAuthConfig {
+                    mode: "preset".into(),
+                    scopes,
+                    refresh_token: signed_in.then(|| "sealed".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            enabled: true,
+            policy: Policy::default(),
+            service: service.into(),
+            paused_reason: None,
+            paused_at: None,
+            auth_state: "ok".into(),
+            workspace_cwd: false,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let all: Vec<String> = GOOGLE_SCOPES.iter().map(|s| s.to_string()).collect();
+        assert!(!google_needs_more_access(&con(all.clone(), true, "google")));
+        // Granted everything except Gmail filters (settings.basic).
+        let without_filters: Vec<String> = all
+            .iter()
+            .filter(|s| !s.ends_with("/gmail.settings.basic"))
+            .cloned()
+            .collect();
+        assert_eq!(without_filters.len(), all.len() - 1);
+        assert!(google_needs_more_access(&con(
+            without_filters.clone(),
+            true,
+            "google"
+        )));
+        // Not signed in yet, or not Google: nothing to ask.
+        assert!(!google_needs_more_access(&con(
+            without_filters.clone(),
+            false,
+            "google"
+        )));
+        assert!(!google_needs_more_access(&con(
+            without_filters,
+            true,
+            "custom"
+        )));
+    }
+
+    #[test]
+    fn one_tap_services_are_hosted_https_servers_that_ask_before_changes() {
+        for e in CATALOG {
+            if e.setup == "oauth_sign_in" {
+                let url = e.url.expect("a one-tap service has its server's address");
+                assert!(url.starts_with("https://"), "{url}");
+                assert!(
+                    crate::oauth::check_secure_url(url).is_ok(),
+                    "{url} is a public https address"
+                );
+                assert_eq!(e.mode, Mode::Careful, "{}", e.id);
+                assert!(e.requires.is_empty());
+                // The connector is named after the service: a valid MCP
+                // server name that is not reserved.
+                assert!(e.id.bytes().all(|b| b.is_ascii_lowercase()), "{}", e.id);
+            } else {
+                assert!(e.url.is_none(), "{}", e.id);
+                assert_eq!(e.mode, Mode::Standard, "{}", e.id);
+            }
+        }
     }
 }
