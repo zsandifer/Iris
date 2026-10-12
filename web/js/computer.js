@@ -267,9 +267,10 @@ function NoSandbox({ b }) {
     how = html`<small>This server blocks the sandbox Chrome uses to keep websites away from the rest of the system (common on Ubuntu). Run this once on your server to allow it for this browser only, then tap Try again.</small>
       <${Command} text=${fix.command} />`;
   } else if (fix?.kind === 'setup') {
-    how = html`<small>This server blocks the sandbox Chrome uses to keep websites away from the rest of the system (common on Ubuntu). The browser I found isn't protected well enough to allow it safely. Run this once on your server from the Iris source folder and follow what it prints${fix.install_browser ? '' : ' (then restart Iris)'}. Then set up my own browser here and tap Try again.</small>
+    how = html`<small>This server blocks the sandbox Chrome uses to keep websites away from the rest of the system (common on Ubuntu). The browser I found isn't protected well enough to allow it safely. Run this once on your server from the Iris source folder and follow what it prints${fix.install_browser ? '' : ' (then restart Iris)'}. Then ${b.managed ? 'update' : 'set up'} my own browser here and tap Try again.</small>
+      ${fix.configured_command && html`<small>Your server's config picks this browser (<span class="mono">command</span> under <span class="mono">[browser]</span>). Clear it and restart Iris so I use my own.</small>`}
       <${Command} text=${fix.command} />
-      ${fix.install_browser && b.requires !== 'nodejs' && html`<button class="b2" disabled=${installing} onClick=${install}>${installing ? 'Setting up the browser…' : 'Set up the browser'}</button>`}
+      ${fix.install_browser && b.requires !== 'nodejs' && html`<button class="b2" disabled=${installing} onClick=${install}>${installing ? 'Setting up the browser…' : b.managed ? 'Update the browser' : 'Set up the browser'}</button>`}
       ${b.install?.state === 'failed' && html`<small class="err-line">That didn't work: ${b.install.error}</small>`}`;
   }
   return html`<div class="screen">

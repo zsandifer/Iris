@@ -526,8 +526,14 @@ out each tool call the CLI makes, nothing more.
      `iris` admin user, so the user running Iris cannot put another program
      at that path.
   2. Add the printed `[engines]` settings, restart Iris, and tap "Set up the
-     browser" in Iris's computer (or Settings, AI engine). Iris now uses that
-     copy unless `browser.command` points elsewhere.
+     browser" in Iris's computer. Iris now uses that copy unless
+     `browser.command` is set (it always wins; clear it to use Iris's copy).
+     A browser Iris installed before this layout moves to the fixed path on
+     its next update (Iris's computer offers **Update the browser**).
+
+  The script refuses to run when the account running Iris, or the CLI agent
+  account, is the `iris` engine admin itself: that account owns the
+  approved browser.
 
   If the sandbox still cannot start, Iris's computer explains and shows the
   exact command for this machine, with **Copy**, **Try again**, and **Run

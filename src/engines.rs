@@ -621,12 +621,16 @@ fn adopt_browser_build(root: &Path, browsers: &Path, bin: &Path) -> Result<PathB
     let had_old = match std::fs::rename(&app, &old) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(e.into());
+        }
     };
     if let Err(e) = std::fs::rename(&staged, &app) {
         if had_old {
             let _ = std::fs::rename(&old, &app);
         }
+        let _ = std::fs::remove_dir_all(&staged);
         return Err(e.into());
     }
     if had_old {
@@ -644,10 +648,21 @@ fn install_browser(root: &Path) -> Result<Report> {
     let npm = crate::harness::resolve_command("npm").ok_or(
         "Node.js (npm) is needed to install the browser; install Node.js on the server first",
     )?;
+    install_browser_with(root, &npm, &|| {
+        crate::harness::resolve_command("node")
+            .ok_or_else(|| "Node.js was not found next to npm".into())
+    })
+}
+
+fn install_browser_with(
+    root: &Path,
+    npm: &Path,
+    node: &dyn Fn() -> Result<PathBuf>,
+) -> Result<Report> {
     let prefix = install_dir(root, "browser");
     std::fs::create_dir_all(&prefix)?;
     let before = installed_version(root, "browser");
-    let mut cmd = std::process::Command::new(&npm);
+    let mut cmd = std::process::Command::new(npm);
     cmd.args([
         "install",
         "--prefix",
@@ -691,8 +706,7 @@ fn install_browser(root: &Path) -> Result<Report> {
             path: Some(launcher(root, "browser").to_string_lossy().into_owned()),
         });
     }
-    let node =
-        crate::harness::resolve_command("node").ok_or("Node.js was not found next to npm")?;
+    let node = node()?;
     let browsers = prefix.join("browsers");
     let mut cmd = std::process::Command::new(&node);
     cmd.arg(&cli)
@@ -951,6 +965,109 @@ mod tests {
         // Outside the download directory: refused.
         assert!(adopt_browser_build(root, &browsers, Path::new("/bin/sh")).is_err());
         assert!(app_executable(&root.join("missing")).is_none());
+    }
+
+    #[test]
+    fn browser_install_update_and_failed_download() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("engines");
+        let tools = tmp.path().join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let script = |name: &str, body: &str| {
+            let p = tools.join(name);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        // npm: "installs" playwright-core pinning the revision in rev.
+        let npm = script(
+            "npm",
+            r#"#!/bin/sh
+d="$3/node_modules/playwright-core"
+mkdir -p "$d"
+echo '// cli' > "$d/cli.js"
+printf '{"browsers": [{"name": "chromium", "revision": "%s"}]}\n' "$(cat "$(dirname "$0")/rev")" > "$d/browsers.json"
+"#,
+        );
+        // node cli.js install chromium: downloads that revision (or fails
+        // halfway when fail exists), counting its runs.
+        let node = script(
+            "node",
+            r#"#!/bin/sh
+t="$(dirname "$0")"
+echo run >> "$t/downloads"
+r="$(cat "$t/rev")"
+d="$PLAYWRIGHT_BROWSERS_PATH/chromium-$r/chrome-linux64"
+mkdir -p "$d"
+[ -f "$t/fail" ] && { echo 'Error: download failed' >&2; exit 1; }
+echo "chrome $r" > "$d/chrome"
+chmod 755 "$d/chrome"
+touch "$PLAYWRIGHT_BROWSERS_PATH/chromium-$r/INSTALLATION_COMPLETE"
+"#,
+        );
+        let downloads = || {
+            std::fs::read_to_string(tools.join("downloads"))
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        let install = || install_browser_with(&root, &npm, &|| Ok(node.clone()));
+        let fixed = browser_binary(&root);
+        let launcher_target = || std::fs::canonicalize(launcher(&root, "browser")).unwrap();
+
+        std::fs::write(tools.join("rev"), "1200").unwrap();
+        let r = install().unwrap();
+        assert!(r.changed);
+        assert_eq!(r.version.as_deref(), Some("build 1200"));
+        assert_eq!(launcher_target(), fixed.canonicalize().unwrap());
+        assert_eq!(std::fs::read_to_string(&fixed).unwrap(), "chrome 1200\n");
+        assert_eq!(
+            installed_version(&root, "browser").as_deref(),
+            Some("build 1200")
+        );
+        assert!(
+            !root.join("chromium/browsers").exists(),
+            "download dir removed"
+        );
+        assert_eq!(downloads(), 1);
+
+        // Same pinned build: nothing is downloaded.
+        let r = install().unwrap();
+        assert!(!r.changed);
+        assert_eq!(downloads(), 1);
+        assert_eq!(launcher_target(), fixed.canonicalize().unwrap());
+
+        // A failed download keeps the working browser and its version.
+        std::fs::write(tools.join("rev"), "1300").unwrap();
+        std::fs::write(tools.join("fail"), "").unwrap();
+        assert!(install().is_err());
+        assert_eq!(std::fs::read_to_string(&fixed).unwrap(), "chrome 1200\n");
+        assert_eq!(
+            installed_version(&root, "browser").as_deref(),
+            Some("build 1200")
+        );
+        assert_eq!(launcher_target(), fixed.canonicalize().unwrap());
+
+        // A new build replaces it at the same path.
+        std::fs::remove_file(tools.join("fail")).unwrap();
+        let r = install().unwrap();
+        assert!(r.changed);
+        assert_eq!(r.version.as_deref(), Some("build 1300"));
+        assert_eq!(std::fs::read_to_string(&fixed).unwrap(), "chrome 1300\n");
+        assert!(!root.join("chromium/browsers").exists());
+
+        // An install from before the fixed path (launcher into Playwright's
+        // download directory) moves over without downloading again.
+        std::fs::remove_dir_all(browser_app_dir(&root)).unwrap();
+        let old = root.join("chromium/browsers/chromium-1300/chrome-linux64");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("chrome"), "chrome 1300\n").unwrap();
+        set_launcher_symlink(&root, "browser", &old.join("chrome")).unwrap();
+        let before = downloads();
+        install().unwrap();
+        assert_eq!(launcher_target(), fixed.canonicalize().unwrap());
+        assert_eq!(std::fs::read_to_string(&fixed).unwrap(), "chrome 1300\n");
+        assert_eq!(downloads(), before + 1, "Playwright only checks its cache");
     }
 
     #[test]

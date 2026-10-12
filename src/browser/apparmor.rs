@@ -94,22 +94,40 @@ pub fn profile_command(binary: &Path) -> Option<String> {
 /// and are not writable by group or others (symlinks inside the directory
 /// only need a trusted owner; their targets are not followed).
 pub fn protected(binary: &Path, trusted: &[u32]) -> bool {
+    protected_with(binary, trusted, &real_meta)
+}
+
+/// Owner and mode of a path itself (never following a symlink).
+type Meta<'a> = &'a dyn Fn(&Path) -> Option<(u32, u32)>;
+
+fn real_meta(p: &Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(p)
+        .ok()
+        .map(|m| (m.uid(), m.mode()))
+}
+
+fn protected_with(binary: &Path, trusted: &[u32], meta: Meta) -> bool {
     binary.is_absolute()
         && binary.canonicalize().ok().as_deref() == Some(binary)
-        && chain_safe(binary, trusted)
+        && chain_safe(binary, trusted, meta)
         && binary.parent().is_some_and(|d| tree_safe(d, trusted))
 }
 
 fn safe_meta(m: &std::fs::Metadata, trusted: &[u32]) -> bool {
     use std::os::unix::fs::MetadataExt;
-    trusted.contains(&m.uid()) && m.mode() & 0o022 == 0
+    safe_mode(m.uid(), m.mode(), trusted)
+}
+
+fn safe_mode(uid: u32, mode: u32, trusted: &[u32]) -> bool {
+    trusted.contains(&uid) && mode & 0o022 == 0
 }
 
 /// The path and every ancestor (no sticky-directory exception: a
 /// world-writable ancestor could swap the whole tree).
-fn chain_safe(path: &Path, trusted: &[u32]) -> bool {
+fn chain_safe(path: &Path, trusted: &[u32], meta: Meta) -> bool {
     path.ancestors()
-        .all(|p| std::fs::symlink_metadata(p).is_ok_and(|m| safe_meta(&m, trusted)))
+        .all(|p| meta(p).is_some_and(|(uid, mode)| safe_mode(uid, mode, trusted)))
 }
 
 /// Everything in the browser's directory (the libraries and resources it
@@ -166,7 +184,7 @@ fn tree_safe(dir: &Path, trusted: &[u32]) -> bool {
 pub fn sandbox_fix(
     restricted: bool,
     binary: Option<&Path>,
-    trusted: &[u32],
+    is_protected: &dyn Fn(&Path) -> bool,
     setup_command: &str,
 ) -> Value {
     if !restricted {
@@ -175,7 +193,7 @@ pub fn sandbox_fix(
     let real = binary.and_then(|b| b.canonicalize().ok());
     let path = real.as_ref().map(|p| p.to_string_lossy().into_owned());
     if let Some(real) = &real
-        && protected(real, trusted)
+        && is_protected(real)
         && let Some(command) = profile_command(real)
     {
         return json!({"kind": "apparmor", "path": path, "command": command});
@@ -214,7 +232,7 @@ pub fn setup_command(user: &str, iris_bin: Option<&Path>, engines_dir: Option<&P
 /// requires before it lets sudo run it).
 pub fn root_owned_iris() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
-    chain_safe(&exe, &[0]).then_some(exe)
+    chain_safe(&exe, &[0], &real_meta).then_some(exe)
 }
 
 /// The account Iris runs as.
@@ -392,29 +410,74 @@ mod tests {
         assert!(tree_safe(app, &me));
     }
 
+    /// Ancestors outside `base` look like root-owned 0755 directories;
+    /// inside, the real metadata counts (so tests do not depend on where
+    /// the temp directory lives).
+    fn meta_below(base: &Path) -> impl Fn(&Path) -> Option<(u32, u32)> + '_ {
+        move |p: &Path| {
+            if p.starts_with(base) {
+                real_meta(p)
+            } else {
+                Some((0, 0o40755))
+            }
+        }
+    }
+
     #[test]
-    fn writable_or_symlinked_paths_are_refused() {
+    fn protection_needs_every_ancestor_safe() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().canonicalize().unwrap().join("base");
         std::fs::create_dir(&base).unwrap();
         let bin = tree(&base);
-        // Every ancestor's owner trusted, so only modes decide below.
-        let mut trusted: Vec<u32> = bin
-            .ancestors()
-            .map(|p| std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(p).unwrap()))
-            .collect();
-        trusted.push(uid());
-        for mode in [0o777, 0o1777, 0o775] {
+        let trusted = [0, uid()];
+        let meta = meta_below(&base);
+        // Baseline: everything owned by trusted accounts, nothing shared.
+        assert!(chain_safe(&bin, &trusted, &meta));
+        assert!(protected_with(&bin, &trusted, &meta));
+        // The current user is not trusted (single-user mode).
+        assert!(!protected_with(&bin, &[0], &meta));
+        // A writable ancestor could swap the whole tree; sticky is not
+        // enough.
+        for mode in [0o777, 0o1777, 0o775, 0o757] {
             std::fs::set_permissions(&base, std::fs::Permissions::from_mode(mode)).unwrap();
-            assert!(!chain_safe(&bin, &trusted), "{mode:o}");
-            assert!(!protected(&bin, &trusted), "{mode:o}");
+            assert!(!chain_safe(&bin, &trusted, &meta), "{mode:o}");
+            assert!(!protected_with(&bin, &trusted, &meta), "{mode:o}");
         }
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(protected_with(&bin, &trusted, &meta));
+        // An ancestor above that is not root's.
+        let foreign = |p: &Path| {
+            if p == Path::new("/") {
+                Some((u32::MAX, 0o40755))
+            } else {
+                meta(p)
+            }
+        };
+        assert!(!protected_with(&bin, &trusted, &foreign));
+        // A world-writable ancestor above.
+        let shared = |p: &Path| {
+            if p == Path::new("/") {
+                Some((0, 0o41777))
+            } else {
+                meta(p)
+            }
+        };
+        assert!(!protected_with(&bin, &trusted, &shared));
+        // The binary itself writable.
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(!protected_with(&bin, &trusted, &meta));
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         // Through a symlink: the profile would name the wrong path.
         let link = tmp.path().canonicalize().unwrap().join("link");
         std::os::unix::fs::symlink(&base, &link).unwrap();
-        assert!(!protected(&link.join("app/chrome"), &trusted));
-        assert!(!protected(Path::new("relative/chrome"), &trusted));
+        let meta = meta_below(tmp.path());
+        assert!(!protected_with(&link.join("app/chrome"), &trusted, &meta));
+        assert!(!protected_with(
+            Path::new("relative/chrome"),
+            &trusted,
+            &meta
+        ));
+        assert!(!protected_with(&base.join("app/missing"), &trusted, &meta));
     }
 
     #[test]
@@ -433,27 +496,42 @@ mod tests {
 
     #[test]
     fn fix_suggests_a_profile_only_for_a_protected_browser() {
-        assert_eq!(sandbox_fix(false, None, &[0], "setup"), Value::Null);
-        let none = sandbox_fix(true, None, &[0], "sudo sh deploy/setup-engines.sh x");
+        let yes = |_: &Path| true;
+        let no = |_: &Path| false;
+        assert_eq!(sandbox_fix(false, None, &yes, "setup"), Value::Null);
+        let none = sandbox_fix(true, None, &yes, "sudo sh deploy/setup-engines.sh x");
         assert_eq!(none["kind"], "setup");
+        assert_eq!(none["path"], Value::Null);
         assert_eq!(none["command"], "sudo sh deploy/setup-engines.sh x");
-        // A browser the current user (or anyone but root) could replace
-        // never gets a profile, only the setup route.
         let tmp = tempfile::tempdir().unwrap();
-        let bin = tree(&tmp.path().canonicalize().unwrap());
-        let fix = sandbox_fix(true, Some(&bin), &[0], "setup");
+        let base = tmp.path().canonicalize().unwrap();
+        let bin = tree(&base);
+        // Not protected: only the setup route.
+        let fix = sandbox_fix(true, Some(&bin), &no, "setup");
         assert_eq!(fix["kind"], "setup");
+        assert_eq!(fix["command"], "setup");
         assert_eq!(fix["path"], bin.to_string_lossy().as_ref());
-        // A root-owned one gets a profile for its real path.
-        if let Some(sh) = ["/usr/bin/sh", "/bin/sh"]
-            .iter()
-            .filter_map(|p| Path::new(p).canonicalize().ok())
-            .find(|p| protected(p, &[0]))
-        {
-            let fix = sandbox_fix(true, Some(&sh), &[0], "setup");
-            assert_eq!(fix["kind"], "apparmor");
-            let cmd = fix["command"].as_str().unwrap();
-            assert!(cmd.contains(&format!("\"{}\"", sh.display())), "{cmd}");
-        }
+        // Protected: a profile for its real path, also when reached
+        // through a symlink (AppArmor attaches to the real path).
+        let link = base.join("chrome-link");
+        std::os::unix::fs::symlink(&bin, &link).unwrap();
+        let checked = std::cell::RefCell::new(Vec::new());
+        let record = |p: &Path| {
+            checked.borrow_mut().push(p.to_path_buf());
+            true
+        };
+        let fix = sandbox_fix(true, Some(&link), &record, "setup");
+        assert_eq!(fix["kind"], "apparmor");
+        assert_eq!(checked.borrow().as_slice(), std::slice::from_ref(&bin));
+        assert_eq!(fix["path"], bin.to_string_lossy().as_ref());
+        let cmd = fix["command"].as_str().unwrap();
+        assert_eq!(cmd, profile_command(&bin).unwrap());
+        assert!(cmd.contains(&format!("\"{}\"", bin.display())), "{cmd}");
+        // Protected but not expressible in a profile: setup route.
+        let odd = base.join("a{b}");
+        std::fs::create_dir(&odd).unwrap();
+        std::fs::write(odd.join("chrome"), "").unwrap();
+        let fix = sandbox_fix(true, Some(&odd.join("chrome")), &yes, "setup");
+        assert_eq!(fix["kind"], "setup");
     }
 }

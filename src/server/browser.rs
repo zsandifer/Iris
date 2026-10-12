@@ -36,15 +36,7 @@ pub fn status_json(state: &AppState) -> Value {
     };
     v["install"] = json!(state.engine_ops.get("browser"));
     v["sandbox_fix"] = if v["sandbox_unavailable"] == true {
-        let mut fix = sandbox_fix(state, &root);
-        if fix["kind"] == "setup" {
-            // With the privilege split in place, installing Iris's own
-            // browser (into the protected engines directory) is the step
-            // the app can offer.
-            fix["install_browser"] =
-                (!state.cfg.engines.helper.is_empty() && v["managed"] == false).into();
-        }
-        fix
+        sandbox_fix(state, &root)
     } else {
         Value::Null
     };
@@ -56,6 +48,7 @@ pub fn status_json(state: &AppState) -> Value {
 /// with the privilege split the engines admin user.
 fn sandbox_fix(state: &AppState, root: &std::path::Path) -> Value {
     use crate::browser::apparmor;
+    use crate::engines;
     use std::os::unix::fs::MetadataExt;
     // SAFETY: geteuid has no preconditions and cannot fail.
     let me = unsafe { libc::geteuid() };
@@ -67,6 +60,19 @@ fn sandbox_fix(state: &AppState, root: &std::path::Path) -> Value {
     {
         trusted.push(m.uid());
     }
+    // Iris's own browser from before the fixed path: its directory changes
+    // with every update, so it is moved (updated), never approved in place.
+    let app = engines::browser_app_dir(root).canonicalize().ok();
+    let downloads = engines::install_dir(root, "browser").canonicalize().ok();
+    let old_layout = |p: &std::path::Path| {
+        downloads.as_ref().is_some_and(|d| p.starts_with(d))
+            && !app.as_ref().is_some_and(|a| p.starts_with(a))
+    };
+    let managed = engines::is_installed(root, "browser");
+    let managed_moved = engines::launcher(root, "browser")
+        .canonicalize()
+        .ok()
+        .is_some_and(|p| !old_layout(&p));
     let setup = apparmor::setup_command(
         &apparmor::current_user()
             .or_else(|| std::env::var("USER").ok())
@@ -74,12 +80,21 @@ fn sandbox_fix(state: &AppState, root: &std::path::Path) -> Value {
         apparmor::root_owned_iris().as_deref(),
         split.then_some(root),
     );
-    apparmor::sandbox_fix(
+    let mut fix = apparmor::sandbox_fix(
         apparmor::userns_restricted(),
         state.browser.executable().as_deref(),
-        &trusted,
+        &|p| !old_layout(p) && apparmor::protected(p, &trusted),
         &setup,
-    )
+    );
+    if fix["kind"] == "setup" {
+        // `browser.command` always wins, so it has to go first.
+        fix["configured_command"] = (!state.cfg.browser.command.trim().is_empty()).into();
+        // With the privilege split in place, installing (or moving) Iris's
+        // own browser into the protected engines directory is the step the
+        // app can offer.
+        fix["install_browser"] = (split && (!managed || !managed_moved)).into();
+    }
+    fix
 }
 
 /// Send the full status (with install state) to the owner's apps.

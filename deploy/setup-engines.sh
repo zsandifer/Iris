@@ -34,6 +34,22 @@ IRIS_BIN="${2:-/usr/local/bin/iris}"
 ENGINES_DIR="${3:-/opt/iris/engines}"
 ADMIN_USER="iris"
 
+# The admin user owns the engines (and so Iris's browser, which may get
+# user namespaces below). The account running Iris, and the CLI agent
+# account, must be different accounts, or they could replace them.
+same_account() { # name, name
+    [ "$1" = "$2" ] && return 0
+    a="$(id -u "$1" 2>/dev/null)" || return 1
+    b="$(id -u "$2" 2>/dev/null)" || return 1
+    [ "$a" = "$b" ]
+}
+for account in "$AGENT_USER" "${4:-}"; do
+    if [ -n "$account" ] && same_account "$account" "$ADMIN_USER"; then
+        echo "$account is the engine admin account ($ADMIN_USER); run Iris and its agent as other accounts." >&2
+        exit 1
+    fi
+done
+
 if [ "$(id -u)" -ne 0 ]; then
     echo "Run this as root (for example with sudo)." >&2
     exit 1
