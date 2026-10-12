@@ -74,7 +74,7 @@ own personality. It is not a clone.
 - **Voice replies:** off by default, toggled in Settings. Replies arrive as
   voice notes plus text.
 - **Push notifications:** every message from Iris, unless that chat is open.
-  Quiet hours are available.
+  Quiet hours hold notifications and send one summary when they end.
 - **Reconnect cards:** when an engine's sign-in expires or a connector drops,
   Iris posts a "Reconnect Claude/Google" card and sends a push. The card runs
   the official sign-in flow (link or device code, paste code) and moves
@@ -99,14 +99,27 @@ own personality. It is not a clone.
 - **Feed:** posts with the source's name and favicon, a swipeable stack of
   the page's **original photos** (never generated), a short summary, a "why
   you'd like this" line, and ♡ · 💬 Talk about it · Visit ›.
-- Steered by likes and conversations (no prompt box).
+- Steered by likes and conversations (no prompt box). Settings → For you
+  lists the sources (yours, ones Iris suggested, your YouTube
+  subscriptions) with on/off and remove, an "Add a source" box that takes a
+  link, `r/name`, `@handle`, or `#tag`, today's topics, and a Daily posts
+  switch.
 - Size adapts: about 10 posts a day, growing to about 30 if the user keeps
-  reaching the end, shrinking if rarely opened, and auto-pausing after 2
-  weeks unused (Iris mentions it once).
-- Push only for big, personal items (price drops, events).
-- Pipeline is deterministic code: RSS/APIs (YouTube via Google, Reddit,
-  Bluesky, Mastodon, creator RSS) → OpenGraph extraction → one batched
-  cheap-model summary call per day → rule-based ranking.
+  reaching the end of the day's posts, shrinking if the feed is rarely
+  opened, and auto-pausing after 2 weeks unused. Iris says so once in the
+  Main chat with a one-tap Resume card; the feed shows a paused card with
+  Resume too.
+- While a batch is being made the feed shows "Finding today's posts…";
+  an empty feed explains when posts arrive (with "Find something now" for
+  the owner). The end of the feed says "You're all caught up."
+- Push only for big, personal items (a price drop on something you saved,
+  an event soon near you), at most two a day.
+- Pipeline is deterministic code: RSS/APIs (YouTube channels and, with
+  Google connected, subscriptions; Reddit, Hacker News, Bluesky, Mastodon,
+  creator RSS) → OpenGraph/JSON-LD extraction → rule-based ranking → one
+  batched cheap-model summary call per day (plus one call a day that turns
+  the user's notes, likes, and chats into topics and sources). Photos are
+  the pages' originals, cached on the server.
 
 ## Ideas, Goals, Library
 

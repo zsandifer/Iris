@@ -298,6 +298,7 @@ pub async fn verify(
             Err(_) => return AuthState::Unknown,
         },
         scope: "keycheck".into(),
+        tools: true,
         key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
         // A one-word check needs none of the CLI's own tools or memory.
         isolated: true,

@@ -45,6 +45,22 @@ impl Gemini {
     }
 }
 
+/// Gemini CLI's built-in tools (excluded for tool-less helper calls).
+const GEMINI_BUILTIN_TOOLS: &[&str] = &[
+    "run_shell_command",
+    "write_file",
+    "replace",
+    "read_file",
+    "read_many_files",
+    "list_directory",
+    "glob",
+    "search_file_content",
+    "web_fetch",
+    "google_web_search",
+    "save_memory",
+    "write_todos",
+];
+
 /// Appended to the Iris prompt because GEMINI_SYSTEM_MD replaces the CLI's
 /// own prompt. The `${...}` names are substituted by the CLI.
 const TOOLS_SUFFIX: &str = "
@@ -178,6 +194,7 @@ impl Harness for Gemini {
             // Restricted mode disables project memory and MCP connections in Gemini 0.63.
             mcp: false,
             resume: true,
+            tool_less: false,
         }
     }
 
@@ -249,12 +266,25 @@ impl Harness for Gemini {
             // otherwise win over the environment).
             body["security"] = json!({"auth": {"selectedType": "gemini-api-key"}});
         }
-        let body = serde_json::to_vec_pretty(&body)?;
-        write_private_file(&settings, &body)?;
+        if !spec.tools {
+            // Best effort only: user-level MCP servers and discovered tools
+            // can survive workspace settings, so the capability says
+            // `tool_less: false` and helper calls skip Gemini. These
+            // settings still narrow anything built this way.
+            body["tools"] = json!({"exclude": GEMINI_BUILTIN_TOOLS});
+            body["excludeTools"] = json!(GEMINI_BUILTIN_TOOLS);
+            body["mcp"] = json!({"allowed": []});
+            body["allowMCPServers"] = json!([]);
+        }
+        write_private_file(&settings, &serde_json::to_vec_pretty(&body)?)?;
         inv.temp_files.push(settings);
 
         let prompt_file = spec.run_dir.join(format!("{}.system.md", spec.turn_id));
-        let system = format!("{}\n{TOOLS_SUFFIX}", spec.system_prompt);
+        let system = if spec.tools {
+            format!("{}\n{TOOLS_SUFFIX}", spec.system_prompt)
+        } else {
+            spec.system_prompt.clone()
+        };
         write_private_file(&prompt_file, system.as_bytes())?;
         inv.temp_files.push(prompt_file.clone());
         inv.env.push((
@@ -281,7 +311,9 @@ impl Harness for Gemini {
             a.push("--resume".into());
             a.push(id.clone());
         }
-        if !self.cfg.permission_mode.is_empty() {
+        if !spec.tools {
+            a.extend(["--approval-mode", "default"].map(String::from));
+        } else if !self.cfg.permission_mode.is_empty() {
             a.push("--approval-mode".into());
             a.push(self.cfg.permission_mode.clone());
         }
@@ -750,6 +782,7 @@ mod tests {
             writable_dirs: vec!["/data/memory".into()],
             run_dir: tmp.path().into(),
             scope: "conv/../1".into(),
+            tools: true,
             key_env: vec!["GEMINI_API_KEY".into()],
             isolated: false,
             own_mcp_servers: Vec::new(),

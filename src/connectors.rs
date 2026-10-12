@@ -66,6 +66,7 @@ pub const GOOGLE_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/youtube.readonly",
 ];
 pub const GITHUB_MCP_URL: &str = "https://api.githubcopilot.com/mcp/";
 

@@ -114,6 +114,9 @@ impl Harness for OpenCode {
             effort: true,
             mcp: true,
             resume: true,
+            // Agent-level permissions in the user's own config can override
+            // the deny-all rules Iris passes, so helper calls skip OpenCode.
+            tool_less: false,
         }
     }
 
@@ -157,6 +160,11 @@ impl Harness for OpenCode {
         let providers = provider_keys(&spec.key_env);
         if !providers.is_null() {
             config["provider"] = providers;
+        }
+        if !spec.tools {
+            // Every tool (built-in and MCP) off, and anything left denied.
+            config["tools"] = json!({"*": false});
+            config["permission"] = json!({"edit": "deny", "bash": "deny", "webfetch": "deny"});
         }
         // A private file rather than OPENCODE_CONFIG_CONTENT: connector
         // headers must not sit in the process environment.
@@ -773,6 +781,7 @@ anthropic/claude-haiku-4-5
             writable_dirs: vec!["/data/memory".into()],
             run_dir: tmp.path().into(),
             scope: "c1".into(),
+            tools: true,
             key_env: vec!["OPENROUTER_API_KEY".into()],
             isolated: false,
             own_mcp_servers: vec!["mine".into()],

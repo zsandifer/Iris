@@ -569,6 +569,7 @@ async fn run_locked(
             writable_dirs: Vec::new(),
             run_dir,
             scope: conv_id.to_string(),
+            tools: true,
             key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
             isolated: scope != Scope::Private,
             own_mcp_servers: Vec::new(),
@@ -875,75 +876,298 @@ async fn refine_with_model(
     if *cancel.borrow() {
         return None;
     }
-    let (res, pin) = state.resolve_slot(Slot::Classifier, shared).await;
-    let model_id = res.effective?;
-    let catalog = state.catalog();
-    let m = catalog.get(&model_id)?;
-    let entry = state.harness(&m.harness)?;
-    let program = entry.program()?;
-    // The classifier always runs isolated (it needs nothing of the CLI's).
-    if state.cfg.agent.user.is_empty() {
-        entry.harness.can_isolate().ok()?;
-    }
-    let effort = pin
-        .and_then(|p| p.effort)
-        .or_else(|| crate::ranking::default_effort(m));
-    let keys = crate::keys::env_for(state, &m.harness).await;
-    let spec = TurnSpec {
-        turn_id: new_id(),
-        prompt: classifier::model_prompt(text),
-        images: Vec::new(),
-        system_prompt: "You classify requests. Answer with one word.".into(),
-        model: m.model.clone(),
-        effort,
-        resume: None,
-        mcp_servers: Vec::new(),
-        cwd: crate::agent::workdir(&state.cfg.agent, &state.paths, "classifier").ok()?,
-        writable_dirs: Vec::new(),
-        run_dir: crate::agent::turn_dir(&state.cfg.agent, &state.paths, &new_id()).ok()?,
-        scope: "classifier".into(),
-        key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
-        // A one-word answer needs none of the CLI's own tools or memory.
-        isolated: true,
-        own_mcp_servers: own_mcp_servers(state, entry, &program).await?,
-        protected_paths: state.protected_paths().ok()?,
-        split: !state.cfg.agent.user.is_empty(),
-    };
-    let _turn_files = crate::agent::TurnFiles::new(&state.cfg.agent, "classifier", &spec.run_dir);
-    let mut invocation = build_invocation(state, &m.harness, &spec).await.ok()?;
-    invocation.env.extend(keys);
-    crate::agent::expose_files(&state.cfg.agent, &invocation).ok()?;
-    crate::agent::wrap(&state.cfg.agent, &m.harness, "classifier", &mut invocation).ok()?;
-    let strip = state.strip_env(entry);
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let run = runner::run(
-        RunRequest {
-            program: &program,
-            invocation: &invocation,
-            cwd: &spec.cwd,
-            env_remove: &strip,
+    let reply = one_shot_with_cancel(
+        state,
+        OneShotRequest {
+            slot: Slot::Classifier,
+            shared,
+            system_prompt: "You classify requests. Answer with one word.",
+            prompt: &classifier::model_prompt(text),
             timeout: Duration::from_secs(30),
+            scope: "classifier",
+            max_attempts: 1,
+            // Runs inside a chat turn that already holds a CLI slot.
+            take_slot: false,
         },
-        entry.harness.parser(&[]),
         cancel,
-        tx,
     )
-    .await;
+    .await
+    .ok()?;
+    classifier::parse_model_reply(&reply.text)
+}
 
-    if spec.split {
-        let _ = std::fs::remove_dir_all(&spec.run_dir);
-    }
-    for f in &invocation.temp_files {
-        let _ = std::fs::remove_file(f);
-    }
-    run.ok()?;
-    let mut reply = String::new();
-    while let Ok(ev) = rx.try_recv() {
-        if let HarnessEvent::TextDelta { text } = ev {
-            reply.push_str(&text);
+/// A single tool-less, session-less model call (no persona, no MCP).
+pub struct OneShotRequest<'a> {
+    pub slot: Slot,
+    /// For a conversation with more than one person (the individual-use
+    /// policy then applies to the engine choice).
+    pub shared: bool,
+    pub system_prompt: &'a str,
+    pub prompt: &'a str,
+    pub timeout: Duration,
+    /// Names the run's private temp files.
+    pub scope: &'a str,
+    /// Engines to try: the slot's model first, then the next-ranked model
+    /// on a different CLI when one is signed out or fails.
+    pub max_attempts: usize,
+    /// Wait for a free CLI slot (`max_concurrent_turns`) first.
+    pub take_slot: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OneShotError {
+    /// No engine is installed, signed in, and allowed for this slot.
+    NoEngine,
+    /// Engines were tried and failed (signed out, error, timeout).
+    Failed(String),
+}
+
+impl std::fmt::Display for OneShotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OneShotError::NoEngine => write!(f, "no usable engine"),
+            OneShotError::Failed(e) => write!(f, "{e}"),
         }
     }
-    classifier::parse_model_reply(&reply)
+}
+
+#[derive(Debug, Clone)]
+pub struct OneShotReply {
+    pub text: String,
+    /// Catalog id of the model that answered, e.g. "claude:haiku".
+    pub model: String,
+    pub harness: String,
+}
+
+/// Run one prompt on a slot's model and return the reply text. Used for
+/// small helper calls (effort classification, the feed's daily interests
+/// and summaries).
+pub async fn one_shot(
+    state: &AppState,
+    req: OneShotRequest<'_>,
+) -> Result<OneShotReply, OneShotError> {
+    let (cancel_tx, cancel) = watch::channel(false);
+    let run_id = new_id();
+    {
+        let mut running = state.running.lock().unwrap_or_else(|p| p.into_inner());
+        if state.stopping.load(Ordering::SeqCst) {
+            let _ = cancel_tx.send(true);
+        }
+        running.insert(run_id.clone(), cancel_tx);
+    }
+    let result = one_shot_with_cancel(state, req, cancel).await;
+    state
+        .running
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&run_id);
+    result
+}
+
+async fn one_shot_with_cancel(
+    state: &AppState,
+    req: OneShotRequest<'_>,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<OneShotReply, OneShotError> {
+    if state.is_paused().await || *cancel.borrow() {
+        return Err(OneShotError::Failed(
+            "Iris is paused or the run was stopped".into(),
+        ));
+    }
+    let (res, pin) = state.resolve_slot(req.slot, req.shared).await;
+    let allow_shared = state.allow_claude_for_shared().await;
+    let catalog = state.catalog();
+    let mut candidates: Vec<String> = res.effective.iter().cloned().collect();
+    for id in &res.ranked {
+        if !candidates.contains(id) {
+            candidates.push(id.clone());
+        }
+    }
+    let mut tried_harnesses: Vec<String> = Vec::new();
+    // Runs that reached a model (a signed-out CLI does not count).
+    let mut attempts = 0;
+    let mut last_error = "no usable engine".to_string();
+    for model_id in candidates {
+        if attempts >= req.max_attempts.max(1) {
+            break;
+        }
+        let Some(m) = catalog.get(&model_id) else {
+            continue;
+        };
+        // `ranked` lists every available model; the policy decides.
+        if !crate::router::policy_allows(&m.harness, req.shared, allow_shared) {
+            continue;
+        }
+        if tried_harnesses.contains(&m.harness) {
+            continue;
+        }
+        let Some(entry) = state.harness(&m.harness).filter(|e| e.usable()) else {
+            continue;
+        };
+        // Helper prompts carry untrusted text: only CLIs that can really
+        // turn every tool off.
+        if !entry.harness.capabilities().tool_less
+            || (state.cfg.agent.user.is_empty() && entry.harness.can_isolate().is_err())
+        {
+            continue;
+        }
+        let Some(program) = entry.program() else {
+            continue;
+        };
+        tried_harnesses.push(m.harness.clone());
+        let effort = pin
+            .as_ref()
+            .filter(|p| p.model == model_id)
+            .and_then(|p| p.effort.clone())
+            .or_else(|| crate::ranking::default_effort(m));
+        let keys = crate::keys::env_for(state, &m.harness).await;
+        let prepared = (|| -> crate::util::Result<_> {
+            Ok((
+                crate::agent::workdir(&state.cfg.agent, &state.paths, req.scope)?,
+                state.protected_paths()?,
+                crate::agent::turn_dir(&state.cfg.agent, &state.paths, &new_id())?,
+            ))
+        })();
+        let (cwd, protected_paths, run_dir) = match prepared {
+            Ok(p) => p,
+            Err(e) => {
+                last_error = format!("could not prepare isolated helper: {e}");
+                continue;
+            }
+        };
+        let _turn_files = crate::agent::TurnFiles::new(&state.cfg.agent, req.scope, &run_dir);
+        let spec = TurnSpec {
+            turn_id: new_id(),
+            prompt: req.prompt.to_string(),
+            images: Vec::new(),
+            system_prompt: req.system_prompt.to_string(),
+            model: m.model.clone(),
+            effort,
+            resume: None,
+            mcp_servers: Vec::new(),
+            cwd,
+            writable_dirs: Vec::new(),
+            run_dir,
+            scope: req.scope.to_string(),
+            key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
+            // Helper calls read untrusted text (feed items): no tools at all,
+            // and none of the owner's CLI memory or integrations.
+            tools: false,
+            isolated: true,
+            own_mcp_servers: match own_mcp_servers(state, entry, &program).await {
+                Some(names) => names,
+                None => {
+                    last_error = format!("could not list {}'s own MCP servers", m.harness);
+                    continue;
+                }
+            },
+            protected_paths,
+            split: !state.cfg.agent.user.is_empty(),
+        };
+        let mut invocation = match build_invocation(state, &m.harness, &spec).await {
+            Ok(i) => i,
+            Err(e) => {
+                last_error = format!("could not build command: {e}");
+                continue;
+            }
+        };
+        invocation.env.extend(keys);
+        if let Err(e) = crate::agent::expose_files(&state.cfg.agent, &invocation).and_then(|_| {
+            crate::agent::wrap(&state.cfg.agent, &m.harness, req.scope, &mut invocation)
+        }) {
+            for f in &invocation.temp_files {
+                let _ = std::fs::remove_file(f);
+            }
+            last_error = format!("could not isolate CLI: {e}");
+            continue;
+        }
+        let _permit = if req.take_slot {
+            tokio::select! {
+                permit = state.limiter.acquire() => Some(permit),
+                _ = cancel.wait_for(|c| *c) => {
+                    for f in &invocation.temp_files {
+                        let _ = std::fs::remove_file(f);
+                    }
+                    return Err(OneShotError::Failed("the run was stopped".into()));
+                }
+            }
+        } else {
+            None
+        };
+        if state.is_paused().await || *cancel.borrow() {
+            for f in &invocation.temp_files {
+                let _ = std::fs::remove_file(f);
+            }
+            return Err(OneShotError::Failed(
+                "Iris is paused or the run was stopped".into(),
+            ));
+        }
+        let strip = state.strip_env(entry);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let run = runner::run(
+            RunRequest {
+                program: &program,
+                invocation: &invocation,
+                cwd: &spec.cwd,
+                env_remove: &strip,
+                timeout: req.timeout,
+            },
+            entry.harness.parser(&[]),
+            cancel.clone(),
+            tx,
+        )
+        .await;
+        for f in &invocation.temp_files {
+            let _ = std::fs::remove_file(f);
+        }
+        let mut text = String::new();
+        let mut terminal: Option<Terminal> = None;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                HarnessEvent::TextDelta { text: t } => text.push_str(&t),
+                HarnessEvent::Done => terminal = Some(Terminal::Done),
+                HarnessEvent::AuthRequired { message } => terminal = Some(Terminal::Auth(message)),
+                HarnessEvent::Error { message } => terminal = Some(Terminal::Error(message)),
+                _ => {}
+            }
+        }
+        // A run counts when it reached a model: not when the CLI could not
+        // start, and not when it said it is signed out.
+        if run.is_ok() && !matches!(terminal, Some(Terminal::Auth(_))) {
+            attempts += 1;
+        }
+        match (run, terminal) {
+            (Ok(out), _) if out.cancelled => {
+                return Err(OneShotError::Failed("the run was stopped".into()));
+            }
+            (Ok(out), _) if out.timed_out => {
+                last_error = format!("no result after {}s", req.timeout.as_secs());
+            }
+            (Ok(_), Some(Terminal::Done)) => {
+                state.note_auth(&m.harness, AuthState::Ok, None).await;
+                return Ok(OneShotReply {
+                    text,
+                    model: model_id,
+                    harness: m.harness.clone(),
+                });
+            }
+            (Ok(_), Some(Terminal::Auth(message))) => {
+                crate::warn!("{}: {} is not signed in", req.scope, m.harness);
+                state
+                    .note_auth(&m.harness, AuthState::AuthRequired, Some(message))
+                    .await;
+                last_error = format!("{} is signed out", m.harness);
+            }
+            (Ok(_), Some(Terminal::Error(e))) => last_error = truncate_chars(&e, 300),
+            (Ok(_), None) => last_error = "the CLI exited without a result".into(),
+            (Err(e), _) => last_error = format!("could not start {}: {e}", m.harness),
+        }
+    }
+    Err(if attempts == 0 {
+        OneShotError::NoEngine
+    } else {
+        OneShotError::Failed(last_error)
+    })
 }
 
 /// Build the command line off the async workers: adapters read and encode

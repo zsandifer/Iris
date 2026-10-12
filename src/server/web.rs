@@ -187,10 +187,7 @@ mod tests {
         listed.sort();
         assert_eq!(files, listed, "web/ and ASSETS differ");
         let sw = std::str::from_utf8(find("sw.js").unwrap().1.body).unwrap();
-        for a in ASSETS
-            .iter()
-            .filter(|a| a.path.ends_with(".js") && a.path != "sw.js")
-        {
+        for a in ASSETS {
             assert!(
                 sw.contains(&format!("'/{}'", a.path)),
                 "sw.js SHELL misses {}",

@@ -138,12 +138,15 @@ interval_mins = 60
 active_start = "08:00"
 active_end = "22:00"
 
-# Feed generation: the agent writes posts about your interests (guided by the
-# feed prompt you can edit in the app).
+# The For you feed: fetches your sources (RSS, YouTube, Reddit, Hacker News,
+# Bluesky, Mastodon), ranks them by rules, and publishes about 10 posts once a
+# day (fewer or more as you use it). Uses two small model calls a day (the
+# `background` and `feed` slots). The job checks every `interval_mins` inside
+# the window and publishes at most one batch per day.
 [feed]
-enabled = false
-interval_mins = 360
-active_start = "08:00"
+enabled = true
+interval_mins = 60
+active_start = "06:00"
 active_end = "22:00"
 
 # Web Push notifications (VAPID). Keys are generated on first run.

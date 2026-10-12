@@ -81,6 +81,11 @@ pub struct TurnSpec {
     /// Stable key for per-conversation state some CLIs keep on disk
     /// (the conversation id).
     pub scope: String,
+    /// False for helper calls that must not use any tool: every adapter
+    /// then turns off the CLI's built-in tools (as far as the CLI allows),
+    /// ignores MCP servers from the user's own CLI config, and never
+    /// auto-approves edits.
+    pub tools: bool,
     /// Names of API-key variables Iris passes to this run (keys the owner
     /// added in the app; values are added to the environment by the turn).
     pub key_env: Vec<String>,
@@ -154,6 +159,10 @@ pub struct Capabilities {
     pub mcp: bool,
     /// Can resume a previous session.
     pub resume: bool,
+    /// Can run a helper prompt with every tool turned off, including MCP
+    /// servers from the user's own CLI config (`TurnSpec.tools = false`).
+    /// Helper calls (the feed's) skip CLIs that cannot.
+    pub tool_less: bool,
 }
 
 /// How the CLI's own login command works headless.
@@ -485,6 +494,163 @@ mod tests {
     }
 
     #[test]
+    fn tool_less_calls_turn_tools_off_in_every_adapter() {
+        use crate::config::HarnessConfig;
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = TurnSpec {
+            turn_id: "t1".into(),
+            prompt: "summarize".into(),
+            images: Vec::new(),
+            system_prompt: "You write blurbs.".into(),
+            model: "m".into(),
+            effort: None,
+            resume: None,
+            mcp_servers: Vec::new(),
+            cwd: tmp.path().into(),
+            writable_dirs: Vec::new(),
+            run_dir: tmp.path().into(),
+            scope: "feed-summaries".into(),
+            key_env: Vec::new(),
+            tools: false,
+            isolated: true,
+            own_mcp_servers: Vec::new(),
+            protected_paths: vec!["/private/iris".into()],
+            split: false,
+        };
+        let args = |h: &dyn Harness| h.build(&spec).unwrap();
+
+        // Operator extra args (here: an MCP server and live web search)
+        // never reach a tool-less run.
+        let risky = vec![
+            "-c".to_string(),
+            "mcp_servers.mail.url=\"https://mcp.example.com\"".to_string(),
+            "-c".to_string(),
+            "web_search=\"live\"".to_string(),
+            "--mcp-config".to_string(),
+            "/tmp/x.json".to_string(),
+        ];
+        let mut ccfg = HarnessConfig::claude_default();
+        ccfg.extra_args = risky.clone();
+        let c = args(&claude::Claude::new(ccfg));
+        assert!(!c.args.iter().any(|a| risky.contains(a)), "{:?}", c.args);
+        let pos = c.args.iter().position(|a| a == "--tools").unwrap();
+        assert_eq!(c.args[pos + 1], "");
+        assert!(c.args[pos + 2].starts_with("--"), "variadic flag is closed");
+        assert!(c.args.contains(&"--strict-mcp-config".to_string()));
+        assert!(c.args.windows(2).any(|a| a == ["--setting-sources", ""]));
+        let deny = c
+            .args
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .unwrap();
+        assert!(c.args[deny + 1].contains("Read(//private/iris/**)"));
+        assert!(
+            c.env
+                .contains(&("CLAUDE_CODE_DISABLE_CLAUDE_MDS".into(), "1".into()))
+        );
+        assert!(
+            !c.args
+                .iter()
+                .any(|a| a == "--allowedTools" || a == "--permission-mode")
+        );
+
+        let mut xcfg = HarnessConfig::codex_default();
+        xcfg.extra_args = risky.clone();
+        let x = args(&codex::Codex::new(xcfg));
+        assert!(
+            !x.args
+                .iter()
+                .any(|a| a.contains("mcp_servers.mail") || a.contains("\"live\""))
+        );
+        for o in [
+            "sandbox_mode=\"read-only\"",
+            "approval_policy=\"never\"",
+            "web_search=\"disabled\"",
+            "--ignore-user-config",
+            "--ephemeral",
+        ] {
+            assert!(x.args.iter().any(|a| a == o), "{o}");
+        }
+        // Every tool feature is switched off, as a `--disable <feature>` pair.
+        for f in [
+            "shell_tool",
+            "unified_exec",
+            "apps",
+            "plugins",
+            "browser_use",
+            "browser_use_external",
+            "in_app_browser",
+            "computer_use",
+            "image_generation",
+            "view_image",
+            "code_mode_host",
+            "tool_suggest",
+            "goals",
+            "sleep_tool",
+        ] {
+            assert!(
+                x.args.windows(2).any(|w| w[0] == "--disable" && w[1] == f),
+                "--disable {f}"
+            );
+        }
+        assert!(!x.args.iter().any(|a| a == "--enable"));
+        assert!(!x.args.iter().any(|a| a.contains("workspace-write")));
+        assert!(x.args.contains(&"project_doc_max_bytes=0".into()));
+        let profiles = x
+            .args
+            .iter()
+            .find(|a| a.starts_with("permissions="))
+            .unwrap();
+        let table: toml::Table = toml::from_str(profiles).unwrap();
+        assert_eq!(
+            table["permissions"]["iris"]["extends"].as_str(),
+            Some(":read-only")
+        );
+        assert_eq!(
+            table["permissions"]["iris"]["filesystem"]["/private/iris"].as_str(),
+            Some("deny")
+        );
+
+        let gem = gemini::Gemini::new(HarnessConfig::gemini_default());
+        assert!(!gem.capabilities().tool_less, "helper calls skip Gemini");
+        for h in [
+            &claude::Claude::new(HarnessConfig::claude_default()) as &dyn Harness,
+            &codex::Codex::new(HarnessConfig::codex_default()),
+        ] {
+            assert!(h.capabilities().tool_less, "{}", h.name());
+        }
+        let oc = opencode::OpenCode::new(HarnessConfig::opencode_default());
+        assert!(!oc.capabilities().tool_less, "helper calls skip OpenCode");
+        let g = args(&gem);
+        let pos = g.args.iter().position(|a| a == "--approval-mode").unwrap();
+        assert_eq!(g.args[pos + 1], "default");
+        let settings: Value = serde_json::from_slice(
+            &std::fs::read(g.cwd.as_ref().unwrap().join(".gemini/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            settings["tools"]["exclude"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "run_shell_command")
+        );
+        assert_eq!(settings["mcp"]["allowed"], serde_json::json!([]));
+
+        let o = args(&opencode::OpenCode::new(HarnessConfig::opencode_default()));
+        let file = &o
+            .env
+            .iter()
+            .find(|(k, _)| k == "OPENCODE_CONFIG")
+            .unwrap()
+            .1;
+        let cfg: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(cfg["tools"]["*"], false);
+        assert_eq!(cfg["permission"]["bash"], "deny");
+        assert_eq!(cfg["permission"]["edit"], "deny");
+    }
+
+    #[test]
     fn resolve_finds_absolute_and_path_commands() {
         assert!(resolve_command("sh").is_some());
         assert!(resolve_command("/bin/sh").is_some());
@@ -523,6 +689,7 @@ mod isolation_tests {
             writable_dirs: Vec::new(),
             run_dir: dir.join("run"),
             scope: "conversation".into(),
+            tools: true,
             key_env: Vec::new(),
             isolated: false,
             own_mcp_servers: Vec::new(),

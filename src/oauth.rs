@@ -949,6 +949,14 @@ pub async fn start(
         mode: "discover".into(),
         ..Default::default()
     });
+    // Reconnecting an older Google grant must request today's scopes too.
+    if con.service == "google" && o.mode == "preset" {
+        for scope in crate::connectors::GOOGLE_SCOPES {
+            if !o.scopes.iter().any(|s| s == scope) {
+                o.scopes.push((*scope).to_string());
+            }
+        }
+    }
     if con.transport == "http" {
         crate::connectors::check_credential_url(&con.config).map_err(StartError::Other)?;
     }
