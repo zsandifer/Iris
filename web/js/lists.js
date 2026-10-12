@@ -7,6 +7,7 @@ import {
 import { Icon, Img, Empty, Spinner, ago, since, openSheet, closeSheet, confirmSheet, hostOf, useBlob } from './ui.js';
 import { md } from './md.js';
 import { Post, findPost } from './feed.js';
+import { openPhoto } from './photo.js';
 
 function Head({ title, sub }) {
   return html`<h1 class="ttl">${title}</h1>${sub && html`<div class="sub">${sub}</div>`}`;
@@ -160,7 +161,7 @@ function MadeByIris({ items, limit }) {
   const docs = items.filter((i) => !i.mime.startsWith('image/'));
   const shown = limit ? docs.slice(0, limit) : docs;
   return html`${media.length > 0 && html`<div class="grid">${(limit ? media.slice(0, 6) : media).map((it) => html`
-      <button class="gi" onClick=${() => openItem(it)}><${Img} src=${`/api/library/${seg(it.id)}/content`} alt=${it.title} /></button>`)}</div>`}
+      <button class="gi" onClick=${() => openPhoto(`/api/library/${seg(it.id)}/content`, it.title, { action: { label: 'Details', onClick: () => openItem(it) } })}><${Img} src=${`/api/library/${seg(it.id)}/content`} alt=${it.title} /></button>`)}</div>`}
     ${shown.length > 0 && html`<div class="grp">${shown.map((it) => html`<div class="r tap" onClick=${() => openItem(it)}>
       <div class="ri"><${Icon} name=${KIND_ICON(it.mime)} size=${17} /></div>
       <div class="rt">${it.title}<small>${it.description || it.mime} · ${ago(it.created_at)}</small></div>
@@ -169,8 +170,9 @@ function MadeByIris({ items, limit }) {
 
 function PhotoGrid({ photos, limit }) {
   const list = limit ? photos.slice(0, limit) : photos;
-  return html`<div class="grid">${list.map((p) => html`<button class="gi" onClick=${() => set({ lightbox: `/api/attachments/${seg(p.id)}`, lightboxChat: p.conversation_id })}>
-    <${Img} src=${`/api/attachments/${seg(p.id)}`} alt="Photo you sent" /></button>`)}</div>`;
+  const options = (p) => ({ action: p.conversation_id ? { label: 'Open chat', onClick: () => go(`chat/${p.conversation_id}`) } : null });
+  return html`<div class="grid">${list.map((p) => html`<button class="gi" onClick=${() => openPhoto(`/api/attachments/${seg(p.id)}`, 'Photo you sent', options(p))}>
+    <${Img} src=${`/api/attachments/${seg(p.id)}`} alt="Photo you sent" photoOptions=${options(p)} /></button>`)}</div>`;
 }
 
 function Saved({ posts, limit }) {
@@ -184,7 +186,7 @@ function Saved({ posts, limit }) {
     });
   };
   return html`<div class="grp">${list.map((p) => html`<div class="r tap" onClick=${() => show(p)}>
-    <div class="ri thumb">${(p.images?.[0] || p.image_url) ? html`<${Img} src=${p.images?.[0] || p.image_url} alt="" />` : html`<${Icon} name="heart" size=${16} />`}</div>
+    <div class="ri thumb">${(p.images?.[0] || p.image_url) ? html`<${Img} src=${p.images?.[0] || p.image_url} alt=${p.title} />` : html`<${Icon} name="heart" size=${16} />`}</div>
     <div class="rt">${p.title}<small>${p.source_name || hostOf(p.source_url) || p.topic || 'Saved post'}</small></div>
     <${Icon} name="chev" size=${16} cls="rc" /></div>`)}</div>`;
 }

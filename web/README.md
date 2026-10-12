@@ -26,6 +26,8 @@ js/
 ├── settings.js       Settings, AI engine, devices, people, activity log
 ├── push.js           Web Push subscription
 ├── md.js             small, safe Markdown renderer
+├── photo.js          shared photo dialog, history, pinch and pan gestures
+├── photo-math.js     pure photo zoom and pan geometry
 ├── ui.js             icons, rows, sheets, time helpers
 ├── viewport.js       visible viewport sizing and phone keyboard detection
 └── h.js              Preact + htm exports
@@ -65,3 +67,10 @@ pans, recording every animation frame. The header stays at zero in visible
 viewport coordinates (its layout `getBoundingClientRect().top` minus
 `visualViewport.offsetTop`), with stable height and avatar. Native iPhone
 keyboard animation still needs a device check.
+
+`scripts/e2e/photos.mjs` uses the same Playwright setup and an iPhone
+descriptor to check photo surfaces, safe areas, focus, history, dismissals,
+carousel taps, story pause, reduced motion, and zoom/pan bounds. It uses
+native taps and injected touch lists for pinch gestures (Playwright's
+touchscreen API provides only single-touch taps). Set `WEBKIT` to the
+installed browser's `pw_run.sh` if its version differs from Playwright's.

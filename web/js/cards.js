@@ -34,7 +34,7 @@ function LinkCard({ c }) {
 
 function ResultCard({ c }) {
   return html`<div class="res">
-    ${c.image_url ? html`<${Img} cls="res-im" src=${c.image_url} />` : html`<div class="res-im res-blank" />`}
+    ${c.image_url ? html`<${Img} cls="res-im" src=${c.image_url} alt=${c.title || 'Photo'} />` : html`<div class="res-im res-blank" />`}
     <div class="res-tx"><b>${c.title}</b>${c.body && html`<small>${plain(c.body, 160)}</small>`}</div>
     ${safeUrl(c.url) && html`<a class="res-bk" href=${safeUrl(c.url)} target="_blank" rel="noopener noreferrer">${c.action_label || 'Open'}</a>`}
   </div>`;

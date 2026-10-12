@@ -6,7 +6,7 @@ import {
   loadArchived, convFor, setArchived,
 } from './store.js';
 import {
-  Icon, Avatar, Img, Sheet, agentName, promptSheet, confirmSheet, openSheet, closeSheet, LetterTile, Row, Spinner, ago,
+  Icon, Avatar, Sheet, agentName, promptSheet, confirmSheet, openSheet, closeSheet, LetterTile, Row, Spinner, ago,
 } from './ui.js';
 import { ChatScreen } from './chat.js';
 import { FeedScreen, StoryViewer } from './feed.js';
@@ -221,16 +221,6 @@ function Tabs() {
       <${Icon} name=${icon} size=${23} /><span>${label}</span></button>`)}</nav>`;
 }
 
-function Lightbox() {
-  if (!S.lightbox) return null;
-  const close = () => set({ lightbox: null, lightboxChat: null });
-  return html`<div class="lightbox" onClick=${close}>
-    <button class="x" aria-label="Close"><${Icon} name="x" size=${26} /></button>
-    <${Img} src=${S.lightbox} alt="" />
-    ${S.lightboxChat && html`<button class="b2 lb-go" onClick=${(e) => { e.stopPropagation(); const c = S.lightboxChat; close(); go(`chat/${c}`); }}>Open chat</button>`}
-  </div>`;
-}
-
 // -------------------------------------------------------------------- root
 
 function Screen() {
@@ -290,11 +280,10 @@ function App() {
   const tabbed = TABS.some(([k]) => k === S.route.tab);
   return html`<div class=${'app' + (tabbed ? ' tabbed' : ' paged') + (S.route.tab === 'chat' ? ' is-chat' : '')}>
     ${tabbed && html`<${TopBar} />`}
-    <main class="main" inert=${!!(S.drawer || S.sheet || S.story || S.lightbox)}><${Screen} /></main>
+    <main class="main" inert=${!!(S.drawer || S.sheet || S.story)}><${Screen} /></main>
     ${tabbed && html`<${Tabs} />`}
     <${Drawer} />
     <${StoryViewer} />
-    <${Lightbox} />
     <${Sheet} />
     ${S.toast && html`<div class="toast" role="status">${S.toast}</div>`}
   </div>`;
