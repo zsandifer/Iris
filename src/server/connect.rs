@@ -1966,7 +1966,7 @@ mod tests {
             None,
         )
         .await;
-        assert!(partial.contains("all four services"));
+        assert!(partial.contains("every Google service"));
         let (_, setup) = call(&a, "GET", "/api/connectors/google/setup", None).await;
         assert_eq!(setup["progress"]["phase"], "sign_in");
         let current = a
@@ -2054,6 +2054,195 @@ mod tests {
         .await;
         assert!(html.contains("Google is connected"));
         assert_eq!(count_notes(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_older_google_grant_keeps_working_and_adds_the_new_services_on_sign_in() {
+        use crate::connectors::{GOOGLE_SCOPES, google_args, google_needs_more_access};
+        let a = app_with_public_url("https://iris.example").await;
+        let (s, _) = call(
+            &a,
+            "POST",
+            "/api/connectors/google/setup/client",
+            Some(json!({"paste": "123-example.apps.googleusercontent.com GOCSPX-test-secret"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let get = |a: &App| {
+            a.state
+                .db
+                .with(|c| Ok(entities::list_connectors(c, false)?[0].clone()))
+                .unwrap()
+        };
+        let con = get(&a);
+        // A new Google connection turns on the whole suite.
+        assert_eq!(con.config.args, google_args());
+        for tool in ["docs", "sheets", "slides", "forms", "tasks", "contacts"] {
+            assert!(con.config.args.iter().any(|t| t == tool), "{tool}");
+        }
+        assert!(!con.config.args.iter().any(|t| t == "chat"));
+        assert!(!google_needs_more_access(&con));
+
+        // As an older Iris left it: signed in for Gmail, Calendar, Drive and
+        // YouTube only, with the old server arguments.
+        let old_scopes: Vec<String> = GOOGLE_SCOPES[..7].iter().map(|s| s.to_string()).collect();
+        let old_args: Vec<String> = [
+            "workspace-mcp@1.30.1",
+            "--transport",
+            "streamable-http",
+            "--tools",
+            "gmail",
+            "calendar",
+            "drive",
+        ]
+        .map(String::from)
+        .to_vec();
+        {
+            let (con, old_scopes, old_args) = (con.clone(), old_scopes.clone(), old_args.clone());
+            let rt = a
+                .state
+                .vault
+                .seal_str(
+                    "old-rt",
+                    &format!("connector:{}:oauth:refresh_token", con.id),
+                )
+                .unwrap();
+            a.state
+                .db
+                .with(move |c| {
+                    let mut cfg = con.config.clone();
+                    cfg.args = old_args;
+                    let o = cfg.oauth.as_mut().unwrap();
+                    o.scopes = old_scopes;
+                    o.refresh_token = Some(rt);
+                    entities::update_connector(c, &con.id, None, Some(&cfg), None)?;
+                    entities::set_connector_state(
+                        c,
+                        &con.id,
+                        &ConnectorState {
+                            auth_state: Some("ok"),
+                            ..Default::default()
+                        },
+                    )?;
+                    crate::google_setup::save(
+                        c,
+                        &crate::google_setup::Progress {
+                            step: 6,
+                            sign_in: true,
+                            completed: true,
+                            issue: None,
+                            ..crate::google_setup::read(c)?
+                        },
+                    )
+                })
+                .unwrap();
+        }
+        // It keeps working, and the owner is asked to sign in again.
+        let con = get(&a);
+        assert!(con.active());
+        assert!(google_needs_more_access(&con));
+        let (_, list) = call(&a, "GET", "/api/connectors", None).await;
+        assert_eq!(list["connectors"][0]["oauth"]["needs_more_access"], true);
+        let (_, setup) = call(&a, "GET", "/api/connectors/google/setup", None).await;
+        assert_eq!(setup["progress"]["phase"], "connected");
+        assert_eq!(setup["progress"]["more_access"], true);
+        let owner = a.state.db.with(crate::db::owner_user_id).unwrap().unwrap();
+        let conv = a
+            .state
+            .db
+            .with(|c| crate::db::ensure_main_conversation(c, &owner))
+            .unwrap();
+        let req = crate::awareness::request(
+            &a.state,
+            &owner,
+            &conv,
+            "request_connector_setup",
+            &json!({"name": "google"}),
+        )
+        .await
+        .unwrap();
+        let card_id = req["card_id"]
+            .as_str()
+            .expect("a card, not already connected");
+        let card = |a: &App| {
+            a.state
+                .db
+                .with(|c| crate::db::get_message(c, card_id))
+                .unwrap()
+                .unwrap()
+                .card
+                .unwrap()
+        };
+        assert_eq!(card(&a)["type"], "connector_reconnect");
+        assert_eq!(card(&a)["connector_id"], con.id.as_str());
+
+        // Saving the same key again keeps the older grant's record.
+        let (s, _) = call(
+            &a,
+            "POST",
+            "/api/connectors/google/setup/client",
+            Some(json!({"paste": "123-example.apps.googleusercontent.com GOCSPX-test-secret"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let con = get(&a);
+        assert!(google_needs_more_access(&con));
+        assert_eq!(con.config.args, old_args);
+
+        // Signing in again asks for everything; until it lands, the record
+        // still shows the older grant.
+        let provider = fake_provider().await;
+        let base = provider.lock().unwrap().base.clone();
+        {
+            let con = con.clone();
+            a.state
+                .db
+                .with(move |c| {
+                    let mut cfg = con.config.clone();
+                    let o = cfg.oauth.as_mut().unwrap();
+                    o.authorization_endpoint = Some(format!("{base}/auth/authorize"));
+                    o.token_endpoint = Some(format!("{base}/auth/token"));
+                    o.local = true;
+                    entities::update_connector(c, &con.id, None, Some(&cfg), None)?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let (_, flow) = call(
+            &a,
+            "POST",
+            &format!("/api/connectors/{}/oauth/start", con.id),
+            Some(json!({})),
+        )
+        .await;
+        let q = crate::oauth::parse_query(flow["authorize_url"].as_str().unwrap());
+        for scope in GOOGLE_SCOPES {
+            assert!(
+                q["scope"].split_whitespace().any(|s| s == *scope),
+                "{scope}"
+            );
+        }
+        assert!(google_needs_more_access(&get(&a)));
+        {
+            let mut p = provider.lock().unwrap();
+            p.challenge = Some(q["code_challenge"].clone());
+            p.granted_scopes = Some(GOOGLE_SCOPES.join(" "));
+        }
+        let (_, html) = send(
+            &a.app,
+            "GET",
+            &format!("/api/oauth/callback?state={}&code=the-code", q["state"]),
+            "",
+            None,
+        )
+        .await;
+        assert!(html.contains("Google is connected"), "{html}");
+        let con = get(&a);
+        assert!(!google_needs_more_access(&con));
+        assert_eq!(con.config.args, google_args());
+        let (_, setup) = call(&a, "GET", "/api/connectors/google/setup", None).await;
+        assert_eq!(setup["progress"]["more_access"], false);
+        assert_eq!(card(&a)["state"], "done");
     }
 
     #[tokio::test]

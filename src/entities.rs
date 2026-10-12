@@ -1003,6 +1003,7 @@ impl Connector {
                 "account": o.account,
                 "scopes": o.scopes,
                 "redirect_uri": o.redirect_uri,
+                "needs_more_access": crate::connectors::google_needs_more_access(self),
             })
         });
         json!({

@@ -241,7 +241,10 @@ pub async fn request(
                     .find(|x| (x.service == n && n != "custom") || x.name.eq_ignore_ascii_case(&n)))
             })
             .await?;
-        if con.as_ref().is_some_and(|c| c.active()) {
+        let more_access = con
+            .as_ref()
+            .is_some_and(crate::connectors::google_needs_more_access);
+        if con.as_ref().is_some_and(|c| c.active()) && !more_access {
             return Ok(json!({"outcome": "already connected"}));
         }
         if let Some(con) = con
@@ -262,7 +265,11 @@ pub async fn request(
                 },
             )
         } else {
-            let card = if let Some(con) = con.filter(|c| c.auth_state != "ok") {
+            let card = if let Some(con) = con.as_ref().filter(|_| more_access) {
+                json!({"type": "connector_reconnect", "title": "Add more Google services", "connector_id": con.id, "service": name,
+                "body": "Google works as before. Turn on the new Google APIs in your project, then sign in again to add Docs, Sheets, Slides, Forms, Tasks and Contacts.",
+                "auth": "oauth", "state": "needs_reconnect", "owner_only": true})
+            } else if let Some(con) = con.filter(|c| c.auth_state != "ok") {
                 json!({"type": "connector_reconnect", "title": format!("Reconnect {}", catalog.label), "connector_id": con.id, "service": name,
                 "auth": if con.config.oauth.is_some() { "oauth" } else { "secrets" }, "state": "needs_reconnect", "owner_only": true})
             } else {

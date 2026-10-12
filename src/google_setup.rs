@@ -12,9 +12,9 @@ const GOOGLE_PAGES: &[(&str, &str)] = &[
     ("project", "https://console.cloud.google.com/projectcreate"),
     (
         "apis",
-        "https://console.cloud.google.com/flows/enableapi?apiid=gmail.googleapis.com,calendar-json.googleapis.com,drive.googleapis.com,youtube.googleapis.com",
+        "https://console.cloud.google.com/flows/enableapi?apiid=gmail.googleapis.com,calendar-json.googleapis.com,drive.googleapis.com,youtube.googleapis.com,docs.googleapis.com,sheets.googleapis.com,slides.googleapis.com,forms.googleapis.com,tasks.googleapis.com,people.googleapis.com",
     ),
-    // One-at-a-time fallbacks if the combined link doesn't enable all four.
+    // One-at-a-time fallbacks if the combined link doesn't enable them all.
     (
         "api_gmail",
         "https://console.cloud.google.com/apis/library/gmail.googleapis.com",
@@ -30,6 +30,30 @@ const GOOGLE_PAGES: &[(&str, &str)] = &[
     (
         "api_youtube",
         "https://console.cloud.google.com/apis/library/youtube.googleapis.com",
+    ),
+    (
+        "api_docs",
+        "https://console.cloud.google.com/apis/library/docs.googleapis.com",
+    ),
+    (
+        "api_sheets",
+        "https://console.cloud.google.com/apis/library/sheets.googleapis.com",
+    ),
+    (
+        "api_slides",
+        "https://console.cloud.google.com/apis/library/slides.googleapis.com",
+    ),
+    (
+        "api_forms",
+        "https://console.cloud.google.com/apis/library/forms.googleapis.com",
+    ),
+    (
+        "api_tasks",
+        "https://console.cloud.google.com/apis/library/tasks.googleapis.com",
+    ),
+    (
+        "api_people",
+        "https://console.cloud.google.com/apis/library/people.googleapis.com",
     ),
     ("branding", "https://console.cloud.google.com/auth/branding"),
     ("audience", "https://console.cloud.google.com/auth/audience"),
@@ -170,11 +194,11 @@ impl Issue {
             ),
             Self::InvalidScope => (
                 2,
-                "I couldn't request Google access. Turn on all four APIs in your Iris project, then try signing in again.",
+                "I couldn't request Google access. Turn on all of the Google APIs in your Iris project, then try signing in again.",
             ),
             Self::MissingPermissions => (
                 6,
-                "I need permission for all four services to connect Google. Sign in again and select Gmail, Calendar, Drive and YouTube access.",
+                "I need permission for every Google service to connect Google. Sign in again and leave every box checked: Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts and YouTube.",
             ),
         }
     }
@@ -327,8 +351,14 @@ pub fn status(c: &rusqlite::Connection) -> rusqlite::Result<Value> {
     } else {
         "setup"
     };
+    // Connected with an older grant: the owner can add the newer services.
+    let more_access = phase == "connected"
+        && con
+            .as_ref()
+            .is_some_and(crate::connectors::google_needs_more_access);
     Ok(json!({
         "step": p.step, "total_steps": STEPS, "phase": phase,
+        "more_access": more_access,
         "project_id": p.project_id,
         "summary": if phase == "connected" { "Google connected".into() } else { format!("Google setup: step {} of {STEPS}", p.step) },
         "error": p.issue.map(|i| { let (step, message) = i.fix(); json!({"step": step, "message": message}) }),

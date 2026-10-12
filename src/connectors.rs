@@ -1,5 +1,5 @@
 //! The small built-in catalog of services to connect: Google (Gmail,
-//! Calendar, Drive), GitHub, services with a hosted MCP server the owner just
+//! Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts), GitHub, services with a hosted MCP server the owner just
 //! signs in to (Notion, Todoist, Linear, Atlassian, Canva), and a custom MCP
 //! server. Each entry says how the connector is set up; the app walks the
 //! owner through it.
@@ -67,7 +67,7 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         id: "google",
         label: "Google",
-        description: "Gmail, Calendar, Drive, and YouTube read-only",
+        description: GOOGLE_DESCRIPTION,
         requires: &["uvx"],
         setup: "google_client",
         url: None,
@@ -127,9 +127,24 @@ pub fn catalog_entry(id: &str) -> Option<&'static CatalogEntry> {
     CATALOG.iter().find(|e| e.id == id)
 }
 
+pub const GOOGLE_DESCRIPTION: &str =
+    "Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts, and YouTube read-only";
+
 /// The Google Workspace MCP server release Iris is set up for (the owner
 /// can change it under the connection's advanced settings).
 pub const GOOGLE_MCP_PACKAGE: &str = "workspace-mcp@2.1.0";
+/// The server's services Iris turns on (`--tools`). Google Chat is left
+/// out: its API only works for Business or Enterprise Workspace accounts
+/// and needs a Chat app configured in the owner's project. Search and Apps
+/// Script are left out too (a separate search engine, and running code).
+pub const GOOGLE_TOOLS: &[&str] = &[
+    "gmail", "calendar", "drive", "docs", "sheets", "slides", "forms", "tasks", "contacts",
+];
+/// What Iris's server arguments used to turn on, before the full suite.
+const GOOGLE_TOOLS_BEFORE_SUITE: &[&str] = &["gmail", "calendar", "drive"];
+/// One sign-in for every service in `GOOGLE_TOOLS` (the broad scope of
+/// each, which the server accepts for its narrower checks), plus YouTube
+/// read-only for For you. Forms responses need their own read scope.
 pub const GOOGLE_SCOPES: &[&str] = &[
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
@@ -138,7 +153,53 @@ pub const GOOGLE_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/youtube.readonly",
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/presentations",
+    "https://www.googleapis.com/auth/forms.body",
+    "https://www.googleapis.com/auth/forms.responses.readonly",
+    "https://www.googleapis.com/auth/tasks",
+    "https://www.googleapis.com/auth/contacts",
 ];
+
+/// The Google server's program arguments.
+pub fn google_args() -> Vec<String> {
+    let mut args: Vec<String> = [
+        GOOGLE_MCP_PACKAGE,
+        "--transport",
+        "streamable-http",
+        "--tools",
+    ]
+    .map(String::from)
+    .to_vec();
+    args.extend(GOOGLE_TOOLS.iter().map(|t| t.to_string()));
+    args
+}
+
+/// Arguments an older Iris saved by default (any `workspace-mcp` release,
+/// Gmail, Calendar and Drive only) become today's. Arguments the owner
+/// changed are theirs and stay.
+pub fn upgraded_google_args(args: &[String]) -> Option<Vec<String>> {
+    let (head, tools) = args.split_at_checked(4)?;
+    let old = head[0].starts_with("workspace-mcp@")
+        && head[1..] == ["--transport", "streamable-http", "--tools"]
+        && tools == GOOGLE_TOOLS_BEFORE_SUITE;
+    old.then(google_args)
+}
+
+/// A signed-in Google connection whose grant predates services Iris now
+/// uses: it keeps working, and the owner is asked to sign in again (after
+/// turning on the new APIs) to add them.
+pub fn google_needs_more_access(con: &entities::Connector) -> bool {
+    con.service == "google"
+        && con.config.oauth.as_ref().is_some_and(|o| {
+            o.mode == "preset"
+                && o.refresh_token.is_some()
+                && GOOGLE_SCOPES
+                    .iter()
+                    .any(|s| !o.scopes.iter().any(|g| g == s))
+        })
+}
 pub const GITHUB_MCP_URL: &str = "https://api.githubcopilot.com/mcp/";
 
 /// Check both newly saved settings and old settings at dispatch.
@@ -356,7 +417,12 @@ pub async fn setup(
             o.mode = "preset".into();
             o.authorization_endpoint = Some("https://accounts.google.com/o/oauth2/v2/auth".into());
             o.token_endpoint = Some("https://oauth2.googleapis.com/token".into());
-            o.scopes = GOOGLE_SCOPES.iter().map(|s| s.to_string()).collect();
+            let signed_in = o.refresh_token.is_some();
+            // `scopes` records what the owner granted: a kept sign-in keeps
+            // its scopes until they sign in again.
+            if !signed_in {
+                o.scopes = GOOGLE_SCOPES.iter().map(|s| s.to_string()).collect();
+            }
             o.extra_params = BTreeMap::from([
                 ("access_type".into(), "offline".into()),
                 ("prompt".into(), "consent".into()),
@@ -365,24 +431,11 @@ pub async fn setup(
             o.client_id = Some(client_id);
             o.client_secret = Some(sealed_secret);
             o.client_source = "owner".into();
-            let signed_in = o.refresh_token.is_some();
             let args = existing
                 .as_ref()
                 .filter(|c| !c.config.args.is_empty())
                 .map(|c| c.config.args.clone())
-                .unwrap_or_else(|| {
-                    [
-                        GOOGLE_MCP_PACKAGE,
-                        "--transport",
-                        "streamable-http",
-                        "--tools",
-                        "gmail",
-                        "calendar",
-                        "drive",
-                    ]
-                    .map(String::from)
-                    .to_vec()
-                });
+                .unwrap_or_else(google_args);
             (
                 "http",
                 ConnectorConfig {
@@ -520,6 +573,91 @@ mod tests {
         assert!(catalog_entry("spotify").is_none());
         // No client secret ships with Iris.
         assert!(GOOGLE_SCOPES.iter().all(|s| !s.contains("secret")));
+    }
+
+    #[test]
+    fn google_turns_on_the_suite_and_upgrades_only_old_default_arguments() {
+        let args = google_args();
+        assert_eq!(
+            args[..4],
+            [
+                GOOGLE_MCP_PACKAGE,
+                "--transport",
+                "streamable-http",
+                "--tools"
+            ]
+        );
+        assert_eq!(args[4..], *GOOGLE_TOOLS);
+        // Service names workspace-mcp@2.1.0 accepts for --tools.
+        let known = [
+            "gmail",
+            "drive",
+            "calendar",
+            "docs",
+            "sheets",
+            "chat",
+            "forms",
+            "slides",
+            "tasks",
+            "contacts",
+            "search",
+            "appscript",
+        ];
+        assert!(GOOGLE_TOOLS.iter().all(|t| known.contains(t)));
+        // Each service's broad scope is requested in the one sign-in.
+        for scope in [
+            "documents",
+            "spreadsheets",
+            "presentations",
+            "forms.body",
+            "forms.responses.readonly",
+            "tasks",
+            "contacts",
+        ] {
+            let full = format!("https://www.googleapis.com/auth/{scope}");
+            assert!(GOOGLE_SCOPES.contains(&full.as_str()), "{scope}");
+        }
+        assert!(!GOOGLE_SCOPES.iter().any(|s| s.contains("chat")));
+
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let base = ["--transport", "streamable-http", "--tools"];
+        for pkg in ["workspace-mcp@2.1.0", "workspace-mcp@1.30.1"] {
+            let old = v(&[&[pkg][..], &base, &["gmail", "calendar", "drive"]].concat());
+            assert_eq!(upgraded_google_args(&old), Some(google_args()), "{pkg}");
+        }
+        // Arguments the owner changed, or already current ones, stay.
+        for kept in [
+            v(&[&["workspace-mcp@2.1.0"][..], &base, &["gmail"]].concat()),
+            v(&[
+                &["workspace-mcp@2.1.0"][..],
+                &base,
+                &["gmail", "calendar", "drive", "chat"],
+            ]
+            .concat()),
+            v(&[
+                &["workspace-mcp@2.1.0"][..],
+                &base,
+                &["drive", "calendar", "gmail"],
+            ]
+            .concat()),
+            v(&[
+                &["workspace-mcp@2.1.0", "--single-user"][..],
+                &base[1..],
+                &["gmail", "calendar", "drive"],
+            ]
+            .concat()),
+            v(&[
+                &["other-mcp@1.0"][..],
+                &base,
+                &["gmail", "calendar", "drive"],
+            ]
+            .concat()),
+            v(&["workspace-mcp@2.1.0"]),
+            vec![],
+            google_args(),
+        ] {
+            assert_eq!(upgraded_google_args(&kept), None, "{kept:?}");
+        }
     }
 
     #[test]

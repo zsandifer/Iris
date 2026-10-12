@@ -84,7 +84,7 @@ export function Connections() {
     ${!S.connectors ? html`<${Spinner} />` : html`
       <${Group} label="Connected" note=${list.length ? `${agentName()} asks you before sending, buying, deleting, or contacting someone new.` : null}>
         ${list.length ? list.map((c) => html`<${Row} icon=${html`<${ServiceTile} c=${c} />`} title=${labelOf(c)}
-          sub=${c.service === 'google' && c.auth_state === 'ok' && c.enabled && !c.paused ? 'Gmail ✓ · Calendar ✓ · Drive ✓ · YouTube read-only ✓' : statusOf(c)} onClick=${() => go(`iris/connections/${c.id}`)} />`)
+          sub=${c.service === 'google' && c.auth_state === 'ok' && c.enabled && !c.paused ? (c.oauth?.needs_more_access ? 'Sign in again to add Docs, Sheets and more' : 'Gmail ✓ · Calendar ✓ · Drive ✓ · Docs ✓ · and more') : statusOf(c)} onClick=${() => go(`iris/connections/${c.id}`)} />`)
           : html`<div class="r"><div class="rt mu">Nothing connected yet</div></div>`}
       <//>
       <${Group} label="Add a connection">
@@ -197,6 +197,11 @@ function useCatalog() {
   return cat;
 }
 
+// The Google APIs the setup turns on, one link each (for when the combined
+// link misses some).
+const GOOGLE_APIS = [['api_gmail', 'Gmail'], ['api_calendar', 'Calendar'], ['api_drive', 'Drive'], ['api_youtube', 'YouTube'],
+  ['api_docs', 'Docs'], ['api_sheets', 'Sheets'], ['api_slides', 'Slides'], ['api_forms', 'Forms'], ['api_tasks', 'Tasks'], ['api_people', 'Contacts (People API)']];
+
 function GoogleSetup({ entry, con }) {
   useStore();
   const [setup, setSetup] = useState(null);
@@ -263,7 +268,7 @@ function GoogleSetup({ entry, con }) {
       autocomplete="off" autocapitalize="off" spellcheck=${false} aria-describedby="google-project-help"
       onInput=${(e) => { setProject(e.target.value); setError(''); }} />
     <small id="google-project-help" class="mu">Paste the ID, or the Google Console page’s address.</small>`;
-  return html`<${Page} title=${title} sub="One setup for Gmail, Calendar, Drive and YouTube read-only." onBack=${back}>
+  return html`<${Page} title=${title} sub="One setup for Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts and YouTube read-only." onBack=${back}>
     ${error && html`<p class="err-line" role="alert">${error}</p>`}
     ${!p ? html`<${Spinner} />${error && html`<button class="b2 wide" onClick=${reload}>Try again</button>`}` : html`
       <div class="wizard-progress" aria-label=${p.phase === 'setup' ? `Step ${p.step} of 6` : p.phase === 'sign_in' ? 'Setup complete. Sign in with Google.' : 'Connected'}>
@@ -272,11 +277,17 @@ function GoogleSetup({ entry, con }) {
       </div>
       ${p.error && html`<div class="warn-box" role="alert">${p.error.message}</div>`}
       ${entry.missing?.length > 0 && p.phase === 'sign_in' && html`<div class="warn-box">I need the Google helper installed on my server before I can use this connection. Ask whoever runs your Iris server to install uv.</div>`}
-      ${p.phase === 'connected' ? html`<div class="ok-line"><${Icon} name="check" /> Connected ✓</div><p>Gmail, Calendar, Drive and YouTube read-only are ready. ${agentName()} uses your approval rules for Google actions.</p>
+      ${p.phase === 'connected' && p.more_access ? html`<div class="ok-line"><${Icon} name="check" /> Connected ✓</div>
+        <p>Google works as before. I can now also use Docs, Sheets, Slides, Forms, Tasks and Contacts.</p>
+        <p>First turn on the new services in your Google project (it's fine that some are already on):</p>${open('apis', 'Turn on Google services')}
+        <p>Then sign in again and leave every box checked.</p>
+        ${con ? html`<${ServiceSignIn} con=${con} label="Google" onDone=${reload} />` : html`<${Spinner} />`}
+        <button class="b2 wide gap" onClick=${() => go('iris/connections', true)}>Not now</button>`
+      : p.phase === 'connected' ? html`<div class="ok-line"><${Icon} name="check" /> Connected ✓</div><p>Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts and YouTube read-only are ready. ${agentName()} uses your approval rules for Google actions.</p>
         <button class="b1 wide" onClick=${() => go('iris/connections', true)}>Done</button>
         <button class="b2 wide gap" disabled=${busy} onClick=${() => advance(6)}>Replace login key</button>`
-      : p.phase === 'sign_in' ? html`<p>Google asks your permission so I can use all four services with your approval rules.</p>
-        <p>“Google hasn't verified this app” is expected for your own private app. Tap <b>Advanced → Go to Iris</b>, then approve access to all four services.</p>
+      : p.phase === 'sign_in' ? html`<p>Google asks your permission so I can use every service with your approval rules.</p>
+        <p>“Google hasn't verified this app” is expected for your own private app. Tap <b>Advanced → Go to Iris</b>, then approve access and leave every box checked.</p>
         ${!setup.redirect_uri ? html`<div class="warn-box">I need my server’s HTTPS address set first.</div><button class="b1 wide" onClick=${() => advance(4)}>Set up HTTPS</button>` : con ? html`<${ServiceSignIn} con=${con} label="Google" onDone=${reload} />` : html`<${Spinner} />`}
         <details class="alt"><summary>Google showed a problem</summary><p>If Google stopped before returning here, choose what its page says:</p>
           ${[['redirect_uri_mismatch', 'Callback address doesn’t match'], ['access_denied', 'Access denied'], ['invalid_client', 'Invalid login key'], ['unauthorized_client', 'Wrong kind of login key']].map(([code, label]) => html`<button class="b2 wide gap" disabled=${busy} onClick=${() => report(code)}>${label}</button>`)}
@@ -291,10 +302,10 @@ function GoogleSetup({ entry, con }) {
           <form class="form" onSubmit=${(e) => { e.preventDefault(); advance(2, false, project); }}>
             ${projectField}<button class="b1 wide gap" disabled=${busy || !project.trim()}>${busy ? 'Saving…' : 'Save Project ID and continue'}</button>
           </form>`}
-        ${p.step === 2 && html`<p>Turning these on lets Iris use your mail, calendar, files and YouTube subscriptions.</p>
-          <p>Turn on all four services together.</p>${open('apis')}
-          <details class="alt"><summary>Didn't turn on all four?</summary><p>Open each one and tap <b>Enable</b>:</p>
-            ${[['api_gmail', 'Gmail'], ['api_calendar', 'Calendar'], ['api_drive', 'Drive'], ['api_youtube', 'YouTube']].map(([k, l]) => html`<${ExternalLink} url=${pages[k]} cls="b2 wide gap">${l}<//>`)}</details>`}
+        ${p.step === 2 && html`<p>Turning these on lets Iris use your mail, calendar, files, documents, spreadsheets, slides, forms, tasks, contacts and YouTube subscriptions.</p>
+          <p>Turn on all ten services together.</p>${open('apis')}
+          <details class="alt"><summary>Didn't turn on all ten?</summary><p>Open each one and tap <b>Enable</b>:</p>
+            ${GOOGLE_APIS.map(([k, l]) => html`<${ExternalLink} url=${pages[k]} cls="b2 wide gap">${l}<//>`)}</details>`}
         ${p.step === 3 && html`<p>This tells Google what to show when you sign in to your own app.</p>
           <p>On <b>Branding</b>, fill all three required fields:</p>
           <ul>
@@ -499,6 +510,9 @@ export function ConnectorPage({ id }) {
   return html`<${Page} title=${label} sub=${con.oauth?.account ? `Connected as ${con.oauth.account}` : con.description || 'A connected service'}>
     ${con.paused && html`<div class="warn-box"><b>Paused.</b> I stopped using ${label} because ${con.paused_reason}. Check the recent activity below, then resume it if everything looks right.
       <div class="act"><button class="b1 sm" onClick=${resume}>Resume</button></div></div>`}
+    ${!needsSignIn && con.enabled && con.oauth?.needs_more_access && html`<div class="card-x wide-card"><b>Google can do more now</b>
+      <p>Sign in again to add Docs, Sheets, Slides, Forms, Tasks and Contacts. Everything you use today keeps working until then.</p>
+      <div class="act"><button onClick=${() => go('iris/connections/add/google')}>Add Google services</button></div></div>`}
     ${needsSignIn && con.enabled && html`<div class="card-x wide-card"><b>${con.auth_state === 'needs_reconnect' ? `Sign in to ${label} again` : `Sign in to ${label}`}</b>
       <p>${con.auth_state === 'needs_reconnect' ? 'The sign-in expired or was revoked.' : 'One more step: approve access on its own page.'}</p>
       <${ServiceSignIn} con=${con} label=${label} onDone=${() => loadConnectors()} /></div>`}
