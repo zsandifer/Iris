@@ -313,6 +313,7 @@ span.fav { display: inline-block; overflow: hidden; }
 .tap-gl { background: none; border: 0; padding: 0; }
 .gnote { color: var(--mu); font-size: 12px; margin: 6px 4px 0; }
 .grp { background: var(--sf); border: 1px solid var(--ln); border-radius: 18px; padding: 0 12px; }
+.grp + .grp { margin-top: 18px; }
 .r { display: flex; align-items: center; gap: 11px; padding: 11px 0; border-bottom: 1px solid var(--ln); min-height: 50px; }
 .r:last-child { border-bottom: 0; }
 .r.tap { cursor: pointer; }
