@@ -510,7 +510,7 @@ function PermissionRow({ a, onChoose, disabled }) {
 function PermissionSections({ perms, con, onSaved, disabled }) {
   const choose = async (a, choice) => {
     try {
-      const r = await put(`/connectors/${seg(con.id)}/policy`, { tools: { [a.id]: ruleFor(choice, a.default) } });
+      const r = await put(`/connectors/${seg(con.id)}/policy`, { tools: { [a.id]: ruleFor(choice) } });
       onSaved(r.connector);
     } catch (e) { toast(e.message); }
   };
@@ -553,11 +553,18 @@ export function ConnectorPage({ id, part = null }) {
   const saved = (c) => { replace(c); loadPerms(); };
   const needsSignIn = con.oauth && con.auth_state !== 'ok';
   const account = perms?.account || con.oauth?.account;
-  const serviceOn = svc ? !(con.policy?.off || []).includes(svc) : con.enabled;
+  const partOff = svc && (con.policy?.off || []).includes(svc);
+  const serviceOn = con.enabled && !partOff;
+  const turnOn = async () => {
+    try { replace((await post(`/connectors/${seg(id)}/connect`)).connector); } catch (e) { toast(e.message); }
+  };
   const toggle = async (on) => {
     try {
-      if (svc) saved((await put(`/connectors/${seg(id)}/policy`, { services: { [svc]: on } })).connector);
-      else replace((await post(`/connectors/${seg(id)}/${on ? 'connect' : 'disconnect'}`)).connector);
+      if (svc) {
+        // Turning a Google service on also turns the Google connection on.
+        if (on && !con.enabled) replace((await post(`/connectors/${seg(id)}/connect`)).connector);
+        if (on === partOff) saved((await put(`/connectors/${seg(id)}/policy`, { services: { [svc]: on } })).connector);
+      } else replace((await post(`/connectors/${seg(id)}/${on ? 'connect' : 'disconnect'}`)).connector);
     } catch (e) { toast(e.message); }
   };
   const resume = async () => {
@@ -587,6 +594,8 @@ export function ConnectorPage({ id, part = null }) {
 
   return html`<${Page} title=${null}>
     <${Hero} c=${tileFor} title=${label} sub=${sub} />
+    ${svc && !con.enabled && html`<div class="warn-box"><b>Google is off.</b> ${agentName()} isn't using any Google service right now.
+      <div class="act"><button class="b1 sm" onClick=${turnOn}>Turn Google on</button></div></div>`}
     ${con.paused && html`<div class="warn-box"><b>Paused.</b> I stopped using ${labelOf(con)} because ${con.paused_reason}. Check the recent activity below, then resume it if everything looks right.
       <div class="act"><button class="b1 sm" onClick=${resume}>Resume</button></div></div>`}
     ${!needsSignIn && con.enabled && con.oauth?.needs_more_access && html`<div class="card-x wide-card"><b>Google can do more now</b>

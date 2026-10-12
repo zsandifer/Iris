@@ -36,12 +36,11 @@ test('rows say View once connected and open the right screen', () => {
   assert.equal(rowTarget({ service: 'google', part: 'drive', connector_id: null }), 'iris/connections/add/google');
 });
 
-test('choosing what the rules already do clears the override; off is stored as block', () => {
-  assert.equal(ruleFor('ask', 'ask'), null);
-  assert.equal(ruleFor('allow', 'ask'), 'allow');
-  assert.equal(ruleFor('off', 'ask'), 'block');
-  assert.equal(ruleFor('ask', 'allow'), 'ask');
-  assert.equal(ruleFor('allow', 'allow'), null);
+test('a choice is always saved as an explicit rule; off is stored as block', () => {
+  // Ask over an "ask unless trusted" default must still ask for trusted people.
+  assert.equal(ruleFor('ask'), 'ask');
+  assert.equal(ruleFor('allow'), 'allow');
+  assert.equal(ruleFor('off'), 'block');
 });
 
 test('every catalog service and Google part has a local tile', () => {

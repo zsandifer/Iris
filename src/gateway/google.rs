@@ -26,6 +26,9 @@ pub struct Action {
     /// The riskiest thing it does: decides its section (reads, or writes
     /// and deletes) and its default.
     pub category: Category,
+    /// Another kind of call it covers whose default may differ (creating a
+    /// label is a change, deleting one a deletion).
+    pub also: Option<Category>,
 }
 
 /// One Google service, shown as its own row and permission screen.
@@ -41,6 +44,14 @@ const fn a(id: &'static str, label: &'static str, category: Category) -> Action 
         id,
         label,
         category,
+        also: None,
+    }
+}
+
+const fn a2(id: &'static str, label: &'static str, category: Category, also: Category) -> Action {
+    Action {
+        also: Some(also),
+        ..a(id, label, category)
     }
 }
 
@@ -58,8 +69,18 @@ pub const SERVICES: &[Service] = &[
             a("gmail.send", "Send, reply to and forward email", Send),
             a("gmail.organize", "Label, archive and mark email", Write),
             a("gmail.trash", "Move email to the trash", Delete),
-            a("gmail.labels", "Create, edit and delete labels", Delete),
-            a("gmail.filters", "Create, edit and delete filters", Delete),
+            a2(
+                "gmail.labels",
+                "Create, edit and delete labels",
+                Delete,
+                Write,
+            ),
+            a2(
+                "gmail.filters",
+                "Create, edit and delete filters",
+                Delete,
+                Write,
+            ),
             a(
                 "gmail.forward_filters",
                 "Filters that forward email to someone",
@@ -114,11 +135,12 @@ pub const SERVICES: &[Service] = &[
     Service {
         id: "docs",
         label: "Google Docs",
-        description: "Read, write and edit documents",
+        description: "Read, write, edit and comment on documents",
         actions: &[
             a("docs.read", "Read documents", Read),
             a("docs.create", "Create documents and PDFs", Write),
-            a("docs.edit", "Edit documents", Write),
+            a2("docs.edit", "Edit documents", Write, Delete),
+            a("docs.comments", "Comment on documents", Send),
         ],
     },
     Service {
@@ -128,7 +150,8 @@ pub const SERVICES: &[Service] = &[
         actions: &[
             a("sheets.read", "Read spreadsheets", Read),
             a("sheets.create", "Create spreadsheets", Write),
-            a("sheets.edit", "Edit spreadsheets", Write),
+            a2("sheets.edit", "Edit spreadsheets", Write, Delete),
+            a("sheets.comments", "Comment on spreadsheets", Send),
         ],
     },
     Service {
@@ -139,6 +162,7 @@ pub const SERVICES: &[Service] = &[
             a("slides.read", "Read presentations", Read),
             a("slides.create", "Create presentations", Write),
             a("slides.edit", "Edit presentations", Write),
+            a("slides.comments", "Comment on presentations", Send),
         ],
     },
     Service {
@@ -223,7 +247,13 @@ const TOOLS: &[(&str, &str, &[&str])] = &[
     (
         "manage_gmail_filter",
         "gmail",
-        &["gmail.filters", "gmail.forward_filters"],
+        &[
+            "gmail.filters",
+            "gmail.forward_filters",
+            "gmail.trash",
+            "gmail.organize",
+            "gmail.labels.read",
+        ],
     ),
     // Calendar
     ("list_calendars", "calendar", &["calendar.calendars.read"]),
@@ -304,6 +334,8 @@ const TOOLS: &[(&str, &str, &[&str])] = &[
     ("create_table_with_data", "docs", &["docs.edit"]),
     ("update_paragraph_style", "docs", &["docs.edit"]),
     ("manage_doc_tab", "docs", &["docs.edit"]),
+    ("list_document_comments", "docs", &["docs.read"]),
+    ("manage_document_comment", "docs", &["docs.comments"]),
     // Sheets
     ("list_spreadsheets", "sheets", &["sheets.read"]),
     ("get_spreadsheet_info", "sheets", &["sheets.read"]),
@@ -323,12 +355,20 @@ const TOOLS: &[(&str, &str, &[&str])] = &[
         "sheets",
         &["sheets.read", "sheets.edit"],
     ),
+    ("list_spreadsheet_comments", "sheets", &["sheets.read"]),
+    ("manage_spreadsheet_comment", "sheets", &["sheets.comments"]),
     // Slides
     ("get_presentation", "slides", &["slides.read"]),
     ("get_page", "slides", &["slides.read"]),
     ("get_page_thumbnail", "slides", &["slides.read"]),
     ("create_presentation", "slides", &["slides.create"]),
     ("batch_update_presentation", "slides", &["slides.edit"]),
+    ("list_presentation_comments", "slides", &["slides.read"]),
+    (
+        "manage_presentation_comment",
+        "slides",
+        &["slides.comments"],
+    ),
     // Forms
     ("get_form", "forms", &["forms.read"]),
     ("get_form_response", "forms", &["forms.responses"]),
@@ -444,21 +484,98 @@ fn has_key(v: Option<&Value>, needle: &str) -> bool {
     }
 }
 
+/// The arguments as the server sees them: it renames a camelCase key to
+/// its snake_case parameter (`addLabelIds` -> `add_label_ids`) unless the
+/// snake_case key is also given or two keys would collide.
+fn server_arguments(args: &Value) -> Value {
+    let Some(o) = args.as_object() else {
+        return args.clone();
+    };
+    let renames: Vec<(String, String)> = o
+        .keys()
+        .filter_map(|k| {
+            let snake = snake_case(k);
+            (snake != *k && !o.contains_key(&snake)).then(|| (k.clone(), snake))
+        })
+        .collect();
+    let mut out = o.clone();
+    for (k, snake) in &renames {
+        if renames.iter().filter(|(_, s)| s == snake).count() == 1
+            && let Some(v) = out.remove(k)
+        {
+            out.insert(snake.clone(), v);
+        }
+    }
+    Value::Object(out)
+}
+
+/// The server's `to_snake_case`: a boundary before an uppercase letter that
+/// follows a lowercase letter or digit, or that ends an acronym run before
+/// a new word; then lowercase.
+fn snake_case(name: &str) -> String {
+    let c: Vec<char> = name.chars().collect();
+    let mut out = String::new();
+    for (i, ch) in c.iter().enumerate() {
+        if i > 0 && ch.is_ascii_uppercase() {
+            let prev = c[i - 1];
+            let next_lower = c.get(i + 1).is_some_and(|n| n.is_ascii_lowercase());
+            if prev.is_ascii_lowercase()
+                || prev.is_ascii_digit()
+                || (prev.is_ascii_uppercase() && next_lower)
+            {
+                out.push('_');
+            }
+        }
+        out.extend(ch.to_lowercase());
+    }
+    out
+}
+
+/// Label ids in a list argument (an array, a JSON array string, or a
+/// comma-separated string), lowercased.
+fn label_tokens(v: Option<&Value>) -> Vec<String> {
+    let items: Vec<Value> = match v {
+        Some(Value::Array(a)) => a.clone(),
+        Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
+            Ok(Value::Array(a)) => a,
+            _ => s.split(',').map(|t| Value::String(t.into())).collect(),
+        },
+        _ => Vec::new(),
+    };
+    items
+        .iter()
+        .map(|x| match x {
+            Value::String(t) => t.trim().to_ascii_lowercase(),
+            other => other.to_string(),
+        })
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
 /// What one call does: each action it performs, with the call's category
 /// for that action. `None` when the tool or an argument value that chooses
 /// what it does is unknown (the caller falls back to the general
 /// classification).
 pub fn call_actions(name: &str, args: &Value) -> Option<Vec<(&'static str, Category)>> {
     let (_, _, actions) = tool(name)?;
+    let args = &server_arguments(args);
     let one = |id: &'static str, c: Category| Some(vec![(id, c)]);
     let act = || selector(args, "action");
     match name {
         "modify_gmail_message_labels" | "batch_modify_gmail_message_labels" => {
-            if mentions(args.get("add_label_ids"), "trash") {
-                one("gmail.trash", Delete)
-            } else {
-                one("gmail.organize", Write)
+            let add = args.get("add_label_ids");
+            let mut out = Vec::new();
+            if mentions(add, "trash") {
+                out.push(("gmail.trash", Delete));
             }
+            // Any other label change is organizing (with or without trash).
+            if out.is_empty()
+                || given(args, "remove_label_ids")
+                || label_tokens(add).iter().any(|t| t != "trash")
+            {
+                out.push(("gmail.organize", Write));
+            }
+            Some(out)
         }
         "manage_gmail_label" => match act()?.as_str() {
             "create" | "update" => one("gmail.labels", Write),
@@ -467,16 +584,39 @@ pub fn call_actions(name: &str, args: &Value) -> Option<Vec<(&'static str, Categ
         },
         "manage_gmail_filter" => {
             let a = act()?;
-            let forwards = has_key(args.get("filter_action"), "forward");
+            let fa = args.get("filter_action");
+            // Without a new action, the server keeps (update) or applies
+            // (apply by filter_id) the saved one, which Iris cannot see.
+            let unseen = !given(args, "filter_action");
+            let forwards = unseen || has_key(fa, "forward");
+            let trashes = unseen || mentions(fa, "trash");
+            let mut out = Vec::new();
             match a.as_str() {
-                "create" | "update" if forwards => Some(vec![
-                    ("gmail.filters", Write),
-                    ("gmail.forward_filters", Send),
-                ]),
-                "create" | "update" | "apply" => one("gmail.filters", Write),
-                "delete" => one("gmail.filters", Delete),
-                _ => None,
+                "create" | "update" => {
+                    out.push(("gmail.filters", Write));
+                    if forwards {
+                        out.push(("gmail.forward_filters", Send));
+                    }
+                    if trashes {
+                        out.push(("gmail.trash", Delete));
+                    }
+                }
+                // Counting matches changes nothing.
+                "apply" if args.get("dry_run") == Some(&Value::Bool(true)) => {
+                    out.push(("gmail.labels.read", Read));
+                }
+                // Applying changes labels on mail already in the mailbox.
+                "apply" => {
+                    out.push(("gmail.filters", Write));
+                    out.push(("gmail.organize", Write));
+                    if trashes {
+                        out.push(("gmail.trash", Delete));
+                    }
+                }
+                "delete" => out.push(("gmail.filters", Delete)),
+                _ => return None,
             }
+            Some(out)
         }
         "manage_event" => {
             let guests = given(args, "attendees");
@@ -487,6 +627,11 @@ pub fn call_actions(name: &str, args: &Value) -> Option<Vec<(&'static str, Categ
                 "create" => one("calendar.events.create", Write),
                 "update" if guests || !silent => one("calendar.events.notify", Send),
                 "update" => one("calendar.events.update", Write),
+                // Google tells guests an event was cancelled, too.
+                "delete" if !silent => Some(vec![
+                    ("calendar.events.delete", Delete),
+                    ("calendar.events.notify", Send),
+                ]),
                 "delete" => one("calendar.events.delete", Delete),
                 "rsvp" => one("calendar.events.rsvp", Send),
                 _ => None,
@@ -526,6 +671,13 @@ pub fn call_actions(name: &str, args: &Value) -> Option<Vec<(&'static str, Categ
         "manage_drive_access" => match act()?.as_str() {
             "grant" | "grant_batch" | "update" | "transfer_owner" => one("drive.share", Send),
             "revoke" => one("drive.share", Delete),
+            _ => None,
+        },
+        // Comments are seen by everyone the file is shared with.
+        "manage_document_comment"
+        | "manage_spreadsheet_comment"
+        | "manage_presentation_comment" => match act()?.as_str() {
+            "create" | "reply" | "resolve" => one(actions[0], Send),
             _ => None,
         },
         "manage_doc_tab" => match act()?.as_str() {
@@ -680,6 +832,13 @@ mod tests {
         "get_contact_group",
         "manage_contacts_batch",
         "manage_contact_group",
+        // Registered by core/comments.py's create_comment_tools.
+        "list_document_comments",
+        "manage_document_comment",
+        "list_spreadsheet_comments",
+        "manage_spreadsheet_comment",
+        "list_presentation_comments",
+        "manage_presentation_comment",
     ];
 
     #[test]
@@ -812,6 +971,17 @@ mod tests {
         );
         assert_eq!(
             c("manage_event", json!({"action": "delete"})),
+            Some(vec![
+                ("calendar.events.delete", Delete),
+                ("calendar.events.notify", Send)
+            ]),
+            "Google tells guests about a cancellation by default"
+        );
+        assert_eq!(
+            c(
+                "manage_event",
+                json!({"action": "delete", "send_updates": "none"})
+            ),
             Some(vec![("calendar.events.delete", Delete)])
         );
         assert_eq!(
@@ -868,8 +1038,41 @@ mod tests {
                 "batch_modify_gmail_message_labels",
                 json!({"message_ids": ["m"], "add_label_ids": "STARRED,trash"})
             ),
+            Some(vec![("gmail.trash", Delete), ("gmail.organize", Write)])
+        );
+        assert_eq!(
+            c(
+                "modify_gmail_message_labels",
+                json!({"message_id": "m", "add_label_ids": ["TRASH"]})
+            ),
             Some(vec![("gmail.trash", Delete)])
         );
+        // camelCase keys the server renames count the same.
+        assert_eq!(
+            c(
+                "modify_gmail_message_labels",
+                json!({"messageId": "m", "addLabelIds": "[\"TRASH\"]"})
+            ),
+            Some(vec![("gmail.trash", Delete)])
+        );
+        assert_eq!(
+            c(
+                "update_drive_file",
+                json!({"fileId": "f", "writersCanShare": true})
+            ),
+            Some(vec![("drive.share", Send)])
+        );
+        assert_eq!(
+            c(
+                "manage_event",
+                json!({"action": "create", "summary": "x", "Attendees": ["a@example.com"]})
+            ),
+            Some(vec![("calendar.events.invite", Send)]),
+            "the server renames it to attendees too"
+        );
+        assert_eq!(snake_case("timeMin"), "time_min");
+        assert_eq!(snake_case("fooURLValue"), "foo_url_value");
+        assert_eq!(snake_case("iCalUID"), "i_cal_uid");
         assert_eq!(
             c(
                 "modify_gmail_message_labels",
@@ -895,6 +1098,75 @@ mod tests {
             ),
             Some(vec![("gmail.filters", Write)])
         );
+        // Filters that trash mail, saved actions Iris cannot see, and
+        // applying filters to mail already in the mailbox.
+        assert_eq!(
+            c(
+                "manage_gmail_filter",
+                json!({"action": "create", "filter_action": {"addLabelIds": ["TRASH"]}})
+            ),
+            Some(vec![("gmail.filters", Write), ("gmail.trash", Delete)])
+        );
+        assert_eq!(
+            c(
+                "manage_gmail_filter",
+                json!({"action": "update", "filter_id": "f1", "criteria": {"from": "x@example.com"}})
+            ),
+            Some(vec![
+                ("gmail.filters", Write),
+                ("gmail.forward_filters", Send),
+                ("gmail.trash", Delete)
+            ])
+        );
+        assert_eq!(
+            c(
+                "manage_gmail_filter",
+                json!({"action": "apply", "filter_id": "f1"})
+            ),
+            Some(vec![
+                ("gmail.filters", Write),
+                ("gmail.organize", Write),
+                ("gmail.trash", Delete)
+            ])
+        );
+        assert_eq!(
+            c(
+                "manage_gmail_filter",
+                json!({"action": "apply", "criteria": {}, "filter_action": {"addLabelIds": ["L1"]}})
+            ),
+            Some(vec![("gmail.filters", Write), ("gmail.organize", Write)])
+        );
+        assert_eq!(
+            c(
+                "manage_gmail_filter",
+                json!({"action": "apply", "filter_id": "f1", "dry_run": true})
+            ),
+            Some(vec![("gmail.labels.read", Read)])
+        );
+        assert_eq!(
+            c(
+                "manage_gmail_filter",
+                json!({"action": "apply", "filter_id": "f1", "dry_run": "true"})
+            ),
+            Some(vec![
+                ("gmail.filters", Write),
+                ("gmail.organize", Write),
+                ("gmail.trash", Delete)
+            ]),
+            "only a real true is trusted as a dry run"
+        );
+        // Comments reach everyone the file is shared with.
+        assert_eq!(
+            c(
+                "manage_document_comment",
+                json!({"document_id": "d", "action": "reply", "comment_id": "c"})
+            ),
+            Some(vec![("docs.comments", Send)])
+        );
+        assert_eq!(
+            c("list_spreadsheet_comments", json!({"spreadsheet_id": "s"})),
+            Some(vec![("sheets.read", Read)])
+        );
         // The server accepts the object as a JSON string too.
         assert_eq!(
             c(
@@ -908,7 +1180,10 @@ mod tests {
         );
         // Python's strip() also removes these separators.
         assert_eq!(
-            c("manage_event", json!({"action": "\u{1c}DELETE\u{3000}"})),
+            c(
+                "manage_event",
+                json!({"action": "\u{1c}DELETE\u{3000}", "send_updates": "none"})
+            ),
             Some(vec![("calendar.events.delete", Delete)])
         );
         // Lists inside multi-purpose tools are reads.

@@ -79,11 +79,11 @@ export function rowTarget(row) {
 export const CHOICE_LABEL = { allow: 'Allow', ask: 'Ask', off: 'Off' };
 
 /**
- * The rule to save for a picker choice. Choosing what the rules already do
- * removes the override (null), so "ask unless trusted" defaults keep
- * working; otherwise "off" is stored as "block".
+ * The rule to save for a picker choice: always an explicit override ("off"
+ * is stored as "block"). A default that shows as Ask can still let some
+ * calls run (sends only to trusted people, or the milder calls an action
+ * groups), so choosing Ask must store Ask.
  */
-export function ruleFor(choice, def) {
-  if (choice === def) return null;
+export function ruleFor(choice) {
   return choice === 'off' ? 'block' : choice;
 }

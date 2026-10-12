@@ -1487,11 +1487,19 @@ by their real arguments: `manage_event` with `action: "create"` is
 "Create events", or "Create events with invitations" when it has
 `attendees`; `action: "update"` is "Update events and notify guests" unless
 `send_updates` is `"none"` and no attendees are given (Google tells guests
-by default); `update_drive_file` with `trashed: true` is "Move files to the
+by default), and deleting also notifies guests unless `send_updates` is
+`"none"`; `update_drive_file` with `trashed: true` is "Move files to the
 trash" and with sharing settings "Share files"; Gmail labels that add
-`TRASH` are "Move email to the trash"; filters with a `forward` action are
-"Filters that forward email to someone". A call that performs several
-actions needs every one of them allowed. A tool or argument value the table
+`TRASH` are "Move email to the trash" (other label changes in the same call
+are also "Label, archive and mark email"); filters with a `forward` or
+`TRASH` action also need "Filters that forward email to someone" or "Move
+email to the trash", as does updating or applying a filter without giving
+its action (the server keeps or applies the saved one); applying a filter
+also changes labels on existing mail; comments on Docs, Sheets and Slides
+are their own "Comment on ..." actions. Arguments are read the way the
+server reads them (it accepts `addLabelIds` for `add_label_ids`, JSON
+strings for objects and lists, and strips and lowercases `action`). A call
+that performs several actions needs every one of them allowed. A tool or argument value the table
 does not know (`action: "purge"`, a newer server's tool) is classified as
 above under its tool name, which asks for anything it cannot place. The
 owner's rule for an action (`allow`, `ask`, `block`) is stored in the
@@ -1686,7 +1694,10 @@ service reported when signing in (the OpenID email), or null. `rule` is the
 owner's override (`allow`, `ask`, `block`) or null; `value` is what happens
 now and `default` what happens without the override (`allow`, `ask`, `off`).
 Purchases and actions Iris cannot place leave `allow` out of `choices`
-(they always ask). Sections without actions are left out. If the server
+(they always ask). A `note` also says when the starting rules treat the
+kinds of call a grouped action covers differently. The app saves every
+choice as an explicit rule (choosing Ask over an "asks unless trusted"
+default stores `ask`, which asks even for trusted people). Sections without actions are left out. If the server
 cannot start: `"sections": [], "error": "...", "detail": "..."`.
 
 #### `POST /api/connectors/{id}/oauth/sign-out`

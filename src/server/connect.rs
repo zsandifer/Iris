@@ -623,14 +623,23 @@ async fn permissions(
         let s = google::service(svc)
             .filter(|_| con.service == "google")
             .ok_or_else(|| ApiError::not_found("service"))?;
+        use crate::gateway::policy::effect;
         let rows = s
             .actions
             .iter()
             .map(|a| {
-                (
-                    matches!(a.category, Category::Read | Category::Export),
-                    permission_row(&con.policy, a.id, a.label, "", a.category),
-                )
+                let mut row = permission_row(&con.policy, a.id, a.label, "", a.category);
+                // Without the owner's choice, the starting rules may treat
+                // the kinds of call it groups differently.
+                if let Some(also) = a.also
+                    && row["rule"].is_null()
+                    && effect(&con.policy, a.id, also) != effect(&con.policy, a.id, a.category)
+                {
+                    row["note"] = "Some of these run on their own and some ask, under your \
+                                   starting rules"
+                        .into();
+                }
+                (matches!(a.category, Category::Read | Category::Export), row)
             })
             .collect();
         return ok(json!({
@@ -2871,6 +2880,22 @@ mod tests {
         assert_eq!(invite["value"], "ask");
         assert!(invite["note"].as_str().unwrap().contains("trust"));
         assert_eq!(invite["choices"], json!(["allow", "ask", "off"]));
+
+        // Under starting rules where label edits run but deletions ask, the
+        // grouped row says so.
+        let policy = format!("/api/connectors/{id}/policy");
+        call(&a, "PUT", &policy, Some(json!({"mode": "standard"}))).await;
+        let (_, v) = call(&a, "GET", &perms("gmail"), None).await;
+        assert!(
+            row(&v, "gmail.labels")["note"]
+                .as_str()
+                .unwrap()
+                .contains("Some of these")
+        );
+        assert!(row(&v, "gmail.trash")["note"].is_null());
+        call(&a, "PUT", &policy, Some(json!({"mode": "careful"}))).await;
+        let (_, v) = call(&a, "GET", &perms("gmail"), None).await;
+        assert!(row(&v, "gmail.labels")["note"].is_null());
 
         // Rules and the service switch.
         let (s, v) = call(
