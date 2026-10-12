@@ -89,8 +89,9 @@ own personality. It is not a clone.
   Google errors point to the step to fix. One Google sign-in lights up Gmail,
   Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts and YouTube
   read-only; a connection from before the newer services shows “Sign in
-  again to add Docs, Sheets and more”. Notion, Todoist, Linear and
-  Canva are one Connect button, then approve on the service's page.
+  again to add Docs, Sheets and more”. One-tap services (Notion, Todoist,
+  Linear, Sentry, Stripe and more) are one Connect button, then approve on
+  the service's page.
   Installing
   a new engine works the same way: install → sign-in card → done. Engines
   that sign in with an API key (Gemini, OpenCode providers) get a key field
@@ -142,14 +143,19 @@ own personality. It is not a clone.
 
 ## Iris hub
 
-- **Connections:** connected services with plain-language rules ("Reads
-  freely · asks before sending, buying, or deleting"), a small catalog to
-  connect (Google, GitHub, Custom MCP server) with step-by-step guides and
-  sign-in on the service's own page, and Trusted people. Each connection
-  has an On switch, its rules (four plain choices), its actions (each can
-  be set to run, ask, or never), recent use, Sign in again (shows the
-  account), its sign-in app, and advanced settings. A connection a
-  tripwire paused shows why, with Resume.
+- **Connections:** the catalog in groups (Productivity, Development, Money,
+  Lifestyle), each showing its top five with "See all ›"; every row is an
+  icon, a name, and View (connected) or Connect. Google shows as its
+  services (Gmail, Google Calendar, Drive, Docs, Sheets, Slides, Forms,
+  Tasks, Contacts, YouTube), all one connection; Custom and Trusted people
+  come last. Tapping a service opens its permission screen: the icon, name
+  and description, Disconnect, the signed-in account (Use another
+  account), a switch to stop using that service, then "Read permissions"
+  and "Write and delete permissions", each action in plain words with an
+  Allow / Ask / Off picker (reads allow; changes, sends, and anything that
+  invites or notifies people ask). A connection's own page adds recent
+  use, its starting rules, sign-in app, and advanced settings. A
+  connection a tripwire paused shows why, with Resume.
 - **Logins & wallet:** an encrypted store. The app explains that Iris can use
   these but never sees them. Cards always ask before paying.
 - **Iris's computer:** a live screen with Watch / Take over, recent activity,

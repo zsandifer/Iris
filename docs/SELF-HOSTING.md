@@ -532,8 +532,10 @@ out each tool call the CLI makes, nothing more.
 ## Connections and approvals
 
 Connections (MCP servers) give Iris your services: Google (Gmail, Calendar,
-Drive, Docs and more), GitHub, Notion, Todoist, Linear, Canva, or any MCP
-server. Add them in the app under Iris, Connections, or
+Drive, Docs and more), GitHub, one-tap services (Notion, Todoist, Linear,
+Sentry, Stripe and more), or any MCP server. They are grouped by
+Productivity, Development, Money and Lifestyle. Add them in the app under
+Iris, Connections, or
 just ask in chat ("help me set up Google"); Iris posts a Connect card that
 opens the step-by-step setup.
 
@@ -566,6 +568,18 @@ server's own hints, and the real arguments:
 - Buying or paying always asks. Deleting and bulk exports ask.
 - Anything else that reaches someone new (for example a calendar invite to a
   new address) asks; once you approve someone, they are no longer new.
+
+**Your choices per service.** Each service's page in Connections lists its
+actions in plain words, under "Read permissions" and "Write and delete
+permissions", each set to **Allow** (runs on its own), **Ask** (waits for
+your OK), or **Off** (Iris refuses it, and a tool whose every action is off
+is hidden from the AI). Purchases always ask. Google signs in once for
+every service, so Iris enforces these choices itself: each Google service
+(Gmail, Calendar, Drive...) has its own page and a switch to stop using it
+entirely, and actions are told apart by what a call really does (creating
+an event is not the same action as creating one that invites people, and
+updating an event notifies its guests unless the call says not to). Google
+starts with reads allowed and every change asking.
 
 Asking means Iris holds the call, posts an approval card built from the
 exact arguments (who, subject, the exact text, and the complete raw
@@ -679,10 +693,14 @@ elsewhere on your private network needs HTTPS to receive credentials.
   checked. Iris then turns on the new services. If you changed the Google
   server's arguments under Advanced settings, Iris leaves them as they are;
   add `docs sheets slides forms tasks contacts` after `--tools` yourself.
-- **Notion, Todoist, Linear, Canva**: one tap.
+- **One tap** (Notion, Todoist, Airtable, monday.com, Miro, Canva, Cal.com,
+  Granola, Fireflies, Zapier, Linear, Sentry, Cloudflare, Supabase,
+  Netlify, Neon, Hugging Face, Readwise, Stripe, Mercury):
   Iris connects to the service's own hosted MCP server, registers itself
   with the service, and you approve access on the service's page. Nothing to
-  create or paste. These start with “Reads freely · asks before any change”.
+  create or paste. These start with “Reads freely · asks before any change”;
+  Stripe and Mercury ask before every action. Disconnect signs Iris out and
+  keeps your choices, so connecting again is one sign-in.
   If Iris is not on HTTPS, you paste the address your browser ends on back
   into the app, as with any sign-in.
 - **GitHub** uses GitHub's remote MCP server with a fine-grained personal

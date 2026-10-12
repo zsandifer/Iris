@@ -175,8 +175,9 @@ Iris is **early** and moving fast. What works today:
 - ✅ Reconnect cards for Claude and Codex sign-ins; API keys for Gemini CLI
   and OpenCode from the app; installing and auto-updating engines from the
   app
-- ✅ Connections (Google Workspace, GitHub, one-tap Notion, Todoist, Linear
-  and Canva, any MCP server) through Iris's gateway:
+- ✅ Connections (Google Workspace, GitHub, one-tap Notion, Todoist, Linear,
+  Sentry, Supabase, Stripe and more, any MCP server) through Iris's gateway:
+  Allow / Ask / Off per action on each service's page,
   approval cards for sends, purchases, deletions and new recipients,
   trusted people, tripwires, Pause Iris and Disconnect everything
 - ✅ For you feed with stories, Ideas, Goals, Library, system file editing
