@@ -13,6 +13,8 @@
 //!   which some hosted providers reject).
 //! - Model/effort: `-m provider/model` and `--variant <effort>`.
 //! - Resume: `-s <session id>`. Images: `-f <file>`. Prompt on stdin.
+//! - Provider keys the owner added in the app arrive as the providers'
+//!   usual environment variables (`OPENROUTER_API_KEY`, ...).
 //! - Models: `opencode models --verbose` (provider/model header lines, each
 //!   followed by a pretty-printed JSON object with capabilities).
 
@@ -62,19 +64,43 @@ impl OpenCode {
 pub fn mcp_config(servers: &[super::McpServer]) -> Value {
     let mut map = Map::new();
     for s in servers {
-        let v = match &s.transport {
+        let mut v = match &s.transport {
             McpTransport::Stdio { command, args, env } => {
                 let mut cmd = vec![command.clone()];
                 cmd.extend(args.iter().cloned());
                 json!({"type": "local", "command": cmd, "environment": env, "enabled": true})
             }
-            McpTransport::Http { url, headers } => {
-                json!({"type": "remote", "url": url, "headers": headers, "enabled": true})
-            }
         };
+        if let Some(t) = s.timeout_secs {
+            // OpenCode 1.19 uses this for connecting, listing, and calls.
+            v["timeout"] = (t * 1000).into();
+        }
         map.insert(s.name.clone(), v);
     }
     Value::Object(map)
+}
+
+/// Keys the owner added in the app win over keys saved with `opencode auth
+/// login` (which OpenCode would otherwise load after the environment): the
+/// per-run config points each provider at Iris's variable. The values stay
+/// in the environment; the file only names them.
+pub fn provider_keys(key_env: &[String]) -> Value {
+    let mut map = Map::new();
+    for env in key_env {
+        if let Some(o) = crate::keys::option("opencode", env)
+            && !o.provider.is_empty()
+        {
+            map.insert(
+                o.provider.to_string(),
+                json!({"options": {"apiKey": format!("{{env:{env}}}")}}),
+            );
+        }
+    }
+    if map.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(map)
+    }
 }
 
 impl Harness for OpenCode {
@@ -99,12 +125,24 @@ impl Harness for OpenCode {
         let prompt_file = spec.run_dir.join(format!("{}.prompt.md", spec.turn_id));
         write_private_file(&prompt_file, spec.system_prompt.as_bytes())?;
         inv.temp_files.push(prompt_file.clone());
+        // OpenCode merges this file into its own config, so Iris's servers
+        // get names OpenCode itself does not use, and its own servers are
+        // switched off (they would bypass Iris's gateway).
+        let servers = super::unclaimed_servers(&spec.mcp_servers, &spec.own_mcp_servers);
+        let mut mcp = mcp_config(&servers);
+        for name in &spec.own_mcp_servers {
+            mcp[name] = json!({"enabled": false});
+        }
         let mut config = json!({
             "$schema": "https://opencode.ai/config.json",
             "instructions": [prompt_file.to_string_lossy()],
             "permission": self.permissions(&spec.writable_dirs),
-            "mcp": mcp_config(&spec.mcp_servers),
+            "mcp": mcp,
         });
+        let providers = provider_keys(&spec.key_env);
+        if !providers.is_null() {
+            config["provider"] = providers;
+        }
         if !spec.tools {
             // Every tool (built-in and MCP) off, and anything left denied.
             config["tools"] = json!({"*": false});
@@ -187,6 +225,21 @@ impl Harness for OpenCode {
 
     fn api_key_env(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// Names of servers configured in OpenCode itself, from its resolved
+    /// configuration (`opencode debug config`); the rest is discarded.
+    fn own_mcp_servers_args(&self) -> Option<Vec<String>> {
+        Some(vec!["debug".into(), "config".into()])
+    }
+
+    fn parse_own_mcp_servers(&self, stdout: &str) -> Option<Vec<String>> {
+        let start = stdout.find('{')?;
+        let v: Value = serde_json::from_str(&stdout[start..]).ok()?;
+        match v.get("mcp") {
+            None | Some(Value::Null) => Some(Vec::new()),
+            Some(m) => Some(m.as_object()?.keys().cloned().collect()),
+        }
     }
 
     fn models_probe_args(&self) -> Option<Vec<String>> {
@@ -670,8 +723,8 @@ anthropic/claude-haiku-4-5
     #[test]
     fn builds_invocation_with_private_config() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut headers = BTreeMap::new();
-        headers.insert("Authorization".to_string(), "Bearer s3cret".to_string());
+        let mut env = BTreeMap::new();
+        env.insert(crate::gateway::TOKEN_ENV.to_string(), "s3cret".to_string());
         let spec = TurnSpec {
             turn_id: "t1".into(),
             prompt: "--help me".into(),
@@ -691,13 +744,16 @@ anthropic/claude-haiku-4-5
                         args: vec!["mcp".into()],
                         env: BTreeMap::new(),
                     },
+                    timeout_secs: Some(420),
                 },
                 McpServer {
                     name: "web".into(),
-                    transport: McpTransport::Http {
-                        url: "https://mcp.example.com".into(),
-                        headers,
+                    transport: McpTransport::Stdio {
+                        command: "/bin/iris".into(),
+                        args: vec!["mcp-gateway".into()],
+                        env,
                     },
+                    timeout_secs: None,
                 },
             ],
             cwd: tmp.path().into(),
@@ -705,8 +761,9 @@ anthropic/claude-haiku-4-5
             run_dir: tmp.path().into(),
             scope: "c1".into(),
             tools: true,
+            key_env: vec!["OPENROUTER_API_KEY".into()],
             isolated: false,
-            own_mcp_servers: Vec::new(),
+            own_mcp_servers: vec!["mine".into()],
         };
         let inv = OpenCode::new(HarnessConfig::opencode_default())
             .build(&spec)
@@ -735,7 +792,31 @@ anthropic/claude-haiku-4-5
         assert!(!inv.env.iter().any(|(_, v)| v.contains("s3cret")));
         let cfg: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(cfg["mcp"]["iris"]["command"], json!(["/bin/iris", "mcp"]));
-        assert_eq!(cfg["mcp"]["web"]["type"], "remote");
+        assert_eq!(cfg["mcp"]["iris"]["timeout"], 420_000);
+        assert!(cfg["mcp"]["web"].get("timeout").is_none());
+        assert_eq!(cfg["mcp"]["web"]["type"], "local");
+        assert_eq!(cfg["mcp"]["mine"], json!({"enabled": false}));
+        // OpenCode has its own server named like one of Iris's: its own is
+        // off and Iris's is renamed rather than merged into it.
+        let mut clash = spec.clone();
+        clash.own_mcp_servers = vec!["web".into()];
+        let inv2 = OpenCode::new(HarnessConfig::opencode_default())
+            .build(&clash)
+            .unwrap();
+        let cfg2: Value = serde_json::from_slice(&std::fs::read(&inv2.env[0].1).unwrap()).unwrap();
+        assert_eq!(cfg2["mcp"]["web"], json!({"enabled": false}));
+        assert_eq!(cfg2["mcp"]["iris_web"]["type"], "local");
+        let oc = OpenCode::new(HarnessConfig::opencode_default());
+        assert_eq!(
+            oc.parse_own_mcp_servers("{\n  \"mcp\": {\"mine\": {\"type\": \"local\"}}\n}"),
+            Some(vec!["mine".to_string()])
+        );
+        assert_eq!(oc.parse_own_mcp_servers("{\"model\": \"x\"}"), Some(vec![]));
+        assert_eq!(oc.parse_own_mcp_servers("Error: no config"), None);
+        assert_eq!(
+            cfg["provider"]["openrouter"]["options"]["apiKey"],
+            "{env:OPENROUTER_API_KEY}"
+        );
         assert_eq!(cfg["permission"]["bash"], "ask");
         assert_eq!(cfg["permission"]["edit"], "allow");
         assert_eq!(

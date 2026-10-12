@@ -2,15 +2,16 @@
 // and the feed's sources screen. Posts come from the server's daily
 // pipeline (docs/API.md, "For you pipeline").
 import { html, useEffect, useRef, useState } from './h.js';
-import { get, post as apiPost, patch, del, seg } from './api.js';
-import { S, set, useStore, loadFeed, go, toast, isOwner } from './store.js';
+import { get, post as apiPost, patch, del, seg, sessionGen } from './api.js';
+import { S, set, useStore, loadFeed, go, toast, isOwner, touchList } from './store.js';
 import { Icon, Img, LetterTile, Empty, Spinner, Page, Group, Row, Toggle, ago, since, hostOf, safeUrl, agentName, confirmSheet } from './ui.js';
 import { md, plain } from './md.js';
+import { photoIsOpen } from './photo.js';
 
 // The local copies Iris cached (photos[i]) stand in for the originals.
 // The app is served over https, so plain-http originals are left out.
 const shown = (u) => typeof u === 'string' && (u.startsWith('/api/') || u.startsWith('https://'));
-const photos = (p) => (p.photos?.length ? p.photos : p.images?.length ? p.images : p.image_url ? [p.image_url] : []).filter(shown);
+export const photos = (p) => (Array.isArray(p.photos) ? p.photos : p.images?.length ? p.images : p.image_url ? [p.image_url] : []).filter(shown);
 const sourceName = (p) => p.source_name || hostOf(p.source_url) || 'For you';
 const STORY_MS = 7000;
 
@@ -32,6 +33,10 @@ export function topics(posts) {
 function markLiked(p, liked) {
   const swap = (x) => (x.id === p.id ? { ...x, liked } : x);
   const patch = {};
+  // Refreshes already in flight predate this; the server's change event
+  // brings a fresh one.
+  if (S.feed) touchList('feed');
+  if (S.library) touchList('library');
   if (S.feed) patch.feed = { ...S.feed, posts: S.feed.posts.map(swap) };
   if (S.library) {
     const saved = S.library.saved;
@@ -48,10 +53,12 @@ export function findPost(id) {
   return S.library?.saved.find((x) => x.id === id) || S.feed?.posts.find((x) => x.id === id);
 }
 
-async function like(p) {
+export async function like(p) {
   const liked = !p.liked;
+  const gen = sessionGen();
   markLiked(p, liked);
   try { await apiPost(`/feed/${seg(p.id)}/like`, { liked }); } catch (e) {
+    if (gen !== sessionGen()) return; // another session now: not ours to roll back
     toast(e.message);
     markLiked(p, !liked);
   }
@@ -79,7 +86,7 @@ function Favicon({ p, size = 30 }) {
   const src = candidates[bad];
   if (!src) return html`<${LetterTile} name=${sourceName(p)} size=${size} radius=${size / 2} />`;
   const style = `width:${size}px;height:${size}px`;
-  if (src.startsWith('/api/')) return html`<span class="fav" style=${style}><${Img} src=${src} alt="" onError=${() => setBad(bad + 1)} /></span>`;
+  if (src.startsWith('/api/')) return html`<span class="fav" style=${style}><${Img} src=${src} alt="" photo=${false} onError=${() => setBad(bad + 1)} /></span>`;
   return html`<img class="fav" style=${style} alt="" referrerpolicy="no-referrer" src=${src} onError=${() => setBad(bad + 1)} />`;
 }
 
@@ -88,7 +95,7 @@ function Carousel({ urls, alt }) {
   const onScroll = (e) => setI(Math.round(e.currentTarget.scrollLeft / e.currentTarget.clientWidth));
   if (!urls.length) return null;
   return html`<div class="car" onScroll=${onScroll}>
-      ${urls.map((u) => html`<div class="car-i"><${Img} src=${u} alt=${alt} transient /></div>`)}
+      ${urls.map((u) => html`<div class="car-i"><${Img} src=${u} alt=${alt} /></div>`)}
     </div>
     ${urls.length > 1 && html`<div class="dots">${urls.map((_, j) => html`<i class=${j === i ? 'on' : ''} />`)}</div>`}`;
 }
@@ -252,14 +259,15 @@ export function FeedScreen() {
     ${st?.running && posts.length > 0 && html`<div class="feed-run"><span class="shimmer">Finding today's posts…</span></div>`}
     ${tps.length > 0 && html`<div class="rail" role="list">
       ${tps.map((t, i) => html`<button class="stile" role="listitem" onClick=${() => set({ story: { t: i, s: 0 } })}>
-        <${Img} src=${photos(t.stories[0])[0]} alt="" cls="stile-im" transient />
+        <${Img} src=${photos(t.stories[0])[0]} alt=${t.stories[0].title} cls="stile-im" photo=${false} />
         <div class="stile-src"><${Favicon} p=${t.stories[0]} size=${22} /></div>
         <small>${t.name}</small>
       </button>`)}
     </div>`}
     ${posts.map((p) => html`<${Post} p=${p} key=${p.id} />`)}
     ${!posts.length && empty()}
-    ${posts.length > 0 && !S.feed.hasMore && html`<div class="end mu">You're all caught up.${st?.pipeline && !st.paused ? ' New posts arrive each morning.' : ''}</div>`}
+    ${posts.length > 0 && !S.feed.hasMore && html`<div class="end mu">You're all caught up.${st?.pipeline && !st.paused ? ' New posts arrive each morning.' : ''}
+      ${isOwner() && html`<div><button class="b2 sm" disabled=${busy} onClick=${refresh}>Find more</button></div>`}</div>`}
     ${st?.pipeline && html`<div class="end"><button class="linkish" onClick=${() => go('settings/feed')}>Sources and settings</button></div>`}
   </div>`;
 }
@@ -272,6 +280,13 @@ export function StoryViewer() {
   const tps = S.feed ? topics(S.feed.posts) : [];
   const touch = useRef(null);
   const [paused, setPaused] = useState(false);
+  const [photoOpen, setPhotoOpen] = useState(photoIsOpen);
+  useEffect(() => {
+    const change = () => setPhotoOpen(photoIsOpen());
+    document.addEventListener('iris-photo-change', change);
+    change();
+    return () => document.removeEventListener('iris-photo-change', change);
+  }, []);
   const topic = st && tps[st.t];
   const p = topic?.stories[st.s];
 
@@ -290,14 +305,15 @@ export function StoryViewer() {
   };
 
   useEffect(() => {
-    if (!p || paused) return undefined;
+    if (!p || paused || photoOpen) return undefined;
     const id = setTimeout(() => step(1), STORY_MS);
     return () => clearTimeout(id);
-  }, [st?.t, st?.s, paused, !!p]);
+  }, [st?.t, st?.s, paused, photoOpen, !!p]);
 
   useEffect(() => {
     if (!st) return undefined;
     const key = (e) => {
+      if (photoIsOpen()) return;
       if (e.key === 'Escape') close();
       if (e.key === 'ArrowRight') step(1);
       if (e.key === 'ArrowLeft') step(-1);
@@ -319,16 +335,17 @@ export function StoryViewer() {
     if (Math.abs(dy) > 70 && Math.abs(dy) > Math.abs(dx)) return dy < 0 ? discuss(p) : close();
     if (Math.abs(dx) > 60) return topicStep(dx < 0 ? 1 : -1);
     if (Date.now() - t0.t > 500) return undefined;
+    if (e.target.closest('.viewer-im')) return; // its click opens the photo
     const w = e.currentTarget.clientWidth;
     step(e.clientX - e.currentTarget.getBoundingClientRect().left < w * 0.3 ? -1 : 1);
   };
 
   const img = photos(p)[0];
   return html`<div class="viewer" onPointerDown=${down} onPointerUp=${up} onPointerCancel=${() => setPaused(false)}>
-    ${img ? html`<${Img} src=${img} alt="" cls="viewer-im" />` : html`<div class="viewer-im viewer-blank" />`}
+    ${img ? html`<${Img} src=${img} alt=${p.title} cls="viewer-im" />` : html`<div class="viewer-im viewer-blank" />`}
     <div class="viewer-shade" />
     <div class="bars">${topic.stories.map((_, i) => html`<i class=${i < st.s ? 'f' : ''}>
-      ${i === st.s && html`<b class=${'run' + (paused ? ' paused' : '')} style=${`animation-duration:${STORY_MS}ms`} key=${`${st.t}-${st.s}`} />`}</i>`)}</div>
+      ${i === st.s && html`<b class=${'run' + (paused || photoOpen ? ' paused' : '')} style=${`animation-duration:${STORY_MS}ms`} key=${`${st.t}-${st.s}`} />`}</i>`)}</div>
     <div class="viewer-top"><${Favicon} p=${p} size=${28} /><div><b>${topic.name}</b><small>${sourceName(p)} · ${ago(p.created_at)}</small></div>
       <button class="x" aria-label="Close" onClick=${close}><${Icon} name="x" size=${24} /></button></div>
     <div class="viewer-tx">

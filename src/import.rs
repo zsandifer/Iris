@@ -67,6 +67,30 @@ fn destination(paths: &Paths, rel: &Path) -> Option<PathBuf> {
     }
 }
 
+/// `path` made absolute and resolved through its nearest existing ancestor
+/// (the rest may not exist yet).
+fn resolved(path: &Path) -> Option<PathBuf> {
+    let mut existing = std::path::absolute(path).ok()?;
+    let mut rest = Vec::new();
+    while !existing.exists() {
+        rest.push(existing.file_name()?.to_owned());
+        existing = existing.parent()?.to_path_buf();
+    }
+    let mut out = existing.canonicalize().ok()?;
+    out.extend(rest.iter().rev());
+    Some(out)
+}
+
+/// Whether `dest` still holds the generic template Iris seeded, which an
+/// import replaces without `--force` (that is what `iris init` suggests).
+fn is_seeded_default(dest: &Path) -> bool {
+    let Some(name) = dest.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    crate::persona::system_file(name)
+        .is_some_and(|f| std::fs::read(dest).is_ok_and(|b| b == f.template.as_bytes()))
+}
+
 fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(PathBuf, Option<&'static str>)>) {
     if depth > MAX_DEPTH {
         return;
@@ -105,14 +129,18 @@ pub fn import_openclaw(source: &Path, paths: &Paths, opts: &Options) -> Result<V
         return Err(format!("{} is not a directory", source.display()).into());
     }
     let source = source.canonicalize()?;
-    if paths.data_dir.exists()
-        && let Ok(data) = paths.data_dir.canonicalize()
-        && (source.starts_with(&data) || data.starts_with(&source))
-    {
+    // Also when the data directory does not exist yet: creating it inside
+    // the source would modify the workspace being imported.
+    let data = resolved(&paths.data_dir).ok_or("cannot resolve the Iris data directory")?;
+    if source.starts_with(&data) || data.starts_with(&source) {
         return Err("source and Iris data directory must not overlap".into());
     }
     let mut found = Vec::new();
     walk(&source, &source, 0, &mut found);
+    // Shallower files first, so when two sources map to the same place
+    // (MEMORY.md and memory/MEMORY.md) the workspace's own file wins.
+    found.sort_by(|(a, _), (b, _)| (a.components().count(), a).cmp(&(b.components().count(), b)));
+    let mut planned = std::collections::HashSet::new();
     let mut items = Vec::new();
     for (rel, skip) in found {
         let src = source.join(&rel);
@@ -148,6 +176,14 @@ pub fn import_openclaw(source: &Path, paths: &Paths, opts: &Options) -> Result<V
             });
             continue;
         }
+        if !planned.insert(dest.clone()) {
+            items.push(Item {
+                src,
+                dest: Some(dest),
+                action: Action::Skip("another file is imported to the same place"),
+            });
+            continue;
+        }
         let action = match std::fs::symlink_metadata(&dest) {
             Err(_) => Action::Create,
             Ok(m) if m.file_type().is_symlink() || !m.is_file() => {
@@ -157,7 +193,7 @@ pub fn import_openclaw(source: &Path, paths: &Paths, opts: &Options) -> Result<V
                 let same = std::fs::read(&dest).ok() == std::fs::read(&src).ok();
                 if same {
                     Action::Unchanged
-                } else if opts.force {
+                } else if opts.force || is_seeded_default(&dest) {
                     Action::Overwrite
                 } else {
                     Action::SkipExists
@@ -385,6 +421,83 @@ mod tests {
         assert_eq!(
             read(paths.persona_dir().join("USER.md")),
             "# User\nLikes tea."
+        );
+    }
+
+    #[test]
+    fn two_sources_never_share_a_destination() {
+        let (_t, src, paths) = setup();
+        std::fs::write(src.join("memory/MEMORY.md"), "Older memory copy").unwrap();
+        let items = import_openclaw(
+            &src,
+            &paths,
+            &Options {
+                dry_run: false,
+                force: false,
+            },
+        )
+        .unwrap();
+        let dest = paths.memory_dir().join("MEMORY.md");
+        let to_dest: Vec<&Item> = items
+            .iter()
+            .filter(|i| i.dest.as_ref() == Some(&dest))
+            .collect();
+        assert_eq!(to_dest.len(), 2);
+        assert!(matches!(to_dest[0].action, Action::Create));
+        assert!(
+            to_dest[0].src.ends_with("MEMORY.md") && !to_dest[0].src.ends_with("memory/MEMORY.md")
+        );
+        assert!(matches!(to_dest[1].action, Action::Skip(_)));
+        assert_eq!(
+            std::fs::read_to_string(dest).unwrap(),
+            "Remember the garden."
+        );
+        assert!(report(&items, false).contains("same place"));
+    }
+
+    #[test]
+    fn importing_after_init_replaces_the_seeded_defaults() {
+        let (_t, src, paths) = setup();
+        crate::persona::seed(&paths).unwrap();
+        // The owner already edited SOUL.md: that one is kept.
+        std::fs::write(paths.persona_dir().join("SOUL.md"), "my own soul").unwrap();
+        let items = import_openclaw(
+            &src,
+            &paths,
+            &Options {
+                dry_run: false,
+                force: false,
+            },
+        )
+        .unwrap();
+        let read = |p: PathBuf| std::fs::read_to_string(p).unwrap();
+        assert_eq!(
+            read(paths.persona_dir().join("USER.md")),
+            "# User\nLikes tea."
+        );
+        assert_eq!(
+            read(paths.memory_dir().join("MEMORY.md")),
+            "Remember the garden."
+        );
+        assert_eq!(read(paths.persona_dir().join("SOUL.md")), "my own soul");
+        assert!(items.iter().any(|i| matches!(i.action, Action::SkipExists)));
+    }
+
+    #[test]
+    fn rejects_a_data_dir_inside_the_source_before_it_exists() {
+        let (_t, src, paths) = setup();
+        let inside = Paths {
+            config_file: paths.config_file.clone(),
+            data_dir: src.join("iris-data"),
+        };
+        let opts = Options {
+            dry_run: false,
+            force: false,
+        };
+        assert!(import_openclaw(&src, &inside, &opts).is_err());
+        assert!(
+            !src.join("iris-data").exists(),
+            "nothing written into the source"
         );
     }
 

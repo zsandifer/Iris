@@ -1,11 +1,14 @@
 // Chat cards: agent cards (link, connect, info, result, idea, goal,
 // feed_post) and server cards (action, engine_signin, engine_setup,
 // connector_reconnect, approval).
-import { html, useState } from './h.js';
-import { api, post, patch, seg, isId } from './api.js';
-import { S, set, go, isOwner, toast, loadGoals, loadEngines } from './store.js';
+import { html, useEffect, useState } from './h.js';
+import { api, get, post, put, patch, seg, isId } from './api.js';
+import {
+  S, set, go, isOwner, toast, loadGoals, loadEngines, loginMark, applyLoginResponse, ensureConnectors,
+} from './store.js';
 import { Icon, Img, LetterTile, hostOf, safeUrl } from './ui.js';
 import { plain } from './md.js';
+import { ServiceSignIn, ServiceTile, labelOf } from './connect.js';
 
 const apiPath = (p) => String(p || '').replace(/^\/api(?=\/)/, '');
 
@@ -31,25 +34,37 @@ function LinkCard({ c }) {
 
 function ResultCard({ c }) {
   return html`<div class="res">
-    ${c.image_url ? html`<${Img} cls="res-im" src=${c.image_url} />` : html`<div class="res-im res-blank" />`}
+    ${c.image_url ? html`<${Img} cls="res-im" src=${c.image_url} alt=${c.title || 'Photo'} />` : html`<div class="res-im res-blank" />`}
     <div class="res-tx"><b>${c.title}</b>${c.body && html`<small>${plain(c.body, 160)}</small>`}</div>
     ${safeUrl(c.url) && html`<a class="res-bk" href=${safeUrl(c.url)} target="_blank" rel="noopener noreferrer">${c.action_label || 'Open'}</a>`}
   </div>`;
 }
 
+const CATALOG = ['google', 'github', 'custom'];
+
 function ConnectCard({ c }) {
-  const service = c.service || c.title;
-  const url = safeUrl(c.url);
+  const service = String(c.service || c.title || '');
+  const known = CATALOG.includes(service.toLowerCase()) ? service.toLowerCase() : null;
+  useEffect(() => { if (known) ensureConnectors(); }, [known]);
+  const con = known && known !== 'custom' && (S.connectors || []).find((x) => x.service === known);
+  const ready = con && con.enabled && con.auth_state === 'ok';
+  const url = !known && safeUrl(c.url);
   const label = c.action_label || 'Connect';
-  const manage = () => go(`iris/connections?service=${encodeURIComponent(service)}`);
-  // The card's url is the service's own connection page; Connections stays
-  // one tap away for the owner.
+  const open = () => {
+    if (con) go(`iris/connections/${con.id}`);
+    else if (known) go(known === 'custom' ? 'iris/connections/new' : `iris/connections/add/${known}`);
+    else go('iris/connections');
+  };
+  // A service Iris knows opens its setup here; for others the card's url
+  // is the service's own connection page, with Connections one tap away
+  // for the owner.
   return html`<div class="lk">
-    <${LetterTile} name=${service} size=${36} radius=${11} />
-    <div class="grow"><b>${c.title}</b><small>${c.body ? plain(c.body, 90) : url ? hostOf(url) : 'Connect it so I can help with it'}</small>
-      ${url && isOwner() && html`<button class="lk-m" onClick=${manage}>Connections ›</button>`}</div>
-    ${url ? html`<a class="go" href=${url} target="_blank" rel="noopener noreferrer">${label}</a>`
-      : html`<button class="go" onClick=${manage}>${label}</button>`}
+    ${known && known !== 'custom' ? html`<${ServiceTile} c=${{ service: known }} size=${36} />` : html`<${LetterTile} name=${service} size=${36} radius=${11} />`}
+    <div class="grow"><b>${c.title}</b><small>${ready ? 'Connected' : c.body ? plain(c.body, 90) : url ? hostOf(url) : 'Connect it so I can help with it'}</small>
+      ${url && isOwner() && html`<button class="lk-m" onClick=${open}>Connections ›</button>`}</div>
+    ${ready ? html`<span class="ok">${'\u2713'}</span>`
+      : url ? html`<a class="go" href=${url} target="_blank" rel="noopener noreferrer">${label}</a>`
+      : html`<button class="go" onClick=${open}>${label}</button>`}
   </div>`;
 }
 
@@ -112,7 +127,7 @@ function ActionCard({ c, m }) {
 }
 
 /** The engine sign-in flow; used by Reconnect cards and AI engine settings. */
-export function SignIn({ card, harness, flow, instructions }) {
+export function SignIn({ card, harness, flow, instructions, keyOptions }) {
   harness = harness || card?.harness;
   // A card is kept current by the server (message.updated); without one
   // (Settings), follow the live sign-in session (harness.login events).
@@ -124,8 +139,9 @@ export function SignIn({ card, harness, flow, instructions }) {
   const start = async () => {
     setBusy(true);
     try {
+      const mark = loginMark(harness);
       const r = await post(`/harnesses/${seg(harness)}/login`);
-      if (r.login) set({ logins: { ...S.logins, [harness]: r.login } });
+      if (r.login) applyLoginResponse(harness, r.login, mark);
       else if (r.manual) toast(r.auth === 'ok' ? 'Signed in. Thanks!' : 'Still signed out. Follow the step above, then check again.');
     } catch (e) { toast(e.message); }
     setBusy(false);
@@ -135,8 +151,9 @@ export function SignIn({ card, harness, flow, instructions }) {
     if (!code.trim()) return;
     setBusy(true);
     try {
+      const mark = loginMark(harness);
       const r = await post(`/harnesses/${seg(harness)}/login/code`, { code: code.trim() });
-      set({ logins: { ...S.logins, [harness]: r.login } });
+      applyLoginResponse(harness, r.login, mark);
       setCode('');
     } catch (err) { toast(err.message); }
     setBusy(false);
@@ -145,6 +162,11 @@ export function SignIn({ card, harness, flow, instructions }) {
 
   if (!isOwner()) return html`<small class="mu">Only the owner can reconnect this.</small>`;
   if (st.state === 'connected') return html`<div class="ok-line"><${Icon} name="check" size=${16} /> Connected</div>`;
+  if (flow === 'api_key') {
+    return html`<${ApiKeyForm} harness=${harness} options=${card?.key_options || keyOptions} />
+      ${st.instructions && html`<details class="alt"><summary>Or set it up on the server</summary><div class="steps-box"><code>${st.instructions}</code></div>
+        <div class="act"><button disabled=${busy} onClick=${start}>Check again</button></div></details>`}`;
+  }
   if (flow === 'manual') {
     return html`${st.instructions && html`<div class="steps-box"><code>${st.instructions}</code></div>`}
       <div class="act"><button disabled=${busy} onClick=${start}>${card?.action_label || 'Check again'}</button></div>`;
@@ -175,6 +197,42 @@ export function SignIn({ card, harness, flow, instructions }) {
     default:
       return html`<div class="act"><button disabled=${busy} onClick=${start}>${card?.action_label || 'Reconnect'}</button></div>`;
   }
+}
+
+/** Add an API key for an engine (Gemini CLI, an OpenCode provider, or a
+ * Claude/OpenAI key instead of the subscription). Checked right away with
+ * one tiny request through the engine itself. */
+export function ApiKeyForm({ harness, options = [], onDone }) {
+  const [env, setEnv] = useState(options[0]?.env || '');
+  const [value, setValue] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const opt = options.find((o) => o.env === env) || options[0];
+  const save = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    setMsg(null);
+    try {
+      const r = await put(`/harnesses/${seg(harness)}/keys/${seg(opt.env)}`, { value: value.trim() });
+      setValue('');
+      if (r.auth === 'ok') { setMsg(['ok', 'Connected. I can use it now.']); onDone?.(); }
+      else if (r.auth === 'auth_required') setMsg(['err', "That key didn't work, so I didn't keep it. Check it and try again."]);
+      else setMsg(['ok', "Saved. I'll use it from your next message."]);
+      get('/harnesses').then((x) => set({ harnesses: x.harnesses })).catch(() => {});
+    } catch (err) { setMsg(['err', err.message]); }
+    setBusy(false);
+  };
+  if (!opt) return null;
+  return html`<form class="form key-form" onSubmit=${save}>
+    ${options.length > 1 && html`<label class="lbl">Provider</label>
+      <select class="field" value=${env} onChange=${(e) => setEnv(e.target.value)}>${options.map((o) => html`<option value=${o.env}>${o.label}</option>`)}</select>`}
+    <div class="key-hint"><span>Get a key from ${opt.label}</span> <${OpenLink} url=${opt.url} label="Open" /></div>
+    <div class="code-row"><input class="field" type="password" value=${value} placeholder="Paste the key" autocomplete="off"
+      autocapitalize="off" spellcheck=${false} onInput=${(e) => setValue(e.target.value)} aria-label="API key" />
+      <button class="b1 sm" disabled=${busy || !value.trim()}>${busy ? 'Checking…' : 'Save'}</button></div>
+    ${msg && html`<div class=${msg[0] === 'ok' ? 'ok-line' : 'err-line'}>${msg[1]}</div>`}
+    <small class="mu">Stored encrypted on your server and passed only to the engine.</small>
+  </form>`;
 }
 
 function label(h) {
@@ -216,18 +274,40 @@ function SetupCard({ c }) {
 }
 
 function ConnectorReconnectCard({ c }) {
+  useEffect(() => { ensureConnectors(); }, []);
+  const con = (S.connectors || []).find((x) => x.id === c.connector_id);
   const done = c.state === 'connected';
   return html`<div class=${'card-x' + (done ? ' done' : '')}>
-    <div class="card-h"><${LetterTile} name=${c.service || c.title} size=${30} radius=${9} /><b>${c.title}</b></div>
+    <div class="card-h">${con ? html`<${ServiceTile} c=${con} />` : html`<${LetterTile} name=${c.service || c.title} size=${30} radius=${9} />`}<b>${c.title}</b></div>
     ${c.body && html`<p>${c.body}</p>`}
     ${done ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> Connected</div>`
-      : isOwner() ? html`<div class="act"><button onClick=${() => go(`iris/connections/${c.connector_id}`)}>${c.action_label || 'Reconnect'}</button></div>`
-      : html`<small class="mu">Only the owner can reconnect this.</small>`}
+      : !isOwner() ? html`<small class="mu">Only the owner can reconnect this.</small>`
+      : c.auth === 'oauth' && con ? html`<${ServiceSignIn} con=${con} label=${labelOf(con)} />`
+      : isId(c.connector_id) ? html`<div class="act"><button onClick=${() => go(`iris/connections/${c.connector_id}${c.auth === 'oauth' ? '' : '/edit'}`)}>${c.action_label || 'Reconnect'}</button></div>`
+      : null}
   </div>`;
 }
 
+function Countdown({ until }) {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => tick((x) => x + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const s = Math.max(0, Math.round((until - Date.now()) / 1000));
+  return html`<span>${s >= 60 ? `${Math.ceil(s / 60)} min` : `${s}s`} left</span>`;
+}
+
+const APPROVAL_DONE = {
+  approved: 'You approved this',
+  denied: "You said no, so I didn't do it.",
+  expired: "No answer in time, so I didn't do it.",
+  cancelled: 'Cancelled. Nothing was done.',
+};
+
 function ApprovalCard({ c, m }) {
   const [busy, setBusy] = useState(false);
+  const [raw, setRaw] = useState(false);
   const mine = c.approver_user_id === S.me?.user?.id;
   const decide = async (approve) => {
     setBusy(true);
@@ -235,14 +315,20 @@ function ApprovalCard({ c, m }) {
     setBusy(false);
   };
   const p = c.preview || {};
-  return html`<div class=${'ap' + (c.state !== 'pending' ? ' decided' : '')}>
-    <div class="ap-h"><${Icon} name="lock" size=${14} /> Needs your OK</div>
+  const pending = c.state === 'pending';
+  return html`<div class=${'ap' + (!pending ? ' decided' : '')}>
+    <div class="ap-h"><${Icon} name="lock" size=${14} /> Needs your OK
+      ${pending && c.expires_at && html`<span class="ap-left"><${Countdown} until=${c.expires_at} /></span>`}</div>
+    ${c.reason && html`<div class="ap-why">${c.reason}</div>`}
     <div class="ap-em"><b>${c.title}</b>
       ${p.to && html`<div><span class="mu">To</span> ${p.to}</div>`}
       ${p.subject && html`<div><span class="mu">Subject</span> ${p.subject}</div>`}
+      ${(p.fields || []).map((f) => html`<div><span class="mu">${f.label}</span> ${f.value}</div>`)}
       ${p.body && html`<div class="ap-body">${p.body}</div>`}</div>
-    ${c.state === 'approved' ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> You approved this</div>`
-      : c.state === 'denied' ? html`<div class="mu small">You said no, so I won't do it.</div>`
+    ${c.details && html`<button class="ap-raw-btn" onClick=${() => setRaw(!raw)} aria-expanded=${raw ? 'true' : 'false'}>${raw ? 'Hide' : 'Show'} the exact request</button>
+      ${raw && html`<pre class="ap-raw">${c.details}</pre>`}`}
+    ${c.state === 'approved' ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> ${APPROVAL_DONE.approved}</div>`
+      : !pending ? html`<div class="mu small">${APPROVAL_DONE[c.state] || 'Decided.'}</div>`
       : mine ? html`<div class="ap-bt"><button disabled=${busy} onClick=${() => decide(false)}>Deny</button>
           <button class="y" disabled=${busy} onClick=${() => decide(true)}>${c.action_label || 'Approve'}</button></div>`
       : html`<small class="mu">Waiting for the person this is for.</small>`}
@@ -264,9 +350,12 @@ const CARDS = {
   approval: ApprovalCard,
 };
 
-export function Card({ m }) {
+export function Card({ m, inactive = false }) {
   const c = m.card || {};
   let C = CARDS[c.type] || InfoCard;
   if (c.type === 'link' && c.image_url) C = ResultCard;
-  return html`<div class="card-wrap"><${C} c=${c} m=${m} /></div>`;
+  // Sign-in cards can contain inputs. Keep them out of iOS's form
+  // navigation while the composer has focus; scrolling stays on .scr.
+  const signin = c.type === 'engine_signin' || c.type === 'connector_reconnect';
+  return html`<div class="card-wrap" inert=${inactive && signin}><${C} c=${c} m=${m} /></div>`;
 }

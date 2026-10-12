@@ -6,14 +6,16 @@ import {
   loadArchived, convFor, setArchived,
 } from './store.js';
 import {
-  Icon, Avatar, Img, Sheet, agentName, promptSheet, confirmSheet, openSheet, closeSheet, LetterTile, Row, Spinner, ago,
+  Icon, Avatar, Sheet, agentName, promptSheet, confirmSheet, openSheet, closeSheet, LetterTile, Row, Spinner, ago,
 } from './ui.js';
 import { ChatScreen } from './chat.js';
 import { FeedScreen, StoryViewer, FeedSettings } from './feed.js';
 import { IdeasScreen, GoalsScreen, LibraryScreen } from './lists.js';
-import { Hub, Connections, ConnectorForm, Logins, Computer, Files, FileEditor, Folder } from './hub.js';
+import { Hub, Logins, Computer, Files, FileEditor, Folder } from './hub.js';
+import { Connections, AddService, ConnectorPage, ConnectorForm, TrustedPeople } from './connect.js';
 import { Settings, AiEngine, Devices, People, ActivityLog } from './settings.js';
 import { isIOS, standalone, syncPush, resetPush } from './push.js';
+import { trackViewport, blockZoom } from './viewport.js';
 
 const TABS = [
   ['chat', 'Chat', 'chat'],
@@ -36,11 +38,12 @@ function deviceName() {
 }
 
 function Pair() {
+  const [install, setInstall] = useState(() => isIOS() && !standalone());
   const [code, setCode] = useState('');
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
   const ref = useRef();
-  useEffect(() => { ref.current?.focus(); }, []);
+  useEffect(() => { if (!install) ref.current?.focus({ preventScroll: true }); }, [install]);
   const onInput = (e) => {
     const raw = e.target.value.toUpperCase().replace(/[^0-9A-Z]/g, '').slice(0, 8);
     setCode(raw.length > 4 ? `${raw.slice(0, 4)}-${raw.slice(4)}` : raw);
@@ -61,7 +64,15 @@ function Pair() {
       setBusy(false);
     }
   };
-  const ios = isIOS() && !standalone();
+  if (install) return html`<div class="pair"><div class="pair-in">
+    <div class="avatar" style="width:84px;height:84px"><div class="orb" /></div>
+    <h1 class="serif">Add Iris to your Home Screen</h1>
+    <p class="mu">Pair inside the app. Safari and the Home Screen app keep separate sign-ins.</p>
+    <ol class="install-steps"><li>Tap <b>Share</b> in Safari.</li>
+      <li>Choose <b>Add to Home Screen</b>, then tap <b>Add</b>.</li>
+      <li>Open <b>Iris</b> from its icon and enter your pairing code.</li></ol>
+    <button class="safari-link" onClick=${() => setInstall(false)}>Continue in Safari anyway</button>
+  </div></div>`;
   return html`<div class="pair">
     <div class="pair-in">
       <div class="avatar" style="width:84px;height:84px"><div class="orb" /></div>
@@ -73,7 +84,6 @@ function Pair() {
         ${err && html`<div class="err-line">${err}</div>`}
         <button class="b1 wide" disabled=${busy || code.replace('-', '').length < 8}>${busy ? 'Pairing…' : 'Continue'}</button>
       </form>
-      ${ios && html`<p class="hint mu">Tip: tap Share, then <b>Add to Home Screen</b> so Iris opens like an app and can send you notifications.</p>`}
     </div>
   </div>`;
 }
@@ -105,8 +115,8 @@ function Drawer() {
   const Item = ({ c, icon }) => html`<button class=${'it' + (c.id === cid && S.route.tab === 'chat' ? ' on' : '')} onClick=${() => go(`chat/${c.id}`)}>
     <${Icon} name=${icon} size=${18} /><span>${title(c)}</span></button>`;
   return html`<div class=${'scrim' + (S.drawer ? ' on' : '')} onClick=${() => set({ drawer: false })} />
-    <nav class=${'drw' + (S.drawer ? ' on' : '')} aria-hidden=${S.drawer ? 'false' : 'true'}>
-      <label class="srch"><${Icon} name="search" size=${17} /><input value=${q} placeholder="Search chats" onInput=${(e) => setQ(e.target.value)} /></label>
+    <nav class=${'drw' + (S.drawer ? ' on' : '')} aria-hidden=${S.drawer ? 'false' : 'true'} inert=${!S.drawer}>
+      ${S.drawer && html`<label class="srch"><${Icon} name="search" size=${17} /><input value=${q} placeholder="Search chats" onInput=${(e) => setQ(e.target.value)} /></label>`}
       <div class="drw-scroll">
         <div class="sm">Chats</div>
         ${chats.map((c) => html`<${Item} c=${c} icon=${c.kind === 'main' ? 'chat' : c.seed?.type === 'feed_post' ? 'sparkles' : c.seed?.type === 'idea' ? 'bulb' : 'chat'} />`)}
@@ -193,12 +203,13 @@ function TopBar() {
   const busy = Object.keys(S.live).length > 0;
   let line = 'here for you';
   if (!S.online) line = 'reconnecting…';
+  else if (S.settings?.paused) line = 'paused';
   else if (S.route.tab === 'chat' && conv && conv.kind !== 'main') line = title(conv);
   else if (busy) line = 'working on it';
   return html`<header class="top">
     <button class="btn" aria-label="Menu" onClick=${() => set({ drawer: true })}><${Icon} name="menu" /></button>
     <button class="who-btn" onClick=${() => go('iris')} aria-label=${`${agentName()} profile`}><${Avatar} size=${36} /></button>
-    <div class="grow"><div class="nm">${agentName()}</div><div class=${'st' + (!S.online ? ' warn' : '')}>${line}</div></div>
+    <div class="grow"><div class="nm">${agentName()}</div><div class=${'st' + (!S.online || S.settings?.paused ? ' warn' : '')}>${line}</div></div>
     ${S.route.tab === 'chat' && conv && conv.kind !== 'main' && html`<button class="btn" aria-label="Chat options" onClick=${() => chatMenu(conv)}><${Icon} name="more" cls="ic-more" /></button>`}
   </header>`;
 }
@@ -208,16 +219,6 @@ function Tabs() {
     <button class=${S.route.tab === k ? 'on' : ''} aria-current=${S.route.tab === k ? 'page' : undefined}
       onClick=${() => go(k === 'chat' ? `chat/${mainId()}` : k)}>
       <${Icon} name=${icon} size=${23} /><span>${label}</span></button>`)}</nav>`;
-}
-
-function Lightbox() {
-  if (!S.lightbox) return null;
-  const close = () => set({ lightbox: null, lightboxChat: null });
-  return html`<div class="lightbox" onClick=${close}>
-    <button class="x" aria-label="Close"><${Icon} name="x" size=${26} /></button>
-    <${Img} src=${S.lightbox} alt="" />
-    ${S.lightboxChat && html`<button class="b2 lb-go" onClick=${(e) => { e.stopPropagation(); const c = S.lightboxChat; close(); go(`chat/${c}`); }}>Open chat</button>`}
-  </div>`;
 }
 
 // -------------------------------------------------------------------- root
@@ -238,7 +239,14 @@ function Screen() {
       const [, sub, a, ...rest] = parts;
       if (!sub) return html`<${Hub} />`;
       if (!owner) return html`<${Settings} />`;
-      if (sub === 'connections') return a === 'new' || isId(a) ? html`<${ConnectorForm} id=${a} key=${a} />` : html`<${Connections} />`;
+      if (sub === 'connections') {
+        if (a === 'add' && ['google', 'github', 'custom'].includes(rest[0])) return html`<${AddService} service=${rest[0]} key=${rest[0]} />`;
+        if (a === 'new') return html`<${ConnectorForm} id="new" key="new" />`;
+        if (a === 'trusted') return html`<${TrustedPeople} />`;
+        if (isId(a) && rest[0] === 'edit') return html`<${ConnectorForm} id=${a} key=${`${a}-edit`} />`;
+        if (isId(a)) return html`<${ConnectorPage} id=${a} key=${a} />`;
+        return html`<${Connections} />`;
+      }
       if (sub === 'logins') return html`<${Logins} />`;
       if (sub === 'computer') return html`<${Computer} />`;
       if (sub === 'files') {
@@ -273,11 +281,10 @@ function App() {
   const tabbed = TABS.some(([k]) => k === S.route.tab);
   return html`<div class=${'app' + (tabbed ? ' tabbed' : ' paged') + (S.route.tab === 'chat' ? ' is-chat' : '')}>
     ${tabbed && html`<${TopBar} />`}
-    <main class="main"><${Screen} /></main>
+    <main class="main" inert=${!!(S.drawer || S.sheet || S.story)}><${Screen} /></main>
     ${tabbed && html`<${Tabs} />`}
     <${Drawer} />
     <${StoryViewer} />
-    <${Lightbox} />
     <${Sheet} />
     ${S.toast && html`<div class="toast" role="status">${S.toast}</div>`}
   </div>`;
@@ -328,5 +335,8 @@ if ('serviceWorker' in navigator) {
   });
 }
 
-render(html`<${App} />`, document.getElementById('app'));
+const root = document.getElementById('app');
+trackViewport(root);
+blockZoom();
+render(html`<${App} />`, root);
 boot();

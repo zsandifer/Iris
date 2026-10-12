@@ -33,6 +33,38 @@ pub struct Config {
     pub feed: JobConfig,
     pub push: PushConfig,
     pub engines: EnginesConfig,
+    pub safety: SafetyConfig,
+}
+
+/// The connector gateway's approval gate and tripwires.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SafetyConfig {
+    /// How long an approval card waits for the owner before the action is
+    /// dropped (and the agent told).
+    pub approval_timeout_secs: u64,
+    /// Tripwire: a connector that sends more than this many messages in an
+    /// hour is paused and the owner notified.
+    pub max_sends_per_hour: u32,
+    /// Tripwire: more calls than this through one connector in an hour.
+    pub max_calls_per_hour: u32,
+    /// Tripwire: more data than this (MB) read through one connector in an
+    /// hour looks like a bulk export.
+    pub max_read_mb_per_hour: u32,
+    /// Stop a connector's program after this many idle minutes.
+    pub idle_minutes: u64,
+}
+
+impl Default for SafetyConfig {
+    fn default() -> Self {
+        Self {
+            approval_timeout_secs: 300,
+            max_sends_per_hour: 5,
+            max_calls_per_hour: 200,
+            max_read_mb_per_hour: 25,
+            idle_minutes: 5,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -284,6 +316,7 @@ impl Default for Config {
             feed: JobConfig::feed_default(),
             push: PushConfig::default(),
             engines: EnginesConfig::default(),
+            safety: SafetyConfig::default(),
         }
     }
 }
@@ -379,6 +412,12 @@ impl Config {
                 return Err(format!("harness.{name}.command is empty").into());
             }
         }
+        if self.safety.approval_timeout_secs < 30 {
+            return Err("safety.approval_timeout_secs must be at least 30".into());
+        }
+        if self.safety.idle_minutes == 0 {
+            return Err("safety.idle_minutes must be at least 1".into());
+        }
         if !self.engines.helper.is_empty() && self.engines.dir.trim().is_empty() {
             return Err("engines.helper needs engines.dir (a directory the helper owns)".into());
         }
@@ -396,6 +435,15 @@ impl Config {
         Ok(())
     }
 
+    /// How long an approval card really waits: the configured time, but
+    /// at least a minute less than a turn may run (older configs with a
+    /// short `turn_timeout_secs` keep working).
+    pub fn approval_timeout_secs(&self) -> u64 {
+        let t = self.turn_timeout_secs;
+        let cap = if t > 60 { t - 60 } else { t / 2 };
+        self.safety.approval_timeout_secs.min(cap).max(1)
+    }
+
     /// Engines directory (absolute).
     pub fn engines_dir(&self, paths: &Paths) -> PathBuf {
         let d = self.engines.dir.trim();
@@ -404,6 +452,23 @@ impl Config {
         } else {
             absolutize(PathBuf::from(d))
         }
+    }
+
+    /// The VAPID contact sent to push services: `push.vapid_subject` (a
+    /// `mailto:` or `https:` URL), else an `https:` `public_url`. Apple
+    /// rejects pushes without one, so without it push is unavailable.
+    pub fn push_subject(&self) -> Option<String> {
+        let valid = |s: &str| {
+            s.starts_with("mailto:") && s.len() > 7 || s.starts_with("https://") && s.len() > 8
+        };
+        let subject = self.push.vapid_subject.trim();
+        if valid(subject) {
+            return Some(subject.to_string());
+        }
+        let url = self.public_url.trim().trim_end_matches('/');
+        url.starts_with("https://")
+            .then(|| url.to_string())
+            .filter(|u| valid(u))
     }
 
     /// URL printed by `iris pair`.
@@ -507,6 +572,34 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
 }
 
 /// Atomically write a file readable only by the owner.
+/// Create `path` (0600) with `contents` only if it does not exist yet, as
+/// one atomic step: a complete private file is hard-linked into place, which
+/// fails if another process created it first. Returns false if it existed.
+/// For keys: two processes starting at once must not each write their own.
+pub fn create_private_file_once(path: &Path, contents: &[u8]) -> Result<bool> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".{}.tmp", crate::util::new_id()));
+    let tmp = path.with_file_name(tmp_name);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -569,6 +662,16 @@ mod tests {
     }
 
     #[test]
+    fn short_turn_timeouts_still_load() {
+        let cfg = Config::parse("turn_timeout_secs = 120").unwrap();
+        assert_eq!(cfg.approval_timeout_secs(), 60);
+        assert_eq!(Config::default().approval_timeout_secs(), 300);
+        let tiny = Config::parse("turn_timeout_secs = 5").unwrap();
+        assert_eq!(tiny.approval_timeout_secs(), 2);
+        assert!(Config::parse("[safety]\napproval_timeout_secs = 5").is_err());
+    }
+
+    #[test]
     fn legacy_router_keys_are_ignored() {
         let cfg = Config::parse(
             "[router]\ndefault = \"claude:haiku\"\nstrong_keywords = [\"plan\"]\nallow_claude_for_shared = true\n",
@@ -584,6 +687,29 @@ mod tests {
         assert_eq!(parse_hhmm("23:59"), Some(1439));
         assert_eq!(parse_hhmm("24:00"), None);
         assert_eq!(parse_hhmm("8"), None);
+    }
+
+    #[test]
+    fn push_needs_a_contact() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.push_subject(), None, "default config has none");
+        cfg.public_url = "http://100.64.0.2:7420".into();
+        assert_eq!(cfg.push_subject(), None);
+        cfg.public_url = "https://iris.example.ts.net/".into();
+        assert_eq!(
+            cfg.push_subject().as_deref(),
+            Some("https://iris.example.ts.net")
+        );
+        cfg.push.vapid_subject = "mailto:admin@example.com".into();
+        assert_eq!(
+            cfg.push_subject().as_deref(),
+            Some("mailto:admin@example.com")
+        );
+        cfg.push.vapid_subject = "admin@example.com".into();
+        assert_eq!(
+            cfg.push_subject().as_deref(),
+            Some("https://iris.example.ts.net")
+        );
     }
 
     #[test]

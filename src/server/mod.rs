@@ -4,6 +4,7 @@
 
 pub(crate) mod admin;
 mod chat;
+mod connect;
 mod content;
 mod web;
 mod ws;
@@ -12,8 +13,6 @@ pub use chat::sniff_image;
 
 use crate::auth::{self, PairError};
 use crate::db::{self, Device, User};
-use crate::entities::Connector;
-use crate::harness::{McpServer, McpTransport};
 use crate::state::AppState;
 use crate::util::Result;
 use axum::Router;
@@ -175,6 +174,7 @@ pub fn router(state: AppState) -> Router {
         .merge(chat::routes())
         .merge(content::routes())
         .merge(admin::routes())
+        .merge(connect::routes())
         .route("/ws", get(ws::handler))
         .layer(DefaultBodyLimit::max(upload_limit));
     Router::new()
@@ -413,7 +413,7 @@ async fn user_pairing_code(
 /// Reserved MCP server names (the built-in bridge).
 pub const RESERVED_CONNECTOR_NAMES: &[&str] = &["iris"];
 
-fn connector_aad(id: &str, field: &str, key: &str) -> String {
+pub(crate) fn connector_aad(id: &str, field: &str, key: &str) -> String {
     format!("connector:{id}:{field}:{key}")
 }
 
@@ -435,40 +435,6 @@ pub fn seal_connector_secrets(
         .collect()
 }
 
-/// Build the per-turn MCP server definition, unsealing secrets in memory.
-pub fn connector_to_mcp(state: &AppState, con: &Connector) -> Result<McpServer> {
-    let open = |field: &str, m: &BTreeMap<String, String>| -> Result<BTreeMap<String, String>> {
-        m.iter()
-            .map(|(k, v)| {
-                Ok((
-                    k.clone(),
-                    state.vault.open_str(v, &connector_aad(&con.id, field, k))?,
-                ))
-            })
-            .collect()
-    };
-    let transport = match con.transport.as_str() {
-        "stdio" => McpTransport::Stdio {
-            command: con
-                .config
-                .command
-                .clone()
-                .ok_or("stdio connector without command")?,
-            args: con.config.args.clone(),
-            env: open("env", &con.config.env)?,
-        },
-        "http" => McpTransport::Http {
-            url: con.config.url.clone().ok_or("http connector without url")?,
-            headers: open("headers", &con.config.headers)?,
-        },
-        other => return Err(format!("unknown transport {other}").into()),
-    };
-    Ok(McpServer {
-        name: con.name.clone(),
-        transport,
-    })
-}
-
 // ------------------------------------------------------------------- serve
 
 pub async fn serve(state: AppState) -> Result<()> {
@@ -483,9 +449,28 @@ pub async fn serve(state: AppState) -> Result<()> {
         );
     }
     axum::serve(listener, router(state.clone()))
-        .with_graceful_shutdown(shutdown_signal(state))
+        .with_graceful_shutdown(shutdown_signal(state.clone()))
         .await?;
+    // Cancelled turns are still stopping their CLIs' process groups (TERM,
+    // grace, KILL); the runtime must outlive that cleanup.
+    wait_for_turns(&state, std::time::Duration::from_secs(9)).await;
+    // Same for connector programs that were asked to stop.
+    crate::gateway::upstream::wait_for_reaping(std::time::Duration::from_secs(4)).await;
     Ok(())
+}
+
+/// Wait until no turn is running, at most `limit`.
+async fn wait_for_turns(state: &AppState, limit: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < deadline
+        && !state
+            .running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 async fn shutdown_signal(state: AppState) {
@@ -498,17 +483,30 @@ async fn shutdown_signal(state: AppState) {
     }
     crate::info!("shutting down");
     // Stop running turns (kills their CLI process groups); open WebSockets
-    // would otherwise keep graceful shutdown waiting forever.
-    for tx in state
-        .running
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .values()
+    // would otherwise keep graceful shutdown waiting forever. Turns still
+    // queued behind them are cancelled as they start (`stopping`).
     {
-        let _ = tx.send(true);
+        let running = state.running.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for tx in running.values() {
+            let _ = tx.send(true);
+        }
     }
+    // Connector programs Iris started run in their own process groups:
+    // end them (TERM, then KILL shortly after) before exiting.
+    crate::gateway::cancel_all_grants(&state);
+    crate::gateway::cancel_approvals(&state, None);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::gateway::stop_all(&state),
+    )
+    .await;
+    // Last resort if something still hangs (turn cleanup takes at most
+    // about five seconds).
     tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         std::process::exit(0);
     });
 }
@@ -603,6 +601,57 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK, "{body}");
         body["token"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn connector_credentials_require_https_except_on_loopback() {
+        let h = setup();
+        let token = pair_as(&h, None).await;
+        for credential in [
+            json!({"auth": "oauth"}),
+            json!({"headers": {"Authorization": "Bearer synthetic-token"}}),
+        ] {
+            let mut body = json!({"name": "unsafe", "transport": "http", "url": "http://connector.example/mcp"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(credential.as_object().unwrap().clone());
+            let (s, _) = send(&h.app, "POST", "/api/connectors", Some(&token), Some(body)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+        }
+        let (s, b) = send(&h.app, "POST", "/api/connectors", Some(&token), Some(json!({"name": "local", "transport": "http", "url": "http://[::1]:7999/mcp", "auth": "oauth"}))).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let id = b["connector"]["id"].as_str().unwrap();
+        let (s, _) = send(
+            &h.app,
+            "PATCH",
+            &format!("/api/connectors/{id}"),
+            Some(&token),
+            Some(json!({"url": "http://connector.example/mcp"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        // Unauthenticated HTTP is still permitted; adding credentials is not.
+        let (s, b) = send(&h.app, "POST", "/api/connectors", Some(&token), Some(json!({"name": "public", "transport": "http", "url": "http://connector.example/mcp"}))).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let id = b["connector"]["id"].as_str().unwrap();
+        let (s, _) = send(
+            &h.app,
+            "PATCH",
+            &format!("/api/connectors/{id}"),
+            Some(&token),
+            Some(json!({"headers": {"X-Api-Key": "synthetic-key"}})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/connectors/{id}/oauth/start"),
+            Some(&token),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1148,9 +1197,27 @@ esac
             })
             .unwrap();
         assert!(!dump.contains("good-code") && !dump.contains("bad-code"));
-        // Non-owners cannot drive sign-in.
+        // Nobody unpaired, and no non-owner, can drive sign-in.
         let (s, _) = send(&h.app, "POST", "/api/harnesses/claude/login", None, None).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let (_, u) = send(
+            &h.app,
+            "POST",
+            "/api/users",
+            Some(&t),
+            Some(json!({"display_name": "Sam"})),
+        )
+        .await;
+        let sam = pair_as(&h, u["user"]["id"].as_str()).await;
+        for (method, uri, body) in [
+            ("POST", "/api/harnesses/claude/login", None),
+            ("GET", "/api/harnesses/claude/login", None),
+            ("POST", code_uri, Some(json!({"code": "x"}))),
+            ("DELETE", "/api/harnesses/claude/login", None),
+        ] {
+            let (s, _) = send(&h.app, method, uri, Some(&sam), body).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{method} {uri}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1185,6 +1252,181 @@ esac
         let status = state.harness("gemini").unwrap().status();
         assert_eq!(status.auth, crate::harness::AuthState::AuthRequired);
         assert_eq!(status.version.as_deref(), Some("0.0.1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_older_auth_probe_never_overwrites_a_newer_report() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let db = crate::db::Db::open(&paths.db_file()).unwrap();
+        let mut cfg = Config::default();
+        for h in cfg.harness.values_mut() {
+            h.enabled = false;
+        }
+        // `auth status` saw a signed-out CLI, but answers slowly.
+        let script = tmp.path().join("fake-claude");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$1 $2\" in\n  \"--version \"*) echo 9.9.9;;\n  \"auth status\") sleep 0.5; echo '{\"loggedIn\": false}'; exit 1;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let claude = cfg.harness.get_mut("claude").unwrap();
+        claude.enabled = true;
+        claude.command = script.to_string_lossy().into_owned();
+        let state = AppState::new(cfg, paths, db).unwrap();
+        let st = state.clone();
+        let probe = tokio::spawn(async move { st.refresh_harnesses().await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Meanwhile a turn (or the in-app sign-in) found it signed in.
+        state
+            .note_auth("claude", crate::harness::AuthState::Ok, None)
+            .await;
+        probe.await.unwrap();
+        assert_eq!(
+            state.harness("claude").unwrap().status().auth,
+            crate::harness::AuthState::Ok
+        );
+        // A probe that starts afterwards is applied as usual.
+        state.refresh_harnesses().await;
+        assert_eq!(
+            state.harness("claude").unwrap().status().auth,
+            crate::harness::AuthState::AuthRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn push_is_unavailable_without_a_contact() {
+        let h = setup();
+        let t = pair_as(&h, None).await;
+        let (_, b) = send(&h.app, "GET", "/api/push/vapid-public-key", Some(&t), None).await;
+        assert_eq!(b["enabled"], false, "{b}");
+        assert!(b["reason"].as_str().unwrap().contains("vapid_subject"));
+        let sub = json!({"endpoint": "https://fcm.googleapis.com/fcm/send/x",
+                         "keys": {"p256dh": "x", "auth": "y"}});
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            "/api/push/subscriptions",
+            Some(&t),
+            Some(sub),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_cards_reach_the_main_chat() {
+        let h = setup();
+        let owner = h.state.db.with(db::owner_user_id).unwrap().unwrap();
+        let (reply, main) = h
+            .state
+            .db
+            .with(|c| {
+                let job = db::ensure_job_conversation(c, &owner, "heartbeat")?;
+                let reply = db::insert_message(
+                    c,
+                    &db::NewMessage {
+                        conversation_id: &job,
+                        role: "assistant",
+                        content: "Your package arrives today.",
+                        ..Default::default()
+                    },
+                )?;
+                crate::entities::insert_card(
+                    c,
+                    &job,
+                    &json!({"type": "link", "title": "Tracking", "url": "https://example.com/t"}),
+                    "assistant",
+                )?;
+                Ok((reply, db::ensure_main_conversation(c, &owner)?))
+            })
+            .unwrap();
+        crate::jobs::move_cards_to_main(&h.state, &owner, &reply)
+            .await
+            .unwrap();
+        let msgs = h
+            .state
+            .db
+            .with(|c| db::list_messages(c, &main, None, 10))
+            .unwrap();
+        assert!(
+            msgs.iter()
+                .any(|m| m.kind == "card" && m.content == "Tracking")
+        );
+    }
+
+    #[tokio::test]
+    async fn feed_instructions_are_the_owner_s_alone() {
+        let h = setup();
+        let owner_t = pair_as(&h, None).await;
+        let (s, _) = send(
+            &h.app,
+            "PUT",
+            "/api/settings",
+            Some(&owner_t),
+            Some(json!({"feed_prompt": "owner-interest: rare orchids"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, u) = send(
+            &h.app,
+            "POST",
+            "/api/users",
+            Some(&owner_t),
+            Some(json!({"display_name": "Sam"})),
+        )
+        .await;
+        let sam = pair_as(&h, u["user"]["id"].as_str()).await;
+        let (_, mine) = send(&h.app, "GET", "/api/settings", Some(&owner_t), None).await;
+        assert_eq!(mine["feed_prompt"], "owner-interest: rare orchids");
+        let (_, theirs) = send(&h.app, "GET", "/api/settings", Some(&sam), None).await;
+        assert!(theirs["feed_prompt"].is_null(), "{theirs}");
+        assert!(!theirs.to_string().contains("orchids"));
+        let (s, _) = send(&h.app, "GET", "/api/feed/prompt", Some(&sam), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        // Broadcasts carry it only to the owner.
+        let mut rx = h.state.hub.subscribe();
+        send(
+            &h.app,
+            "PUT",
+            "/api/settings",
+            Some(&owner_t),
+            Some(json!({"feed_prompt": "orchids again"})),
+        )
+        .await;
+        let sam_id = u["user"]["id"].as_str().unwrap().to_string();
+        while let Ok(env) = rx.try_recv() {
+            if env.json.contains("orchids") {
+                assert!(!env.audience.includes(&sam_id), "{}", env.json);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_turns_to_stop() {
+        let h = setup();
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        h.state.running.lock().unwrap().insert("c1".into(), tx);
+        let st = h.state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            st.running.lock().unwrap().remove("c1");
+        });
+        let start = std::time::Instant::now();
+        wait_for_turns(&h.state, std::time::Duration::from_secs(5)).await;
+        let waited = start.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(150),
+            "{waited:?}"
+        );
+        assert!(waited < std::time::Duration::from_secs(2));
+        assert!(h.state.running.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2233,7 +2475,9 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let system = t.read(1, "system.md");
         assert!(system.contains("owner-user-fact") && system.contains("owner-memory-fact"));
         assert!(t.read(1, "args").contains(&memory));
-        assert!(!t.read(1, "args").contains("--strict-mcp-config"));
+        // Only Iris's MCP servers there too (the CLI's own would bypass the
+        // connector gateway).
+        assert!(t.read(1, "args").contains("--strict-mcp-config"));
         let mcp: Value = serde_json::from_str(&t.read(1, "mcp.json")).unwrap();
         assert!(mcp["mcpServers"]["notes"].is_object());
     }
@@ -2402,6 +2646,176 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         };
         assert_eq!(reply["status"], "complete");
+    }
+
+    #[tokio::test]
+    async fn joining_during_a_private_reply_withholds_it() {
+        let t = turn_setup(|c| c.router.allow_claude_for_shared = true).await;
+        let gid = t.create("group", &[]).await;
+        let mut rx = t.h.state.hub.subscribe();
+        std::fs::write(t.dir.join("hold"), "").unwrap();
+        let (s, b) = send(
+            &t.h.app,
+            "POST",
+            &format!("/api/conversations/{gid}/messages"),
+            Some(&t.owner_t),
+            Some(json!({"text": "what's in my memory?"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::ACCEPTED);
+        let reply_id = b["assistant_message"]["id"].as_str().unwrap().to_string();
+        let started = t.run_dir(0).join("started");
+        t.wait_for("private run", || started.exists()).await;
+        assert!(t.read(0, "system.md").contains("owner-memory-fact"));
+        let (s, _) = send(
+            &t.h.app,
+            "POST",
+            &format!("/api/conversations/{gid}/members"),
+            Some(&t.owner_t),
+            Some(json!({"user_id": t.guest_id})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        std::fs::remove_file(t.dir.join("hold")).unwrap();
+        let reply = loop {
+            let (_, msgs) = send(
+                &t.h.app,
+                "GET",
+                &format!("/api/conversations/{gid}/messages"),
+                Some(&t.guest_t),
+                None,
+            )
+            .await;
+            let m = msgs["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == reply_id.as_str())
+                .cloned()
+                .unwrap();
+            if m["status"] != "streaming" {
+                break m;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(reply["status"], "cancelled", "{reply}");
+        assert_eq!(reply["content"], "");
+        assert_eq!(reply["meta"]["activity"], json!([]));
+        assert_eq!(t.runs(), 1, "no retry with the private context");
+        // The owner's app is told the reply ended (it was streaming).
+        let owner = t.h.state.db.with(db::owner_user_id).unwrap().unwrap();
+        let mut completed = false;
+        while let Ok(env) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&env.json).unwrap();
+            if v["type"] == "message.completed" && v["message"]["id"] == reply_id.as_str() {
+                assert!(env.audience.includes(&owner));
+                assert_eq!(v["message"]["content"], "");
+                completed = true;
+            }
+        }
+        assert!(completed, "the owner got the terminal event");
+    }
+
+    #[tokio::test]
+    async fn private_turn_cards_show_only_once_the_reply_is_kept() {
+        let t = turn_setup(|c| c.router.allow_claude_for_shared = true).await;
+        let messages = |token: String, conv: String| {
+            let app = t.h.app.clone();
+            async move {
+                let (_, b) = send(
+                    &app,
+                    "GET",
+                    &format!("/api/conversations/{conv}/messages"),
+                    Some(&token),
+                    None,
+                )
+                .await;
+                b["messages"].as_array().unwrap().clone()
+            }
+        };
+        // What the bridge does in the owner's own chat: a held-back card.
+        let pending_card = |conv: &str, title: &str| {
+            let (conv, title) = (conv.to_string(), title.to_string());
+            t.h.state
+                .db
+                .with(move |c| {
+                    crate::entities::insert_card_with_status(
+                        c,
+                        &conv,
+                        &json!({"type": "info", "title": title}),
+                        "assistant",
+                        "pending",
+                    )
+                })
+                .unwrap()
+        };
+        for (run, joins) in [false, true].into_iter().enumerate() {
+            let gid = t.create("group", &[]).await;
+            std::fs::write(t.dir.join("hold"), "").unwrap();
+            let (s, _) = send(
+                &t.h.app,
+                "POST",
+                &format!("/api/conversations/{gid}/messages"),
+                Some(&t.owner_t),
+                Some(json!({"text": "hi"})),
+            )
+            .await;
+            assert_eq!(s, StatusCode::ACCEPTED);
+            let started = t.run_dir(run).join("started");
+            t.wait_for("run", || started.exists()).await;
+            let card = pending_card(&gid, "owner-memory-card");
+            let shown = |msgs: &[Value]| msgs.iter().any(|m| m["id"] == card.id.as_str());
+            assert!(
+                !shown(&messages(t.owner_t.clone(), gid.clone()).await),
+                "hidden while running"
+            );
+            if joins {
+                let (s, _) = send(
+                    &t.h.app,
+                    "POST",
+                    &format!("/api/conversations/{gid}/members"),
+                    Some(&t.owner_t),
+                    Some(json!({"user_id": t.guest_id})),
+                )
+                .await;
+                assert_eq!(s, StatusCode::OK);
+                assert!(!shown(&messages(t.guest_t.clone(), gid.clone()).await));
+            }
+            std::fs::remove_file(t.dir.join("hold")).unwrap();
+            let reply = loop {
+                let msgs = messages(t.owner_t.clone(), gid.clone()).await;
+                if let Some(m) = msgs.iter().find(|m| {
+                    m["role"] == "assistant" && m["kind"] == "text" && m["status"] != "streaming"
+                }) {
+                    break (m.clone(), msgs);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            if joins {
+                assert_eq!(reply.0["status"], "cancelled");
+                assert!(
+                    !shown(&reply.1),
+                    "a private card never reaches the newcomer"
+                );
+                let gone = t.h.state.db.with(|c| db::get_message(c, &card.id)).unwrap();
+                assert!(gone.is_none());
+            } else {
+                assert_eq!(reply.0["status"], "complete");
+                assert!(shown(&reply.1), "published with the reply");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn turns_starting_during_shutdown_never_run() {
+        let t = turn_setup(|_| {}).await;
+        t.h.state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let main = t.main_of(&t.owner_t).await;
+        let reply = t.chat(&t.owner_t, &main, "hello").await;
+        assert_eq!(reply["status"], "cancelled", "{reply}");
+        assert_eq!(t.runs(), 0);
     }
 
     #[tokio::test]

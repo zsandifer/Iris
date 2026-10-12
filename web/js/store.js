@@ -1,7 +1,7 @@
 // App state: one plain object, a change counter, and loaders that keep it
 // in sync with the REST API and the WebSocket event stream.
 import { useEffect, useReducer, useRef } from './h.js';
-import { get, post, patch, seg } from './api.js';
+import { get, post, patch, seg, isId } from './api.js';
 
 /** Fresh client state: everything here belongs to the signed-in user. */
 function initialState() {
@@ -13,9 +13,10 @@ function initialState() {
     convs: null,         // Conversation[] (not archived)
     archived: null,      // archived Conversation[] (loaded on demand)
     msgs: {},            // conversation id -> {list, hasMore, loading}
-    live: {},            // assistant message id -> {text, acts: Activity[], queued}
+    live: {},            // assistant message id -> {text, acts: Activity[], queued, cid}
     logins: {},          // harness -> LoginStatus (owner)
     engines: null,       // GET /api/engines (owner)
+    connectors: null,    // GET /api/connectors (owner)
     slots: null,         // Slot[]
     feed: null,          // {posts, hasMore, status}
     ideas: null,
@@ -54,6 +55,9 @@ export function set(patch) {
  * data, drafts, open sheets and overlays, and any ad hoc keys.
  */
 export function resetUserState() {
+  connectorsLoading = null;
+  connectorsTried = false;
+  userGen++;
   const fresh = initialState();
   for (const k of Object.keys(S)) if (!(k in fresh)) delete S[k];
   set(fresh);
@@ -116,9 +120,20 @@ export const mainId = () => S.me?.main_conversation_id;
 
 // ----------------------------------------------------------------- loaders
 
+// conversation.created events that arrive while a list request is in flight
+// may be newer than its answer: each running load collects them.
+const convWatch = new Set();
+
 export async function loadConvs() {
-  const { conversations } = await get('/conversations');
-  set({ convs: conversations });
+  const seen = [];
+  convWatch.add(seen);
+  try {
+    const { conversations } = await get('/conversations');
+    const ids = new Set(conversations.map((c) => c.id));
+    set({ convs: [...conversations, ...seen.filter((c) => !ids.has(c.id))] });
+  } finally {
+    convWatch.delete(seen);
+  }
 }
 
 export async function loadArchived() {
@@ -178,7 +193,12 @@ function mergeSnapshot(list, snap) {
   const out = snap.map((m) => (have.has(m.id) ? newer(m, have.get(m.id)) : m));
   for (const m of list) {
     if (ids.has(m.id)) continue;
-    if (m.created_at >= newest || (joined && m.created_at <= oldest.created_at)) out.push(m);
+    if (m.created_at >= newest) out.push(m);
+    else if (joined && m.created_at <= oldest.created_at) {
+      // Outside the latest page, so only a cached copy: it cannot be
+      // confirmed as still streaming, and nothing would ever settle it.
+      out.push(m.status === 'streaming' ? { ...m, status: 'interrupted' } : m);
+    }
   }
   return { list: out.sort((x, y) => x.created_at - y.created_at), joined };
 }
@@ -207,8 +227,12 @@ export async function loadMessages(cid) {
     const live = { ...S.live };
     for (const m of list) {
       if (m.status !== 'streaming') delete live[m.id];
-      else if (!live[m.id]) live[m.id] = { text: '', acts: [] };
+      else if (!live[m.id]) live[m.id] = { text: '', acts: [], cid };
     }
+    // A reply of this chat that is no longer streaming may also have left
+    // the latest page (it finished while we were away): drop its entry too.
+    const streaming = new Set(list.filter((m) => m.status === 'streaming').map((m) => m.id));
+    for (const [mid, l] of Object.entries(live)) if (l.cid === cid && !streaming.has(mid)) delete live[mid];
     set({ live });
     doneLoading(cid, { list, hasMore: joined ? (cur.hasMore ?? r.has_more) : r.has_more, error: undefined });
   } catch (e) {
@@ -232,71 +256,188 @@ export async function loadOlder(cid) {
   }
 }
 
-export async function loadFeed(more = false) {
-  const before = more && S.feed?.posts?.length ? `&before=${S.feed.posts.at(-1).created_at}` : '';
-  const r = await get(`/feed?limit=30${before}`);
-  const posts = more ? [...(S.feed?.posts || []), ...r.posts] : r.posts;
-  set({ feed: { posts, hasMore: r.has_more, status: r.status } });
+// Lists that are refreshed whole (feed, ideas, goals, library) can have
+// several refreshes and page loads in flight. Per list: `started` counts
+// refreshes begun, `applied` is the newest one shown (or the point a local
+// change made everything older stale), and `gen` changes whenever the list
+// is replaced or changed here, which invalidates pages still loading.
+const lists = {};
+const track = (k) => (lists[k] ||= { started: 0, applied: 0, gen: 0 });
+
+/** Begin a full refresh of list `k`; `apply(fn)` runs fn only if still newest. */
+function refreshOf(k) {
+  const t = track(k);
+  const n = ++t.started;
+  return (fn) => {
+    if (n <= t.applied) return false;
+    t.applied = n;
+    t.gen++;
+    fn();
+    return true;
+  };
 }
-export async function loadIdeas() { set({ ideas: (await get('/ideas')).ideas }); }
-export async function loadGoals() { set({ goals: (await get('/goals?include_done=true')).goals }); }
-const SAVED_PAGE = 50;
-const PHOTO_PAGE = 60;
-// Feed posts page by created_at; photos by (used_at, id), newest first.
-const postOlder = (x, last) => x.created_at < last.created_at;
-const photoOlder = (x, last) => x.used_at < last.used_at || (x.used_at === last.used_at && x.id < last.id);
-const photoCursor = (p) => `&before=${p.used_at}&before_id=${encodeURIComponent(p.id)}`;
 
 /**
- * A refreshed first page, keeping later pages that were already loaded, but
- * only when the fresh page reaches back to them (so nothing in between is
- * skipped); otherwise start over from the fresh page and its has_more.
+ * A local (optimistic) change to list `k`: refreshes already in flight may
+ * carry the state from before it, and pages loading may no longer fit, so
+ * both are dropped. Call before or with the change.
  */
-function keepOlder(fresh, freshMore, old, oldMore, older) {
-  if (!freshMore || !old?.length || !fresh.length) return [fresh, !!freshMore];
-  const last = fresh.at(-1);
-  const newestOld = old.reduce((n, x) => (older(n, x) ? x : n));
-  if (older(newestOld, last)) return [fresh, true]; // a gap: drop the old pages
-  const ids = new Set(fresh.map((x) => x.id));
-  const tail = old.filter((x) => !ids.has(x.id) && older(x, last))
-    .sort((a, b) => (older(a, b) ? 1 : older(b, a) ? -1 : 0));
-  return tail.length ? [[...fresh, ...tail], oldMore] : [fresh, true];
+export function touchList(k) {
+  const t = track(k);
+  t.applied = t.started;
+  t.gen++;
 }
 
-export async function loadLibrary() {
-  const [items, ph, sv] = await Promise.all([
-    get('/library').then((r) => r.items),
-    get(`/attachments?limit=${PHOTO_PAGE}`),
-    get(`/feed?liked=true&limit=${SAVED_PAGE}`),
-  ]);
-  const cur = S.library;
-  const [photos, photosMore] = keepOlder(ph.attachments, ph.has_more, cur?.photos, cur?.photosMore, photoOlder);
-  const [saved, savedMore] = keepOlder(sv.posts, sv.has_more, cur?.saved, cur?.savedMore, postOlder);
-  set({ library: { items, photos, photosMore, saved, savedMore } });
+/** A page was appended to list `k`: other pages in flight no longer fit. */
+const grew = (k) => { track(k).gen++; };
+
+/** For a page load: true while list `k` has not been replaced or changed since. */
+function pageOf(k) {
+  const t = track(k);
+  const gen = t.gen;
+  return () => t.gen === gen;
 }
+
+export async function loadFeed(more = false) {
+  if (!more) {
+    const apply = refreshOf('feed');
+    const r = await get('/feed?limit=30');
+    apply(() => set({ feed: { posts: r.posts, hasMore: r.has_more, status: r.status } }));
+    return;
+  }
+  const last = S.feed?.posts?.at(-1);
+  if (!last) return;
+  const fits = pageOf('feed');
+  const r = await get(`/feed?limit=30&before=${last.created_at}`);
+  // This page only follows the list it was asked for.
+  if (!fits() || S.feed?.posts.at(-1)?.id !== last.id) return;
+  grew('feed');
+  set({ feed: { posts: appendNew(S.feed.posts, r.posts), hasMore: r.has_more, status: r.status } });
+}
+
+/**
+ * The Ideas screen shows open and started ideas; asking for just those means
+ * the newest dismissed or done ones never crowd them out of the server's
+ * page (at most 200, newest first).
+ */
+export async function loadIdeas() {
+  const apply = refreshOf('ideas');
+  const r = await get('/ideas?status=open,started');
+  apply(() => set({ ideas: r.ideas }));
+}
+export async function loadGoals() {
+  const apply = refreshOf('goals');
+  const r = await get('/goals?include_done=true');
+  apply(() => set({ goals: r.goals }));
+}
+const SAVED_PAGE = 50;
+const PHOTO_PAGE = 60;
+const ITEM_PAGE = 60;
+const MAX_RELOAD = 600; // a refresh reloads at most this many shown items
+// Photos page by (used_at, id), generated items by (created_at, id),
+// saved posts by created_at; all newest first.
+const photoCursor = (p) => `&before=${p.used_at}&before_id=${encodeURIComponent(p.id)}`;
+const itemCursor = (it) => `&before=${it.created_at}&before_id=${encodeURIComponent(it.id)}`;
 
 const appendNew = (list, more) => {
   const ids = new Set(list.map((x) => x.id));
   return [...list, ...more.filter((x) => !ids.has(x.id))];
 };
 
-/** Next page of Library's Saved posts. */
-export async function loadMoreSaved() {
-  const last = S.library?.saved.at(-1);
-  if (!last) return;
-  const r = await get(`/feed?liked=true&limit=${SAVED_PAGE}&before=${last.created_at}`);
-  if (!S.library) return;
-  set({ library: { ...S.library, saved: appendNew(S.library.saved, r.posts), savedMore: !!r.has_more } });
+// Library lists, newest first. `page(last)` fetches the page after `last`
+// (the first page without it) and returns [items, hasMore].
+const PAGED = {
+  items: {
+    more: 'itemsMore',
+    page: (last) => get(`/library?limit=${ITEM_PAGE}${last ? itemCursor(last) : ''}`)
+      .then((r) => [r.items, !!r.has_more]),
+  },
+  saved: {
+    more: 'savedMore',
+    page: (last) => get(`/feed?liked=true&limit=${SAVED_PAGE}${last ? `&before=${last.created_at}` : ''}`)
+      .then((r) => [r.posts, !!r.has_more]),
+  },
+  photos: {
+    more: 'photosMore',
+    page: (last) => get(`/attachments?limit=${PHOTO_PAGE}${last ? photoCursor(last) : ''}`)
+      .then((r) => [r.attachments, !!r.has_more]),
+  },
+};
+
+/** Pages from the top until at least `want` items are loaded (or the end). */
+async function loadPages(kind, want) {
+  let list = [];
+  let more;
+  do {
+    const [items, m] = await PAGED[kind].page(list.at(-1));
+    const had = list.length;
+    list = appendNew(list, items);
+    more = m && list.length > had; // stop if a page brings nothing new
+  } while (more && list.length < Math.min(want, MAX_RELOAD));
+  return [list, more];
+}
+let connectorsLoading = null;
+let userGen = 0;
+/** Load the owner's connectors; concurrent callers share one request. */
+export function loadConnectors() {
+  if (!isOwner()) return Promise.resolve();
+  const gen = userGen;
+  const req = connectorsLoading || get('/connectors')
+    // Dropped if the user signed out meanwhile.
+    .then((r) => { if (gen === userGen) set({ connectors: r.connectors }); })
+    .finally(() => { if (connectorsLoading === req) connectorsLoading = null; });
+  connectorsLoading = req;
+  return req;
 }
 
-/** Next page of Library's Photos. */
-export async function loadMorePhotos() {
-  const last = S.library?.photos.at(-1);
-  if (!last) return;
-  const r = await get(`/attachments?limit=${PHOTO_PAGE}${photoCursor(last)}`);
-  if (!S.library) return;
-  set({ library: { ...S.library, photos: appendNew(S.library.photos, r.attachments), photosMore: !!r.has_more } });
+let connectorsTried = false;
+/** Load connectors once for cards that only need them for display. */
+export function ensureConnectors() {
+  if (S.connectors || connectorsTried || !isOwner()) return;
+  connectorsTried = true;
+  loadConnectors().catch(() => {});
 }
+
+/**
+ * (Re)load the Library. Each list (made by me, photos, saved) is reloaded
+ * from the server as far as it was shown, never patched from what was
+ * cached, so an item unliked or removed elsewhere disappears and a newly
+ * saved one shows up.
+ */
+export async function loadLibrary() {
+  const apply = refreshOf('library');
+  const cur = S.library;
+  const [[items, itemsMore], [photos, photosMore], [saved, savedMore]] = await Promise.all([
+    loadPages('items', cur?.items.length || 0),
+    loadPages('photos', cur?.photos.length || 0),
+    loadPages('saved', cur?.saved.length || 0),
+  ]);
+  apply(() => set({ library: { items, itemsMore, photos, photosMore, saved, savedMore } }));
+}
+
+/**
+ * The next page of a Library list. Dropped if the list was replaced while
+ * the request was out (its last item is no longer the cursor), so a page
+ * never joins a list it doesn't follow.
+ */
+async function loadMore(kind) {
+  const last = S.library?.[kind].at(-1);
+  if (!last) return;
+  const fits = pageOf('library');
+  const [items, more] = await PAGED[kind].page(last);
+  const lib = S.library;
+  if (!fits() || !lib || lib[kind].at(-1)?.id !== last.id) return;
+  grew('library');
+  set({ library: { ...lib, [kind]: appendNew(lib[kind], items), [PAGED[kind].more]: more } });
+}
+
+/** Next page of Library's Saved posts. */
+export const loadMoreSaved = () => loadMore('saved');
+/** Next page of Library's generated items ("Made by me"). */
+export const loadMoreItems = () => loadMore('items');
+/** Next page of Library's Photos. */
+export const loadMorePhotos = () => loadMore('photos');
+
 export async function loadSlots() { set({ slots: (await get('/models/slots')).slots }); }
 export async function loadEngines() {
   if (!isOwner()) return;
@@ -329,8 +470,9 @@ function bumpConv(cid, at) {
   S.convs = S.convs.map((c) => (c.id === cid ? { ...c, updated_at: at } : c));
 }
 
-function liveFor(mid) {
-  return S.live[mid] || { text: '', acts: [] };
+function liveFor(mid, cid) {
+  const l = S.live[mid] || { text: '', acts: [] };
+  return cid && !l.cid ? { ...l, cid } : l;
 }
 
 /**
@@ -345,6 +487,29 @@ export function currentLogins(harnesses) {
   return logins;
 }
 
+// Sign-in sessions: events are authoritative and arrive in order (a
+// rejected code legitimately goes back from verifying to waiting_for_code),
+// so an HTTP response is applied only when no event for that harness came
+// in while it was in flight. A session that started earlier than the one
+// shown is stale either way.
+const loginEvents = {}; // harness -> count of harness.login events seen
+
+/** Call before a sign-in request; pass the result to applyLoginResponse. */
+export const loginMark = (harness) => loginEvents[harness] || 0;
+
+function newerSession(cur, next) {
+  return !cur || cur.id === next.id || (next.started_at || 0) >= (cur.started_at || 0);
+}
+
+/** Apply a sign-in request's `{login}` response unless events moved past it. */
+export function applyLoginResponse(harness, login, mark) {
+  if (!login) return;
+  const cur = S.logins[harness];
+  if (cur && cur.id === login.id && loginMark(harness) !== mark) return;
+  if (!newerSession(cur, login)) return;
+  set({ logins: { ...S.logins, [harness]: login } });
+}
+
 export function handleEvent(ev) {
   switch (ev.type) {
     case 'ready':
@@ -356,19 +521,19 @@ export function handleEvent(ev) {
       break;
     case 'message.created': {
       const m = ev.message;
-      if (m.status === 'streaming' && !S.live[m.id]) S.live = { ...S.live, [m.id]: { text: '', acts: [] } };
+      if (m.status === 'streaming' && !S.live[m.id]) S.live = { ...S.live, [m.id]: { text: '', acts: [], cid: ev.conversation_id } };
       upsert(ev.conversation_id, m);
       bumpConv(ev.conversation_id, m.created_at);
       set({});
       break;
     }
     case 'message.delta': {
-      const l = liveFor(ev.message_id);
+      const l = liveFor(ev.message_id, ev.conversation_id);
       set({ live: { ...S.live, [ev.message_id]: { ...l, text: l.text + ev.text, queued: false } } });
       break;
     }
     case 'message.activity': {
-      const l = liveFor(ev.message_id);
+      const l = liveFor(ev.message_id, ev.conversation_id);
       const acts = l.acts.filter((a) => a.id !== ev.activity.id);
       const i = l.acts.findIndex((a) => a.id === ev.activity.id);
       if (i >= 0) acts.splice(i, 0, ev.activity);
@@ -377,7 +542,7 @@ export function handleEvent(ev) {
       break;
     }
     case 'turn.status': {
-      const l = liveFor(ev.message_id);
+      const l = liveFor(ev.message_id, ev.conversation_id);
       set({ live: { ...S.live, [ev.message_id]: { ...l, queued: ev.status === 'queued' } } });
       break;
     }
@@ -393,6 +558,7 @@ export function handleEvent(ev) {
       set({});
       break;
     case 'conversation.created':
+      for (const seen of convWatch) seen.push(ev.conversation);
       if (S.convs && !S.convs.some((c) => c.id === ev.conversation.id)) {
         set({ convs: [...S.convs, ev.conversation] });
       }
@@ -414,13 +580,41 @@ export function handleEvent(ev) {
       set({ slots: ev.slots });
       break;
     case 'harness.login':
-      set({ logins: { ...S.logins, [ev.login.harness]: ev.login } });
+      loginEvents[ev.login.harness] = loginMark(ev.login.harness) + 1;
+      if (newerSession(S.logins[ev.login.harness], ev.login)) set({ logins: { ...S.logins, [ev.login.harness]: ev.login } });
       break;
     case 'engines.changed':
       if (S.engines) set({ engines: { ...S.engines, engines: ev.engines } });
       break;
+    case 'connectors.changed':
+      if (S.connectors) loadConnectors().catch(() => {});
+      break;
     default:
       break;
+  }
+}
+
+/**
+ * Live replies in chats that aren't loaded: reloading S.msgs won't see them
+ * finish (their completion may have been missed while offline). Ask whether
+ * a turn still holds each such chat and drop the entries if not.
+ */
+function reconcileLive() {
+  const byChat = {};
+  for (const [mid, l] of Object.entries(S.live)) {
+    if (l.cid && S.msgs[l.cid]) continue; // loadMessages reconciles these
+    (byChat[l.cid || ''] ||= []).push(mid);
+  }
+  for (const [cid, mids] of Object.entries(byChat)) {
+    const drop = () => {
+      const live = { ...S.live };
+      for (const m of mids) delete live[m];
+      set({ live });
+    };
+    if (!isId(cid)) { drop(); continue; }
+    get(`/conversations/${seg(cid)}`)
+      .then((r) => { if (!r.turn_running) drop(); })
+      .catch((e) => { if (e.status === 403 || e.status === 404) drop(); });
   }
 }
 
@@ -428,9 +622,11 @@ export function handleEvent(ev) {
 export function refreshAll() {
   loadConvs().catch(() => {});
   for (const cid of Object.keys(S.msgs)) loadMessages(cid).catch(() => {});
+  reconcileLive();
   for (const k of Object.keys(loaders)) if (S[k]) loaders[k]().catch(() => {});
   if (S.slots) loadSlots().catch(() => {});
   if (S.engines) loadEngines().catch(() => {});
+  if (S.connectors) loadConnectors().catch(() => {});
 }
 
 /** Send a message (text and/or attachment ids) and track the reply. */
@@ -442,7 +638,7 @@ export async function sendMessage(cid, text, attachments = []) {
   if (!known) {
     upsert(cid, r.assistant_message);
     if (!S.live[r.assistant_message.id]) {
-      S.live = { ...S.live, [r.assistant_message.id]: { text: '', acts: [] } };
+      S.live = { ...S.live, [r.assistant_message.id]: { text: '', acts: [], cid } };
     }
   }
   bumpConv(cid, r.user_message.created_at);

@@ -2,6 +2,7 @@
 import { html, useEffect, useState, useRef } from './h.js';
 import { holdBlob } from './api.js';
 import { S, set, back } from './store.js';
+import { openPhoto } from './photo.js';
 
 // Line icons (24px grid, drawn for Iris).
 const P = {
@@ -78,38 +79,58 @@ export function useBlob(src, enabled = true) {
 }
 
 const canObserve = typeof IntersectionObserver === 'function';
+// Fetch when within NEAR of the viewport; let go of the image (so the
+// cache may evict it) once it is more than FAR away. The gap keeps images
+// near the edge from flickering.
+const NEAR = '400px';
+const FAR = '1600px';
 
 /**
- * Image from a URL; `/api/...` paths are fetched with the device token once
- * near the viewport. With `transient`, the bytes are also let go once the
- * image is far out of view (long feeds), and fetched again on the way back;
- * use it only where the box keeps its size without the image.
+ * Image from a URL. `/api/...` paths are fetched with the device token while
+ * the image is near the viewport, and released when it scrolls far away.
  */
-export function Img({ src, alt = '', cls = '', onLoad, onError, transient = false, ...rest }) {
+export function Img({ src, alt = '', cls = '', onLoad, onError, photo = true, photoOptions, ...rest }) {
   const authed = !!src && src.startsWith('/api/');
-  const ph = useRef();
+  const [el, setEl] = useState(null);
   const [near, setNear] = useState(!canObserve);
   const [blob, blobFailed] = useBlob(authed ? src : null, near);
   const [failed, setFailed] = useState(false);
+  const touch = useRef(null);
   useEffect(() => { setFailed(false); }, [src]);
-  const shown = !!(authed ? blob : src);
   useEffect(() => {
-    if (!authed || !canObserve || !ph.current || (near && !transient)) return undefined;
-    const io = new IntersectionObserver((es) => {
-      const e = es[es.length - 1];
-      if (e.isIntersecting) {
-        if (!transient) io.disconnect();
-        setNear(true);
-      } else if (transient) {
-        setNear(false);
-      }
-    }, transient ? { rootMargin: '1500px 500px' } : { rootMargin: '400px', scrollMargin: '400px' });
-    io.observe(ph.current);
-    return () => io.disconnect();
-  }, [near, authed, transient, shown]);
+    if (!canObserve || !authed || !el) return undefined;
+    const watch = (margin, fn) => {
+      // The placeholder is replaced once its blob loads. An observer can
+      // report that detached node before effect cleanup; it must not evict
+      // the new image and start an endless placeholder/image cycle.
+      const io = new IntersectionObserver((es) => {
+        if (el.isConnected) fn(es.at(-1).isIntersecting);
+      }, { rootMargin: margin, scrollMargin: margin });
+      io.observe(el);
+      return io;
+    };
+    const near = watch(NEAR, (yes) => yes && setNear(true));
+    const far = watch(FAR, (yes) => !yes && setNear(false));
+    return () => { near.disconnect(); far.disconnect(); };
+  }, [el, authed]);
   const url = authed ? blob : src;
-  if (!url || failed || blobFailed) return html`<div ref=${ph} class=${'img-ph ' + cls} />`;
-  return html`<img ref=${ph} class=${cls} src=${url} alt=${alt} loading="lazy" decoding="async"
+  if (!url || failed || blobFailed) return html`<div ref=${setEl} class=${'img-ph ' + cls} />`;
+  const open = (e) => {
+    e.preventDefault(); e.stopPropagation();
+    // A carousel swipe can still produce a click in some browsers.
+    const t = touch.current;
+    if (e.detail && t && (t.moved || (t.car && Math.abs(t.car.scrollLeft - t.scroll) > 8))) return;
+    openPhoto(src, alt, { ...photoOptions, focus: el.closest('button, a') || el });
+  };
+  const nested = el?.closest('button, a');
+  return html`<img ref=${setEl} class=${cls + (photo ? ' photo-tap' : '')} src=${url} alt=${alt} loading="lazy" decoding="async"
+    role=${photo && !nested ? 'button' : undefined} tabindex=${photo && !nested ? 0 : undefined}
+    aria-label=${photo && !nested ? `View photo${alt ? ': ' + alt : ''}` : undefined}
+    onPointerDown=${photo ? (e) => { const car = e.currentTarget.closest('.car'); touch.current = { x: e.clientX, y: e.clientY, car, scroll: car?.scrollLeft }; } : undefined}
+    onPointerMove=${photo ? (e) => { const t = touch.current; if (t && Math.hypot(e.clientX - t.x, e.clientY - t.y) > 8) t.moved = true; } : undefined}
+    onPointerCancel=${photo ? () => { if (touch.current) touch.current.moved = true; } : undefined}
+    onClick=${photo ? open : undefined}
+    onKeyDown=${photo ? (e) => { if (e.key === 'Enter' || e.key === ' ') open(e); } : undefined}
     referrerpolicy="no-referrer" onLoad=${onLoad}
     onError=${() => { setFailed(true); onError?.(); }} ...${rest} />`;
 }
@@ -119,7 +140,7 @@ export function Avatar({ size = 36 }) {
   const custom = S.settings?.avatar_custom;
   const src = custom ? S.settings.avatar_url : null;
   return html`<div class="avatar" style=${`width:${size}px;height:${size}px`}>
-    ${src ? html`<${Img} src=${src} alt="" />` : html`<div class="orb" />`}
+    ${src ? html`<${Img} src=${src} alt="Profile photo" width=${size} height=${size} />` : html`<div class="orb" />`}
   </div>`;
 }
 

@@ -63,7 +63,10 @@ pub struct RunRequest<'a> {
 
 fn base_command(program: &Path, cwd: &Path, env_remove: &[&str]) -> Command {
     let mut cmd = Command::new(program);
+    // Some CLIs take their project root from PWD rather than the real
+    // working directory; never let them inherit the daemon's.
     cmd.current_dir(cwd)
+        .env("PWD", cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -230,14 +233,19 @@ pub async fn run(
 }
 
 /// Run a short command (`--version`, `auth status`) and capture its output.
+/// `env_add` carries the owner's engine API keys, if any.
 pub async fn probe(
     program: &Path,
     args: &[String],
     cwd: &Path,
     env_remove: &[&str],
+    env_add: &[(String, String)],
 ) -> Result<(bool, String, String)> {
     let mut cmd = base_command(program, cwd, env_remove);
     cmd.args(args).stdin(Stdio::null());
+    for (k, v) in env_add {
+        cmd.env(k, v);
+    }
     let child = cmd.spawn()?;
     let pid = child.id();
     match tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await {
@@ -307,15 +315,16 @@ mod tests {
 
     #[tokio::test]
     async fn streams_stdin_through_and_finishes() {
-        let (out, evs) = sh("cat; echo done", b"a\nb\n", 5000).await;
+        let (out, evs) = sh("cat; echo \"done pwd=$PWD\"", b"a\nb\n", 5000).await;
         assert!(out.exit_ok && !out.timed_out);
         assert_eq!(
             evs,
             vec![
                 HarnessEvent::TextDelta { text: "a".into() },
                 HarnessEvent::TextDelta { text: "b".into() },
+                // PWD is the run's directory, not the daemon's.
                 HarnessEvent::TextDelta {
-                    text: "done".into()
+                    text: "done pwd=/".into()
                 },
                 HarnessEvent::Done
             ]

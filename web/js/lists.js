@@ -1,12 +1,13 @@
 // Ideas, Goals, and Library tabs.
 import { html, useEffect, useState } from './h.js';
-import { post, patch, del, api, seg } from './api.js';
+import { get, post, patch, del, api, seg, isId, sessionGen } from './api.js';
 import {
-  S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary, loadMoreSaved, loadMorePhotos,
+  S, set, useStore, go, toast, loadIdeas, loadGoals, loadLibrary, loadMoreSaved, loadMorePhotos, loadMoreItems, convFor, touchList,
 } from './store.js';
 import { Icon, Img, Empty, Spinner, ago, since, openSheet, closeSheet, confirmSheet, hostOf, useBlob } from './ui.js';
 import { md } from './md.js';
-import { Post, findPost } from './feed.js';
+import { Post, findPost, photos } from './feed.js';
+import { openPhoto } from './photo.js';
 
 function Head({ title, sub }) {
   return html`<h1 class="ttl">${title}</h1>${sub && html`<div class="sub">${sub}</div>`}`;
@@ -31,6 +32,7 @@ export function IdeasScreen() {
     setBusy(null);
   };
   const later = async (i) => {
+    touchList('ideas');
     set({ ideas: S.ideas.map((x) => (x.id === i.id ? { ...x, status: 'dismissed' } : x)) });
     try { await patch(`/ideas/${seg(i.id)}`, { status: 'dismissed' }); } catch (e) { toast(e.message); loadIdeas(); }
   };
@@ -62,11 +64,13 @@ export function GoalsScreen() {
   const active = S.goals.filter((g) => !g.suggested && !g.done);
   const done = S.goals.filter((g) => g.done);
   const update = async (g, body) => {
+    touchList('goals');
     set({ goals: S.goals.map((x) => (x.id === g.id ? { ...x, ...body } : x)) });
     try { await patch(`/goals/${seg(g.id)}`, body); } catch (e) { toast(e.message); }
     loadGoals().catch(() => {});
   };
   const remove = async (g) => {
+    touchList('goals');
     set({ goals: S.goals.filter((x) => x.id !== g.id) });
     try { await del(`/goals/${seg(g.id)}`); } catch (e) { toast(e.message); loadGoals(); }
   };
@@ -114,8 +118,22 @@ function Download({ src, name }) {
   return html`<a class="b1" href=${url || undefined} download=${name} aria-disabled=${url ? undefined : 'true'}>Download</a>`;
 }
 
-async function openItem(it) {
+/** `cid` if it is a chat this user can open (not a background job's), else null. */
+async function openableChat(cid) {
+  if (!isId(cid)) return null;
+  if (convFor(cid)) return cid;
+  try {
+    const { conversation: c } = await get(`/conversations/${seg(cid)}`);
+    return c && c.kind !== 'job' ? cid : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function openItem(it) {
   openSheet(() => html`<div class="sheet-body"><${Spinner} /></div>`);
+  const gen = sessionGen();
+  const chat = openableChat(it.conversation_id);
   try {
     const path = `/library/${seg(it.id)}/content`;
     let view;
@@ -125,11 +143,14 @@ async function openItem(it) {
       view = it.mime === 'text/markdown' ? html`<div class="md doc" dangerouslySetInnerHTML=${{ __html: md(text) }} />`
         : html`<pre class="doc">${text}</pre>`;
     } else view = html`<p class="mu">I can't show this kind of file here, but you can download it.</p>`;
+    const cid = await chat;
+    // Signed out or re-paired meanwhile: this belongs to the previous user.
+    if (gen !== sessionGen()) return;
     openSheet(() => html`<div class="sheet-body tall">
       <h3>${it.title}</h3>${it.description && html`<p class="mu">${it.description}</p>`}
       ${view}
       <div class="btns">
-        ${it.conversation_id && html`<button class="b2" onClick=${() => { closeSheet(); go(`chat/${it.conversation_id}`); }}>Open chat</button>`}
+        ${cid && html`<button class="b2" onClick=${() => { closeSheet(); go(`chat/${cid}`); }}>Open chat</button>`}
         <${Download} src=${`/api${path}`} name=${it.title} />
       </div></div>`);
   } catch (e) { closeSheet(); toast(e.message); }
@@ -140,7 +161,7 @@ function MadeByIris({ items, limit }) {
   const docs = items.filter((i) => !i.mime.startsWith('image/'));
   const shown = limit ? docs.slice(0, limit) : docs;
   return html`${media.length > 0 && html`<div class="grid">${(limit ? media.slice(0, 6) : media).map((it) => html`
-      <button class="gi" onClick=${() => openItem(it)}><${Img} src=${`/api/library/${seg(it.id)}/content`} alt=${it.title} /></button>`)}</div>`}
+      <button class="gi" onClick=${() => openPhoto(`/api/library/${seg(it.id)}/content`, it.title, { action: { label: 'Details', onClick: () => openItem(it) } })}><${Img} src=${`/api/library/${seg(it.id)}/content`} alt=${it.title} /></button>`)}</div>`}
     ${shown.length > 0 && html`<div class="grp">${shown.map((it) => html`<div class="r tap" onClick=${() => openItem(it)}>
       <div class="ri"><${Icon} name=${KIND_ICON(it.mime)} size=${17} /></div>
       <div class="rt">${it.title}<small>${it.description || it.mime} · ${ago(it.created_at)}</small></div>
@@ -149,8 +170,9 @@ function MadeByIris({ items, limit }) {
 
 function PhotoGrid({ photos, limit }) {
   const list = limit ? photos.slice(0, limit) : photos;
-  return html`<div class="grid">${list.map((p) => html`<button class="gi" onClick=${() => set({ lightbox: `/api/attachments/${seg(p.id)}`, lightboxChat: p.conversation_id })}>
-    <${Img} src=${`/api/attachments/${seg(p.id)}`} alt="Photo you sent" /></button>`)}</div>`;
+  const options = (p) => ({ action: p.conversation_id ? { label: 'Open chat', onClick: () => go(`chat/${p.conversation_id}`) } : null });
+  return html`<div class="grid">${list.map((p) => html`<button class="gi" onClick=${() => openPhoto(`/api/attachments/${seg(p.id)}`, 'Photo you sent', options(p))}>
+    <${Img} src=${`/api/attachments/${seg(p.id)}`} alt="Photo you sent" photoOptions=${options(p)} /></button>`)}</div>`;
 }
 
 function Saved({ posts, limit }) {
@@ -164,7 +186,7 @@ function Saved({ posts, limit }) {
     });
   };
   return html`<div class="grp">${list.map((p) => html`<div class="r tap" onClick=${() => show(p)}>
-    <div class="ri thumb">${(p.images?.[0] || p.image_url) ? html`<${Img} src=${p.images?.[0] || p.image_url} alt="" />` : html`<${Icon} name="heart" size=${16} />`}</div>
+    <div class="ri thumb">${photos(p)[0] ? html`<${Img} src=${photos(p)[0]} alt=${p.title} />` : html`<${Icon} name="heart" size=${16} />`}</div>
     <div class="rt">${p.title}<small>${p.source_name || hostOf(p.source_url) || p.topic || 'Saved post'}</small></div>
     <${Icon} name="chev" size=${16} cls="rc" /></div>`)}</div>`;
 }
@@ -190,7 +212,7 @@ export function LibraryScreen() {
   const tabs = [['all', 'All'], ['made', 'Made by me'], ['photos', 'Photos'], ['saved', 'Saved']];
   let body;
   if (!lib) body = html`<${Spinner} />`;
-  else if (tab === 'made') body = lib.items.length ? html`<${MadeByIris} items=${lib.items} />` : html`<${Empty} icon="file" title="Nothing yet">Reports, drafts, and images I make for you land here.<//>`;
+  else if (tab === 'made') body = lib.items.length ? html`<${MadeByIris} items=${lib.items} />${lib.itemsMore && html`<${ShowMore} load=${loadMoreItems} />`}` : html`<${Empty} icon="file" title="Nothing yet">Reports, drafts, and images I make for you land here.<//>`;
   else if (tab === 'photos') body = lib.photos.length ? html`<${PhotoGrid} photos=${lib.photos} />${lib.photosMore && html`<${ShowMore} load=${loadMorePhotos} />`}` : html`<${Empty} icon="image" title="No photos yet">Photos you send me show up here.<//>`;
   else if (tab === 'saved') body = saved.length || lib.savedMore ? html`<${Saved} posts=${saved} />${lib.savedMore && html`<${ShowMore} load=${loadMoreSaved} />`}` : html`<${Empty} icon="heart" title="Nothing saved">Tap ♡ on a post in For you to keep it here.<//>`;
   else {

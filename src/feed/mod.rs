@@ -241,7 +241,7 @@ pub async fn resume(state: &AppState, user_id: &str) -> Result<bool> {
         })
         .await?;
     let owner = state.db.call(db::owner_user_id).await?;
-    if owner.as_deref() == Some(user_id) && state.cfg.feed.enabled {
+    if owner.as_deref() == Some(user_id) && state.cfg.feed.enabled && !state.is_paused().await {
         crate::jobs::trigger(state, crate::jobs::Job::Feed, false);
     }
     Ok(was_paused)
@@ -305,6 +305,41 @@ fn pause_locked(c: &rusqlite::Connection, uid: &str) -> rusqlite::Result<Vec<db:
 /// per local day; `manual` (the app's "find something now", or resuming)
 /// always runs. Returns None when there was nothing to do.
 pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option<RunReport>> {
+    let run_id = crate::util::new_id();
+    let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+    {
+        let mut running = state.running.lock().unwrap_or_else(|p| p.into_inner());
+        if state.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = cancel_tx.send(true);
+        }
+        running.insert(run_id.clone(), cancel_tx);
+    }
+    let result = run_pipeline(state, user_id, manual, &cancel).await;
+    state
+        .running
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&run_id);
+    result
+}
+
+/// Each bounded fetch phase finishes before observing Stop; a cancelled
+/// run stays stopped even if the owner resumes Iris in the meantime.
+async fn stopped(state: &AppState, cancel: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *cancel.borrow()
+        || state.stopping.load(std::sync::atomic::Ordering::SeqCst)
+        || state.is_paused().await
+}
+
+async fn run_pipeline(
+    state: &AppState,
+    user_id: &str,
+    manual: bool,
+    cancel: &tokio::sync::watch::Receiver<bool>,
+) -> Result<Option<RunReport>> {
+    if stopped(state, cancel).await {
+        return Ok(None);
+    }
     let now = now_ms();
     let today = crate::jobs::local_day(now);
     let uid = user_id.to_string();
@@ -359,6 +394,10 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
     };
     let mut model_notes: Vec<(OneShotReply, &'static str)> = Vec::new();
 
+    if stopped(state, cancel).await {
+        return Ok(None);
+    }
+
     // YouTube via Google, when a token is available.
     let mut youtube_likes = Vec::new();
     if let Some(token) = google::access_token(state, user_id).await {
@@ -381,6 +420,10 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
         }
     }
 
+    if stopped(state, cancel).await {
+        return Ok(None);
+    }
+
     // 1. Interests: at most one model call a day, even across manual runs
     // and failures.
     let interests = match st.interests.clone() {
@@ -395,6 +438,10 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
         }
     };
     let topics = interests.topics.clone();
+
+    if stopped(state, cancel).await {
+        return Ok(None);
+    }
 
     // 2. Fetch.
     let uid = user_id.to_string();
@@ -481,6 +528,10 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
     items.extend(search_items);
     report.items_found = items.len() as u32;
 
+    if stopped(state, cancel).await {
+        return Ok(None);
+    }
+
     // 3. Clean and 4. rank (CPU work, off the async workers), enrich the
     // finalists from their pages, then pick.
     let lang = interests.language.clone().unwrap_or_else(|| "en".into());
@@ -514,6 +565,10 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
         .collect();
     let picked = rank::select(rescored, size as usize);
 
+    if stopped(state, cancel).await {
+        return Ok(None);
+    }
+
     // 5. Blurbs: one batched call for the posts that need one.
     let mut blurbs: HashMap<String, model::Blurb> = HashMap::new();
     let need: Vec<model::SummaryInput> = picked
@@ -540,6 +595,10 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
             report.model_used = true;
             model_notes.push((reply, "summaries"));
         }
+    }
+
+    if stopped(state, cancel).await {
+        return Ok(None);
     }
 
     // 6. Cache photos and icons, then publish.
@@ -632,6 +691,10 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
     // Published today, by the clock now (not when the run started).
     let t = crate::jobs::local_day(now_ms());
     let rep = report.clone().with_stats(fetcher.stats());
+    if stopped(state, cancel).await {
+        return Ok(None);
+    }
+
     let published: Vec<String> = state
         .db
         .call(move |c| publish_batch(c, &uid, &posts, &seen_new, &t, rep))
@@ -643,8 +706,15 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
         json!({"type": "entities.changed", "kinds": ["feed"]}),
     );
 
+    if stopped(state, cancel).await {
+        return Ok(None);
+    }
+
     // Urgent pushes: events in today's batch, then price drops.
     for (title, ev, topic, followed) in urgent_candidates {
+        if stopped(state, cancel).await {
+            return Ok(None);
+        }
         let affinity = topic
             .as_ref()
             .and_then(|t| topics.iter().find(|x| x.name.eq_ignore_ascii_case(t)))
@@ -662,7 +732,11 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
             push_urgent(state, user_id, "Something near you soon", &body).await;
         }
     }
-    check_price_watches(state, user_id, &fetcher).await;
+    if stopped(state, cancel).await {
+        return Ok(None);
+    }
+
+    check_price_watches(state, user_id, &fetcher, cancel).await;
 
     // Housekeeping: photos no post uses any more.
     let referenced = state
@@ -701,6 +775,9 @@ fn publish_batch(
     crate::db::write_tx(c, |c| {
         // Recheck inside the transaction: the agent may have posted the
         // same story (through the bridge) while this run worked.
+        if db::get_setting(c, "paused")?.is_some() {
+            return Ok(Vec::new());
+        }
         let seen_now = store::seen_keys(c, uid)?;
         let fresh: Vec<&PipelinePost> = posts
             .iter()
@@ -1229,6 +1306,9 @@ fn topics_from_likes(liked: &[(String, Option<String>)]) -> Vec<Topic> {
 
 /// Send an urgent push (counts toward the daily cap). Quiet hours delay it.
 async fn push_urgent(state: &AppState, user_id: &str, title: &str, body: &str) {
+    if state.is_paused().await || state.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     let uid = user_id.to_string();
     let day = crate::jobs::local_day(now_ms());
     let allowed = state
@@ -1259,7 +1339,12 @@ async fn push_urgent(state: &AppState, user_id: &str, title: &str, body: &str) {
 }
 
 /// Re-check saved products' prices; a real drop becomes a post and a push.
-async fn check_price_watches(state: &AppState, user_id: &str, fetcher: &Arc<Fetcher>) {
+async fn check_price_watches(
+    state: &AppState,
+    user_id: &str,
+    fetcher: &Arc<Fetcher>,
+    cancel: &tokio::sync::watch::Receiver<bool>,
+) {
     let uid = user_id.to_string();
     let due = state
         .db
@@ -1331,6 +1416,9 @@ async fn check_price_watches(state: &AppState, user_id: &str, fetcher: &Arc<Fetc
     .await
     .unwrap_or_default();
     for (w, _new, post) in checked {
+        if stopped(state, cancel).await {
+            return;
+        }
         let uid = user_id.to_string();
         let push = post.as_ref().map(|p| p.body.clone());
         // The lower reference price and the alert post commit together, so
@@ -1341,7 +1429,7 @@ async fn check_price_watches(state: &AppState, user_id: &str, fetcher: &Arc<Fetc
                 crate::db::write_tx(c, |c| {
                     // Unliked or deleted while the page was being read:
                     // nothing to alert about any more.
-                    if !store::watch_active(c, &w.id)? {
+                    if db::get_setting(c, "paused")?.is_some() || !store::watch_active(c, &w.id)? {
                         return Ok(false);
                     }
                     let drop_to = post
@@ -1486,6 +1574,7 @@ esac
 cat >/dev/null
 echo run >> "$D/calls"
 case "$(cat "$D/mode")" in
+  slow) sleep 60;;
   ok) printf '{"type":"result","subtype":"success","is_error":false,"result":%s}\n' "$(cat "$D/reply")";;
   auth) echo '{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login"}';;
   *) echo '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}';;
@@ -1562,6 +1651,62 @@ esac
         std::fs::read_to_string(tmp.path().join("ccalls"))
             .map(|s| s.lines().count())
             .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn paused_feed_and_helpers_do_not_start_and_running_helpers_stop() {
+        let (state, tmp, owner) = fake_engine().await;
+        set(&tmp, "slow", "");
+        state
+            .db
+            .with(|c| db::set_setting(c, "paused", "1"))
+            .unwrap();
+        assert!(run(&state, &owner, true).await.unwrap().is_none());
+        let request = || OneShotRequest {
+            slot: Slot::Feed,
+            shared: false,
+            system_prompt: "Summarize this story.",
+            prompt: "A comet",
+            timeout: Duration::from_secs(60),
+            scope: "feed-summaries",
+            max_attempts: 1,
+            take_slot: true,
+        };
+        assert!(one_shot(&state, request()).await.is_err());
+        assert_eq!(runs(&tmp), 0);
+        assert!(state.running.lock().unwrap().is_empty());
+        state.db.with(|c| db::delete_setting(c, "paused")).unwrap();
+
+        let st = state.clone();
+        let task = tokio::spawn(async move { one_shot(&st, request()).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runs(&tmp) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        state
+            .db
+            .with(|c| db::set_setting(c, "paused", "2"))
+            .unwrap();
+        let ids: Vec<String> = state.running.lock().unwrap().keys().cloned().collect();
+        assert_eq!(ids.len(), 1);
+        for id in ids {
+            assert!(crate::turn::cancel(&state, &id));
+        }
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        assert!(state.running.lock().unwrap().is_empty());
+        assert!(
+            std::fs::read_dir(state.paths.run_dir())
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 
     #[tokio::test]

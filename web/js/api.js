@@ -8,16 +8,35 @@ let unauthorizedHandler = () => {};
 // earlier token are dropped, so one user's data never reaches the next.
 let generation = 0;
 
+/** Changes whenever the signed-in token does; compare across awaits. */
+export const sessionGen = () => generation;
 export const hasToken = () => !!token;
 export function setToken(t) {
   const next = t || '';
-  if (next !== token) {
+  const changed = next !== token;
+  const hadSession = !!token;
+  if (changed) {
     generation++;
     clearBlobs();
   }
   token = next;
   if (token) localStorage.setItem(TOKEN_KEY, token);
   else localStorage.removeItem(TOKEN_KEY);
+  if (changed && hadSession) restartApp();
+}
+
+/**
+ * The session ended or changed: drop session-scoped caches and reload the
+ * page at the app root, so no promise, catch handler or rollback from the
+ * old session can touch the next one's UI. (The generation guards stay as
+ * a second line of defense until the reload lands.)
+ */
+export const restarts = { count: 0 };
+function restartApp() {
+  restarts.count++;
+  try { sessionStorage.clear(); } catch { /* unavailable */ }
+  try { globalThis.caches?.keys().then((ks) => ks.forEach((k) => globalThis.caches.delete(k))).catch(() => {}); } catch { /* unavailable */ }
+  if (typeof location.replace === 'function') location.replace('/');
 }
 export function onUnauthorized(fn) { unauthorizedHandler = fn; }
 
@@ -171,12 +190,24 @@ export function connectEvents(onEvent, onStatus) {
   let ping;
   let backoff = 1000;
   let stopped = false;
+  // Only the newest socket is live. A replaced one (e.g. a wake while it was
+  // still closing) gets no handlers, so it can neither deliver events twice
+  // nor schedule another reconnect.
+  const drop = (sock) => {
+    if (!sock) return;
+    sock.onopen = sock.onmessage = sock.onclose = sock.onerror = null;
+    try { sock.close(); } catch { /* already closed */ }
+  };
   const open = () => {
     clearTimeout(retry);
+    clearInterval(ping);
+    drop(ws);
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    ws = new WebSocket(`${proto}://${location.host}/api/ws`);
-    ws.onopen = () => ws.send(JSON.stringify({ type: 'auth', token }));
-    ws.onmessage = (e) => {
+    const sock = new WebSocket(`${proto}://${location.host}/api/ws`);
+    ws = sock;
+    sock.onopen = () => sock.send(JSON.stringify({ type: 'auth', token }));
+    sock.onmessage = (e) => {
+      if (sock !== ws) return;
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       if (m.type === 'ready') {
@@ -190,15 +221,15 @@ export function connectEvents(onEvent, onStatus) {
       }
       onEvent(m);
     };
-    ws.onclose = () => {
+    sock.onclose = () => {
+      if (sock !== ws) return;
       clearInterval(ping);
       onStatus(false);
       if (stopped) return;
       retry = setTimeout(open, backoff);
       backoff = Math.min(backoff * 2, 15000);
     };
-    clearInterval(ping);
-    ping = setInterval(() => ws.readyState === 1 && ws.send('{"type":"ping"}'), 25000);
+    ping = setInterval(() => sock.readyState === 1 && sock.send('{"type":"ping"}'), 25000);
   };
   const wake = () => {
     if (document.visibilityState === 'visible' && !stopped && ws && ws.readyState > 1) {
@@ -211,12 +242,15 @@ export function connectEvents(onEvent, onStatus) {
   open();
   return {
     close() {
+      if (stopped && !ws) return;
       stopped = true;
       clearInterval(ping);
       clearTimeout(retry);
       document.removeEventListener('visibilitychange', wake);
       window.removeEventListener('online', wake);
-      ws?.close();
+      drop(ws);
+      ws = null;
+      onStatus(false);
     },
   };
 }

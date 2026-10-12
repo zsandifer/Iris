@@ -9,6 +9,7 @@
 
 use crate::config::{JobConfig, parse_hhmm};
 use crate::db::{self, NewMessage};
+use crate::entities;
 use crate::router::Purpose;
 use crate::state::AppState;
 use crate::turn::{TurnInput, run_turn};
@@ -183,6 +184,9 @@ fn due(cfg: &JobConfig, last_run: Option<i64>, now: i64, local_minutes: u32) -> 
         && last_run.is_none_or(|l| now - l >= cfg.interval_mins as i64 * 60_000)
 }
 
+/// A periodic engine probe is running.
+static PROBING: AtomicBool = AtomicBool::new(false);
+
 /// Background loop: checks jobs every minute and re-probes harness sign-in
 /// state every 15 minutes.
 pub fn spawn_scheduler(state: AppState) {
@@ -192,8 +196,14 @@ pub fn spawn_scheduler(state: AppState) {
         loop {
             tick.tick().await;
             n += 1;
-            if n.is_multiple_of(15) {
-                state.refresh_harnesses().await;
+            if n.is_multiple_of(15) && !PROBING.swap(true, Ordering::SeqCst) {
+                // Probes can take a while (each command has its own
+                // timeout); never hold up due jobs for them.
+                let st = state.clone();
+                tokio::spawn(async move {
+                    st.refresh_harnesses().await;
+                    PROBING.store(false, Ordering::SeqCst);
+                });
             }
             // New models (codex cache, CLI lists) and sign-in changes move
             // automatic slots; announce it.
@@ -202,6 +212,10 @@ pub fn spawn_scheduler(state: AppState) {
             // tick (at most one runs a day, and each engine only once).
             let st = state.clone();
             tokio::spawn(async move { crate::setup::maybe_auto_update(&st).await });
+            crate::gateway::reap_idle(&state).await;
+            if state.is_paused().await {
+                continue;
+            }
             // Notifications held during quiet hours go out once they end.
             crate::notify::spawn_flush_quiet(&state);
             for job in Job::ALL {
@@ -232,6 +246,9 @@ fn heartbeat_prompt(state: &AppState) -> String {
 }
 
 pub async fn run_job(state: &AppState, job: Job, manual: bool) -> crate::util::Result<()> {
+    if state.is_paused().await || state.stopping.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     let owner = state
         .db
         .call(db::owner_user_id)
@@ -318,6 +335,41 @@ pub async fn run_job(state: &AppState, job: Job, manual: bool) -> crate::util::R
         return Ok(());
     }
     post_to_main(state, &owner, &text, &result.message, "heartbeat").await?;
+    move_cards_to_main(state, &owner, &result.message).await?;
+    Ok(())
+}
+
+/// Copy the cards a job turn created (after its reply placeholder, in the
+/// hidden job conversation) into the user's Main chat, and broadcast them.
+pub async fn move_cards_to_main(
+    state: &AppState,
+    user_id: &str,
+    reply: &db::Message,
+) -> crate::util::Result<()> {
+    let (uid, job_conv, after) = (
+        user_id.to_string(),
+        reply.conversation_id.clone(),
+        reply.created_at,
+    );
+    let moved = state
+        .db
+        .call(move |c| {
+            let main = db::ensure_main_conversation(c, &uid)?;
+            let mut moved = Vec::new();
+            for m in db::messages_between(c, &job_conv, after, i64::MAX)? {
+                if let (true, Some(card)) = (m.kind == "card", m.card) {
+                    moved.push(entities::insert_card(c, &main, &card, "assistant")?);
+                }
+            }
+            Ok(moved)
+        })
+        .await?;
+    for m in moved {
+        state.hub.to_users(
+            &[user_id.to_string()],
+            json!({"type": "message.created", "conversation_id": m.conversation_id, "message": m}),
+        );
+    }
     Ok(())
 }
 

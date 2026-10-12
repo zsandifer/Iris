@@ -46,6 +46,13 @@ pub struct HarnessEntry {
     pub status: RwLock<HarnessStatus>,
     /// Models the CLI listed at the last probe (OpenCode).
     pub models: RwLock<Vec<DiscoveredModel>>,
+    /// Counts sign-in reports from turns and logins, so a probe that
+    /// started before one never overwrites it.
+    auth_reports: AtomicU64,
+    /// Orders concurrent probes: only a probe newer than the last applied
+    /// one may set the sign-in state.
+    probe_seq: AtomicU64,
+    last_probe_applied: AtomicU64,
 }
 
 impl HarnessEntry {
@@ -65,6 +72,9 @@ impl HarnessEntry {
             cfg,
             status: RwLock::new(status),
             models: RwLock::default(),
+            auth_reports: AtomicU64::new(0),
+            probe_seq: AtomicU64::new(0),
+            last_probe_applied: AtomicU64::new(0),
         }
     }
 
@@ -87,6 +97,7 @@ impl HarnessEntry {
 
     pub fn set_auth(&self, auth: AuthState, message: Option<String>) -> bool {
         let mut s = self.status.write().unwrap_or_else(|p| p.into_inner());
+        self.auth_reports.fetch_add(1, Ordering::SeqCst);
         let changed = s.auth != auth;
         s.auth = auth;
         s.auth_message = message;
@@ -106,10 +117,13 @@ pub struct Inner {
     pub pair_limiter: PairLimiter,
     /// Cancel handles of running turns, by conversation id.
     pub running: Mutex<HashMap<String, watch::Sender<bool>>>,
+    /// Set once shutdown begins: turns that start afterwards (queued behind
+    /// another in the same chat) are cancelled before running a CLI.
+    pub stopping: std::sync::atomic::AtomicBool,
     /// Serializes turns within one conversation.
     pub conv_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Bumped after anyone leaves a conversation (or it is deleted), so
-    /// running turns stop streaming to people who lost access.
+    /// Bumped after anyone joins or leaves a conversation (or it is
+    /// deleted), so running turns re-check who may see them.
     pub membership_generation: AtomicU64,
     catalog: Mutex<(Option<CatalogKey>, Arc<Catalog>)>,
     /// Bumped whenever a CLI reports a different model list.
@@ -119,6 +133,10 @@ pub struct Inner {
     pub rankings: Rankings,
     pub logins: crate::login::LoginManager,
     pub engine_ops: crate::setup::EngineOps,
+    /// Connector gateway: turn grants, running connectors, approvals.
+    pub gateway: crate::gateway::Gateway,
+    /// Connector sign-ins (OAuth) in progress.
+    pub oauth: crate::oauth::Flows,
     serving: std::sync::atomic::AtomicBool,
     /// Last broadcast recommendation per slot (to announce changes).
     last_recommended: Mutex<BTreeMap<Slot, Option<String>>>,
@@ -169,6 +187,8 @@ impl AppState {
             rankings,
             logins: crate::login::LoginManager::default(),
             engine_ops: crate::setup::EngineOps::default(),
+            gateway: crate::gateway::Gateway::default(),
+            oauth: crate::oauth::Flows::default(),
             serving: std::sync::atomic::AtomicBool::new(false),
             last_recommended: Mutex::default(),
             limiter: Limiter::new(cfg.max_concurrent_turns),
@@ -182,6 +202,7 @@ impl AppState {
             pair_limiter: PairLimiter::default(),
             running: Mutex::default(),
             conv_locks: Mutex::default(),
+            stopping: std::sync::atomic::AtomicBool::new(false),
             membership_generation: AtomicU64::new(0),
             catalog: Mutex::new((None, Arc::new(Catalog::default()))),
             models_generation: AtomicU64::new(0),
@@ -271,27 +292,34 @@ impl AppState {
         // status as it is by then: a turn may report a sign-in change (the
         // only source for Gemini) while a probe runs.
         let program = entry.program();
+        let reports = entry.auth_reports.load(Ordering::SeqCst);
+        let seq = entry.probe_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let mut version: Option<Option<String>> = None;
         let mut auth: Option<(AuthState, Option<String>)> = None;
+        let mut has_keys = false;
         if let (true, Some(program)) = (entry.cfg.enabled, &program) {
             let cwd = self.paths.workspace_dir();
             let strip = self.strip_env(entry);
+            let keys = crate::keys::env_for(self, entry.harness.name()).await;
+            has_keys = !keys.is_empty();
             if let Ok((_, out, _)) =
-                runner::probe(program, &["--version".into()], &cwd, &strip).await
+                runner::probe(program, &["--version".into()], &cwd, &strip, &[]).await
             {
                 let v = out.lines().next().unwrap_or("").trim();
                 version = Some((!v.is_empty()).then(|| v.chars().take(80).collect()));
             }
             if let Some(args) = entry.harness.auth_probe_args() {
-                auth = Some(match runner::probe(program, &args, &cwd, &strip).await {
-                    Ok((ok, out, err)) => {
-                        let state = entry.harness.parse_auth_probe(ok, &out, &err);
-                        let message = (state == AuthState::AuthRequired)
-                            .then(|| "The CLI reports it is not signed in".to_string());
-                        (state, message)
-                    }
-                    Err(_) => (AuthState::Unknown, None),
-                });
+                auth = Some(
+                    match runner::probe(program, &args, &cwd, &strip, &keys).await {
+                        Ok((ok, out, err)) => {
+                            let state = entry.harness.parse_auth_probe(ok, &out, &err);
+                            let message = (state == AuthState::AuthRequired)
+                                .then(|| "The CLI reports it is not signed in".to_string());
+                            (state, message)
+                        }
+                        Err(_) => (AuthState::Unknown, None),
+                    },
+                );
             }
             // Without a status command the state comes from turns and is
             // kept (see `recheck_auth`).
@@ -312,9 +340,25 @@ impl AppState {
             if let Some(v) = version {
                 status.version = v;
             }
-            if let Some((state, message)) = auth {
-                status.auth = state;
-                status.auth_message = message;
+            // Only if nothing newer arrived while probing: a turn or login
+            // report, or a later probe that already finished.
+            if let Some((state, message)) = auth
+                && entry.auth_reports.load(Ordering::SeqCst) == reports
+                && entry.last_probe_applied.load(Ordering::SeqCst) < seq
+            {
+                if has_keys && state == AuthState::AuthRequired {
+                    // The owner added an API key; some status commands
+                    // only know about the subscription sign-in. Keep what
+                    // the key check or turns learned instead.
+                    if status.auth != AuthState::Ok {
+                        status.auth = AuthState::Unknown;
+                    }
+                    status.auth_message = None;
+                } else {
+                    status.auth = state;
+                    status.auth_message = message;
+                }
+                entry.last_probe_applied.store(seq, Ordering::SeqCst);
             }
             (before, status.clone())
         };
@@ -405,7 +449,8 @@ impl AppState {
         };
         let cwd = self.paths.workspace_dir();
         let strip = self.strip_env(entry);
-        match runner::probe(program, &args, &cwd, &strip).await {
+        let keys = crate::keys::env_for(self, entry.harness.name()).await;
+        match runner::probe(program, &args, &cwd, &strip, &keys).await {
             Ok((true, out, _)) => {
                 let models = entry.harness.parse_models(&out);
                 self.set_discovered_models(entry, models)
@@ -448,10 +493,12 @@ impl AppState {
                     owner can fix it by running `codex login` on the server."
                     .to_string(),
                 "gemini" => "The Gemini engine on the Iris server is signed out. The owner can \
-                    fix it by running `gemini` on the server and signing in."
+                    fix it by adding a Gemini API key in the app (Settings, AI engine), or by \
+                    running `gemini` on the server and signing in."
                     .to_string(),
                 "opencode" => "The OpenCode engine on the Iris server has no usable provider. \
-                    The owner can fix it with `opencode auth login` on the server."
+                    The owner can fix it by adding a provider key in the app (Settings, AI \
+                    engine), or with `opencode auth login` on the server."
                     .to_string(),
                 other => format!("The {other} engine on the Iris server needs to be signed in."),
             })
@@ -563,6 +610,20 @@ impl AppState {
             .unwrap_or_else(|| self.cfg.agent_name.clone())
     }
 
+    /// The owner paused Iris: no new turns or jobs, no connector calls.
+    pub async fn is_paused(&self) -> bool {
+        self.setting("paused").await.is_some()
+    }
+
+    /// Recipients the owner trusts: messages only to them need no
+    /// approval (normalized like the gate does).
+    pub async fn trusted_recipients(&self) -> Vec<String> {
+        self.setting("safety.trusted_recipients")
+            .await
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+            .unwrap_or_default()
+    }
+
     pub async fn feed_prompt(&self) -> String {
         self.setting("feed_prompt")
             .await
@@ -571,7 +632,9 @@ impl AppState {
     }
 
     /// Settings as exposed to clients.
-    pub async fn settings_json(&self) -> Value {
+    /// App settings as the API shows them. The feed instructions describe
+    /// the owner's interests, so only the owner sees them.
+    pub async fn settings_json(&self, owner: bool) -> Value {
         let avatar = self.setting("agent_avatar").await;
         let updated = self
             .setting("agent_avatar_updated")
@@ -582,9 +645,28 @@ impl AppState {
             "avatar_url": format!("/api/avatar?v={}", if avatar.is_some() { updated } else { "default".into() }),
             "avatar_custom": avatar.is_some(),
             "allow_claude_for_shared": self.allow_claude_for_shared().await,
-            "feed_prompt": self.feed_prompt().await,
+            "feed_prompt": if owner { Some(self.feed_prompt().await) } else { None },
             "voice": {"enabled": false, "status": "not_implemented"},
+            "paused": self.is_paused().await,
         })
+    }
+
+    /// Tell every app about changed settings (the owner's with the private
+    /// parts) and return the owner's view.
+    pub async fn broadcast_settings(&self) -> Value {
+        let public = self.settings_json(false).await;
+        self.hub.send(
+            crate::events::Audience::All,
+            json!({"type": "settings.changed", "settings": public}),
+        );
+        let full = self.settings_json(true).await;
+        if let Ok(Some(owner)) = self.db.call(db::owner_user_id).await {
+            self.hub.to_users(
+                &[owner],
+                json!({"type": "settings.changed", "settings": full}),
+            );
+        }
+        full
     }
 
     /// Per-conversation turn lock.

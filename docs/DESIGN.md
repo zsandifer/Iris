@@ -53,8 +53,17 @@ own personality. It is not a clone.
 - **Browser peek:** only while Iris is browsing or researching, a small live
   thumbnail of its browser appears. Tap it to watch full screen or take over.
 - **Approval card:** rendered by Iris (not the agent) for sending email or
-  messages, purchases, and messages to new recipients. It shows the real
-  preview with Deny / Approve buttons.
+  messages, purchases, deleting, bulk exports, and anything that reaches a
+  new recipient through a connected service. It says why it asks ("Sends a
+  message to someone new: sam@example.com"), shows the real preview (to,
+  subject, the exact text, other fields) built from the held call's
+  arguments, a "Show the exact request" toggle with the raw
+  request, a countdown, and Deny / Send (Pay, Delete, Allow). It sits just
+  above the reply of the turn that asked, and the status line says
+  "Waiting for your OK…" meanwhile. Afterwards it reads "You approved
+  this", "You said no, so I didn't do it", "No answer in time, so I didn't
+  do it", or "Cancelled. Nothing was done." Messages only to trusted people
+  go out without a card (reply-all always asks).
 - **Rich result cards:** for example a restaurant with an image, details and
   one action.
 - **Long tasks:** Iris says "I'll ping you when it's done", then sends a push.
@@ -69,8 +78,14 @@ own personality. It is not a clone.
   the official sign-in flow (link or device code, paste code) and moves
   through waiting → connected ✓ / failed, retry. While it is down, Iris uses
   the next-ranked model and says so once.
-- **Setup by chat:** "help me set up Google" returns a Connect card.
-  Installing a new engine works the same way: install → sign-in card → done.
+- **Setup by chat:** "help me set up Google" returns a Connect card that
+  opens the step-by-step setup (and shows Connected once done). Installing
+  a new engine works the same way: install → sign-in card → done. Engines
+  that sign in with an API key (Gemini, OpenCode providers) get a key field
+  right in the card, checked on save.
+- **Paused:** while Iris is paused, the status line says "paused" and a bar
+  at the top of the chat offers Resume; messages get a short "I'm paused"
+  reply.
 
 ## For you (feed)
 
@@ -116,22 +131,31 @@ own personality. It is not a clone.
 ## Iris hub
 
 - **Connections:** connected services with plain-language rules ("Reads
-  freely · asks before sending"), popular services to connect, and Custom
-  (MCP server).
+  freely · asks before sending, buying, or deleting"), a small catalog to
+  connect (Google, GitHub, Custom MCP server) with step-by-step guides and
+  sign-in on the service's own page, and Trusted people. Each connection
+  has an On switch, its rules (four plain choices), its actions (each can
+  be set to run, ask, or never), recent use, Sign in again (shows the
+  account), its sign-in app, and advanced settings. A connection a
+  tripwire paused shows why, with Resume.
 - **Logins & wallet:** an encrypted store. The app explains that Iris can use
   these but never sees them. Cards always ask before paying.
 - **Iris's computer:** a live screen with Watch / Take over, recent activity,
-  Pause Iris, and Disconnect everything.
+  Pause Iris (stops everything now and starts nothing new until resumed),
+  Trusted people, and Disconnect everything (turns every connection off).
 - **System files:** the persona markdown files and memory/workspace folders,
   each with a plain-language label, editable.
 - **Settings:**
   - Name, picture, voice replies, notifications, quiet hours.
-  - Advanced: **AI engine**, devices, people, activity log.
+  - Advanced: **AI engine**, devices, people, activity log (all steps, or
+    just connected services with whether each ran on its own or you
+    approved it).
 - **AI engine:** one selector per slot (Chat, Hard requests, Background,
   Feed), showing only models actually installed. Each slot defaults to
   "Automatic (recommended: X)" from the built-in ranking, and can be pinned.
   The screen also lists the engines on this server with their sign-in state
-  and Set up / Reconnect.
+  and Set up / Reconnect / Add key (an API key instead of a subscription,
+  stored encrypted).
 
 ## People
 

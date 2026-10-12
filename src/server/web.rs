@@ -41,16 +41,20 @@ pub static ASSETS: &[Asset] = assets![
     "js/app.js" => JS,
     "js/cards.js" => JS,
     "js/chat.js" => JS,
+    "js/connect.js" => JS,
     "js/feed.js" => JS,
     "js/h.js" => JS,
     "js/hub.js" => JS,
     "js/lists.js" => JS,
     "js/md.js" => JS,
+    "js/photo.js" => JS,
+    "js/photo-math.js" => JS,
     "js/push.js" => JS,
     "js/settings.js" => JS,
     "js/status.js" => JS,
     "js/store.js" => JS,
     "js/ui.js" => JS,
+    "js/viewport.js" => JS,
     "vendor/hooks.js" => JS,
     "vendor/htm.js" => JS,
     "vendor/preact.js" => JS,
@@ -182,10 +186,7 @@ mod tests {
         listed.sort();
         assert_eq!(files, listed, "web/ and ASSETS differ");
         let sw = std::str::from_utf8(find("sw.js").unwrap().1.body).unwrap();
-        for a in ASSETS
-            .iter()
-            .filter(|a| a.path.ends_with(".js") && a.path != "sw.js")
-        {
+        for a in ASSETS {
             assert!(
                 sw.contains(&format!("'/{}'", a.path)),
                 "sw.js SHELL misses {}",

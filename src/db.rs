@@ -230,6 +230,59 @@ ALTER TABLE goals ADD COLUMN suggested INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX messages_created ON messages(created_at);
 "#,
     r#"
+-- Connector gateway: per-connector approval rules, catalog service, the
+-- tripwire pause, and sign-in state for OAuth connectors.
+ALTER TABLE connectors ADD COLUMN policy TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE connectors ADD COLUMN service TEXT NOT NULL DEFAULT 'custom';
+ALTER TABLE connectors ADD COLUMN paused_reason TEXT;
+ALTER TABLE connectors ADD COLUMN paused_at INTEGER;
+ALTER TABLE connectors ADD COLUMN auth_state TEXT NOT NULL DEFAULT 'ok';
+-- Connectors saved before the gateway keep running in the workspace (they
+-- may use paths relative to it); new ones get a private folder.
+ALTER TABLE connectors ADD COLUMN workspace_cwd INTEGER NOT NULL DEFAULT 1;
+
+-- Every connector tool call that went through the gateway (activity log,
+-- rate limits). `summary` is a short preview (recipients, subject).
+CREATE TABLE connector_calls (
+    id              TEXT PRIMARY KEY,
+    connector_id    TEXT,
+    connector_name  TEXT NOT NULL,
+    tool            TEXT NOT NULL,
+    category        TEXT NOT NULL,
+    decision        TEXT NOT NULL,
+    outcome         TEXT,
+    reason          TEXT NOT NULL DEFAULT '',
+    summary         TEXT NOT NULL DEFAULT '',
+    conversation_id TEXT,
+    message_id      TEXT,
+    card_message_id TEXT,
+    result_bytes    INTEGER NOT NULL DEFAULT 0,
+    created_at      INTEGER NOT NULL,
+    admitted_at     INTEGER,
+    finished_at     INTEGER
+);
+CREATE INDEX connector_calls_recent ON connector_calls(connector_id, created_at);
+CREATE INDEX connector_calls_time ON connector_calls(created_at);
+-- The tripwires' hourly usage (by when calls ran).
+CREATE INDEX connector_calls_admitted ON connector_calls(connector_id, admitted_at);
+
+-- Recipients the owner approved a message or invite to.
+CREATE TABLE known_recipients (
+    address    TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
+
+-- API keys for engines (Gemini CLI, OpenCode providers, optionally Claude
+-- Code or Codex), sealed with the vault; passed to the CLI per turn.
+CREATE TABLE engine_keys (
+    harness    TEXT NOT NULL,
+    env        TEXT NOT NULL,
+    ciphertext TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (harness, env)
+);
+"#,
+    r#"
 -- The For you pipeline (src/feed). Posts gain a story hook, the source's
 -- favicon, local copies of their photos ({original url: cached file}),
 -- the source kind, a canonical link key, and page facts (price, event).
@@ -409,9 +462,8 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
         if i + 1 == UNIQUE_TIMESTAMPS_VERSION {
-            for table in ["messages", "feed_posts"] {
-                spread_timestamps(&tx, table)?;
-            }
+            spread_message_timestamps(&tx)?;
+            spread_timestamps(&tx, "feed_posts")?;
         }
         tx.pragma_update(None, "user_version", (i + 1) as i64)?;
         tx.commit()?;
@@ -421,6 +473,38 @@ fn migrate(conn: &mut Connection) -> Result<()> {
 
 /// Schema version from which message and feed timestamps are unique.
 const UNIQUE_TIMESTAMPS_VERSION: usize = 3;
+
+/// Spread message timestamps, moving each harness session's watermark with
+/// the newest message it had seen, so nothing it already has is replayed.
+fn spread_message_timestamps(conn: &Connection) -> rusqlite::Result<()> {
+    let sessions: Vec<(String, String, i64)> = conn
+        .prepare("SELECT conversation_id, harness, synced_at FROM harness_sessions")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut anchors = Vec::new();
+    for (conv, harness, synced) in sessions {
+        let anchor: Option<i64> = conn
+            .query_row(
+                "SELECT rowid FROM messages WHERE conversation_id = ?1 AND created_at <= ?2
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![conv, synced],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(rowid) = anchor {
+            anchors.push((conv, harness, rowid));
+        }
+    }
+    spread_timestamps(conn, "messages")?;
+    for (conv, harness, rowid) in anchors {
+        conn.execute(
+            "UPDATE harness_sessions SET synced_at = (SELECT created_at FROM messages WHERE rowid = ?3)
+             WHERE conversation_id = ?1 AND harness = ?2",
+            params![conv, harness, rowid],
+        )?;
+    }
+    Ok(())
+}
 
 /// Make `created_at` unique across `table`: rows written in the same
 /// millisecond before timestamps were allocated uniquely move forward a
@@ -988,6 +1072,7 @@ pub fn list_messages(
     let mut stmt = conn.prepare(
         "SELECT * FROM (
              SELECT * FROM messages WHERE conversation_id = ?1 AND created_at < ?2
+               AND status != 'pending'
              ORDER BY created_at DESC LIMIT ?3
          ) ORDER BY created_at",
     )?;
@@ -1027,7 +1112,7 @@ pub fn replay_messages(
         "SELECT * FROM (
              SELECT * FROM messages
              WHERE conversation_id = ?1 AND created_at > ?2 AND created_at < ?3
-               AND status != 'streaming' AND trim(content) != ''
+               AND status NOT IN ('streaming', 'pending') AND trim(content) != ''
              ORDER BY created_at DESC LIMIT ?4
          ) ORDER BY created_at",
     )?;
@@ -1061,7 +1146,13 @@ pub fn synced_watermark(
 }
 
 /// Mark turns that were streaming when the daemon stopped.
+/// Cards still held back by a private turn that never finished are dropped
+/// (nothing decided whether they may be shown).
 pub fn mark_interrupted(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM messages WHERE kind = 'card' AND status = 'pending'",
+        [],
+    )?;
     conn.execute(
         "UPDATE messages SET status = 'interrupted', updated_at = ?1 WHERE status = 'streaming'",
         [now_ms()],
@@ -1523,6 +1614,113 @@ mod tests {
     }
 
     #[test]
+    fn a_database_at_the_release_schema_upgrades_with_connectors_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..3] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 3).unwrap();
+            conn.execute(
+                "INSERT INTO connectors (id, name, transport, config, created_at, updated_at)
+                 VALUES ('c1', 'old', 'stdio', '{}', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            let v: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            assert_eq!(v as usize, MIGRATIONS.len());
+            let (cwd, policy): (i64, String) = c.query_row(
+                "SELECT workspace_cwd, policy FROM connectors WHERE id = 'c1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!((cwd, policy.as_str()), (1, "{}"));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_database_at_main_schema_upgrades_with_feed_and_gateway_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        let owner;
+        {
+            let conn = Connection::open(&path).unwrap();
+            // Main shipped migrations 1–4; the feed is migration 5.
+            for sql in &MIGRATIONS[..4] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 4).unwrap();
+            owner = ensure_owner(&conn).unwrap();
+            conn.execute(
+                r#"INSERT INTO connectors (id, name, transport, config, policy, paused_reason,
+                     paused_at, auth_state, workspace_cwd, created_at, updated_at)
+                 VALUES ('c1', 'mail', 'stdio', '{}', '{"default":"ask"}', 'tripwire',
+                     2, 'ok', 0, 1, 1)"#,
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO connector_calls (id, connector_id, connector_name, tool,
+                     category, decision, created_at) VALUES ('call1', 'c1', 'mail',
+                     'send_message', 'send', 'ask', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                r#"INSERT INTO feed_posts (id, user_id, title, body, images, source_name, why,
+                     created_at, updated_at) VALUES ('p1', ?1, 'A story', 'A description',
+                     '["https://example.com/photo.jpg"]', 'Example', 'Your interests', 1, 1)"#,
+                [&owner],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            let v: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            assert_eq!(v as usize, MIGRATIONS.len());
+            let (policy, reason, cwd): (String, String, i64) = c.query_row(
+                "SELECT policy, paused_reason, workspace_cwd FROM connectors WHERE id = 'c1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            assert_eq!(policy, r#"{"default":"ask"}"#);
+            assert_eq!(reason, "tripwire");
+            assert_eq!(cwd, 0);
+            let calls: i64 =
+                c.query_row("SELECT COUNT(*) FROM connector_calls", [], |r| r.get(0))?;
+            assert_eq!(calls, 1);
+            let posts = crate::entities::list_feed(c, &owner, None, 10)?;
+            assert_eq!(posts.len(), 1);
+            assert_eq!(posts[0].title, "A story");
+            assert_eq!(posts[0].source_name.as_deref(), Some("Example"));
+            assert!(posts[0].hook.is_none());
+            let source =
+                crate::feed::store::add_source(c, &owner, "hn", "front_page", None, None, "user")?;
+            assert_eq!(
+                crate::feed::store::list_sources(c, &owner)?[0].id,
+                source.unwrap().id
+            );
+            c.execute(
+                "INSERT INTO push_queue (id, user_id, payload, created_at)
+                VALUES ('push1', ?1, '{}', 1)",
+                [&owner],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        // Reopening an upgraded DB must not try to apply the feed twice.
+        drop(db);
+        Db::open(&path).unwrap();
+    }
+
+    #[test]
     fn upgrading_spreads_existing_timestamp_ties() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("iris.db");
@@ -1557,9 +1755,36 @@ mod tests {
             }
             tx.commit().unwrap();
         }
+        // A session that had seen everything up to the ties.
+        {
+            let conn = Connection::open(&path).unwrap();
+            let main: String = conn
+                .query_row(
+                    "SELECT conversation_id FROM messages WHERE id = 'm0'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO harness_sessions (conversation_id, harness, session_id, synced_at, updated_at)
+                 VALUES (?1, 'codex', 's1', 5000, 0)",
+                params![main],
+            )
+            .unwrap();
+        }
         let db = Db::open(&path).unwrap();
         db.with(|c| {
             let owner = owner_user_id(c)?.unwrap();
+            let main: String = c.query_row(
+                "SELECT conversation_id FROM messages WHERE id = 'm0'",
+                [],
+                |r| r.get(0),
+            )?;
+            let session = get_harness_session(c, &main, "codex")?.unwrap();
+            assert!(
+                replay_messages(c, &main, session.synced_at, i64::MAX, 40)?.is_empty(),
+                "nothing the session saw is replayed"
+            );
             // Two per page: every tied row still shows up exactly once.
             let (mut seen, mut before) = (Vec::new(), None);
             loop {

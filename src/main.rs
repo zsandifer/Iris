@@ -5,18 +5,22 @@ mod auth;
 mod catalog;
 mod classifier;
 mod config;
+mod connectors;
 mod db;
 mod demo;
 mod engines;
 mod entities;
 mod events;
 mod feed;
+mod gateway;
 mod harness;
 mod import;
 mod jobs;
+mod keys;
 mod login;
 mod mcp;
 mod notify;
+mod oauth;
 mod persona;
 mod push;
 mod ranking;
@@ -44,10 +48,13 @@ Usage:
                                    Copy persona/memory files from OpenClaw
   iris mcp --data-dir DIR --user ID [--conversation ID] [--shared] [--workdir DIR]
                                    Iris MCP bridge (launched by harnesses)
+  iris mcp-gateway --data-dir DIR --connector NAME
+                                   Connector gateway proxy (launched by
+                                   harnesses; token in IRIS_GATEWAY_TOKEN)
   iris mcp-exec ENV_FILE COMMAND [ARGS...]
                                    Run an MCP server with the environment in
                                    ENV_FILE (launched by harnesses, so
-                                   connector secrets stay off command lines)
+                                   secrets stay off command lines)
   iris engines <install|update|uninstall> <NAME> [--dir PATH]
   iris engines list [--dir PATH]   Install/update the official CLIs (claude,
                                    codex, gemini, opencode) into the engines
@@ -77,6 +84,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--conversation",
     "--dir",
     "--assets",
+    "--connector",
     "--workdir",
 ];
 
@@ -201,6 +209,17 @@ fn run(args: Args) -> Result<()> {
                 workdir: args.value("--workdir").map(PathBuf::from),
             })
         }
+        ["mcp-gateway"] => {
+            args.check_flags(&["--connector"])?;
+            let connector = args.value("--connector").ok_or("--connector is required")?;
+            let token = std::env::var(gateway::TOKEN_ENV)
+                .map_err(|_| format!("{} is not set", gateway::TOKEN_ENV))?;
+            gateway::proxy::run(gateway::proxy::Proxy {
+                socket: gateway::socket_path(&paths),
+                connector: connector.to_string(),
+                token,
+            })
+        }
         ["engines", rest @ ..] => {
             args.check_flags(&["--dir"])?;
             let root = match args.value("--dir") {
@@ -298,7 +317,32 @@ fn runtime(cfg: &Config) -> Result<tokio::runtime::Runtime> {
         .build()?)
 }
 
+/// Hold an exclusive lock on the data directory for this process's
+/// lifetime, so a second `iris serve` cannot clean up the first one's
+/// per-turn files or mark its replies interrupted.
+fn lock_data_dir(paths: &Paths) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    config::ensure_private_dir(&paths.data_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(paths.data_dir.join("serve.lock"))?;
+    // SAFETY: flock on a descriptor this function owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!(
+            "another `iris serve` is already using {}",
+            paths.data_dir.display()
+        )
+        .into());
+    }
+    Ok(file)
+}
+
 fn serve(cfg: Config, paths: Paths) -> Result<()> {
+    let _lock = lock_data_dir(&paths)?;
     persona::seed(&paths)?;
     // Leftover per-turn files from a crash.
     if let Ok(rd) = std::fs::read_dir(paths.run_dir()) {
@@ -315,6 +359,8 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
     rt.block_on(async move {
         let state = state::AppState::new(cfg, paths, db)?;
         state.set_serving();
+        gateway::expire_stale_approvals(&state).await;
+        gateway::listen(state.clone())?;
         let probe = state.clone();
         tokio::spawn(async move {
             probe.refresh_harnesses().await;
@@ -416,6 +462,20 @@ mod tests {
 
     fn parse(s: &str) -> Args {
         Args::parse(s.split_whitespace().map(String::from)).unwrap()
+    }
+
+    #[test]
+    fn one_server_per_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        let first = lock_data_dir(&paths).unwrap();
+        let err = lock_data_dir(&paths).unwrap_err().to_string();
+        assert!(err.contains("already using"), "{err}");
+        drop(first);
+        assert!(lock_data_dir(&paths).is_ok(), "released with the process");
     }
 
     #[test]

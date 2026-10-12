@@ -3,7 +3,8 @@
 //! The prompt is rebuilt for every turn from `persona/*.md`, `memory/MEMORY.md`
 //! and an index of `memory/`, so edits and agent renames apply immediately.
 //! It is injected through the harness's own system-prompt mechanism
-//! (`--append-system-prompt-file` / `developer_instructions`), before the
+//! (`--append-system-prompt-file`, `GEMINI_SYSTEM_MD`, ...; for Codex, on
+//! stdin at the start of a session), before the
 //! user's message.
 
 use crate::config::{Paths, ensure_private_dir, write_private_file};
@@ -95,9 +96,8 @@ const MAX_PERSONA_FILE_CHARS: usize = 24_000;
 const MAX_MEMORY_INLINE_CHARS: usize = 12_000;
 const MAX_MEMORY_INDEX_ENTRIES: usize = 200;
 const MAX_MEMORY_DEPTH: usize = 4;
-/// Keeps the prompt under Linux's 128 KiB per-argument limit, which matters
-/// for codex where it travels as a `-c developer_instructions=...` value.
-/// Counted in UTF-8 bytes, which is what the kernel limits.
+/// Bounds the prompt (counted in UTF-8 bytes) so it stays a modest share
+/// of every engine's context.
 pub const MAX_PROMPT_BYTES: usize = 100_000;
 
 /// Whose private context a conversation may see.
@@ -202,7 +202,7 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
 
     for f in SYSTEM_FILES
         .iter()
-        .filter(|f| f.in_prompt && (private || f.name != "USER.md"))
+        .filter(|f| f.in_prompt && (private || shared_with_others(f.name)))
     {
         let Ok(body) = std::fs::read_to_string(system_file_path(paths, f)) else {
             continue;
@@ -328,13 +328,28 @@ when it genuinely helps, and never mention tool names to the user.
   produce; `list_library`.
 - Cards: `create_card` shows a structured card in the current chat. Whenever
   the user asks to set up, connect, or link an account or service (for
-  example \"help me set up Google\"), call `create_card` with type `connect`,
-  the `service` name, and the `url` of the official page where they can
-  connect it, then explain the next step in a sentence or two. Use `link`
-  cards for other links worth highlighting instead of pasting raw URLs, and
-  a `result` card (with `image_url`, details in `body`, and one action) for
-  one concrete result such as a restaurant or product.
-- Connectors: `list_connectors` shows which services are connected.
+  example \"help me set up Google\"), call `create_card` with type `connect`
+  and the `service`: `google` (Gmail, Calendar, Drive), `github`, or
+  `custom` (any other MCP server) open Iris's own step-by-step setup and
+  need no url; for anything else give the `url` of the official page where
+  they can connect it. Then explain the next step in a sentence or two. Use
+  `link` cards for other links worth highlighting instead of pasting raw
+  URLs, and a `result` card (with `image_url`, details in `body`, and one
+  action) for one concrete result such as a restaurant or product.
+- Connectors: `list_connectors` shows which services are connected and which
+  can still be connected.
+
+## Connected services
+
+Tools from other MCP servers are services the user connected. Iris runs
+them and enforces the user's rules: anything that sends a message or email,
+buys or pays, deletes, exports a lot of data, or reaches someone new waits
+until the user approves it on a card Iris shows in the chat (built from the
+exact arguments you send). Waiting is expected; say briefly that you asked
+for their OK. If a call comes back denied, unanswered, paused, or refused,
+tell the user plainly what did not happen and do not retry unless they ask.
+Never try to get around an approval (for example by using another tool or
+service for the same action).
 ";
 
 /// Hash of the inputs that define who the agent is (name, conversation
@@ -359,12 +374,19 @@ pub fn persona_hash(
     for f in SYSTEM_FILES
         .iter()
         .filter(|f| f.in_prompt || f.name == "MEMORY.md")
-        .filter(|f| private || !matches!(f.name, "USER.md" | "MEMORY.md"))
+        .filter(|f| private || shared_with_others(f.name))
     {
         h.update([0]);
         h.update(std::fs::read(system_file_path(paths, f)).unwrap_or_default());
     }
     format!("{}-{}", scope.name(), crate::util::hex(&h.finalize()[..12]))
+}
+
+/// Persona files other people's chats also get: only the agent's own
+/// character. USER.md, TOOLS.md (accounts, devices), PROACTIVE_PREFERENCES.md
+/// (the owner's interests), and memory stay in the owner's chats.
+fn shared_with_others(name: &str) -> bool {
+    matches!(name, "IDENTITY.md" | "SOUL.md")
 }
 
 /// The scope a stored persona hash was made for (None for hashes stored
@@ -527,22 +549,36 @@ mod tests {
         let mut g = ctx("Iris");
         g.scope = Scope::Shared;
         std::fs::write(p.persona_dir().join("USER.md"), "secret-user-fact").unwrap();
+        std::fs::write(p.persona_dir().join("TOOLS.md"), "secret-account-note").unwrap();
+        std::fs::write(
+            p.persona_dir().join("PROACTIVE_PREFERENCES.md"),
+            "secret-interest",
+        )
+        .unwrap();
+        std::fs::write(p.persona_dir().join("SOUL.md"), "calm-and-kind").unwrap();
         std::fs::write(p.memory_dir().join("MEMORY.md"), "secret-memory-fact").unwrap();
         std::fs::write(p.memory_dir().join("diary.md"), "# Secret diary").unwrap();
         let shared = assemble(&p, &g);
         assert!(!shared.contains("secret-user-fact") && !shared.contains("secret-memory-fact"));
         assert!(!shared.contains("Secret diary"));
+        assert!(!shared.contains("secret-account-note") && !shared.contains("secret-interest"));
+        assert!(
+            shared.contains("calm-and-kind"),
+            "the agent's character is shared"
+        );
         assert!(shared.contains("only offers `create_card`"));
         // Another person's own chat: no owner files, but the full app tools.
         g.scope = Scope::Personal;
         let personal = assemble(&p, &g);
         assert!(!personal.contains("secret-user-fact") && !personal.contains("secret-memory-fact"));
         assert!(!personal.contains("Secret diary"));
+        assert!(!personal.contains("secret-account-note") && !personal.contains("secret-interest"));
         assert!(!personal.contains(&p.memory_dir().display().to_string()));
         assert!(personal.contains("not available in this conversation"));
         assert!(personal.contains("create_goal"));
         let private = assemble(&p, &ctx("Iris"));
         assert!(private.contains("secret-user-fact") && private.contains("secret-memory-fact"));
+        assert!(private.contains("secret-account-note") && private.contains("secret-interest"));
         assert!(private.contains("Secret diary"));
         std::fs::remove_file(p.memory_dir().join("diary.md")).unwrap();
         assert!(prompt.contains("## Notices\n\n- The Claude engine"));

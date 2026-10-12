@@ -83,11 +83,14 @@ pub async fn run_turn(state: &AppState, input: TurnInput) -> TurnResult {
     let lock = state.conversation_lock(&conv_id);
     let _turn_guard = lock.lock().await;
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    state
-        .running
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(conv_id.clone(), cancel_tx);
+    {
+        let mut running = state.running.lock().unwrap_or_else(|p| p.into_inner());
+        if state.stopping.load(Ordering::SeqCst) {
+            // Shutting down: never start a CLI that cleanup would not wait for.
+            let _ = cancel_tx.send(true);
+        }
+        running.insert(conv_id.clone(), cancel_tx);
+    }
     let result = run_locked(state, &input, cancel_rx).await;
     state
         .running
@@ -99,6 +102,9 @@ pub async fn run_turn(state: &AppState, input: TurnInput) -> TurnResult {
 
 /// Request cancellation of the running turn in a conversation.
 pub fn cancel(state: &AppState, conversation_id: &str) -> bool {
+    // Connector access ends now, not when the CLI has finished exiting: an
+    // approval tapped meanwhile must not run.
+    crate::gateway::cancel_conversation_grants(state, conversation_id);
     state
         .running
         .lock()
@@ -162,7 +168,7 @@ async fn load_ctx(state: &AppState, conv_id: &str) -> Ctx {
         })
 }
 
-/// Call after someone leaves a conversation or it is deleted.
+/// Call after someone joins or leaves a conversation, or it is deleted.
 pub fn membership_changed(state: &AppState) {
     state.membership_generation.fetch_add(1, Ordering::SeqCst);
 }
@@ -174,6 +180,11 @@ struct Audience {
     conv_id: String,
     users: Vec<String>,
     generation: u64,
+    /// The owner, when the turn runs with the owner's private context.
+    private_owner: Option<String>,
+    /// Someone joined a private turn's conversation: its reply must not be
+    /// streamed or kept.
+    privacy_lost: bool,
 }
 
 impl Audience {
@@ -184,12 +195,20 @@ impl Audience {
             conv_id: conv_id.to_string(),
             users,
             generation,
+            private_owner: None,
+            privacy_lost: false,
         }
     }
 
     /// Narrow to a fresher member list read after `generation`.
     fn refresh(&mut self, members: &[String], generation: u64) {
         self.users.retain(|u| members.contains(u));
+        if let Some(owner) = &self.private_owner
+            && members != std::slice::from_ref(owner)
+        {
+            self.privacy_lost = true;
+            self.users.clear();
+        }
         self.generation = generation;
     }
 
@@ -202,11 +221,13 @@ impl Audience {
                 .call(move |c| db::conversation_member_ids(c, &id))
                 .await
             {
-                Ok(members) => self.users.retain(|u| members.contains(u)),
+                Ok(members) => self.refresh(&members, generation),
                 // Fail closed: stop streaming rather than risk a leak.
-                Err(_) => self.users.clear(),
+                Err(_) => {
+                    self.users.clear();
+                    self.generation = generation;
+                }
             }
-            self.generation = generation;
         }
         &self.users
     }
@@ -240,6 +261,20 @@ async fn run_locked(
         generation,
     );
 
+    if state.is_paused().await {
+        return finish(
+            state,
+            input,
+            &mut audience,
+            &Acc::default(),
+            json!(null),
+            Outcome::Failed {
+                kind: "paused",
+                detail: "the owner paused Iris".into(),
+            },
+        )
+        .await;
+    }
     if state.limiter.saturated() {
         state.hub.to_users(
             audience.current(state).await,
@@ -283,6 +318,9 @@ async fn run_locked(
     // Engine policy: more than one human. Privacy: see `Ctx::scope`.
     let shared = ctx.members.len() > 1;
     let scope = ctx.scope();
+    if scope == Scope::Private {
+        audience.private_owner = ctx.owner.clone();
+    }
     state.hub.to_users(
         audience.current(state).await,
         json!({"type": "turn.status", "conversation_id": conv_id, "message_id": msg_id, "status": "running"}),
@@ -292,7 +330,7 @@ async fn run_locked(
     let pins = state.slot_pins().await;
     let allow_shared = state.allow_claude_for_shared().await;
     let has_images = !input.user_message.attachments.is_empty();
-    let assessment = assess_turn(state, input, shared).await;
+    let assessment = assess_turn(state, input, shared, cancel.clone()).await;
     let mut excluded: Vec<String> = Vec::new();
     let mut fresh_session = !input.continuity;
     let mut routing_notes: Vec<String> = Vec::new();
@@ -304,6 +342,13 @@ async fn run_locked(
     };
 
     for _attempt in 0..MAX_ATTEMPTS {
+        // Someone joined a private turn's chat (or it was cancelled): no
+        // further attempt may run with the owner's context.
+        audience.current(state).await;
+        if audience.privacy_lost || *cancel.borrow() {
+            outcome = Outcome::Cancelled;
+            break;
+        }
         // Routing borrows non-Send closures; keep them out of any await.
         let routed = {
             let available = |m: &crate::catalog::ModelEntry| {
@@ -415,11 +460,23 @@ async fn run_locked(
                     .into(),
             );
         }
-        let mcp_servers = if caps.mcp {
-            mcp_servers(state, &input.owner_user_id, conv_id, scope).await
+        let (mcp_servers, _grant) = if caps.mcp {
+            mcp_servers(
+                state,
+                &input.owner_user_id,
+                conv_id,
+                &ctx.kind,
+                msg_id,
+                scope,
+            )
+            .await
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
+        if scope == Scope::Private {
+            notices.extend(crate::gateway::connector_notices(state, &input.owner_user_id).await);
+        }
+        let keys = crate::keys::env_for(state, &harness_name).await;
         let participants: Vec<String> = ctx.names.values().cloned().collect();
         // Reads persona files and indexes the memory tree: blocking I/O.
         let system_prompt = {
@@ -467,20 +524,30 @@ async fn run_locked(
             run_dir: state.paths.run_dir(),
             scope: conv_id.to_string(),
             tools: true,
+            key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
             isolated: scope != Scope::Private,
             own_mcp_servers: Vec::new(),
         };
-        if spec.isolated {
-            match own_mcp_servers(state, entry, &program).await {
-                Some(names) => spec.own_mcp_servers = names,
-                None => {
-                    // Cannot tell which of the CLI's own tools to switch
-                    // off: do not use it for someone else's chat.
-                    crate::warn!("turn {msg_id}: could not list {harness_name}'s own MCP servers");
-                    routing_notes.push(format!("{} could not be isolated", d.model));
-                    excluded.push(harness_name);
-                    continue;
-                }
+        if spec.isolated
+            && let Err(why) = entry.harness.can_isolate()
+        {
+            crate::warn!("turn {msg_id}: {harness_name} cannot be isolated: {why}");
+            routing_notes.push(format!("{} could not be isolated", d.model));
+            excluded.push(harness_name);
+            continue;
+        }
+        // MCP servers configured in the CLI itself are off in every turn
+        // (they would bypass Iris's gateway and approvals; in someone
+        // else's chat they are also the owner's).
+        match own_mcp_servers(state, entry, &program).await {
+            Some(names) => spec.own_mcp_servers = names,
+            None => {
+                // Cannot tell which of the CLI's own tools to switch off:
+                // do not use it rather than leave them on.
+                crate::warn!("turn {msg_id}: could not list {harness_name}'s own MCP servers");
+                routing_notes.push(format!("{} could not be isolated", d.model));
+                excluded.push(harness_name);
+                continue;
             }
         }
         let invocation = match build_invocation(state, &harness_name, &spec).await {
@@ -490,6 +557,9 @@ async fn run_locked(
                     // updater could not write there anyway.
                     i.env.push(("DISABLE_AUTOUPDATER".into(), "1".into()));
                 }
+                // API keys the owner added in the app (after inherited
+                // ones were stripped).
+                i.env.extend(keys);
                 i
             }
             Err(e) => {
@@ -522,7 +592,17 @@ async fn run_locked(
         decision = Some(d.clone());
 
         let strip = state.strip_env(entry);
-        let server_names: Vec<String> = spec.mcp_servers.iter().map(|s| s.name.clone()).collect();
+        // As the CLI knows them (renamed where its own config has the name).
+        let server_names: Vec<String> = invocation.mcp_server_names.clone().unwrap_or_else(|| {
+            crate::harness::unclaimed_names(
+                &spec
+                    .mcp_servers
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect::<Vec<_>>(),
+                &spec.own_mcp_servers,
+            )
+        });
         let (tx, rx) = mpsc::unbounded_channel();
         let run_fut = runner::run(
             RunRequest {
@@ -661,7 +741,12 @@ fn no_engine_reason(state: &AppState, shared: bool, allow_shared: bool) -> (&'st
 /// Classify the message (chat) or use the job default (low effort).
 /// `shared` applies the individual-use policy to the optional model
 /// classifier too: it sees the message, so it is an engine use.
-async fn assess_turn(state: &AppState, input: &TurnInput, shared: bool) -> Assessment {
+async fn assess_turn(
+    state: &AppState,
+    input: &TurnInput,
+    shared: bool,
+    cancel: watch::Receiver<bool>,
+) -> Assessment {
     if input.purpose != Purpose::Chat {
         return Assessment {
             effort: Effort::Low,
@@ -694,7 +779,8 @@ async fn assess_turn(state: &AppState, input: &TurnInput, shared: bool) -> Asses
     let mut a = classifier::assess(&input.user_message.content, &turns, &thresholds);
     if state.cfg.router.classifier_model
         && a.ambiguous
-        && let Some(effort) = refine_with_model(state, &input.user_message.content, shared).await
+        && let Some(effort) =
+            refine_with_model(state, &input.user_message.content, shared, cancel).await
     {
         a.signals.push("model_classifier");
         a.effort = effort;
@@ -705,8 +791,17 @@ async fn assess_turn(state: &AppState, input: &TurnInput, shared: bool) -> Asses
 
 /// Optional: ask the `classifier` slot's model about an ambiguous message.
 /// One short, tool-less, session-less run; None on any failure.
-async fn refine_with_model(state: &AppState, text: &str, shared: bool) -> Option<Effort> {
-    let reply = one_shot(
+/// Stops with the turn (Stop, deletion, shutdown).
+async fn refine_with_model(
+    state: &AppState,
+    text: &str,
+    shared: bool,
+    cancel: watch::Receiver<bool>,
+) -> Option<Effort> {
+    if *cancel.borrow() {
+        return None;
+    }
+    let reply = one_shot_with_cancel(
         state,
         OneShotRequest {
             slot: Slot::Classifier,
@@ -719,6 +814,7 @@ async fn refine_with_model(state: &AppState, text: &str, shared: bool) -> Option
             // Runs inside a chat turn that already holds a CLI slot.
             take_slot: false,
         },
+        cancel,
     )
     .await
     .ok()?;
@@ -775,6 +871,34 @@ pub async fn one_shot(
     state: &AppState,
     req: OneShotRequest<'_>,
 ) -> Result<OneShotReply, OneShotError> {
+    let (cancel_tx, cancel) = watch::channel(false);
+    let run_id = new_id();
+    {
+        let mut running = state.running.lock().unwrap_or_else(|p| p.into_inner());
+        if state.stopping.load(Ordering::SeqCst) {
+            let _ = cancel_tx.send(true);
+        }
+        running.insert(run_id.clone(), cancel_tx);
+    }
+    let result = one_shot_with_cancel(state, req, cancel).await;
+    state
+        .running
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&run_id);
+    result
+}
+
+async fn one_shot_with_cancel(
+    state: &AppState,
+    req: OneShotRequest<'_>,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<OneShotReply, OneShotError> {
+    if state.is_paused().await || *cancel.borrow() {
+        return Err(OneShotError::Failed(
+            "Iris is paused or the run was stopped".into(),
+        ));
+    }
     let (res, pin) = state.resolve_slot(req.slot, req.shared).await;
     let allow_shared = state.allow_claude_for_shared().await;
     let catalog = state.catalog();
@@ -807,7 +931,7 @@ pub async fn one_shot(
         };
         // Helper prompts carry untrusted text: only CLIs that can really
         // turn every tool off.
-        if !entry.harness.capabilities().tool_less {
+        if !entry.harness.capabilities().tool_less || entry.harness.can_isolate().is_err() {
             continue;
         }
         let Some(program) = entry.program() else {
@@ -819,6 +943,7 @@ pub async fn one_shot(
             .filter(|p| p.model == model_id)
             .and_then(|p| p.effort.clone())
             .or_else(|| crate::ranking::default_effort(m));
+        let keys = crate::keys::env_for(state, &m.harness).await;
         let spec = TurnSpec {
             turn_id: new_id(),
             prompt: req.prompt.to_string(),
@@ -832,6 +957,7 @@ pub async fn one_shot(
             writable_dirs: Vec::new(),
             run_dir: state.paths.run_dir(),
             scope: req.scope.to_string(),
+            key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
             // Helper calls read untrusted text (feed items): no tools at all,
             // and none of the owner's CLI memory or integrations.
             tools: false,
@@ -844,21 +970,37 @@ pub async fn one_shot(
                 }
             },
         };
-        let invocation = match build_invocation(state, &m.harness, &spec).await {
+        let mut invocation = match build_invocation(state, &m.harness, &spec).await {
             Ok(i) => i,
             Err(e) => {
                 last_error = format!("could not build command: {e}");
                 continue;
             }
         };
+        invocation.env.extend(keys);
         let _permit = if req.take_slot {
-            Some(state.limiter.acquire().await)
+            tokio::select! {
+                permit = state.limiter.acquire() => Some(permit),
+                _ = cancel.wait_for(|c| *c) => {
+                    for f in &invocation.temp_files {
+                        let _ = std::fs::remove_file(f);
+                    }
+                    return Err(OneShotError::Failed("the run was stopped".into()));
+                }
+            }
         } else {
             None
         };
+        if state.is_paused().await || *cancel.borrow() {
+            for f in &invocation.temp_files {
+                let _ = std::fs::remove_file(f);
+            }
+            return Err(OneShotError::Failed(
+                "Iris is paused or the run was stopped".into(),
+            ));
+        }
         let strip = state.strip_env(entry);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
         let run = runner::run(
             RunRequest {
                 program: &program,
@@ -868,7 +1010,7 @@ pub async fn one_shot(
                 timeout: req.timeout,
             },
             entry.harness.parser(&[]),
-            cancel_rx,
+            cancel.clone(),
             tx,
         )
         .await;
@@ -892,6 +1034,9 @@ pub async fn one_shot(
             attempts += 1;
         }
         match (run, terminal) {
+            (Ok(out), _) if out.cancelled => {
+                return Err(OneShotError::Failed("the run was stopped".into()));
+            }
             (Ok(out), _) if out.timed_out => {
                 last_error = format!("no result after {}s", req.timeout.as_secs());
             }
@@ -939,9 +1084,8 @@ async fn build_invocation(
 }
 
 /// MCP servers configured in the CLI itself, for CLIs that switch them off
-/// by name in isolated turns (empty for the others). None if the CLI could
-/// not be asked.
-async fn own_mcp_servers(
+/// by name (empty for the others). None if the CLI could not be asked.
+pub(crate) async fn own_mcp_servers(
     state: &AppState,
     entry: &crate::state::HarnessEntry,
     program: &std::path::Path,
@@ -950,7 +1094,7 @@ async fn own_mcp_servers(
         return Some(Vec::new());
     };
     let strip = state.strip_env(entry);
-    match runner::probe(program, &args, &state.paths.workspace_dir(), &strip).await {
+    match runner::probe(program, &args, &state.paths.workspace_dir(), &strip, &[]).await {
         Ok((true, out, _)) => entry.harness.parse_own_mcp_servers(&out),
         _ => None,
     }
@@ -961,11 +1105,11 @@ async fn own_mcp_servers(
 async fn post_policy_card_once(state: &AppState, conv_id: &str) {
     let key = format!("notice.policy_card.{conv_id}");
     let c = conv_id.to_string();
-    let _ = state
+    let posted = state
         .db
         .call(move |db| {
             if db::get_setting(db, &key)?.is_some() {
-                return Ok(());
+                return Ok(None);
             }
             let card = json!({
                 "type": "action",
@@ -979,10 +1123,18 @@ async fn post_policy_card_once(state: &AppState, conv_id: &str) {
                            "body": {"allow_claude_for_shared": true}},
                 "owner_only": true,
             });
-            crate::entities::insert_card(db, &c, &card, "assistant")?;
-            db::set_setting(db, &key, &crate::util::now_ms().to_string())
+            let m = crate::entities::insert_card(db, &c, &card, "assistant")?;
+            db::set_setting(db, &key, &crate::util::now_ms().to_string())?;
+            Ok(Some((m, db::conversation_member_ids(db, &c)?)))
         })
         .await;
+    // Sent live (turns only re-send the agent's own cards).
+    if let Ok(Some((m, members))) = posted {
+        state.hub.to_users(
+            &members,
+            json!({"type": "message.created", "conversation_id": m.conversation_id, "message": m}),
+        );
+    }
 }
 
 fn routing_json(d: &RouteDecision, notes: &[String]) -> Value {
@@ -1007,7 +1159,15 @@ async fn consume(
     mut rx: mpsc::UnboundedReceiver<HarnessEvent>,
 ) -> Acc {
     let mut acc = Acc::default();
+    let mut stopped = false;
     while let Some(ev) = rx.recv().await {
+        audience.current(state).await;
+        if audience.privacy_lost && !stopped {
+            // Someone joined while the owner's private context is in use.
+            crate::info!("turn {msg_id}: people changed; stopping");
+            cancel(state, conv_id);
+            stopped = true;
+        }
         match ev {
             HarnessEvent::Session { id } => acc.session = Some(id),
             HarnessEvent::TextDelta { text } => {
@@ -1101,8 +1261,8 @@ fn failure_text(kind: &str, detail: &str) -> String {
                 .filter_map(|h| match h.trim() {
                     "claude" => Some("run `claude` on the Iris server and sign in with /login"),
                     "codex" => Some("run `codex login` on the Iris server"),
-                    "gemini" => Some("run `gemini` on the Iris server and sign in"),
-                    "opencode" => Some("run `opencode auth login` on the Iris server"),
+                    "gemini" => Some("add a Gemini API key in Settings, AI engine"),
+                    "opencode" => Some("add a provider key for OpenCode in Settings, AI engine"),
                     _ => None,
                 })
                 .collect();
@@ -1121,6 +1281,9 @@ fn failure_text(kind: &str, detail: &str) -> String {
             shared conversations unless the owner turns that on."
             .into(),
         "timeout" => "That took too long, so I stopped. Want me to try again?".into(),
+        "paused" => "I'm paused right now, so I didn't do anything. You can resume me from \
+            my computer screen in the app whenever you're ready."
+            .into(),
         "no_engine" => "I can't reach any AI engine on the server right now. One of Claude, \
             Codex, Gemini, or OpenCode needs to be installed and signed in; I can walk you \
             through it in Settings."
@@ -1149,35 +1312,81 @@ async fn finish(
     }
     let duration_ms = crate::util::now_ms() - input.assistant_message.created_at;
     meta["duration_ms"] = duration_ms.into();
-    let (status, content, ok) = match &outcome {
-        Outcome::Complete => ("complete", acc.text.trim().to_string(), true),
-        Outcome::Cancelled => ("cancelled", acc.text.trim().to_string(), false),
+    audience.current(state).await;
+    let text = if audience.privacy_lost {
+        ""
+    } else {
+        acc.text.trim()
+    };
+    let (status, content, mut ok) = match &outcome {
+        Outcome::Complete => ("complete", text.to_string(), true),
+        Outcome::Cancelled => ("cancelled", text.to_string(), false),
         Outcome::Failed { kind, detail } => {
             meta["error"] = json!({"kind": kind, "detail": truncate_chars(detail, 500)});
-            let text = if acc.text.trim().is_empty() {
+            let text = if text.is_empty() {
                 failure_text(kind, detail)
             } else {
-                acc.text.trim().to_string()
+                text.to_string()
             };
             ("error", text, false)
         }
     };
-    let (m, c, s, mt) = (msg_id.clone(), content, status, meta);
-    let message = match state
+    // Who is in the conversation is checked in the same database call that
+    // saves the reply (one connection, so no one can join in between). A
+    // reply made with the owner's private context is never kept once
+    // someone else is in the conversation, nor are the cards it created
+    // (held back as `pending` until now).
+    let (m, c, s, mut mt) = (msg_id.clone(), content, status, meta);
+    let (conv, private_owner) = (conv_id.clone(), audience.private_owner.clone());
+    let audience_private_owner = audience.private_owner.clone();
+    let saved = state
         .db
-        .call(move |db| db::finish_message(db, &m, &c, s, &mt))
-        .await
-    {
-        Ok(m) => m,
+        .call(move |db| {
+            let members = db::conversation_member_ids(db, &conv)?;
+            let lost = private_owner.is_some_and(|o| members != [o]);
+            if lost {
+                mt["withheld"] = "people changed during a private reply".into();
+                mt["activity"] = json!([]);
+                db.execute(
+                    "DELETE FROM messages WHERE conversation_id = ?1 AND kind = 'card'
+                     AND status = 'pending'",
+                    [&conv],
+                )?;
+                return Ok((db::finish_message(db, &m, "", "cancelled", &mt)?, true));
+            }
+            db.execute(
+                "UPDATE messages SET status = 'complete' WHERE conversation_id = ?1
+                 AND kind = 'card' AND status = 'pending'",
+                [&conv],
+            )?;
+            Ok((db::finish_message(db, &m, &c, s, &mt)?, false))
+        })
+        .await;
+    let message = match saved {
+        Ok((m, lost)) => {
+            if lost {
+                audience.privacy_lost = true;
+                audience.users.clear();
+                ok = false;
+            }
+            m
+        }
         Err(e) => {
             crate::warn!("turn {msg_id}: failed to save reply: {e}");
             input.assistant_message.clone()
         }
     };
     crate::info!("turn {msg_id}: {} in {duration_ms}ms", message.status);
+    let withheld = audience.privacy_lost;
     let audience = audience.current(state).await.to_vec();
+    // A withheld reply streams to nobody any more, but its owner's app
+    // still shows it running: the (empty, cancelled) result ends it.
+    let completed_to = match (&audience_private_owner, withheld) {
+        (Some(owner), true) => vec![owner.clone()],
+        _ => audience.clone(),
+    };
     state.hub.to_users(
-        &audience,
+        &completed_to,
         json!({"type": "message.completed", "conversation_id": conv_id, "message": message}),
     );
 
@@ -1188,7 +1397,17 @@ async fn finish(
         .call(move |db| db::messages_between(db, &c, after, i64::MAX))
         .await
     {
-        for m in new.into_iter().filter(|m| m.kind == "card") {
+        // Agent cards only: server cards (approvals, notices) were sent
+        // live when they were posted.
+        let agent_card = |m: &Message| {
+            m.card.as_ref().is_some_and(|c| {
+                crate::entities::CARD_TYPES.contains(&c["type"].as_str().unwrap_or(""))
+            })
+        };
+        for m in new
+            .into_iter()
+            .filter(|m| m.kind == "card" && agent_card(m))
+        {
             state.hub.to_users(
                 &audience,
                 json!({"type": "message.created", "conversation_id": conv_id, "message": m}),
@@ -1215,7 +1434,7 @@ async fn finish(
     }
     // A failed turn tells offline members Iris got stuck, so nobody is left
     // waiting; the app offers a retry on the message.
-    let stuck = matches!(outcome, Outcome::Failed { .. });
+    let stuck = matches!(outcome, Outcome::Failed { kind, .. } if kind != "paused");
     if (ok || stuck) && input.purpose == Purpose::Chat && state.cfg.push.notify_replies_when_offline
     {
         let offline: Vec<String> = audience
@@ -1340,18 +1559,22 @@ async fn load_images(state: &AppState, m: &Message) -> Vec<ImageInput> {
         .unwrap_or_default()
 }
 
-/// The Iris MCP bridge plus every enabled connector (secrets unsealed).
+/// The Iris MCP bridge plus one gateway proxy per connector the turn may
+/// use (with the guard that ends that access when the attempt ends).
 ///
 /// Connectors are the owner's accounts, so they are only attached to the
-/// owner's own chats. In shared conversations (more than one person) the
-/// bridge also only offers cards, so other members cannot reach the
-/// owner's goals, feed, or library through the agent.
+/// owner's own chats and jobs (the gateway checks this again). In shared
+/// conversations (more than one person) the bridge also only offers cards,
+/// so other members cannot reach the owner's goals, feed, or library
+/// through the agent.
 async fn mcp_servers(
     state: &AppState,
     user_id: &str,
     conv_id: &str,
+    conv_kind: &str,
+    message_id: &str,
     scope: Scope,
-) -> Vec<McpServer> {
+) -> (Vec<McpServer>, Option<crate::gateway::GrantGuard>) {
     let shared = scope == Scope::Shared;
     let mut args = vec![
         "mcp".into(),
@@ -1372,22 +1595,18 @@ async fn mcp_servers(
             args,
             env: BTreeMap::new(),
         },
+        timeout_secs: None,
     }];
     if scope != Scope::Private {
-        return servers;
+        return (servers, None);
     }
-    let connectors = state
-        .db
-        .call(|c| crate::entities::list_connectors(c, true))
-        .await
-        .unwrap_or_default();
-    for con in connectors {
-        match crate::server::connector_to_mcp(state, &con) {
-            Ok(s) => servers.push(s),
-            Err(e) => crate::warn!("connector {} skipped: {e}", con.name),
+    match crate::gateway::grant_for_turn(state, user_id, conv_id, conv_kind, message_id).await {
+        Some((connectors, guard)) => {
+            servers.extend(connectors);
+            (servers, Some(guard))
         }
+        None => (servers, None),
     }
-    servers
 }
 
 /// Store a user message and an assistant placeholder, broadcast both, and

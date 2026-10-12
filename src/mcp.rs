@@ -185,7 +185,8 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "list_connectors",
-            "List connected services (MCP connectors) and whether they are enabled.",
+            "List connected services (MCP connectors), whether they are on and signed in, \
+             and the services the user can still connect (`available_to_connect`).",
             json!({}),
             &[],
         ),
@@ -392,9 +393,19 @@ impl Bridge {
                     .as_deref()
                     .ok_or("no current conversation")?;
                 let card = entities::validate_card(a)?;
+                // In the owner's own chat the card may carry private context:
+                // it stays hidden until the turn is saved, which publishes it
+                // only if nobody else has joined meanwhile.
+                let status = if self.owner_context() {
+                    "pending"
+                } else {
+                    "complete"
+                };
                 let m = self
                     .db
-                    .with(|c| entities::insert_card(c, conv, &card, "assistant"))
+                    .with(|c| {
+                        entities::insert_card_with_status(c, conv, &card, "assistant", status)
+                    })
                     .map_err(db_err)?;
                 Ok(json!({"card_message_id": m.id, "shown": true}))
             }
@@ -410,11 +421,21 @@ impl Bridge {
                 let items: Vec<Value> = list
                     .iter()
                     .map(|c| {
-                        json!({"name": c.name, "description": c.description,
-                               "transport": c.transport, "enabled": c.enabled})
+                        json!({"name": c.name, "service": c.service,
+                               "description": c.description, "enabled": c.enabled,
+                               "signed_in": c.auth_state == "ok",
+                               "paused": c.paused_reason.is_some(),
+                               "rules": c.policy.mode.describe()})
                     })
                     .collect();
-                Ok(json!({"connectors": items}))
+                let available: Vec<Value> = crate::connectors::CATALOG
+                    .iter()
+                    .filter(|e| e.id == "custom" || !list.iter().any(|c| c.service == e.id))
+                    .map(
+                        |e| json!({"service": e.id, "name": e.label, "description": e.description}),
+                    )
+                    .collect();
+                Ok(json!({"connectors": items, "available_to_connect": available}))
             }
             other => Err(format!("unknown tool {other}")),
         }
@@ -733,10 +754,26 @@ mod tests {
         );
         assert_eq!(r["structuredContent"]["shown"], true);
         let conv = b.conversation_id.clone().unwrap();
+        // The owner's own chat: held back until the turn is saved.
+        let card_id = r["structuredContent"]["card_message_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let card =
+            b.db.with(|c| db::get_message(c, &card_id))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            (card.kind.as_str(), card.status.as_str()),
+            ("card", "pending")
+        );
         let msgs =
             b.db.with(|c| db::list_messages(c, &conv, None, 10))
                 .unwrap();
-        assert_eq!(msgs.last().unwrap().kind, "card");
+        assert!(
+            msgs.iter().all(|m| m.id != card_id),
+            "hidden until published"
+        );
 
         let r = call(
             &b,
