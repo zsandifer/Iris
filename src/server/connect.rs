@@ -108,10 +108,9 @@ async fn setup_service(
 async fn google_setup(State(state): State<AppState>, user: AuthUser) -> ApiResult {
     user.require_owner()?;
     let progress = state.db.call(crate::google_setup::status).await?;
-    ok(
-        json!({"progress": progress, "pages": crate::google_setup::pages(),
-        "redirect_uri": crate::google_setup::callback(&state.cfg.public_url)}),
-    )
+    let pages = crate::google_setup::pages(progress["project_id"].as_str());
+    ok(json!({"progress": progress, "pages": pages,
+        "redirect_uri": crate::google_setup::callback(&state.cfg.public_url)}))
 }
 
 #[derive(Deserialize)]
@@ -119,6 +118,7 @@ struct GoogleProgressBody {
     step: u8,
     #[serde(default)]
     sign_in: bool,
+    project_id: Option<String>,
 }
 
 async fn google_progress(
@@ -127,6 +127,12 @@ async fn google_progress(
     GoogleJson(body): GoogleJson<GoogleProgressBody>,
 ) -> ApiResult {
     user.require_owner()?;
+    let project_id = body
+        .project_id
+        .as_deref()
+        .map(crate::google_setup::parse_project_id)
+        .transpose()
+        .map_err(ApiError::bad_request)?;
     if !(1..=crate::google_setup::STEPS).contains(&body.step) || (body.sign_in && body.step != 6) {
         return Err(ApiError::bad_request("I need a setup step from 1 to 6."));
     }
@@ -153,6 +159,10 @@ async fn google_progress(
                     "I need your login key first. Paste it in step 6.",
                 )));
             }
+            let mut progress = crate::google_setup::read(c)?;
+            if let Some(id) = project_id {
+                progress.project_id = Some(id);
+            }
             crate::google_setup::save(
                 c,
                 &crate::google_setup::Progress {
@@ -160,6 +170,7 @@ async fn google_progress(
                     sign_in: body.sign_in,
                     completed: false,
                     issue: None,
+                    ..progress
                 },
             )?;
             Ok(Ok(()))
@@ -1576,15 +1587,51 @@ mod tests {
             &a,
             "PUT",
             "/api/connectors/google/setup",
-            Some(json!({"step": 3})),
+            Some(json!({"step": 3, "project_id": "https://console.cloud.google.com/auth/branding?project=example-project-123456"})),
         )
         .await;
         assert_eq!(s, StatusCode::OK);
         let (_, v) = call(&a, "GET", "/api/connectors/google/setup", None).await;
         assert_eq!(v["progress"]["summary"], "Google setup: step 3 of 6");
+        assert_eq!(v["progress"]["project_id"], "example-project-123456");
+        assert_eq!(
+            v["pages"]["branding"],
+            "https://console.cloud.google.com/auth/branding?project=example-project-123456"
+        );
         // A fresh connection sees the saved position, independent of AppState.
         let reopened = rusqlite::Connection::open(a.state.paths.db_file()).unwrap();
         assert_eq!(crate::google_setup::read(&reopened).unwrap().step, 3);
+        assert_eq!(
+            crate::google_setup::read(&reopened)
+                .unwrap()
+                .project_id
+                .as_deref(),
+            Some("example-project-123456")
+        );
+        let (s, _) = call(
+            &a,
+            "PUT",
+            "/api/connectors/google/setup",
+            Some(json!({"step": 3, "project_id": "BAD-ID"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            crate::google_setup::read(&reopened)
+                .unwrap()
+                .project_id
+                .as_deref(),
+            Some("example-project-123456")
+        );
+        let (s, v) = call(
+            &a,
+            "PUT",
+            "/api/connectors/google/setup",
+            Some(json!({"step": 3, "project_id": "other-project-123456"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["progress"]["project_id"], "other-project-123456");
         let (s, _) = call(
             &a,
             "PUT",
@@ -1619,6 +1666,7 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!(v["progress"]["phase"], "sign_in");
+        assert_eq!(v["progress"]["project_id"], "other-project-123456");
         assert!(!v.to_string().contains("canary"));
         let con = a
             .state
@@ -1683,6 +1731,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status["google_setup"]["phase"], "sign_in");
+        assert_eq!(status["google_setup"]["project_id"], "other-project-123456");
         assert!(!status.to_string().contains("canary"));
         // Replacing the secret invalidates a previous grant even with the same ID.
         a.state
@@ -1723,6 +1772,14 @@ mod tests {
     #[tokio::test]
     async fn google_errors_return_to_the_fix_step_without_echoing_provider_text() {
         let a = app_with_public_url("https://iris.example").await;
+        let (s, _) = call(
+            &a,
+            "PUT",
+            "/api/connectors/google/setup",
+            Some(json!({"step": 2, "project_id": "example-project-123456"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
         let _ = call(
             &a,
             "POST",
@@ -1761,6 +1818,7 @@ mod tests {
             assert_eq!(setup["progress"]["step"], step);
             assert_eq!(setup["progress"]["error"]["step"], step);
             assert_eq!(setup["progress"]["phase"], "setup");
+            assert_eq!(setup["progress"]["project_id"], "example-project-123456");
         }
         let (s, v) = call(
             &a,
@@ -1780,6 +1838,7 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK);
         assert!(v["progress"]["error"].is_null());
+        assert_eq!(v["progress"]["project_id"], "example-project-123456");
         let (_, flow) = call(
             &a,
             "POST",
@@ -1805,6 +1864,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn google_signin_resolves_the_card_and_reports_success_to_the_agent() {
         let a = app_with_public_url("https://iris.example").await;
+        let (s, _) = call(
+            &a,
+            "PUT",
+            "/api/connectors/google/setup",
+            Some(json!({"step": 2, "project_id": "example-project-123456"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
         let owner = a.state.db.with(crate::db::owner_user_id).unwrap().unwrap();
         let conv = a
             .state
@@ -1929,6 +1996,7 @@ mod tests {
         assert!(html.contains("Google is connected"), "{html}");
         let (_, v) = call(&a, "GET", "/api/connectors/google/setup", None).await;
         assert_eq!(v["progress"]["phase"], "connected");
+        assert_eq!(v["progress"]["project_id"], "example-project-123456");
         let card = a
             .state
             .db

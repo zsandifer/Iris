@@ -1058,6 +1058,7 @@ pub async fn start(
                         sign_in: true,
                         completed: false,
                         issue: None,
+                        ..crate::google_setup::read(c)?
                     },
                 )
             })
@@ -1299,6 +1300,7 @@ pub async fn finish(
                         sign_in: true,
                         completed: true,
                         issue: None,
+                        ..crate::google_setup::read(c)?
                     },
                 )
             })
