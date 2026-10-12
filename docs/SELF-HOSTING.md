@@ -620,9 +620,14 @@ elsewhere on your private network needs HTTPS to receive credentials.
   1. Create a Google Cloud project named **Iris**. Keep that project selected
      in Google’s project picker for the remaining steps.
   2. Enable Gmail, Calendar, Drive and YouTube together with the Open button.
-  3. On **Branding**, enter **Iris** and your own Google email for support and
-     developer contact. On **Audience**, choose **External** and add your own
-     Google account as a test user.
+  3. On **Branding**, fill all three required fields: **App name**: **Iris**;
+     **User support email**: pick your Gmail; **Developer contact information**:
+     your Gmail (at the very bottom of the page, easy to miss). In **Authorized
+     domains**, enter the exact domain the wizard shows: domain only, no
+     `https://`, port or path. Leave the logo, **App domain** links, home page
+     and privacy policy empty; adding links there can trigger Google verification.
+     Tap **Save** at the bottom. On **Audience**, choose **External** and add
+     your own Google account as a test user.
   4. Create a **Web application** login key. Copy the wizard’s exact callback
      into **Authorized redirect URIs**. Iris requires `public_url` to be its
      HTTPS address first; the screen links to instructions. See also
@@ -630,6 +635,8 @@ elsewhere on your private network needs HTTPS to receive credentials.
      client JSON or copy its client ID and secret for step 6.
   5. On **Audience**, choose **Publish app** and confirm **In production**.
      Otherwise Google’s testing mode signs you out every seven days.
+     If **Publish app** is greyed out, return to step 3, fill all three Branding
+     fields and the **Authorized domains** entry, then **Save**.
      Your app is still for your own private use. During sign-in, the warning
      **“Google hasn’t verified this app”** is expected: choose
      **Advanced → Go to Iris**.

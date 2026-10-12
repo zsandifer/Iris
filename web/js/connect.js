@@ -284,7 +284,22 @@ function GoogleSetup({ entry, con }) {
           <details class="alt"><summary>Didn't turn on all four?</summary><p>Open each one and tap <b>Enable</b>:</p>
             ${[['api_gmail', 'Gmail'], ['api_calendar', 'Calendar'], ['api_drive', 'Drive'], ['api_youtube', 'YouTube']].map(([k, l]) => html`<${ExternalLink} url=${pages[k]} cls="b2 wide gap">${l}<//>`)}</details>`}
         ${p.step === 3 && html`<p>This tells Google what to show when you sign in to your own app.</p>
-          <p>On Branding, use <b>Iris</b> as the app name and your own Google email as both the support and developer email.</p>
+          <p>On <b>Branding</b>, fill all three required fields:</p>
+          <ul>
+            <li><b>App name:</b> Iris</li>
+            <li><b>User support email:</b> pick your Gmail.</li>
+            <li><b>Developer contact information:</b> your Gmail. This is at the very bottom of the Branding page and easy to miss.</li>
+          </ul>
+          ${setup.redirect_uri && html`<p>Under <b>App domain</b>, Google needs two links before it lets you publish. Iris serves both:</p>
+            <p><b>Application home page:</b></p><${Copy} text=${setup.redirect_uri.replace(/\/api\/oauth\/callback$/, '/')} />
+            <p><b>Application privacy policy link:</b></p><${Copy} text=${setup.redirect_uri.replace(/\/api\/oauth\/callback$/, '/privacy')} />`}
+          <p>Leave the logo and terms of service empty. A logo makes Google require a review.</p>
+          ${setup.authorized_domain ? html`<p>Under <b>Authorized domains</b>, add this domain:</p>
+            <${Copy} text=${setup.authorized_domain} />
+            <p>Domain only — no https://, no port, no path.</p>`
+            : html`<div class="warn-box">I need my server’s HTTPS address set first to show the authorized domain.</div>
+              <a class="pill" href="#/iris/connections/google-help">How to set up HTTPS</a>`}
+          <p>Then tap <b>Save</b> at the bottom of Branding.</p>
           <${Copy} text="Iris" /><label class="lbl" for="google-email">Your Google email (for copying)</label>
           <input id="google-email" class="field" type="email" value=${email} autocomplete="email" onInput=${(e) => setEmail(e.target.value)} />
           ${email.trim() && html`<${Copy} text=${email.trim()} />`}${open('branding', 'Open Branding')}
@@ -298,6 +313,7 @@ function GoogleSetup({ entry, con }) {
             <small class="mu">On older Google screens this is <b>APIs &amp; Services → Credentials → Create credentials → OAuth client ID</b>.</small>`}`}
         ${p.step === 5 && html`<p>Publishing prevents Google from signing you out every 7 days.</p>
           <p>On Audience, tap <b>Publish app</b> and confirm that it says <b>In production</b>. Your app is still for your own private use.</p>
+          <p>If <b>Publish app</b> is greyed out, Google says to complete Branding: go back to step 3 and make sure all three fields, the two App domain links, and the <b>Authorized domains</b> entry are filled in, then <b>Save</b>.</p>
           <p>When you sign in, Google will say <b>“Google hasn't verified this app”</b>. That’s expected because this is your own app: tap <b>Advanced → Go to Iris</b>.</p>${open('audience')}`}
         ${p.step === 6 && html`<p>I keep your login key encrypted so Google actions go through your approval rules.</p>
           <p>Paste the whole downloaded JSON, or the client ID and secret together, in any order. Labels and line breaks are fine.</p>

@@ -73,7 +73,7 @@ export function Settings() {
   const [version, setVersion] = useState('');
   const [counts, setCounts] = useState({});
   useEffect(() => {
-    get('/health').then((h) => setVersion(h.version)).catch(() => {});
+    get('/health').then((h) => setVersion(`${h.version} · ${h.build_id}`)).catch(() => {});
     get('/devices').then((r) => setCounts((c) => ({ ...c, devices: r.devices.filter((d) => !d.revoked_at).length }))).catch(() => {});
     if (owner) get('/users').then((r) => setCounts((c) => ({ ...c, people: r.users.length }))).catch(() => {});
     if (owner && !S.slots) loadSlots().catch(() => {});
@@ -129,7 +129,7 @@ export function Settings() {
     <${Group}>
       <${Row} title="Forget this device" danger chevron=${false} onClick=${signOut} />
     <//>
-    <div class="foot mu">Iris ${version} · self-hosted, no telemetry</div>
+    <div class="foot mu">Iris ${version}</div>
   <//>`;
 }
 

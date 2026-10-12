@@ -227,7 +227,9 @@ async fn console() -> Response {
 }
 
 async fn health() -> ApiResult {
-    ok(json!({"ok": true, "name": "iris", "version": env!("CARGO_PKG_VERSION")}))
+    ok(
+        json!({"ok": true, "name": "iris", "version": env!("CARGO_PKG_VERSION"), "build_id": env!("IRIS_BUILD_ID")}),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1007,6 +1009,13 @@ mod tests {
         }
         let (s, body) = send(&h.app, "GET", "/api/health", None, None).await;
         assert_eq!((s, body["ok"].as_bool()), (StatusCode::OK, Some(true)));
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        let build_id = body["build_id"].as_str().unwrap();
+        assert_eq!(build_id, env!("IRIS_BUILD_ID"));
+        assert!(
+            build_id == "dev"
+                || (build_id.len() == 8 && build_id.bytes().all(|b| b.is_ascii_hexdigit()))
+        );
         let (s, _) = send(&h.app, "GET", "/api/nope", None, None).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
