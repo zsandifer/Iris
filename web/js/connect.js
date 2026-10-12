@@ -281,8 +281,7 @@ function GoogleSetup({ entry, con }) {
         <p>Google works as before. I can now also use Docs, Sheets, Slides, Forms, Tasks and Contacts.</p>
         <p>First turn on the new services in your Google project (it's fine that some are already on):</p>${open('apis', 'Turn on Google services')}
         <p>Then sign in again and leave every box checked.</p>
-        ${con ? html`<${ServiceSignIn} con=${con} label="Google" onDone=${reload} />` : html`<${Spinner} />`}
-        <button class="b2 wide gap" onClick=${() => go('iris/connections', true)}>Not now</button>`
+        ${con ? html`<${ServiceSignIn} con=${con} label="Google" onDone=${reload} />` : html`<${Spinner} />`}`
       : p.phase === 'connected' ? html`<div class="ok-line"><${Icon} name="check" /> Connected ✓</div><p>Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts and YouTube read-only are ready. ${agentName()} uses your approval rules for Google actions.</p>
         <button class="b1 wide" onClick=${() => go('iris/connections', true)}>Done</button>
         <button class="b2 wide gap" disabled=${busy} onClick=${() => advance(6)}>Replace login key</button>`
