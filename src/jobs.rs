@@ -51,6 +51,13 @@ impl Job {
             Job::Feed => &state.cfg.feed,
         }
     }
+    async fn effective_cfg(self, state: &AppState) -> JobConfig {
+        let mut cfg = self.cfg(state).clone();
+        if self == Job::Feed {
+            cfg.enabled = crate::feed::enabled(state).await;
+        }
+        cfg
+    }
     fn flag(self) -> &'static AtomicBool {
         match self {
             Job::Heartbeat => &HEARTBEAT_RUNNING,
@@ -95,7 +102,7 @@ pub fn is_running(job: Job) -> bool {
 pub async fn status(state: &AppState) -> Vec<Value> {
     let mut out = Vec::new();
     for job in Job::ALL {
-        let cfg = job.cfg(state);
+        let cfg = job.effective_cfg(state).await;
         let last = state
             .setting(job.last_run_key())
             .await
@@ -223,7 +230,12 @@ pub fn spawn_scheduler(state: AppState) {
                     .setting(job.last_run_key())
                     .await
                     .and_then(|s| s.parse::<i64>().ok());
-                if due(job.cfg(&state), last, now_ms(), local_minutes_now()) {
+                if due(
+                    &job.effective_cfg(&state).await,
+                    last,
+                    now_ms(),
+                    local_minutes_now(),
+                ) {
                     trigger(&state, job, false);
                 }
             }

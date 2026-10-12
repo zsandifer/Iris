@@ -147,7 +147,11 @@ async fn pause_feed(State(state): State<AppState>, user: AuthUser) -> ApiResult 
     state
         .db
         .call(move |c| {
+            let owner = crate::db::owner_user_id(c)?.as_deref() == Some(uid.as_str());
             crate::feed::store::update_state(c, &uid, |s| {
+                if owner {
+                    s.enabled = Some(false);
+                }
                 if !s.paused {
                     s.paused = true;
                     s.paused_by_user = true;

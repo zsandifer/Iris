@@ -1723,6 +1723,7 @@ esac
         let t = pair_as(&h, None).await;
         let (_, feed) = send(&h.app, "GET", "/api/feed", Some(&t), None).await;
         assert_eq!(feed["status"]["pipeline"], true);
+        assert_eq!(feed["status"]["enabled"], false, "config is off by default");
         assert_eq!(feed["status"]["daily_size"], 10);
         assert_eq!(feed["status"]["paused"], false);
 
@@ -1755,7 +1756,15 @@ esac
             .unwrap();
         assert!(st.last_open_at.is_some());
 
-        // Pause by hand, then resume.
+        h.state
+            .db
+            .with(|c| {
+                crate::feed::store::update_state(c, &owner, |s| {
+                    s.last_batch_day = Some(crate::jobs::local_day(crate::util::now_ms()))
+                })
+            })
+            .unwrap();
+        // Pause by hand, then resume: the app overrides the disabled config.
         let (_, p) = send(&h.app, "POST", "/api/feed/pause", Some(&t), None).await;
         assert_eq!(
             (
@@ -1764,10 +1773,49 @@ esac
             ),
             (Some(true), Some("user"))
         );
+        assert_eq!(p["status"]["enabled"], false);
         let (_, r) = send(&h.app, "POST", "/api/feed/resume", Some(&t), None).await;
         assert_eq!(
             (r["was_paused"].as_bool(), r["status"]["paused"].as_bool()),
             (Some(true), Some(false))
+        );
+
+        assert_eq!(r["status"]["enabled"], true);
+        assert!(crate::feed::enabled(&h.state).await);
+        assert_eq!(
+            crate::jobs::status(&h.state)
+                .await
+                .iter()
+                .find(|j| j["name"] == "feed")
+                .unwrap()["enabled"],
+            true
+        );
+        // A restart retains the app's choice even though config defaults off.
+        let reloaded = AppState::new(
+            h.state.cfg.clone(),
+            h.state.paths.clone(),
+            crate::db::Db::open(&h.state.paths.db_file()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::feed::status_json(&reloaded, &owner).await["enabled"],
+            true
+        );
+        let (_, p) = send(&h.app, "POST", "/api/feed/pause", Some(&t), None).await;
+        assert_eq!(p["status"]["enabled"], false);
+        assert!(!crate::feed::enabled(&h.state).await);
+        let mut cfg = h.state.cfg.clone();
+        cfg.feed.enabled = true;
+        let reloaded = AppState::new(
+            cfg,
+            h.state.paths.clone(),
+            crate::db::Db::open(&h.state.paths.db_file()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::feed::status_json(&reloaded, &owner).await["enabled"],
+            false,
+            "app choice also overrides an enabled config"
         );
 
         // Sources.

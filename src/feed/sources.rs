@@ -356,21 +356,74 @@ pub fn mastodon_tag(f: &Fetcher, tag: &str, instance: &str) -> Result<Vec<Item>,
 /// (subscribed channels as (id, title), liked video titles)
 pub type YoutubeAccount = (Vec<(String, String)>, Vec<String>);
 
+/// Scope failures need reconnecting; other API failures affect only this run.
+#[derive(Debug, PartialEq, Eq)]
+pub enum YoutubeAccountError {
+    InsufficientScope,
+    Unavailable(String),
+}
+
+impl std::fmt::Display for YoutubeAccountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InsufficientScope => write!(f, "YouTube permission needs reconnecting"),
+            Self::Unavailable(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+fn youtube_response(res: super::http::Response) -> Result<Value, YoutubeAccountError> {
+    let v: Value = serde_json::from_slice(&res.body).unwrap_or(Value::Null);
+    if res.status == 403 {
+        let insufficient = v["error"]["errors"].as_array().is_some_and(|errors| {
+            errors
+                .iter()
+                .any(|e| e["reason"] == "insufficientPermissions")
+        }) || v["error"]["details"].as_array().is_some_and(|details| {
+            details
+                .iter()
+                .any(|e| e["reason"] == "ACCESS_TOKEN_SCOPE_INSUFFICIENT")
+        });
+        if insufficient {
+            return Err(YoutubeAccountError::InsufficientScope);
+        }
+    }
+    if !(200..300).contains(&res.status) {
+        return Err(YoutubeAccountError::Unavailable(format!(
+            "HTTP {}",
+            res.status
+        )));
+    }
+    if v.is_null() {
+        return Err(YoutubeAccountError::Unavailable("not JSON".into()));
+    }
+    Ok(v)
+}
+
+fn youtube_json(f: &Fetcher, url: &str, token: &str) -> Result<Value, YoutubeAccountError> {
+    let mut req = Request::new(url, Mode::Feed, JSON_ACCEPT, MAX_JSON_BYTES);
+    req.bearer = Some(token);
+    let res = f
+        .get_response(&req)
+        .map_err(|e| YoutubeAccountError::Unavailable(e.to_string()))?;
+    youtube_response(res)
+}
+
 /// YouTube Data API with the user's Google token: subscribed channel ids
 /// (with titles) and the titles of recently liked videos.
-pub fn youtube_account(f: &Fetcher, token: &str) -> Result<YoutubeAccount, String> {
+pub fn youtube_account(f: &Fetcher, token: &str) -> Result<YoutubeAccount, YoutubeAccountError> {
     let base = "https://www.googleapis.com/youtube/v3";
     // Every subscription (up to 250); the run's source rotation then reads
     // them a few at a time.
     let mut subs = Vec::new();
     let mut page = String::new();
     for _ in 0..5 {
-        let v = get_json(
+        let v = youtube_json(
             f,
             &format!(
                 "{base}/subscriptions?part=snippet&mine=true&maxResults=50&order=alphabetical{page}"
             ),
-            Some(token),
+            token,
         )?;
         subs.extend(parse::youtube_subscriptions(&v));
         match v["nextPageToken"].as_str().filter(|t| {
@@ -381,13 +434,19 @@ pub fn youtube_account(f: &Fetcher, token: &str) -> Result<YoutubeAccount, Strin
             None => break,
         }
     }
-    let likes = get_json(
+    let likes = youtube_json(
         f,
         &format!("{base}/videos?part=snippet&myRating=like&maxResults=25"),
-        Some(token),
+        token,
     )
-    .map(|v| parse::youtube_likes(&v))
-    .unwrap_or_default();
+    .map(|v| parse::youtube_likes(&v));
+    let likes = match likes {
+        Ok(likes) => likes,
+        Err(YoutubeAccountError::InsufficientScope) => {
+            return Err(YoutubeAccountError::InsufficientScope);
+        }
+        Err(_) => Vec::new(),
+    };
     Ok((
         subs,
         likes
@@ -614,6 +673,39 @@ pub fn from_suggestion(s: &Value) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn youtube_scope_failures_are_distinct_from_other_forbidden_responses() {
+        let response = |status, body: &str| super::super::http::Response {
+            status,
+            body: body.as_bytes().to_vec(),
+            ..Default::default()
+        };
+        for body in [
+            r#"{"error":{"errors":[{"reason":"insufficientPermissions"}]}}"#,
+            r#"{"error":{"details":[{"reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}"#,
+        ] {
+            assert_eq!(
+                youtube_response(response(403, body)),
+                Err(YoutubeAccountError::InsufficientScope)
+            );
+        }
+        assert_eq!(
+            youtube_response(response(
+                403,
+                r#"{"error":{"errors":[{"reason":"quotaExceeded"}],"message":"untrusted-secret"}}"#
+            )),
+            Err(YoutubeAccountError::Unavailable("HTTP 403".into()))
+        );
+        assert_eq!(
+            youtube_response(response(401, "untrusted-secret")),
+            Err(YoutubeAccountError::Unavailable("HTTP 401".into()))
+        );
+        assert_eq!(
+            youtube_response(response(200, r#"{"items":[]}"#)).unwrap(),
+            json!({"items": []})
+        );
+    }
 
     #[test]
     fn input_parsing() {

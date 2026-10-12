@@ -175,7 +175,7 @@ pub async fn status_json(state: &AppState, user_id: &str) -> Value {
     json!({
         // The daily pipeline runs for the owner (it reads the owner's notes).
         "pipeline": owner,
-        "enabled": owner && state.cfg.feed.enabled,
+        "enabled": owner && st.enabled.unwrap_or(state.cfg.feed.enabled),
         "running": owner && crate::jobs::is_running(crate::jobs::Job::Feed),
         "paused": st.paused,
         "paused_at": st.paused_at,
@@ -225,13 +225,34 @@ pub async fn record_activity(
         .await
 }
 
-/// Resume a paused feed. Starts today's batch if there is none yet.
+/// Whether the owner's daily feed is enabled (the app overrides the config).
+pub async fn enabled(state: &AppState) -> bool {
+    let default = state.cfg.feed.enabled;
+    state
+        .db
+        .call(move |c| {
+            let Some(owner) = db::owner_user_id(c)? else {
+                return Ok(false);
+            };
+            let st = store::get_state(c, &owner)?;
+            Ok(st.enabled.unwrap_or(default) && !st.paused)
+        })
+        .await
+        .unwrap_or(false)
+}
+
+/// Resume a paused feed and enable the owner's daily posts.
+/// Starts today's batch if there is none yet.
 pub async fn resume(state: &AppState, user_id: &str) -> Result<bool> {
     let uid = user_id.to_string();
     let was_paused = state
         .db
         .call(move |c| {
+            let owner = db::owner_user_id(c)?.as_deref() == Some(uid.as_str());
             store::update_state(c, &uid, |s| {
+                if owner {
+                    s.enabled = Some(true);
+                }
                 let was = s.paused;
                 s.paused = false;
                 s.paused_at = None;
@@ -241,7 +262,7 @@ pub async fn resume(state: &AppState, user_id: &str) -> Result<bool> {
         })
         .await?;
     let owner = state.db.call(db::owner_user_id).await?;
-    if owner.as_deref() == Some(user_id) && state.cfg.feed.enabled && !state.is_paused().await {
+    if owner.as_deref() == Some(user_id) && !state.is_paused().await {
         crate::jobs::trigger(state, crate::jobs::Job::Feed, false);
     }
     Ok(was_paused)
@@ -325,10 +346,22 @@ pub async fn run(state: &AppState, user_id: &str, manual: bool) -> Result<Option
 
 /// Each bounded fetch phase finishes before observing Stop; a cancelled
 /// run stays stopped even if the owner resumes Iris in the meantime.
-async fn stopped(state: &AppState, cancel: &tokio::sync::watch::Receiver<bool>) -> bool {
+async fn stopped(
+    state: &AppState,
+    user_id: &str,
+    cancel: &tokio::sync::watch::Receiver<bool>,
+) -> bool {
     *cancel.borrow()
         || state.stopping.load(std::sync::atomic::Ordering::SeqCst)
         || state.is_paused().await
+        || {
+            let uid = user_id.to_string();
+            state
+                .db
+                .call(move |c| Ok(store::get_state(c, &uid)?.paused))
+                .await
+                .unwrap_or(true)
+        }
 }
 
 async fn run_pipeline(
@@ -337,14 +370,17 @@ async fn run_pipeline(
     manual: bool,
     cancel: &tokio::sync::watch::Receiver<bool>,
 ) -> Result<Option<RunReport>> {
-    if stopped(state, cancel).await {
+    if *cancel.borrow()
+        || state.stopping.load(std::sync::atomic::Ordering::SeqCst)
+        || state.is_paused().await
+    {
         return Ok(None);
     }
     let now = now_ms();
     let today = crate::jobs::local_day(now);
     let uid = user_id.to_string();
     let st = state.db.call(move |c| store::get_state(c, &uid)).await?;
-    if st.paused && !manual {
+    if !manual && (st.paused || !st.enabled.unwrap_or(state.cfg.feed.enabled)) {
         return Ok(None);
     }
     if !manual && should_pause(&st, now) {
@@ -394,15 +430,23 @@ async fn run_pipeline(
     };
     let mut model_notes: Vec<(OneShotReply, &'static str)> = Vec::new();
 
-    if stopped(state, cancel).await {
+    if stopped(state, user_id, cancel).await {
         return Ok(None);
     }
 
     // YouTube via Google, when a token is available.
     let mut youtube_likes = Vec::new();
     if let Some(token) = google::access_token(state, user_id).await {
+        if stopped(state, user_id, cancel).await {
+            return Ok(None);
+        }
         let f = fetcher.clone();
-        match tokio::task::spawn_blocking(move || sources::youtube_account(&f, &token)).await? {
+        let account =
+            tokio::task::spawn_blocking(move || sources::youtube_account(&f, &token)).await?;
+        if stopped(state, user_id, cancel).await {
+            return Ok(None);
+        }
+        match account {
             Ok((subs, likes)) => {
                 youtube_likes = likes;
                 let uid = user_id.to_string();
@@ -416,11 +460,14 @@ async fn run_pipeline(
                     })
                     .await?;
             }
+            Err(sources::YoutubeAccountError::InsufficientScope) => {
+                google::note_reconnect(state, user_id).await?;
+            }
             Err(e) => crate::warn!("feed: YouTube account unavailable: {e}"),
         }
     }
 
-    if stopped(state, cancel).await {
+    if stopped(state, user_id, cancel).await {
         return Ok(None);
     }
 
@@ -439,7 +486,7 @@ async fn run_pipeline(
     };
     let topics = interests.topics.clone();
 
-    if stopped(state, cancel).await {
+    if stopped(state, user_id, cancel).await {
         return Ok(None);
     }
 
@@ -498,6 +545,9 @@ async fn run_pipeline(
     })
     .await?;
 
+    if stopped(state, user_id, cancel).await {
+        return Ok(None);
+    }
     let mut items: Vec<Item> = Vec::new();
     let mut results: Vec<(String, std::result::Result<Option<Value>, String>)> = Vec::new();
     for (src, r) in source_results {
@@ -528,7 +578,7 @@ async fn run_pipeline(
     items.extend(search_items);
     report.items_found = items.len() as u32;
 
-    if stopped(state, cancel).await {
+    if stopped(state, user_id, cancel).await {
         return Ok(None);
     }
 
@@ -549,6 +599,9 @@ async fn run_pipeline(
         shortlist(scored, (size as usize * 3).clamp(15, 60))
     })
     .await?;
+    if stopped(state, user_id, cancel).await {
+        return Ok(None);
+    }
     let f = fetcher.clone();
     let mut enriched =
         tokio::task::spawn_blocking(move || parallel(finalists, WORKERS, |it| enrich(&f, it)))
@@ -565,7 +618,7 @@ async fn run_pipeline(
         .collect();
     let picked = rank::select(rescored, size as usize);
 
-    if stopped(state, cancel).await {
+    if stopped(state, user_id, cancel).await {
         return Ok(None);
     }
 
@@ -597,7 +650,7 @@ async fn run_pipeline(
         }
     }
 
-    if stopped(state, cancel).await {
+    if stopped(state, user_id, cancel).await {
         return Ok(None);
     }
 
@@ -691,7 +744,7 @@ async fn run_pipeline(
     // Published today, by the clock now (not when the run started).
     let t = crate::jobs::local_day(now_ms());
     let rep = report.clone().with_stats(fetcher.stats());
-    if stopped(state, cancel).await {
+    if stopped(state, user_id, cancel).await {
         return Ok(None);
     }
 
@@ -706,13 +759,13 @@ async fn run_pipeline(
         json!({"type": "entities.changed", "kinds": ["feed"]}),
     );
 
-    if stopped(state, cancel).await {
+    if stopped(state, user_id, cancel).await {
         return Ok(None);
     }
 
     // Urgent pushes: events in today's batch, then price drops.
     for (title, ev, topic, followed) in urgent_candidates {
-        if stopped(state, cancel).await {
+        if stopped(state, user_id, cancel).await {
             return Ok(None);
         }
         let affinity = topic
@@ -729,14 +782,17 @@ async fn run_pipeline(
                 ev.local_date.clone()
             };
             let body = format!("{} · {}", truncate_chars(&title, 90), when);
-            push_urgent(state, user_id, "Something near you soon", &body).await;
+            push_urgent(state, user_id, "Something near you soon", &body, cancel).await;
         }
     }
-    if stopped(state, cancel).await {
+    if stopped(state, user_id, cancel).await {
         return Ok(None);
     }
 
     check_price_watches(state, user_id, &fetcher, cancel).await;
+    if stopped(state, user_id, cancel).await {
+        return Ok(None);
+    }
 
     // Housekeeping: photos no post uses any more.
     let referenced = state
@@ -747,6 +803,9 @@ async fn run_pipeline(
     let dd = state.paths.data_dir.clone();
     let _ = tokio::task::spawn_blocking(move || images::prune(&dd, &referenced)).await;
 
+    if stopped(state, user_id, cancel).await {
+        return Ok(None);
+    }
     let report = report.with_stats(fetcher.stats());
     record_run(state, user_id, &report, &model_notes).await;
     crate::info!(
@@ -775,7 +834,7 @@ fn publish_batch(
     crate::db::write_tx(c, |c| {
         // Recheck inside the transaction: the agent may have posted the
         // same story (through the bridge) while this run worked.
-        if db::get_setting(c, "paused")?.is_some() {
+        if db::get_setting(c, "paused")?.is_some() || store::get_state(c, uid)?.paused {
             return Ok(Vec::new());
         }
         let seen_now = store::seen_keys(c, uid)?;
@@ -1113,6 +1172,9 @@ async fn reserve_call(state: &AppState, user_id: &str, today: &str, call: Call) 
         .db
         .call(move |c| {
             store::update_state(c, &uid, |s| {
+                if s.paused {
+                    return false;
+                }
                 let slot = match call {
                     Call::Interests => &mut s.interests_call_day,
                     Call::Summaries => &mut s.summary_call_day,
@@ -1305,8 +1367,14 @@ fn topics_from_likes(liked: &[(String, Option<String>)]) -> Vec<Topic> {
 }
 
 /// Send an urgent push (counts toward the daily cap). Quiet hours delay it.
-async fn push_urgent(state: &AppState, user_id: &str, title: &str, body: &str) {
-    if state.is_paused().await || state.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+async fn push_urgent(
+    state: &AppState,
+    user_id: &str,
+    title: &str,
+    body: &str,
+    cancel: &tokio::sync::watch::Receiver<bool>,
+) {
+    if stopped(state, user_id, cancel).await {
         return;
     }
     let uid = user_id.to_string();
@@ -1314,7 +1382,13 @@ async fn push_urgent(state: &AppState, user_id: &str, title: &str, body: &str) {
     let allowed = state
         .db
         .call(move |c| {
+            if db::get_setting(c, "paused")?.is_some() {
+                return Ok(false);
+            }
             store::update_state(c, &uid, |s| {
+                if s.paused {
+                    return false;
+                }
                 if s.urgent_day.as_deref() != Some(day.as_str()) {
                     s.urgent_day = Some(day.clone());
                     s.urgent_count = 0;
@@ -1328,7 +1402,7 @@ async fn push_urgent(state: &AppState, user_id: &str, title: &str, body: &str) {
         })
         .await
         .unwrap_or(false);
-    if !allowed {
+    if !allowed || stopped(state, user_id, cancel).await {
         return;
     }
     crate::notify::push_users(
@@ -1345,13 +1419,16 @@ async fn check_price_watches(
     fetcher: &Arc<Fetcher>,
     cancel: &tokio::sync::watch::Receiver<bool>,
 ) {
+    if stopped(state, user_id, cancel).await {
+        return;
+    }
     let uid = user_id.to_string();
     let due = state
         .db
         .call(move |c| store::due_watches(c, &uid, 10))
         .await
         .unwrap_or_default();
-    if due.is_empty() {
+    if due.is_empty() || stopped(state, user_id, cancel).await {
         return;
     }
     let f = fetcher.clone();
@@ -1416,7 +1493,7 @@ async fn check_price_watches(
     .await
     .unwrap_or_default();
     for (w, _new, post) in checked {
-        if stopped(state, cancel).await {
+        if stopped(state, user_id, cancel).await {
             return;
         }
         let uid = user_id.to_string();
@@ -1425,23 +1502,7 @@ async fn check_price_watches(
         // an interruption never loses the drop.
         let ok = state
             .db
-            .call(move |c| {
-                crate::db::write_tx(c, |c| {
-                    // Unliked or deleted while the page was being read:
-                    // nothing to alert about any more.
-                    if db::get_setting(c, "paused")?.is_some() || !store::watch_active(c, &w.id)? {
-                        return Ok(false);
-                    }
-                    let drop_to = post
-                        .as_ref()
-                        .and_then(|p| p.facts["price"]["amount"].as_f64());
-                    store::checked_watch(c, &w.id, drop_to)?;
-                    if let Some(p) = &post {
-                        entities::insert_pipeline_post(c, &uid, p)?;
-                    }
-                    Ok(true)
-                })
-            })
+            .call(move |c| publish_price_watch(c, &uid, &w, post.as_ref()))
             .await
             .unwrap_or(false);
         if let (true, Some(text)) = (ok, push) {
@@ -1449,9 +1510,33 @@ async fn check_price_watches(
                 &[user_id.to_string()],
                 json!({"type": "entities.changed", "kinds": ["feed"]}),
             );
-            push_urgent(state, user_id, "Price drop", &text).await;
+            push_urgent(state, user_id, "Price drop", &text, cancel).await;
         }
     }
+}
+
+/// Commit a price check and its optional alert atomically, checking pause
+/// again after the page fetch and immediately before writing.
+fn publish_price_watch(
+    c: &rusqlite::Connection,
+    uid: &str,
+    watch: &store::Watch,
+    post: Option<&PipelinePost>,
+) -> rusqlite::Result<bool> {
+    db::write_tx(c, |c| {
+        if db::get_setting(c, "paused")?.is_some()
+            || store::get_state(c, uid)?.paused
+            || !store::watch_active(c, &watch.id)?
+        {
+            return Ok(false);
+        }
+        let drop_to = post.and_then(|p| p.facts["price"]["amount"].as_f64());
+        store::checked_watch(c, &watch.id, drop_to)?;
+        if let Some(p) = post {
+            entities::insert_pipeline_post(c, uid, p)?;
+        }
+        Ok(true)
+    })
 }
 
 /// Download up to 3 photos and the icon into the cache (robots.txt, public
@@ -1577,7 +1662,10 @@ pwd > "$D/cwd"
 printf '%s\n' "$@" > "$D/args"
 case "$(cat "$D/mode")" in
   slow) sleep 60;;
-  ok) printf '{"type":"result","subtype":"success","is_error":false,"result":%s}\n' "$(cat "$D/reply")";;
+  gated|ok) if [ "$(cat "$D/mode")" = gated ]; then
+               while [ ! -f "$D/release" ]; do sleep 0.01; done
+            fi
+            printf '{"type":"result","subtype":"success","is_error":false,"result":%s}\n' "$(cat "$D/reply")";;
   auth) echo '{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login"}';;
   *) echo '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}';;
 esac
@@ -1750,6 +1838,55 @@ esac
                 .next()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn user_pause_during_interests_aborts_before_fetch_and_push() {
+        let (state, tmp, owner) = fake_engine().await;
+        set(&tmp, "gated", r#"{"topics": [], "sources": []}"#);
+        let st = state.clone();
+        let uid = owner.clone();
+        let task = tokio::spawn(async move { run(&st, &uid, true).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runs(&tmp) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        state
+            .db
+            .with(|c| store::update_state(c, &owner, |s| s.paused = true))
+            .unwrap();
+        std::fs::write(tmp.path().join("release"), "").unwrap();
+        let report = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(report.is_none());
+        let (_, cancel) = tokio::sync::watch::channel(false);
+        assert!(stopped(&state, &owner, &cancel).await);
+        check_price_watches(&state, &owner, &Arc::new(Fetcher::for_tests()), &cancel).await;
+        push_urgent(&state, &owner, "Event", "Soon", &cancel).await;
+        assert_eq!(feed_state(&state, &owner).urgent_count, 0);
+        assert!(feed_state(&state, &owner).last_run.is_none());
+        assert!(
+            state
+                .db
+                .with(|c| store::list_sources(c, &owner))
+                .unwrap()
+                .is_empty(),
+            "fetch phase never starts"
+        );
+        assert!(
+            state
+                .db
+                .with(|c| entities::list_feed(c, &owner, None, 10))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(state.running.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2124,6 +2261,16 @@ esac
                 post("Third story of the day", "https://x.example/3"),
             ];
             let keys: Vec<String> = batch.iter().flat_map(|p| p.seen_keys.clone()).collect();
+            store::update_state(c, u, |s| s.paused = true)?;
+            let seen_before = store::seen_keys(c, u)?;
+            let before = entities::list_feed(c, u, None, 10)?.len();
+            assert!(
+                publish_batch(c, u, &batch, &keys, "2026-10-11", RunReport::default())?.is_empty()
+            );
+            assert_eq!(entities::list_feed(c, u, None, 10)?.len(), before);
+            assert_eq!(store::seen_keys(c, u)?, seen_before);
+            assert_eq!(store::get_state(c, u)?.last_batch_day, None);
+            store::update_state(c, u, |s| s.paused = false)?;
             let out = publish_batch(c, u, &batch, &keys, "2026-10-11", RunReport::default())?;
             assert_eq!(out, vec!["Best story of the day", "Third story of the day"]);
             let feed = entities::list_feed(c, u, None, 10)?;
@@ -2153,6 +2300,43 @@ esac
                 store::get_state(c, u)?.last_batch_day.as_deref(),
                 Some("2026-10-11")
             );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn paused_price_check_preserves_the_watch_and_does_not_publish() {
+        let db = db::Db::open_in_memory().unwrap();
+        db.with(|c| {
+            let owner = db::owner_user_id(c)?.unwrap();
+            let product = PipelinePost {
+                title: "Trail shoe".into(),
+                body: "Shoe".into(),
+                source_url: "https://shop.example/shoe".into(),
+                facts: json!({"price": {"amount": 100.0, "currency": "USD"}}),
+                ..Default::default()
+            };
+            let saved = entities::insert_pipeline_post(c, &owner, &product)?;
+            entities::set_feed_liked(c, &owner, &saved.id, true)?;
+            store::watch_post(c, &owner, &saved.id)?;
+            let watch = store::due_watches(c, &owner, 10)?.remove(0);
+            let drop = PipelinePost {
+                title: "Price drop".into(),
+                facts: json!({"price": {"amount": 50.0, "currency": "USD"}}),
+                ..product
+            };
+            // Pause after the page has been checked, before committing it.
+            store::update_state(c, &owner, |s| s.paused = true)?;
+            assert!(!publish_price_watch(c, &owner, &watch, Some(&drop))?);
+            assert_eq!(entities::list_feed(c, &owner, None, 10)?.len(), 1);
+            let due = store::due_watches(c, &owner, 10)?;
+            assert_eq!(due.len(), 1);
+            assert_eq!(due[0].price, 100.0);
+            store::update_state(c, &owner, |s| s.paused = false)?;
+            assert!(publish_price_watch(c, &owner, &watch, Some(&drop))?);
+            assert_eq!(entities::list_feed(c, &owner, None, 10)?.len(), 2);
+            assert!(store::due_watches(c, &owner, 10)?.is_empty());
             Ok(())
         })
         .unwrap();

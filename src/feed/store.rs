@@ -59,6 +59,11 @@ impl RunReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedState {
     pub daily_size: u32,
+    /// Owner choice from the app; None uses the config default.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub youtube_reconnect_noted: bool,
     #[serde(default)]
     pub size_day: Option<String>,
     #[serde(default)]
@@ -102,6 +107,8 @@ impl Default for FeedState {
     fn default() -> Self {
         Self {
             daily_size: DEFAULT_DAILY_SIZE,
+            enabled: None,
+            youtube_reconnect_noted: false,
             size_day: None,
             paused: false,
             paused_at: None,

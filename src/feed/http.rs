@@ -343,6 +343,20 @@ impl Fetcher {
     /// per-host spacing, and the size cap. Non-2xx statuses (other than 304)
     /// are errors.
     pub fn get(&self, req: &Request) -> Result<Response, FetchError> {
+        self.get_with_status(req, false)
+    }
+
+    /// Bounded API error bodies, for classifying OAuth scope failures.
+    /// Callers must never log or return these untrusted bodies.
+    pub(super) fn get_response(&self, req: &Request) -> Result<Response, FetchError> {
+        self.get_with_status(req, true)
+    }
+
+    fn get_with_status(
+        &self,
+        req: &Request,
+        keep_error_body: bool,
+    ) -> Result<Response, FetchError> {
         let mut url = req.url.to_string();
         for _ in 0..=MAX_REDIRECTS {
             if markup::split_url(&url).is_none() {
@@ -354,25 +368,31 @@ impl Fetcher {
             }
             let hop = Request { url: &url, ..*req };
             let mut res = self
-                .raw(&hop)
+                .raw(&hop, keep_error_body)
                 .inspect_err(|_| self.bump(|s| s.errors += 1))?;
             if res.status == 429 && res.final_url == "retry" {
                 // The host said when to come back (and it is soon): the
                 // next slot already waits for it. Try once more.
                 res = self
-                    .raw(&hop)
+                    .raw(&hop, keep_error_body)
                     .inspect_err(|_| self.bump(|s| s.errors += 1))?;
             }
             if (300..400).contains(&res.status) {
                 let Some(loc) = res.final_url.strip_prefix("redirect:") else {
                     return Err(FetchError::Status(res.status));
                 };
-                url = markup::resolve(&url, loc).ok_or(FetchError::BadUrl)?;
+                let next = markup::resolve(&url, loc).ok_or(FetchError::BadUrl)?;
+                if req.bearer.is_some() && markup::origin_of(&next) != markup::origin_of(req.url) {
+                    return Err(FetchError::BadUrl);
+                }
+                url = next;
                 continue;
             }
             if !(200..300).contains(&res.status) {
                 self.bump(|s| s.errors += 1);
-                return Err(FetchError::Status(res.status));
+                if !keep_error_body {
+                    return Err(FetchError::Status(res.status));
+                }
             }
             return Ok(res);
         }
@@ -381,7 +401,7 @@ impl Fetcher {
 
     /// One request, no redirects. A 3xx response carries its `Location` in
     /// `final_url` as `redirect:<location>`.
-    fn raw(&self, req: &Request) -> Result<Response, FetchError> {
+    fn raw(&self, req: &Request, keep_error_body: bool) -> Result<Response, FetchError> {
         let host = markup::host_of(req.url).ok_or(FetchError::BadUrl)?;
         let origin = markup::origin_of(req.url).ok_or(FetchError::BadUrl)?;
         self.wait_turn(&host, &origin)?;
@@ -437,7 +457,7 @@ impl Fetcher {
                 ..Default::default()
             });
         }
-        if !(200..300).contains(&status) {
+        if !(200..300).contains(&status) && !keep_error_body {
             return Ok(Response {
                 status,
                 final_url: if retry {
@@ -470,7 +490,11 @@ impl Fetcher {
         self.bump(|s| s.bytes += body.len() as u64);
         Ok(Response {
             status,
-            final_url: req.url.to_string(),
+            final_url: if retry {
+                "retry".into()
+            } else {
+                req.url.to_string()
+            },
             content_type,
             body,
         })
@@ -750,6 +774,36 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    #[test]
+    fn api_error_bodies_are_bounded_and_bearers_never_cross_origins() {
+        let body = r#"{"error":{"errors":[{"reason":"insufficientPermissions"}]}}"#;
+        let base = serve(vec![
+            ("/scope", 403, "", body.into()),
+            ("/large", 403, "", "x".repeat(100)),
+            (
+                "/redirect",
+                302,
+                "Location: https://other.example/account\r\n",
+                String::new(),
+            ),
+        ]);
+        let f = Fetcher::for_tests();
+        let url = format!("{base}/scope");
+        let mut req = Request::new(&url, Mode::Feed, "application/json", 1000);
+        req.bearer = Some("synthetic-token");
+        assert!(matches!(f.get(&req), Err(FetchError::Status(403))));
+        let res = f.get_response(&req).unwrap();
+        assert_eq!(res.status, 403);
+        assert_eq!(res.text(), body);
+        let url = format!("{base}/large");
+        let req = Request::new(&url, Mode::Feed, "application/json", 10);
+        assert!(matches!(f.get_response(&req), Err(FetchError::TooLarge)));
+        let url = format!("{base}/redirect");
+        let mut req = Request::new(&url, Mode::Feed, "application/json", 1000);
+        req.bearer = Some("synthetic-token");
+        assert!(matches!(f.get_response(&req), Err(FetchError::BadUrl)));
     }
 
     #[test]

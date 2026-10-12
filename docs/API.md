@@ -718,7 +718,7 @@ day's batch the best-ranked post is the newest.
 | Field | Type | Notes |
 |---|---|---|
 | `pipeline` | bool | The daily pipeline runs for this user (the owner; it reads the owner's persona files). |
-| `enabled` | bool | `pipeline` and `[feed] enabled` in the config. |
+| `enabled` | bool | `pipeline` and the owner's stored enable choice, falling back to `[feed] enabled` in the config. |
 | `running` | bool | A run is in progress. |
 | `paused` | bool | Daily posts are paused. |
 | `paused_at` | int or null | |
@@ -746,8 +746,13 @@ two-week pause. Response `{"ok": true}`.
 
 #### `POST /api/feed/pause`, `POST /api/feed/resume`
 
-Pause or resume the daily posts. Resuming starts today's batch right away
-when there is none yet (and the feed job is enabled). Responses:
+Pause or resume the daily posts. For the owner, these also persist the app's
+enable choice (off/on), overriding the `[feed] enabled` config default.
+`enabled=false` in the config means off by default; the owner can turn it on
+with Resume (the Daily posts switch). Resuming starts today's batch right away
+when there is none yet and Iris is not globally paused. Pausing an active run
+stops it at the next phase boundary, with pause checks before publication,
+price checks, and urgent notifications. Responses:
 `{"ok": true, "status": {FeedStatus}}`, plus `was_paused` for resume. Both
 emit `entities.changed` `["feed"]` to the caller.
 
@@ -2486,12 +2491,16 @@ overall timeouts; size caps of 4 MB for feeds and JSON, 1.5 MB for pages
 no ambient proxy; hostnames that resolve to loopback, private, link-local, or carrier-grade
 NAT (tailnet) addresses are refused on every redirect hop.
 
-**Google (YouTube).** When the Google connector has stored a token for the
-owner (vault-sealed setting `connector_token.google:<user id>`, JSON
-`{"access_token", "expires_at"}`), the run reads `subscriptions.list` and
-`videos.list?myRating=like` from the YouTube Data API (all subscriptions,
-up to 250, become `google` sources that the run reads in rotation). Without one, YouTube
-works through channel sources.
+**Google (YouTube).** The run uses the owner's active Google connector's
+vault-encrypted `OAuthConfig`, refreshing its access token through the same
+OAuth path as the connector gateway. Google sign-in and reconnect request
+`https://www.googleapis.com/auth/youtube.readonly`. The run reads
+`subscriptions.list` and `videos.list?myRating=like` from the YouTube Data API
+(all subscriptions, up to 250, become `google` sources read in rotation).
+Older connections that return insufficient-scope errors get one Main chat
+note asking the owner to reconnect Google to add YouTube access; the rest of
+the feed continues. Without a usable Google connection, YouTube works through
+channel sources. Tokens are never exposed to the CLI, API, or logs.
 
 ---
 

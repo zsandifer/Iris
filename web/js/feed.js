@@ -376,6 +376,17 @@ function sourceTitle(s) {
   return s.value;
 }
 
+export function dailyPostsOn(status) {
+  return !!status?.enabled && !status.paused;
+}
+
+export function dailyPostsSubtitle(status) {
+  if (!status.enabled) return 'Off';
+  if (status.paused) return 'Paused';
+  const last = status.last_run;
+  return last ? `Last batch ${ago(last.at)}: ${last.published} posts from ${last.sources_checked} sources` : 'First batch coming up';
+}
+
 export function FeedSettings() {
   useStore();
   const [sources, setSources] = useState(null);
@@ -401,11 +412,10 @@ export function FeedSettings() {
   const pauseToggle = async (on) => {
     try { await apiPost(on ? '/feed/resume' : '/feed/pause'); await loadFeed(); } catch (e) { toast(e.message); }
   };
-  const last = st?.last_run;
   return html`<${Page} title="For you" sub="Where your feed comes from and how it works.">
     ${st?.pipeline && html`<${Group} note=${`About ${st.daily_size} posts a day. It grows when you keep reaching the end and shrinks when you rarely look. Only big personal things (a price drop on something you saved, an event near you) send a notification.`}>
-      <${Row} icon="sparkles" title="Daily posts" sub=${st.paused ? 'Paused' : last ? `Last batch ${ago(last.at)}: ${last.published} posts from ${last.sources_checked} sources` : 'First batch coming up'}
-        right=${html`<${Toggle} on=${!st.paused} onChange=${pauseToggle} label="Daily posts" />`} />
+      <${Row} icon="sparkles" title="Daily posts" sub=${dailyPostsSubtitle(st)}
+        right=${html`<${Toggle} on=${dailyPostsOn(st)} onChange=${pauseToggle} label="Daily posts" />`} />
     <//>`}
     ${st?.topics?.length > 0 && html`<div class="gl">Today's topics</div><div class="pills static">${st.topics.map((t) => html`<button disabled>${t}</button>`)}</div>`}
     <div class="gl">Add a source</div>

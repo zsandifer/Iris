@@ -875,7 +875,8 @@ pub fn approval_card(r: &ApprovalRequest) -> Value {
 /// OAuth state of a connector (MCP authorization spec, or a catalog
 /// provider such as Google with the owner's own client). Secret fields
 /// (`client_secret`, `access_token`, `refresh_token`) are sealed with the
-/// vault (base64) and only opened in memory by the gateway.
+/// vault (base64) and only opened in memory on Iris's side (the gateway
+/// and the owner's feed).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OAuthConfig {
     /// `discover`: endpoints come from the MCP server's metadata (and the
