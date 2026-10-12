@@ -127,10 +127,15 @@ pub const GOOGLE_DESCRIPTION: &str =
 /// The Google Workspace MCP server release Iris is set up for (the owner
 /// can change it under the connection's advanced settings).
 pub const GOOGLE_MCP_PACKAGE: &str = "workspace-mcp@2.1.0";
-/// The server's services Iris turns on (`--tools`). Google Chat is left
-/// out: its API only works for Business or Enterprise Workspace accounts
-/// and needs a Chat app configured in the owner's project. Search and Apps
-/// Script are left out too (a separate search engine, and running code).
+/// The server's services Iris turns on (`--tools`). Left out on purpose:
+/// - `chat`: Google Chat's API only works for Business or Enterprise
+///   Workspace accounts and needs a Chat app configured in the project.
+/// - `search`: the Custom Search JSON API is closed to new customers (and
+///   ends on 2027-01-01), and needs its own API key and search engine.
+/// - `appscript`: writing and running Apps Script is arbitrary code in the
+///   owner's account (it can send mail or fetch URLs itself), which would
+///   step around the gateway's per-call approval; running a script also
+///   needs it moved into the owner's Cloud project and deployed.
 pub const GOOGLE_TOOLS: &[&str] = &[
     "gmail", "calendar", "drive", "docs", "sheets", "slides", "forms", "tasks", "contacts",
 ];
@@ -138,12 +143,14 @@ pub const GOOGLE_TOOLS: &[&str] = &[
 const GOOGLE_TOOLS_BEFORE_SUITE: &[&str] = &["gmail", "calendar", "drive"];
 /// One sign-in for every service in `GOOGLE_TOOLS` (the broad scope of
 /// each, which the server accepts for its narrower checks), plus YouTube
-/// read-only for For you. Forms responses need their own read scope.
+/// read-only for For you. Forms responses need their own read scope, and
+/// Gmail filters need `gmail.settings.basic` (not covered by `modify`).
 pub const GOOGLE_SCOPES: &[&str] = &[
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.settings.basic",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/youtube.readonly",
@@ -593,6 +600,7 @@ mod tests {
         assert!(GOOGLE_TOOLS.iter().all(|t| known.contains(t)));
         // Each service's broad scope is requested in the one sign-in.
         for scope in [
+            "gmail.settings.basic",
             "documents",
             "spreadsheets",
             "presentations",
@@ -645,6 +653,59 @@ mod tests {
         ] {
             assert_eq!(upgraded_google_args(&kept), None, "{kept:?}");
         }
+    }
+
+    #[test]
+    fn any_missing_google_scope_asks_a_signed_in_connection_to_sign_in_again() {
+        let con = |scopes: Vec<String>, signed_in: bool, service: &str| entities::Connector {
+            id: "g".into(),
+            name: "google".into(),
+            description: String::new(),
+            transport: "http".into(),
+            config: ConnectorConfig {
+                oauth: Some(OAuthConfig {
+                    mode: "preset".into(),
+                    scopes,
+                    refresh_token: signed_in.then(|| "sealed".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            enabled: true,
+            policy: Policy::default(),
+            service: service.into(),
+            paused_reason: None,
+            paused_at: None,
+            auth_state: "ok".into(),
+            workspace_cwd: false,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let all: Vec<String> = GOOGLE_SCOPES.iter().map(|s| s.to_string()).collect();
+        assert!(!google_needs_more_access(&con(all.clone(), true, "google")));
+        // Granted everything except Gmail filters (settings.basic).
+        let without_filters: Vec<String> = all
+            .iter()
+            .filter(|s| !s.ends_with("/gmail.settings.basic"))
+            .cloned()
+            .collect();
+        assert_eq!(without_filters.len(), all.len() - 1);
+        assert!(google_needs_more_access(&con(
+            without_filters.clone(),
+            true,
+            "google"
+        )));
+        // Not signed in yet, or not Google: nothing to ask.
+        assert!(!google_needs_more_access(&con(
+            without_filters.clone(),
+            false,
+            "google"
+        )));
+        assert!(!google_needs_more_access(&con(
+            without_filters,
+            true,
+            "custom"
+        )));
     }
 
     #[test]

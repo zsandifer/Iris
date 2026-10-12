@@ -2085,7 +2085,17 @@ mod tests {
 
         // As an older Iris left it: signed in for Gmail, Calendar, Drive and
         // YouTube only, with the old server arguments.
-        let old_scopes: Vec<String> = GOOGLE_SCOPES[..7].iter().map(|s| s.to_string()).collect();
+        let old_scopes: Vec<String> = [
+            "openid",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/calendar",
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/youtube.readonly",
+        ]
+        .map(String::from)
+        .to_vec();
         let old_args: Vec<String> = [
             "workspace-mcp@1.30.1",
             "--transport",

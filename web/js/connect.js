@@ -277,7 +277,7 @@ function GoogleSetup({ entry, con }) {
       ${p.error && html`<div class="warn-box" role="alert">${p.error.message}</div>`}
       ${entry.missing?.length > 0 && p.phase === 'sign_in' && html`<div class="warn-box">I need the Google helper installed on my server before I can use this connection. Ask whoever runs your Iris server to install uv.</div>`}
       ${p.phase === 'connected' && p.more_access ? html`<div class="ok-line"><${Icon} name="check" /> Connected ✓</div>
-        <p>Google works as before. I can now also use Docs, Sheets, Slides, Forms, Tasks and Contacts.</p>
+        <p>Google works as before. I can now also use Docs, Sheets, Slides, Forms, Tasks, Contacts and Gmail filters.</p>
         <p>First turn on the new services in your Google project (it's fine that some are already on):</p>${open('apis', 'Turn on Google services')}
         <p>Then sign in again and leave every box checked.</p>
         ${con ? html`<${ServiceSignIn} con=${con} label="Google" onDone=${reload} />` : html`<${Spinner} />`}`
@@ -509,7 +509,7 @@ export function ConnectorPage({ id }) {
     ${con.paused && html`<div class="warn-box"><b>Paused.</b> I stopped using ${label} because ${con.paused_reason}. Check the recent activity below, then resume it if everything looks right.
       <div class="act"><button class="b1 sm" onClick=${resume}>Resume</button></div></div>`}
     ${!needsSignIn && con.enabled && con.oauth?.needs_more_access && html`<div class="card-x wide-card"><b>Google can do more now</b>
-      <p>Sign in again to add Docs, Sheets, Slides, Forms, Tasks and Contacts. Everything you use today keeps working until then.</p>
+      <p>Sign in again to add Docs, Sheets, Slides, Forms, Tasks, Contacts and Gmail filters. Everything you use today keeps working until then.</p>
       <div class="act"><button onClick=${() => go('iris/connections/add/google')}>Add Google services</button></div></div>`}
     ${needsSignIn && con.enabled && html`<div class="card-x wide-card"><b>${con.auth_state === 'needs_reconnect' ? `Sign in to ${label} again` : `Sign in to ${label}`}</b>
       <p>${con.auth_state === 'needs_reconnect' ? 'The sign-in expired or was revoked.' : 'One more step: approve access on its own page.'}</p>

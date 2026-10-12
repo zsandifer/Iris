@@ -664,9 +664,13 @@ elsewhere on your private network needs HTTPS to receive credentials.
   [Google Workspace MCP server](https://github.com/taylorwilsdon/google_workspace_mcp)
   (`uvx workspace-mcp`) in external OAuth mode, with a fresh token on each
   request. YouTube read-only also powers subscriptions and likes in For you.
-  No client secret ships with Iris. Google Chat is not included: its API
-  only works for Business or Enterprise Workspace accounts and needs a Chat
-  app configured in your project.
+  No client secret ships with Iris. Not included: Google Chat (its API only
+  works for Business or Enterprise Workspace accounts and needs a Chat app
+  configured in your project), Custom Search (closed to new customers, and
+  it needs its own API key and search engine; your AI engine can already
+  search the web), and Apps Script (scripts run with your account's access
+  and could act without asking you first). Gmail filters are included;
+  connections made before that ask you to sign in again.
 
   **Already connected before Docs, Sheets and the rest?** Google keeps
   working as before. Connections shows “Sign in again to add Docs, Sheets

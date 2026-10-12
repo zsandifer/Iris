@@ -1505,7 +1505,8 @@ the service's own page:
   itself is on this machine).
 - `preset` (Google): fixed endpoints and scopes, the owner's own OAuth
   client (`access_type=offline`, `include_granted_scopes=true`), requesting
-  in one sign-in `gmail.modify`, `calendar`, `drive`, `documents`,
+  in one sign-in `gmail.modify`, `gmail.settings.basic` (Gmail filters),
+  `calendar`, `drive`, `documents`,
   `spreadsheets`, `presentations`, `forms.body`, `forms.responses.readonly`,
   `tasks`, `contacts`, and `youtube.readonly` (plus `openid`, email and
   profile). A sign-in that does not grant every one is refused. The
@@ -1648,8 +1649,12 @@ Creates (or updates) the connector named after the service. Response
   Workspace MCP server (`uvx workspace-mcp@2.1.0 --transport streamable-http
   --tools gmail calendar drive docs sheets slides forms tasks contacts`) on a
   loopback port in its external OAuth mode and passes the owner's access
-  token with every request. Google Chat is not turned on (its API needs a
-  Business or Enterprise Workspace account and a configured Chat app). No
+  token with every request. The server's other services stay off: `chat`
+  (its API needs a Business or Enterprise Workspace account and a
+  configured Chat app), `search` (the Custom Search JSON API is closed to
+  new customers and needs its own key and engine), and `appscript` (running
+  arbitrary scripts in the owner's account would step around per-call
+  approval). No
   client secret ships with Iris. Saving the same key again keeps the current
   sign-in and its recorded scopes. When a Google sign-in completes, server
   arguments that are exactly an older Iris default (`--tools gmail calendar
