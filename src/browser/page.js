@@ -282,7 +282,7 @@ if (!globalThis.__iris) {
             if (el === el.ownerDocument.activeElement) line += ' [focused]';
             if (r === 'link') {
               const h = el.getAttribute('href') || '';
-              if (h && !h.startsWith('javascript:') && h !== '#') line += ' -> ' + clean(el.href, 120);
+              if (h && h !== '#' && /^https?:$/.test(el.protocol || '')) line += ' -> ' + clean(el.href, 120);
             }
             if (t === 'select') {
               const opts = [...el.options].slice(0, 25).map((o) => clean(o.text, 40)).filter(Boolean);
