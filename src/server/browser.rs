@@ -35,7 +35,28 @@ pub fn status_json(state: &AppState) -> Value {
         Value::Null
     };
     v["install"] = json!(state.engine_ops.get("browser"));
+    v["sandbox_fix"] = if v["sandbox_unavailable"] == true {
+        sandbox_fix(state, &root)
+    } else {
+        Value::Null
+    };
     v
+}
+
+/// The exact step that lets Chrome's sandbox start on this machine (see
+/// `browser::apparmor::recovery`).
+fn sandbox_fix(state: &AppState, root: &std::path::Path) -> Value {
+    use crate::browser::apparmor;
+    let browser = state.browser.executable();
+    apparmor::recovery_here(
+        &apparmor::Setup {
+            root,
+            split: !state.cfg.engines.helper.is_empty(),
+            configured: !state.cfg.browser.command.trim().is_empty(),
+            browser: browser.as_deref(),
+        },
+        &state.cfg.agent.user,
+    )
 }
 
 /// Send the full status (with install state) to the owner's apps.

@@ -83,3 +83,28 @@ fn sudoers_allow_exact_browser_install_update_and_uninstall_commands() {
         Err(e) => panic!("visudo failed: {e}"),
     }
 }
+
+#[test]
+fn setup_refuses_the_engine_admin_as_service_or_agent_account() {
+    // Checked before anything needs root: the admin account owns Iris's
+    // browser (which may get user namespaces), so Iris or its agent must
+    // never be that account.
+    for args in [
+        &["iris"][..],
+        &["svc", "/usr/local/bin/iris", "/opt/iris/engines", "iris"][..],
+    ] {
+        let out = Command::new("sh")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/deploy/setup-engines.sh"
+            ))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("engine admin account"),
+            "{out:?}"
+        );
+    }
+}

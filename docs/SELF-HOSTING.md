@@ -282,7 +282,11 @@ For a stricter setup, `deploy/setup-engines.sh` (run once as root) creates a
 separate `iris` system user that owns the engines directory and performs
 installs through a narrow sudo rule. The rule includes install, update, and
 uninstall for `browser` (managed Chromium); rerun the script if your rule
-was created before browser support was added. The user running Iris can
+was created before browser support was added. Where AppArmor restricts
+user namespaces (Ubuntu 23.10 and later), the script also approves Iris's
+own browser for Chrome's sandbox (see
+[Iris's computer](#iriss-computer-browser)); rerun it to add that to an
+existing setup. The user running Iris can
 then run the engines but cannot modify them, and never needs download or
 install rights.
 
@@ -470,12 +474,15 @@ out each tool call the CLI makes, nothing more.
 - **Getting a browser.** Tap "Set up the browser" in Iris's computer: Iris
   installs the official `playwright-core` npm package into its engines
   directory and runs its own `install chromium`, which downloads Chromium
-  from Playwright's official servers (needs Node.js). Iris updates it daily
-  with the other engines it installed, while the browser is closed. Or
-  install Chromium or Chrome yourself; Iris looks at `browser.command`, then
-  `PATH` (`chromium`, `google-chrome`, ...; snap packages are skipped because
-  their sandbox cannot use Iris's profile), then Playwright's cache
-  (`~/.cache/ms-playwright`).
+  from Playwright's official servers (needs Node.js). The build lands at one
+  fixed path, `<engines dir>/chromium/app/chrome` (linked as
+  `<engines dir>/bin/browser`), so the one-time root setup can approve it
+  for Chrome's sandbox (below). Iris updates it daily with the other
+  engines it installed, while the browser is closed. Or install Chromium or
+  Chrome yourself. Iris looks at `browser.command`, then its own installed
+  browser, then `PATH` (`chromium`, `google-chrome`, ...; snap packages are
+  skipped because their sandbox cannot use Iris's profile), then
+  Playwright's cache (`~/.cache/ms-playwright`).
 - **System libraries.** A fresh server may lack the libraries Chromium
   needs; the app then shows the error. Fix it once as root with
   `npx playwright install-deps chromium` (or install your distribution's
@@ -504,27 +511,69 @@ out each tool call the CLI makes, nothing more.
   view on your phone stays available.
 - **Who gets it.** Only the owner's own conversations and jobs (the profile
   holds the owner's sign-ins); never shared chats.
-- **Sandbox.** Iris always starts Chrome with its sandbox. Some systems
-  cannot start it (for example Ubuntu 23.10 and later, which restrict
-  unprivileged user namespaces with AppArmor). Then the browser does not
-  start, and Iris's computer explains and offers **Run without the
-  sandbox**: only if you tap it (a saved choice, `POST /api/browser/sandbox`)
-  does Iris run Chromium without it. The safer fix is one step as root, for
-  example an AppArmor profile that allows user namespaces for that one
-  binary (see Chromium's `docs/security/apparmor-userns-restrictions.md`):
+- **Sandbox.** Iris always starts Chrome with its sandbox. Ubuntu 23.10
+  and later restrict unprivileged user namespaces with AppArmor
+  (`kernel.apparmor_restrict_unprivileged_userns = 1`), and Chrome's
+  sandbox needs one, so it only starts for a browser an AppArmor profile
+  allows. The recommended setup approves Iris's own browser once:
 
-  ```sh
-  # replace the path with the browser Iris uses (GET /api/browser shows the
-  # error; `ls -l <engines dir>/bin/browser` shows the installed one)
-  sudo tee /etc/apparmor.d/iris-chrome <<'EOF2'
-  abi <abi/4.0>,
-  include <tunables/global>
-  profile iris-chrome /path/to/chrome flags=(unconfined) {
-    userns,
-  }
-  EOF2
-  sudo apparmor_parser -r /etc/apparmor.d/iris-chrome
-  ```
+  1. Run the engines privilege split, `deploy/setup-engines.sh`, as root
+     (see [Engines from the app](#engines-from-the-app)).
+     Where the restriction is on, it writes `/etc/apparmor.d/iris-browser`
+     for exactly `<engines dir>/chromium/app/chrome` and loads it with
+     `apparmor_parser -r` (rerunning it is safe; without the restriction or
+     AppArmor 4 it does nothing). It refuses if anything already under
+     `<engines dir>/chromium` belongs to another account or is writable by
+     group or others. The engines directory belongs to the
+     `iris` admin user, so the user running Iris cannot put another program
+     at that path.
+  2. Add the printed `[engines]` settings, restart Iris, and tap "Set up the
+     browser" in Iris's computer. Iris now uses that copy unless
+     `browser.command` is set (it always wins; clear it to use Iris's copy).
+     A browser Iris installed before this layout moves to the fixed path on
+     its next update (Iris's computer offers **Update the browser**).
+
+  The script refuses to run when the account running Iris, or the CLI agent
+  account, is the `iris` engine admin itself: that account owns the
+  approved browser.
+
+  If the sandbox still cannot start, Iris's computer explains and shows the
+  exact command for this machine, with **Copy**, **Try again**, and **Run
+  without the sandbox**:
+
+  - If the browser Iris found is protected (it, its directory, and every
+    folder above it are owned by root or the engines admin user and not
+    writable by others; for example `/usr/bin/chromium` or Iris's own copy
+    from before the profile existed), the command installs the same
+    profile for that browser's real path:
+
+    ```sh
+    sudo tee /etc/apparmor.d/iris-browser >/dev/null <<'EOF'
+    # Iris's browser: allow Chrome's sandbox (user namespaces) for this one program.
+    abi <abi/4.0>,
+    include <tunables/global>
+
+    profile iris-browser "/opt/iris/engines/chromium/app/chrome" flags=(unconfined) {
+      userns,
+    }
+    EOF
+    sudo apparmor_parser -r /etc/apparmor.d/iris-browser
+    ```
+  - Otherwise (for example Playwright's cache in your home directory, or
+    engines in Iris's data directory in single-user mode) it shows the
+    `setup-engines.sh` command instead. A profile for a path your own user
+    can write would give user namespaces to any program copied there,
+    undoing the system's protection, so Iris never suggests one.
+
+  **Run without the sandbox** remains: only if you tap it (a saved choice,
+  `POST /api/browser/sandbox`) does Iris run Chromium without it. Iris
+  itself never writes AppArmor profiles or runs anything as root. See
+  Chromium's `docs/security/apparmor-userns-restrictions.md` for background.
+
+  Moving from a hand-written profile (an earlier version of this guide
+  suggested `/etc/apparmor.d/iris-chrome` for a Playwright cache path):
+  once Iris uses its own approved copy, remove the old one with
+  `sudo apparmor_parser -R /etc/apparmor.d/iris-chrome && sudo rm /etc/apparmor.d/iris-chrome`.
 - **Approval lifetime.** Wallet fills use the gateway’s approval wait and
   cancellation rules. Denial, expiry, Stop, Pause, or Disconnect prevents
   the held fill; a late approval never restarts a turn.

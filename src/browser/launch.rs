@@ -1,10 +1,12 @@
 //! Finding and starting Chromium.
 //!
 //! Lookup order: `browser.command` from the config, the copy Iris
-//! installed from the app (`<engines>/bin/browser`, see `engines.rs`),
-//! Chromium or Chrome on PATH (snap wrappers are skipped: their sandbox
-//! cannot use a profile under a hidden directory), then Playwright's
-//! browser cache (`$PLAYWRIGHT_BROWSERS_PATH` or `~/.cache/ms-playwright`).
+//! installed from the app (`<engines>/bin/browser`, pointing at the fixed
+//! `<engines>/chromium/app/chrome` that the root setup approves for
+//! Chrome's sandbox; see `engines.rs` and `apparmor.rs`), Chromium or
+//! Chrome on PATH (snap wrappers are skipped: their sandbox cannot use a
+//! profile under a hidden directory), then Playwright's browser cache
+//! (`$PLAYWRIGHT_BROWSERS_PATH` or `~/.cache/ms-playwright`).
 
 use super::cdp::Cdp;
 use crate::util::Result;
@@ -24,17 +26,34 @@ const PATH_NAMES: &[&str] = &[
 
 /// Resolve the browser executable (None: not installed anywhere).
 pub fn find(command: &str) -> Option<PathBuf> {
+    let managed =
+        crate::harness::resolve_command("browser").filter(|p| crate::harness::is_managed(p));
+    find_in(
+        command,
+        managed,
+        &crate::harness::resolve_command,
+        &playwright_cache_dirs(),
+    )
+}
+
+/// The lookup order, with the system around it passed in (for tests):
+/// the configured command, then Iris's own browser, then PATH (snap
+/// wrappers skipped), the usual macOS apps, then Playwright's cache.
+fn find_in(
+    command: &str,
+    managed: Option<PathBuf>,
+    resolve: &dyn Fn(&str) -> Option<PathBuf>,
+    caches: &[PathBuf],
+) -> Option<PathBuf> {
     let command = command.trim();
     if !command.is_empty() {
-        return crate::harness::resolve_command(command);
+        return resolve(command);
     }
-    if let Some(p) =
-        crate::harness::resolve_command("browser").filter(|p| crate::harness::is_managed(p))
-    {
-        return Some(p);
+    if managed.is_some() {
+        return managed;
     }
     for name in PATH_NAMES {
-        if let Some(p) = crate::harness::resolve_command(name) {
+        if let Some(p) = resolve(name) {
             let real = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
             if real.starts_with("/snap") || p.starts_with("/snap") {
                 continue;
@@ -49,9 +68,7 @@ pub fn find(command: &str) -> Option<PathBuf> {
     if let Some(p) = mac.iter().map(PathBuf::from).find(|p| p.is_file()) {
         return Some(p);
     }
-    playwright_cache_dirs()
-        .iter()
-        .find_map(|d| newest_in_playwright_cache(d))
+    caches.iter().find_map(|d| newest_in_playwright_cache(d))
 }
 
 fn playwright_cache_dirs() -> Vec<PathBuf> {
@@ -481,6 +498,54 @@ mod tests {
             std::fs::write(&p, "").unwrap();
             let root = d.join(dir).parent().unwrap().to_path_buf();
             assert_eq!(newest_in_playwright_cache(&root).unwrap(), p);
+        }
+    }
+
+    #[test]
+    fn lookup_prefers_config_then_irises_own_browser_then_path_then_cache() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let exe = |p: PathBuf| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let managed = exe(d.join("engines/chromium/app/chrome"));
+        let on_path = exe(d.join("path/chromium"));
+        let configured = exe(d.join("custom/chrome"));
+        let cached = exe(d.join("cache/chromium-1200/chrome-linux64/chrome"));
+        let path_dir = d.join("path");
+        let resolve = move |c: &str| -> Option<PathBuf> {
+            if c.contains('/') {
+                return Path::new(c).is_file().then(|| PathBuf::from(c));
+            }
+            Some(path_dir.join(c)).filter(|p| p.is_file())
+        };
+        let caches = [d.join("cache")];
+        let cfg = configured.to_string_lossy().into_owned();
+        // browser.command wins over everything.
+        assert_eq!(
+            find_in(&cfg, Some(managed.clone()), &resolve, &caches),
+            Some(configured.clone())
+        );
+        // A configured command that is missing does not fall through.
+        assert_eq!(
+            find_in("/nope/chrome", Some(managed.clone()), &resolve, &caches),
+            None
+        );
+        // Iris's own browser beats PATH and Playwright's cache.
+        assert_eq!(
+            find_in("  ", Some(managed.clone()), &resolve, &caches),
+            Some(managed)
+        );
+        // Then PATH, then the cache.
+        assert_eq!(find_in("", None, &resolve, &caches), Some(on_path.clone()));
+        std::fs::remove_file(&on_path).unwrap();
+        if !Path::new("/Applications").exists() {
+            assert_eq!(find_in("", None, &resolve, &caches), Some(cached));
+            assert_eq!(find_in("", None, &resolve, &[]), None);
         }
     }
 

@@ -63,8 +63,10 @@ impl Default for AgentConfig {
 pub struct BrowserConfig {
     /// Offer browser tools to the agent (owner's own conversations only).
     pub enabled: bool,
-    /// Chromium or Chrome executable. Empty: the one Iris installed, then
-    /// PATH (`chromium`, `google-chrome`, ...), then Playwright's cache.
+    /// Chromium or Chrome executable. Empty: the one Iris installed
+    /// (`<engines dir>/chromium/app/chrome`, the path the root setup
+    /// approves for Chrome's sandbox), then PATH (`chromium`,
+    /// `google-chrome`, ...), then Playwright's cache. Set, it always wins.
     pub command: String,
     /// Close the browser after this many minutes without use. Sign-ins
     /// persist in its profile.
