@@ -44,63 +44,19 @@ pub fn status_json(state: &AppState) -> Value {
 }
 
 /// The exact step that lets Chrome's sandbox start on this machine (see
-/// `browser::apparmor`). Trusted owners of the browser's files: root, and
-/// with the privilege split the engines admin user.
+/// `browser::apparmor::recovery`).
 fn sandbox_fix(state: &AppState, root: &std::path::Path) -> Value {
     use crate::browser::apparmor;
-    use crate::engines;
-    use std::os::unix::fs::MetadataExt;
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let me = unsafe { libc::geteuid() };
-    let split = !state.cfg.engines.helper.is_empty();
-    let mut trusted = vec![0];
-    if split
-        && let Ok(m) = std::fs::metadata(root)
-        && m.uid() != me
-    {
-        trusted.push(m.uid());
-    }
-    // Iris's own browser from before the fixed path: its directory changes
-    // with every update, so it is moved (updated), never approved in place.
-    let app = engines::browser_app_dir(root).canonicalize().ok();
-    let downloads = engines::install_dir(root, "browser").canonicalize().ok();
-    let old_layout = |p: &std::path::Path| {
-        downloads.as_ref().is_some_and(|d| p.starts_with(d))
-            && !app.as_ref().is_some_and(|a| p.starts_with(a))
-    };
-    let managed = engines::is_installed(root, "browser");
-    let managed_moved = engines::launcher(root, "browser")
-        .canonicalize()
-        .ok()
-        .is_some_and(|p| !old_layout(&p));
-    let user = apparmor::current_user()
-        .or_else(|| std::env::var("USER").ok())
-        .unwrap_or_else(|| "IRIS_USER".into());
-    // The setup reserves this account for engine installs and refuses to
-    // run for it.
-    let account_conflict =
-        user == apparmor::ENGINE_ADMIN || state.cfg.agent.user == apparmor::ENGINE_ADMIN;
-    let setup = apparmor::setup_command(
-        &user,
-        apparmor::root_owned_iris().as_deref(),
-        split.then_some(root),
-    );
-    let mut fix = apparmor::sandbox_fix(
-        apparmor::userns_restricted(),
-        state.browser.executable().as_deref(),
-        &|p| !old_layout(p) && apparmor::protected(p, &trusted),
-        &setup,
-    );
-    if fix["kind"] == "setup" {
-        // `browser.command` always wins, so it has to go first.
-        fix["configured_command"] = (!state.cfg.browser.command.trim().is_empty()).into();
-        // With the privilege split in place, installing (or moving) Iris's
-        // own browser into the protected engines directory is the step the
-        // app can offer.
-        fix["install_browser"] = (split && (!managed || !managed_moved)).into();
-        fix["account_conflict"] = account_conflict.into();
-    }
-    fix
+    let browser = state.browser.executable();
+    apparmor::recovery_here(
+        &apparmor::Setup {
+            root,
+            split: !state.cfg.engines.helper.is_empty(),
+            configured: !state.cfg.browser.command.trim().is_empty(),
+            browser: browser.as_deref(),
+        },
+        &state.cfg.agent.user,
+    )
 }
 
 /// Send the full status (with install state) to the owner's apps.

@@ -91,15 +91,6 @@ pub fn profile_command(binary: &Path) -> Option<String> {
     ))
 }
 
-/// Whether nobody but the trusted owners can replace `binary` or what it
-/// loads from its directory: the path is real (no symlinks), and it, every
-/// ancestor, and everything in its directory belong to a trusted owner
-/// and are not writable by group or others (symlinks inside the directory
-/// only need a trusted owner; their targets are not followed).
-pub fn protected(binary: &Path, trusted: &[u32]) -> bool {
-    protected_with(binary, trusted, &real_meta)
-}
-
 /// Owner and mode of a path itself (never following a symlink).
 type Meta<'a> = &'a dyn Fn(&Path) -> Option<(u32, u32)>;
 
@@ -110,16 +101,17 @@ fn real_meta(p: &Path) -> Option<(u32, u32)> {
         .map(|m| (m.uid(), m.mode()))
 }
 
+/// Whether nobody but the trusted owners can replace `binary` or what it
+/// loads from its directory: the path is real (no symlinks), and it, every
+/// ancestor, and everything in its directory belong to a trusted owner
+/// and are not writable by group or others (symlinks inside the directory
+/// only need a trusted owner; their targets are not followed).
+/// (`meta` gives owner and mode; tests pass stand-ins.)
 fn protected_with(binary: &Path, trusted: &[u32], meta: Meta) -> bool {
     binary.is_absolute()
         && binary.canonicalize().ok().as_deref() == Some(binary)
         && chain_safe(binary, trusted, meta)
-        && binary.parent().is_some_and(|d| tree_safe(d, trusted))
-}
-
-fn safe_meta(m: &std::fs::Metadata, trusted: &[u32]) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    safe_mode(m.uid(), m.mode(), trusted)
+        && binary.parent().is_some_and(|d| tree_safe(d, trusted, meta))
 }
 
 fn safe_mode(uid: u32, mode: u32, trusted: &[u32]) -> bool {
@@ -136,8 +128,10 @@ fn chain_safe(path: &Path, trusted: &[u32], meta: Meta) -> bool {
 /// Everything in the browser's directory (the libraries and resources it
 /// loads). In a shared system directory such as /usr/bin only its files
 /// are checked.
-fn tree_safe(dir: &Path, trusted: &[u32]) -> bool {
-    use std::os::unix::fs::MetadataExt;
+fn tree_safe(dir: &Path, trusted: &[u32], meta: Meta) -> bool {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFLNK: u32 = 0o120000;
+    const S_IFDIR: u32 = 0o040000;
     let recurse = !matches!(
         dir.to_str(),
         Some("/usr/bin" | "/bin" | "/usr/local/bin" | "/usr/sbin" | "/sbin")
@@ -150,25 +144,22 @@ fn tree_safe(dir: &Path, trusted: &[u32]) -> bool {
         };
         for e in entries {
             seen += 1;
-            let Some(m) = e.ok().and_then(|e| {
-                std::fs::symlink_metadata(e.path())
-                    .ok()
-                    .map(|m| (e.path(), m))
-            }) else {
-                return false;
-            };
-            let (path, m) = m;
             if seen > MAX_ENTRIES {
                 return false;
             }
-            if m.file_type().is_symlink() {
-                if !trusted.contains(&m.uid()) {
-                    return false;
-                }
-            } else if !safe_meta(&m, trusted) {
+            let Ok(e) = e else {
                 return false;
-            } else if m.is_dir() && recurse {
-                stack.push(path);
+            };
+            let path = e.path();
+            let Some((uid, mode)) = meta(&path) else {
+                return false;
+            };
+            match mode & S_IFMT {
+                S_IFLNK if !trusted.contains(&uid) => return false,
+                S_IFLNK => {}
+                _ if !safe_mode(uid, mode, trusted) => return false,
+                S_IFDIR if recurse => stack.push(path),
+                _ => {}
             }
         }
     }
@@ -261,6 +252,127 @@ pub fn current_user() -> Option<String> {
             .ok()
             .map(String::from)
     }
+}
+
+/// The uid of an account, if it exists.
+pub fn uid_of(name: &str) -> Option<u32> {
+    let c = std::ffi::CString::new(name).ok()?;
+    // SAFETY: getpwnam_r writes into the buffers we pass; the result is
+    // read only on success.
+    unsafe {
+        let mut pw: libc::passwd = std::mem::zeroed();
+        let mut out: *mut libc::passwd = std::ptr::null_mut();
+        let mut buf = vec![0 as libc::c_char; 4096];
+        let rc = libc::getpwnam_r(c.as_ptr(), &mut pw, buf.as_mut_ptr(), buf.len(), &mut out);
+        (rc == 0 && !out.is_null()).then_some(pw.pw_uid)
+    }
+}
+
+/// Facts about this machine that the recovery depends on.
+pub struct Host<'a> {
+    /// AppArmor restricts unprivileged user namespaces.
+    pub restricted: bool,
+    /// The account Iris runs as, and its uid.
+    pub user: &'a str,
+    pub uid: u32,
+    /// The isolated agent account (empty: none), and its uid.
+    pub agent_user: &'a str,
+    pub agent_uid: Option<u32>,
+    /// The uid of the engine admin account (`iris`), if it exists.
+    pub admin_uid: Option<u32>,
+    /// This Iris binary, if only root can replace it.
+    pub iris_bin: Option<&'a Path>,
+}
+
+/// Iris's browser setup as configured.
+pub struct Setup<'a> {
+    /// Engines directory.
+    pub root: &'a Path,
+    /// The privilege split (`engines.helper`) is configured.
+    pub split: bool,
+    /// `browser.command` is set.
+    pub configured: bool,
+    /// The browser Iris would start.
+    pub browser: Option<&'a Path>,
+}
+
+/// `sandbox_fix` for the app (see [`sandbox_fix`]), plus, on the setup
+/// route, what else stands in the way: `configured_command`,
+/// `install_browser`, and `account_conflict`.
+///
+/// Trusted owners of a browser's files: root, and with the privilege split
+/// the engine admin account, but only if it owns the engines directory and
+/// is neither Iris's account nor the agent's.
+pub fn recovery(host: &Host, setup: &Setup, meta: Meta) -> Value {
+    use crate::engines;
+    let mut trusted = vec![0];
+    if setup.split
+        && let Some(admin) = host.admin_uid
+        && meta(setup.root).is_some_and(|(uid, _)| uid == admin)
+        && admin != host.uid
+        && host.agent_uid != Some(admin)
+    {
+        trusted.push(admin);
+    }
+    // Iris's own browser from before the fixed path: its directory changes
+    // with every update, so it is moved (updated), never approved in place.
+    let app = engines::browser_app_dir(setup.root).canonicalize().ok();
+    let downloads = engines::install_dir(setup.root, "browser")
+        .canonicalize()
+        .ok();
+    let old_layout = |p: &Path| {
+        downloads.as_ref().is_some_and(|d| p.starts_with(d))
+            && !app.as_ref().is_some_and(|a| p.starts_with(a))
+    };
+    let managed = engines::is_installed(setup.root, "browser");
+    let managed_moved = engines::launcher(setup.root, "browser")
+        .canonicalize()
+        .ok()
+        .is_some_and(|p| !old_layout(&p));
+    let command = setup_command(host.user, host.iris_bin, setup.split.then_some(setup.root));
+    let mut fix = sandbox_fix(
+        host.restricted,
+        setup.browser,
+        &|p| !old_layout(p) && protected_with(p, &trusted, meta),
+        &command,
+    );
+    if fix["kind"] == "setup" {
+        // `browser.command` always wins, so it has to go first.
+        fix["configured_command"] = setup.configured.into();
+        // With the privilege split in place, installing (or moving) Iris's
+        // own browser into the protected engines directory is the step the
+        // app can offer.
+        fix["install_browser"] = (setup.split && (!managed || !managed_moved)).into();
+        // The setup reserves this account for engine installs and refuses
+        // to run for it.
+        let admin = |name: &str, uid: Option<u32>| {
+            name == ENGINE_ADMIN || (uid.is_some() && uid == host.admin_uid)
+        };
+        fix["account_conflict"] = (admin(host.user, Some(host.uid))
+            || (!host.agent_user.is_empty() && admin(host.agent_user, host.agent_uid)))
+        .into();
+    }
+    fix
+}
+
+/// [`recovery`] for this machine.
+pub fn recovery_here(setup: &Setup, agent_user: &str) -> Value {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let user = current_user()
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "IRIS_USER".into());
+    let iris_bin = root_owned_iris();
+    let host = Host {
+        restricted: userns_restricted(),
+        user: &user,
+        uid,
+        agent_user,
+        agent_uid: Some(agent_user).filter(|a| !a.is_empty()).and_then(uid_of),
+        admin_uid: uid_of(ENGINE_ADMIN),
+        iris_bin: iris_bin.as_deref(),
+    };
+    recovery(&host, setup, &real_meta)
 }
 
 #[cfg(test)]
@@ -358,12 +470,12 @@ mod tests {
 
     /// Runs the setup script's approval step with stand-ins for the
     /// kernel switch, /etc/apparmor.d, and apparmor_parser.
-    struct Setup {
+    struct ScriptRun {
         _tmp: tempfile::TempDir,
         dir: std::path::PathBuf,
     }
 
-    impl Setup {
+    impl ScriptRun {
         fn new() -> Self {
             let tmp = tempfile::tempdir().unwrap();
             let dir = tmp.path().canonicalize().unwrap();
@@ -433,7 +545,7 @@ mod tests {
 
     #[test]
     fn setup_approves_the_browser_only_where_userns_is_restricted() {
-        let s = Setup::new();
+        let s = ScriptRun::new();
         let bin = s.dir.join("engines/chromium/app/chrome");
         let expected = profile_text(&bin).unwrap();
         // No switch, or switched off: nothing loaded or written.
@@ -552,22 +664,22 @@ mod tests {
         let bin = tree(&tmp.path().canonicalize().unwrap());
         let app = bin.parent().unwrap();
         let me = [uid()];
-        assert!(tree_safe(app, &me));
+        assert!(tree_safe(app, &me, &real_meta));
         // Not a trusted owner.
-        assert!(!tree_safe(app, &[u32::MAX]));
+        assert!(!tree_safe(app, &[u32::MAX], &real_meta));
         // A library anyone could replace.
         let lib = app.join("libEGL.so");
         std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o757)).unwrap();
-        assert!(!tree_safe(app, &me));
+        assert!(!tree_safe(app, &me, &real_meta));
         std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o755)).unwrap();
         // A group-writable subdirectory.
         let sub = app.join("locales");
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o775)).unwrap();
-        assert!(!tree_safe(app, &me));
+        assert!(!tree_safe(app, &me, &real_meta));
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
         // A symlink inside only needs a trusted owner.
         std::os::unix::fs::symlink("/etc/hostname", app.join("link")).unwrap();
-        assert!(tree_safe(app, &me));
+        assert!(tree_safe(app, &me, &real_meta));
     }
 
     /// Ancestors outside `base` look like root-owned 0755 directories;
@@ -646,6 +758,199 @@ mod tests {
             &meta
         ));
         assert!(!protected_with(&base.join("app/missing"), &trusted, &meta));
+    }
+
+    /// An engines directory with Iris's browser at the fixed path (or, for
+    /// `old`, inside Playwright's per-build download directory).
+    fn engines(old: bool) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("engines");
+        let rel = if old {
+            "chromium/browsers/chromium-1200/chrome-linux64/chrome"
+        } else {
+            "chromium/app/chrome"
+        };
+        let bin = root.join(rel);
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "").unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&bin, root.join("bin/browser")).unwrap();
+        for p in bin.ancestors().take_while(|p| p.starts_with(tmp.path())) {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (tmp, root, bin)
+    }
+
+    /// Everything under `base` owned by `uid` (real modes); above it,
+    /// root-owned 0755 directories.
+    fn owned_by(base: &Path, uid: u32) -> impl Fn(&Path) -> Option<(u32, u32)> + '_ {
+        move |p: &Path| {
+            if p.starts_with(base) {
+                real_meta(p).map(|(_, mode)| (uid, mode))
+            } else {
+                Some((0, 0o40755))
+            }
+        }
+    }
+
+    const ADMIN: u32 = 4242;
+    const SERVICE: u32 = 1000;
+    const AGENT: u32 = 2000;
+
+    fn host<'a>() -> Host<'a> {
+        Host {
+            restricted: true,
+            user: "svc",
+            uid: SERVICE,
+            agent_user: "",
+            agent_uid: None,
+            admin_uid: Some(ADMIN),
+            iris_bin: Some(Path::new("/usr/local/bin/iris")),
+        }
+    }
+
+    #[test]
+    fn recovery_picks_the_safe_route_for_each_setup() {
+        let (_t, root, bin) = engines(false);
+        let split = Setup {
+            root: &root,
+            split: true,
+            configured: false,
+            browser: Some(&bin),
+        };
+        // Privilege split, browser owned by the engine admin: a profile for
+        // exactly the fixed path.
+        let fix = recovery(&host(), &split, &owned_by(&root, ADMIN));
+        assert_eq!(fix["kind"], "apparmor", "{fix}");
+        assert_eq!(fix["command"], profile_command(&bin).unwrap());
+        assert!(fix.get("install_browser").is_none());
+        // Not restricted: nothing to suggest.
+        let off = Host {
+            restricted: false,
+            ..host()
+        };
+        assert_eq!(recovery(&off, &split, &owned_by(&root, ADMIN)), Value::Null);
+        // Single-user mode: the service's own files are never trusted.
+        let single = Setup {
+            split: false,
+            ..split
+        };
+        let fix = recovery(&host(), &single, &owned_by(&root, SERVICE));
+        assert_eq!(fix["kind"], "setup");
+        assert_eq!(
+            fix["command"],
+            "sudo sh deploy/setup-engines.sh 'svc' '/usr/local/bin/iris'"
+        );
+        assert_eq!(fix["install_browser"], false);
+        assert_eq!(fix["configured_command"], false);
+        assert_eq!(fix["account_conflict"], false);
+        // Split configured, but the engines belong to the service account.
+        let fix = recovery(&host(), &split, &owned_by(&root, SERVICE));
+        assert_eq!(fix["kind"], "setup");
+        assert!(
+            fix["command"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("'{}'", root.display()))
+        );
+        // ...or to the isolated agent (even if it is the admin uid).
+        let agent = Host {
+            agent_user: "agent",
+            agent_uid: Some(ADMIN),
+            ..host()
+        };
+        let fix = recovery(&agent, &split, &owned_by(&root, ADMIN));
+        assert_eq!(fix["kind"], "setup");
+        assert_eq!(fix["account_conflict"], true);
+        let agent = Host {
+            agent_user: "agent",
+            agent_uid: Some(AGENT),
+            ..host()
+        };
+        assert_eq!(
+            recovery(&agent, &split, &owned_by(&root, AGENT))["kind"],
+            "setup"
+        );
+        assert_eq!(
+            recovery(&agent, &split, &owned_by(&root, ADMIN))["kind"],
+            "apparmor"
+        );
+        // ...or to an account that is not the engine admin.
+        let other = Host {
+            admin_uid: Some(5555),
+            ..host()
+        };
+        assert_eq!(
+            recovery(&other, &split, &owned_by(&root, ADMIN))["kind"],
+            "setup"
+        );
+        let none = Host {
+            admin_uid: None,
+            ..host()
+        };
+        assert_eq!(
+            recovery(&none, &split, &owned_by(&root, ADMIN))["kind"],
+            "setup"
+        );
+        // Iris running as the admin account: the setup refuses it.
+        let as_admin = Host {
+            user: "iris",
+            uid: ADMIN,
+            ..host()
+        };
+        let fix = recovery(&as_admin, &split, &owned_by(&root, ADMIN));
+        assert_eq!(fix["kind"], "setup");
+        assert_eq!(fix["account_conflict"], true);
+        // browser.command picks an unprotected browser: it has to go.
+        let (_t2, other_root, other_bin) = engines(false);
+        let configured = Setup {
+            configured: true,
+            browser: Some(&other_bin),
+            ..split
+        };
+        let meta = |p: &Path| {
+            if p.starts_with(&other_root) {
+                real_meta(p).map(|(_, m)| (SERVICE, m))
+            } else {
+                owned_by(&root, ADMIN)(p)
+            }
+        };
+        let fix = recovery(&host(), &configured, &meta);
+        assert_eq!(fix["kind"], "setup");
+        assert_eq!(fix["configured_command"], true);
+        assert_eq!(
+            fix["install_browser"], false,
+            "Iris's own copy is installed"
+        );
+        // No browser at all: install Iris's own.
+        std::fs::remove_file(root.join("bin/browser")).unwrap();
+        let fix = recovery(
+            &host(),
+            &Setup {
+                browser: None,
+                ..split
+            },
+            &owned_by(&root, ADMIN),
+        );
+        assert_eq!(fix["kind"], "setup");
+        assert_eq!(fix["install_browser"], true);
+    }
+
+    #[test]
+    fn recovery_moves_a_browser_from_before_the_fixed_path() {
+        let (_t, root, bin) = engines(true);
+        let split = Setup {
+            root: &root,
+            split: true,
+            configured: false,
+            browser: Some(&bin),
+        };
+        // Protected, but its path changes with every update: offer the
+        // update (which moves it), not a profile for this build.
+        let fix = recovery(&host(), &split, &owned_by(&root, ADMIN));
+        assert_eq!(fix["kind"], "setup", "{fix}");
+        assert_eq!(fix["install_browser"], true);
+        assert_eq!(fix["path"], bin.to_string_lossy().as_ref());
     }
 
     #[test]
