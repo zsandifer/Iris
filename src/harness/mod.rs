@@ -574,7 +574,7 @@ mod isolation_tests {
                                 for tool in ["Read", "Edit", "Write", "Glob", "Grep"] {
                                     assert!(
                                         inv.args[deny + 1]
-                                            .contains(&format!("{tool}(/private/iris/**)"))
+                                            .contains(&format!("{tool}(//private/iris/**)"))
                                     );
                                 }
                                 assert!(inv.args[deny + 1].contains("Bash"));
@@ -584,12 +584,6 @@ mod isolation_tests {
                             }
                             "codex" => {
                                 assert!(inv.args.contains(&"project_doc_max_bytes=0".into()));
-                                assert!(inv.args.contains(&format!(
-                                    "sandbox_workspace_write.writable_roots={}",
-                                    toml::Value::Array(vec![toml::Value::String(
-                                        spec.cwd.to_string_lossy().into_owned()
-                                    )])
-                                )));
                                 let profiles = inv
                                     .args
                                     .iter()
@@ -602,9 +596,11 @@ mod isolation_tests {
                                     Some("deny")
                                 );
                                 assert_eq!(table["permissions"]["iris"]["filesystem"]["/agent/home/.codex/auth.json"].as_str(), Some("deny"));
-                                assert!(inv.args.contains(
-                                    &"sandbox_workspace_write.exclude_slash_tmp=true".into()
-                                ));
+                                assert_eq!(
+                                    table["permissions"]["iris"]["filesystem"][":slash_tmp"]
+                                        .as_str(),
+                                    Some("read")
+                                );
                             }
                             "gemini" => {
                                 assert!(

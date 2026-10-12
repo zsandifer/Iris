@@ -166,9 +166,12 @@ impl Harness for Claude {
         a.extend(self.cfg.extra_args.iter().cloned());
         let mut deny = vec!["Bash".to_string()];
         for path in &spec.protected_paths {
+            // Claude Code 2.1.x anchors `/path` at the working directory;
+            // `//path` is absolute (docs/en/permissions#read-and-edit).
+            let pattern = format!("/{}", path.display());
             for tool in ["Read", "Edit", "Write", "Glob", "Grep"] {
-                deny.push(format!("{tool}({}/**)", path.display()));
-                deny.push(format!("{tool}({})", path.display()));
+                deny.push(format!("{tool}({pattern}/**)"));
+                deny.push(format!("{tool}({pattern})"));
             }
         }
         a.extend(["--disallowedTools".into(), deny.join(",")]);
@@ -659,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_invocation() {
+    fn builds_invocation_with_absolute_permission_denials() {
         let tmp = tempfile::tempdir().unwrap();
         let img = tmp.path().join("a.png");
         std::fs::write(&img, b"PNG").unwrap();
@@ -693,7 +696,13 @@ mod tests {
             protected_paths: vec![
                 "/private/iris".into(),
                 "/private/config".into(),
+                "/private/config/config.toml".into(),
+                "/home/agent/.claude/.credentials.json".into(),
+                "/home/agent/.claude.json".into(),
                 "/home/agent/.codex/auth.json".into(),
+                "/home/agent/.gemini/oauth_creds.json".into(),
+                "/home/agent/.gemini/google_accounts.json".into(),
+                "/home/agent/.local/share/opencode/auth.json".into(),
             ],
             split: false,
         };
@@ -740,13 +749,31 @@ mod tests {
                 .env
                 .contains(&("CLAUDE_CODE_DISABLE_CLAUDE_MDS".into(), "1".into()))
         );
-        assert!(
-            plain
-                .args
-                .iter()
-                .any(|a| a.contains("Read(/private/iris/**)"))
-        );
-        assert!(plain.args.iter().any(|a| a.starts_with("Bash,")));
+        let deny_index = plain
+            .args
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .unwrap();
+        let denied: Vec<_> = plain.args[deny_index + 1].split(',').collect();
+        assert_eq!(denied[0], "Bash");
+        for path in [
+            "//private/iris",
+            "//private/config",
+            "//private/config/config.toml",
+            "//home/agent/.claude/.credentials.json",
+            "//home/agent/.claude.json",
+            "//home/agent/.codex/auth.json",
+            "//home/agent/.gemini/oauth_creds.json",
+            "//home/agent/.gemini/google_accounts.json",
+            "//home/agent/.local/share/opencode/auth.json",
+        ] {
+            for tool in ["Read", "Edit", "Write", "Glob", "Grep"] {
+                for suffix in ["", "/**"] {
+                    assert!(denied.contains(&format!("{tool}({path}{suffix})").as_str()));
+                }
+            }
+        }
+        assert_eq!(denied.len(), 1 + spec.protected_paths.len() * 10);
         let mut iso = spec.clone();
         iso.isolated = true;
         let inv = Claude::new(HarnessConfig::claude_default())

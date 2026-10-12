@@ -211,28 +211,33 @@ impl Harness for Codex {
             overrides.push(format!("model_reasoning_effort={}", toml_str(e)));
         }
         overrides.push(developer_instructions_arg(DEVELOPER_NOTE));
-        overrides.push("sandbox_mode=\"workspace-write\"".into());
-        overrides.push(format!(
-            "sandbox_workspace_write.writable_roots={}",
-            toml_str_array(&[spec.cwd.to_string_lossy().into_owned()])
-        ));
-        overrides.push("sandbox_workspace_write.exclude_slash_tmp=true".into());
-        overrides.push("sandbox_workspace_write.exclude_tmpdir_env_var=true".into());
-        // Codex 0.162 supports named filesystem profiles with read denials.
-        let filesystem = toml::Value::Table(
-            spec.protected_paths
-                .iter()
-                .map(|p| {
-                    (
-                        p.to_string_lossy().into_owned(),
-                        toml::Value::String("deny".into()),
-                    )
-                })
-                .collect(),
-        );
+        // Preserve read-only; more permissive modes remain confined to the
+        // conversation's working directory by the workspace profile.
+        let (sandbox, parent) = if self.cfg.sandbox == "read-only" {
+            ("read-only", ":read-only")
+        } else {
+            ("workspace-write", ":workspace")
+        };
+        overrides.push(format!("sandbox_mode={}", toml_str(sandbox)));
+        // Codex 0.162.1's config/permissions.rs recognizes these special
+        // paths. Named profiles ignore legacy sandbox_workspace_write flags;
+        // override the inherited temp write grants in the active profile.
+        let mut filesystem: toml::map::Map<String, toml::Value> = spec
+            .protected_paths
+            .iter()
+            .map(|p| {
+                (
+                    p.to_string_lossy().into_owned(),
+                    toml::Value::String("deny".into()),
+                )
+            })
+            .collect();
+        for path in [":tmpdir", ":slash_tmp"] {
+            filesystem.insert(path.into(), toml::Value::String("read".into()));
+        }
         let profile = toml::Value::Table(toml::map::Map::from_iter([
-            ("extends".into(), toml::Value::String(":workspace".into())),
-            ("filesystem".into(), filesystem),
+            ("extends".into(), toml::Value::String(parent.into())),
+            ("filesystem".into(), toml::Value::Table(filesystem)),
         ]));
         let profiles = toml::Value::Table(toml::map::Map::from_iter([("iris".into(), profile)]));
         overrides.push(format!("permissions={profiles}"));
@@ -573,6 +578,105 @@ mod tests {
             .collect()
     }
 
+    fn permission_spec(run_dir: &Path) -> TurnSpec {
+        TurnSpec {
+            turn_id: "permission-test".into(),
+            prompt: "hello".into(),
+            images: Vec::new(),
+            system_prompt: "You are Iris".into(),
+            model: "synthetic-model".into(),
+            effort: None,
+            resume: None,
+            mcp_servers: Vec::new(),
+            cwd: "/conversations/c1".into(),
+            writable_dirs: vec!["/unrelated-memory".into()],
+            run_dir: run_dir.into(),
+            scope: "c1".into(),
+            key_env: Vec::new(),
+            isolated: false,
+            own_mcp_servers: Vec::new(),
+            protected_paths: vec![
+                "/private/iris".into(),
+                "/private/config".into(),
+                "/home/agent/.codex/auth.json".into(),
+            ],
+            split: false,
+        }
+    }
+
+    fn rendered_config(inv: &Invocation) -> toml::Table {
+        let config = inv
+            .args
+            .windows(2)
+            .filter(|a| a[0] == "-c")
+            .map(|a| a[1].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        toml::from_str(&config).unwrap()
+    }
+
+    #[test]
+    fn read_only_sandbox_stays_read_only_on_new_and_resumed_turns() {
+        let run = tempfile::tempdir().unwrap();
+        let mut spec = permission_spec(run.path());
+        let mut cfg = HarnessConfig::codex_default();
+        cfg.sandbox = "read-only".into();
+        for resume in [None, Some("synthetic-thread".into())] {
+            spec.resume = resume;
+            let inv = Codex::new(cfg.clone()).build(&spec).unwrap();
+            let config = rendered_config(&inv);
+            assert_eq!(config["sandbox_mode"].as_str(), Some("read-only"));
+            assert_eq!(config["default_permissions"].as_str(), Some("iris"));
+            let profile = &config["permissions"]["iris"];
+            assert_eq!(profile["extends"].as_str(), Some(":read-only"));
+            assert!(profile.get("workspace_roots").is_none());
+            assert!(
+                profile["filesystem"]
+                    .as_table()
+                    .unwrap()
+                    .values()
+                    .all(|v| matches!(v.as_str(), Some("read" | "deny")))
+            );
+            assert!(config.get("sandbox_workspace_write").is_none());
+            for path in &spec.protected_paths {
+                assert_eq!(
+                    profile["filesystem"][path.to_str().unwrap()].as_str(),
+                    Some("deny")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn active_workspace_profile_excludes_temp_write_grants() {
+        let run = tempfile::tempdir().unwrap();
+        let mut spec = permission_spec(run.path());
+        for resume in [None, Some("synthetic-thread".into())] {
+            spec.resume = resume;
+            let inv = Codex::new(HarnessConfig::codex_default())
+                .build(&spec)
+                .unwrap();
+            let config = rendered_config(&inv);
+            assert_eq!(config["sandbox_mode"].as_str(), Some("workspace-write"));
+            assert_eq!(config["default_permissions"].as_str(), Some("iris"));
+            let profile = &config["permissions"]["iris"];
+            assert_eq!(profile["extends"].as_str(), Some(":workspace"));
+            // The base grants writes to the runtime cwd; Iris adds no roots.
+            assert_eq!(inv.cwd.as_deref().unwrap_or(&spec.cwd), spec.cwd);
+            assert!(profile.get("workspace_roots").is_none());
+            let filesystem = profile["filesystem"].as_table().unwrap();
+            for path in [":slash_tmp", ":tmpdir"] {
+                assert_eq!(filesystem[path].as_str(), Some("read"));
+            }
+            for path in &spec.protected_paths {
+                assert_eq!(filesystem[path.to_str().unwrap()].as_str(), Some("deny"));
+            }
+            assert_eq!(filesystem.len(), spec.protected_paths.len() + 2);
+            assert!(config.get("sandbox_workspace_write").is_none());
+            assert!(!inv.args.contains(&"--add-dir".into()));
+        }
+    }
+
     #[test]
     fn parses_messages_commands_and_usage() {
         // Synthetic sample modeled on codex-cli 0.162 `exec --json` output.
@@ -743,10 +847,6 @@ mod tests {
         assert!(
             inv.args
                 .contains(&r#"sandbox_mode="workspace-write""#.to_string())
-        );
-        assert!(
-            inv.args
-                .contains(&r#"sandbox_workspace_write.writable_roots=["/w"]"#.to_string())
         );
         assert!(
             inv.args
