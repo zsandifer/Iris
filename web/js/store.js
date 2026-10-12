@@ -97,9 +97,14 @@ export function parseRoute() {
   return { parts, query: new URLSearchParams(query), tab: parts[0] || 'chat' };
 }
 
-export function go(path) {
+// replace: swap the current screen instead of adding one, so leaving a
+// flow (like the Google setup wizard) can't be undone with Back into it.
+export function go(path, replace = false) {
   const next = '#/' + path.replace(/^\/+/, '');
-  if (location.hash !== next) location.hash = next;
+  if (location.hash !== next) {
+    if (replace) location.replace(location.pathname + location.search + next);
+    else location.hash = next;
+  }
   set({ drawer: false });
 }
 
