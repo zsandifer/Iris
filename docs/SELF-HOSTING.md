@@ -37,6 +37,7 @@ state (conversations, goals, feed, and so on) in SQLite.
 - [Configuration](#configuration)
 - [Engines and models](#engines-and-models)
 - [Engines from the app](#engines-from-the-app)
+- [Iris's computer (browser)](#iriss-computer-browser)
 - [Connections and approvals](#connections-and-approvals)
 - [Proactive jobs](#proactive-jobs)
 - [Security model](#security-model)
@@ -107,6 +108,8 @@ See [docs/API.md](API.md) for every route, event, and data type.
   - OpenCode 1.19 or newer
 - Node.js (with npm) on the server if you want to install Codex, Gemini CLI,
   or OpenCode from the app (Claude Code installs natively)
+- Optional, for Iris's own browser: Chromium or Chrome, or Node.js to
+  install Chromium from the app
 - [uv](https://docs.astral.sh/uv/) (`uvx`) on the server if you want to
   connect Google (Gmail, Calendar, Drive)
 
@@ -274,8 +277,11 @@ After pairing your phone you should not need the server again:
 
 For a stricter setup, `deploy/setup-engines.sh` (run once as root) creates a
 separate `iris` system user that owns the engines directory and performs
-installs through a narrow sudo rule. The user running Iris can then run the
-engines but cannot modify them, and never needs download or install rights.
+installs through a narrow sudo rule. The rule includes install, update, and
+uninstall for `browser` (managed Chromium); rerun the script if your rule
+was created before browser support was added. The user running Iris can
+then run the engines but cannot modify them, and never needs download or
+install rights.
 
 ### What still needs the server
 
@@ -290,6 +296,76 @@ engines but cannot modify them, and never needs download or install rights.
 - `uv`, if you want to connect Google.
 - The optional privilege split (`deploy/setup-engines.sh`, as root).
 
+## Iris's computer (browser)
+
+Iris launches and owns one headless Chromium for the agent. Every engine
+gets it as the `browser` MCP tools (open pages, read them, click, type,
+screenshots, tabs), and you can watch it live and take over from the app
+(Iris hub, Iris's computer). Iris itself is not an agent here: it carries
+out each tool call the CLI makes, nothing more.
+
+- **Getting a browser.** Tap "Set up the browser" in Iris's computer: Iris
+  installs the official `playwright-core` npm package into its engines
+  directory and runs its own `install chromium`, which downloads Chromium
+  from Playwright's official servers (needs Node.js). Iris updates it daily
+  with the other engines it installed, while the browser is closed. Or
+  install Chromium or Chrome yourself; Iris looks at `browser.command`, then
+  `PATH` (`chromium`, `google-chrome`, ...; snap packages are skipped because
+  their sandbox cannot use Iris's profile), then Playwright's cache
+  (`~/.cache/ms-playwright`).
+- **System libraries.** A fresh server may lack the libraries Chromium
+  needs; the app then shows the error. Fix it once as root with
+  `npx playwright install-deps chromium` (or install your distribution's
+  Chromium package).
+- **Sign-ins persist.** The profile lives in `<data dir>/browser/profile`,
+  so sites you or Iris signed in to stay signed in. Chrome's own password
+  manager and autofill are turned off there. Chrome's session files
+  (open tabs with what was typed into their forms) are deleted before each
+  start and after each close.
+- **Memory.** The browser starts on first use and closes after
+  `browser.idle_mins` (default 10) without use, so it costs nothing while
+  idle. A running browser with one tab takes roughly 200 to 400 MB.
+- **Live view and take over.** Frames stream over the app's WebSocket only
+  while you watch (about 1 per second for the small peek in chat, up to
+  about 6 full screen, only when the page changes). Take over forwards your
+  taps, scrolling, and typing; the agent's browser tools wait until you hand
+  back.
+- **Saved logins and cards.** The agent asks Iris to fill a login
+  (`fill_login`) or card (`fill_card`) on the current page; Iris types it in
+  from the vault and the agent only hears `filled` or `not found`. Logins go
+  only to the site they were saved for, over HTTPS. Every card use asks you
+  first with an approval card in the chat. After a secret is filled, the agent
+  cannot read that document, query its text, or screenshot it: it can still
+  click the submit button, press Enter, or navigate. Reads resume on a new
+  document (navigation, reload, or a submission that loads a page). The live
+  view on your phone stays available.
+- **Who gets it.** Only the owner's own conversations and jobs (the profile
+  holds the owner's sign-ins); never shared chats.
+- **Sandbox.** Iris always starts Chrome with its sandbox. Some systems
+  cannot start it (for example Ubuntu 23.10 and later, which restrict
+  unprivileged user namespaces with AppArmor). Then the browser does not
+  start, and Iris's computer explains and offers **Run without the
+  sandbox**: only if you tap it (a saved choice, `POST /api/browser/sandbox`)
+  does Iris run Chromium without it. The safer fix is one step as root, for
+  example an AppArmor profile that allows user namespaces for that one
+  binary (see Chromium's `docs/security/apparmor-userns-restrictions.md`):
+
+  ```sh
+  # replace the path with the browser Iris uses (GET /api/browser shows the
+  # error; `ls -l <engines dir>/bin/browser` shows the installed one)
+  sudo tee /etc/apparmor.d/iris-chrome <<'EOF2'
+  abi <abi/4.0>,
+  include <tunables/global>
+  profile iris-chrome /path/to/chrome flags=(unconfined) {
+    userns,
+  }
+  EOF2
+  sudo apparmor_parser -r /etc/apparmor.d/iris-chrome
+  ```
+- **Approval lifetime.** Wallet fills use the gateway’s approval wait and
+  cancellation rules. Denial, expiry, Stop, Pause, or Disconnect prevents
+  the held fill; a late approval never restarts a turn.
+- **Turning it off.** `[browser] enabled = false` removes the tools.
 ## Connections and approvals
 
 Connections (MCP servers) give Iris your services: Gmail, Calendar, Drive,
@@ -348,7 +424,9 @@ notifies you with a Resume button. Every call is in the activity log
 waiting approvals, and stops connection programs) and starts nothing new
 (chats, check-ins, connection calls) until you resume. A request already
 handed to a remote service before the pause cannot be recalled.
-**Disconnect everything** turns every connection off at once.
+**Disconnect everything** turns every connection off at once, cancels browser
+approvals, and closes and disconnects the browser. Reopen it in Iris’s
+computer to enable browser tools again.
 
 **Signing in to services.** Connections that use OAuth (the MCP sign-in
 standard, OAuth 2.1 with PKCE) sign in on the service's own page and come
@@ -429,6 +507,17 @@ Both are off by default, respect active hours, and can be triggered manually
   that headless runs reject. Adjust all of them in `config.toml`.
 - Engines installed from the app come only from official sources and are
   verified (checksum or npm integrity); see the privilege split above.
+- Iris's browser is driven over a private pipe (no DevTools port is opened),
+  and its tools reach the server through a Unix socket in the private run
+  directory, accepted only for a running turn. Saved secrets go from the
+  vault straight into the page (set on the exact field, on the same page
+  and site that were checked); filled fields are masked on
+  screen and in what the agent reads, any copy a page echoes (a dialog,
+  another field) is redacted from tool results, and no screenshot is taken
+  while a page shows one. Only `http`/`https` pages can be opened. When a
+  turn ends or you take over, its pending browser actions stop.
+- "Pause Iris" in Iris's computer stops running turns, closes the browser,
+  and holds chats and jobs until you turn it back on.
 
 ## Subscription terms
 
@@ -479,15 +568,11 @@ Contributor notes, architecture, and invariants are in
 ## Not done yet
 
 - **Voice replies**: `POST /api/voice/speak` is a placeholder (returns 501).
-- **Using saved credentials**: logins and cards are stored encrypted and
-  managed through the API, but nothing injects them into the agent's
-  browsing yet. Planned design: the agent requests a credential by id
-  through a tool and Iris fills it into a browser session without the
-  model ever seeing the secret.
-- **Live view of the agent's browser.**
 - **Per-person memory**: people you add chat with Iris in their own chats
   and in shared chats, but only the owner has long-term memory, persona
   notes, and connectors.
+- **Logins and cards inside cross-origin frames** (for example embedded
+  payment widgets) cannot be filled; take over and type them yourself.
 - **Full engine isolation in other people's chats**: MCP servers the
   engines have configured themselves (including claude.ai connectors) are
   off in every Iris turn; in other people's chats Iris also switches off

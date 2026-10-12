@@ -8,6 +8,7 @@ import { md } from './md.js';
 import { Card } from './cards.js';
 import { statusPhrase, receipt, seconds } from './status.js';
 import { pushState, enablePush } from './push.js';
+import { BrowserPeek } from './computer.js';
 import { focusComposer, prepareComposerFocus } from './viewport.js';
 
 const GAP = 30 * 60 * 1000;
@@ -51,11 +52,13 @@ function Assistant({ m, list }) {
   if (m.status === 'streaming') {
     const text = live?.text || '';
     const running = (live?.acts || []).some((a) => a.status === 'started');
+    // Only while Iris is browsing in this turn: a live thumbnail.
+    const peek = S.browsing[m.id] && html`<${BrowserPeek} />`;
     const waiting = list.some((x) => x.card?.type === 'approval' && x.card.turn_message_id === m.id && x.card.state === 'pending');
-    if (waiting) return html`${text && html`<div class="b" dangerouslySetInnerHTML=${{ __html: md(text) }} />`}<div class="status shimmer" aria-live="polite">Waiting for your OK…</div>`;
-    if (!text) return html`<${StatusLine} live=${live} />`;
+    if (waiting) return html`${text && html`<div class="b" dangerouslySetInnerHTML=${{ __html: md(text) }} />`}<div class="status shimmer" aria-live="polite">Waiting for your OK…</div>${peek}`;
+    if (!text) return html`<${StatusLine} live=${live} />${peek}`;
     return html`<div class="b" dangerouslySetInnerHTML=${{ __html: md(text) }} />
-      ${running && html`<${StatusLine} live=${live} />`}`;
+      ${running && html`<${StatusLine} live=${live} />`}${peek}`;
   }
   const retry = async () => {
     const u = retryFor(list, m);

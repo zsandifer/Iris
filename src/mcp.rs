@@ -36,6 +36,64 @@ const SHARED_TOOLS: &[&str] = &["create_card"];
 
 /// Run the stdio loop until stdin closes.
 pub fn run(bridge: Bridge) -> Result<()> {
+    serve_stdio(|req| bridge.handle(req))
+}
+
+/// `iris mcp --browser`: the `browser` tools. Calls are forwarded to the
+/// server that owns Iris's browser (see `browser::socket`); this process
+/// never touches the browser, the vault, or the database itself.
+pub struct BrowserBridge {
+    pub socket: PathBuf,
+    /// Identifies the turn (from `IRIS_BROWSER_TOKEN`).
+    pub token: String,
+}
+
+impl BrowserBridge {
+    pub fn handle(&self, req: &Value) -> Option<Value> {
+        let id = req.get("id").cloned()?;
+        let result = match req["method"].as_str().unwrap_or("") {
+            "initialize" => initialize_result(
+                req,
+                "browser",
+                "Iris's own web browser, which the user can watch and take over from \
+                 their phone. Saved logins and cards are filled in by Iris; you never see them.",
+            ),
+            "ping" => json!({}),
+            "tools/list" => json!({"tools": crate::browser::tools::definitions()}),
+            "tools/call" => crate::browser::socket::forward(
+                &self.socket,
+                &self.token,
+                req["params"]["name"].as_str().unwrap_or(""),
+                &req["params"]
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            ),
+            "resources/list" => json!({"resources": []}),
+            "prompts/list" => json!({"prompts": []}),
+            _ => return Some(error_response(id, -32601, "method not found")),
+        };
+        Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+    }
+}
+
+fn initialize_result(req: &Value, name: &str, instructions: &str) -> Value {
+    let requested = req["params"]["protocolVersion"].as_str().unwrap_or("");
+    let version = if SUPPORTED_VERSIONS.contains(&requested) {
+        requested
+    } else {
+        SUPPORTED_VERSIONS[1]
+    };
+    json!({
+        "protocolVersion": version,
+        "capabilities": {"tools": {"listChanged": false}},
+        "serverInfo": {"name": name, "version": env!("CARGO_PKG_VERSION")},
+        "instructions": instructions,
+    })
+}
+
+/// JSON-RPC over stdio, one message per line.
+pub fn serve_stdio(handle: impl Fn(&Value) -> Option<Value>) -> Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -44,7 +102,7 @@ pub fn run(bridge: Bridge) -> Result<()> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(req) => bridge.handle(&req),
+            Ok(req) => handle(&req),
             Err(_) => Some(error_response(Value::Null, -32700, "parse error")),
         };
         if let Some(resp) = response {
@@ -203,21 +261,12 @@ impl Bridge {
             return None;
         };
         let result = match method {
-            "initialize" => {
-                let requested = req["params"]["protocolVersion"].as_str().unwrap_or("");
-                let version = if SUPPORTED_VERSIONS.contains(&requested) {
-                    requested
-                } else {
-                    SUPPORTED_VERSIONS[1]
-                };
-                json!({
-                    "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}},
-                    "serverInfo": {"name": "iris", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Iris app bridge: update the user's goals, ideas, feed, \
-                        library, and show cards in the chat.",
-                })
-            }
+            "initialize" => initialize_result(
+                req,
+                "iris",
+                "Iris app bridge: update the user's goals, ideas, feed, library, and show \
+                 cards in the chat.",
+            ),
             "ping" => json!({}),
             "tools/list" => {
                 let tools: Vec<Value> = tool_definitions()
@@ -689,6 +738,34 @@ mod tests {
             .handle(&json!({"jsonrpc": "2.0", "id": 4, "method": "bogus"}))
             .unwrap();
         assert_eq!(unknown["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn browser_bridge_lists_tools_and_forwards_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = BrowserBridge {
+            socket: tmp.path().join("missing.sock"),
+            token: "t".into(),
+        };
+        let init = b
+            .handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                            "params": {"protocolVersion": "2025-06-18"}}))
+            .unwrap();
+        assert_eq!(init["result"]["serverInfo"]["name"], "browser");
+        let tools = b
+            .handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+            .unwrap();
+        assert!(tools["result"]["tools"].as_array().unwrap().len() > 5);
+        // No server: a friendly tool error, not a protocol error.
+        let r = b
+            .handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                            "params": {"name": "snapshot", "arguments": {}}}))
+            .unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        assert!(
+            b.handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+                .is_none()
+        );
     }
 
     #[test]

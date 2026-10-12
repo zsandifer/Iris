@@ -92,7 +92,9 @@ src/
 ├── events.rs        WebSocket event hub
 ├── server/          axum routes (chat, content, admin), WebSocket, app + /console
 ├── demo.rs          `iris demo-seed`: fake demo data for screenshots
-├── mcp.rs           `iris mcp` stdio MCP bridge (CRUD into the DB)
+├── mcp.rs           `iris mcp` stdio MCP bridge (CRUD into the DB), `iris mcp --browser`
+├── browser/         Iris's computer: Chromium over a DevTools pipe, browser tools,
+│                    live view, take over, login/card fill from the vault
 ├── jobs.rs          heartbeat and feed jobs, scheduler
 ├── login.rs         engine sign-in from the app, reconnect cards
 ├── engines.rs       install/update the official CLIs (official sources only)

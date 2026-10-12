@@ -158,6 +158,8 @@ pub struct PromptContext<'a> {
     pub participants: &'a [String],
     /// Whether the `iris` MCP bridge is attached to this turn.
     pub app_tools: bool,
+    /// Name of Iris's browser MCP server when it is attached.
+    pub browser: Option<&'a str>,
     /// Who is in the conversation. The owner's private persona (USER.md)
     /// and memory are only included when it is `Private`.
     pub scope: Scope,
@@ -223,6 +225,9 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
         out.push_str(SHARED_TOOLS_GUIDE);
     } else if ctx.app_tools {
         out.push_str(APP_TOOLS_GUIDE);
+    }
+    if let Some(server) = ctx.browser.filter(|_| ctx.scope == Scope::Private) {
+        out.push_str(&crate::browser::tools::guide(server));
     }
 
     if ctx.scope == Scope::Shared {
@@ -473,6 +478,7 @@ mod tests {
             purpose: Purpose::Chat,
             participants: &[],
             app_tools: true,
+            browser: None,
             scope: Scope::Private,
             notices: &[],
         }
@@ -530,6 +536,12 @@ mod tests {
         assert!(!prompt.contains("link.md"));
         assert!(prompt.contains("create_goal"));
         assert!(!prompt.contains("## Notices"));
+        assert!(!prompt.contains("## Your browser"));
+        let mut b = ctx("Nova");
+        b.browser = Some("browser");
+        assert!(assemble(&p, &b).contains("fill_login"));
+        b.scope = Scope::Shared;
+        assert!(!assemble(&p, &b).contains("## Your browser"));
     }
 
     #[test]

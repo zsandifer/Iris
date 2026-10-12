@@ -33,7 +33,33 @@ pub struct Config {
     pub feed: JobConfig,
     pub push: PushConfig,
     pub engines: EnginesConfig,
+    pub browser: BrowserConfig,
     pub safety: SafetyConfig,
+}
+
+/// Iris's own browser: a headless Chromium the agent drives through the
+/// `browser` MCP tools, with a live view in the app.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BrowserConfig {
+    /// Offer browser tools to the agent (owner's own conversations only).
+    pub enabled: bool,
+    /// Chromium or Chrome executable. Empty: the one Iris installed, then
+    /// PATH (`chromium`, `google-chrome`, ...), then Playwright's cache.
+    pub command: String,
+    /// Close the browser after this many minutes without use. Sign-ins
+    /// persist in its profile.
+    pub idle_mins: u64,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            command: String::new(),
+            idle_mins: 10,
+        }
+    }
 }
 
 /// The connector gateway's approval gate and tripwires.
@@ -314,6 +340,7 @@ impl Default for Config {
             feed: JobConfig::feed_default(),
             push: PushConfig::default(),
             engines: EnginesConfig::default(),
+            browser: BrowserConfig::default(),
             safety: SafetyConfig::default(),
         }
     }
@@ -409,6 +436,9 @@ impl Config {
             if h.command.trim().is_empty() {
                 return Err(format!("harness.{name}.command is empty").into());
             }
+        }
+        if self.browser.idle_mins == 0 {
+            return Err("browser.idle_mins must be at least 1".into());
         }
         if self.safety.approval_timeout_secs < 30 {
             return Err("safety.approval_timeout_secs must be at least 30".into());
@@ -538,6 +568,10 @@ impl Paths {
     /// 32-byte key for the credentials vault (0600).
     pub fn vault_key_file(&self) -> PathBuf {
         self.data_dir.join("vault.key")
+    }
+    /// Iris's browser: its persistent profile and scratch space.
+    pub fn browser_dir(&self) -> PathBuf {
+        self.data_dir.join("browser")
     }
     /// VAPID key pair for Web Push (0600).
     pub fn vapid_key_file(&self) -> PathBuf {

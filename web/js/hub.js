@@ -1,10 +1,11 @@
-// The Iris hub: Connections, Logins & wallet, Iris's computer, System files.
+// The Iris hub: Connections, Logins & wallet, System files (Iris's computer
+// lives in computer.js).
 import { html, useEffect, useState } from './h.js';
 import { get, post, patch, put, del, seg } from './api.js';
 import { S, set, useStore, go, toast, isOwner } from './store.js';
 import {
   Icon, Avatar, Row, Group, Page, Empty, Spinner, Toggle, LetterTile,
-  agentName, ago, since, confirmSheet, stamp,
+  agentName, ago, since, confirmSheet,
 } from './ui.js';
 import { describe, visible } from './status.js';
 
@@ -24,6 +25,7 @@ export function Hub() {
   const [cons] = useData(owner ? '/connectors' : '/me');
   const [creds] = useData(owner ? '/credentials' : '/me');
   const working = Object.keys(S.live).length > 0;
+  const computer = S.settings?.paused ? 'paused' : S.browser?.busy ? 'browsing' : working ? 'working' : 'idle';
   const nCon = cons?.connectors?.filter((c) => c.enabled).length;
   const logins = creds?.credentials?.filter((c) => c.kind === 'login').length;
   const cards = creds?.credentials?.filter((c) => c.kind === 'card').length;
@@ -34,7 +36,7 @@ export function Hub() {
       ${owner && html`
       <${Row} icon="plug" title="Connections" sub=${nCon == null ? ' ' : nCon ? `${nCon} connected` : 'Nothing connected yet'} onClick=${() => go('iris/connections')} />
       <${Row} icon="lock" title="Logins & wallet" sub=${creds ? `${logins} login${logins === 1 ? '' : 's'} · ${cards} card${cards === 1 ? '' : 's'}` : ' '} onClick=${() => go('iris/logins')} />
-      <${Row} icon="monitor" title=${`${agentName()}'s computer`} sub=${S.settings?.paused ? 'paused' : working ? 'working' : 'idle'} onClick=${() => go('iris/computer')} />
+      <${Row} icon="monitor" title=${`${agentName()}'s computer`} sub=${computer} onClick=${() => go('iris/computer')} />
       <${Row} icon="folder" title="System files" sub="Personality, memory, and notes" onClick=${() => go('iris/files')} />`}
       <${Row} icon="sliders" title="Settings" onClick=${() => go('settings')} />
     <//>
@@ -90,8 +92,7 @@ export function Logins() {
   const logins = list.filter((c) => c.kind === 'login');
   const cards = list.filter((c) => c.kind === 'card');
   return html`<${Page} title="Logins & wallet" sub=${`${agentName()} can use these but never sees them`}>
-    <div class="lock"><${Icon} name="lock" size=${15} /> Stored encrypted on your server, separate from ${agentName()}. When it's switched on, ${agentName()} signs in for you and the password never enters its chat or memory. Cards always ask before paying.
-      ${data?.injection === 'not_implemented' && html`<br /><b>Not switched on yet:</b> ${agentName()} can't use these yet. You can store them now.`}</div>
+    <div class="lock"><${Icon} name="lock" size=${15} /> Stored encrypted on your server, separate from ${agentName()}. ${agentName()} signs in for you in its own browser: the password is typed into the site directly and never enters its chat or memory. Cards always ask you first, every time.</div>
     ${!data ? html`<${Spinner} />` : html`
     <${Group} label="Logins">
       ${logins.map((c) => html`<${Row} icon=${html`<${LetterTile} name=${c.metadata.site || c.label} />`} title=${c.label}
@@ -124,50 +125,6 @@ export function placeLabel(item) {
   if (item.conversation_kind === 'job') return item.conversation_title === 'feed' ? 'Feed' : 'Background check-in';
   if (item.conversation_kind === 'main') return 'Main chat';
   return item.conversation_title || 'Side chat';
-}
-
-export function Computer() {
-  useStore();
-  const [act] = useData('/activity?limit=8');
-  const [safety, setSafety] = useState(null);
-  useEffect(() => { get('/safety').then(setSafety).catch(() => {}); }, [S.settings?.paused]);
-  const working = Object.keys(S.live).length > 0;
-  const paused = !!S.settings?.paused;
-  const pause = async (on) => {
-    if (on && !(await confirmSheet({ title: `Pause ${agentName()}?`, body: `${agentName()} stops what it's doing now, won't start anything new (chats, check-ins, connected services) and won't send anything until you resume.`, yes: 'Pause' }))) return;
-    try {
-      setSafety(await put('/safety', { paused: on }));
-      toast(on ? `${agentName()} is paused` : `${agentName()} is back`);
-    } catch (e) { toast(e.message); }
-  };
-  const disconnectAll = async () => {
-    if (!(await confirmSheet({ title: 'Disconnect everything?', body: `${agentName()} will stop using every connected service right away, and anything waiting for your OK is cancelled. Turn them back on one by one in Connections.`, yes: 'Disconnect', danger: true }))) return;
-    try {
-      const r = await post('/safety/disconnect-all');
-      set({ connectors: r.connectors });
-      toast(r.disconnected ? 'All connections are off' : 'Nothing was connected');
-    } catch (e) { toast(e.message); }
-  };
-  return html`<${Page} title=${`${agentName()}'s computer`} sub=${`${agentName()}'s own space on your server`}>
-    <div class=${'screen' + (paused ? ' paused' : '')}>
-      <${Icon} name=${paused ? 'pause' : 'monitor'} size=${30} />
-      <b>${paused ? `${agentName()} is paused` : working ? `${agentName()} is working` : `${agentName()} is idle`}</b>
-      <small>${paused ? 'Nothing runs until you resume.' : `A live view of ${agentName()}'s browser isn't available yet. When it is, you'll be able to watch and take over here, for example to log in.`}</small>
-    </div>
-    <div class="big2"><button disabled><${Icon} name="eye" size=${16} /> Watch</button><button class="p" disabled><${Icon} name="hand" size=${16} /> Take over</button></div>
-    <${Group} label="Recently">
-      ${!act ? html`<${Spinner} />` : act.items.length ? act.items.map((it) => html`<${Row} title=${activityTitle(it)} sub=${placeLabel(it)}
-        value=${stamp(it.created_at)} chevron=${false} onClick=${it.conversation_kind === 'job' ? undefined : () => go(`chat/${it.conversation_id}`)} />`)
-        : html`<div class="r"><div class="rt mu">Nothing yet</div></div>`}
-      ${act?.items.length > 0 && html`<${Row} title="See all activity" accent onClick=${() => go('settings/activity')} />`}
-    <//>
-    <${Group} label="Safety" note=${`Pausing stops everything ${agentName()} is doing and starts nothing new until you resume. Disconnecting turns off every connected service at once.`}>
-      <${Row} icon="pause" title=${`Pause ${agentName()}`} sub=${paused ? 'Paused' : safety?.pending_approvals ? `${safety.pending_approvals} waiting for your OK` : 'Running'}
-        right=${html`<${Toggle} on=${paused} onChange=${pause} label=${`Pause ${agentName()}`} />`} />
-      <${Row} icon="users" title="Trusted people" sub="Messages to them don't need your OK" onClick=${() => go('iris/connections/trusted')} />
-      <${Row} title="Disconnect everything" danger chevron=${false} onClick=${disconnectAll} />
-    <//>
-  <//>`;
 }
 
 // ------------------------------------------------------------ system files

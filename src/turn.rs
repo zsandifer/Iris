@@ -321,6 +321,20 @@ async fn run_locked(
     if scope == Scope::Private {
         audience.private_owner = ctx.owner.clone();
     }
+    if state.browser.is_paused() {
+        return finish(
+            state,
+            input,
+            &mut audience,
+            &Acc::default(),
+            json!(null),
+            Outcome::Failed {
+                kind: "paused",
+                detail: "the owner paused Iris".into(),
+            },
+        )
+        .await;
+    }
     state.hub.to_users(
         audience.current(state).await,
         json!({"type": "turn.status", "conversation_id": conv_id, "message_id": msg_id, "status": "running"}),
@@ -339,6 +353,18 @@ async fn run_locked(
     let mut outcome = Outcome::Failed {
         kind: "no_engine",
         detail: "no engine available".into(),
+    };
+    // Iris's browser: only in the owner's own conversations (its profile
+    // holds the owner's sign-ins). Dropping the guard ends the browser peek.
+    let browser_turn = if scope == Scope::Private && browser_allowed(state) {
+        let users = audience.current(state).await.to_vec();
+        Some(
+            state
+                .browser
+                .begin_turn(&input.owner_user_id, conv_id, msg_id, &users),
+        )
+    } else {
+        None
     };
 
     for _attempt in 0..MAX_ATTEMPTS {
@@ -460,7 +486,8 @@ async fn run_locked(
                     .into(),
             );
         }
-        let (mcp_servers, _grant) = if caps.mcp {
+        let browser_token = browser_turn.as_ref().map(|g| g.token());
+        let (mcp_servers, _grant, browser_server) = if caps.mcp {
             mcp_servers(
                 state,
                 &input.owner_user_id,
@@ -468,10 +495,11 @@ async fn run_locked(
                 &ctx.kind,
                 msg_id,
                 scope,
+                browser_token,
             )
             .await
         } else {
-            (Vec::new(), None)
+            (Vec::new(), None, None)
         };
         if scope == Scope::Private {
             notices.extend(crate::gateway::connector_notices(state, &input.owner_user_id).await);
@@ -487,6 +515,7 @@ async fn run_locked(
                 input.purpose,
                 !mcp_servers.is_empty(),
             );
+            let browser = browser_server.clone();
             let notices = notices.clone();
             tokio::task::spawn_blocking(move || {
                 persona::assemble(
@@ -497,6 +526,7 @@ async fn run_locked(
                         purpose,
                         participants: &participants,
                         app_tools,
+                        browser: browser.as_deref(),
                         scope,
                         notices: &notices,
                     },
@@ -1367,7 +1397,12 @@ async fn mcp_servers(
     conv_kind: &str,
     message_id: &str,
     scope: Scope,
-) -> (Vec<McpServer>, Option<crate::gateway::GrantGuard>) {
+    browser_token: Option<&str>,
+) -> (
+    Vec<McpServer>,
+    Option<crate::gateway::GrantGuard>,
+    Option<String>,
+) {
     let shared = scope == Scope::Shared;
     let mut args = vec![
         "mcp".into(),
@@ -1391,15 +1426,50 @@ async fn mcp_servers(
         timeout_secs: None,
     }];
     if scope != Scope::Private {
-        return (servers, None);
+        return (servers, None, None);
+    }
+    let all = state
+        .db
+        .call(|c| crate::entities::list_connectors(c, false))
+        .await;
+    let browser_name = browser_token.and_then(|_| {
+        let all = all.as_ref().ok()?;
+        [
+            crate::browser::tools::SERVER,
+            crate::browser::tools::SERVER_ALT,
+        ]
+        .into_iter()
+        .find(|n| !all.iter().any(|c| c.name == *n))
+    });
+    if let (Some(token), Some(name)) = (browser_token, browser_name) {
+        servers.push(McpServer {
+            name: name.into(),
+            transport: McpTransport::Stdio {
+                command: state.exe.to_string_lossy().into_owned(),
+                args: vec![
+                    "mcp".into(),
+                    "--browser".into(),
+                    "--data-dir".into(),
+                    state.paths.data_dir.to_string_lossy().into_owned(),
+                ],
+                env: BTreeMap::from([("IRIS_BROWSER_TOKEN".to_string(), token.to_string())]),
+            },
+            timeout_secs: Some(state.cfg.approval_timeout_secs() + 300),
+        });
     }
     match crate::gateway::grant_for_turn(state, user_id, conv_id, conv_kind, message_id).await {
         Some((connectors, guard)) => {
             servers.extend(connectors);
-            (servers, Some(guard))
+            (servers, Some(guard), browser_name.map(String::from))
         }
-        None => (servers, None),
+        None => (servers, None, browser_name.map(String::from)),
     }
+}
+
+/// Whether this turn gets the browser tools: enabled, not paused, a
+/// browser is installed (the caller requires the owner's own private chat).
+fn browser_allowed(state: &AppState) -> bool {
+    state.browser.enabled() && !state.browser.is_paused() && state.browser.executable().is_some()
 }
 
 /// Store a user message and an assistant placeholder, broadcast both, and
@@ -1546,6 +1616,93 @@ mod tests {
         assert!(p.contains("Sam: m99"));
         assert!(!p.contains("Sam: m10\n"));
         assert_eq!(p.matches("Sam: m").count(), MAX_REPLAY_MESSAGES);
+    }
+
+    #[tokio::test]
+    async fn browser_server_takes_a_free_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::browser::tools::tests::test_state(tmp.path());
+        let (owner, conv) = state
+            .db
+            .with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                let conv = db::ensure_main_conversation(c, &owner)?;
+                Ok((owner, conv))
+            })
+            .unwrap();
+        let add = |name: &str, enabled: bool| {
+            let cfg = crate::entities::ConnectorConfig {
+                command: Some("x".into()),
+                ..Default::default()
+            };
+            state
+                .db
+                .with(|c| {
+                    crate::entities::insert_connector(
+                        c,
+                        &new_id(),
+                        name,
+                        "",
+                        "stdio",
+                        &cfg,
+                        enabled,
+                    )
+                })
+                .unwrap();
+        };
+        let names = |v: &[McpServer]| v.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
+        let (s, _grant, b) = mcp_servers(
+            &state,
+            &owner,
+            &conv,
+            "main",
+            "m",
+            Scope::Private,
+            Some("t"),
+        )
+        .await;
+        assert_eq!(b.as_deref(), Some("browser"));
+        assert_eq!(names(&s), ["iris", "browser"]);
+        // Shared chats and turns without a token never get it.
+        assert_eq!(
+            mcp_servers(&state, &owner, &conv, "main", "m", Scope::Shared, Some("t"))
+                .await
+                .2,
+            None
+        );
+        assert_eq!(
+            mcp_servers(&state, &owner, &conv, "main", "m", Scope::Private, None)
+                .await
+                .2,
+            None
+        );
+        // An older connector named "browser" (even switched off) keeps it.
+        add("browser", false);
+        let (s, _grant, b) = mcp_servers(
+            &state,
+            &owner,
+            &conv,
+            "main",
+            "m",
+            Scope::Private,
+            Some("t"),
+        )
+        .await;
+        assert_eq!(b.as_deref(), Some("iris_browser"));
+        assert_eq!(names(&s), ["iris", "iris_browser"]);
+        add("iris_browser", true);
+        let (s, _grant, b) = mcp_servers(
+            &state,
+            &owner,
+            &conv,
+            "main",
+            "m",
+            Scope::Private,
+            Some("t"),
+        )
+        .await;
+        assert_eq!(b, None);
+        assert_eq!(names(&s), ["iris", "iris_browser"]);
     }
 
     #[test]

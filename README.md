@@ -180,13 +180,14 @@ Iris is **early** and moving fast. What works today:
   trusted people, tripwires, Pause Iris and Disconnect everything
 - ✅ For you feed with stories, Ideas, Goals, Library, system file editing
 - ✅ Push notifications, quiet hours, an encrypted credentials vault
+- ✅ Iris's own browser: watch it live, take over from your phone, and let
+  Iris sign in with saved logins (cards always ask first)
 - 🧪 Shared chats with more than one person (preview)
 
 On the way:
 
 - 🚧 Automatic feed sources (RSS, YouTube, Reddit) with adaptive size
-- 🚧 Watching and taking over Iris's browser
-- 🚧 Voice replies, and Iris using saved logins for you
+- 🚧 Voice replies
 - 🚧 A character for Iris
 
 ## Contributing

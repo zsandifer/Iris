@@ -282,6 +282,12 @@ CREATE TABLE engine_keys (
     PRIMARY KEY (harness, env)
 );
 "#,
+    r#"
+-- Browser wallet approvals share the gateway cards and cancellation states.
+CREATE INDEX messages_pending_approvals ON messages(conversation_id, created_at)
+    WHERE kind = 'card' AND json_extract(card, '$.type') = 'approval'
+      AND json_extract(card, '$.state') = 'pending';
+"#,
 ];
 
 /// Run `f` in a write transaction taken up front (`BEGIN IMMEDIATE`), so a
@@ -1559,6 +1565,68 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             assert_eq!((cwd, policy.as_str()), (1, "{}"));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn main_schema_upgrades_with_gateway_data_and_browser_approvals_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            // origin/main schema is version 4; branch migrations start after it.
+            conn.execute_batch(include_str!("../tests/fixtures/main-schema-v4.sql"))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO connectors (id, name, transport, config, created_at, updated_at, policy)
+                 VALUES ('c1', 'saved', 'stdio', '{}', 1, 1, ?1)",
+                [r#"{"mode":"ask"}"#],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO known_recipients VALUES ('reader@example.test', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO engine_keys VALUES ('codex', 'SYNTHETIC_KEY', 'sealed', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            let v: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            assert_eq!(v as usize, MIGRATIONS.len());
+            let policy: String =
+                c.query_row("SELECT policy FROM connectors WHERE id = 'c1'", [], |r| {
+                    r.get(0)
+                })?;
+            assert_eq!(policy, r#"{"mode":"ask"}"#);
+            let key: String =
+                c.query_row("SELECT ciphertext FROM engine_keys", [], |r| r.get(0))?;
+            assert_eq!(key, "sealed");
+            let recipients: i64 =
+                c.query_row("SELECT COUNT(*) FROM known_recipients", [], |r| r.get(0))?;
+            assert_eq!(recipients, 1);
+            c.prepare("SELECT * FROM connector_calls")?;
+            let owner = owner_user_id(c)?.unwrap();
+            let conv = ensure_main_conversation(c, &owner)?;
+            let card = crate::entities::approval_card(&crate::entities::ApprovalRequest {
+                service: "wallet",
+                approver_user_id: &owner,
+                ..Default::default()
+            });
+            crate::entities::insert_card(c, &conv, &card, "assistant")?;
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM messages INDEXED BY messages_pending_approvals
+                WHERE kind = 'card' AND json_extract(card, '$.type') = 'approval'
+                  AND json_extract(card, '$.state') = 'pending'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(n, 1);
             Ok(())
         })
         .unwrap();

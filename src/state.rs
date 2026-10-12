@@ -133,6 +133,8 @@ pub struct Inner {
     pub rankings: Rankings,
     pub logins: crate::login::LoginManager,
     pub engine_ops: crate::setup::EngineOps,
+    /// Iris's computer: the agent's browser.
+    pub browser: crate::browser::Browser,
     /// Connector gateway: turn grants, running connectors, approvals.
     pub gateway: crate::gateway::Gateway,
     /// Connector sign-ins (OAuth) in progress.
@@ -184,8 +186,26 @@ impl AppState {
         let rankings = Rankings::load(
             (!rankings_file.is_empty()).then(|| std::path::Path::new(rankings_file)),
         )?;
+        let hub = Hub::new();
+        let browser = crate::browser::Browser::new(cfg.browser.clone(), &paths, hub.clone());
+        browser.init_paused(db.with(|c| db::get_setting(c, "paused"))?.is_some());
+        browser.set_disconnected(
+            db.with(|c| db::get_setting(c, "browser.disconnected"))?
+                .is_some(),
+        );
+        {
+            let (db, vault, history) = (
+                db.clone(),
+                vault.clone(),
+                crate::browser::fill::history_path(&paths),
+            );
+            browser.set_secret_source(Arc::new(move || {
+                crate::browser::fill::load_secrets_blocking(&db, &vault, &history)
+            }));
+        }
         Ok(Self(Arc::new(Inner {
             rankings,
+            browser,
             logins: crate::login::LoginManager::default(),
             engine_ops: crate::setup::EngineOps::default(),
             gateway: crate::gateway::Gateway::default(),
@@ -196,7 +216,7 @@ impl AppState {
             cfg,
             paths,
             db,
-            hub: Hub::new(),
+            hub,
             vault,
             vapid,
             harnesses,

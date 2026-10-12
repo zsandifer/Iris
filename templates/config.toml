@@ -173,6 +173,18 @@ helper = []
 # Update engines Iris installed once a day.
 auto_update = true
 
+# Iris's computer: a headless Chromium the agent can browse with (through
+# its `browser` tools) and you can watch and take over from the app. Saved
+# logins and cards are filled in by Iris itself; the agent never sees them.
+[browser]
+enabled = true
+# Chromium or Chrome executable. Empty: the one installed from the app,
+# then PATH (chromium, google-chrome, ...), then Playwright's browser cache.
+command = ""
+# Close the browser after this many idle minutes (frees memory). Sign-ins
+# persist in its profile under <data dir>/browser.
+idle_mins = 10
+
 # Connected services (connectors) are reached through Iris's gateway, which
 # holds actions that send messages, buy things, delete, export, or reach
 # someone new until you approve them in the app.
