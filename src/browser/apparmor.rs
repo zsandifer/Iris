@@ -23,6 +23,9 @@ use std::path::{Component, Path};
 pub const PROFILE_NAME: &str = "iris-browser";
 /// Where the profile is installed.
 pub const PROFILE_FILE: &str = "/etc/apparmor.d/iris-browser";
+/// The engine admin account `deploy/setup-engines.sh` creates; Iris and its
+/// agent must run as other accounts.
+pub const ENGINE_ADMIN: &str = "iris";
 /// The kernel switch Ubuntu uses for the restriction.
 const RESTRICT_SYSCTL: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
 /// Most entries checked in a browser's directory before giving up.
@@ -340,9 +343,166 @@ mod tests {
         );
         // The script only accepts engines directories the profile can name.
         assert!(script.contains("*[!A-Za-z0-9/._-]*)"));
-        assert!(script.contains("apparmor_restrict_unprivileged_userns"));
-        assert!(script.contains("apparmor_parser -r"));
-        assert!(script.contains(&format!("APPARMOR_PROFILE={PROFILE_FILE}")));
+        assert!(
+            script
+                .contains("USERNS_SYSCTL=/proc/sys/kernel/apparmor_restrict_unprivileged_userns\n")
+        );
+        assert_eq!(
+            format!("{}/{PROFILE_NAME}", "/etc/apparmor.d"),
+            PROFILE_FILE
+        );
+        assert!(script.contains("APPARMOR_DIR=/etc/apparmor.d\n"));
+        assert!(script.contains(&format!("ADMIN_USER=\"{ENGINE_ADMIN}\"\n")));
+        assert!(script.contains("\napprove_browser \"$BROWSER_BIN\"\n"));
+    }
+
+    /// Runs the setup script's approval step with stand-ins for the
+    /// kernel switch, /etc/apparmor.d, and apparmor_parser.
+    struct Setup {
+        _tmp: tempfile::TempDir,
+        dir: std::path::PathBuf,
+    }
+
+    impl Setup {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().canonicalize().unwrap();
+            for d in ["bin", "apparmor.d/abi/4.0", "engines"] {
+                std::fs::create_dir_all(dir.join(d)).unwrap();
+            }
+            let parser = dir.join("bin/apparmor_parser");
+            std::fs::write(
+                &parser,
+                "#!/bin/sh\nd=\"$(dirname \"$0\")/..\"\necho \"$*\" >> \"$d/parser.log\"\n\
+                 cat \"$2\" > \"$d/loaded\"\n[ ! -f \"$d/parser.fail\" ]\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&parser, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self { _tmp: tmp, dir }
+        }
+
+        fn run(&self, sysctl: Option<&str>) -> std::process::Output {
+            let script = include_str!("../../deploy/setup-engines.sh");
+            let block = script
+                .split_once("# --- browser approval: functions only")
+                .unwrap()
+                .1
+                .split_once("# --- end browser approval ---")
+                .unwrap()
+                .0;
+            let sysctl_file = self.dir.join("sysctl");
+            match sysctl {
+                Some(v) => std::fs::write(&sysctl_file, v).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(&sysctl_file);
+                }
+            }
+            let me = std::process::Command::new("id")
+                .arg("-un")
+                .output()
+                .unwrap();
+            let path = format!(
+                "{}:{}",
+                self.dir.join("bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "set -eu\n#{block}\napprove_browser \"$ENGINES_DIR/chromium/app/chrome\""
+                ))
+                .env("PATH", path)
+                .env("USERNS_SYSCTL", &sysctl_file)
+                .env("APPARMOR_DIR", self.dir.join("apparmor.d"))
+                .env("ENGINES_DIR", self.dir.join("engines"))
+                .env("ADMIN_USER", String::from_utf8_lossy(&me.stdout).trim())
+                .output()
+                .unwrap()
+        }
+
+        fn profile(&self) -> Option<String> {
+            std::fs::read_to_string(self.dir.join("apparmor.d/iris-browser")).ok()
+        }
+
+        fn loads(&self) -> usize {
+            std::fs::read_to_string(self.dir.join("parser.log"))
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn setup_approves_the_browser_only_where_userns_is_restricted() {
+        let s = Setup::new();
+        let bin = s.dir.join("engines/chromium/app/chrome");
+        let expected = profile_text(&bin).unwrap();
+        // No switch, or switched off: nothing loaded or written.
+        for sysctl in [None, Some("0\n")] {
+            let out = s.run(sysctl);
+            assert!(out.status.success(), "{out:?}");
+            assert_eq!((s.loads(), s.profile()), (0, None));
+        }
+        // Restricted: loaded first, then installed; rerunning reloads.
+        let out = s.run(Some("1\n"));
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(s.loads(), 1);
+        assert!(
+            std::fs::read_to_string(s.dir.join("parser.log"))
+                .unwrap()
+                .starts_with("-r ")
+        );
+        assert_eq!(
+            std::fs::read_to_string(s.dir.join("loaded")).unwrap(),
+            expected
+        );
+        assert_eq!(s.profile().as_deref(), Some(expected.as_str()));
+        assert!(s.run(Some("1")).status.success());
+        assert_eq!(s.loads(), 2);
+        // A profile that does not load is not installed; the one in place
+        // stays.
+        std::fs::write(s.dir.join("apparmor.d/iris-browser"), "previous").unwrap();
+        std::fs::write(s.dir.join("parser.fail"), "").unwrap();
+        let out = s.run(Some("1"));
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(s.loads(), 3);
+        assert_eq!(s.profile().as_deref(), Some("previous"));
+        std::fs::remove_file(s.dir.join("parser.fail")).unwrap();
+        // Without AppArmor 4: nothing loaded.
+        std::fs::remove_dir(s.dir.join("apparmor.d/abi/4.0")).unwrap();
+        let out = s.run(Some("1"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("AppArmor 4 is missing"));
+        assert_eq!(s.loads(), 3);
+        std::fs::create_dir(s.dir.join("apparmor.d/abi/4.0")).unwrap();
+        // Files under the browser directory others could change: refused.
+        let app = s.dir.join("engines/chromium/app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("chrome"), "").unwrap();
+        std::fs::set_permissions(
+            app.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let out = s.run(Some("1"));
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("Not approving"),
+            "{out:?}"
+        );
+        assert_eq!(s.loads(), 3);
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(app.join("chrome"), std::fs::Permissions::from_mode(0o757))
+            .unwrap();
+        assert!(String::from_utf8_lossy(&s.run(Some("1")).stderr).contains("Not approving"));
+        assert_eq!(s.loads(), 3);
+        std::fs::set_permissions(app.join("chrome"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let out = s.run(Some("1"));
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("Not approving"),
+            "{out:?}"
+        );
+        assert_eq!(s.loads(), 4);
     }
 
     #[test]
@@ -434,8 +594,16 @@ mod tests {
         // Baseline: everything owned by trusted accounts, nothing shared.
         assert!(chain_safe(&bin, &trusted, &meta));
         assert!(protected_with(&bin, &trusted, &meta));
-        // The current user is not trusted (single-user mode).
-        assert!(!protected_with(&bin, &[0], &meta));
+        // Files owned by an account that is not trusted (for example the
+        // user running Iris in single-user mode).
+        let other = |p: &Path| {
+            if p.starts_with(&base) {
+                real_meta(p).map(|(_, mode)| (4242, mode))
+            } else {
+                meta(p)
+            }
+        };
+        assert!(!protected_with(&bin, &trusted, &other));
         // A writable ancestor could swap the whole tree; sticky is not
         // enough.
         for mode in [0o777, 0o1777, 0o775, 0o757] {

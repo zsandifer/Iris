@@ -268,6 +268,7 @@ function NoSandbox({ b }) {
       <${Command} text=${fix.command} />`;
   } else if (fix?.kind === 'setup') {
     how = html`<small>This server blocks the sandbox Chrome uses to keep websites away from the rest of the system (common on Ubuntu). The browser I found isn't protected well enough to allow it safely. Run this once on your server from the Iris source folder and follow what it prints${fix.install_browser ? '' : ' (then restart Iris)'}. Then ${b.managed ? 'update' : 'set up'} my own browser here and tap Try again.</small>
+      ${fix.account_conflict && html`<small>First, run Iris (and its agent) under an account other than <span class="mono">iris</span>: the setup keeps that name for installing engines and won't run for it.</small>`}
       ${fix.configured_command && html`<small>Your server's config picks this browser (<span class="mono">command</span> under <span class="mono">[browser]</span>). Clear it and restart Iris so I use my own.</small>`}
       <${Command} text=${fix.command} />
       ${fix.install_browser && b.requires !== 'nodejs' && html`<button class="b2" disabled=${installing} onClick=${install}>${installing ? 'Setting up the browser…' : b.managed ? 'Update the browser' : 'Set up the browser'}</button>`}

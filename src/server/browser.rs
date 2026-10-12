@@ -73,10 +73,15 @@ fn sandbox_fix(state: &AppState, root: &std::path::Path) -> Value {
         .canonicalize()
         .ok()
         .is_some_and(|p| !old_layout(&p));
+    let user = apparmor::current_user()
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "IRIS_USER".into());
+    // The setup reserves this account for engine installs and refuses to
+    // run for it.
+    let account_conflict =
+        user == apparmor::ENGINE_ADMIN || state.cfg.agent.user == apparmor::ENGINE_ADMIN;
     let setup = apparmor::setup_command(
-        &apparmor::current_user()
-            .or_else(|| std::env::var("USER").ok())
-            .unwrap_or_else(|| "IRIS_USER".into()),
+        &user,
         apparmor::root_owned_iris().as_deref(),
         split.then_some(root),
     );
@@ -93,6 +98,7 @@ fn sandbox_fix(state: &AppState, root: &std::path::Path) -> Value {
         // own browser into the protected engines directory is the step the
         // app can offer.
         fix["install_browser"] = (split && (!managed || !managed_moved)).into();
+        fix["account_conflict"] = account_conflict.into();
     }
     fix
 }

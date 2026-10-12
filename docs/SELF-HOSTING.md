@@ -522,7 +522,9 @@ out each tool call the CLI makes, nothing more.
      Where the restriction is on, it writes `/etc/apparmor.d/iris-browser`
      for exactly `<engines dir>/chromium/app/chrome` and loads it with
      `apparmor_parser -r` (rerunning it is safe; without the restriction or
-     AppArmor 4 it does nothing). The engines directory belongs to the
+     AppArmor 4 it does nothing). It refuses if anything already under
+     `<engines dir>/chromium` belongs to another account or is writable by
+     group or others. The engines directory belongs to the
      `iris` admin user, so the user running Iris cannot put another program
      at that path.
   2. Add the printed `[engines]` settings, restart Iris, and tap "Set up the

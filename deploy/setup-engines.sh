@@ -180,30 +180,50 @@ printf '%s\n' "$DROPIN" | $AS_AGENT sh -c 'umask 022 && mkdir -p "$1" && cat > "
 #    above). Nothing else gains user namespaces. Without the restriction
 #    this step does nothing; rerunning it rewrites and reloads the profile.
 BROWSER_BIN="$ENGINES_DIR/chromium/app/chrome"
-APPARMOR_PROFILE=/etc/apparmor.d/iris-browser
+USERNS_SYSCTL=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+APPARMOR_DIR=/etc/apparmor.d
+# --- browser approval: functions only (tests run them with stand-ins) ---
 browser_profile() { # path of the browser executable
     printf '%s\n' "# Iris's browser: allow Chrome's sandbox (user namespaces) for this one program."
     printf '%s\n' 'abi <abi/4.0>,' 'include <tunables/global>' ''
     printf 'profile iris-browser "%s" flags=(unconfined) {\n' "$1"
     printf '%s\n' '  userns,' '}'
 }
-if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || true)" = 1 ]; then
-    if ! command -v apparmor_parser >/dev/null 2>&1 || [ ! -e /etc/apparmor.d/abi/4.0 ]; then
+# Everything already under the browser's directory must belong to root or
+# the admin user and not be writable by group or others; otherwise someone
+# else could put a program at the approved path.
+browser_tree_ok() { # directory
+    [ -e "$1" ] || [ -L "$1" ] || return 0
+    bad="$(find "$1" \( ! -user root ! -user "$ADMIN_USER" \) -print -o \
+        \( ! -type l \( -perm -g+w -o -perm -o+w \) \) -print 2>&1)" || bad="(could not check)"
+    if [ -n "$bad" ]; then
+        echo "Not approving Iris's browser for Chrome's sandbox: other accounts could change files under $1:" >&2
+        printf '%s\n' "$bad" | head -n 5 >&2
+        echo "Remove the browser in the app (or delete $1), rerun this script, then set it up again." >&2
+        return 1
+    fi
+}
+approve_browser() { # path of the browser executable
+    [ "$(cat "$USERNS_SYSCTL" 2>/dev/null || true)" = 1 ] || return 0
+    if ! command -v apparmor_parser >/dev/null 2>&1 || [ ! -e "$APPARMOR_DIR/abi/4.0" ]; then
         echo "AppArmor restricts user namespaces here, but apparmor_parser or AppArmor 4 is missing:" >&2
         echo "Chrome's sandbox for Iris's browser was not set up." >&2
-    else
-        PROFILE_TMP="$(mktemp)"
-        browser_profile "$BROWSER_BIN" > "$PROFILE_TMP"
-        # Load first; only a profile that loads is installed for boot.
-        if apparmor_parser -r "$PROFILE_TMP"; then
-            install -m 0644 -o root -g root "$PROFILE_TMP" "$APPARMOR_PROFILE"
-            echo "Allowed Chrome's sandbox for Iris's browser ($BROWSER_BIN): $APPARMOR_PROFILE"
-        else
-            echo "Could not load the AppArmor profile for Iris's browser; Chrome's sandbox stays blocked." >&2
-        fi
-        rm -f "$PROFILE_TMP"
+        return 0
     fi
-fi
+    browser_tree_ok "$ENGINES_DIR/chromium" || return 0
+    profile_tmp="$(mktemp)"
+    browser_profile "$1" > "$profile_tmp"
+    # Load first; only a profile that loads is installed for boot.
+    if apparmor_parser -r "$profile_tmp"; then
+        install -m 0644 "$profile_tmp" "$APPARMOR_DIR/iris-browser"
+        echo "Allowed Chrome's sandbox for Iris's browser ($1): $APPARMOR_DIR/iris-browser"
+    else
+        echo "Could not load the AppArmor profile for Iris's browser; Chrome's sandbox stays blocked." >&2
+    fi
+    rm -f "$profile_tmp"
+}
+# --- end browser approval ---
+approve_browser "$BROWSER_BIN"
 
 echo "Done. Add to $AGENT_HOME/.config/iris/config.toml:"
 echo ""
