@@ -35,6 +35,13 @@ export function focusComposer(el) {
   el.focus({ preventScroll: true });
 }
 
+// Safari ignores user-scalable=no; its gesture events still let us stop pinch zoom.
+export function blockZoom(doc = document) {
+  const stop = (e) => e.preventDefault();
+  for (const t of ['gesturestart', 'gesturechange', 'gestureend']) doc.addEventListener(t, stop, { passive: false });
+  doc.addEventListener('touchmove', (e) => { if (e.touches.length > 1) e.preventDefault(); }, { passive: false });
+}
+
 export function trackViewport(root) {
   const vv = window.visualViewport;
   let frame = 0;
