@@ -352,8 +352,13 @@ another user's id behaves like an unknown id (`404`).
 No auth.
 
 ```json
-{"ok": true, "name": "iris", "version": "0.1.0"}
+{"ok": true, "name": "iris", "version": "0.1.0", "build_id": "a1b2c3d4"}
 ```
+
+`version` is `CARGO_PKG_VERSION`; `build_id` is the first eight characters of
+the Git commit captured at build time, or `"dev"` when Git metadata is unavailable.
+Settings shows these together at the bottom. No timestamp or dirty-tree marker
+is included.
 
 #### `POST /api/pair`
 
@@ -1654,7 +1659,8 @@ Creates (or updates) the connector named after the service. Response
     "audience": "https://console.cloud.google.com/auth/audience?project=example-project-123456",
     "client": "https://console.cloud.google.com/auth/clients/create?project=example-project-123456"
   },
-  "redirect_uri": "https://iris.example/api/oauth/callback"
+  "redirect_uri": "https://iris.example/api/oauth/callback",
+  "authorized_domain": "iris.example"
 }
 ```
 
@@ -1664,7 +1670,12 @@ The Console URLs are defined together on the server. All later Console links,
 including the individual API fallbacks, are pinned with `project=<project_id>`
 when an ID is saved; otherwise they retain their unpinned URLs. `redirect_uri` is null
 until `public_url` is a valid HTTPS URL without credentials, query or fragment.
-The app links to its HTTPS setup help from step 4.
+`authorized_domain` is the domain to enter in Branding's Authorized domains,
+without scheme, port or path. Iris uses a small embedded public-suffix subset
+(including `ts.net`, common TLDs and country suffixes such as `co.uk`) to derive
+the registrable domain. For unknown suffixes it removes the first label of
+hosts with three or more labels, otherwise showing the full host. It is null
+without a valid HTTPS callback or DNS host. Steps 3 and 4 link to HTTPS setup help.
 
 `PUT /api/connectors/google/setup` accepts `{"step": 1..6, "sign_in"?: false,
 "project_id"?: "..."}`. The optional non-secret project ID accepts a bare ID,
@@ -3244,7 +3255,9 @@ Private system prompts include the same compact status projection. Shared and
 isolated turns receive only Iris's version and whether the current engine is usable.
 Status reads cached official CLI probe results and current DB/runtime state; it
 never runs a CLI probe or operation. `signed_in: null` means not yet known.
-Status includes `google_setup` (step, total_steps, phase, summary, non-secret
+Status includes `iris_version` and `iris_build_id` (the same version/build values
+as `/api/health`, also supplied to shared and isolated turns), and
+`google_setup` (step, total_steps, phase, summary, authorized_domain, non-secret
 project_id, and fixed
 error step/message only), engine names/install/sign-in/version, current engine and model,
 isolation, connector names/status/rules, saved login host names, wallet card count,
@@ -3555,7 +3568,10 @@ a strict Content-Security-Policy (`script-src 'self'`). It is mobile first,
 follows the phone's light or dark theme, and installs to the home screen
 (`/manifest.webmanifest`). The service worker (`/sw.js`) caches the app
 shell for offline start (never `/api`), shows push notifications, and opens
-the right chat when one is tapped.
+the right chat when one is tapped. The server renders its cache name as
+`iris-shell-<version>-<bundle hash>`, hashing the paths and bytes of all embedded
+web assets. Any web change creates a new cache; unchanged bundles keep the same
+name regardless of build ID.
 
 The app only uses the routes and events in this document. It stores its
 device token in `localStorage` and fetches binary routes with the

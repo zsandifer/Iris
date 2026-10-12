@@ -31,7 +31,7 @@ pub async fn status(
         "version": s.version,
     })).collect();
     let (uid, conv) = (owner.to_owned(), conversation.to_owned());
-    let Some((connectors, logins, wallet_cards, pending, notes, google_setup)) = state.db.call(move |c| {
+    let Some((connectors, logins, wallet_cards, pending, notes, mut google_setup)) = state.db.call(move |c| {
         if db::owner_user_id(c)?.as_deref() != Some(&uid) || db::conversation_member_ids(c, &conv)? != [uid.clone()] {
             return Ok(None);
         }
@@ -71,9 +71,12 @@ pub async fn status(
         notes.reverse();
         Ok(Some((connectors, logins, wallet_cards, pending, notes, crate::google_setup::status(c)?)))
     }).await? else { return Ok(json!({"outcome": "not allowed"})); };
+    google_setup["authorized_domain"] = json!(crate::google_setup::authorized_domain(
+        &state.cfg.public_url
+    ));
     let quiet = crate::notify::quiet_hours(state, owner).await;
     Ok(json!({
-        "iris_version": env!("CARGO_PKG_VERSION"), "engines": engines,
+        "iris_version": env!("CARGO_PKG_VERSION"), "iris_build_id": env!("IRIS_BUILD_ID"), "engines": engines,
         "current_turn": {"engine": engine, "model": model},
         "isolation": if state.cfg.agent.user.is_empty() { "single-user" } else { "split" },
         "connectors": connectors, "saved_logins": logins, "wallet_cards": wallet_cards,
@@ -441,6 +444,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value["saved_logins"], json!(["shop.example"]));
+        assert_eq!(value["iris_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["iris_build_id"], env!("IRIS_BUILD_ID"));
         assert_eq!(value["wallet_cards"], 1);
         assert_eq!(value["current_turn"]["engine"], "codex");
         let raw = value.to_string();

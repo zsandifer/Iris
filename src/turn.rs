@@ -563,7 +563,7 @@ async fn run_locked(
             .ok()
         } else {
             Some(
-                json!({"iris_version": env!("CARGO_PKG_VERSION"), "current_engine_working": entry.usable()}),
+                json!({"iris_version": env!("CARGO_PKG_VERSION"), "iris_build_id": env!("IRIS_BUILD_ID"), "current_engine_working": entry.usable()}),
             )
         };
         let keys = crate::keys::env_for(state, &harness_name).await;

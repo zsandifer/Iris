@@ -110,7 +110,8 @@ async fn google_setup(State(state): State<AppState>, user: AuthUser) -> ApiResul
     let progress = state.db.call(crate::google_setup::status).await?;
     let pages = crate::google_setup::pages(progress["project_id"].as_str());
     ok(json!({"progress": progress, "pages": pages,
-        "redirect_uri": crate::google_setup::callback(&state.cfg.public_url)}))
+        "redirect_uri": crate::google_setup::callback(&state.cfg.public_url),
+        "authorized_domain": crate::google_setup::authorized_domain(&state.cfg.public_url)}))
 }
 
 #[derive(Deserialize)]
@@ -1527,6 +1528,7 @@ mod tests {
         let insecure = app().await;
         let (_, v) = call(&insecure, "GET", "/api/connectors/google/setup", None).await;
         assert!(v["redirect_uri"].is_null());
+        assert!(v["authorized_domain"].is_null());
         let (s, _) = call(
             &insecure,
             "PUT",
@@ -1573,6 +1575,7 @@ mod tests {
         let (_, v) = call(&a, "GET", "/api/connectors/google/setup", None).await;
         assert_eq!(v["progress"]["step"], 1);
         assert_eq!(v["redirect_uri"], "https://iris.example/api/oauth/callback");
+        assert_eq!(v["authorized_domain"], "iris.example");
         for step in [0, 7] {
             let (s, _) = call(
                 &a,
@@ -1732,6 +1735,7 @@ mod tests {
             .unwrap();
         assert_eq!(status["google_setup"]["phase"], "sign_in");
         assert_eq!(status["google_setup"]["project_id"], "other-project-123456");
+        assert_eq!(status["google_setup"]["authorized_domain"], "iris.example");
         assert!(!status.to_string().contains("canary"));
         // Replacing the secret invalidates a previous grant even with the same ID.
         a.state
