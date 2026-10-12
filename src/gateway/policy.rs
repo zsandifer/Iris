@@ -628,7 +628,14 @@ pub fn audience(tool: &str, args: &Value) -> Vec<String> {
         classify_call(tool, &Value::Null, args),
         Category::Send | Category::Write | Category::Unclear
     );
-    walk_recipients(args, 0, scan, &mut out);
+    let mut fallback = Vec::new();
+    walk_recipients(args, 0, scan, &mut out, &mut fallback);
+    // Address-like text is evidence of risk, never evidence that we know
+    // the audience. Only recognized recipient fields can establish that.
+    if !fallback.is_empty() && !out.iter().any(|r| !is_placeholder(r)) {
+        out.push(UNREADABLE_RECIPIENTS.into());
+    }
+    out.extend(fallback);
     let mut seen = std::collections::HashSet::new();
     out.retain(|r| seen.insert(r.clone()));
     if publishes(tool, args) && !out.iter().any(|r| r == PUBLIC_AUDIENCE) {
@@ -914,7 +921,25 @@ fn truthy(v: &Value) -> bool {
     }
 }
 
-fn walk_recipients(v: &Value, depth: usize, scan: bool, out: &mut Vec<String>) {
+const CONTENT_KEYS: &[&str] = &[
+    "body",
+    "text",
+    "content",
+    "message",
+    "subject",
+    "html",
+    "markdown",
+    "description",
+    "notes",
+];
+
+fn walk_recipients(
+    v: &Value,
+    depth: usize,
+    scan: bool,
+    out: &mut Vec<String>,
+    fallback: &mut Vec<String>,
+) {
     if depth > 5 {
         out.push(UNREADABLE_RECIPIENTS.into());
         return;
@@ -953,17 +978,37 @@ fn walk_recipients(v: &Value, depth: usize, scan: bool, out: &mut Vec<String>) {
                 {
                     out.push(PUBLIC_AUDIENCE.into());
                 }
-                if RECIPIENT_KEYS.contains(&key.as_str()) {
+                if CONTENT_KEYS.contains(&key.as_str()) {
+                    if scan {
+                        // Even nested recipient-shaped objects in content
+                        // cannot authorize delivery to anyone.
+                        scan_fallback(val, depth + 1, fallback);
+                    }
+                } else if RECIPIENT_KEYS.contains(&key.as_str()) {
                     push_recipients(val, depth + 1, out);
                 } else {
-                    walk_recipients(val, depth + 1, scan, out);
+                    walk_recipients(val, depth + 1, scan, out, fallback);
                 }
             }
         }
         Value::Array(items) => items
             .iter()
-            .for_each(|i| walk_recipients(i, depth + 1, scan, out)),
-        Value::String(s) if scan => {
+            .for_each(|i| walk_recipients(i, depth + 1, scan, out, fallback)),
+        Value::String(_) if scan => scan_fallback(v, depth, fallback),
+        _ => {}
+    }
+}
+
+/// Scan content and unknown fields for additional risk only.
+fn scan_fallback(v: &Value, depth: usize, out: &mut Vec<String>) {
+    if depth > 5 {
+        out.push(UNREADABLE_RECIPIENTS.into());
+        return;
+    }
+    match v {
+        Value::Object(o) => o.values().for_each(|v| scan_fallback(v, depth + 1, out)),
+        Value::Array(a) => a.iter().for_each(|v| scan_fallback(v, depth + 1, out)),
+        Value::String(s) => {
             // Unknown fields can carry an address embedded in prose. Ambiguous
             // address-like text fails closed instead of silently dropping it.
             let digits = s.chars().filter(char::is_ascii_digit).count();
@@ -993,7 +1038,7 @@ fn walk_recipients(v: &Value, depth: usize, scan: bool, out: &mut Vec<String>) {
 /// order).
 pub fn recipients(args: &Value) -> Vec<String> {
     let mut out = Vec::new();
-    walk_recipients(args, 0, false, &mut out);
+    walk_recipients(args, 0, false, &mut out, &mut Vec::new());
     let mut seen = std::collections::HashSet::new();
     out.retain(|r| seen.insert(r.clone()));
     out
@@ -1723,6 +1768,62 @@ mod tests {
         let r = recipients(&json!({"phone_number": "+1 (555) 010-2000"}));
         assert_eq!(r, ["+15550102000"]);
         assert!(recipients(&json!({"query": "from:x@y.com"})).is_empty());
+    }
+
+    #[test]
+    fn review_regression_fallback_addresses_never_establish_a_trusted_audience() {
+        let trusted = |r: &str| r == "friend@example.test";
+        for key in CONTENT_KEYS.iter().copied().chain(["unknown_destination"]) {
+            let mut args = json!({"thread_id": "x"});
+            args[key] = json!("Contact friend@example.test");
+            let who = audience("reply_to_thread", &args);
+            assert!(
+                who.contains(&"friend@example.test".into()),
+                "{key}: {who:?}"
+            );
+            assert!(
+                who.contains(&UNREADABLE_RECIPIENTS.into()),
+                "{key}: {who:?}"
+            );
+            assert!(
+                matches!(
+                    decide(
+                        &Policy::default(),
+                        "reply_to_thread",
+                        Category::Send,
+                        &who,
+                        &trusted,
+                        &trusted
+                    ),
+                    Verdict::Ask(_)
+                ),
+                "{key}"
+            );
+        }
+        // A recipient-shaped object inside content cannot authorize a call.
+        let args = json!({"body": {"to": "friend@example.test"}});
+        assert!(recipients(&args).is_empty());
+        assert!(audience("reply_to_thread", &args).contains(&UNREADABLE_RECIPIENTS.into()));
+        // Recognized fields can fully identify the audience; content can
+        // still introduce an additional, untrusted address and force an ask.
+        for address in ["friend@example.test", "stranger@example.test"] {
+            let args = json!({"to": "friend@example.test", "body": address});
+            let who = audience("send_message", &args);
+            assert!(!who.contains(&UNREADABLE_RECIPIENTS.into()));
+            let verdict = decide(
+                &Policy::default(),
+                "send_message",
+                Category::Send,
+                &who,
+                &trusted,
+                &trusted,
+            );
+            if address == "friend@example.test" {
+                assert!(matches!(verdict, Verdict::Allow(AllowedBy::Trusted)));
+            } else {
+                assert!(matches!(verdict, Verdict::Ask(_)));
+            }
+        }
     }
 
     #[test]

@@ -119,6 +119,7 @@ struct Ctx {
     exists: bool,
     kind: String,
     members: Vec<String>,
+    membership_version: i64,
     names: HashMap<String, String>,
     /// The server owner's user id.
     owner: Option<String>,
@@ -143,6 +144,11 @@ async fn load_ctx(state: &AppState, conv_id: &str) -> Ctx {
         .db
         .call(move |c| {
             let conv = db::get_conversation_any(c, &id)?;
+            let membership_version = if conv.is_some() {
+                db::conversation_membership_version(c, &id)?
+            } else {
+                0
+            };
             let members = db::conversation_member_ids(c, &id)?;
             let mut names = HashMap::new();
             for m in &members {
@@ -154,6 +160,7 @@ async fn load_ctx(state: &AppState, conv_id: &str) -> Ctx {
                 exists: conv.is_some(),
                 kind: conv.map(|c| c.kind).unwrap_or_else(|| "side".into()),
                 members,
+                membership_version,
                 names,
                 owner: db::owner_user_id(c)?,
             })
@@ -163,6 +170,7 @@ async fn load_ctx(state: &AppState, conv_id: &str) -> Ctx {
             exists: false,
             kind: "side".into(),
             members: Vec::new(),
+            membership_version: 0,
             names: HashMap::new(),
             owner: None,
         })
@@ -717,6 +725,7 @@ async fn run_locked(
                 &acc,
                 input.user_message.created_at,
                 &persona_hash,
+                ctx.membership_version,
             )
             .await;
             break;
@@ -733,7 +742,16 @@ async fn run_locked(
                 state.note_auth(&harness_name, AuthState::Ok, None).await;
                 let synced =
                     synced_through(state, conv_id, input.assistant_message.created_at).await;
-                remember_session(state, conv_id, &harness_name, &acc, synced, &persona_hash).await;
+                remember_session(
+                    state,
+                    conv_id,
+                    &harness_name,
+                    &acc,
+                    synced,
+                    &persona_hash,
+                    ctx.membership_version,
+                )
+                .await;
                 outcome = Outcome::Complete;
                 break;
             }
@@ -1119,6 +1137,7 @@ async fn remember_session(
     acc: &Acc,
     synced_at: i64,
     persona_hash: &str,
+    membership_version: i64,
 ) {
     let Some(session_id) = acc.session.clone() else {
         return;
@@ -1131,7 +1150,16 @@ async fn remember_session(
     };
     let _ = state
         .db
-        .call(move |db| db::set_harness_session(db, &c, &h, &s))
+        .call(move |db| {
+            db::write_tx(db, |db| {
+                // A running CLI must not restore a session invalidated by a
+                // concurrent join or removal. Compare and save atomically.
+                if db::conversation_membership_version(db, &c)? == membership_version {
+                    db::set_harness_session(db, &c, &h, &s)?;
+                }
+                Ok(())
+            })
+        })
         .await;
 }
 
@@ -1639,6 +1667,7 @@ mod tests {
             exists: true,
             kind: kind.into(),
             members: vec!["u1".into(), "u2".into()],
+            membership_version: 0,
             names,
             owner: Some("u1".into()),
         }
@@ -1685,6 +1714,243 @@ mod tests {
         assert!(p.contains("Sam: m99"));
         assert!(!p.contains("Sam: m10\n"));
         assert_eq!(p.matches("Sam: m").count(), MAX_REPLAY_MESSAGES);
+    }
+
+    #[tokio::test]
+    async fn review_regression_membership_changes_start_fresh_with_only_post_join_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::browser::tools::tests::test_state(tmp.path());
+        let (owner, conv) = state
+            .db
+            .with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                let conv = db::create_conversation(c, &owner, "group", "Test", None)?.id;
+                for id in ["guest", "later"] {
+                    c.execute(
+                        "INSERT INTO users (id, display_name, created_at) VALUES (?1, ?1, 0)",
+                        [id],
+                    )?;
+                }
+                db::insert_message(
+                    c,
+                    &db::NewMessage {
+                        conversation_id: &conv,
+                        role: "user",
+                        author_user_id: Some(&owner),
+                        kind: "text",
+                        content: "private pre-join history",
+                        status: "complete",
+                        ..Default::default()
+                    },
+                )?;
+                Ok((owner, conv))
+            })
+            .unwrap();
+        let private_ctx = load_ctx(&state, &conv).await;
+        let acc = Acc {
+            session: Some("old-session".into()),
+            ..Default::default()
+        };
+        for harness in crate::config::SUPPORTED_HARNESSES {
+            remember_session(
+                &state,
+                &conv,
+                harness,
+                &acc,
+                0,
+                "private",
+                private_ctx.membership_version,
+            )
+            .await;
+        }
+        // Owner-only chats retain their entire replay.
+        assert_eq!(
+            state
+                .db
+                .with(|c| db::replay_messages(c, &conv, 0, i64::MAX, 40))
+                .unwrap()
+                .len(),
+            1
+        );
+        let join = |id: &str| {
+            state.db.with(|c| {
+                c.execute("INSERT INTO conversation_members (conversation_id, user_id, joined_at) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![conv, id, db::join_timestamp(c, &conv)?])?;
+                Ok(())
+            }).unwrap();
+        };
+        let post = |content: &str| {
+            state
+                .db
+                .with(|c| {
+                    db::insert_message(
+                        c,
+                        &db::NewMessage {
+                            conversation_id: &conv,
+                            role: "user",
+                            author_user_id: Some(&owner),
+                            kind: "text",
+                            content,
+                            status: "complete",
+                            ..Default::default()
+                        },
+                    )
+                })
+                .unwrap()
+        };
+        join("guest");
+        let first_ctx = load_ctx(&state, &conv).await;
+        // A private turn that finishes after the join cannot restore its session.
+        remember_session(
+            &state,
+            &conv,
+            "claude",
+            &acc,
+            0,
+            "private",
+            private_ctx.membership_version,
+        )
+        .await;
+        for harness in crate::config::SUPPORTED_HARNESSES {
+            assert!(
+                state
+                    .db
+                    .with(|c| db::get_harness_session(c, &conv, harness))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        post("visible after first join");
+        join("later");
+        let latest = post("visible after latest join");
+        state
+            .db
+            .with(|c| {
+                c.execute(
+                    "UPDATE messages SET created_at = (SELECT joined_at FROM conversation_members
+             WHERE conversation_id = ?1 AND user_id = 'later') WHERE id = ?2",
+                    rusqlite::params![conv, latest.id],
+                )
+            })
+            .unwrap();
+        let ctx = load_ctx(&state, &conv).await;
+        let (session, replay) = state
+            .db
+            .with(|c| {
+                Ok((
+                    db::get_harness_session(c, &conv, "claude")?,
+                    db::replay_messages(c, &conv, 0, i64::MAX, MAX_REPLAY_MESSAGES)?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            replay
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            ["visible after latest join"]
+        );
+        assert!(session.is_none());
+        // Shared-to-shared joins also prevent an in-flight session save.
+        remember_session(
+            &state,
+            &conv,
+            "claude",
+            &acc,
+            0,
+            "shared",
+            first_ctx.membership_version,
+        )
+        .await;
+        assert!(
+            state
+                .db
+                .with(|c| db::get_harness_session(c, &conv, "claude"))
+                .unwrap()
+                .is_none()
+        );
+        for harness in crate::config::SUPPORTED_HARNESSES {
+            remember_session(
+                &state,
+                &conv,
+                harness,
+                &acc,
+                0,
+                "shared",
+                ctx.membership_version,
+            )
+            .await;
+            assert!(
+                state
+                    .db
+                    .with(|c| db::get_harness_session(c, &conv, harness))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        state.db.with(|c| c.execute("DELETE FROM conversation_members WHERE conversation_id = ?1 AND user_id = 'later'", [&conv])).unwrap();
+        // Removing a member invalidates every harness as well.
+        for harness in crate::config::SUPPORTED_HARNESSES {
+            assert!(
+                state
+                    .db
+                    .with(|c| db::get_harness_session(c, &conv, harness))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        remember_session(
+            &state,
+            &conv,
+            "claude",
+            &acc,
+            0,
+            "shared",
+            ctx.membership_version,
+        )
+        .await;
+        assert!(
+            state
+                .db
+                .with(|c| db::get_harness_session(c, &conv, "claude"))
+                .unwrap()
+                .is_none()
+        );
+        let replay = state
+            .db
+            .with(|c| db::replay_messages(c, &conv, 0, i64::MAX, 40))
+            .unwrap();
+        assert_eq!(replay.len(), 2);
+        assert!(replay.iter().all(|m| !m.content.contains("private")));
+        let before_rejoin = load_ctx(&state, &conv).await;
+        state.db.with(|c| {
+            let joined: i64 = c.query_row("SELECT joined_at FROM conversation_members
+                WHERE conversation_id = ?1 AND user_id = 'guest'", [&conv], |r| r.get(0))?;
+            c.execute("DELETE FROM conversation_members WHERE conversation_id = ?1 AND user_id = 'guest'", [&conv])?;
+            assert_eq!(db::replay_messages(c, &conv, 0, i64::MAX, 40)?.len(), 3);
+            // Reusing the timestamp must not resurrect a session from
+            // before the membership change.
+            c.execute("INSERT INTO conversation_members (conversation_id, user_id, joined_at)
+                VALUES (?1, 'guest', ?2)", rusqlite::params![conv, joined])?;
+            Ok(())
+        }).unwrap();
+        remember_session(
+            &state,
+            &conv,
+            "claude",
+            &acc,
+            0,
+            "shared",
+            before_rejoin.membership_version,
+        )
+        .await;
+        assert!(
+            state
+                .db
+                .with(|c| db::get_harness_session(c, &conv, "claude"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

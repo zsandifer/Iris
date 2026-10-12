@@ -1983,20 +1983,12 @@ async fn concatenated_sends_count_against_the_send_tripwire() {
         .unwrap();
     let (token, _grant, _) = t.grant().await;
     let first = t
-        .call(
-            &token,
-            "sendemail",
-            json!({"odd_destination":"friend@example.test"}),
-        )
+        .call(&token, "sendemail", json!({"to":"friend@example.test"}))
         .await;
     assert!(!first["isError"].as_bool().unwrap_or(false), "{first}");
     assert_eq!(t.calls()[0].category, "send");
     let second = t
-        .call(
-            &token,
-            "sendemail",
-            json!({"odd_destination":"friend@example.test"}),
-        )
+        .call(&token, "sendemail", json!({"to":"friend@example.test"}))
         .await;
     assert!(text(&second).contains("paused"), "{second}");
     assert_eq!(t.calls_log().matches("sendemail").count(), 1);

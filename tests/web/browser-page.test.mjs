@@ -117,3 +117,40 @@ test('tab protection survives a fresh document exposing a hex password', () => {
   assert.equal(iris.info().url, 'https://shop.test');
   assert.equal(iris.info().title, '');
 });
+
+// The daemon supplies these cached encoding variants via setSecrets on
+// every document. Exercise the same submit redirect as the Rust regression.
+test('submit redirect to /sink#hex(password) masks snapshots, waits, title and URL', () => {
+  const bytes = Buffer.from(password);
+  const forms = [password, bytes.toString('hex'), bytes.toString('base64'),
+    bytes.toString('base64').replace(/=+$/, ''), bytes.toString('base64url'),
+    encodeURIComponent(password), [...password].reverse().join('')];
+  const login = page(['Sign in'], true);
+  const ref = login.iris.snapshot(12000).text.match(/\[ref=(\w+)\]/)[1];
+  assert.equal(login.iris.fillField(ref, password, true, login.iris.info().doc).ok, true);
+  for (const echo of [...forms, ...forms.map((x) => x.toUpperCase())]) {
+    const { iris, document } = page(['Welcome', echo]);
+    iris.setSecrets(forms);
+    // An agent click/Enter lets the submit handler redirect to a new path.
+    document.location.href = `https://shop.test/sink#${echo}`;
+    document.title = echo;
+    const snapshot = iris.snapshot(12000);
+    assert.ok(snapshot.text.includes('Welcome'));
+    for (const value of [snapshot.text, snapshot.title, snapshot.url, iris.info().title, iris.info().url]) {
+      assert.ok(!value.toLowerCase().includes(echo.toLowerCase()), value);
+    }
+    assert.equal(iris.hasText(echo), false, echo);
+    assert.equal(iris.hasText('Welcome'), true);
+    document.location.href = `https://shop.test/sink?password=${echo}`;
+    assert.ok(!iris.info().url.toLowerCase().includes(echo.toLowerCase()));
+  }
+});
+
+test('case changes and split nodes cannot expose encoded secrets through waits', () => {
+  const hex = Buffer.from(password).toString('hex');
+  const { iris } = page([hex.slice(0, 12).toUpperCase(), hex.slice(12).toUpperCase()]);
+  iris.setSecrets([password, hex]);
+  assert.equal(iris.hasText(hex.slice(0, 12)), false);
+  assert.equal(iris.hasText(hex.slice(12)), false);
+  assert.ok(!iris.snapshot(12000).text.includes(hex.slice(0, 12).toUpperCase()));
+});

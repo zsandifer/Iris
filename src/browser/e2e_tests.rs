@@ -154,10 +154,12 @@ async fn test_site() -> (u16, Arc<Mutex<Vec<String>>>) {
                                 CHECKOUT_PAGE.to_string()
                             } else if line.starts_with("GET /plain-checkout") {
                                 PLAIN_CHECKOUT.to_string()
+                            } else if line.starts_with("GET /login") {
+                                r#"<!doctype html><title>Sign in</title><form onsubmit="event.preventDefault();location.href='/sink#'+Array.from(pw.value).map(c=>c.charCodeAt(0).toString(16).padStart(2,'0')).join('')"><input id="pw" name="password" type="password" aria-label="Password"><button>Sign in</button></form>"#.into()
                             } else if line.starts_with("GET /redirect-fill") {
                                 r#"<!doctype html><title>Sign in</title><input name="password" type="password" aria-label="Password" oninput="location.href='/sink#'+Array.from(this.value).map(c=>c.charCodeAt(0).toString(16).padStart(2,'0')).join('')">"#.into()
                             } else if line.starts_with("GET /sink") {
-                                r#"<!doctype html><title>Sink</title><p id="echo"></p><script>echo.textContent=location.hash</script>"#.into()
+                                r#"<!doctype html><title>Sink</title><h1>Sink</h1><p id="echo"></p><script>echo.textContent=location.hash;document.title=location.hash</script>"#.into()
                             } else if line.starts_with("GET /tricky") {
                                 TRICKY_PAGE.to_string()
                             } else if line.starts_with("GET /saved") {
@@ -1028,6 +1030,91 @@ async fn input_redirect_keeps_encoded_secret_tainted() {
     )
     .await;
     assert!(!clean.is_error, "{}", clean.text);
+    state.browser.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_redirect_redacts_encoded_secret_in_every_read() {
+    let Some((_tmp, state, owner, conv)) = setup() else {
+        return;
+    };
+    let (port, _) = test_site().await;
+    bind_logins(&state, &owner, port);
+    let guard = state.browser.begin_turn(
+        &owner,
+        &conv,
+        "submit-regression",
+        std::slice::from_ref(&owner),
+    );
+    let call = |name: &'static str, args: Value| {
+        let (st, token) = (state.clone(), guard.token().to_string());
+        async move { tools::call(&st, &token, name, &args).await }
+    };
+    let hex = crate::util::hex(PASSWORD.as_bytes());
+    for action in ["click", "press_key"] {
+        let login = call(
+            "navigate",
+            json!({"url": format!("http://127.0.0.1:{port}/login")}),
+        )
+        .await;
+        assert!(!login.is_error, "{}", login.text);
+        let submit = ref_of(&login.text, "button \"Sign in\"");
+        let filled = call("fill_login", json!({})).await;
+        assert!(
+            !filled.is_error && filled.text.contains("filled"),
+            "{}",
+            filled.text
+        );
+        let out = call(
+            action,
+            if action == "click" {
+                json!({"ref": submit})
+            } else {
+                json!({"key": "Enter"})
+            },
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(!out.text.contains(&hex), "{}", out.text);
+        let run = state.browser.running().unwrap();
+        assert_eq!(
+            tools::eval(&run, "navigationState()").await.unwrap()["path"],
+            "/sink"
+        );
+        // Check that this is the reproduction, with the actual hex value
+        // in the URL; the isolated helper must mask it before every read.
+        let page = run.page();
+        let targets = run
+            .cdp
+            .call("Target.getTargets", json!({}), None)
+            .await
+            .unwrap();
+        assert!(
+            targets["targetInfos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["targetId"] == page.target_id
+                    && t["url"].as_str().is_some_and(|url| url.ends_with(&hex)))
+        );
+        for (name, args) in [
+            ("snapshot", json!({})),
+            ("wait", json!({"text": "Sink"})),
+            ("tabs", json!({"action": "list"})),
+        ] {
+            let out = call(name, args).await;
+            assert!(
+                !out.is_error && !out.text.contains(&hex),
+                "{name}: {}",
+                out.text
+            );
+        }
+        let probe = call("wait", json!({"text": &hex[..8], "seconds": 0.1})).await;
+        assert!(probe.text.contains("did not appear"), "{}", probe.text);
+        let info = tools::eval(&run, "info()").await.unwrap();
+        assert!(!info["title"].as_str().unwrap().contains(&hex));
+        assert!(!info["url"].as_str().unwrap().contains(&hex));
+    }
     state.browser.close().await;
 }
 

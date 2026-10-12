@@ -288,6 +288,24 @@ CREATE INDEX messages_pending_approvals ON messages(conversation_id, created_at)
     WHERE kind = 'card' AND json_extract(card, '$.type') = 'approval'
       AND json_extract(card, '$.state') = 'pending';
 "#,
+    r#"
+-- A monotonic revision also prevents a running turn from restoring a
+-- stale session, even if someone leaves and rejoins in one millisecond.
+ALTER TABLE conversations ADD COLUMN membership_version INTEGER NOT NULL DEFAULT 0;
+-- Existing shared sessions may already contain history hidden by joined_at.
+DELETE FROM harness_sessions WHERE conversation_id IN (
+    SELECT cm.conversation_id FROM conversation_members cm
+    JOIN users u ON u.id = cm.user_id WHERE u.is_owner = 0
+);
+CREATE TRIGGER conversation_member_added AFTER INSERT ON conversation_members BEGIN
+    DELETE FROM harness_sessions WHERE conversation_id = NEW.conversation_id;
+    UPDATE conversations SET membership_version = membership_version + 1 WHERE id = NEW.conversation_id;
+END;
+CREATE TRIGGER conversation_member_removed AFTER DELETE ON conversation_members BEGIN
+    DELETE FROM harness_sessions WHERE conversation_id = OLD.conversation_id;
+    UPDATE conversations SET membership_version = membership_version + 1 WHERE id = OLD.conversation_id;
+END;
+"#,
 ];
 
 /// Run `f` in a write transaction taken up front (`BEGIN IMMEDIATE`), so a
@@ -1059,7 +1077,8 @@ pub fn messages_between(
 
 /// The newest `limit` finished, non-empty messages strictly between `after`
 /// and `before`, oldest first: the replay for a harness session. Limited in
-/// SQL so a long unsynced history is never loaded whole.
+/// SQL so a long unsynced history is never loaded whole. Shared context
+/// starts at the latest join among current non-owner members.
 pub fn replay_messages(
     conn: &Connection,
     conversation_id: &str,
@@ -1071,6 +1090,11 @@ pub fn replay_messages(
         "SELECT * FROM (
              SELECT * FROM messages
              WHERE conversation_id = ?1 AND created_at > ?2 AND created_at < ?3
+               AND created_at >= COALESCE((
+                   SELECT MAX(cm.joined_at) FROM conversation_members cm
+                   JOIN users u ON u.id = cm.user_id
+                   WHERE cm.conversation_id = ?1 AND u.is_owner = 0
+               ), 0)
                AND status NOT IN ('streaming', 'pending') AND trim(content) != ''
              ORDER BY created_at DESC LIMIT ?4
          ) ORDER BY created_at",
@@ -1293,6 +1317,18 @@ pub fn recent_activity(
     .collect()
 }
 
+/// Monotonic revision for detecting membership changes during a CLI turn.
+pub fn conversation_membership_version(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT membership_version FROM conversations WHERE id = ?1",
+        [conversation_id],
+        |r| r.get(0),
+    )
+}
+
 // --------------------------------------------------------- harness sessions
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1479,6 +1515,54 @@ mod tests {
             card(c)?;
             assert_eq!(synced_watermark(c, &conv, placeholder)?, c1);
             assert!(c1 < heartbeat);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn membership_migration_discards_existing_shared_sessions_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        let (private, shared) = {
+            let c = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
+                .unwrap();
+            let owner = ensure_owner(&c).unwrap();
+            let private = create_conversation(&c, &owner, "side", "Private", None)
+                .unwrap()
+                .id;
+            let shared = create_conversation(&c, &owner, "group", "Shared", None)
+                .unwrap()
+                .id;
+            c.execute(
+                "INSERT INTO users (id, display_name, created_at) VALUES ('guest', 'Guest', 0)",
+                [],
+            )
+            .unwrap();
+            c.execute("INSERT INTO conversation_members (conversation_id, user_id, joined_at) VALUES (?1, 'guest', 1)", [&shared]).unwrap();
+            for conv in [&private, &shared] {
+                set_harness_session(
+                    &c,
+                    conv,
+                    "claude",
+                    &HarnessSession {
+                        session_id: "old-session".into(),
+                        synced_at: 0,
+                        persona_hash: "test".into(),
+                    },
+                )
+                .unwrap();
+            }
+            (private, shared)
+        };
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            assert!(get_harness_session(c, &private, "claude")?.is_some());
+            assert!(get_harness_session(c, &shared, "claude")?.is_none());
             Ok(())
         })
         .unwrap();

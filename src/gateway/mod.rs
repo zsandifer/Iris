@@ -478,34 +478,13 @@ fn fingerprint(con: &Connector) -> String {
 
 /// Replace secret values in text shown to the owner or the agent.
 pub fn redact(text: &str, secrets: &[String]) -> String {
-    use base64::{
-        Engine as _,
-        engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
-    };
     let mut forms = Vec::new();
     for secret in secrets.iter().filter(|s| s.len() >= 4) {
-        forms.push((secret.clone(), secret.chars().count() >= 8));
-        if secret.chars().count() < 8 {
-            continue;
+        let long = secret.chars().count() >= 8;
+        forms.push((secret.clone(), long));
+        if long {
+            forms.extend(encoded_secret_forms(secret).into_iter().map(|s| (s, true)));
         }
-        for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
-            forms.push((engine.encode(secret), true));
-        }
-        forms.push((crate::util::hex(secret.as_bytes()), true));
-        forms.push((secret.chars().rev().collect(), true));
-        let encoded: String = secret
-            .bytes()
-            .map(|b| {
-                if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
-                    (b as char).to_string()
-                } else {
-                    format!("%{b:02X}")
-                }
-            })
-            .collect();
-        forms.push((encoded.replace("%20", "+"), true));
-        forms.push((encoded, true));
-        forms.push((secret.bytes().map(|b| format!("%{b:02X}")).collect(), true));
     }
     forms.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
     let mut out = text.to_string();
@@ -514,14 +493,45 @@ pub fn redact(text: &str, secrets: &[String]) -> String {
             out = out.replace(&form, "[hidden]");
             continue;
         }
-        out = replace_case_insensitive(&out, &form);
+        out = replace_case_insensitive(&out, &form, "[hidden]");
     }
     out
 }
 
+/// Common reversible encodings of a secret, shared with browser redaction.
+/// Callers cache these forms when remembering a filled value.
+pub(crate) fn encoded_secret_forms(secret: &str) -> Vec<String> {
+    use base64::{
+        Engine as _,
+        engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+    };
+    let mut forms = Vec::new();
+    for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
+        forms.push(engine.encode(secret));
+    }
+    forms.push(crate::util::hex(secret.as_bytes()));
+    forms.push(secret.chars().rev().collect());
+    let encoded: String = secret
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    forms.push(encoded.replace("%20", "+"));
+    forms.push(encoded);
+    forms.push(secret.bytes().map(|b| format!("%{b:02X}")).collect());
+    forms.sort();
+    forms.dedup();
+    forms
+}
+
 /// Fold Unicode case while tracking original byte boundaries. An expanding
 /// lowercase mapping must never turn a replacement offset into a UTF-8 split.
-fn replace_case_insensitive(text: &str, form: &str) -> String {
+pub(crate) fn replace_case_insensitive(text: &str, form: &str, replacement: &str) -> String {
     let folded: String = text.chars().flat_map(char::to_lowercase).collect();
     let needle: String = form.chars().flat_map(char::to_lowercase).collect();
     let mut chars = text.chars();
@@ -546,7 +556,7 @@ fn replace_case_insensitive(text: &str, form: &str) -> String {
             continue;
         }
         out.push_str(&text[from..start]);
-        out.push_str("[hidden]");
+        out.push_str(replacement);
         from = original_at;
     }
     out.push_str(&text[from..]);

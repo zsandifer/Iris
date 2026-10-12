@@ -2590,9 +2590,9 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
     async fn a_group_gets_a_new_session_when_it_becomes_shared() {
         let t = turn_setup(|c| c.router.allow_claude_for_shared = true).await;
         let gid = t.create("group", &[]).await;
-        t.chat(&t.owner_t, &gid, "hi").await;
+        t.chat(&t.owner_t, &gid, "private pre-join history").await;
         assert!(t.read(0, "system.md").contains("owner-memory-fact"));
-        t.chat(&t.owner_t, &gid, "again").await;
+        t.chat(&t.owner_t, &gid, "another pre-join fact").await;
         assert!(
             t.read(1, "args").contains("--resume\nsess-0"),
             "same people: resumed"
@@ -2606,7 +2606,12 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         )
         .await;
         assert_eq!(s, StatusCode::OK);
-        t.chat(&t.owner_t, &gid, "now with Sam").await;
+        t.chat(&t.guest_t, &gid, "Summarize this conversation")
+            .await;
+        let prompt = t.read(2, "stdin");
+        assert!(prompt.contains("Summarize this conversation"));
+        assert!(!prompt.contains("private pre-join history"), "{prompt}");
+        assert!(!prompt.contains("another pre-join fact"), "{prompt}");
         assert!(
             !t.read(2, "args").contains("--resume"),
             "never resume a private session"
