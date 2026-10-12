@@ -1019,6 +1019,13 @@ holding for it (approved: it runs exactly as previewed; denied: it never
 runs and the agent is told), broadcasts `message.updated`, and returns
 `{"message": {Message}}`.
 
+Owner setup request cards (`requested_by: "system_request"`) also accept
+`{"approve": false}` here to decline once (`state: "declined"`). Setup approval
+uses the card's existing sign-in/install/connect flow; `approve: true` on a setup
+request returns `400`. Every accepted decision atomically inserts a `system_note`
+and broadcasts `message.created` alongside the card update. Approval notes record
+the decision, not a claim that the held operation succeeded.
+
 ### 3.8 Library
 
 Items are saved by the agent through `save_to_library`. Kinds: `artifact`
@@ -1245,7 +1252,7 @@ posts one `engine_signin` [card](#card) per outage in the owner's Main chat
 and says in the card which model it uses meanwhile. Right after an install
 from the app, a "Sign in to <engine>" card is posted instead. The card's
 `state` follows the sign-in; when the CLI reports it is signed in again the
-card becomes `connected`.
+card becomes `done` (✓).
 
 The sign-in runs the CLI's **own** login command on the server. Iris relays
 what the user needs, passes the code the user pastes to the process's
@@ -1316,7 +1323,7 @@ inherited ones). Subscription sign-ins are never read or touched.
 engine's `key_options` (`400`). Checks the key first with one tiny real
 request through the engine's own CLI (for OpenCode, with a model of that
 provider), then saves it. Returns the `GET` body plus `auth`: `ok` (saved;
-the engine is marked signed in and its sign-in card turns `connected`),
+the engine is marked signed in and its sign-in card turns `done` (✓)),
 `auth_required` (the provider refused it; **it is not saved**, and a key
 saved earlier stays), or `unknown` (could not check, for example the engine
 is turned off; saved and used from the next turn). For OpenCode the per-run
@@ -2598,7 +2605,7 @@ Returned by `GET /api/conversations/{id}/members`.
 | `conversation_id` | string | |
 | `role` | string | `user`, `assistant`, or `system`. |
 | `author_user_id` | string or null | Set for user messages. |
-| `kind` | string | `text` or `card`. |
+| `kind` | string | `text`, `card`, or `system_note` (short service-generated outcome; render as a subtle centered line). |
 | `content` | string | Text (Markdown from the agent). For cards, a plain-text fallback (the card title, or a summary for feed-post cards). |
 | `attachments` | string[] | Attachment ids. |
 | `card` | object or null | See [Card](#card). |
@@ -2641,9 +2648,9 @@ changes are re-sent as `message.updated`.
 | `type` | Extra fields | Action |
 |---|---|---|
 | `action` | `action: {"method", "path", "body"}` | Call that Iris API route with that JSON body when the owner taps `action_label` (e.g. `PUT /api/settings {"allow_claude_for_shared": true}`). |
-| `engine_signin` | `harness`, `flow` (`code_paste`, `device_code`, `manual`), `state` (`needs_reconnect`, `starting`, `waiting_for_code`, `waiting_for_approval`, `verifying`, `connected`, `failed`, `cancelled`), `url`, `user_code`, `error`, `instructions` (manual flow), `login_id` | Start with `POST /api/harnesses/{harness}/login`. For `waiting_for_code`, show `url` and a code field (`/login/code`); for `waiting_for_approval`, show `url` and `user_code`; for `manual`, show `instructions` and a "Check again" button (the same `POST`). |
+| `engine_signin` | `harness`, `flow` (`code_paste`, `device_code`, `manual`), `state` (`needs_reconnect`, `starting`, `waiting_for_code`, `waiting_for_approval`, `verifying`, `done`, `failed`, `cancelled`), `url`, `user_code`, `error`, `instructions` (manual flow), `login_id` | Start with `POST /api/harnesses/{harness}/login`. For `waiting_for_code`, show `url` and a code field (`/login/code`); for `waiting_for_approval`, show `url` and `user_code`; for `manual`, show `instructions` and a "Check again" button (the same `POST`). |
 | `engine_setup` | `state` (`needs_setup`, `done`), `options: [{"harness", "label", "installed", "requires", "action": {"method", "path"}}]` | Each option installs that engine (`POST /api/engines/{name}/install`). |
-| `connector_reconnect` | `connector_id`, `service`, `auth` (`oauth` or `secrets`), `state` (`needs_reconnect`, `connected`) | `oauth`: sign in again (`POST /api/connectors/{id}/oauth/start`). `secrets`: open the connector's settings so the owner can update its credentials (`PATCH /api/connectors/{id}`). The card turns `connected` when they do. |
+| `connector_reconnect` | `connector_id`, `service`, `auth` (`oauth` or `secrets`), `state` (`needs_reconnect`, `done`) | `oauth`: sign in again (`POST /api/connectors/{id}/oauth/start`). `secrets`: open the connector's settings so the owner can update its credentials (`PATCH /api/connectors/{id}`). The card turns `done` (✓) after a successful connection. |
 | `approval` | `service`, `preview: {"to", "subject", "body", "fields": [{"label", "value"}]}`, `details` (the complete arguments, pretty JSON; requests too large to show in full are refused), `reason` (why it asks, e.g. "Sends a message to someone new: sam@example.com"), `tool`, `category`, `connector_id`, `turn_message_id` (the reply of the turn that asked; absent for scheduled jobs), `action_label` (`Send`, `Pay`, `Delete`, or `Allow`), `approver_user_id`, `owner_only: false`, `state` (`pending`, `approved`, `denied`, `expired`, `cancelled`), `expires_at`, `decided_at` | Show the preview exactly as given with Deny / `action_label`; decide with [`POST /api/messages/{id}/decision`](#post-apimessagesiddecision). Built by the gateway from the real arguments of the held call, never from agent text; characters that could hide or reorder text are shown as `[U+XXXX]`, and a body over 4,000 characters is cut with a note (the full text is in `details`). |
 
 Wallet approval cards use this same gate with `service: "wallet"`,
@@ -3148,10 +3155,39 @@ Failure (validation errors, unknown ids, unknown tools): no
 
 ### Tools
 
-All tools are available in normal mode; only `create_card` in shared mode.
+Only `create_card` is offered in shared mode. System status and setup request tools
+require an authenticated, active owner private turn; they are unavailable in other
+people's chats, standalone bridge invocations, and shared turns. Iris rechecks
+membership on calls and expires access with the turn. In split mode the bridge
+and status handler run on the service side; no agent process opens private files.
+
+Private system prompts include the same compact status projection. Shared and
+isolated turns receive only Iris's version and whether the current engine is usable.
+Status reads cached official CLI probe results and current DB/runtime state; it
+never runs a CLI probe or operation. `signed_in: null` means not yet known.
+Status includes engine names/install/sign-in/version, current engine and model,
+isolation, connector names/status/rules, saved login host names, wallet card count,
+agent name, feed/Pause/quiet hours/voice state, eight recent pending card summaries
+(type/title only), and eight recent conversation system notes. It excludes secrets,
+account identities, paths, credential labels/usernames/numbers, connector configs,
+and card bodies or authorization URLs.
+
+Requests create the app's ordinary owner cards in the current conversation. They
+never install, sign in, or connect. Repeated open requests return the same card id;
+a persistent owner budget allows six new request cards per hour across turns and
+conversations. Existing state returns `already signed in`, `already installed`, or
+`already connected`. Invalid targets, denied scope, and exhausted budgets return
+`not allowed`. Completion resolves all outstanding matching cards as `done` (✓)
+and records `system_note` outcomes in their conversations; declines and approval
+decisions also record notes. Notes appear in subsequent context without starting
+a new turn. Resolved cards are explicitly described as resolved in replay history.
 
 | Tool | Arguments | Result (`structuredContent`) |
 |---|---|---|
+| `system_status` | none; owner private turn only | The allowlisted status object described above |
+| `request_engine_signin` | `engine: "claude" \| "codex" \| "gemini" \| "opencode"` | `{"outcome", "card_id"?}`; sign-in card or already signed in |
+| `request_engine_install` | `engine` (same names) | `{"outcome", "card_id"?}`; install card or already installed |
+| `request_connector_setup` | `name: "google" \| "github" \| "custom"` | `{"outcome", "card_id"?}`; connect/reconnect card or already connected |
 | `list_goals` | `include_done?: bool` (default false) | `{"goals": [Goal]}` |
 | `create_goal` | `title: string` (required, max 300), `status_text?: string` (max 2,000), `suggested?: bool` (a proposal the user confirms; default false) | `{"goal": Goal}` |
 | `update_goal` | `id: string` (required), `title?` (non-blank, max 300), `status_text?` (max 2,000), `done?: bool` | `{"goal": Goal}`; error `no goal with that id` |

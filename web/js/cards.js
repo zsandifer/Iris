@@ -47,7 +47,7 @@ function ConnectCard({ c }) {
   const known = CATALOG.includes(service.toLowerCase()) ? service.toLowerCase() : null;
   useEffect(() => { if (known) ensureConnectors(); }, [known]);
   const con = known && known !== 'custom' && (S.connectors || []).find((x) => x.service === known);
-  const ready = con && con.enabled && con.auth_state === 'ok';
+  const ready = c.state === 'done' || (con && con.enabled && con.auth_state === 'ok');
   const url = !known && safeUrl(c.url);
   const label = c.action_label || 'Connect';
   const open = () => {
@@ -161,7 +161,7 @@ export function SignIn({ card, harness, flow, instructions, keyOptions }) {
   const copy = () => navigator.clipboard?.writeText(st.user_code).then(() => toast('Code copied'));
 
   if (!isOwner()) return html`<small class="mu">Only the owner can reconnect this.</small>`;
-  if (st.state === 'connected') return html`<div class="ok-line"><${Icon} name="check" size=${16} /> Connected</div>`;
+  if (['connected', 'done'].includes(st.state)) return html`<div class="ok-line"><${Icon} name="check" size=${16} /> Connected</div>`;
   if (flow === 'api_key') {
     return html`<${ApiKeyForm} harness=${harness} options=${card?.key_options || keyOptions} />
       ${st.instructions && html`<details class="alt"><summary>Or set it up on the server</summary><div class="steps-box"><code>${st.instructions}</code></div>
@@ -240,7 +240,7 @@ function label(h) {
 }
 
 function SigninCard({ c }) {
-  const done = c.state === 'connected';
+  const done = ['connected', 'done'].includes(c.state);
   return html`<div class=${'card-x signin' + (done ? ' done' : '')}>
     <div class="card-h"><${LetterTile} name=${c.harness} size=${30} radius=${9} /><b>${c.title}</b></div>
     ${c.body && html`<p>${c.body}</p>`}
@@ -276,7 +276,7 @@ function SetupCard({ c }) {
 function ConnectorReconnectCard({ c }) {
   useEffect(() => { ensureConnectors(); }, []);
   const con = (S.connectors || []).find((x) => x.id === c.connector_id);
-  const done = c.state === 'connected';
+  const done = ['connected', 'done'].includes(c.state);
   return html`<div class=${'card-x' + (done ? ' done' : '')}>
     <div class="card-h">${con ? html`<${ServiceTile} c=${con} />` : html`<${LetterTile} name=${c.service || c.title} size=${30} radius=${9} />`}<b>${c.title}</b></div>
     ${c.body && html`<p>${c.body}</p>`}
@@ -361,5 +361,12 @@ export function Card({ m, inactive = false }) {
   // Sign-in cards can contain inputs. Keep them out of iOS's form
   // navigation while the composer has focus; scrolling stays on .scr.
   const signin = c.type === 'engine_signin' || c.type === 'connector_reconnect';
-  return html`<div class="card-wrap" inert=${inactive && signin}><${C} c=${c} m=${m} /></div>`;
+  const decline = async () => {
+    try { await post(`/messages/${seg(m.id)}/decision`, { approve: false }); } catch (e) { toast(e.message); }
+  };
+  if (c.state === 'declined') return html`<div class="card-wrap"><div class="note">${c.title} · Declined</div></div>`;
+  return html`<div class="card-wrap" inert=${inactive && signin}><${C} c=${c} m=${m} />
+    ${c.requested_by === 'system_request' && !['done', 'connected'].includes(c.state) && isOwner()
+      && html`<button class="lk-m" onClick=${decline}>No thanks</button>`}
+  </div>`;
 }

@@ -3,6 +3,8 @@
 Notes about the tools, accounts, and devices available to the agent. Iris
 reads this file into the agent's context on every turn.
 
+Use `system_status` to check current setup and the request tools to ask for owner setup cards. You cannot change connections, credentials, or settings directly.
+
 ## Connectors
 
 <!-- Connected MCP servers appear automatically. Add notes here, e.g.

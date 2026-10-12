@@ -169,3 +169,12 @@ own personality. It is not a clone.
   plus shared "Together" chats. The owner's memory, persona notes, files,
   and connectors stay private to the owner; per-person memory is on the way.
 - Pairing: one-time code → long-lived per-device key, revocable per device.
+
+Private chats give Iris a compact, read-only view of current system setup, refreshed
+through `system_status` when needed. It can request the existing owner sign-in,
+install, or connector cards, with deduplication and a bounded request budget.
+Connections, credentials, settings, and installations remain owner-controlled.
+Shared and isolated turns see only trivial, non-personal status. Completion and
+decline outcomes appear as subtle centered system lines, enter the next turn's
+context, and never start a turn themselves. Stale setup/reconnect cards resolve
+to ✓; setup requests offer “No thanks.”

@@ -226,6 +226,9 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
     } else if ctx.app_tools {
         out.push_str(APP_TOOLS_GUIDE);
     }
+    if ctx.app_tools && private {
+        out.push_str("\nCheck `system_status` for current setup; use `request_engine_signin`, `request_engine_install`, and `request_connector_setup` to request owner cards. You cannot change connections, credentials, or settings directly. System notes report outcomes; resolved cards need no further action.\n");
+    }
     if let Some(server) = ctx.browser.filter(|_| ctx.scope == Scope::Private) {
         out.push_str(&crate::browser::tools::guide(server));
     }
@@ -329,16 +332,7 @@ when it genuinely helps, and never mention tool names to the user.
   generated ones), and a short `why` line.
 - Library: `save_to_library` for documents, drafts and other artifacts you
   produce; `list_library`.
-- Cards: `create_card` shows a structured card in the current chat. Whenever
-  the user asks to set up, connect, or link an account or service (for
-  example \"help me set up Google\"), call `create_card` with type `connect`
-  and the `service`: `google` (Gmail, Calendar, Drive), `github`, or
-  `custom` (any other MCP server) open Iris's own step-by-step setup and
-  need no url; for anything else give the `url` of the official page where
-  they can connect it. Then explain the next step in a sentence or two. Use
-  `link` cards for other links worth highlighting instead of pasting raw
-  URLs, and a `result` card (with `image_url`, details in `body`, and one
-  action) for one concrete result such as a restaurant or product.
+- Cards: `create_card` shows links, results, and other structured information.
 - Connectors: `list_connectors` shows which services are connected and which
   can still be connected.
 

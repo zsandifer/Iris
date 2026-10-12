@@ -1,0 +1,753 @@
+//! Service-owned, allowlisted status and card-only setup requests. No secrets or operations.
+use crate::{db, entities, harness::AuthState, state::AppState, util::now_ms};
+use serde_json::{Value, json};
+
+pub const TOOLS: &[&str] = &[
+    "system_status",
+    "request_engine_signin",
+    "request_engine_install",
+    "request_connector_setup",
+];
+
+pub fn resolved(card: &Value) -> bool {
+    matches!(
+        card["state"].as_str(),
+        Some("done" | "connected" | "declined" | "approved" | "denied" | "expired" | "cancelled")
+    )
+}
+
+/// Explicit projection: never serialize engine paths, connector configs, credential metadata,
+/// account identities, card bodies, or vault records.
+pub async fn status(
+    state: &AppState,
+    owner: &str,
+    conversation: &str,
+    engine: &str,
+    model: &str,
+) -> crate::util::Result<Value> {
+    let engines: Vec<_> = state.harness_statuses().into_iter().map(|s| json!({
+        "name": s.name, "installed": s.installed,
+        "signed_in": match s.auth { AuthState::Ok => Some(true), AuthState::AuthRequired => Some(false), AuthState::Unknown => None },
+        "version": s.version,
+    })).collect();
+    let (uid, conv) = (owner.to_owned(), conversation.to_owned());
+    let Some((connectors, logins, wallet_cards, pending, notes)) = state.db.call(move |c| {
+        if db::owner_user_id(c)?.as_deref() != Some(&uid) || db::conversation_member_ids(c, &conv)? != [uid.clone()] {
+            return Ok(None);
+        }
+        let connectors: Vec<_> = entities::list_connectors(c, false)?.into_iter().map(|con| {
+            let status = if !con.enabled { "disabled" } else if con.paused_reason.is_some() { "paused" } else if con.auth_state != "ok" { "needs reconnect" } else { "connected" };
+            let mut rules = con.policy.mode.describe().to_owned();
+            if !con.policy.tools.is_empty() {
+                use crate::gateway::policy::ToolRule;
+                let counts = con.policy.tools.values().fold([0; 3], |mut counts, rule| {
+                    counts[match rule { ToolRule::Allow => 0, ToolRule::Ask => 1, ToolRule::Block => 2 }] += 1;
+                    counts
+                });
+                rules.push_str(&format!("; tool overrides: {} run, {} ask, {} blocked (purchases still ask)", counts[0], counts[1], counts[2]));
+            }
+            json!({"name": con.name, "status": status, "rules": rules})
+        }).collect();
+        let credentials = entities::list_credentials(c, &uid)?;
+        let mut logins: Vec<_> = credentials.iter().filter(|x| x.kind == "login")
+            .filter_map(|x| x.metadata["site"].as_str())
+            .filter_map(|site| crate::browser::fill::origin_of(&if site.contains("://") { site.to_owned() } else { format!("https://{site}") }).map(|(_, host)| host)).collect();
+        logins.sort(); logins.dedup();
+        let wallet_cards = credentials.iter().filter(|x| x.kind == "card").count();
+        let mut stmt = c.prepare("SELECT json_extract(card, '$.type'), json_extract(card, '$.title') FROM messages
+            WHERE kind = 'card' AND status = 'complete'
+              AND json_extract(card, '$.type') IN ('engine_signin', 'engine_setup', 'connect', 'connector_reconnect', 'approval', 'action')
+              AND COALESCE(json_extract(card, '$.state'), '') NOT IN ('done', 'connected', 'declined', 'approved', 'denied', 'expired', 'cancelled')
+              AND conversation_id IN (SELECT conversation_id FROM conversation_members WHERE user_id = ?1
+                AND (SELECT COUNT(*) FROM conversation_members m WHERE m.conversation_id = conversation_members.conversation_id) = 1)
+            ORDER BY created_at DESC LIMIT 8")?;
+        let pending = stmt.query_map([&uid], |r| {
+            let kind: String = r.get(0)?;
+            let title: String = r.get(1)?;
+            Ok(json!({"type": kind, "title": crate::util::truncate_chars(&title, 80)}))
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut stmt = c.prepare("SELECT content FROM messages WHERE conversation_id = ?1 AND kind = 'system_note' ORDER BY created_at DESC LIMIT 8")?;
+        let mut notes = stmt.query_map([&conv], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        notes.reverse();
+        Ok(Some((connectors, logins, wallet_cards, pending, notes)))
+    }).await? else { return Ok(json!({"outcome": "not allowed"})); };
+    let quiet = crate::notify::quiet_hours(state, owner).await;
+    Ok(json!({
+        "iris_version": env!("CARGO_PKG_VERSION"), "engines": engines,
+        "current_turn": {"engine": engine, "model": model},
+        "isolation": if state.cfg.agent.user.is_empty() { "single-user" } else { "split" },
+        "connectors": connectors, "saved_logins": logins, "wallet_cards": wallet_cards,
+        "settings": {"agent_name": state.agent_name().await, "feed": crate::feed::enabled(state).await,
+            "paused": state.is_paused().await, "quiet_hours": quiet.map(|q| json!({"start": q["start"], "end": q["end"]})), "voice_replies": false},
+        "pending_cards": pending, "recent_system_notes": notes,
+    }))
+}
+
+pub fn insert_note(
+    c: &rusqlite::Connection,
+    conv: &str,
+    content: &str,
+) -> rusqlite::Result<db::Message> {
+    db::insert_message(
+        c,
+        &db::NewMessage {
+            conversation_id: conv,
+            role: "system",
+            kind: "system_note",
+            content,
+            ..Default::default()
+        },
+    )
+}
+
+pub async fn broadcast_created(state: &AppState, message: &db::Message) {
+    let conv = message.conversation_id.clone();
+    let members = state
+        .db
+        .call(move |c| db::conversation_member_ids(c, &conv))
+        .await
+        .unwrap_or_default();
+    state.hub.to_users(&members, json!({"type": "message.created", "conversation_id": message.conversation_id, "message": message}));
+}
+
+/// Resolve all matching outstanding owner cards, once per conversation, with an outcome note.
+pub async fn finish(state: &AppState, kind: &str, target: &str, outcome: &str, note: &str) {
+    let (kind, target, outcome, note) = (
+        kind.to_owned(),
+        target.to_owned(),
+        outcome.to_owned(),
+        note.to_owned(),
+    );
+    let result = state
+        .db
+        .call(move |c| {
+            db::write_tx(c, |c| {
+                let service = if kind == "connector" {
+                    entities::get_connector(c, &target)?.map(|con| con.service)
+                } else {
+                    None
+                };
+                let Some(owner) = db::owner_user_id(c)? else {
+                    return Ok((vec![], vec![]));
+                };
+                let mut stmt = c.prepare("SELECT id FROM messages WHERE kind = 'card'
+                    AND json_extract(card, '$.type') IN ('engine_signin', 'engine_setup', 'connect', 'connector_reconnect')
+                    AND COALESCE(json_extract(card, '$.state'), '') NOT IN ('done', 'connected', 'declined', 'approved', 'denied', 'expired', 'cancelled')")?;
+                let ids = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut updates = vec![];
+                let mut conversations = std::collections::BTreeSet::new();
+                for id in ids {
+                    let Some(m) = db::get_message(c, &id)? else {
+                        continue;
+                    };
+                    let Some(mut card) = m.card else {
+                        continue;
+                    };
+                    let matches = match kind.as_str() {
+                        "signin" => card["type"] == "engine_signin" && card["harness"] == target,
+                        "install" => card["type"] == "engine_setup" && card["harness"] == target,
+                        "connector" => {
+                            (card["type"] == "connector_reconnect"
+                                && card["connector_id"] == target)
+                                || (card["type"] == "connect"
+                                    && card["service"].as_str() == service.as_deref()
+                                    && service.is_some())
+                        }
+                        _ => false,
+                    };
+                    if !matches || resolved(&card) {
+                        continue;
+                    }
+                    card["state"] = outcome.clone().into();
+                    card["body"] = note.clone().into();
+                    for field in ["url", "user_code", "error"] {
+                        card[field] = Value::Null;
+                    }
+                    updates.push(db::update_message_card(c, &id, &card)?);
+                    if db::conversation_member_ids(c, &m.conversation_id)? == [owner.clone()] {
+                        conversations.insert(m.conversation_id);
+                    }
+                }
+                let notes = conversations
+                    .iter()
+                    .map(|conv| insert_note(c, conv, &note))
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok((updates, notes))
+            })
+        })
+        .await;
+    if let Ok((updates, notes)) = result {
+        for m in updates {
+            crate::login::broadcast_updated(state, &m).await;
+        }
+        for m in notes {
+            broadcast_created(state, &m).await;
+        }
+    }
+}
+
+pub async fn request(
+    state: &AppState,
+    owner: &str,
+    conv: &str,
+    tool: &str,
+    args: &Value,
+) -> crate::util::Result<Value> {
+    let (uid, cid) = (owner.to_owned(), conv.to_owned());
+    if !state
+        .db
+        .call(move |c| {
+            Ok(db::owner_user_id(c)?.as_deref() == Some(&uid)
+                && db::conversation_member_ids(c, &cid)? == [uid])
+        })
+        .await?
+    {
+        return Ok(json!({"outcome": "not allowed"}));
+    }
+    let (target, card, happened) = if tool == "request_connector_setup" {
+        let name = args["name"].as_str().unwrap_or("").to_lowercase();
+        let Some(catalog) = crate::connectors::catalog_entry(&name) else {
+            return Ok(json!({"outcome": "not allowed"}));
+        };
+        let n = name.clone();
+        let con = state
+            .db
+            .call(move |c| {
+                Ok(entities::list_connectors(c, false)?
+                    .into_iter()
+                    .find(|x| (x.service == n && n != "custom") || x.name.eq_ignore_ascii_case(&n)))
+            })
+            .await?;
+        if con.as_ref().is_some_and(|c| c.active()) {
+            return Ok(json!({"outcome": "already connected"}));
+        }
+        let card = if let Some(con) = con.filter(|c| c.auth_state != "ok") {
+            json!({"type": "connector_reconnect", "title": format!("Reconnect {}", catalog.label), "connector_id": con.id, "service": name,
+                "auth": if con.config.oauth.is_some() { "oauth" } else { "secrets" }, "state": "needs_reconnect", "owner_only": true})
+        } else {
+            json!({"type": "connect", "title": format!("Connect {}", catalog.label), "service": name, "state": "pending", "owner_only": true})
+        };
+        (name, card, "posted a connect card")
+    } else {
+        let name = args["engine"].as_str().unwrap_or("");
+        let Some(entry) = state.harness(name) else {
+            return Ok(json!({"outcome": "not allowed"}));
+        };
+        let status = entry.status();
+        let label = crate::login::engine_label(name);
+        if tool == "request_engine_signin" {
+            if status.auth == AuthState::Ok {
+                return Ok(json!({"outcome": "already signed in"}));
+            }
+            if !status.installed {
+                return Ok(json!({"outcome": "not allowed", "reason": "request an install first"}));
+            }
+            let flow = entry.harness.login().map(|s| s.flow);
+            let options = crate::keys::options(name);
+            let api_key = flow.is_none() && !options.is_empty();
+            (
+                name.to_owned(),
+                json!({"type": "engine_signin", "title": format!("Sign in to {label}"), "harness": name,
+                    "state": "needs_reconnect", "owner_only": true,
+                    "flow": match flow { Some(crate::harness::LoginFlow::CodePaste) => "code_paste", Some(crate::harness::LoginFlow::DeviceCode) => "device_code", None if api_key => "api_key", None => "manual" },
+                    "key_options": options,
+                "instructions": if flow.is_none() { Some(crate::login::manual_login_hint(state, entry.harness.as_ref())) } else { None },
+                }),
+                "posted a sign-in card",
+            )
+        } else if tool == "request_engine_install" {
+            if status.installed {
+                return Ok(json!({"outcome": "already installed"}));
+            }
+            (
+                name.to_owned(),
+                json!({"type": "engine_setup", "title": format!("Install {label}"), "harness": name, "state": "needs_setup", "owner_only": true,
+                    "options": [{"harness": name, "label": label, "installed": false, "action": {"method": "POST", "path": format!("/api/engines/{name}/install")}}],
+                }),
+                "posted an install card",
+            )
+        } else {
+            return Ok(json!({"outcome": "not allowed"}));
+        }
+    };
+    let (uid, conv, tool) = (owner.to_owned(), conv.to_owned(), tool.to_owned());
+    let (value, posted) = state
+        .db
+        .call(move |c| {
+            db::write_tx(c, |c| {
+                // Recheck membership under the write lock; a joining person revokes private requests.
+                if db::owner_user_id(c)?.as_deref() != Some(&uid)
+                    || db::conversation_member_ids(c, &conv)? != [uid.clone()]
+                {
+                    return Ok((json!({"outcome": "not allowed"}), None));
+                }
+                let mut stmt = c.prepare(
+                    "SELECT id FROM messages WHERE conversation_id = ?1 AND kind = 'card'
+                        AND json_extract(card, '$.type') = ?2
+                        AND COALESCE(json_extract(card, '$.state'), '') NOT IN ('done', 'connected', 'declined', 'approved', 'denied', 'expired', 'cancelled')",
+                )?;
+                let ids = stmt
+                    .query_map(rusqlite::params![conv, card["type"].as_str()], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let messages = ids
+                    .iter()
+                    .filter_map(|id| db::get_message(c, id).transpose())
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if let Some(m) = messages.iter().find(|m| {
+                    m.card.as_ref().is_some_and(|k| {
+                        !resolved(k)
+                            && k["type"] == card["type"]
+                            && (k["harness"] == target || k["service"] == target)
+                    })
+                }) {
+                    return Ok((
+                        json!({"outcome": "card already posted", "card_id": m.id}),
+                        None,
+                    ));
+                }
+                // Global owner budget survives new turns and CLI restarts: at most 6 cards/hour.
+                let key = format!("awareness.requests.{uid}");
+                let raw = db::get_setting(c, &key)?.unwrap_or_default();
+                let mut times: Vec<i64> = serde_json::from_str(&raw).unwrap_or_default();
+                times.retain(|at| *at > now_ms() - 3_600_000);
+                if times.len() >= 6 {
+                    return Ok((
+                        json!({"outcome": "not allowed", "reason": "request limit reached"}),
+                        None,
+                    ));
+                }
+                times.push(now_ms());
+                db::set_setting(c, &key, &json!(times).to_string())?;
+                let mut card = card;
+                card["requested_by"] = "system_request".into();
+                card["request_tool"] = tool.into();
+                let message = entities::insert_card(c, &conv, &card, "assistant")?;
+                if card["type"] == "engine_signin" {
+                    db::set_setting(c, &format!("signin_card.{target}"), &message.id)?;
+                } else if card["type"] == "connector_reconnect"
+                    && let Some(id) = card["connector_id"].as_str() {
+                    db::set_setting(c, &format!("connector_card.{id}"), &message.id)?;
+                }
+                Ok((
+                    json!({"outcome": happened, "card_id": message.id}),
+                    Some(message),
+                ))
+            })
+        })
+        .await?;
+    if let Some(m) = posted {
+        broadcast_created(state, &m).await;
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::{ConnectorConfig, ConnectorState, OAuthConfig};
+
+    fn fixture() -> (tempfile::TempDir, AppState, String, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::browser::tools::tests::test_state(tmp.path());
+        let (owner, conv) = state
+            .db
+            .with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                let conv = db::ensure_main_conversation(c, &owner)?;
+                Ok((owner, conv))
+            })
+            .unwrap();
+        (tmp, state, owner, conv)
+    }
+
+    #[tokio::test]
+    async fn status_projects_only_non_sensitive_fields() {
+        let (_tmp, state, owner, conv) = fixture();
+        let key = state.vault.seal_str("vault-key-canary", "key").unwrap();
+        let token = state
+            .vault
+            .seal_str("connector-token-canary", "connector")
+            .unwrap();
+        let secret = state
+            .vault
+            .encrypt(b"credential-secret-canary", "credential")
+            .unwrap();
+        state.db.with(|c| {
+            entities::set_engine_key(c, "codex", "CODEX_API_KEY", &key)?;
+            entities::insert_connector(c, "mail", "mail", "description-canary", "http", &ConnectorConfig {
+                url: Some("https://connector.example/path-canary?token=url-canary".into()),
+                env: [("KEY".into(), token.clone())].into(),
+                headers: [("Authorization".into(), token.clone())].into(),
+                oauth: Some(OAuthConfig { access_token: Some(token.clone()), refresh_token: Some(token.clone()), client_secret: Some(token.clone()), account: Some("account-canary@example.com".into()), ..Default::default() }),
+                ..Default::default()
+            }, true)?;
+            entities::insert_credential(c, "login", &owner, "login", "label-canary", &json!({"site": "https://shop.example/path-canary?token=url-canary", "username": "username-canary"}), &secret)?;
+            entities::insert_credential(c, "wallet", &owner, "card", "wallet-label-canary", &json!({"last4": "4242", "cardholder": "holder-canary", "exp_year": 2099}), &secret)?;
+            Ok(())
+        }).unwrap();
+        {
+            let mut status = state.harness("codex").unwrap().status.write().unwrap();
+            status.installed = true;
+            status.auth = AuthState::Ok;
+            status.version = Some("1.2.3".into());
+            status.path = Some("/path-canary/bin/codex".into());
+            status.auth_message = Some("auth-message-canary".into());
+        }
+        let value = status(&state, &owner, &conv, "codex", "test-model")
+            .await
+            .unwrap();
+        assert_eq!(value["saved_logins"], json!(["shop.example"]));
+        assert_eq!(value["wallet_cards"], 1);
+        assert_eq!(value["current_turn"]["engine"], "codex");
+        let raw = value.to_string();
+        for forbidden in ["canary", "4242", "2099", key.as_str(), token.as_str()] {
+            assert!(!raw.contains(forbidden), "leaked {forbidden}: {raw}");
+        }
+        assert_eq!(
+            status(&state, "not-owner", &conv, "codex", "test-model")
+                .await
+                .unwrap()["outcome"],
+            "not allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_only_post_cards_and_deduplicate_concurrently() {
+        let (_tmp, state, owner, conv) = fixture();
+        let args = json!({"engine": "codex"});
+        let (a, b) = tokio::join!(
+            request(&state, &owner, &conv, "request_engine_install", &args),
+            request(&state, &owner, &conv, "request_engine_install", &args)
+        );
+        assert_eq!(a.unwrap()["card_id"], b.unwrap()["card_id"]);
+        assert!(state.engine_ops.get("codex").is_none());
+        assert!(state.logins.status("codex").is_none());
+        assert_eq!(
+            state
+                .db
+                .with(|c| entities::list_connectors(c, false))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            state
+                .db
+                .with(|c| db::list_messages(c, &conv, None, 100))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            request(
+                &state,
+                &owner,
+                &conv,
+                "request_engine_install",
+                &json!({"engine": "shell"})
+            )
+            .await
+            .unwrap()["outcome"],
+            "not allowed"
+        );
+        {
+            let mut s = state.harness("claude").unwrap().status.write().unwrap();
+            s.installed = true;
+            s.auth = AuthState::Ok;
+        }
+        assert_eq!(
+            request(
+                &state,
+                &owner,
+                &conv,
+                "request_engine_signin",
+                &json!({"engine": "claude"})
+            )
+            .await
+            .unwrap()["outcome"],
+            "already signed in"
+        );
+        let args = json!({"name": "google"});
+        let a = request(&state, &owner, &conv, "request_connector_setup", &args)
+            .await
+            .unwrap();
+        let b = request(&state, &owner, &conv, "request_connector_setup", &args)
+            .await
+            .unwrap();
+        assert_eq!(a["card_id"], b["card_id"]);
+        assert!(
+            state
+                .db
+                .with(|c| entities::list_connectors(c, false))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn request_budget_survives_conversations_and_turns() {
+        let (_tmp, state, owner, conv) = fixture();
+        for _ in 0..6 {
+            let response = request(
+                &state,
+                &owner,
+                &conv,
+                "request_engine_install",
+                &json!({"engine": "codex"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response["outcome"], "posted an install card");
+            finish(
+                &state,
+                "install",
+                "codex",
+                "declined",
+                "You declined installation.",
+            )
+            .await;
+        }
+        let other = state
+            .db
+            .with(|c| db::create_conversation(c, &owner, "side", "Other", None))
+            .unwrap();
+        assert_eq!(
+            request(
+                &state,
+                &owner,
+                &other.id,
+                "request_engine_install",
+                &json!({"engine": "codex"})
+            )
+            .await
+            .unwrap()["reason"],
+            "request limit reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn completions_resolve_all_stale_cards_and_note_each_conversation_once() {
+        let (_tmp, state, owner, conv) = fixture();
+        state
+            .harness("codex")
+            .unwrap()
+            .status
+            .write()
+            .unwrap()
+            .installed = true;
+        request(
+            &state,
+            &owner,
+            &conv,
+            "request_engine_signin",
+            &json!({"engine": "codex"}),
+        )
+        .await
+        .unwrap();
+        let other = state.db.with(|c| {
+            let other = db::create_conversation(c, &owner, "side", "Other", None)?;
+            for _ in 0..2 { entities::insert_card(c, &other.id, &json!({"type": "engine_signin", "harness": "codex", "title": "Reconnect", "state": "needs_reconnect", "url": "https://signin.example", "user_code": "one-time-canary"}), "assistant")?; }
+            Ok(other)
+        }).unwrap();
+        state.note_auth("codex", AuthState::Ok, None).await;
+        crate::login::on_signed_in(&state, "codex").await;
+        for cid in [&conv, &other.id] {
+            let messages = state
+                .db
+                .with(|c| db::list_messages(c, cid, None, 100))
+                .unwrap();
+            assert_eq!(
+                messages.iter().filter(|m| m.kind == "system_note").count(),
+                1
+            );
+            for m in messages.iter().filter(|m| m.kind == "card") {
+                let card = m.card.as_ref().unwrap();
+                assert_eq!(card["state"], "done");
+                assert!(card["url"].is_null());
+                assert!(card["user_code"].is_null());
+            }
+        }
+        let value = status(&state, &owner, &conv, "codex", "test-model")
+            .await
+            .unwrap();
+        assert!(value["pending_cards"].as_array().unwrap().is_empty());
+        assert!(
+            value["recent_system_notes"][0]
+                .as_str()
+                .unwrap()
+                .contains("signed in ✓")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_installed_engine_resolves_its_install_request_with_a_note() {
+        let (_tmp, state, owner, conv) = fixture();
+        request(
+            &state,
+            &owner,
+            &conv,
+            "request_engine_install",
+            &json!({"engine": "codex"}),
+        )
+        .await
+        .unwrap();
+        state
+            .harness("codex")
+            .unwrap()
+            .status
+            .write()
+            .unwrap()
+            .installed = true;
+        state.note_auth("codex", AuthState::Ok, None).await;
+        let messages = state
+            .db
+            .with(|c| db::list_messages(c, &conv, None, 100))
+            .unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.kind == "system_note" && m.content.contains("installed ✓"))
+        );
+        assert!(
+            messages
+                .iter()
+                .filter(|m| m.kind == "card")
+                .all(|m| m.card.as_ref().unwrap()["state"] == "done")
+        );
+    }
+
+    #[tokio::test]
+    async fn connector_success_resolves_connect_and_reconnect_cards() {
+        let (_tmp, state, owner, conv) = fixture();
+        request(
+            &state,
+            &owner,
+            &conv,
+            "request_connector_setup",
+            &json!({"name": "google"}),
+        )
+        .await
+        .unwrap();
+        state
+            .db
+            .with(|c| {
+                entities::insert_connector(
+                    c,
+                    "google-id",
+                    "google",
+                    "",
+                    "http",
+                    &ConnectorConfig::default(),
+                    true,
+                )?;
+                entities::set_connector_state(
+                    c,
+                    "google-id",
+                    &ConnectorState {
+                        service: Some("google"),
+                        auth_state: Some("needs_reconnect"),
+                        ..Default::default()
+                    },
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let response = request(
+            &state,
+            &owner,
+            &conv,
+            "request_connector_setup",
+            &json!({"name": "google"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["outcome"], "posted a connect card");
+        crate::login::on_connector_updated(&state, "google-id").await;
+        assert!(
+            status(&state, &owner, &conv, "codex", "test-model")
+                .await
+                .unwrap()["recent_system_notes"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        state
+            .db
+            .with(|c| {
+                entities::set_connector_state(
+                    c,
+                    "google-id",
+                    &ConnectorState {
+                        auth_state: Some("ok"),
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+        crate::login::on_connector_updated(&state, "google-id").await;
+        let messages = state
+            .db
+            .with(|c| db::list_messages(c, &conv, None, 100))
+            .unwrap();
+        assert!(
+            messages
+                .iter()
+                .filter(|m| m.kind == "card")
+                .all(|m| m.card.as_ref().unwrap()["state"] == "done")
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.kind == "system_note" && m.content.contains("connected ✓"))
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_token_expires_and_a_join_revokes_status_and_requests() {
+        let (_tmp, state, owner, conv) = fixture();
+        let (_, guard) = crate::gateway::grant_for_turn(&state, &owner, &conv, "main", "turn")
+            .await
+            .unwrap();
+        let token = guard.status_token("codex", "test-model");
+        let envelope = |tool: &str| json!({"token": token, "awareness": true, "request": {"id": 1, "method": "tools/call", "params": {"name": tool, "arguments": {"engine": "codex"}}}});
+        let value = crate::gateway::handle(&state, &envelope("system_status")).await;
+        assert_eq!(value["result"]["current_turn"]["model"], "test-model");
+        state
+            .db
+            .with(|c| {
+                c.execute("INSERT INTO users (id, display_name, is_owner, created_at) VALUES ('guest', 'Guest', 0, 1)", [])?;
+                c.execute("INSERT INTO conversation_members (conversation_id, user_id, role, joined_at) VALUES (?1, 'guest', 'member', ?2)", rusqlite::params![conv, db::join_timestamp(c, &conv)?])?;
+                Ok(())
+            })
+            .unwrap();
+        for tool in TOOLS {
+            assert!(
+                crate::gateway::handle(&state, &envelope(tool))
+                    .await
+                    .get("error")
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            request(
+                &state,
+                &owner,
+                &conv,
+                "request_engine_install",
+                &json!({"engine": "codex"})
+            )
+            .await
+            .unwrap()["outcome"],
+            "not allowed"
+        );
+        drop(guard);
+        assert!(
+            crate::gateway::handle(&state, &envelope("system_status"))
+                .await
+                .get("error")
+                .is_some()
+        );
+    }
+}

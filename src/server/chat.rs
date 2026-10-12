@@ -692,14 +692,29 @@ async fn decide_approval(
         .map_err(|_| ApiError::not_found("message"))?;
     let card = msg
         .card
-        .filter(|c| c["type"] == "approval")
+        .clone()
         .ok_or_else(|| ApiError::bad_request("not an approval card"))?;
-    if card["approver_user_id"].as_str() != Some(user.id()) {
+    let setup_request = card["requested_by"] == "system_request";
+    if setup_request {
+        user.require_owner()?;
+        if body.approve {
+            return Err(ApiError::bad_request("use the card's setup action"));
+        }
+    } else if card["type"] != "approval" {
+        return Err(ApiError::bad_request("not an approval card"));
+    }
+    if !setup_request && card["approver_user_id"].as_str() != Some(user.id()) {
         return Err(ApiError::forbidden(
             "only the person this request is for can decide",
         ));
     }
-    let state_name = if body.approve { "approved" } else { "denied" };
+    let state_name = if setup_request {
+        "declined"
+    } else if body.approve {
+        "approved"
+    } else {
+        "denied"
+    };
     let mid = id.clone();
     // Check and update under the one database lock so two taps cannot both win.
     let updated = state
@@ -709,12 +724,25 @@ async fn decide_approval(
                 return Ok(None);
             };
             let mut card = current.card.unwrap_or_default();
-            if card["state"] != "pending" {
+            if (setup_request && crate::awareness::resolved(&card))
+                || (!setup_request && card["state"] != "pending")
+            {
                 return Ok(None);
             }
             card["state"] = state_name.into();
             card["decided_at"] = crate::util::now_ms().into();
-            db::update_message_card(c, &mid, &card).map(Some)
+            db::write_tx(c, |c| {
+                let updated = db::update_message_card(c, &mid, &card)?;
+                let text = if setup_request {
+                    "You declined the setup request."
+                } else if state_name == "approved" {
+                    "You approved the request. Approval does not mean it has completed."
+                } else {
+                    "You declined the request. Nothing was done."
+                };
+                let note = crate::awareness::insert_note(c, &updated.conversation_id, text)?;
+                Ok(Some((updated, note)))
+            })
         })
         .await?
         .ok_or_else(|| {
@@ -724,6 +752,8 @@ async fn decide_approval(
                 "this was already decided or has expired",
             )
         })?;
+    let (updated, note) = updated;
+    crate::awareness::broadcast_created(&state, &note).await;
     // Release the held connector call, if one is waiting.
     crate::gateway::decided(&state, &id, body.approve);
     crate::login::broadcast_updated(&state, &updated).await;

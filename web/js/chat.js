@@ -75,6 +75,7 @@ function Assistant({ m, list }) {
 }
 
 function Message({ m, list, members, composing }) {
+  if (m.kind === 'system_note') return html`<div class="system-note" role="status">${m.content}</div>`;
   if (m.kind === 'card') return html`<${Card} m=${m} inactive=${composing} />`;
   if (m.role === 'user') {
     const mine = m.author_user_id === S.me?.user?.id;

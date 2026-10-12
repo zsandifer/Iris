@@ -3,6 +3,7 @@
 
 mod agent;
 mod auth;
+mod awareness;
 mod browser;
 mod catalog;
 mod classifier;
@@ -240,6 +241,7 @@ fn run(args: Args) -> Result<()> {
                 shared: args.has("--shared"),
                 workdir: args.value("--workdir").map(PathBuf::from),
                 agent,
+                status_token: std::env::var("IRIS_STATUS_TOKEN").ok(),
             })
         }
         ["mcp-gateway"] => {
@@ -401,6 +403,12 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
         let probe = state.clone();
         tokio::spawn(async move {
             probe.refresh_harnesses().await;
+            // Reconcile cards left by an older daemon against persisted connection state.
+            if let Ok(connectors) = probe.db.call(|c| entities::list_connectors(c, false)).await {
+                for connector in connectors {
+                    login::on_connector_updated(&probe, &connector.id).await;
+                }
+            }
             probe.check_recommendations().await;
             setup::post_setup_card_if_needed(&probe).await;
             // Jobs start once engines are known; before the first probe

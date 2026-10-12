@@ -573,6 +573,7 @@ async fn create_connector(
         .await;
     match res {
         Ok(con) => {
+            crate::login::on_connector_updated(&state, &con.id).await;
             crate::connectors::broadcast_changed(&state).await;
             ok(json!({"connector": con.public_json()}))
         }
@@ -702,7 +703,7 @@ async fn update_connector(
     if touches_config || !enabled {
         crate::gateway::stop(&state, &cid).await;
     }
-    if touches_config {
+    if touches_config || enabled {
         crate::login::on_connector_updated(&state, &cid).await;
     }
     crate::connectors::broadcast_changed(&state).await;

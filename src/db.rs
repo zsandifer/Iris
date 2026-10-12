@@ -387,6 +387,32 @@ CREATE TRIGGER conversation_member_removed AFTER DELETE ON conversation_members 
     UPDATE conversations SET membership_version = membership_version + 1 WHERE id = OLD.conversation_id;
 END;
 "#,
+    r#"
+CREATE TABLE messages_new (
+    id              TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role            TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    author_user_id  TEXT REFERENCES users(id) ON DELETE SET NULL,
+    kind            TEXT NOT NULL DEFAULT 'text' CHECK (kind IN ('text', 'card', 'system_note')),
+    content         TEXT NOT NULL,
+    attachments     TEXT NOT NULL DEFAULT '[]',
+    card            TEXT,
+    status          TEXT NOT NULL DEFAULT 'complete',
+    harness         TEXT,
+    model           TEXT,
+    effort          TEXT,
+    meta            TEXT NOT NULL DEFAULT '{}',
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+INSERT INTO messages_new SELECT * FROM messages;
+DROP TABLE messages;
+ALTER TABLE messages_new RENAME TO messages;
+CREATE INDEX messages_conversation ON messages(conversation_id, created_at);
+CREATE INDEX messages_created ON messages(created_at);
+CREATE INDEX messages_pending_approvals ON messages(conversation_id, created_at)
+WHERE kind = 'card' AND json_extract(card, '$.type') = 'approval' AND json_extract(card, '$.state') = 'pending';
+"#,
 ];
 
 /// Run `f` in a write transaction taken up front (`BEGIN IMMEDIATE`), so a
@@ -1602,15 +1628,44 @@ mod tests {
     }
 
     #[test]
-    fn membership_migration_discards_existing_shared_sessions_only() {
+    fn system_note_migration_preserves_history_and_indexes() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("iris.db");
-        let (private, shared) = {
+        let (conv, text_id, card_id) = {
             let c = Connection::open(&path).unwrap();
             for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
                 c.execute_batch(sql).unwrap();
             }
             c.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
+                .unwrap();
+            let owner = ensure_owner(&c).unwrap();
+            let conv = ensure_main_conversation(&c, &owner).unwrap();
+            let message = insert_message(&c, &text(&conv, &owner, "Existing history")).unwrap();
+            let card = crate::entities::insert_card(&c, &conv, &serde_json::json!({"type": "engine_signin", "title": "Sign in", "state": "needs_reconnect"}), "assistant").unwrap();
+            (conv, message.id, card.id)
+        };
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            assert_eq!(get_message(c, &text_id)?.unwrap().content, "Existing history");
+            assert_eq!(get_message(c, &card_id)?.unwrap().card.unwrap()["state"], "needs_reconnect");
+            crate::awareness::insert_note(c, &conv, "Engine signed in ✓")?;
+            let indexes: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages' AND name IN ('messages_conversation', 'messages_created', 'messages_pending_approvals')", [], |r| r.get(0))?;
+            assert_eq!(indexes, 3);
+            assert!(!c.prepare("PRAGMA foreign_key_check")?.exists([])?);
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn membership_migration_discards_existing_shared_sessions_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        let (private, shared) = {
+            let c = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..MIGRATIONS.len() - 2] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.pragma_update(None, "user_version", (MIGRATIONS.len() - 2) as i64)
                 .unwrap();
             let owner = ensure_owner(&c).unwrap();
             let private = create_conversation(&c, &owner, "side", "Private", None)

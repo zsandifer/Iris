@@ -495,6 +495,16 @@ async fn publish(state: &AppState, harness: &str) {
             json!({"type": "harness.login", "login": status}),
         );
     }
+    if status.state == "cancelled" {
+        crate::awareness::finish(
+            state,
+            "signin",
+            harness,
+            "declined",
+            &format!("You declined sign-in to {}.", engine_label(harness)),
+        )
+        .await;
+    }
     update_card(state, harness, move |card| {
         card["state"] = status.state.into();
         card["url"] = status.url.clone().map_or(Value::Null, Value::from);
@@ -521,25 +531,27 @@ pub fn engine_label(harness: &str) -> &'static str {
 
 /// Update the stored sign-in card for a harness and broadcast it.
 async fn update_card(state: &AppState, harness: &str, f: impl FnOnce(&mut Value) + Send + 'static) {
-    let key = card_key(harness);
-    let updated = state
-        .db
-        .call(move |c| {
-            let Some(id) = db::get_setting(c, &key)? else {
-                return Ok(None);
-            };
-            let Some(msg) = db::get_message(c, &id)? else {
-                return Ok(None);
-            };
-            let mut card = msg.card.clone().unwrap_or(Value::Null);
-            f(&mut card);
-            db::update_message_card(c, &id, &card).map(Some)
-        })
-        .await
-        .ok()
-        .flatten();
-    if let Some(m) = updated {
-        broadcast_updated(state, &m).await;
+    let harness = harness.to_owned();
+    let updated = state.db.call(move |c| {
+        let mut stmt = c.prepare("SELECT id FROM messages WHERE kind = 'card' AND json_extract(card, '$.type') = 'engine_signin' AND json_extract(card, '$.harness') = ?1")?;
+        let ids = stmt.query_map([&harness], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut cards: Vec<_> = ids.iter().filter_map(|id| db::get_message(c, id).transpose()).collect::<rusqlite::Result<Vec<_>>>()?;
+        // Build the state patch once; every open card follows this same login session.
+        let mut patch = json!({});
+        f(&mut patch);
+        let mut updated = Vec::new();
+        for m in cards.drain(..) {
+            let mut card = m.card.unwrap_or(Value::Null);
+            if crate::awareness::resolved(&card) { continue; }
+            for (key, value) in patch.as_object().into_iter().flatten() { card[key] = value.clone(); }
+            updated.push(db::update_message_card(c, &m.id, &card)?);
+        }
+        Ok(updated)
+    }).await;
+    if let Ok(messages) = updated {
+        for m in messages {
+            broadcast_updated(state, &m).await;
+        }
     }
 }
 
@@ -643,7 +655,9 @@ pub async fn post_signin_card(state: &AppState, harness: &str, first_time: bool)
             // Reuse an open card from this outage instead of stacking more.
             if let Some(id) = db::get_setting(c, &key)?
                 && let Some(m) = db::get_message(c, &id)?
-                && m.card.as_ref().is_some_and(|k| k["state"] != "connected")
+                && m.card
+                    .as_ref()
+                    .is_some_and(|k| !crate::awareness::resolved(k))
             {
                 let mut k = m.card.clone().unwrap_or(Value::Null);
                 k["body"] = b.into();
@@ -688,16 +702,21 @@ pub async fn post_signin_card(state: &AppState, harness: &str, first_time: bool)
 
 /// A harness is signed in again: close its card.
 pub async fn on_signed_in(state: &AppState, harness: &str) {
-    let label = engine_label(harness);
-    update_card(state, harness, move |card| {
-        if card["state"] != "connected" {
-            card["state"] = "connected".into();
-            card["body"] = format!("{label} is connected again.").into();
-            card["url"] = Value::Null;
-            card["user_code"] = Value::Null;
-            card["error"] = Value::Null;
-        }
-    })
+    crate::awareness::finish(
+        state,
+        "install",
+        harness,
+        "done",
+        &format!("{} installed ✓", engine_label(harness)),
+    )
+    .await;
+    crate::awareness::finish(
+        state,
+        "signin",
+        harness,
+        "done",
+        &format!("{} is signed in ✓", engine_label(harness)),
+    )
     .await;
 }
 
@@ -721,7 +740,9 @@ pub async fn on_connector_auth_error(state: &AppState, server: &str) {
             let key = format!("connector_card.{}", con.id);
             if let Some(id) = db::get_setting(c, &key)?
                 && let Some(m) = db::get_message(c, &id)?
-                && m.card.as_ref().is_some_and(|k| k["state"] != "connected")
+                && m.card
+                    .as_ref()
+                    .is_some_and(|k| !crate::awareness::resolved(k))
             {
                 return Ok(None);
             }
@@ -779,29 +800,16 @@ pub async fn on_connector_auth_error(state: &AppState, server: &str) {
 
 /// The owner updated a connector's settings: close its reconnect card.
 pub async fn on_connector_updated(state: &AppState, connector_id: &str) {
-    let key = format!("connector_card.{connector_id}");
-    let updated = state
+    let id = connector_id.to_owned();
+    let con = state
         .db
-        .call(move |c| {
-            let Some(id) = db::get_setting(c, &key)? else {
-                return Ok(None);
-            };
-            let Some(m) = db::get_message(c, &id)? else {
-                return Ok(None);
-            };
-            let mut card = m.card.clone().unwrap_or(Value::Null);
-            if card["state"] == "connected" {
-                return Ok(None);
-            }
-            card["state"] = "connected".into();
-            card["body"] = "Connected again. I'll use it from now on.".into();
-            db::update_message_card(c, &id, &card).map(Some)
-        })
+        .call(move |c| crate::entities::get_connector(c, &id))
         .await
         .ok()
         .flatten();
-    if let Some(m) = updated {
-        broadcast_updated(state, &m).await;
+    if let Some(con) = con.filter(|c| c.auth_state == "ok") {
+        let note = format!("{} connected ✓", crate::gateway::service_label(&con));
+        crate::awareness::finish(state, "connector", &con.id, "done", &note).await;
     }
 }
 
