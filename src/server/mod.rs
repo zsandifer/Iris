@@ -3,12 +3,14 @@
 //! requires a device token.
 
 pub(crate) mod admin;
+mod browser;
 mod chat;
 mod connect;
 mod content;
 mod web;
 mod ws;
 
+pub use browser::{ALLOW_NO_SANDBOX, broadcast as browser_broadcast};
 pub use chat::sniff_image;
 
 use crate::auth::{self, PairError};
@@ -174,6 +176,7 @@ pub fn router(state: AppState) -> Router {
         .merge(chat::routes())
         .merge(content::routes())
         .merge(admin::routes())
+        .merge(browser::routes())
         .merge(connect::routes())
         .route("/ws", get(ws::handler))
         .layer(DefaultBodyLimit::max(upload_limit));
@@ -411,7 +414,7 @@ async fn user_pairing_code(
 // -------------------------------------------------------------- connectors
 
 /// Reserved MCP server names (the built-in bridge).
-pub const RESERVED_CONNECTOR_NAMES: &[&str] = &["iris"];
+pub const RESERVED_CONNECTOR_NAMES: &[&str] = &["iris", "browser", "iris_browser"];
 
 pub(crate) fn connector_aad(id: &str, field: &str, key: &str) -> String {
     format!("connector:{id}:{field}:{key}")
@@ -448,6 +451,12 @@ pub async fn serve(state: AppState) -> Result<()> {
             "bound to non-loopback address {addr}; make sure it is a private network (e.g. Tailscale)"
         );
     }
+    let sock = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::browser::socket::serve(sock).await {
+            crate::warn!("browser tools are unavailable: {e}");
+        }
+    });
     axum::serve(listener, router(state.clone()))
         .with_graceful_shutdown(shutdown_signal(state.clone()))
         .await?;
@@ -494,10 +503,12 @@ async fn shutdown_signal(state: AppState) {
             let _ = tx.send(true);
         }
     }
-    // Connector programs Iris started run in their own process groups:
-    // end them (TERM, then KILL shortly after) before exiting.
+    // End grants and held approvals before waiting for process shutdown.
     crate::gateway::cancel_all_grants(&state);
     crate::gateway::cancel_approvals(&state, None);
+    // Close the browser cleanly so its profile (sign-ins) is saved.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(4), state.browser.close()).await;
+    // End connector programs Iris started before the runtime goes away.
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         crate::gateway::stop_all(&state),
@@ -2271,6 +2282,7 @@ n=0
 while ! mkdir "{d}/runs/$n" 2>/dev/null; do n=$((n+1)); done
 r="{d}/runs/$n"
 printf '%s\n' "$@" > "$r/args"
+pwd > "$r/cwd"
 prev=""
 for a in "$@"; do
   case "$prev" in
@@ -2474,7 +2486,28 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         t.chat(&t.owner_t, &owner_main, "hi").await;
         let system = t.read(1, "system.md");
         assert!(system.contains("owner-user-fact") && system.contains("owner-memory-fact"));
-        assert!(t.read(1, "args").contains(&memory));
+        assert!(!t.read(1, "args").contains("--add-dir"));
+        assert!(system.contains("read_memory") && system.contains("write_memory"));
+        let guest_main = t.main_of(&t.guest_t).await;
+        assert_eq!(
+            t.read(0, "cwd").trim(),
+            t.h.state
+                .paths
+                .workspace_dir()
+                .join(guest_main)
+                .to_str()
+                .unwrap()
+        );
+        assert_eq!(
+            t.read(1, "cwd").trim(),
+            t.h.state
+                .paths
+                .workspace_dir()
+                .join(&owner_main)
+                .to_str()
+                .unwrap()
+        );
+        assert_ne!(t.read(0, "cwd"), t.read(1, "cwd"));
         // Only Iris's MCP servers there too (the CLI's own would bypass the
         // connector gateway).
         assert!(t.read(1, "args").contains("--strict-mcp-config"));

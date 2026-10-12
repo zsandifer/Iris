@@ -15,7 +15,6 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 const SUPPORTED_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-const MAX_LIBRARY_BYTES: u64 = 20 * 1024 * 1024;
 
 pub struct Bridge {
     pub db: Db,
@@ -29,6 +28,7 @@ pub struct Bridge {
     /// (Gemini runs in a per-conversation folder); relative library paths
     /// resolve against it.
     pub workdir: Option<PathBuf>,
+    pub agent: crate::config::AgentConfig,
 }
 
 /// Tools available in shared (group) conversations.
@@ -36,6 +36,64 @@ const SHARED_TOOLS: &[&str] = &["create_card"];
 
 /// Run the stdio loop until stdin closes.
 pub fn run(bridge: Bridge) -> Result<()> {
+    serve_stdio(|req| bridge.handle(req))
+}
+
+/// `iris mcp --browser`: the `browser` tools. Calls are forwarded to the
+/// server that owns Iris's browser (see `browser::socket`); this process
+/// never touches the browser, the vault, or the database itself.
+pub struct BrowserBridge {
+    pub socket: PathBuf,
+    /// Identifies the turn (from `IRIS_BROWSER_TOKEN`).
+    pub token: String,
+}
+
+impl BrowserBridge {
+    pub fn handle(&self, req: &Value) -> Option<Value> {
+        let id = req.get("id").cloned()?;
+        let result = match req["method"].as_str().unwrap_or("") {
+            "initialize" => initialize_result(
+                req,
+                "browser",
+                "Iris's own web browser, which the user can watch and take over from \
+                 their phone. Saved logins and cards are filled in by Iris; you never see them.",
+            ),
+            "ping" => json!({}),
+            "tools/list" => json!({"tools": crate::browser::tools::definitions()}),
+            "tools/call" => crate::browser::socket::forward(
+                &self.socket,
+                &self.token,
+                req["params"]["name"].as_str().unwrap_or(""),
+                &req["params"]
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            ),
+            "resources/list" => json!({"resources": []}),
+            "prompts/list" => json!({"prompts": []}),
+            _ => return Some(error_response(id, -32601, "method not found")),
+        };
+        Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+    }
+}
+
+fn initialize_result(req: &Value, name: &str, instructions: &str) -> Value {
+    let requested = req["params"]["protocolVersion"].as_str().unwrap_or("");
+    let version = if SUPPORTED_VERSIONS.contains(&requested) {
+        requested
+    } else {
+        SUPPORTED_VERSIONS[1]
+    };
+    json!({
+        "protocolVersion": version,
+        "capabilities": {"tools": {"listChanged": false}},
+        "serverInfo": {"name": name, "version": env!("CARGO_PKG_VERSION")},
+        "instructions": instructions,
+    })
+}
+
+/// JSON-RPC over stdio, one message per line.
+pub fn serve_stdio(handle: impl Fn(&Value) -> Option<Value>) -> Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -44,7 +102,7 @@ pub fn run(bridge: Bridge) -> Result<()> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(req) => bridge.handle(&req),
+            Ok(req) => handle(&req),
             Err(_) => Some(error_response(Value::Null, -32700, "parse error")),
         };
         if let Some(resp) = response {
@@ -75,6 +133,18 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 pub fn tool_definitions() -> Vec<Value> {
     let s = |d: &str| json!({"type": "string", "description": d});
     vec![
+        tool(
+            "read_memory",
+            "Read an owner memory Markdown file through Iris.",
+            json!({"path": s("Relative Markdown path")}),
+            &["path"],
+        ),
+        tool(
+            "write_memory",
+            "Write an owner memory Markdown file through Iris.",
+            json!({"path": s("Relative Markdown path"), "content": s("Markdown content")}),
+            &["path", "content"],
+        ),
         tool(
             "list_goals",
             "List the user's goals (open ones first).",
@@ -203,27 +273,21 @@ impl Bridge {
             return None;
         };
         let result = match method {
-            "initialize" => {
-                let requested = req["params"]["protocolVersion"].as_str().unwrap_or("");
-                let version = if SUPPORTED_VERSIONS.contains(&requested) {
-                    requested
-                } else {
-                    SUPPORTED_VERSIONS[1]
-                };
-                json!({
-                    "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}},
-                    "serverInfo": {"name": "iris", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Iris app bridge: update the user's goals, ideas, feed, \
-                        library, and show cards in the chat.",
-                })
-            }
+            "initialize" => initialize_result(
+                req,
+                "iris",
+                "Iris app bridge: update the user's goals, ideas, feed, library, and show \
+                 cards in the chat.",
+            ),
             "ping" => json!({}),
             "tools/list" => {
                 let tools: Vec<Value> = tool_definitions()
                     .into_iter()
                     .filter(|t| {
-                        !self.shared || SHARED_TOOLS.contains(&t["name"].as_str().unwrap_or(""))
+                        let name = t["name"].as_str().unwrap_or("");
+                        (!self.shared || SHARED_TOOLS.contains(&name))
+                            && (!matches!(name, "read_memory" | "write_memory")
+                                || self.owner_context())
                     })
                     .collect();
                 json!({"tools": tools})
@@ -273,6 +337,49 @@ impl Bridge {
         let uid = self.user_id.as_str();
         let db_err = |e: crate::util::BoxError| e.to_string();
         match name {
+            "read_memory" | "write_memory" => {
+                if !self.owner_context() {
+                    return Err(
+                        "memory is only available in the owner's private conversations".into(),
+                    );
+                }
+                let path = s("path").ok_or("path is required")?;
+                let relative = Path::new(path);
+                if relative.is_absolute()
+                    || relative.extension().and_then(|e| e.to_str()) != Some("md")
+                    || relative
+                        .components()
+                        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                {
+                    return Err("memory path must be a relative Markdown path".into());
+                }
+                let root = self.paths.memory_dir();
+                if name == "read_memory" {
+                    let bytes = crate::agent::read_scoped_file(&root, path).map_err(db_err)?;
+                    let text = String::from_utf8(bytes).map_err(|_| "memory must be UTF-8")?;
+                    Ok(json!({"content": text}))
+                } else {
+                    let content = s("content").ok_or("content is required")?;
+                    check_text("content", content, MAX_BODY, false)?;
+                    let dest = root.join(relative);
+                    let parent = dest.parent().ok_or("invalid memory path")?;
+                    // Only Iris writes the memory tree; never follow a planted symlink.
+                    let mut dir = root.clone();
+                    for component in relative.parent().unwrap_or(Path::new("")).components() {
+                        dir.push(component);
+                        if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink())
+                        {
+                            return Err("memory path cannot contain symlinks".into());
+                        }
+                        ensure_private_dir(&dir).map_err(db_err)?;
+                    }
+                    if parent.canonicalize().map_err(|_| "invalid memory folder")? != parent {
+                        return Err("invalid memory folder".into());
+                    }
+                    write_private_file(&dest, content.as_bytes()).map_err(db_err)?;
+                    Ok(json!({"written": true}))
+                }
+            }
             "list_goals" => {
                 let include_done = a["include_done"].as_bool().unwrap_or(false);
                 let goals = self
@@ -463,12 +570,20 @@ impl Bridge {
                 (mime.to_string(), content.len() as i64, file_name)
             }
             (None, Some(path)) => {
-                let src = self.resolve_agent_file(path)?;
-                let meta = std::fs::metadata(&src).map_err(|_| "file not found")?;
-                if meta.len() > MAX_LIBRARY_BYTES {
-                    return Err("file is larger than 20 MB".into());
-                }
-                let ext = src
+                let bytes = if self.agent.user.is_empty() {
+                    let root = self.conversation_workdir()?;
+                    crate::agent::read_scoped_file(&root, path).map_err(|e| e.to_string())?
+                } else {
+                    crate::agent::read_file(
+                        &self.agent,
+                        self.conversation_id
+                            .as_deref()
+                            .ok_or("no current conversation")?,
+                        path,
+                    )
+                    .map_err(|e| e.to_string())?
+                };
+                let ext = Path::new(path)
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("bin")
@@ -477,7 +592,6 @@ impl Bridge {
                     .map(String::from)
                     .unwrap_or_else(|| mime_for_ext(&ext).to_string());
                 let file_name = format!("{id}.{}", sanitize_ext(&ext));
-                let bytes = std::fs::read(&src).map_err(|e| e.to_string())?;
                 write_private_file(&lib.join(&file_name), &bytes).map_err(|e| e.to_string())?;
                 (mime, bytes.len() as i64, file_name)
             }
@@ -518,45 +632,19 @@ impl Bridge {
         Ok(json!({"item": item}))
     }
 
-    /// Only files inside the agent's workspace (or, in the owner's own
-    /// chats, memory) folder can be saved, and never through symlinks.
-    /// Relative paths resolve against the harness's working directory.
-    fn resolve_agent_file(&self, path: &str) -> std::result::Result<PathBuf, String> {
-        let workspace = self.paths.workspace_dir();
-        let base = self
-            .workdir
-            .as_ref()
-            .filter(|w| match (w.canonicalize(), workspace.canonicalize()) {
-                (Ok(w), Ok(ws)) => w.starts_with(ws),
-                _ => false,
-            })
-            .cloned()
-            .unwrap_or_else(|| workspace.clone());
-        let candidate = if Path::new(path).is_absolute() {
-            PathBuf::from(path)
-        } else {
-            base.join(path)
-        };
-        let real = candidate
-            .canonicalize()
-            .map_err(|_| "file not found".to_string())?;
-        let mut roots = vec![workspace];
-        if self.owner_context() {
-            roots.push(self.paths.memory_dir());
+    fn conversation_workdir(&self) -> std::result::Result<PathBuf, String> {
+        let id = self
+            .conversation_id
+            .as_deref()
+            .ok_or("no current conversation")?;
+        if !crate::agent::valid_scope(id) {
+            return Err("invalid conversation id".into());
         }
-        let allowed = roots
-            .iter()
-            .filter_map(|d| d.canonicalize().ok())
-            .any(|d| real.starts_with(d));
-        let is_link = std::fs::symlink_metadata(&candidate)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(true);
-        if !allowed || is_link || !real.is_file() {
-            return Err(
-                "only regular files in the working folder or memory folder can be saved".into(),
-            );
+        let expected = self.paths.workspace_dir().join(id);
+        if self.workdir.as_ref().is_some_and(|w| w != &expected) {
+            return Err("working directory does not match the conversation".into());
         }
-        Ok(real)
+        Ok(expected)
     }
 }
 
@@ -618,6 +706,7 @@ mod tests {
                 Ok((u, m))
             })
             .unwrap();
+        crate::agent::workdir(&crate::config::AgentConfig::default(), &paths, &conv).unwrap();
         Bridge {
             db,
             paths,
@@ -625,6 +714,7 @@ mod tests {
             conversation_id: Some(conv),
             shared: false,
             workdir: None,
+            agent: crate::config::AgentConfig::default(),
         }
     }
 
@@ -689,6 +779,34 @@ mod tests {
             .handle(&json!({"jsonrpc": "2.0", "id": 4, "method": "bogus"}))
             .unwrap();
         assert_eq!(unknown["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn browser_bridge_lists_tools_and_forwards_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = BrowserBridge {
+            socket: tmp.path().join("missing.sock"),
+            token: "t".into(),
+        };
+        let init = b
+            .handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                            "params": {"protocolVersion": "2025-06-18"}}))
+            .unwrap();
+        assert_eq!(init["result"]["serverInfo"]["name"], "browser");
+        let tools = b
+            .handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+            .unwrap();
+        assert!(tools["result"]["tools"].as_array().unwrap().len() > 5);
+        // No server: a friendly tool error, not a protocol error.
+        let r = b
+            .handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                            "params": {"name": "snapshot", "arguments": {}}}))
+            .unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        assert!(
+            b.handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+                .is_none()
+        );
     }
 
     #[test]
@@ -782,7 +900,7 @@ mod tests {
         );
         assert_eq!(r["structuredContent"]["item"]["mime"], "text/markdown");
         std::fs::write(
-            b.paths.workspace_dir().join("chart.png"),
+            b.conversation_workdir().unwrap().join("chart.png"),
             b"\x89PNG\r\n\x1a\n",
         )
         .unwrap();
@@ -805,8 +923,11 @@ mod tests {
             json!({"title": "x", "path": "../iris.db"}),
         );
         assert_eq!(r["isError"], true);
-        std::os::unix::fs::symlink("/etc/hostname", b.paths.workspace_dir().join("link.txt"))
-            .unwrap();
+        std::os::unix::fs::symlink(
+            "/etc/hostname",
+            b.conversation_workdir().unwrap().join("link.txt"),
+        )
+        .unwrap();
         let r = call(
             &b,
             "save_to_library",
@@ -822,7 +943,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut b = bridge(tmp.path());
         let ws = b.paths.workspace_dir();
-        let gem = ws.join("gemini/c1");
+        let gem = ws.join(b.conversation_id.as_deref().unwrap());
         std::fs::create_dir_all(&gem).unwrap();
         std::fs::write(gem.join("report.md"), "# From Gemini").unwrap();
         std::fs::write(ws.join("report.md"), "# Unrelated").unwrap();
@@ -837,7 +958,7 @@ mod tests {
             r["structuredContent"]["item"]["size"],
             "# From Gemini".len()
         );
-        // A working folder outside the workspace is ignored.
+        // A working folder outside this conversation is refused.
         b.workdir = Some(tmp.path().to_path_buf());
         std::fs::write(tmp.path().join("report.md"), "# Outside").unwrap();
         let r = call(
@@ -845,7 +966,68 @@ mod tests {
             "save_to_library",
             json!({"title": "Report", "path": "report.md"}),
         );
-        assert_eq!(r["structuredContent"]["item"]["size"], "# Unrelated".len());
+        assert_eq!(r["isError"], true);
+    }
+
+    #[test]
+    fn library_cannot_save_other_conversations_or_symlinked_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = bridge(tmp.path());
+        let other = b.paths.workspace_dir().join("another-chat");
+        std::fs::create_dir(&other).unwrap();
+        let file = other.join("report.md");
+        std::fs::write(&file, "another conversation").unwrap();
+        let r = call(
+            &b,
+            "save_to_library",
+            json!({"title": "report", "path": file}),
+        );
+        assert_eq!(r["isError"], true);
+        std::os::unix::fs::symlink(&other, b.conversation_workdir().unwrap().join("link")).unwrap();
+        let r = call(
+            &b,
+            "save_to_library",
+            json!({"title": "report", "path": "link/report.md"}),
+        );
+        assert_eq!(r["isError"], true);
+    }
+
+    #[test]
+    fn memory_tools_are_owner_only_and_reject_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = bridge(tmp.path());
+        let r = call(
+            &b,
+            "write_memory",
+            json!({"path": "notes/preferences.md", "content": "Prefers mornings."}),
+        );
+        assert_eq!(r["isError"], false, "{r}");
+        let r = call(&b, "read_memory", json!({"path": "notes/preferences.md"}));
+        assert_eq!(r["structuredContent"]["content"], "Prefers mornings.");
+        for path in ["../iris.db", "/etc/example.md", "../outside.md", "file.txt"] {
+            let r = call(&b, "write_memory", json!({"path": path, "content": "x"}));
+            assert_eq!(r["isError"], true, "{path}");
+        }
+        std::os::unix::fs::symlink(tmp.path(), b.paths.memory_dir().join("link")).unwrap();
+        let r = call(
+            &b,
+            "write_memory",
+            json!({"path": "link/outside.md", "content": "x"}),
+        );
+        assert_eq!(r["isError"], true);
+        b.shared = true;
+        for name in ["read_memory", "write_memory"] {
+            let r = call(&b, name, json!({"path": "MEMORY.md", "content": "x"}));
+            assert_eq!(r["isError"], true);
+        }
+        let listed = b.handle(&json!({"id": 1, "method": "tools/list"})).unwrap();
+        assert!(
+            !listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "read_memory" || t["name"] == "write_memory")
+        );
     }
 
     #[test]
@@ -873,7 +1055,7 @@ mod tests {
             1
         );
         let r = call(&b, "save_to_library", json!({"title": "d", "path": diary}));
-        assert_eq!(r["isError"], false, "{r}");
+        assert_eq!(r["isError"], true, "{r}");
         // Another person's own chat: neither.
         let guest = b
             .db

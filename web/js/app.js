@@ -11,7 +11,8 @@ import {
 import { ChatScreen } from './chat.js';
 import { FeedScreen, StoryViewer, FeedSettings } from './feed.js';
 import { IdeasScreen, GoalsScreen, LibraryScreen } from './lists.js';
-import { Hub, Logins, Computer, Files, FileEditor, Folder } from './hub.js';
+import { Hub, Logins, Files, FileEditor, Folder } from './hub.js';
+import { Computer } from './computer.js';
 import { Connections, AddService, ConnectorPage, ConnectorForm, TrustedPeople } from './connect.js';
 import { Settings, AiEngine, Devices, People, ActivityLog } from './settings.js';
 import { isIOS, standalone, syncPush, resetPush } from './push.js';

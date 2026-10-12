@@ -1672,7 +1672,7 @@ pub async fn needs_sign_in(state: &AppState, con: &Connector) {
 
 // ---------------------------------------------------------------- approvals
 
-enum Answer {
+pub(crate) enum Answer {
     Approved,
     Denied,
     Expired,
@@ -1711,8 +1711,23 @@ async fn ask(
         // Shown above the reply of the turn that asked.
         card["turn_message_id"] = grant.message_id.clone().into();
     }
+    hold_approval(state, grant, &con.id, card, Some(call))
+        .await
+        .0
+}
+
+/// One approval mechanism for connector calls and vault card fills. Cards
+/// are posted privately, expire, and are cancelled with their source/turn.
+async fn hold_approval(
+    state: &AppState,
+    grant: &Grant,
+    source_id: &str,
+    card: Value,
+    call: Option<&ConnectorCall>,
+) -> (Answer, Option<db::Message>) {
+    let timeout = Duration::from_secs(state.cfg.approval_timeout_secs());
     let conv = grant.card_conversation_id.clone();
-    let epoch = state.gateway.cancel_epoch(&con.id);
+    let epoch = state.gateway.cancel_epoch(source_id);
     let private = grant.private_conversation.clone();
     let owner = grant.owner_user_id.clone();
     let cancelled = grant.cancel.subscribe();
@@ -1742,7 +1757,7 @@ async fn ask(
         .await;
     let Ok(Some(msg)) = inserted else {
         grant.cancel.send_replace(true);
-        return Answer::Cancelled;
+        return (Answer::Cancelled, None);
     };
     let (tx, rx) = oneshot::channel();
     state
@@ -1750,7 +1765,7 @@ async fn ask(
         .pending
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(msg.id.clone(), (con.id.clone(), tx));
+        .insert(msg.id.clone(), (source_id.to_string(), tx));
     // Between posting the card and waiting on it, the owner may already
     // have decided it, or its approvals may have been cancelled.
     let id = msg.id.clone();
@@ -1764,22 +1779,24 @@ async fn ask(
         Ok(Some(card)) if card["state"] == "pending" => None,
         _ => Some(Answer::Cancelled),
     }
-    .or_else(|| (state.gateway.cancel_epoch(&con.id) != epoch).then_some(Answer::Cancelled));
-    let mut c = call.clone();
-    c.card_message_id = Some(msg.id.clone());
-    record(state, &c).await;
+    .or_else(|| (state.gateway.cancel_epoch(source_id) != epoch).then_some(Answer::Cancelled));
+    if let Some(call) = call {
+        let mut c = call.clone();
+        c.card_message_id = Some(msg.id.clone());
+        record(state, &c).await;
+    }
     crate::notify::push_users(
         state,
         std::slice::from_ref(&grant.owner_user_id),
         json!({
             "title": format!("{} needs your OK", state.agent_name().await),
-            "body": truncate_chars(&p.title, 180),
+            "body": truncate_chars(&msg.content, 180),
             "conversation_id": msg.conversation_id,
             "message_id": msg.id,
             "kind": "approval",
         }),
     );
-    crate::info!("connector {}: {} waiting for approval", con.name, call.tool);
+    crate::info!("approval {} waiting", msg.id);
     let mut cancel = grant.cancel.subscribe();
     let answer = match early {
         Some(a) => a,
@@ -1814,14 +1831,42 @@ async fn ask(
         _ => Answer::Expired,
     };
     // An approval is recorded when the call is admitted to run.
-    if final_state != "approved" {
+    if final_state != "approved"
+        && let Some(call) = call
+    {
         let (id, d) = (call.id.clone(), final_state.clone());
         let _ = state
             .db
             .call(move |c| entities::set_call_decision(c, &id, &d, None))
             .await;
     }
-    decision
+    (decision, Some(msg))
+}
+
+/// Hold a wallet fill through the gateway's ordinary approval mechanism.
+pub(crate) async fn approve_browser_card(
+    state: &AppState,
+    ctx: &crate::browser::TurnCtx,
+    mut card: Value,
+) -> (Answer, Option<db::Message>) {
+    const SOURCE: &str = "iris-browser-wallet";
+    card["expires_at"] = (now_ms() + state.cfg.approval_timeout_secs() as i64 * 1000).into();
+    card["turn_message_id"] = ctx.message_id.clone().into();
+    card["category"] = "purchase".into();
+    card["tool"] = "fill_card".into();
+    let grant = Grant {
+        owner_user_id: ctx.user_id.clone(),
+        conversation_id: ctx.conversation_id.clone(),
+        card_conversation_id: ctx.conversation_id.clone(),
+        message_id: ctx.message_id.clone(),
+        private_conversation: Some(ctx.conversation_id.clone()),
+        connectors: Vec::new(),
+        cancel: ctx.cancellation(),
+    };
+    let st = state.clone();
+    tokio::spawn(async move { hold_approval(&st, &grant, SOURCE, card, None).await })
+        .await
+        .unwrap_or((Answer::Cancelled, None))
 }
 
 /// Move a still-pending card to `to`; returns the card's final state.
@@ -1932,17 +1977,26 @@ pub async fn expire_stale_approvals(state: &AppState) {
 
 /// "Disconnect everything": turn every connector off, stop their programs,
 /// and drop waiting approvals. Returns how many were on.
-pub async fn disconnect_all(state: &AppState) -> usize {
-    let n = state
-        .db
-        .call(entities::disable_all_connectors)
-        .await
-        .unwrap_or(0);
-    stop_all(state).await;
+pub async fn disconnect_all(state: &AppState) -> crate::util::Result<usize> {
+    let _switch = state.browser.switch_lock.lock().await;
+    state.browser.set_disconnected(true);
+    cancel_all_grants(state);
     cancel_approvals(state, None);
     crate::oauth::forget_flows(state, None);
+    let disabled = state
+        .db
+        .call(|c| {
+            db::write_tx(c, |c| {
+                db::set_setting(c, "browser.disconnected", "true")?;
+                entities::disable_all_connectors(c)
+            })
+        })
+        .await;
+    // Permissions are revoked before either process shutdown can wait.
+    tokio::join!(stop_all(state), state.browser.close());
+    let n = disabled?;
     crate::warn!("all connectors disconnected by the owner ({n} were on)");
-    n
+    Ok(n)
 }
 
 /// Stop every connector's program or session.
@@ -1971,6 +2025,7 @@ pub async fn stop_all(state: &AppState) {
 /// End connector access for the turns in one conversation (stopped, or
 /// no longer the owner's alone); their waiting approvals are cancelled.
 pub fn cancel_conversation_grants(state: &AppState, conversation_id: &str) {
+    state.browser.end_turns(Some(conversation_id));
     for g in state
         .gateway
         .grants
@@ -1986,6 +2041,7 @@ pub fn cancel_conversation_grants(state: &AppState, conversation_id: &str) {
 /// End every turn's connector access (their waiting approvals are
 /// cancelled).
 pub fn cancel_all_grants(state: &AppState) {
+    state.browser.end_turns(None);
     for g in state
         .gateway
         .grants

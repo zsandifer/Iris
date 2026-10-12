@@ -242,34 +242,53 @@ impl Harness for Codex {
             overrides.push(format!("model_reasoning_effort={}", toml_str(e)));
         }
         overrides.push(developer_instructions_arg(DEVELOPER_NOTE));
+        // Preserve read-only; more permissive modes remain confined to the
+        // conversation's working directory by the workspace profile.
+        let (sandbox, parent) = if !spec.tools || self.cfg.sandbox == "read-only" {
+            ("read-only", ":read-only")
+        } else {
+            ("workspace-write", ":workspace")
+        };
+        overrides.push(format!("sandbox_mode={}", toml_str(sandbox)));
         if !spec.tools {
-            // `--ignore-user-config` (below) drops the user's MCP servers and
-            // settings; Codex cannot remove its shell tool, so it runs in a
-            // read-only sandbox (no writes, no network) with no approvals
-            // and web search off.
-            overrides.extend(
-                [
-                    "sandbox_mode=\"read-only\"",
-                    "approval_policy=\"never\"",
-                    "web_search=\"disabled\"",
-                ]
-                .map(String::from),
-            );
-        } else if !self.cfg.sandbox.is_empty() {
-            overrides.push(format!("sandbox_mode={}", toml_str(&self.cfg.sandbox)));
-            if self.cfg.sandbox == "workspace-write" && !spec.writable_dirs.is_empty() {
-                let roots: Vec<String> = spec
-                    .writable_dirs
-                    .iter()
-                    .map(|d| d.to_string_lossy().into_owned())
-                    .collect();
-                overrides.push(format!(
-                    "sandbox_workspace_write.writable_roots={}",
-                    toml_str_array(&roots)
-                ));
-            }
+            overrides.push("approval_policy=\"never\"".into());
+            overrides.push("web_search=\"disabled\"".into());
         }
-        let exe = std::env::current_exe()?;
+        // Codex 0.162.1's config/permissions.rs recognizes these special
+        // paths. Named profiles ignore legacy sandbox_workspace_write flags;
+        // override the inherited temp write grants in the active profile.
+        let mut filesystem: toml::map::Map<String, toml::Value> = spec
+            .protected_paths
+            .iter()
+            .map(|p| {
+                (
+                    p.to_string_lossy().into_owned(),
+                    toml::Value::String("deny".into()),
+                )
+            })
+            .collect();
+        for path in [":tmpdir", ":slash_tmp"] {
+            filesystem.insert(path.into(), toml::Value::String("read".into()));
+        }
+        let profile = toml::Value::Table(toml::map::Map::from_iter([
+            ("extends".into(), toml::Value::String(parent.into())),
+            ("filesystem".into(), toml::Value::Table(filesystem)),
+        ]));
+        let profiles = toml::Value::Table(toml::map::Map::from_iter([("iris".into(), profile)]));
+        overrides.push(format!("permissions={profiles}"));
+        overrides.push("default_permissions=\"iris\"".into());
+        overrides.push("project_doc_max_bytes=0".into());
+        overrides.push("features.memories=false".into());
+        let exe = if spec.split {
+            spec.mcp_servers
+                .first()
+                .map(|s| match &s.transport {
+                    McpTransport::Stdio { command, .. } => PathBuf::from(command),
+                })
+                .unwrap_or(std::env::current_exe()?)
+        } else {
+            std::env::current_exe()?
+        };
         // Codex merges `-c` overrides into a server of the same name in its
         // own config (whose `url` would then clash with Iris's `command`):
         // Iris's servers get names Codex itself does not use.
@@ -297,16 +316,14 @@ impl Harness for Codex {
             // No AGENTS.md from the shared workspace (an owner's turn could
             // have written one). The global one cannot be switched off; see
             // `can_isolate`.
-            overrides.push("project_doc_max_bytes=0".into());
+        }
+        // Operator extra arguments may add tools: omit them for helpers.
+        if spec.tools {
+            a.extend(self.cfg.extra_args.iter().cloned());
         }
         for o in overrides {
             a.push("-c".into());
             a.push(o);
-        }
-        // Operator `extra_args` could add MCP servers or tools back, so
-        // tool-less runs leave them out.
-        if spec.tools {
-            a.extend(self.cfg.extra_args.iter().cloned());
         }
         if let Some(id) = &spec.resume {
             a.push(id.clone());
@@ -599,6 +616,106 @@ mod tests {
             .collect()
     }
 
+    fn permission_spec(run_dir: &Path) -> TurnSpec {
+        TurnSpec {
+            turn_id: "permission-test".into(),
+            prompt: "hello".into(),
+            images: Vec::new(),
+            system_prompt: "You are Iris".into(),
+            model: "synthetic-model".into(),
+            effort: None,
+            resume: None,
+            mcp_servers: Vec::new(),
+            cwd: "/conversations/c1".into(),
+            writable_dirs: vec!["/unrelated-memory".into()],
+            run_dir: run_dir.into(),
+            scope: "c1".into(),
+            tools: true,
+            key_env: Vec::new(),
+            isolated: false,
+            own_mcp_servers: Vec::new(),
+            protected_paths: vec![
+                "/private/iris".into(),
+                "/private/config".into(),
+                "/home/agent/.codex/auth.json".into(),
+            ],
+            split: false,
+        }
+    }
+
+    fn rendered_config(inv: &Invocation) -> toml::Table {
+        let config = inv
+            .args
+            .windows(2)
+            .filter(|a| a[0] == "-c")
+            .map(|a| a[1].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        toml::from_str(&config).unwrap()
+    }
+
+    #[test]
+    fn read_only_sandbox_stays_read_only_on_new_and_resumed_turns() {
+        let run = tempfile::tempdir().unwrap();
+        let mut spec = permission_spec(run.path());
+        let mut cfg = HarnessConfig::codex_default();
+        cfg.sandbox = "read-only".into();
+        for resume in [None, Some("synthetic-thread".into())] {
+            spec.resume = resume;
+            let inv = Codex::new(cfg.clone()).build(&spec).unwrap();
+            let config = rendered_config(&inv);
+            assert_eq!(config["sandbox_mode"].as_str(), Some("read-only"));
+            assert_eq!(config["default_permissions"].as_str(), Some("iris"));
+            let profile = &config["permissions"]["iris"];
+            assert_eq!(profile["extends"].as_str(), Some(":read-only"));
+            assert!(profile.get("workspace_roots").is_none());
+            assert!(
+                profile["filesystem"]
+                    .as_table()
+                    .unwrap()
+                    .values()
+                    .all(|v| matches!(v.as_str(), Some("read" | "deny")))
+            );
+            assert!(config.get("sandbox_workspace_write").is_none());
+            for path in &spec.protected_paths {
+                assert_eq!(
+                    profile["filesystem"][path.to_str().unwrap()].as_str(),
+                    Some("deny")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn active_workspace_profile_excludes_temp_write_grants() {
+        let run = tempfile::tempdir().unwrap();
+        let mut spec = permission_spec(run.path());
+        for resume in [None, Some("synthetic-thread".into())] {
+            spec.resume = resume;
+            let inv = Codex::new(HarnessConfig::codex_default())
+                .build(&spec)
+                .unwrap();
+            let config = rendered_config(&inv);
+            assert_eq!(config["sandbox_mode"].as_str(), Some("workspace-write"));
+            assert_eq!(config["default_permissions"].as_str(), Some("iris"));
+            let profile = &config["permissions"]["iris"];
+            assert_eq!(profile["extends"].as_str(), Some(":workspace"));
+            // The base grants writes to the runtime cwd; Iris adds no roots.
+            assert_eq!(inv.cwd.as_deref().unwrap_or(&spec.cwd), spec.cwd);
+            assert!(profile.get("workspace_roots").is_none());
+            let filesystem = profile["filesystem"].as_table().unwrap();
+            for path in [":slash_tmp", ":tmpdir"] {
+                assert_eq!(filesystem[path].as_str(), Some("read"));
+            }
+            for path in &spec.protected_paths {
+                assert_eq!(filesystem[path.to_str().unwrap()].as_str(), Some("deny"));
+            }
+            assert_eq!(filesystem.len(), spec.protected_paths.len() + 2);
+            assert!(config.get("sandbox_workspace_write").is_none());
+            assert!(!inv.args.contains(&"--add-dir".into()));
+        }
+    }
+
     #[test]
     fn parses_messages_commands_and_usage() {
         // Synthetic sample modeled on codex-cli 0.162 `exec --json` output.
@@ -734,6 +851,12 @@ mod tests {
             key_env: vec![],
             isolated: false,
             own_mcp_servers: vec!["mine".into()],
+            protected_paths: vec![
+                "/private/iris".into(),
+                "/private/config".into(),
+                "/home/agent/.codex/auth.json".into(),
+            ],
+            split: false,
         };
         let mut cfg = HarnessConfig::codex_default();
         cfg.sandbox = "workspace-write".into();
@@ -764,10 +887,6 @@ mod tests {
         assert!(
             inv.args
                 .contains(&r#"sandbox_mode="workspace-write""#.to_string())
-        );
-        assert!(
-            inv.args
-                .contains(&r#"sandbox_workspace_write.writable_roots=["/m"]"#.to_string())
         );
         assert!(
             inv.args
@@ -851,7 +970,8 @@ mod tests {
                 for flag in ["features.apps=false", "features.plugins=false"] {
                     assert!(inv.args.contains(&flag.to_string()), "{scope}: {flag}");
                 }
-                assert!(!inv.args.contains(&"features.memories=false".to_string()));
+                assert!(inv.args.contains(&"features.memories=false".to_string()));
+                assert!(inv.args.contains(&"project_doc_max_bytes=0".to_string()));
             }
         }
         // Someone else's chat: Codex's own apps, plugins, and memories are

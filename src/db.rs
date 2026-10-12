@@ -283,6 +283,12 @@ CREATE TABLE engine_keys (
 );
 "#,
     r#"
+-- Browser wallet approvals share the gateway cards and cancellation states.
+CREATE INDEX messages_pending_approvals ON messages(conversation_id, created_at)
+    WHERE kind = 'card' AND json_extract(card, '$.type') = 'approval'
+      AND json_extract(card, '$.state') = 'pending';
+"#,
+    r#"
 -- The For you pipeline (src/feed). Posts gain a story hook, the source's
 -- favicon, local copies of their photos ({original url: cached file}),
 -- the source kind, a canonical link key, and page facts (price, event).
@@ -1646,18 +1652,87 @@ mod tests {
     }
 
     #[test]
+    fn main_schema_upgrades_with_gateway_data_and_browser_approvals_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            // origin/main schema is version 4; branch migrations start after it.
+            conn.execute_batch(include_str!("../tests/fixtures/main-schema-v4.sql"))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO connectors (id, name, transport, config, created_at, updated_at, policy)
+                 VALUES ('c1', 'saved', 'stdio', '{}', 1, 1, ?1)",
+                [r#"{"mode":"ask"}"#],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO known_recipients VALUES ('reader@example.test', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO engine_keys VALUES ('codex', 'SYNTHETIC_KEY', 'sealed', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            let v: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            assert_eq!(v as usize, MIGRATIONS.len());
+            let policy: String =
+                c.query_row("SELECT policy FROM connectors WHERE id = 'c1'", [], |r| {
+                    r.get(0)
+                })?;
+            assert_eq!(policy, r#"{"mode":"ask"}"#);
+            let key: String =
+                c.query_row("SELECT ciphertext FROM engine_keys", [], |r| r.get(0))?;
+            assert_eq!(key, "sealed");
+            let recipients: i64 =
+                c.query_row("SELECT COUNT(*) FROM known_recipients", [], |r| r.get(0))?;
+            assert_eq!(recipients, 1);
+            c.prepare("SELECT * FROM connector_calls")?;
+            let owner = owner_user_id(c)?.unwrap();
+            let conv = ensure_main_conversation(c, &owner)?;
+            let card = crate::entities::approval_card(&crate::entities::ApprovalRequest {
+                service: "wallet",
+                approver_user_id: &owner,
+                ..Default::default()
+            });
+            crate::entities::insert_card(c, &conv, &card, "assistant")?;
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM messages INDEXED BY messages_pending_approvals
+                WHERE kind = 'card' AND json_extract(card, '$.type') = 'approval'
+                  AND json_extract(card, '$.state') = 'pending'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(n, 1);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn a_database_at_main_schema_upgrades_with_feed_and_gateway_intact() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("iris.db");
         let owner;
         {
             let conn = Connection::open(&path).unwrap();
-            // Main shipped migrations 1–4; the feed is migration 5.
-            for sql in &MIGRATIONS[..4] {
-                conn.execute_batch(sql).unwrap();
-            }
-            conn.pragma_update(None, "user_version", 4).unwrap();
+            // Main shipped migrations 1–5; the feed is migration 6.
+            conn.execute_batch(include_str!("../tests/fixtures/main-schema-v4.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../tests/fixtures/main-migration-v5.sql"))
+                .unwrap();
             owner = ensure_owner(&conn).unwrap();
+            let conv = ensure_main_conversation(&conn, &owner).unwrap();
+            let card = crate::entities::approval_card(&crate::entities::ApprovalRequest {
+                service: "wallet",
+                approver_user_id: &owner,
+                ..Default::default()
+            });
+            crate::entities::insert_card(&conn, &conv, &card, "assistant").unwrap();
             conn.execute(
                 r#"INSERT INTO connectors (id, name, transport, config, policy, paused_reason,
                      paused_at, auth_state, workspace_cwd, created_at, updated_at)
@@ -1696,6 +1771,15 @@ mod tests {
             let calls: i64 =
                 c.query_row("SELECT COUNT(*) FROM connector_calls", [], |r| r.get(0))?;
             assert_eq!(calls, 1);
+
+            let pending: i64 = c.query_row(
+                "SELECT COUNT(*) FROM messages INDEXED BY messages_pending_approvals
+                 WHERE kind = 'card' AND json_extract(card, '$.type') = 'approval'
+                   AND json_extract(card, '$.state') = 'pending'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(pending, 1);
             let posts = crate::entities::list_feed(c, &owner, None, 10)?;
             assert_eq!(posts.len(), 1);
             assert_eq!(posts[0].title, "A story");

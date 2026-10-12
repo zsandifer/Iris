@@ -37,6 +37,7 @@ state (conversations, goals, feed, and so on) in SQLite.
 - [Configuration](#configuration)
 - [Engines and models](#engines-and-models)
 - [Engines from the app](#engines-from-the-app)
+- [Iris's computer (browser)](#iriss-computer-browser)
 - [Connections and approvals](#connections-and-approvals)
 - [Proactive jobs](#proactive-jobs)
 - [Security model](#security-model)
@@ -107,6 +108,8 @@ See [docs/API.md](API.md) for every route, event, and data type.
   - OpenCode 1.19 or newer
 - Node.js (with npm) on the server if you want to install Codex, Gemini CLI,
   or OpenCode from the app (Claude Code installs natively)
+- Optional, for Iris's own browser: Chromium or Chrome, or Node.js to
+  install Chromium from the app
 - [uv](https://docs.astral.sh/uv/) (`uvx`) on the server if you want to
   connect Google (Gmail, Calendar, Drive)
 
@@ -183,6 +186,7 @@ Iris to the open internet.
 | `[harness.*]` | | `command`, `models`, `efforts`, permission mode, sandbox, extra args. |
 | `[router]` | | Shared-chat opt-in, rankings override, optional model classifier (below). |
 | `[engines]` | | Engines directory, privileged install helper, daily auto-update. |
+| `[agent]` | `user = ""`, `launcher = "/usr/local/bin/iris"` | Optional OS isolation for CLI turns, status probes and sign-in. |
 | `[heartbeat]` | disabled | Proactive check-in with active hours. |
 | `[feed]` | enabled | The For you pipeline: checks hourly between 06:00 and 22:00, publishes one batch a day. |
 | `[push]` | enabled | Web Push (VAPID). Needs `vapid_subject` (a `mailto:` URL) unless `public_url` is `https:`. |
@@ -199,7 +203,7 @@ Data directory layout:
 ├── iris.db          # SQLite (WAL), 0600
 ├── persona/         # IDENTITY.md, SOUL.md, USER.md, TOOLS.md, ...
 ├── memory/          # MEMORY.md plus notes the agent reads and writes
-├── workspace/       # working directory for the CLIs
+├── workspace-legacy/ # old shared cwd, quarantined on upgrade
 ├── library/         # artifacts and media the agent saved
 ├── uploads/         # images you sent, custom avatar
 ├── run/             # per-turn private files (prompt, MCP config), gateway.sock
@@ -275,8 +279,11 @@ After pairing your phone you should not need the server again:
 
 For a stricter setup, `deploy/setup-engines.sh` (run once as root) creates a
 separate `iris` system user that owns the engines directory and performs
-installs through a narrow sudo rule. The user running Iris can then run the
-engines but cannot modify them, and never needs download or install rights.
+installs through a narrow sudo rule. The rule includes install, update, and
+uninstall for `browser` (managed Chromium); rerun the script if your rule
+was created before browser support was added. The user running Iris can
+then run the engines but cannot modify them, and never needs download or
+install rights.
 
 ### What still needs the server
 
@@ -291,6 +298,236 @@ engines but cannot modify them, and never needs download or install rights.
 - `uv`, if you want to connect Google.
 - The optional privilege split (`deploy/setup-engines.sh`, as root).
 
+### Isolate the agent from Iris's private data
+
+Use a dedicated Linux account for CLI reasoning and tools. The Iris service
+account owns its database, vault key, config, persona and memory (directories
+0700, files 0600). The `iris-agent` account owns only its CLI home and its
+conversation directories. Linux permissions enforce the boundary even if a
+CLI's tool permissions are bypassed. This protects secrets stored by Iris;
+the agent still receives the system prompt, user messages, selected engine
+API keys, and approved connector results needed for its turn.
+
+Initialize Iris and stop its service as your existing service account first.
+The following commands are examples with the synthetic service account
+`iris-service`; replace it with the account that already runs Iris. Run the
+root commands through your administrator:
+
+```sh
+# Build from the updated checkout, then as iris-service:
+cargo build --release
+install -Dm755 target/release/iris ~/.local/bin/iris
+iris init
+systemctl --user stop iris
+
+# As root, from the checkout; install the root-owned launcher first:
+install -Dm755 target/release/iris /usr/local/bin/iris
+# Installs engine administration AND calls setup-agent-user.sh:
+sh deploy/setup-engines.sh iris-service /usr/local/bin/iris /opt/iris/engines iris-agent
+```
+
+The setup is idempotent. It creates `iris-agent` and its dedicated group,
+`/var/lib/iris-agent/home` (0700), a workspace parent (service-owned 0730,
+agent group), and a turn runtime directory (service-owned 0750, agent group).
+The launcher creates `workspace/<conversation-id>` as `iris-agent`, mode
+0700. The service cannot read these directories directly; library saves use
+a bounded, descriptor-relative file read by the fixed launcher. The script
+validates the exact sudoers rule with `visudo -cf`, installs the root-owned
+path policy `/etc/iris-agent.json`, locks down data/config permissions, and
+prints every change. It adds the service user to the agent group for sharing
+only per-turn files and installs `NoNewPrivileges=no` as a service drop-in.
+It grants **no sudo permissions to the agent account**. It supports one Iris
+service installation per machine. For custom data/config locations, supply
+arguments five and six to `setup-engines.sh` (or run
+`setup-agent-user.sh SERVICE AGENT BINARY DATA CONFIG ENGINES` separately).
+Keep managed engines outside the private data directory, readable by the
+agent and writable only by Iris's engine administrator. The root policy can
+register other absolute CLI paths; their real targets and every ancestor
+must be protected from agent, group and world writes.
+
+Add the printed engine settings and these settings to the service account's
+config:
+
+```toml
+[engines]
+dir = "/opt/iris/engines"
+helper = ["sudo", "-n", "-u", "iris", "/usr/local/bin/iris", "engines"]
+
+[agent]
+user = "iris-agent"
+launcher = "/usr/local/bin/iris"
+```
+
+Restart the service user's **user manager**, so its supplementary group
+membership is refreshed (restarting only the Iris unit is insufficient).
+This stops that user's other user services too; the administrator can run
+`loginctl terminate-user iris-service`, after the user has saved their work.
+Then sign in again as `iris-service`, run `systemctl --user daemon-reload`
+and `systemctl --user start iris`. Existing CLI sign-ins belong to the old
+account: use the app to sign Claude/Codex in again. Gemini's interactive
+sign-in and OpenCode provider setup must also run **as iris-agent**, with
+`HOME=/var/lib/iris-agent/home`, using `runuser` from an administrator's
+terminal. Never copy subscription credential files. `iris status`,
+`/api/harnesses` and `/api/engines` report the mode, CLI user, and auth state
+for that account; Gemini has no auth-status command, so its status stays
+unknown until a turn reports it.
+
+After engines are installed and Iris has created its vault key, run as the
+service account:
+
+```sh
+sh deploy/setup-agent-user.sh --check iris-service iris-agent /usr/local/bin/iris
+sh scripts/e2e/isolation.sh iris-agent
+```
+
+These read-only checks run the exact launcher as `iris-agent`, prove that
+opening `vault.key`, `iris.db` and config returns `PermissionDenied`, and
+verify its UID. They never use arbitrary sudo commands. Root setup is
+required before enabling the split; Iris refuses mismatched accounts,
+paths, unsafe permissions or unregistered CLI paths.
+
+All conversations now have separate working directories. In single-user
+mode the workspace tree is a sibling of the data directory (`iris-workspace`
+by default), keeping it outside the harnesses' denied data paths. On first
+startup old `data/workspace` contents are renamed to
+`data/workspace-legacy` with mode 0700. Existing contents in an unscoped new
+workspace are preserved as `data/workspace-legacy-unscoped`. No files are
+executed or copied into conversation directories, and an existing archive
+is never overwritten. Old CLI sessions are invalidated once so their
+implicit instructions are not resumed; conversation history remains in
+Iris. Changing the agent account also resets CLI sessions.
+
+The agent reads and updates Markdown memory through the existing Iris MCP
+bridge's owner-only `read_memory` / `write_memory` tools, rather than direct
+file access. Split-mode MCP stdio processes are authenticated per-turn
+proxies: the actual bridge and gateway proxies run on Iris's side. Only
+prompt/config/image files and proxy sockets are shared with the agent group
+(0750 directories, 0640 files, 0660 sockets); they are removed when the turn
+ends or at the next startup after a crash. Connector secrets remain in Iris.
+
+Harness restrictions apply in **both** modes, including private and resumed
+turns:
+
+- Claude disables CLAUDE.md and auto-memory loading, disables all settings
+  sources, uses strict MCP configuration, denies Read/Edit/Write/Glob/Grep
+  on Iris data/config and CLI credential files, and denies Bash entirely
+  (shell path patterns cannot cover arbitrary command syntax).
+- Codex retains `workspace-write`, limits writable roots to the conversation,
+  excludes `/tmp` and `$TMPDIR`, disables project documents with
+  `project_doc_max_bytes=0`, and disables CLI memories/apps/plugins. Its named
+  `permissions.iris` profile denies reads of Iris data/config and credential
+  files. Verified against installed Codex CLI 0.162.1 help and its strict
+  config parser: `sandbox_workspace_write.denied_paths` is unsupported;
+  named filesystem profiles support `deny`. See the
+  [official config reference](https://developers.openai.com/codex/config-reference/).
+- Gemini 0.63's `context.fileName=[]` **does not disable GEMINI.md**. Iris
+  uses `GEMINI_RESTRICTED_MODE=true`, which disables initial and just-in-time
+  project context, and CLI policy rules deny shell and local file tools.
+  Extensions are off. Restricted mode also disables MCP and workspace
+  settings, so Gemini cannot use Iris memory, app or connector tools;
+  its capabilities report `mcp=false`. Google sign-in still belongs to the
+  agent account. A user setting requiring folder trust can make Gemini refuse
+  headless runs; Iris never bypasses this by trusting project files. See
+  [Gemini's trust behavior](https://github.com/google-gemini/gemini-cli/blob/v0.63.0/packages/core/src/utils/trust.ts)
+  and [memory context implementation](https://github.com/google-gemini/gemini-cli/blob/v0.63.0/packages/core/src/context/memoryContextManager.ts).
+- OpenCode disables project configuration, Claude context and external
+  plugins (`--pure`) in every turn. Version 1.19 still attaches nested
+  AGENTS.md through its built-in Read tool, so Iris withholds Read, Glob,
+  Grep, Bash and external-directory access; app/connector MCP tools remain
+  available. Edit rules deny private data/config/credential paths. See
+  [OpenCode's instruction loading](https://github.com/anomalyco/opencode/blob/v1.19.0/packages/opencode/src/session/instruction.ts).
+
+Split-mode launch refuses nonempty global Codex/Gemini/OpenCode instruction
+files, which those CLIs cannot completely suppress. Keep the dedicated CLI
+home free of global instruction files. CLI updates may change these
+capabilities; reverify the documented switches before relaxing restrictions.
+
+With `[agent] user = ""`, Iris continues to run CLIs under its own account
+and existing sign-ins remain usable. The conversation layout and harness
+rules still apply, but **there is no OS boundary**: arbitrary code executing
+as that account can read the vault and database. Use the split for secret
+protection. It does not isolate different conversations from each other at
+the Unix-user level, restrict network access, or protect the CLI's own
+subscription credentials against arbitrary code running as that CLI user.
+
+Rollback: as root run
+`sh deploy/setup-agent-user.sh --uninstall iris-service iris-agent /usr/local/bin/iris`,
+set `[agent] user = ""`, and restart Iris. The script removes its policy,
+sudoers rule and service drop-in. It retains the account, home, workspaces
+and service group membership to avoid deleting sign-ins or generated files;
+remove those manually only after saving anything you need. Sign in as the
+service account again. The engine-admin split is independent and remains.
+
+## Iris's computer (browser)
+
+Iris launches and owns one headless Chromium for the agent. Every engine
+gets it as the `browser` MCP tools (open pages, read them, click, type,
+screenshots, tabs), and you can watch it live and take over from the app
+(Iris hub, Iris's computer). Iris itself is not an agent here: it carries
+out each tool call the CLI makes, nothing more.
+
+- **Getting a browser.** Tap "Set up the browser" in Iris's computer: Iris
+  installs the official `playwright-core` npm package into its engines
+  directory and runs its own `install chromium`, which downloads Chromium
+  from Playwright's official servers (needs Node.js). Iris updates it daily
+  with the other engines it installed, while the browser is closed. Or
+  install Chromium or Chrome yourself; Iris looks at `browser.command`, then
+  `PATH` (`chromium`, `google-chrome`, ...; snap packages are skipped because
+  their sandbox cannot use Iris's profile), then Playwright's cache
+  (`~/.cache/ms-playwright`).
+- **System libraries.** A fresh server may lack the libraries Chromium
+  needs; the app then shows the error. Fix it once as root with
+  `npx playwright install-deps chromium` (or install your distribution's
+  Chromium package).
+- **Sign-ins persist.** The profile lives in `<data dir>/browser/profile`,
+  so sites you or Iris signed in to stay signed in. Chrome's own password
+  manager and autofill are turned off there. Chrome's session files
+  (open tabs with what was typed into their forms) are deleted before each
+  start and after each close.
+- **Memory.** The browser starts on first use and closes after
+  `browser.idle_mins` (default 10) without use, so it costs nothing while
+  idle. A running browser with one tab takes roughly 200 to 400 MB.
+- **Live view and take over.** Frames stream over the app's WebSocket only
+  while you watch (about 1 per second for the small peek in chat, up to
+  about 6 full screen, only when the page changes). Take over forwards your
+  taps, scrolling, and typing; the agent's browser tools wait until you hand
+  back.
+- **Saved logins and cards.** The agent asks Iris to fill a login
+  (`fill_login`) or card (`fill_card`) on the current page; Iris types it in
+  from the vault and the agent only hears `filled` or `not found`. Logins go
+  only to the site they were saved for, over HTTPS. Every card use asks you
+  first with an approval card in the chat. After a secret is filled, the agent
+  cannot read that document, query its text, or screenshot it: it can still
+  click the submit button, press Enter, or navigate. Reads resume on a new
+  document (navigation, reload, or a submission that loads a page). The live
+  view on your phone stays available.
+- **Who gets it.** Only the owner's own conversations and jobs (the profile
+  holds the owner's sign-ins); never shared chats.
+- **Sandbox.** Iris always starts Chrome with its sandbox. Some systems
+  cannot start it (for example Ubuntu 23.10 and later, which restrict
+  unprivileged user namespaces with AppArmor). Then the browser does not
+  start, and Iris's computer explains and offers **Run without the
+  sandbox**: only if you tap it (a saved choice, `POST /api/browser/sandbox`)
+  does Iris run Chromium without it. The safer fix is one step as root, for
+  example an AppArmor profile that allows user namespaces for that one
+  binary (see Chromium's `docs/security/apparmor-userns-restrictions.md`):
+
+  ```sh
+  # replace the path with the browser Iris uses (GET /api/browser shows the
+  # error; `ls -l <engines dir>/bin/browser` shows the installed one)
+  sudo tee /etc/apparmor.d/iris-chrome <<'EOF2'
+  abi <abi/4.0>,
+  include <tunables/global>
+  profile iris-chrome /path/to/chrome flags=(unconfined) {
+    userns,
+  }
+  EOF2
+  sudo apparmor_parser -r /etc/apparmor.d/iris-chrome
+  ```
+- **Approval lifetime.** Wallet fills use the gateway’s approval wait and
+  cancellation rules. Denial, expiry, Stop, Pause, or Disconnect prevents
+  the held fill; a late approval never restarts a turn.
+- **Turning it off.** `[browser] enabled = false` removes the tools.
 ## Connections and approvals
 
 Connections (MCP servers) give Iris your services: Gmail, Calendar, Drive,
@@ -349,7 +586,9 @@ notifies you with a Resume button. Every call is in the activity log
 waiting approvals, and stops connection programs) and starts nothing new
 (chats, check-ins, connection calls) until you resume. A request already
 handed to a remote service before the pause cannot be recalled.
-**Disconnect everything** turns every connection off at once.
+**Disconnect everything** turns every connection off at once, cancels browser
+approvals, and closes and disconnects the browser. Reopen it in Iris’s
+computer to enable browser tools again.
 
 **Signing in to services.** Connections that use OAuth (the MCP sign-in
 standard, OAuth 2.1 with PKCE) sign in on the service's own page and come
@@ -440,22 +679,31 @@ dropping them; when they end you get one summary notification.
 - Saved logins, wallet cards, connector secrets and tokens, and engine API
   keys are encrypted with XChaCha20-Poly1305 using a key in `vault.key`
   (0600). The API never returns them.
-- Connections run on Iris's side behind the approval gate; the CLI only
-  gets a proxy and a per-turn token. Note that the agent's CLI runs as the
-  same user as Iris: the gate stops a confused or misled agent from acting
-  without you through connections, but an agent with unrestricted shell
-  access could read anything that user can. Keep the CLIs' sandboxes on.
-- Data directory files are created with owner-only permissions.
-- The CLIs run with your user's permissions, in their own process groups,
-  with a timeout. Claude Code runs headless with `--permission-mode
-  acceptEdits --permission-prompts none` and a small allow-list; Codex runs
-  with its `workspace-write` sandbox limited to `workspace/` and `memory/`;
-  Gemini CLI runs with `--approval-mode auto_edit` (anything needing approval
-  is not run); OpenCode, which has no OS sandbox, may edit files in
-  `workspace/` and `memory/` while shell commands stay behind an approval
-  that headless runs reject. Adjust all of them in `config.toml`.
+- Connections run on Iris's side behind the approval gate; the CLI gets
+  authenticated per-turn proxies. In split mode Linux permissions prevent
+  the agent account from reading Iris's vault, database and private files.
+  Single-user mode has no such OS boundary.
+- Data directory files are created with owner-only permissions. Memory
+  reads and writes go through the owner-only Iris MCP bridge.
+- CLI turns use a separate working directory for each conversation, a
+  timeout and process-group management. Project documents are disabled for
+  every turn. Claude and Codex have private-path deny rules; Gemini runs
+  restricted with MCP disabled; OpenCode's file-read and shell tools are
+  withheld. The precise CLI limitations are documented in the isolation
+  setup above.
 - Engines installed from the app come only from official sources and are
   verified (checksum or npm integrity); see the privilege split above.
+- Iris's browser is driven over a private pipe (no DevTools port is opened),
+  and its tools reach the server through a Unix socket in the private run
+  directory, accepted only for a running turn. Saved secrets go from the
+  vault straight into the page (set on the exact field, on the same page
+  and site that were checked); filled fields are masked on
+  screen and in what the agent reads, any copy a page echoes (a dialog,
+  another field) is redacted from tool results, and no screenshot is taken
+  while a page shows one. Only `http`/`https` pages can be opened. When a
+  turn ends or you take over, its pending browser actions stop.
+- "Pause Iris" in Iris's computer stops running turns, closes the browser,
+  and holds chats and jobs until you turn it back on.
 
 ## Subscription terms
 
@@ -506,25 +754,15 @@ Contributor notes, architecture, and invariants are in
 ## Not done yet
 
 - **Voice replies**: `POST /api/voice/speak` is a placeholder (returns 501).
-- **Using saved credentials**: logins and cards are stored encrypted and
-  managed through the API, but nothing injects them into the agent's
-  browsing yet. Planned design: the agent requests a credential by id
-  through a tool and Iris fills it into a browser session without the
-  model ever seeing the secret.
-- **Live view of the agent's browser.**
 - **Per-person memory**: people you add chat with Iris in their own chats
   and in shared chats, but only the owner has long-term memory, persona
   notes, and connectors.
-- **Full engine isolation in other people's chats**: MCP servers the
-  engines have configured themselves (including claude.ai connectors) are
-  off in every Iris turn; in other people's chats Iris also switches off
-  Claude Code's CLAUDE.md files and auto memory, Codex's ChatGPT apps,
-  plugins, and memories, Gemini CLI's extensions, and OpenCode's plugins
-  and Claude Code files. Codex always loads a global `AGENTS.md` (or
-  `AGENTS.override.md`) from its home folder and cannot be told not to, so
-  while one exists Iris does not use Codex for other people's chats.
-  Gemini CLI's global `GEMINI.md` context still applies, so keep personal
-  details out of it if you add people.
+- **Logins and cards inside cross-origin frames** (for example embedded
+  payment widgets) cannot be filled; take over and type them yourself.
+- **CLI context controls**: project instructions are disabled for every
+  turn, and all conversations have separate directories. Gemini restricted
+  mode disables MCP; OpenCode's built-in file reads are withheld because
+  they can inject nested instruction files. See the isolation setup above.
 - **Gemini CLI and OpenCode sign-in from the app**: both need one step on
   the server (see above).
 

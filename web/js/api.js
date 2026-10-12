@@ -183,6 +183,12 @@ export function holdBlob(path) {
   };
 }
 
+let live = null;
+/** Send a message on the event stream (dropped while disconnected). */
+export function wsSend(obj) {
+  if (live && live.readyState === 1) live.send(JSON.stringify(obj));
+}
+
 /** Open the event stream; reconnects with backoff until `close()`. */
 export function connectEvents(onEvent, onStatus) {
   let ws;
@@ -205,6 +211,7 @@ export function connectEvents(onEvent, onStatus) {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const sock = new WebSocket(`${proto}://${location.host}/api/ws`);
     ws = sock;
+    live = sock;
     sock.onopen = () => sock.send(JSON.stringify({ type: 'auth', token }));
     sock.onmessage = (e) => {
       if (sock !== ws) return;

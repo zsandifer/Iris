@@ -3,8 +3,8 @@
 # privilege split.
 #
 # Iris (running as your normal user, the "agent user") can then install and
-# update the official CLIs (Claude Code, Codex, Gemini CLI, OpenCode) from
-# the app, but the downloads and writes happen as a separate system user
+# update the official CLIs (Claude Code, Codex, Gemini CLI, OpenCode) and
+# Chromium from the app, but downloads and writes happen as a system user
 # that owns the engines directory. The agent user can run the engines and
 # cannot modify them.
 #
@@ -12,7 +12,9 @@
 # engines into its own data directory as the agent user.
 #
 # Usage (as root):
-#   sh deploy/setup-engines.sh <agent-user> [iris-binary] [engines-dir]
+#   sh deploy/setup-engines.sh <service-user> [iris-binary] [engines-dir] [agent-user] [data-dir] [config-file]
+# With agent-user, also calls setup-agent-user.sh to isolate CLI turns.
+# The historical AGENT_USER variable below names the service account.
 # Defaults: iris-binary=/usr/local/bin/iris, engines-dir=/opt/iris/engines
 #
 # Then add to the agent user's ~/.config/iris/config.toml:
@@ -94,9 +96,9 @@ fi
 install -d -m 0755 -o "$ADMIN_USER" -g "$ADMIN_USER" "$ENGINES_DIR"
 
 # 3. Let the agent user run exactly `iris engines <op> <name> --dir
-#    <engines-dir>` as the admin user. `iris engines` accepts only the four
-#    known engine names, fetches only from their official sources, and
-#    refuses an engines directory the agent user could tamper with.
+#    <engines-dir>` as the admin user. `iris engines` accepts only the known
+#    engine names (including browser), fetches only from official sources,
+#    and refuses an engines directory the agent user could tamper with.
 SUDOERS=/etc/sudoers.d/iris-engines
 write_rule() {
     rm -f "$SUDOERS.tmp"
@@ -112,7 +114,7 @@ write_rule() {
         printf '%s ALL=(%s) NOPASSWD: %s engines list --dir %s' \
             "$AGENT_USER" "$ADMIN_USER" "$IRIS_BIN" "$ENGINES_DIR"
         for op in install update uninstall; do
-            for engine in claude codex gemini opencode; do
+            for engine in claude codex gemini opencode browser; do
                 printf ', %s engines %s %s --dir %s' "$IRIS_BIN" "$op" "$engine" "$ENGINES_DIR"
             done
         done
@@ -154,3 +156,9 @@ echo "  helper = [\"sudo\", \"-n\", \"-u\", \"$ADMIN_USER\", \"$IRIS_BIN\", \"en
 echo ""
 echo "Then, as $AGENT_USER: systemctl --user daemon-reload && systemctl --user restart iris"
 echo "Engines need Node.js (npm) on the server for Codex, Gemini CLI, and OpenCode."
+
+# Optional second split: CLI turns as a dedicated account, data private to
+# the service account (the historical first argument names that account).
+if [ -n "${4:-}" ]; then
+    sh "$(dirname "$0")/setup-agent-user.sh" "$AGENT_USER" "$4" "$IRIS_BIN" "${5:-$AGENT_HOME/.local/share/iris}" "${6:-$AGENT_HOME/.config/iris/config.toml}" "$ENGINES_DIR"
+fi

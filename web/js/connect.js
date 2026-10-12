@@ -506,4 +506,3 @@ export function ServiceActivity() {
   return html`<${Group}>${items.map((it) => callRow(it, true))}<//>
     ${more && html`<button class="b2 wide" onClick=${() => load(items.at(-1).created_at)}>Show more</button>`}`;
 }
-

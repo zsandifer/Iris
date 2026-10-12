@@ -74,18 +74,6 @@ ${AvailableTools}
 ${AgentSkills}
 ";
 
-/// Directory name for one conversation (ids are hex; anything else is
-/// reduced to a safe name).
-fn scope_dir(cwd: &Path, scope: &str) -> PathBuf {
-    let safe: String = scope
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(64)
-        .collect();
-    cwd.join("gemini")
-        .join(if safe.is_empty() { "default" } else { &safe })
-}
-
 /// Paths read by Gemini CLI 0.63. System overrides workspace; defaults
 /// live beside the (possibly overridden) system settings file.
 /// See packages/cli/src/config/settings.ts and core/src/utils/paths.ts at
@@ -203,7 +191,8 @@ impl Harness for Gemini {
         Capabilities {
             images: true,
             effort: false,
-            mcp: true,
+            // Restricted mode disables project memory and MCP connections in Gemini 0.63.
+            mcp: false,
             resume: true,
             tool_less: false,
         }
@@ -211,9 +200,39 @@ impl Harness for Gemini {
 
     fn build(&self, spec: &TurnSpec) -> Result<Invocation> {
         let mut inv = Invocation::default();
-        let dir = scope_dir(&spec.cwd, &spec.scope);
-        ensure_private_dir(&dir.join(".gemini"))?;
-        let settings = dir.join(".gemini").join("settings.json");
+        inv.env
+            .push(("GEMINI_RESTRICTED_MODE".into(), "true".into()));
+        // 0.63 adds context.fileName to GEMINI.md; [] does not disable it.
+        // Restricted mode is the supported switch for both initial and JIT project context.
+        let policy_file = spec.run_dir.join(format!("{}.policy.toml", spec.turn_id));
+        let mut rules = String::new();
+        for tool in [
+            "run_shell_command",
+            "read_file",
+            "read_many_files",
+            "list_directory",
+            "glob",
+            "grep",
+            "search_file_content",
+            "write_file",
+            "replace",
+            "save_memory",
+        ] {
+            rules.push_str(&format!(
+                "[[rule]]\ntoolName = \"{tool}\"\ndecision = \"deny\"\npriority = 999\n\n"
+            ));
+        }
+        write_private_file(&policy_file, rules.as_bytes())?;
+        inv.temp_files.push(policy_file.clone());
+        let dir = spec.cwd.clone();
+        if !spec.split {
+            ensure_private_dir(&dir.join(".gemini"))?;
+        }
+        let settings = if spec.split {
+            spec.run_dir.join(format!("{}.gemini.json", spec.turn_id))
+        } else {
+            dir.join(".gemini").join("settings.json")
+        };
         // The Iris bridge resolves Library paths against this folder.
         let servers: Vec<super::McpServer> = spec
             .mcp_servers
@@ -237,7 +256,10 @@ impl Harness for Gemini {
         let servers = proxy_servers(&servers, &paths);
         let names: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
         inv.mcp_server_names = Some(names.clone());
-        let mut body = json!({"mcpServers": mcp_settings(&servers)});
+        let mut body = json!({"mcpServers": mcp_settings(&servers),
+            "context": {"fileName": [], "includeDirectoryTree": false, "loadMemoryFromIncludeDirectories": false},
+            "tools": {"exclude": ["run_shell_command"]}
+        });
         if spec.key_env.iter().any(|k| k == "GEMINI_API_KEY") {
             // An API key the owner added in the app: use it even if a
             // Google sign-in was saved before (a saved auth type would
@@ -282,10 +304,8 @@ impl Harness for Gemini {
             a.push(format!("iris_disabled_{}", crate::util::new_id()));
         }
         a.extend(names);
-        if spec.isolated {
-            a.extend(["-e", "none"].map(String::from));
-        }
-        a.extend(["--skip-trust", "-o", "stream-json", "-m"].map(String::from));
+        a.extend(["-e", "none"].map(String::from));
+        a.extend(["-o", "stream-json", "-m"].map(String::from));
         a.push(spec.model.clone());
         if let Some(id) = &spec.resume {
             a.push("--resume".into());
@@ -315,6 +335,13 @@ impl Harness for Gemini {
             a.push(include.join(","));
         }
         a.extend(self.cfg.extra_args.iter().cloned());
+        if self.cfg.extra_args.iter().any(|a| a == "--skip-trust") {
+            return Err("Gemini project trust cannot be enabled for Iris turns".into());
+        }
+        a.extend([
+            "--policy".into(),
+            policy_file.to_string_lossy().into_owned(),
+        ]);
 
         let mut prompt = escape_prompt(&spec.prompt);
         for img in &spec.images {
@@ -759,6 +786,12 @@ mod tests {
             key_env: vec!["GEMINI_API_KEY".into()],
             isolated: false,
             own_mcp_servers: Vec::new(),
+            protected_paths: vec![
+                "/private/iris".into(),
+                "/private/config".into(),
+                "/home/agent/.codex/auth.json".into(),
+            ],
+            split: false,
         };
         let inv = Gemini::new(HarnessConfig::gemini_default())
             .build(&spec)
@@ -766,9 +799,9 @@ mod tests {
         let args = inv.args.join(" ");
         let name = &inv.mcp_server_names.as_ref().unwrap()[0];
         assert!(
-            args.starts_with(
-                &format!("--allowed-mcp-server-names {name} --skip-trust -o stream-json -m flash --resume sess-1")
-            ),
+            args.starts_with(&format!(
+                "--allowed-mcp-server-names {name} -e none -o stream-json -m flash --resume sess-1"
+            )),
             "{args}"
         );
         assert!(args.contains("--approval-mode auto_edit"));
@@ -778,7 +811,12 @@ mod tests {
         )));
         assert!(!inv.args.iter().any(|a| a == "low" || a.contains("effort")));
         let cwd = inv.cwd.clone().unwrap();
-        assert_eq!(cwd, tmp.path().join("gemini/conv1"));
+        assert_eq!(cwd, tmp.path());
+        assert!(
+            inv.env
+                .contains(&("GEMINI_RESTRICTED_MODE".into(), "true".into()))
+        );
+        assert!(!inv.args.iter().any(|a| a == "--skip-trust"));
         let settings: Value =
             serde_json::from_slice(&std::fs::read(cwd.join(".gemini/settings.json")).unwrap())
                 .unwrap();
@@ -800,13 +838,17 @@ mod tests {
             settings["mcpServers"][name]["args"],
             json!(["mcp", "--workdir", cwd.to_string_lossy()])
         );
-        assert_eq!(inv.env[0].0, "GEMINI_SYSTEM_MD");
-        let system = std::fs::read_to_string(&inv.env[0].1).unwrap();
+        let (_, prompt_file) = inv
+            .env
+            .iter()
+            .find(|(k, _)| k == "GEMINI_SYSTEM_MD")
+            .unwrap();
+        let system = std::fs::read_to_string(prompt_file).unwrap();
         assert!(system.starts_with("You are Iris") && system.contains("${AvailableTools}"));
         let stdin = String::from_utf8(inv.stdin).unwrap();
         assert!(stdin.starts_with("what is in \\@this\n@"));
         assert!(stdin.ends_with("a\\ b.png"));
-        assert_eq!(inv.temp_files.len(), 2);
+        assert_eq!(inv.temp_files.len(), 3);
         // Someone else's chat: only Iris's MCP servers, no extensions.
         let mut iso = spec.clone();
         iso.isolated = true;
@@ -816,15 +858,13 @@ mod tests {
         let args = inv.args.join(" ");
         let name = &inv.mcp_server_names.as_ref().unwrap()[0];
         assert!(
-            args.starts_with(&format!(
-                "--allowed-mcp-server-names {name} -e none --skip-trust"
-            )),
+            args.starts_with(&format!("--allowed-mcp-server-names {name} -e none -o")),
             "{args}"
         );
         let plain = Gemini::new(HarnessConfig::gemini_default())
             .build(&spec)
             .unwrap();
-        assert!(!plain.args.iter().any(|a| a == "-e"));
+        assert!(plain.args.iter().any(|a| a == "-e"));
         let mut empty = spec;
         empty.mcp_servers.clear();
         let inv = Gemini::new(HarnessConfig::gemini_default())

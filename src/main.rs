@@ -1,7 +1,9 @@
 //! Iris: a self-hosted personal AI agent that wraps the official Claude Code
 //! and Codex CLIs you already have installed and signed in.
 
+mod agent;
 mod auth;
+mod browser;
 mod catalog;
 mod classifier;
 mod config;
@@ -48,6 +50,9 @@ Usage:
                                    Copy persona/memory files from OpenClaw
   iris mcp --data-dir DIR --user ID [--conversation ID] [--shared] [--workdir DIR]
                                    Iris MCP bridge (launched by harnesses)
+  iris mcp --browser --data-dir DIR
+                                   Browser tools for one turn (launched by
+                                   harnesses; needs IRIS_BROWSER_TOKEN)
   iris mcp-gateway --data-dir DIR --connector NAME
                                    Connector gateway proxy (launched by
                                    harnesses; token in IRIS_GATEWAY_TOKEN)
@@ -134,6 +139,24 @@ fn main() {
     // `mcp-exec` passes the server's own arguments through untouched, so it
     // bypasses the option parser.
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("agent-exec") {
+        if raw.len() != 1 {
+            eprintln!("agent-exec accepts no arguments");
+            std::process::exit(2);
+        }
+        if let Err(e) = agent::exec() {
+            eprintln!("agent-exec: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if raw.first().map(String::as_str) == Some("mcp-relay") {
+        if let Err(e) = agent::relay_stdio(&raw[1..]) {
+            eprintln!("mcp-relay: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if raw.first().map(String::as_str) == Some("mcp-exec") {
         let err = mcp_exec(&raw[1..]);
         eprintln!("iris mcp-exec: {err}");
@@ -191,6 +214,14 @@ fn run(args: Args) -> Result<()> {
             args.check_flags(&[])?;
             status(paths)
         }
+        ["mcp"] if args.has("--browser") => {
+            args.check_flags(&["--browser"])?;
+            let bridge = mcp::BrowserBridge {
+                socket: browser::socket::path(&paths),
+                token: std::env::var("IRIS_BROWSER_TOKEN").unwrap_or_default(),
+            };
+            mcp::serve_stdio(|req| bridge.handle(req))
+        }
         ["mcp"] => {
             args.check_flags(&["--user", "--conversation", "--shared", "--workdir"])?;
             let user = args.value("--user").ok_or("--user is required")?;
@@ -200,6 +231,7 @@ fn run(args: Args) -> Result<()> {
                 return Err(format!("no Iris database at {}", paths.db_file().display()).into());
             }
             let db = db::Db::open(&paths.db_file())?;
+            let agent = Config::load(&paths.config_file)?.agent;
             mcp::run(mcp::Bridge {
                 db,
                 paths,
@@ -207,6 +239,7 @@ fn run(args: Args) -> Result<()> {
                 conversation_id: args.value("--conversation").map(String::from),
                 shared: args.has("--shared"),
                 workdir: args.value("--workdir").map(PathBuf::from),
+                agent,
             })
         }
         ["mcp-gateway"] => {
@@ -343,6 +376,7 @@ fn lock_data_dir(paths: &Paths) -> Result<std::fs::File> {
 
 fn serve(cfg: Config, paths: Paths) -> Result<()> {
     let _lock = lock_data_dir(&paths)?;
+    agent::clear_runtime(&cfg.agent)?;
     persona::seed(&paths)?;
     // Leftover per-turn files from a crash.
     if let Ok(rd) = std::fs::read_dir(paths.run_dir()) {
@@ -358,6 +392,9 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
     let rt = runtime(&cfg)?;
     rt.block_on(async move {
         let state = state::AppState::new(cfg, paths, db)?;
+        state
+            .browser
+            .init_allow_no_sandbox(state.setting(server::ALLOW_NO_SANDBOX).await.is_some());
         state.set_serving();
         gateway::expire_stale_approvals(&state).await;
         gateway::listen(state.clone())?;
@@ -411,6 +448,19 @@ fn status(paths: Paths) -> Result<()> {
     rt.block_on(async move {
         let state = state::AppState::new(cfg, paths, db)?;
         state.refresh_harnesses().await;
+        println!(
+            "isolation: {}{}",
+            if state.cfg.agent.user.is_empty() {
+                "single_user"
+            } else {
+                "split"
+            },
+            if state.cfg.agent.user.is_empty() {
+                String::new()
+            } else {
+                format!(" (CLI user: {})", state.cfg.agent.user)
+            }
+        );
         for h in state.harness_statuses() {
             println!(
                 "{:<8} enabled={:<5} installed={:<5} auth={:<13} version={} path={}",

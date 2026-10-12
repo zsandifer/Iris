@@ -1493,6 +1493,15 @@ pub fn update_credential(
     get_credential(conn, user_id, id)
 }
 
+/// Record that Iris filled this credential into a page.
+pub fn mark_credential_used(conn: &Connection, user_id: &str, id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE credentials SET last_used_at = ?3 WHERE id = ?1 AND user_id = ?2",
+        params![id, user_id, now_ms()],
+    )?;
+    Ok(())
+}
+
 pub fn delete_credential(conn: &Connection, user_id: &str, id: &str) -> rusqlite::Result<bool> {
     Ok(conn.execute(
         "DELETE FROM credentials WHERE id = ?1 AND user_id = ?2",

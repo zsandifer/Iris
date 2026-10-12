@@ -184,12 +184,13 @@ Iris is **early** and moving fast. What works today:
   calls a day
 - ✅ Push notifications, quiet hours with a digest afterwards, an encrypted
   credentials vault
+- ✅ Iris's own browser: watch it live, take over from your phone, and let
+  Iris sign in with saved logins (cards always ask first)
 - 🧪 Shared chats with more than one person (preview)
 
 On the way:
 
-- 🚧 Watching and taking over Iris's browser
-- 🚧 Voice replies, and Iris using saved logins for you
+- 🚧 Voice replies
 - 🚧 A character for Iris
 
 ## Contributing

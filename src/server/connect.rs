@@ -435,6 +435,7 @@ async fn put_safety(
 /// Pause or resume Iris. Pausing cancels running turns (their waiting
 /// approvals with them) and stops new turns, jobs, and connector calls.
 pub async fn set_paused(state: &AppState, paused: bool) -> Result<(), ApiError> {
+    let _switch = state.browser.switch_lock.lock().await;
     let was = state.is_paused().await;
     state
         .db
@@ -446,7 +447,9 @@ pub async fn set_paused(state: &AppState, paused: bool) -> Result<(), ApiError> 
             }
         })
         .await?;
+    state.browser.init_paused(paused);
     if paused {
+        state.browser.end_turns(None);
         let running: Vec<String> = state
             .running
             .lock()
@@ -463,6 +466,7 @@ pub async fn set_paused(state: &AppState, paused: bool) -> Result<(), ApiError> 
         // keeps running.
         crate::gateway::stop_all(state).await;
     }
+    state.browser.set_paused(paused).await;
     if was != paused {
         crate::warn!(
             "Iris {} by the owner",
@@ -475,7 +479,7 @@ pub async fn set_paused(state: &AppState, paused: bool) -> Result<(), ApiError> 
 
 async fn disconnect_all(State(state): State<AppState>, user: AuthUser) -> ApiResult {
     user.require_owner()?;
-    let n = crate::gateway::disconnect_all(&state).await;
+    let n = crate::gateway::disconnect_all(&state).await?;
     crate::connectors::broadcast_changed(&state).await;
     let list = state
         .db

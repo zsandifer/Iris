@@ -1573,6 +1573,8 @@ case "$1" in
 esac
 cat >/dev/null
 echo run >> "$D/calls"
+pwd > "$D/cwd"
+printf '%s\n' "$@" > "$D/args"
 case "$(cat "$D/mode")" in
   slow) sleep 60;;
   ok) printf '{"type":"result","subtype":"success","is_error":false,"result":%s}\n' "$(cat "$D/reply")";;
@@ -1651,6 +1653,47 @@ esac
         std::fs::read_to_string(tmp.path().join("ccalls"))
             .map(|s| s.lines().count())
             .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn feed_helpers_use_scoped_workdirs_and_disable_project_context() {
+        let (state, tmp, _) = fake_engine().await;
+        set(&tmp, "ok", "A summary");
+        let mut dirs = Vec::new();
+        for scope in ["feed-interests", "feed-summaries"] {
+            let reply = one_shot(
+                &state,
+                OneShotRequest {
+                    slot: Slot::Feed,
+                    shared: false,
+                    system_prompt: "Summarize this story.",
+                    prompt: "A comet",
+                    timeout: Duration::from_secs(5),
+                    scope,
+                    max_attempts: 1,
+                    take_slot: true,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(reply.text, "A summary");
+            let cwd = std::fs::read_to_string(tmp.path().join("cwd")).unwrap();
+            let dir = state.paths.workspace_dir().join(scope);
+            assert_eq!(cwd.trim(), dir.to_str().unwrap());
+            dirs.push(dir);
+            let args = std::fs::read_to_string(tmp.path().join("args")).unwrap();
+            assert!(args.contains("--tools\n\n--strict-mcp-config"));
+            assert!(args.contains("--setting-sources\n\n"));
+            assert!(args.contains("--disallowedTools"));
+            assert!(args.contains(&format!("Read(/{}/**)", state.paths.data_dir.display())));
+        }
+        assert_ne!(dirs[0], dirs[1]);
+        assert!(
+            std::fs::read_dir(state.paths.run_dir())
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 
     #[tokio::test]

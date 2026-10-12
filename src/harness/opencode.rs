@@ -139,6 +139,24 @@ impl Harness for OpenCode {
             "permission": self.permissions(&spec.writable_dirs),
             "mcp": mcp,
         });
+        let mut edit =
+            serde_json::Map::from_iter([("*".into(), config["permission"]["edit"].clone())]);
+        for path in &spec.protected_paths {
+            for key in [
+                path.to_string_lossy().into_owned(),
+                format!("{}/**", path.display()),
+            ] {
+                edit.insert(key, json!("deny"));
+            }
+        }
+        // OpenCode 1.19 attaches nested AGENTS.md during built-in Read calls,
+        // even with project config disabled. Withhold Read until it has an off switch.
+        config["permission"]["read"] = json!("deny");
+        config["permission"]["edit"] = Value::Object(edit);
+        config["permission"]["bash"] = json!("deny");
+        config["permission"]["grep"] = json!("deny");
+        config["permission"]["glob"] = json!("deny");
+        config["permission"]["external_directory"] = json!("deny");
         let providers = provider_keys(&spec.key_env);
         if !providers.is_null() {
             config["provider"] = providers;
@@ -158,14 +176,17 @@ impl Harness for OpenCode {
             config_file.to_string_lossy().into_owned(),
         ));
 
-        if spec.isolated {
-            inv.env
-                .push(("OPENCODE_DISABLE_CLAUDE_CODE".into(), "1".into()));
+        for key in [
+            "OPENCODE_DISABLE_CLAUDE_CODE",
+            "OPENCODE_DISABLE_PROJECT_CONFIG",
+            "OPENCODE_DISABLE_CLAUDE_CODE_PROMPT",
+        ] {
+            inv.env.push((key.into(), "1".into()));
         }
         let a = &mut inv.args;
         a.push("run".into());
-        if spec.isolated {
-            // Someone else's chat: no external plugins, and none of the
+        {
+            // Every chat: no external plugins, and none of the
             // owner's Claude Code files OpenCode would otherwise load.
             a.push("--pure".into());
         }
@@ -764,6 +785,12 @@ anthropic/claude-haiku-4-5
             key_env: vec!["OPENROUTER_API_KEY".into()],
             isolated: false,
             own_mcp_servers: vec!["mine".into()],
+            protected_paths: vec![
+                "/private/iris".into(),
+                "/private/config".into(),
+                "/home/agent/.codex/auth.json".into(),
+            ],
+            split: false,
         };
         let inv = OpenCode::new(HarnessConfig::opencode_default())
             .build(&spec)
@@ -772,6 +799,7 @@ anthropic/claude-haiku-4-5
             inv.args,
             [
                 "run",
+                "--pure",
                 "-f",
                 "/u/a.png",
                 "--format",
@@ -817,12 +845,11 @@ anthropic/claude-haiku-4-5
             cfg["provider"]["openrouter"]["options"]["apiKey"],
             "{env:OPENROUTER_API_KEY}"
         );
-        assert_eq!(cfg["permission"]["bash"], "ask");
-        assert_eq!(cfg["permission"]["edit"], "allow");
-        assert_eq!(
-            cfg["permission"]["external_directory"]["/data/memory/**"],
-            "allow"
-        );
+        assert_eq!(cfg["permission"]["bash"], "deny");
+        assert_eq!(cfg["permission"]["read"], "deny");
+        assert_eq!(cfg["permission"]["edit"]["*"], "allow");
+        assert_eq!(cfg["permission"]["edit"]["/private/iris/**"], "deny");
+        assert_eq!(cfg["permission"]["external_directory"], "deny");
         let prompt = cfg["instructions"][0].as_str().unwrap();
         assert_eq!(std::fs::read_to_string(prompt).unwrap(), "You are Iris");
         assert_eq!(inv.temp_files.len(), 2);
@@ -840,7 +867,7 @@ anthropic/claude-haiku-4-5
         let plain = OpenCode::new(HarnessConfig::opencode_default())
             .build(&spec)
             .unwrap();
-        assert!(!plain.args.contains(&"--pure".to_string()));
+        assert!(plain.args.contains(&"--pure".to_string()));
     }
 
     #[test]

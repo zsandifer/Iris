@@ -321,6 +321,20 @@ async fn run_locked(
     if scope == Scope::Private {
         audience.private_owner = ctx.owner.clone();
     }
+    if state.browser.is_paused() {
+        return finish(
+            state,
+            input,
+            &mut audience,
+            &Acc::default(),
+            json!(null),
+            Outcome::Failed {
+                kind: "paused",
+                detail: "the owner paused Iris".into(),
+            },
+        )
+        .await;
+    }
     state.hub.to_users(
         audience.current(state).await,
         json!({"type": "turn.status", "conversation_id": conv_id, "message_id": msg_id, "status": "running"}),
@@ -339,6 +353,18 @@ async fn run_locked(
     let mut outcome = Outcome::Failed {
         kind: "no_engine",
         detail: "no engine available".into(),
+    };
+    // Iris's browser: only in the owner's own conversations (its profile
+    // holds the owner's sign-ins). Dropping the guard ends the browser peek.
+    let browser_turn = if scope == Scope::Private && browser_allowed(state) {
+        let users = audience.current(state).await.to_vec();
+        Some(
+            state
+                .browser
+                .begin_turn(&input.owner_user_id, conv_id, msg_id, &users),
+        )
+    } else {
+        None
     };
 
     for _attempt in 0..MAX_ATTEMPTS {
@@ -448,6 +474,9 @@ async fn run_locked(
         let prompt = render_prompt(&ctx, &agent_name, &replay, &input.user_message);
         let mut notices = state.harness_notices(&harness_name);
         let caps = entry.harness.capabilities();
+        if !caps.mcp {
+            notices.push("App actions, memory updates and connected services are unavailable to this engine right now. Explain that briefly if the user asks for one; do not claim an action was saved or sent.".into());
+        }
         let sees_images =
             caps.images && catalog.get(&d.model).and_then(|m| m.images).unwrap_or(true);
         let mut images = load_images(state, &input.user_message).await;
@@ -460,7 +489,8 @@ async fn run_locked(
                     .into(),
             );
         }
-        let (mcp_servers, _grant) = if caps.mcp {
+        let browser_token = browser_turn.as_ref().map(|g| g.token());
+        let (mcp_servers, _grant, browser_server) = if caps.mcp {
             mcp_servers(
                 state,
                 &input.owner_user_id,
@@ -468,10 +498,11 @@ async fn run_locked(
                 &ctx.kind,
                 msg_id,
                 scope,
+                browser_token,
             )
             .await
         } else {
-            (Vec::new(), None)
+            (Vec::new(), None, None)
         };
         if scope == Scope::Private {
             notices.extend(crate::gateway::connector_notices(state, &input.owner_user_id).await);
@@ -487,6 +518,7 @@ async fn run_locked(
                 input.purpose,
                 !mcp_servers.is_empty(),
             );
+            let browser = browser_server.clone();
             let notices = notices.clone();
             tokio::task::spawn_blocking(move || {
                 persona::assemble(
@@ -497,6 +529,7 @@ async fn run_locked(
                         purpose,
                         participants: &participants,
                         app_tools,
+                        browser: browser.as_deref(),
                         scope,
                         notices: &notices,
                     },
@@ -505,6 +538,24 @@ async fn run_locked(
             .await
             .unwrap_or_default()
         };
+        let prepared = (|| -> crate::util::Result<_> {
+            Ok((
+                crate::agent::workdir(&state.cfg.agent, &state.paths, conv_id)?,
+                state.protected_paths()?,
+                crate::agent::turn_dir(&state.cfg.agent, &state.paths, &new_id())?,
+            ))
+        })();
+        let (cwd, protected_paths, run_dir) = match prepared {
+            Ok(p) => p,
+            Err(e) => {
+                outcome = Outcome::Failed {
+                    kind: "internal",
+                    detail: format!("could not prepare isolated turn: {e}"),
+                };
+                break;
+            }
+        };
+        let _turn_files = crate::agent::TurnFiles::new(&state.cfg.agent, conv_id, &run_dir);
         let mut spec = TurnSpec {
             turn_id: new_id(),
             prompt,
@@ -514,21 +565,19 @@ async fn run_locked(
             effort: d.effort.clone(),
             resume: session.as_ref().map(|s| s.session_id.clone()),
             mcp_servers,
-            cwd: state.paths.workspace_dir(),
-            // The owner's memory is only writable in the owner's own chats.
-            writable_dirs: if scope == Scope::Private {
-                vec![state.paths.memory_dir()]
-            } else {
-                Vec::new()
-            },
-            run_dir: state.paths.run_dir(),
+            cwd,
+            writable_dirs: Vec::new(),
+            run_dir,
             scope: conv_id.to_string(),
             tools: true,
             key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
             isolated: scope != Scope::Private,
             own_mcp_servers: Vec::new(),
+            protected_paths,
+            split: !state.cfg.agent.user.is_empty(),
         };
         if spec.isolated
+            && !spec.split
             && let Err(why) = entry.harness.can_isolate()
         {
             crate::warn!("turn {msg_id}: {harness_name} cannot be isolated: {why}");
@@ -550,6 +599,22 @@ async fn run_locked(
                 continue;
             }
         }
+        let _relays = match crate::agent::relay_servers(
+            &state.cfg.agent,
+            &spec.run_dir,
+            &mut spec.mcp_servers,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                outcome = Outcome::Failed {
+                    kind: "internal",
+                    detail: format!("could not prepare app bridge: {e}"),
+                };
+                break;
+            }
+        };
         let invocation = match build_invocation(state, &harness_name, &spec).await {
             Ok(mut i) => {
                 if harness_name == "claude" && crate::harness::is_managed(&program) {
@@ -560,6 +625,15 @@ async fn run_locked(
                 // API keys the owner added in the app (after inherited
                 // ones were stripped).
                 i.env.extend(keys);
+                if let Err(e) = crate::agent::expose_files(&state.cfg.agent, &i).and_then(|_| {
+                    crate::agent::wrap(&state.cfg.agent, &harness_name, &spec.scope, &mut i)
+                }) {
+                    outcome = Outcome::Failed {
+                        kind: "internal",
+                        detail: format!("could not isolate CLI: {e}"),
+                    };
+                    break;
+                }
                 i
             }
             Err(e) => {
@@ -618,6 +692,7 @@ async fn run_locked(
         );
         let consume_fut = consume(state, &mut audience, conv_id, msg_id, rx);
         let (run_res, attempt) = tokio::join!(run_fut, consume_fut);
+
         for f in &invocation.temp_files {
             let _ = std::fs::remove_file(f);
         }
@@ -931,7 +1006,9 @@ async fn one_shot_with_cancel(
         };
         // Helper prompts carry untrusted text: only CLIs that can really
         // turn every tool off.
-        if !entry.harness.capabilities().tool_less || entry.harness.can_isolate().is_err() {
+        if !entry.harness.capabilities().tool_less
+            || (state.cfg.agent.user.is_empty() && entry.harness.can_isolate().is_err())
+        {
             continue;
         }
         let Some(program) = entry.program() else {
@@ -944,6 +1021,21 @@ async fn one_shot_with_cancel(
             .and_then(|p| p.effort.clone())
             .or_else(|| crate::ranking::default_effort(m));
         let keys = crate::keys::env_for(state, &m.harness).await;
+        let prepared = (|| -> crate::util::Result<_> {
+            Ok((
+                crate::agent::workdir(&state.cfg.agent, &state.paths, req.scope)?,
+                state.protected_paths()?,
+                crate::agent::turn_dir(&state.cfg.agent, &state.paths, &new_id())?,
+            ))
+        })();
+        let (cwd, protected_paths, run_dir) = match prepared {
+            Ok(p) => p,
+            Err(e) => {
+                last_error = format!("could not prepare isolated helper: {e}");
+                continue;
+            }
+        };
+        let _turn_files = crate::agent::TurnFiles::new(&state.cfg.agent, req.scope, &run_dir);
         let spec = TurnSpec {
             turn_id: new_id(),
             prompt: req.prompt.to_string(),
@@ -953,9 +1045,9 @@ async fn one_shot_with_cancel(
             effort,
             resume: None,
             mcp_servers: Vec::new(),
-            cwd: state.paths.workspace_dir(),
+            cwd,
             writable_dirs: Vec::new(),
-            run_dir: state.paths.run_dir(),
+            run_dir,
             scope: req.scope.to_string(),
             key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
             // Helper calls read untrusted text (feed items): no tools at all,
@@ -969,6 +1061,8 @@ async fn one_shot_with_cancel(
                     continue;
                 }
             },
+            protected_paths,
+            split: !state.cfg.agent.user.is_empty(),
         };
         let mut invocation = match build_invocation(state, &m.harness, &spec).await {
             Ok(i) => i,
@@ -978,6 +1072,15 @@ async fn one_shot_with_cancel(
             }
         };
         invocation.env.extend(keys);
+        if let Err(e) = crate::agent::expose_files(&state.cfg.agent, &invocation).and_then(|_| {
+            crate::agent::wrap(&state.cfg.agent, &m.harness, req.scope, &mut invocation)
+        }) {
+            for f in &invocation.temp_files {
+                let _ = std::fs::remove_file(f);
+            }
+            last_error = format!("could not isolate CLI: {e}");
+            continue;
+        }
         let _permit = if req.take_slot {
             tokio::select! {
                 permit = state.limiter.acquire() => Some(permit),
@@ -1074,9 +1177,14 @@ async fn build_invocation(
     harness: &str,
     spec: &TurnSpec,
 ) -> crate::util::Result<crate::harness::Invocation> {
-    let (st, name, spec) = (state.clone(), harness.to_string(), spec.clone());
+    let (st, name, mut spec) = (state.clone(), harness.to_string(), spec.clone());
     tokio::task::spawn_blocking(move || match st.harness(&name) {
-        Some(e) => e.harness.build(&spec),
+        Some(e) => {
+            let images = crate::agent::copy_images(&mut spec)?;
+            let mut inv = e.harness.build(&spec)?;
+            inv.temp_files.extend(images);
+            Ok(inv)
+        }
         None => Err(format!("unknown harness {name}").into()),
     })
     .await
@@ -1094,7 +1202,7 @@ pub(crate) async fn own_mcp_servers(
         return Some(Vec::new());
     };
     let strip = state.strip_env(entry);
-    match runner::probe(program, &args, &state.paths.workspace_dir(), &strip, &[]).await {
+    match state.agent_probe(entry, program, &args, &strip, &[]).await {
         Ok((true, out, _)) => entry.harness.parse_own_mcp_servers(&out),
         _ => None,
     }
@@ -1574,17 +1682,30 @@ async fn mcp_servers(
     conv_kind: &str,
     message_id: &str,
     scope: Scope,
-) -> (Vec<McpServer>, Option<crate::gateway::GrantGuard>) {
+    browser_token: Option<&str>,
+) -> (
+    Vec<McpServer>,
+    Option<crate::gateway::GrantGuard>,
+    Option<String>,
+) {
     let shared = scope == Scope::Shared;
     let mut args = vec![
         "mcp".into(),
         "--data-dir".into(),
         state.paths.data_dir.to_string_lossy().into_owned(),
+        "--config".into(),
+        state.paths.config_file.to_string_lossy().into_owned(),
         "--user".into(),
         user_id.into(),
         "--conversation".into(),
         conv_id.into(),
     ];
+    args.extend([
+        "--workdir".into(),
+        crate::agent::workdir(&state.cfg.agent, &state.paths, conv_id)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    ]);
     if shared {
         args.push("--shared".into());
     }
@@ -1598,15 +1719,50 @@ async fn mcp_servers(
         timeout_secs: None,
     }];
     if scope != Scope::Private {
-        return (servers, None);
+        return (servers, None, None);
+    }
+    let all = state
+        .db
+        .call(|c| crate::entities::list_connectors(c, false))
+        .await;
+    let browser_name = browser_token.and_then(|_| {
+        let all = all.as_ref().ok()?;
+        [
+            crate::browser::tools::SERVER,
+            crate::browser::tools::SERVER_ALT,
+        ]
+        .into_iter()
+        .find(|n| !all.iter().any(|c| c.name == *n))
+    });
+    if let (Some(token), Some(name)) = (browser_token, browser_name) {
+        servers.push(McpServer {
+            name: name.into(),
+            transport: McpTransport::Stdio {
+                command: state.exe.to_string_lossy().into_owned(),
+                args: vec![
+                    "mcp".into(),
+                    "--browser".into(),
+                    "--data-dir".into(),
+                    state.paths.data_dir.to_string_lossy().into_owned(),
+                ],
+                env: BTreeMap::from([("IRIS_BROWSER_TOKEN".to_string(), token.to_string())]),
+            },
+            timeout_secs: Some(state.cfg.approval_timeout_secs() + 300),
+        });
     }
     match crate::gateway::grant_for_turn(state, user_id, conv_id, conv_kind, message_id).await {
         Some((connectors, guard)) => {
             servers.extend(connectors);
-            (servers, Some(guard))
+            (servers, Some(guard), browser_name.map(String::from))
         }
-        None => (servers, None),
+        None => (servers, None, browser_name.map(String::from)),
     }
+}
+
+/// Whether this turn gets the browser tools: enabled, not paused, a
+/// browser is installed (the caller requires the owner's own private chat).
+fn browser_allowed(state: &AppState) -> bool {
+    state.browser.enabled() && !state.browser.is_paused() && state.browser.executable().is_some()
 }
 
 /// Store a user message and an assistant placeholder, broadcast both, and
@@ -1753,6 +1909,93 @@ mod tests {
         assert!(p.contains("Sam: m99"));
         assert!(!p.contains("Sam: m10\n"));
         assert_eq!(p.matches("Sam: m").count(), MAX_REPLAY_MESSAGES);
+    }
+
+    #[tokio::test]
+    async fn browser_server_takes_a_free_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::browser::tools::tests::test_state(tmp.path());
+        let (owner, conv) = state
+            .db
+            .with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                let conv = db::ensure_main_conversation(c, &owner)?;
+                Ok((owner, conv))
+            })
+            .unwrap();
+        let add = |name: &str, enabled: bool| {
+            let cfg = crate::entities::ConnectorConfig {
+                command: Some("x".into()),
+                ..Default::default()
+            };
+            state
+                .db
+                .with(|c| {
+                    crate::entities::insert_connector(
+                        c,
+                        &new_id(),
+                        name,
+                        "",
+                        "stdio",
+                        &cfg,
+                        enabled,
+                    )
+                })
+                .unwrap();
+        };
+        let names = |v: &[McpServer]| v.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
+        let (s, _grant, b) = mcp_servers(
+            &state,
+            &owner,
+            &conv,
+            "main",
+            "m",
+            Scope::Private,
+            Some("t"),
+        )
+        .await;
+        assert_eq!(b.as_deref(), Some("browser"));
+        assert_eq!(names(&s), ["iris", "browser"]);
+        // Shared chats and turns without a token never get it.
+        assert_eq!(
+            mcp_servers(&state, &owner, &conv, "main", "m", Scope::Shared, Some("t"))
+                .await
+                .2,
+            None
+        );
+        assert_eq!(
+            mcp_servers(&state, &owner, &conv, "main", "m", Scope::Private, None)
+                .await
+                .2,
+            None
+        );
+        // An older connector named "browser" (even switched off) keeps it.
+        add("browser", false);
+        let (s, _grant, b) = mcp_servers(
+            &state,
+            &owner,
+            &conv,
+            "main",
+            "m",
+            Scope::Private,
+            Some("t"),
+        )
+        .await;
+        assert_eq!(b.as_deref(), Some("iris_browser"));
+        assert_eq!(names(&s), ["iris", "iris_browser"]);
+        add("iris_browser", true);
+        let (s, _grant, b) = mcp_servers(
+            &state,
+            &owner,
+            &conv,
+            "main",
+            "m",
+            Scope::Private,
+            Some("t"),
+        )
+        .await;
+        assert_eq!(b, None);
+        assert_eq!(names(&s), ["iris", "iris_browser"]);
     }
 
     #[test]

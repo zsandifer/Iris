@@ -158,6 +158,8 @@ pub struct PromptContext<'a> {
     pub participants: &'a [String],
     /// Whether the `iris` MCP bridge is attached to this turn.
     pub app_tools: bool,
+    /// Name of Iris's browser MCP server when it is attached.
+    pub browser: Option<&'a str>,
     /// Who is in the conversation. The owner's private persona (USER.md)
     /// and memory are only included when it is `Private`.
     pub scope: Scope,
@@ -224,6 +226,9 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
     } else if ctx.app_tools {
         out.push_str(APP_TOOLS_GUIDE);
     }
+    if let Some(server) = ctx.browser.filter(|_| ctx.scope == Scope::Private) {
+        out.push_str(&crate::browser::tools::guide(server));
+    }
 
     if ctx.scope == Scope::Shared {
         out.push_str(
@@ -243,14 +248,12 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
         collect_memory(&memory_dir, &memory_dir, 0, &mut entries);
         entries.retain(|(rel, _, _)| rel != "MEMORY.md");
         entries.sort_by(|a, b| a.0.cmp(&b.0));
-        out.push_str(&format!(
-            "\n## Memory\n\nLong-term memory is stored as Markdown files in `{}`. \
-             Read a file when its topic comes up instead of guessing. When you \
-             learn something durable about the user, update the relevant file \
-             (or MEMORY.md for short, always-relevant facts) if you are able to \
-             write files.\n",
-            memory_dir.display()
-        ));
+        out.push_str(
+            "\n## Memory\n\nLong-term memory is stored by Iris as Markdown files. \
+             Use the Iris read_memory tool to read a file when its topic comes up. \
+             Use write_memory to update durable facts (MEMORY.md for short, \
+             always-relevant facts). These tools are only available in the owner's private chats.\n",
+        );
         if entries.is_empty() {
             out.push_str("\n(No other memory files yet.)\n");
         } else {
@@ -473,6 +476,7 @@ mod tests {
             purpose: Purpose::Chat,
             participants: &[],
             app_tools: true,
+            browser: None,
             scope: Scope::Private,
             notices: &[],
         }
@@ -530,6 +534,12 @@ mod tests {
         assert!(!prompt.contains("link.md"));
         assert!(prompt.contains("create_goal"));
         assert!(!prompt.contains("## Notices"));
+        assert!(!prompt.contains("## Your browser"));
+        let mut b = ctx("Nova");
+        b.browser = Some("browser");
+        assert!(assemble(&p, &b).contains("fill_login"));
+        b.scope = Scope::Shared;
+        assert!(!assemble(&p, &b).contains("## Your browser"));
     }
 
     #[test]

@@ -61,7 +61,7 @@ pub struct RunRequest<'a> {
     pub timeout: Duration,
 }
 
-fn base_command(program: &Path, cwd: &Path, env_remove: &[&str]) -> Command {
+pub(crate) fn base_command(program: &Path, cwd: &Path, env_remove: &[&str]) -> Command {
     let mut cmd = Command::new(program);
     // Some CLIs take their project root from PWD rather than the real
     // working directory; never let them inherit the daemon's.
@@ -146,7 +146,11 @@ pub async fn run(
     events: mpsc::UnboundedSender<HarnessEvent>,
 ) -> Result<RunOutcome> {
     let cwd = req.invocation.cwd.as_deref().unwrap_or(req.cwd);
-    let mut cmd = base_command(req.program, cwd, req.env_remove);
+    let mut cmd = base_command(
+        req.invocation.program.as_deref().unwrap_or(req.program),
+        cwd,
+        req.env_remove,
+    );
     cmd.args(&req.invocation.args);
     for (k, v) in &req.invocation.env {
         cmd.env(k, v);
@@ -241,12 +245,32 @@ pub async fn probe(
     env_remove: &[&str],
     env_add: &[(String, String)],
 ) -> Result<(bool, String, String)> {
-    let mut cmd = base_command(program, cwd, env_remove);
-    cmd.args(args).stdin(Stdio::null());
-    for (k, v) in env_add {
-        cmd.env(k, v);
-    }
-    let child = cmd.spawn()?;
+    let inv = Invocation {
+        args: args.to_vec(),
+        env: env_add.to_vec(),
+        ..Default::default()
+    };
+    probe_invocation(program, &inv, cwd, env_remove).await
+}
+
+pub async fn probe_invocation(
+    program: &Path,
+    inv: &Invocation,
+    cwd: &Path,
+    env_remove: &[&str],
+) -> Result<(bool, String, String)> {
+    let mut cmd = base_command(
+        inv.program.as_deref().unwrap_or(program),
+        inv.cwd.as_deref().unwrap_or(cwd),
+        env_remove,
+    );
+    cmd.args(&inv.args).envs(inv.env.iter().cloned());
+    let mut child = cmd.spawn()?;
+    let mut input = child.stdin.take().expect("piped stdin");
+    let payload = inv.stdin.clone();
+    tokio::spawn(async move {
+        let _ = input.write_all(&payload).await;
+    });
     let pid = child.id();
     match tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await {
         Ok(out) => {

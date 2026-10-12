@@ -311,18 +311,22 @@ function ApprovalCard({ c, m }) {
   const mine = c.approver_user_id === S.me?.user?.id;
   const decide = async (approve) => {
     setBusy(true);
+    // (A card OK that comes after Iris stopped waiting is picked up by the
+    // server, which continues the chat.)
     try { await post(`/messages/${seg(m.id)}/decision`, { approve }); } catch (e) { toast(e.message); }
     setBusy(false);
   };
   const p = c.preview || {};
+  // Wallet approvals name a site and page; messages a recipient and subject.
+  const [toL, subL] = c.service === 'wallet' ? ['Site', 'Page'] : ['To', 'Subject'];
   const pending = c.state === 'pending';
   return html`<div class=${'ap' + (!pending ? ' decided' : '')}>
-    <div class="ap-h"><${Icon} name="lock" size=${14} /> Needs your OK
+    <div class="ap-h"><${Icon} name=${c.service === 'wallet' ? 'card' : 'lock'} size=${14} /> Needs your OK
       ${pending && c.expires_at && html`<span class="ap-left"><${Countdown} until=${c.expires_at} /></span>`}</div>
     ${c.reason && html`<div class="ap-why">${c.reason}</div>`}
     <div class="ap-em"><b>${c.title}</b>
-      ${p.to && html`<div><span class="mu">To</span> ${p.to}</div>`}
-      ${p.subject && html`<div><span class="mu">Subject</span> ${p.subject}</div>`}
+      ${p.to && html`<div><span class="mu">${toL}</span> ${p.to}</div>`}
+      ${p.subject && html`<div><span class="mu">${subL}</span> ${p.subject}</div>`}
       ${(p.fields || []).map((f) => html`<div><span class="mu">${f.label}</span> ${f.value}</div>`)}
       ${p.body && html`<div class="ap-body">${p.body}</div>`}</div>
     ${c.details && html`<button class="ap-raw-btn" onClick=${() => setRaw(!raw)} aria-expanded=${raw ? 'true' : 'false'}>${raw ? 'Hide' : 'Show'} the exact request</button>

@@ -82,6 +82,8 @@ struct SettingsBody {
     agent_name: Option<String>,
     feed_prompt: Option<String>,
     allow_claude_for_shared: Option<bool>,
+    /// "Pause Iris": stop what it is doing and start nothing new.
+    paused: Option<bool>,
 }
 
 async fn put_settings(
@@ -122,6 +124,9 @@ async fn put_settings(
             Ok(())
         })
         .await?;
+    if let Some(p) = body.paused {
+        super::connect::set_paused(&state, p).await?;
+    }
     ok(state.broadcast_settings().await)
 }
 
@@ -187,7 +192,7 @@ pub fn harnesses_for(state: &AppState, user: &AuthUser) -> Vec<Value> {
                     Some(f) => serde_json::to_value(f).unwrap_or(Value::Null),
                     None => "manual".into(),
                 };
-                v["login_hint"] = e.harness.manual_login_hint().into();
+                v["login_hint"] = crate::login::manual_login_hint(state, e.harness.as_ref()).into();
                 v["key_options"] = serde_json::to_value(crate::keys::options(e.harness.name()))
                     .unwrap_or_default();
                 v["login"] = serde_json::to_value(state.logins.status(e.harness.name()))
@@ -522,7 +527,7 @@ async fn create_connector(
     let name = body.name.clone().unwrap_or_default();
     if !valid_server_name(&name) || RESERVED_CONNECTOR_NAMES.contains(&name.as_str()) {
         return Err(ApiError::bad_request(
-            "name must be 1-48 characters of A-Z, a-z, 0-9, _ or - (and not 'iris')",
+            "name must be 1-48 characters of A-Z, a-z, 0-9, _ or - (and not 'iris', 'browser', or 'iris_browser')",
         ));
     }
     let description = body.description.clone().unwrap_or_default();
@@ -880,6 +885,14 @@ fn credential_parts(kind: &str, b: &CredentialBody) -> Result<(Value, SecretFiel
     }
 }
 
+/// The secret values Iris can fill into pages (not free-form notes).
+fn fillable_secrets(secret: &SecretFields) -> Vec<String> {
+    ["password", "number", "cvc"]
+        .iter()
+        .filter_map(|k| secret.get(*k).and_then(Value::as_str).map(String::from))
+        .collect()
+}
+
 async fn list_credentials(State(state): State<AppState>, user: AuthUser) -> ApiResult {
     user.require_owner()?;
     let uid = user.id().to_string();
@@ -887,7 +900,7 @@ async fn list_credentials(State(state): State<AppState>, user: AuthUser) -> ApiR
         .db
         .call(move |c| entities::list_credentials(c, &uid))
         .await?;
-    ok(json!({"credentials": list, "injection": "not_implemented"}))
+    ok(json!({"credentials": list}))
 }
 
 async fn create_credential(
@@ -913,6 +926,8 @@ async fn create_credential(
         }));
     }
     let id = new_id();
+    // A browser session already open must hide the new secret too.
+    state.browser.learn_secrets(&fillable_secrets(&secret));
     let ct = state
         .vault
         .encrypt(Value::Object(secret).to_string().as_bytes(), &id)?;
@@ -968,6 +983,8 @@ async fn update_credential(
                     let mut merged: SecretFields =
                         serde_json::from_slice(&plain).unwrap_or_default();
                     merged.extend(secret);
+                    // A browser session already open must hide it too.
+                    st.browser.learn_secrets(&fillable_secrets(&merged));
                     st.vault
                         .encrypt(Value::Object(merged).to_string().as_bytes(), &id)
                 });
