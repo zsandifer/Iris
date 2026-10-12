@@ -304,6 +304,10 @@ All paths are under `/api`. "Any" means any authenticated user.
 | POST | `/connectors/{id}/oauth/client` | **Owner** | Save the owner's own OAuth client |
 | GET | `/connectors/catalog` | **Owner** | Services to connect (Google, GitHub, custom) |
 | POST | `/connectors/catalog/{service}` | **Owner** | Set up a catalog service |
+| GET | `/connectors/google/setup` | **Owner** | Saved Google wizard progress, Console links and exact callback |
+| PUT | `/connectors/google/setup` | **Owner** | Save a wizard step or return to sign-in |
+| POST | `/connectors/google/setup/client` | **Owner** | Validate a single paste; optionally save the Google client |
+| POST | `/connectors/google/setup/error` | **Owner** | Report a Google error shown before returning to Iris |
 | GET | `/connectors/activity` | **Owner** | Connector calls, newest first |
 | POST | `/oauth/complete` | **Owner** | Finish a sign-in with the address the browser landed on |
 | GET | `/oauth/callback` | none | Where services send the browser after sign-in |
@@ -1494,9 +1498,12 @@ the service's own page:
   followed through redirects (loopback is allowed only when the connector
   itself is on this machine).
 - `preset` (Google): fixed endpoints and scopes, the owner's own OAuth
-  client (`access_type=offline`).
+  client (`access_type=offline`), requesting the existing Gmail/Calendar/Drive scope
+list plus `youtube.readonly` in one sign-in.
 
-The redirect URI is `<base>/api/oauth/callback`, where base is `public_url`
+Google requires an HTTPS `public_url` and always uses its exact
+`<public_url>/api/oauth/callback`, regardless of the requesting app origin.
+For other connectors, the redirect URI is `<base>/api/oauth/callback`, where base is `public_url`
 or the app's origin. If that is not https (and not this machine), the
 redirect goes to `http://127.0.0.1:<port>/api/oauth/callback` instead; the
 browser lands on a page that does not load, and the owner pastes that
@@ -1600,7 +1607,7 @@ line the program printed, or null>"}`.
 ```json
 {
   "services": [{
-    "id": "google", "label": "Google", "description": "Gmail, Calendar, and Drive",
+    "id": "google", "label": "Google", "description": "Gmail, Calendar, Drive, and YouTube read-only",
     "setup": "google_client", "missing": [], "connector_id": null, "connected": false,
     "redirect_uri": "https://iris.example.ts.net/api/oauth/callback", "redirect_direct": true
   }],
@@ -1610,7 +1617,9 @@ line the program printed, or null>"}`.
 
 `missing` lists programs the service needs on the server (Google needs
 `uvx`). `redirect_uri` is the address to register with the service;
-`redirect_direct: false` means the owner will paste the final address back.
+`redirect_direct: false` means the owner will paste the final address back
+for other services. Google instead reports `redirect_uri: null` until an HTTPS
+`public_url` is configured.
 
 #### `POST /api/connectors/catalog/{service}`
 
@@ -1628,12 +1637,72 @@ Creates (or updates) the connector named after the service. Response
   `https://api.githubcopilot.com/mcp/`), or `{"client_id",
   "client_secret"}` of the owner's GitHub OAuth app (then sign in).
 
+#### Google setup wizard (owner only)
+
+`GET /api/connectors/google/setup` returns:
+
+```json
+{
+  "progress": {
+    "step": 3, "total_steps": 6, "phase": "setup",
+    "summary": "Google setup: step 3 of 6", "error": null
+  },
+  "pages": {
+    "project": "https://console.cloud.google.com/projectcreate",
+    "apis": "https://console.cloud.google.com/flows/enableapi?apiid=gmail.googleapis.com,calendar-json.googleapis.com,drive.googleapis.com,youtube.googleapis.com",
+    "branding": "https://console.cloud.google.com/auth/branding",
+    "audience": "https://console.cloud.google.com/auth/audience",
+    "client": "https://console.cloud.google.com/auth/clients/create"
+  },
+  "redirect_uri": "https://iris.example/api/oauth/callback"
+}
+```
+
+Steps 1–6 are project, APIs, branding/audience, login key, publish, paste.
+`phase` is `setup`, `sign_in` (after the key is saved), or `connected`.
+The Console URLs are defined together on the server. `redirect_uri` is null
+until `public_url` is a valid HTTPS URL without credentials, query or fragment.
+The app links to its HTTPS setup help from step 4.
+
+`PUT /api/connectors/google/setup` accepts `{"step": 1..6, "sign_in"?: false}`.
+It saves progress in SQLite and clears the previous reported error. Passing
+`sign_in: true` requires step 6 and a saved Google client. Advancing beyond
+step 4 or returning to sign-in requires HTTPS `public_url`. Returns the same
+object as GET. Done is the owner's confirmation, not a Google Console check.
+
+`POST /api/connectors/google/setup/client` accepts `{"paste": "...",
+"validate_only"?: false}`. The paste is capped at 64 KiB and accepts downloaded
+`web`/`installed` client JSON, or an ID ending in `.apps.googleusercontent.com`
+and a secret starting with `GOCSPX-`, with labels, whitespace and either order.
+Multiple distinct keys, missing parts and malformed values get friendly 400
+errors. `validate_only: true` returns only `{"valid": true}` and stores nothing.
+Saving requires HTTPS, uses the existing single Google connector and vault,
+then moves progress to sign-in. Returns the same object as GET; neither path
+returns the extracted ID or secret. The frontend validates locally on input
+and clears its paste after saving or leaving the step; nothing is stored there.
+
+`POST /api/connectors/google/setup/error` accepts `{"code": "..."}` for an
+error Google showed before it could return to Iris. Only allowlisted codes
+are accepted. Callback and token-exchange errors also update progress:
+`redirect_uri_mismatch` → step 4, `access_denied` → step 3 (retry if cancelled),
+`invalid_client` → step 6 (create a new key in step 4 if deleted),
+`unauthorized_client` → step 4, `invalid_scope` → step 2.
+A partial Google grant reports `missing_permissions` → sign-in at step 6;
+it is not stored as a completed connection.
+The response has `progress.error: {"step", "message"}` with a fixed, plain
+explanation. Provider prose and pasted credentials are never saved in progress
+or echoed. Successful sign-in clears the error, resolves setup cards and posts
+a private system note, including when setup was opened from Connections.
+Progress mutations broadcast `connectors.changed`; clients refetch GET.
+
 #### `POST /api/connectors/{id}/oauth/start`
 
 `{"origin": "<the app's origin>"}`. Discovers and registers as needed and
 returns `{"authorize_url", "redirect_uri", "paste": bool}`. Turning the
 connector off or removing it drops a sign-in in progress. The app opens
-`authorize_url`; when the owner approves, the service sends the browser to
+`authorize_url` in the owner’s real browser, using Safari schemes in an iOS
+standalone PWA and `target="_blank" rel="noopener noreferrer"` elsewhere, with
+a Copy link fallback (also used for engine sign-in and Google Console links); when the owner approves, the service sends the browser to
 `GET /api/oauth/callback`, or (when `paste`) the owner pastes the address
 they landed on into `POST /api/oauth/complete`. `409 needs_client` when the
 service has no dynamic registration and no client is saved (the message
@@ -1643,7 +1712,8 @@ one for the same connector.
 #### `POST /api/connectors/{id}/oauth/client`
 
 `{"client_id", "client_secret"?}`: the owner's own OAuth client for a
-`discover` connector. Clears saved tokens. Response `{"connector":
+`discover` connector. Google replacements use the wizard’s single-paste
+endpoint so its local server and vault credentials stay synchronized. Clears saved tokens. Response `{"connector":
 {Connector}}`.
 
 #### `GET /api/oauth/callback`
@@ -3165,7 +3235,8 @@ Private system prompts include the same compact status projection. Shared and
 isolated turns receive only Iris's version and whether the current engine is usable.
 Status reads cached official CLI probe results and current DB/runtime state; it
 never runs a CLI probe or operation. `signed_in: null` means not yet known.
-Status includes engine names/install/sign-in/version, current engine and model,
+Status includes `google_setup` (step, total_steps, phase, summary, and fixed
+error step/message only), engine names/install/sign-in/version, current engine and model,
 isolation, connector names/status/rules, saved login host names, wallet card count,
 agent name, feed/Pause/quiet hours/voice state, eight recent pending card summaries
 (type/title only), and eight recent conversation system notes. It excludes secrets,

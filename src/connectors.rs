@@ -32,7 +32,7 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         id: "google",
         label: "Google",
-        description: "Gmail, Calendar, and Drive",
+        description: "Gmail, Calendar, Drive, and YouTube read-only",
         requires: &["uvx"],
         setup: "google_client",
     },
@@ -143,8 +143,8 @@ pub async fn catalog_json(state: &AppState, origin: Option<&str>) -> Vec<Value> 
                 "missing": missing,
                 "connector_id": con.map(|c| c.id.clone()),
                 "connected": con.is_some_and(|c| c.active()),
-                "redirect_uri": redirect_uri,
-                "redirect_direct": direct,
+                "redirect_uri": if e.id == "google" { crate::google_setup::callback(&state.cfg.public_url) } else { Some(redirect_uri.clone()) },
+                "redirect_direct": if e.id == "google" { crate::google_setup::callback(&state.cfg.public_url).is_some() } else { direct },
             })
         })
         .collect()
@@ -204,13 +204,16 @@ pub async fn setup(
             let client_id = clean(&body.client_id)
                 .or_else(|| old.as_ref().and_then(|o| o.client_id.clone()))
                 .ok_or("paste the Client ID from Google Cloud")?;
-            if !client_id.ends_with(".apps.googleusercontent.com") {
+            if !client_id.ends_with(".apps.googleusercontent.com") || client_id.len() > 500 {
                 return Err(
                     "that doesn't look like a Google Client ID (it ends in .apps.googleusercontent.com)"
                         .into(),
                 );
             }
             let new_secret = clean(&body.client_secret);
+            if new_secret.as_ref().is_some_and(|s| s.len() > 500) {
+                return Err("I couldn't use that login key. Paste the client ID and secret from Google Cloud.".into());
+            }
             let sealed_secret = match &new_secret {
                 Some(s) => Some(crate::oauth::seal_client_secret(state, &id, s)?),
                 None => old.as_ref().and_then(|o| o.client_secret.clone()),
@@ -230,6 +233,18 @@ pub async fn setup(
                     open(&sealed_secret)?
                 }
             };
+            let same_client = old.as_ref().and_then(|o| o.client_id.as_deref()) == Some(&client_id)
+                && old
+                    .as_ref()
+                    .and_then(|o| o.client_secret.as_ref())
+                    .and_then(|s| {
+                        state
+                            .vault
+                            .open_str(s, &format!("connector:{id}:oauth:client_secret"))
+                            .ok()
+                    })
+                    .as_deref()
+                    == Some(secret_plain.as_str());
             let env = seal_env(BTreeMap::from([
                 ("MCP_ENABLE_OAUTH21".into(), "true".into()),
                 ("EXTERNAL_OAUTH21_PROVIDER".into(), "true".into()),
@@ -241,7 +256,6 @@ pub async fn setup(
                 ("GOOGLE_OAUTH_CLIENT_SECRET".into(), secret_plain),
             ]))
             .map_err(|e| e.to_string())?;
-            let same_client = old.as_ref().and_then(|o| o.client_id.as_deref()) == Some(&client_id);
             let mut o = if same_client {
                 old.clone().unwrap_or_default()
             } else {
@@ -287,7 +301,7 @@ pub async fn setup(
                     headers: BTreeMap::new(),
                     oauth: Some(o),
                 },
-                "Gmail, Calendar, and Drive",
+                "Gmail, Calendar, Drive, and YouTube read-only",
                 !signed_in,
             )
         }
@@ -356,6 +370,17 @@ pub async fn setup(
                     ..Default::default()
                 },
             )?;
+            if svc == "google" {
+                crate::google_setup::save(
+                    c,
+                    &crate::google_setup::Progress {
+                        step: 6,
+                        sign_in: true,
+                        completed: !needs_sign_in,
+                        issue: None,
+                    },
+                )?;
+            }
             Ok(())
         })
         .await

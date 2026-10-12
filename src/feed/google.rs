@@ -85,7 +85,10 @@ mod tests {
         };
         crate::persona::seed(&paths).unwrap();
         let db = db::Db::open(&paths.db_file()).unwrap();
-        let mut cfg = Config::default();
+        let mut cfg = Config {
+            public_url: "https://iris.example".into(),
+            ..Default::default()
+        };
         for h in cfg.harness.values_mut() {
             h.enabled = false;
         }

@@ -13,7 +13,7 @@ import { FeedScreen, StoryViewer, FeedSettings } from './feed.js';
 import { IdeasScreen, GoalsScreen, LibraryScreen } from './lists.js';
 import { Hub, Logins, Files, FileEditor, Folder } from './hub.js';
 import { Computer } from './computer.js';
-import { Connections, AddService, ConnectorPage, ConnectorForm, TrustedPeople } from './connect.js';
+import { Connections, AddService, GoogleHttpsHelp, ConnectorPage, ConnectorForm, TrustedPeople } from './connect.js';
 import { Settings, AiEngine, Devices, People, ActivityLog } from './settings.js';
 import { isIOS, standalone, syncPush, resetPush } from './push.js';
 import { trackViewport, blockZoom } from './viewport.js';
@@ -242,6 +242,7 @@ function Screen() {
       if (!owner) return html`<${Settings} />`;
       if (sub === 'connections') {
         if (a === 'add' && ['google', 'github', 'custom'].includes(rest[0])) return html`<${AddService} service=${rest[0]} key=${rest[0]} />`;
+        if (a === 'google-help') return html`<${GoogleHttpsHelp} />`;
         if (a === 'new') return html`<${ConnectorForm} id="new" key="new" />`;
         if (a === 'trusted') return html`<${TrustedPeople} />`;
         if (isId(a) && rest[0] === 'edit') return html`<${ConnectorForm} id=${a} key=${`${a}-edit`} />`;

@@ -10,6 +10,8 @@ import { Icon, Img, LetterTile, hostOf, safeUrl } from './ui.js';
 import { plain } from './md.js';
 import { ServiceSignIn, ServiceTile, labelOf } from './connect.js';
 
+import { ExternalLink } from './external-link.js';
+
 const apiPath = (p) => String(p || '').replace(/^\/api(?=\/)/, '');
 
 function Busy({ children }) {
@@ -19,7 +21,7 @@ function Busy({ children }) {
 function OpenLink({ url, label = 'Open', cls = 'pill' }) {
   url = safeUrl(url);
   if (!url) return null;
-  return html`<a class=${cls} href=${url} target="_blank" rel="noopener noreferrer">${label} <${Icon} name="external" size=${14} /></a>`;
+  return html`<${ExternalLink} url=${url} cls=${cls}>${label}<//>`;
 }
 
 // ------------------------------------------------------------ agent cards
@@ -51,7 +53,8 @@ function ConnectCard({ c }) {
   const url = !known && safeUrl(c.url);
   const label = c.action_label || 'Connect';
   const open = () => {
-    if (con) go(`iris/connections/${con.id}`);
+    if (known === 'google' && !ready) go('iris/connections/add/google');
+    else if (con) go(`iris/connections/${con.id}`);
     else if (known) go(known === 'custom' ? 'iris/connections/new' : `iris/connections/add/${known}`);
     else go('iris/connections');
   };
@@ -63,7 +66,7 @@ function ConnectCard({ c }) {
     <div class="grow"><b>${c.title}</b><small>${ready ? 'Connected' : c.body ? plain(c.body, 90) : url ? hostOf(url) : 'Connect it so I can help with it'}</small>
       ${url && isOwner() && html`<button class="lk-m" onClick=${open}>Connections ›</button>`}</div>
     ${ready ? html`<span class="ok">${'\u2713'}</span>`
-      : url ? html`<a class="go" href=${url} target="_blank" rel="noopener noreferrer">${label}</a>`
+      : url ? html`<${ExternalLink} url=${url} cls="go">${label}<//>`
       : html`<button class="go" onClick=${open}>${label}</button>`}
   </div>`;
 }
@@ -282,6 +285,7 @@ function ConnectorReconnectCard({ c }) {
     ${c.body && html`<p>${c.body}</p>`}
     ${done ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> Connected</div>`
       : !isOwner() ? html`<small class="mu">Only the owner can reconnect this.</small>`
+      : c.service === 'google' ? html`<div class="act"><button onClick=${() => go('iris/connections/add/google')}>Open Google setup</button></div>`
       : c.auth === 'oauth' && con ? html`<${ServiceSignIn} con=${con} label=${labelOf(con)} />`
       : isId(c.connector_id) ? html`<div class="act"><button onClick=${() => go(`iris/connections/${c.connector_id}${c.auth === 'oauth' ? '' : '/edit'}`)}>${c.action_label || 'Reconnect'}</button></div>`
       : null}

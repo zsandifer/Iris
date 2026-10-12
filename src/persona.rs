@@ -228,6 +228,7 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
     }
     if ctx.app_tools && private {
         out.push_str("\nCheck `system_status` for current setup; use `request_engine_signin`, `request_engine_install`, and `request_connector_setup` to request owner cards. You cannot change connections, credentials, or settings directly. System notes report outcomes; resolved cards need no further action.\n");
+        out.push_str("Google uses one owner-created login key and one sign-in for Gmail, Calendar, Drive and YouTube read-only. `request_connector_setup(\"google\")` opens the saved wizard. Coach only the current `google_setup` step: 1 create project Iris, 2 enable all four APIs, 3 branding (Iris, their own support/developer email) and Audience (External, their own account as test user), 4 Web application key with the exact HTTPS callback shown by Iris, 5 publish on Audience to avoid the seven-day testing sign-out, 6 paste the downloaded JSON or ID and secret together in the app, then sign in. Never ask for or accept the key in chat. The unverified-app warning is expected for their own private app: Advanced → Go to Iris. Sign-in and Google Console pages belong in the owner's real browser, never Iris's managed browser. Use reported error steps to help them fix setup; never claim Google Console steps were verified just because they tapped Done.\n");
     }
     if let Some(server) = ctx.browser.filter(|_| ctx.scope == Scope::Private) {
         out.push_str(&crate::browser::tools::guide(server));

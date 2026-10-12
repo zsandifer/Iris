@@ -111,7 +111,7 @@ See [docs/API.md](API.md) for every route, event, and data type.
 - Optional, for Iris's own browser: Chromium or Chrome, or Node.js to
   install Chromium from the app
 - [uv](https://docs.astral.sh/uv/) (`uvx`) on the server if you want to
-  connect Google (Gmail, Calendar, Drive)
+  connect Google (Gmail, Calendar, Drive, YouTube read-only)
 
 Iris resolves the CLIs from its engines directory, then `PATH` (plus
 `~/.local/bin` and similar), and reports their versions. It never pins or
@@ -607,16 +607,52 @@ Plain HTTP is allowed only for local servers at `localhost` or a loopback
 IP (`127.0.0.1`, `[::1]`). This also applies to OAuth discovery; a server
 elsewhere on your private network needs HTTPS to receive credentials.
 
-- **Google** (Gmail, Calendar, Drive) runs the open-source
+- **Google**: open **Iris hub → Connections → Google**, or ask “help me
+  set up Google” and tap the chat card. One setup and one sign-in connect
+  Gmail, Calendar, Drive and YouTube read-only. Iris uses your **own** Google
+  OAuth client so Gmail actions pass through Iris’s approval gate. Google
+  secrets and tokens stay encrypted on Iris’s side; the agent never gets them.
+
+  The wizard shows one step per screen, with Open, Copy, Done and Back.
+  Your place is saved on the server, so you can leave and resume; Iris can
+  coach you from the current step without seeing your key.
+
+  1. Create a Google Cloud project named **Iris**. Keep that project selected
+     in Google’s project picker for the remaining steps.
+  2. Enable Gmail, Calendar, Drive and YouTube together with the Open button.
+  3. On **Branding**, enter **Iris** and your own Google email for support and
+     developer contact. On **Audience**, choose **External** and add your own
+     Google account as a test user.
+  4. Create a **Web application** login key. Copy the wizard’s exact callback
+     into **Authorized redirect URIs**. Iris requires `public_url` to be its
+     HTTPS address first; the screen links to instructions. See also
+     [using Iris from your phone](#using-iris-from-your-phone). Download the
+     client JSON or copy its client ID and secret for step 6.
+  5. On **Audience**, choose **Publish app** and confirm **In production**.
+     Otherwise Google’s testing mode signs you out every seven days.
+     Your app is still for your own private use. During sign-in, the warning
+     **“Google hasn’t verified this app”** is expected: choose
+     **Advanced → Go to Iris**.
+  6. Paste the downloaded client JSON (web or installed format), or the
+     client ID and secret together, into the **one box in the app**.
+     Labels, line breaks and either order work. Never paste the key in chat.
+
+  Then tap **Sign in with Google**, open its sign-in page, approve access to
+  all four services, and return to Iris for **Connected ✓**. Reported sign-in
+  errors take you back to the step to fix; if Google stops on its own page,
+  use **Google showed a problem** in Iris. Done records your progress; Iris
+  cannot check the settings in your Google Cloud console.
+
+  Sign-in and Console links open in your real browser (Safari from an iOS
+  home-screen app), where your saved passwords and signed-in accounts live.
+  Every link also offers **Copy link**. Iris’s managed browser is never used
+  for these sign-ins.
+
+  The server needs `uv`: Google actions use the existing
   [Google Workspace MCP server](https://github.com/taylorwilsdon/google_workspace_mcp)
-  (`uvx workspace-mcp`) on this machine, in its mode where Iris does the
-  sign-in and hands it a fresh token on each request. You need `uv` on the
-  server and your own Google OAuth client: the app walks you through
-  creating a Google Cloud project, turning on the three APIs, setting up
-  the consent screen (add yourself as a test user; publish it to avoid
-  re-signing in every 7 days), and creating a "Web application" client
-  with the redirect URI the app shows. Paste the client ID and secret, then
-  sign in. No client secret ships with Iris.
+  (`uvx workspace-mcp`) in external OAuth mode, with a fresh token on each
+  request. YouTube read-only also powers subscriptions and likes in For you.
+  No client secret ships with Iris.
 - **GitHub** uses GitHub's remote MCP server with a fine-grained personal
   access token, or your own GitHub OAuth app.
 - **Custom**: any MCP server by web address (with sign-in, a header such as

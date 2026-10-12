@@ -2,13 +2,16 @@
 // step-by-step setup guides, signing a service in through Iris's callback,
 // each connection's rules ("Reads freely · asks before sending"), its
 // actions, recent use, and the trusted people list.
-import { html, useEffect, useState } from './h.js';
+import { html, useEffect, useRef, useState } from './h.js';
 import { get, post, put, patch, del, seg, ApiError } from './api.js';
 import { S, set, useStore, go, toast, loadConnectors } from './store.js';
 import {
   Icon, Row, Group, Page, Spinner, Toggle, LetterTile, Empty,
   agentName, stamp, confirmSheet, openSheet, closeSheet,
 } from './ui.js';
+
+import { ExternalLink } from './external-link.js';
+import { googlePasteError } from './google-paste.js';
 
 const BRAND = { google: '#4285f4', github: '#24292f' };
 
@@ -71,7 +74,7 @@ export function Connections() {
     ${!S.connectors ? html`<${Spinner} />` : html`
       <${Group} label="Connected" note=${list.length ? `${agentName()} asks you before sending, buying, deleting, or contacting someone new.` : null}>
         ${list.length ? list.map((c) => html`<${Row} icon=${html`<${ServiceTile} c=${c} />`} title=${labelOf(c)}
-          sub=${statusOf(c)} onClick=${() => go(`iris/connections/${c.id}`)} />`)
+          sub=${c.service === 'google' && c.auth_state === 'ok' && c.enabled && !c.paused ? 'Gmail ✓ · Calendar ✓ · Drive ✓ · YouTube read-only ✓' : statusOf(c)} onClick=${() => go(`iris/connections/${c.id}`)} />`)
           : html`<div class="r"><div class="rt mu">Nothing connected yet</div></div>`}
       <//>
       <${Group} label="Add a connection">
@@ -137,6 +140,7 @@ export function ServiceSignIn({ con, label, onDone }) {
     } catch (err) { toast(err.message); }
     setBusy(false);
   };
+  if (client && con.service === 'google') return html`<button class="b1 wide" onClick=${() => go('iris/connections/add/google')}>Open Google setup</button>`;
   if (client) {
     return html`<form class="form" onSubmit=${saveClient}>
       <div class="lock">${client}</div>
@@ -149,25 +153,30 @@ export function ServiceSignIn({ con, label, onDone }) {
   }
   return html`<ol class="steps-list">
       <li><span>Open ${label}'s sign-in page and approve.</span>
-        <a class="pill" href=${flow.authorize_url} target="_blank" rel="noopener noreferrer">Open sign-in <${Icon} name="external" size=${14} /></a></li>
+        <${ExternalLink} url=${flow.authorize_url}>Open sign-in<//></li>
       ${flow.paste ? html`<li><span>Your browser will end on a page that doesn't load. That's expected: copy that page's whole address and paste it here.</span>
         <form class="code-row" onSubmit=${paste}>
           <input class="field" value=${url} placeholder="http://127.0.0.1…" autocapitalize="off" spellcheck=${false} onInput=${(e) => setUrl(e.target.value)} />
           <button class="b1 sm" disabled=${busy || !url.trim()}>Connect</button></form></li>`
       : html`<li><span>Come back here when it says connected.</span></li>`}
     </ol>
-    ${!flow.paste && html`<div class="status shimmer">Waiting for you to approve…</div>`}`;
+    ${!flow.paste && html`<div class="status shimmer">Waiting for you to approve…</div>`}
+    <button class="lk-m" disabled=${busy} onClick=${start}>Start sign-in again</button>`;
 }
 
 // ------------------------------------------------------------- set-up guides
 
 function Copy({ text }) {
-  return html`<button class="copy-box mono" onClick=${() => navigator.clipboard?.writeText(text).then(() => toast('Copied'))}>
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(text); toast('Copied'); }
+    catch { toast('I couldn’t copy it. Select the value and copy it.'); }
+  };
+  return html`<button class="copy-box mono" type="button" aria-label=${`Copy ${text}`} onClick=${copy}>
     <span>${text}</span><${Icon} name="copy" size=${15} /></button>`;
 }
 
 function Ext({ href, children }) {
-  return html`<a class="pill" href=${href} target="_blank" rel="noopener noreferrer">${children} <${Icon} name="external" size=${13} /></a>`;
+  return html`<${ExternalLink} url=${href}>${children}<//>`;
 }
 
 function useCatalog() {
@@ -177,50 +186,127 @@ function useCatalog() {
 }
 
 function GoogleSetup({ entry, con }) {
-  const [f, setF] = useState({ client_id: '', client_secret: '' });
+  useStore();
+  const [setup, setSetup] = useState(null);
+  const [paste, setPaste] = useState('');
+  const [email, setEmail] = useState('');
   const [busy, setBusy] = useState(false);
-  const [saved, setSaved] = useState(con);
-  const save = async (e) => {
-    e.preventDefault();
-    setBusy(true);
-    try {
-      const r = await post('/connectors/catalog/google', f);
-      setSaved(r.connector);
-      loadConnectors();
-      toast('Saved. Now sign in with Google.');
-    } catch (err) { toast(err.message); }
-    setBusy(false);
+  const [error, setError] = useState('');
+  const pending = useRef(false);
+  const revision = useRef(0);
+  const reload = async () => {
+    if (pending.current) return;
+    const mark = ++revision.current;
+    try { const r = await get('/connectors/google/setup'); if (revision.current === mark) setSetup(r); }
+    catch (e) { if (revision.current === mark) setError(e.message); }
   };
-  const done = saved?.oauth?.connected && saved?.auth_state === 'ok';
-  return html`
-    <div class="lock"><${Icon} name="lock" size=${15} /> Google's own sign-in, with your own Google Cloud project: your mail and files go only between this server and Google. It takes about five minutes, once.</div>
-    ${entry.missing?.length > 0 && html`<div class="warn-box">Your server needs <b>uv</b> to run the Google connector (an open-source Google Workspace MCP server). Install it once on the server: <code>curl -LsSf https://astral.sh/uv/install.sh | sh</code></div>`}
-    <ol class="guide">
-      <li><b>Create a Google Cloud project</b> (any name, like "Iris").<div><${Ext} href="https://console.cloud.google.com/projectcreate">Open Google Cloud<//></div></li>
-      <li><b>Turn on Gmail, Calendar, and Drive</b> for that project. Tap each and press Enable.
-        <div class="pill-row"><${Ext} href="https://console.cloud.google.com/apis/library/gmail.googleapis.com">Gmail API<//>
-        <${Ext} href="https://console.cloud.google.com/apis/library/calendar-json.googleapis.com">Calendar API<//>
-        <${Ext} href="https://console.cloud.google.com/apis/library/drive.googleapis.com">Drive API<//></div></li>
-      <li><b>Set up the sign-in screen.</b> Choose <i>External</i>, fill in the app name and your email, then under Audience add your own Google address as a test user.
-        <div><${Ext} href="https://console.cloud.google.com/auth/overview">Open sign-in setup<//></div>
-        <small class="mu">Tip: while the app is in testing, Google signs you out every 7 days. Publishing it (Audience, Publish app) keeps you signed in; Google will warn that it's unverified, which is fine for your own use.</small></li>
-      <li><b>Create an OAuth client</b> of type <i>Web application</i>, and add this as an <i>Authorized redirect URI</i>:
-        <${Copy} text=${entry.redirect_uri} />
-        <div><${Ext} href="https://console.cloud.google.com/auth/clients/create">Create client<//></div>
-        ${!entry.redirect_direct && html`<small class="mu">Iris isn't on a secure (https) address, so after you approve, Google sends you to a page that won't load. That's expected: you'll copy its address back into the app.</small>`}</li>
-      <li><b>Paste the Client ID and Client secret</b> Google shows you.
-        <form class="form" onSubmit=${save}>
-          <input class="field mono" placeholder=${saved?.oauth?.client_configured ? 'Saved (paste to replace)' : '….apps.googleusercontent.com'} value=${f.client_id} autocapitalize="off" spellcheck=${false}
-            onInput=${(e) => setF({ ...f, client_id: e.target.value })} />
-          <input class="field mono gap" type="password" placeholder=${saved?.oauth?.client_configured ? 'Saved (paste to replace)' : 'Client secret'} value=${f.client_secret} autocomplete="off"
-            onInput=${(e) => setF({ ...f, client_secret: e.target.value })} />
-          <button class="b2 wide gap" disabled=${busy || (!f.client_id && !saved)}>Save</button>
-        </form></li>
-      <li><b>Sign in with Google.</b>
-        ${done ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> Connected${saved.oauth.account ? ` as ${saved.oauth.account}` : ''}</div>`
-          : saved?.oauth?.client_configured ? html`<${ServiceSignIn} con=${saved} label="Google" onDone=${() => { loadConnectors(); go(`iris/connections/${saved.id}`); }} />`
-          : html`<small class="mu">Save the client first.</small>`}</li>
-    </ol>`;
+  useEffect(() => { reload(); }, [S.connectors]);
+  useEffect(() => {
+    const visible = () => { if (!document.hidden) { reload(); loadConnectors().catch(() => {}); } };
+    window.addEventListener('focus', visible);
+    document.addEventListener('visibilitychange', visible);
+    return () => { window.removeEventListener('focus', visible); document.removeEventListener('visibilitychange', visible); };
+  }, []);
+  const p = setup?.progress;
+  useEffect(() => { if (p?.step !== 6 || p?.phase !== 'setup') setPaste(''); }, [p?.step, p?.phase]);
+  const advance = async (step, sign_in = false) => {
+    pending.current = true; revision.current++; setBusy(true); setError('');
+    try { setSetup(await put('/connectors/google/setup', { step, sign_in })); }
+    catch (e) { setError(e.message); }
+    pending.current = false; setBusy(false);
+  };
+  const save = async (e) => {
+    e.preventDefault(); pending.current = true; revision.current++; setBusy(true); setError('');
+    try {
+      setSetup(await post('/connectors/google/setup/client', { paste }));
+      setPaste('');
+      await loadConnectors();
+    } catch (e) { setError(e.message); }
+    pending.current = false; setBusy(false);
+  };
+  const back = () => {
+    if (busy) { go('iris/connections'); return; }
+    if (!p || p.phase === 'connected' || (p.step === 1 && p.phase === 'setup')) go('iris/connections');
+    else advance(!setup.redirect_uri && p.step >= 4 ? 4 : p.phase === 'sign_in' ? 6 : p.step - 1);
+  };
+  const report = async (code) => {
+    pending.current = true; revision.current++; setBusy(true); setError('');
+    try { setSetup(await post('/connectors/google/setup/error', { code })); }
+    catch (e) { setError(e.message); }
+    pending.current = false; setBusy(false);
+  };
+  const titles = ['Create a project', 'Turn on Google services', 'Set up your sign-in screen', 'Create your login key', 'Keep yourself signed in', 'Paste your login key'];
+  const title = p?.phase === 'connected' ? 'Google connected' : p?.phase === 'sign_in' ? 'Sign in with Google' : titles[(p?.step || 1) - 1];
+  const validation = paste ? googlePasteError(paste) : null;
+  const pages = setup?.pages;
+  const open = (key, label = 'Open') => html`<${ExternalLink} url=${pages[key]} cls="b1 wide">${label}<//>`;
+  return html`<${Page} title=${title} sub="One setup for Gmail, Calendar, Drive and YouTube read-only." onBack=${back}>
+    ${error && html`<p class="err-line" role="alert">${error}</p>`}
+    ${!p ? html`<${Spinner} />${error && html`<button class="b2 wide" onClick=${reload}>Try again</button>`}` : html`
+      <div class="wizard-progress" aria-label=${p.phase === 'setup' ? `Step ${p.step} of 6` : p.phase === 'sign_in' ? 'Setup complete. Sign in with Google.' : 'Connected'}>
+        ${titles.map((t, i) => html`<span class=${i + 1 <= p.step ? 'on' : ''} aria-current=${p.phase === 'setup' && i + 1 === p.step ? 'step' : undefined} title=${t}></span`)}
+        <small>${p.phase === 'setup' ? `Step ${p.step} of 6` : p.phase === 'sign_in' ? 'Last thing: sign in' : 'Connected ✓'}</small>
+      </div>
+      ${p.error && html`<div class="warn-box" role="alert">${p.error.message}</div>`}
+      ${entry.missing?.length > 0 && p.phase === 'sign_in' && html`<div class="warn-box">I need the Google helper installed on my server before I can use this connection. Ask whoever runs your Iris server to install uv.</div>`}
+      ${p.phase === 'connected' ? html`<div class="ok-line"><${Icon} name="check" /> Connected ✓</div><p>Gmail, Calendar, Drive and YouTube read-only are ready. ${agentName()} uses your approval rules for Google actions.</p>
+        <button class="b1 wide" onClick=${() => go('iris/connections')}>Done</button>
+        <button class="b2 wide gap" disabled=${busy} onClick=${() => advance(6)}>Replace login key</button>`
+      : p.phase === 'sign_in' ? html`<p>Google asks your permission so I can use all four services with your approval rules.</p>
+        <p>“Google hasn't verified this app” is expected for your own private app. Tap <b>Advanced → Go to Iris</b>, then approve access to all four services.</p>
+        ${!setup.redirect_uri ? html`<div class="warn-box">I need my server’s HTTPS address set first.</div><button class="b1 wide" onClick=${() => advance(4)}>Set up HTTPS</button>` : con ? html`<${ServiceSignIn} con=${con} label="Google" onDone=${reload} />` : html`<${Spinner} />`}
+        <details class="alt"><summary>Google showed a problem</summary><p>If Google stopped before returning here, choose what its page says:</p>
+          ${[['redirect_uri_mismatch', 'Callback address doesn’t match'], ['access_denied', 'Access denied'], ['invalid_client', 'Invalid login key'], ['unauthorized_client', 'Wrong kind of login key']].map(([code, label]) => html`<button class="b2 wide gap" disabled=${busy} onClick=${() => report(code)}>${label}</button>`)}
+        </details>`
+      : html`<div class="google-step" key=${p.step}>
+        ${p.step === 1 && html`<p>A project gives your private Iris app a home in Google.</p><p>Create a project named <b>Iris</b>. Select it in the project picker before each later step.</p>
+          <${Copy} text="Iris" />${open('project')}`}
+        ${p.step === 2 && html`<p>Turning these on lets Iris use your mail, calendar, files and YouTube subscriptions.</p>
+          <p>Check that your Iris project is selected, then turn on all four services together.</p>${open('apis')}
+          <details class="alt"><summary>Didn't turn on all four?</summary><p>Open each one and tap <b>Enable</b>:</p>
+            ${[['api_gmail', 'Gmail'], ['api_calendar', 'Calendar'], ['api_drive', 'Drive'], ['api_youtube', 'YouTube']].map(([k, l]) => html`<${ExternalLink} url=${pages[k]} cls="b2 wide gap">${l}<//>`)}</details>`}
+        ${p.step === 3 && html`<p>This tells Google what to show when you sign in to your own app.</p>
+          <p>On Branding, use <b>Iris</b> as the app name and your own Google email as both the support and developer email.</p>
+          <${Copy} text="Iris" /><label class="lbl" for="google-email">Your Google email (for copying)</label>
+          <input id="google-email" class="field" type="email" value=${email} autocomplete="email" onInput=${(e) => setEmail(e.target.value)} />
+          ${email.trim() && html`<${Copy} text=${email.trim()} />`}${open('branding', 'Open Branding')}
+          <p>Then on Audience, choose <b>External</b> and add your own Google account as a <b>test user</b>.</p>
+          <${Copy} text="External" />${open('audience', 'Open Audience')}`}
+        ${p.step === 4 && html`<p>A login key lets Google send your sign-in back to this Iris server.</p>
+          ${!setup.redirect_uri ? html`<div class="warn-box">I need my server’s <code>public_url</code> set to its HTTPS address first. Set it in config.toml and restart Iris, then come back here.</div>
+            <a class="pill" href="#/iris/connections/google-help">How to set up HTTPS</a>`
+          : html`<p>Choose <b>Web application</b>. Under <b>Authorized redirect URIs</b>, add this exact address. Save, then download the client JSON or copy the ID and secret for step 6.</p>
+            <${Copy} text="Web application" /><${Copy} text=${setup.redirect_uri} />${open('client')}
+            <small class="mu">On older Google screens this is <b>APIs &amp; Services → Credentials → Create credentials → OAuth client ID</b>.</small>`}`}
+        ${p.step === 5 && html`<p>Publishing prevents Google from signing you out every 7 days.</p>
+          <p>On Audience, tap <b>Publish app</b> and confirm that it says <b>In production</b>. Your app is still for your own private use.</p>
+          <p>When you sign in, Google will say <b>“Google hasn't verified this app”</b>. That’s expected because this is your own app: tap <b>Advanced → Go to Iris</b>.</p>${open('audience')}`}
+        ${p.step === 6 && html`<p>I keep your login key encrypted so Google actions go through your approval rules.</p>
+          <p>Paste the whole downloaded JSON, or the client ID and secret together, in any order. Labels and line breaks are fine.</p>
+          <form class="form" onSubmit=${save}><label class="lbl" for="google-paste">Your login key</label>
+            <textarea id="google-paste" class="field mono" rows="6" value=${paste} autocomplete="off" autocapitalize="off" spellcheck=${false} aria-describedby="google-paste-feedback"
+              onInput=${(e) => { setPaste(e.target.value); setError(''); }} />
+            <small id="google-paste-feedback" class=${validation ? 'err-line' : 'mu'} role="status">${validation || (paste ? 'I found both parts. Ready to save.' : 'Your key stays here, never in chat.')}</small>
+            <button class="b1 wide gap" disabled=${busy || !paste || !!validation}>${busy ? 'Saving…' : 'Done — save key'}</button>
+          </form>
+          ${con?.oauth?.client_configured && html`<button class="b2 wide gap" disabled=${busy} onClick=${() => advance(6, true)}>Use saved key</button>`}`}
+        ${p.step < 6 && html`<button class="b1 wide gap" disabled=${busy || (p.step === 4 && !setup.redirect_uri)} onClick=${() => advance(p.step + 1)}>${busy ? 'Saving…' : 'Done'}</button>`}
+      </div>`}
+      <button class="b2 wide gap" onClick=${back}>Back</button>
+      <small class="mu">Your place is saved. You can leave and come back anytime.</small>
+    `}
+  <//>`;
+}
+
+export function GoogleHttpsHelp() {
+  return html`<${Page} title="Give Iris an HTTPS address" sub="Google needs a secure address to send your sign-in back to Iris.">
+    <p>If you use Tailscale, turn on MagicDNS and HTTPS certificates in its admin console. On the Iris server run:</p>
+    <${Copy} text="tailscale serve --bg 7420" />
+    <p>Use your Iris port if it differs from 7420. Copy the HTTPS address it prints into <code>public_url</code> in your Iris config.toml, then restart Iris. A private HTTPS reverse proxy works too.</p>
+    <p>Open Iris at that HTTPS address on your phone, then return to Google setup.</p>
+    <${ExternalLink} url="https://tailscale.com/kb/1312/serve">Open Tailscale’s guide<//>
+    <a class="b1 wide gap" href="#/iris/connections/add/google">Back to Google setup</a>
+  <//>`;
 }
 
 function GitHubSetup({ entry, con }) {
@@ -269,9 +355,9 @@ export function AddService({ service }) {
   const entry = cat?.services?.find((s) => s.id === service);
   const con = (S.connectors || []).find((c) => c.service === service);
   if (cat && !entry) return html`<${Page} title="Connect"><${Empty} icon="plug" title="Unknown service">Pick one from Connections.<//><//>`;
+  if (service === 'google' && entry) return html`<${GoogleSetup} entry=${entry} con=${con} />`;
   return html`<${Page} title=${`Connect ${entry?.label || ''}`} sub=${entry?.description}>
-    ${!cat ? html`<${Spinner} />` : service === 'google' ? html`<${GoogleSetup} entry=${entry} con=${con} />`
-      : html`<${GitHubSetup} entry=${entry} con=${con} />`}
+    ${!cat ? html`<${Spinner} />` : html`<${GitHubSetup} entry=${entry} con=${con} />`}
   <//>`;
 }
 
