@@ -2198,6 +2198,9 @@ mod tests {
         let con = get(&a);
         assert!(google_needs_more_access(&con));
         assert_eq!(con.config.args, old_args);
+        // Neither that nor a restart's reconciliation closes the card.
+        crate::login::on_connector_updated(&a.state, &con.id).await;
+        assert_eq!(card(&a)["state"], "needs_reconnect");
 
         // Signing in again asks for everything; until it lands, the record
         // still shows the older grant.
@@ -2233,6 +2236,7 @@ mod tests {
             );
         }
         assert!(google_needs_more_access(&get(&a)));
+        assert_eq!(card(&a)["state"], "needs_reconnect");
         {
             let mut p = provider.lock().unwrap();
             p.challenge = Some(q["code_challenge"].clone());

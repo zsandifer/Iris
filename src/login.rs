@@ -821,7 +821,10 @@ pub async fn on_connector_updated(state: &AppState, connector_id: &str) {
         .await
         .ok()
         .flatten();
-    if let Some(con) = con.filter(|c| c.active()) {
+    // A Google connection still waiting for its newer services keeps its
+    // "Add more Google services" card open until that sign-in lands.
+    if let Some(con) = con.filter(|c| c.active() && !crate::connectors::google_needs_more_access(c))
+    {
         let note = format!("{} connected ✓", crate::gateway::service_label(&con));
         crate::awareness::finish(state, "connector", &con.id, "done", &note).await;
     }
