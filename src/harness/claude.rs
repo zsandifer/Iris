@@ -92,7 +92,7 @@ impl Harness for Claude {
         write_private_file(&prompt_file, spec.system_prompt.as_bytes())?;
         inv.temp_files.push(prompt_file.clone());
 
-        if spec.isolated {
+        {
             for var in [
                 "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
                 "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
@@ -137,6 +137,7 @@ impl Harness for Claude {
         // and approvals. Someone else's chat also gets none of the owner's
         // CLAUDE.md files or auto memory (environment above).
         a.push("--strict-mcp-config".into());
+        a.extend(["--setting-sources", ""].map(String::from));
 
         let mut allowed = self.cfg.allowed_tools.clone();
         if !spec.mcp_servers.is_empty() {
@@ -163,6 +164,14 @@ impl Harness for Claude {
             a.push(dir.to_string_lossy().into_owned());
         }
         a.extend(self.cfg.extra_args.iter().cloned());
+        let mut deny = vec!["Bash".to_string()];
+        for path in &spec.protected_paths {
+            for tool in ["Read", "Edit", "Write", "Glob", "Grep"] {
+                deny.push(format!("{tool}({}/**)", path.display()));
+                deny.push(format!("{tool}({})", path.display()));
+            }
+        }
+        a.extend(["--disallowedTools".into(), deny.join(",")]);
         inv.stdin = user_message_line(spec)?;
         Ok(inv)
     }
@@ -681,6 +690,12 @@ mod tests {
             key_env: vec![],
             isolated: false,
             own_mcp_servers: Vec::new(),
+            protected_paths: vec![
+                "/private/iris".into(),
+                "/private/config".into(),
+                "/home/agent/.codex/auth.json".into(),
+            ],
+            split: false,
         };
         let inv = Claude::new(HarnessConfig::claude_default())
             .build(&spec)
@@ -715,7 +730,23 @@ mod tests {
             .build(&spec)
             .unwrap();
         assert!(plain.args.contains(&"--strict-mcp-config".to_string()));
-        assert!(!plain.env.iter().any(|(k, _)| k.contains("MEMORY")));
+        assert!(
+            plain
+                .env
+                .contains(&("CLAUDE_CODE_DISABLE_AUTO_MEMORY".into(), "1".into()))
+        );
+        assert!(
+            plain
+                .env
+                .contains(&("CLAUDE_CODE_DISABLE_CLAUDE_MDS".into(), "1".into()))
+        );
+        assert!(
+            plain
+                .args
+                .iter()
+                .any(|a| a.contains("Read(/private/iris/**)"))
+        );
+        assert!(plain.args.iter().any(|a| a.starts_with("Bash,")));
         let mut iso = spec.clone();
         iso.isolated = true;
         let inv = Claude::new(HarnessConfig::claude_default())

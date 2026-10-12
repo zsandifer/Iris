@@ -38,6 +38,8 @@ pub struct HarnessStatus {
     /// Short reason when auth is required (never contains account data).
     pub auth_message: Option<String>,
     pub checked_at: Option<i64>,
+    pub isolation: String,
+    pub agent_user: Option<String>,
 }
 
 pub struct HarnessEntry {
@@ -66,6 +68,8 @@ impl HarnessEntry {
             auth: AuthState::Unknown,
             auth_message: None,
             checked_at: None,
+            isolation: "single_user".into(),
+            agent_user: None,
         };
         Self {
             harness,
@@ -163,14 +167,44 @@ want to see. Skip anything I have already seen in the feed.";
 
 impl AppState {
     pub fn new(cfg: Config, paths: Paths, db: Db) -> Result<Self> {
+        if let Some(p) = crate::agent::policy(&cfg.agent)?
+            && (p.service_uid != unsafe { libc::geteuid() }
+                || p.data_dir != paths.data_dir
+                || p.config_file != paths.config_file)
+        {
+            return Err("service paths or account do not match agent setup".into());
+        }
+        crate::agent::migrate_workspace(&paths)?;
+        let session_boundary = format!("conversation-cwd-v1:{}", cfg.agent.user);
+        db.with(|c| {
+            if db::get_setting(c, "agent.session_boundary")?.as_deref() != Some(&session_boundary) {
+                c.execute("DELETE FROM harness_sessions", [])?;
+                db::set_setting(c, "agent.session_boundary", &session_boundary)?;
+            }
+            Ok(())
+        })?;
         let vault = Vault::open(&paths.vault_key_file())?;
         let vapid = if cfg.push.enabled {
             Some(VapidKeys::load_or_create(&paths.vapid_key_file())?)
         } else {
             None
         };
+        let split = crate::agent::policy(&cfg.agent)?;
         let mut harnesses = BTreeMap::new();
         for (name, hc) in &cfg.harness {
+            let mut hc = hc.clone();
+            if let Some(policy) = &split {
+                let engine = policy
+                    .engines
+                    .get(name)
+                    .ok_or("engine is missing from agent policy")?;
+                if hc.command != *name && std::path::Path::new(&hc.command) != engine {
+                    return Err(
+                        "configured CLI path must be registered in the root agent policy".into(),
+                    );
+                }
+                hc.command = engine.to_string_lossy().into_owned();
+            }
             let h: Box<dyn Harness> = match name.as_str() {
                 "claude" => Box::new(Claude::new(hc.clone())),
                 "codex" => Box::new(Codex::new(hc.clone())),
@@ -179,6 +213,13 @@ impl AppState {
                 _ => continue,
             };
             harnesses.insert(name.clone(), HarnessEntry::new(h, hc.clone()));
+        }
+        for entry in harnesses.values() {
+            let mut status = entry.status.write().unwrap_or_else(|p| p.into_inner());
+            if !cfg.agent.user.is_empty() {
+                status.isolation = "split".into();
+                status.agent_user = Some(cfg.agent.user.clone());
+            }
         }
         let exe = std::env::current_exe()?;
         crate::harness::set_engines_bin(crate::engines::bin_dir(&cfg.engines_dir(&paths)));
@@ -319,19 +360,19 @@ impl AppState {
         let mut auth: Option<(AuthState, Option<String>)> = None;
         let mut has_keys = false;
         if let (true, Some(program)) = (entry.cfg.enabled, &program) {
-            let cwd = self.paths.workspace_dir();
             let strip = self.strip_env(entry);
             let keys = crate::keys::env_for(self, entry.harness.name()).await;
             has_keys = !keys.is_empty();
-            if let Ok((_, out, _)) =
-                runner::probe(program, &["--version".into()], &cwd, &strip, &[]).await
+            if let Ok((_, out, _)) = self
+                .agent_probe(entry, program, &["--version".into()], &strip, &[])
+                .await
             {
                 let v = out.lines().next().unwrap_or("").trim();
                 version = Some((!v.is_empty()).then(|| v.chars().take(80).collect()));
             }
             if let Some(args) = entry.harness.auth_probe_args() {
                 auth = Some(
-                    match runner::probe(program, &args, &cwd, &strip, &keys).await {
+                    match self.agent_probe(entry, program, &args, &strip, &keys).await {
                         Ok((ok, out, err)) => {
                             let state = entry.harness.parse_auth_probe(ok, &out, &err);
                             let message = (state == AuthState::AuthRequired)
@@ -459,6 +500,63 @@ impl AppState {
         self.refresh_harnesses().await;
     }
 
+    pub(crate) async fn agent_probe(
+        &self,
+        entry: &HarnessEntry,
+        program: &std::path::Path,
+        args: &[String],
+        strip: &[&str],
+        env: &[(String, String)],
+    ) -> Result<(bool, String, String)> {
+        let cwd = crate::agent::workdir(&self.cfg.agent, &self.paths, "probe")?;
+        if self.cfg.agent.user.is_empty() {
+            return runner::probe(program, args, &cwd, strip, env).await;
+        }
+        let mut inv = crate::harness::Invocation {
+            args: args.to_vec(),
+            env: env.to_vec(),
+            ..Default::default()
+        };
+        crate::agent::wrap(&self.cfg.agent, entry.harness.name(), "probe", &mut inv)?;
+        runner::probe_invocation(program, &inv, &cwd, strip).await
+    }
+
+    pub(crate) fn protected_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut paths = vec![self.paths.data_dir.clone(), self.paths.config_file.clone()];
+        if let Some(parent) = self.paths.config_file.parent() {
+            paths.push(parent.into());
+        }
+        let home = crate::agent::policy(&self.cfg.agent)?
+            .map(|p| p.home)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        if let Some(home) = home {
+            paths.extend(
+                [
+                    ".claude/.credentials.json",
+                    ".claude.json",
+                    ".codex/auth.json",
+                    ".gemini/oauth_creds.json",
+                    ".gemini/google_accounts.json",
+                    ".local/share/opencode/auth.json",
+                ]
+                .map(|p| home.join(p)),
+            );
+        }
+        // Respect nonstandard CLI homes in single-user mode too.
+        if self.cfg.agent.user.is_empty() {
+            for (key, file) in [
+                ("CODEX_HOME", "auth.json"),
+                ("CLAUDE_CONFIG_DIR", ".credentials.json"),
+                ("GEMINI_CLI_HOME", ".gemini/oauth_creds.json"),
+            ] {
+                if let Some(dir) = std::env::var_os(key) {
+                    paths.push(PathBuf::from(dir).join(file));
+                }
+            }
+        }
+        Ok(paths)
+    }
+
     /// Ask the CLI which models it can use now (OpenCode). Cheap: a local
     /// command, no model request.
     pub async fn probe_models(&self, entry: &HarnessEntry, program: &std::path::Path) -> bool {
@@ -468,10 +566,9 @@ impl AppState {
         let Some(args) = entry.harness.models_probe_args() else {
             return false;
         };
-        let cwd = self.paths.workspace_dir();
         let strip = self.strip_env(entry);
         let keys = crate::keys::env_for(self, entry.harness.name()).await;
-        match runner::probe(program, &args, &cwd, &strip, &keys).await {
+        match self.agent_probe(entry, program, &args, &strip, &keys).await {
             Ok((true, out, _)) => {
                 let models = entry.harness.parse_models(&out);
                 self.set_discovered_models(entry, models)
@@ -741,6 +838,76 @@ fn legacy_engine_pin(raw: &str) -> BTreeMap<Slot, Pin> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_upgrade_resets_cli_sessions_once_without_losing_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let db = Db::open(&paths.db_file()).unwrap();
+        let conv = db
+            .with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                db::ensure_main_conversation(c, &owner)
+            })
+            .unwrap();
+        let message = db
+            .with(|c| {
+                db::insert_message(
+                    c,
+                    &db::NewMessage {
+                        conversation_id: &conv,
+                        role: "user",
+                        content: "Synthetic history",
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+        let session = db::HarnessSession {
+            session_id: "old-session".into(),
+            synced_at: 0,
+            persona_hash: "old-persona".into(),
+        };
+        db.with(|c| db::set_harness_session(c, &conv, "claude", &session))
+            .unwrap();
+        let state = AppState::new(Config::default(), paths.clone(), db.clone()).unwrap();
+        assert!(
+            db.with(|c| db::get_harness_session(c, &conv, "claude"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            state.harness("claude").unwrap().status().isolation,
+            "single_user"
+        );
+        db.with(|c| db::set_harness_session(c, &conv, "claude", &session))
+            .unwrap();
+        let _state = AppState::new(Config::default(), paths, db.clone()).unwrap();
+        assert_eq!(
+            db.with(|c| db::get_message(c, &message.id))
+                .unwrap()
+                .unwrap()
+                .content,
+            "Synthetic history"
+        );
+        assert!(
+            db.with(|c| db::get_harness_session(c, &conv, "claude"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                db::get_conversation(c, &owner, &conv)
+            })
+            .unwrap()
+            .is_some()
+        );
+    }
 
     #[test]
     fn legacy_engine_setting_becomes_chat_pin() {

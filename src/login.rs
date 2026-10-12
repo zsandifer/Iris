@@ -171,6 +171,18 @@ fn rejected_code(line: &str) -> bool {
 }
 
 /// Start (or return the running) login for a harness.
+pub(crate) fn manual_login_hint(state: &AppState, harness: &dyn crate::harness::Harness) -> String {
+    let hint = harness.manual_login_hint();
+    if state.cfg.agent.user.is_empty() {
+        hint
+    } else {
+        format!(
+            "{hint} Run this as the dedicated {} account with its own HOME; the service user's sign-in is separate.",
+            state.cfg.agent.user
+        )
+    }
+}
+
 pub async fn start(state: &AppState, harness: &str) -> Result<LoginStatus> {
     let entry = state
         .harness(harness)
@@ -178,7 +190,7 @@ pub async fn start(state: &AppState, harness: &str) -> Result<LoginStatus> {
     let spec = entry
         .harness
         .login()
-        .ok_or_else(|| entry.harness.manual_login_hint())?;
+        .ok_or_else(|| manual_login_hint(state, entry.harness.as_ref()))?;
     let program = entry
         .program()
         .ok_or_else(|| format!("{harness} is not installed"))?;
@@ -212,10 +224,21 @@ pub async fn start(state: &AppState, harness: &str) -> Result<LoginStatus> {
         );
     }
     let session_id = status.id.clone();
-    let mut cmd = Command::new(&program);
-    cmd.args(&spec.args)
-        .current_dir(state.paths.workspace_dir())
-        .env("PWD", state.paths.workspace_dir())
+    let cwd = crate::agent::workdir(&state.cfg.agent, &state.paths, "login")?;
+    let mut invocation = crate::harness::Invocation {
+        args: spec.args.clone(),
+        env: vec![
+            ("BROWSER".into(), "true".into()),
+            ("NO_COLOR".into(), "1".into()),
+        ],
+        ..Default::default()
+    };
+    crate::agent::wrap(&state.cfg.agent, harness, "login", &mut invocation)?;
+    let mut cmd = Command::new(invocation.program.as_deref().unwrap_or(&program));
+    cmd.args(&invocation.args)
+        .envs(invocation.env.iter().cloned())
+        .current_dir(invocation.cwd.as_deref().unwrap_or(&cwd))
+        .env("PWD", &cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -240,6 +263,12 @@ pub async fn start(state: &AppState, harness: &str) -> Result<LoginStatus> {
             return Err(e.into());
         }
     };
+    if !invocation.stdin.is_empty() {
+        use tokio::io::AsyncWriteExt;
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin.write_all(&invocation.stdin).await?;
+        }
+    }
     let stdin = child
         .stdin
         .take()
@@ -544,7 +573,7 @@ pub async fn post_signin_card(state: &AppState, harness: &str, first_time: bool)
         return;
     };
     let flow = entry.harness.login().map(|s| s.flow);
-    let hint = entry.harness.manual_login_hint();
+    let hint = manual_login_hint(state, entry.harness.as_ref());
     let label = engine_label(harness);
     let (fallback, _) = state.resolve_slot(crate::ranking::Slot::Chat, false).await;
     let catalog = state.catalog();

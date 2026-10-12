@@ -58,6 +58,17 @@ only run a call unchanged, hold it for approval, or refuse it.
 7. **`templates/config.toml` must equal `Config::default()`.** A test
    enforces it; update both together.
 
+8. **Agent isolation.** In split mode the agent user never has read access
+   to Iris's data directory or configuration. Only the fixed root-owned
+   `iris agent-exec` launcher is allowed by sudoers; secrets never go on
+   argv. CLI turns, probes and app login run as the configured agent user.
+   Memory CRUD and connector calls stay on Iris's side of authenticated,
+   turn-scoped MCP proxies.
+9. **No implicit project instructions.** Every conversation has its own
+   working directory. Project docs/context files never load, including in
+   owner chats, jobs, resumed turns, classifiers and key checks. Do not
+   restore a shared cwd or silently weaken a CLI's context restrictions.
+
 ## Layout
 
 ```
