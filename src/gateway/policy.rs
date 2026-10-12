@@ -175,7 +175,70 @@ pub fn words(name: &str) -> Vec<String> {
     if !cur.is_empty() {
         out.push(cur);
     }
-    out
+    // Delivery/destructive verbs remain risky when an API concatenates them
+    // with nouns or other verbs. Conservative substring matches may ask more.
+    fn split(word: String) -> Vec<String> {
+        let verbs = [
+            "unsubscribe",
+            "unshare",
+            "terminate",
+            "dispatch",
+            "transmit",
+            "broadcast",
+            "purchase",
+            "download",
+            "discard",
+            "dispose",
+            "deliver",
+            "publish",
+            "forward",
+            "withdraw",
+            "destroy",
+            "delete",
+            "submit",
+            "notify",
+            "invite",
+            "export",
+            "mirror",
+            "compose",
+            "respond",
+            "relay",
+            "shred",
+            "share",
+            "reply",
+            "draft",
+            "send",
+            "wire",
+            "kill",
+            "push",
+            "text",
+            "ping",
+        ];
+        let mut parts = Vec::new();
+        let mut rest = word.as_str();
+        let mut start = 0;
+        while !rest.is_empty() {
+            if let Some(verb) = verbs.iter().find(|v| rest.starts_with(**v)) {
+                if start > 0 {
+                    parts.push(
+                        word[word.len() - rest.len() - start..word.len() - rest.len()].into(),
+                    );
+                }
+                parts.push((*verb).into());
+                rest = &rest[verb.len()..];
+                start = 0;
+            } else {
+                let len = rest.chars().next().unwrap().len_utf8();
+                start += len;
+                rest = &rest[len..];
+            }
+        }
+        if start > 0 {
+            parts.push(word[word.len() - start..].into());
+        }
+        parts
+    }
+    out.into_iter().flat_map(split).collect()
 }
 
 const READ_VERBS: &[&str] = &[
@@ -231,13 +294,21 @@ const SEND_WORDS: &[&str] = &[
     "dm",
     "submit",
     "announce",
+    "deliver",
+    "dispatch",
+    "relay",
+    "transmit",
+    "text",
+    "ping",
+    "push",
+    "remote",
 ];
 /// Verbs that only mean "send" in first position (`message_user`, but not
 /// `get_message`).
 const SEND_LEADING: &[&str] = &["message", "react", "request"];
 const PURCHASE_WORDS: &[&str] = &[
     "buy", "purchase", "pay", "payment", "payments", "checkout", "charge", "donate", "tip",
-    "refund", "invoice", "withdraw", "deposit",
+    "refund", "invoice", "withdraw", "deposit", "wire", "remit", "spend",
 ];
 const PURCHASE_LEADING: &[&str] = &["order", "book", "reserve", "subscribe", "transfer", "rent"];
 /// Nouns that make a non-reading call a purchase (`place_order`).
@@ -258,8 +329,26 @@ const DELETE_WORDS: &[&str] = &[
     "uninstall",
     "empty",
     "clear",
+    "discard",
+    "dispose",
+    "shred",
+    "kill",
+    "terminate",
+    "rm",
+    "unlink",
+    "bin",
+    "unshare",
 ];
-const EXPORT_WORDS: &[&str] = &["export", "dump", "backup", "takeout", "bulk", "exfiltrate"];
+const EXPORT_WORDS: &[&str] = &[
+    "export",
+    "dump",
+    "backup",
+    "takeout",
+    "bulk",
+    "exfiltrate",
+    "download",
+    "mirror",
+];
 const DRAFT_WORDS: &[&str] = &["draft", "drafts", "compose"];
 
 /// Ordinary changes (recognized, so an operation argument using them is
@@ -358,18 +447,35 @@ fn classify_words(w: &[String]) -> Option<Category> {
     if risky != Category::Read {
         return Some(risky);
     }
-    if has(&["send", "reply", "forward", "publish", "invite", "tweet"])
-        || (!read_first && (has(SEND_WORDS) || lead(SEND_LEADING)))
-    {
-        // `create_draft` and `draft_reply` stay drafts unless they send:
-        // `send_draft`, `publish_draft`, and `forward_draft` deliver one.
-        if has(DRAFT_WORDS) && !has(&["send", "publish", "forward", "post", "tweet", "invite"]) {
-            return Some(Category::Draft);
-        }
-        return Some(Category::Send);
-    }
-    if has(DRAFT_WORDS) {
+    // Nouns such as email/reply may describe a draft; delivery verbs may not.
+    let delivery = has(&[
+        "send",
+        "reply",
+        "respond",
+        "forward",
+        "publish",
+        "share",
+        "invite",
+        "tweet",
+        "post",
+        "submit",
+        "deliver",
+        "dispatch",
+        "relay",
+        "transmit",
+        "text",
+        "ping",
+        "push",
+        "remote",
+        "broadcast",
+        "notify",
+        "announce",
+    ]);
+    if !delivery && (lead(DRAFT_WORDS) || (first == "create" && has(DRAFT_WORDS))) {
         return Some(Category::Draft);
+    }
+    if delivery || (!read_first && (has(SEND_WORDS) || lead(SEND_LEADING))) {
+        return Some(Category::Send);
     }
     if read_first {
         return Some(Category::Read);
@@ -386,15 +492,9 @@ fn classify_words(w: &[String]) -> Option<Category> {
 
 /// Classify a tool by its name and the MCP server's annotations
 /// (`readOnlyHint`, `destructiveHint`). Annotations may raise a name's risk,
-/// but never lower it; only an unrecognized name can rely on a read hint.
+/// but never lower it. Unrecognized names ask even with a read-only hint.
 pub fn classify(tool: &str, annotations: &Value) -> Category {
-    let mut category = classify_words(&words(tool)).unwrap_or_else(|| {
-        if annotations["readOnlyHint"] == true {
-            Category::Read
-        } else {
-            Category::Write
-        }
-    });
+    let mut category = classify_words(&words(tool)).unwrap_or(Category::Unclear);
     if annotations["destructiveHint"] == true {
         category = category.riskier(Category::Delete);
     }
@@ -473,6 +573,13 @@ const RECIPIENT_KEYS: &[&str] = &[
     "reviewers",
     "collaborator",
     "grantee",
+    "guestemails",
+    "invite",
+    "invites",
+    "sendto",
+    "destination",
+    "bcclist",
+    "recipientemail",
 ];
 /// Flags that make a server add recipients Iris cannot see in the
 /// arguments (reply-all fills in everyone on the thread).
@@ -516,7 +623,14 @@ fn publishes(tool: &str, args: &Value) -> bool {
 /// Everyone a call reaches: the recipients its arguments name, plus a
 /// placeholder for an audience they cannot list (reply-all, publishing).
 pub fn audience(tool: &str, args: &Value) -> Vec<String> {
-    let mut out = recipients(args);
+    let mut out = Vec::new();
+    let scan = matches!(
+        classify_call(tool, &Value::Null, args),
+        Category::Send | Category::Write | Category::Unclear
+    );
+    walk_recipients(args, 0, scan, &mut out);
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|r| seen.insert(r.clone()));
     if publishes(tool, args) && !out.iter().any(|r| r == PUBLIC_AUDIENCE) {
         out.push(PUBLIC_AUDIENCE.to_string());
     }
@@ -755,18 +869,24 @@ pub fn normalize_recipient(raw: &str) -> Option<String> {
     (recipients.len() == 1).then(|| recipients.remove(0))
 }
 
-fn push_recipients(v: &Value, out: &mut Vec<String>) {
+fn push_recipients(v: &Value, depth: usize, out: &mut Vec<String>) {
+    if depth > 5 {
+        out.push(UNREADABLE_RECIPIENTS.into());
+        return;
+    }
     let before = out.len();
     match v {
         Value::String(s) => match parse_recipients(s) {
             Some(recipients) => out.extend(recipients),
             None => out.push(UNREADABLE_RECIPIENTS.into()),
         },
-        Value::Array(items) => items.iter().for_each(|i| push_recipients(i, out)),
+        Value::Array(items) => items
+            .iter()
+            .for_each(|i| push_recipients(i, depth + 1, out)),
         Value::Object(o) => {
             for (k, v) in o {
                 if IDENTITY_FIELDS.contains(&norm_key(k).as_str()) {
-                    push_recipients(v, out);
+                    push_recipients(v, depth + 1, out);
                 }
             }
         }
@@ -782,8 +902,21 @@ fn push_recipients(v: &Value, out: &mut Vec<String>) {
     }
 }
 
-fn walk_recipients(v: &Value, depth: usize, out: &mut Vec<String>) {
+fn truthy(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|n| n != 0.0),
+        Value::String(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "true" | "yes" | "1" | "on"
+        ),
+        _ => false,
+    }
+}
+
+fn walk_recipients(v: &Value, depth: usize, scan: bool, out: &mut Vec<String>) {
     if depth > 5 {
+        out.push(UNREADABLE_RECIPIENTS.into());
         return;
     }
     match v {
@@ -798,16 +931,60 @@ fn walk_recipients(v: &Value, depth: usize, out: &mut Vec<String>) {
             let mut entries: Vec<(&String, &Value)> = o.iter().collect();
             entries.sort_by_key(|(k, _)| rank(k));
             for (k, val) in entries {
-                if RECIPIENT_KEYS.contains(&norm_key(k).as_str()) {
-                    push_recipients(val, out);
+                let key = norm_key(k);
+                if IMPLICIT_RECIPIENT_FLAGS.contains(&key.as_str()) && truthy(val) {
+                    out.push(IMPLICIT_RECIPIENTS.into());
+                }
+                if ([
+                    "visibility",
+                    "public",
+                    "anyone",
+                    "linksharing",
+                    "anyonewithlink",
+                ]
+                .contains(&key.as_str())
+                    && truthy(val))
+                    || (["visibility", "audience", "access", "sharing", "linksharing"]
+                        .contains(&key.as_str())
+                        && val.as_str().is_some_and(|s| {
+                            ["public", "anyone", "anyonewithlink", "link", "true"]
+                                .contains(&norm_key(s).as_str())
+                        }))
+                {
+                    out.push(PUBLIC_AUDIENCE.into());
+                }
+                if RECIPIENT_KEYS.contains(&key.as_str()) {
+                    push_recipients(val, depth + 1, out);
                 } else {
-                    walk_recipients(val, depth + 1, out);
+                    walk_recipients(val, depth + 1, scan, out);
                 }
             }
         }
         Value::Array(items) => items
             .iter()
-            .for_each(|i| walk_recipients(i, depth + 1, out)),
+            .for_each(|i| walk_recipients(i, depth + 1, scan, out)),
+        Value::String(s) if scan => {
+            // Unknown fields can carry an address embedded in prose. Ambiguous
+            // address-like text fails closed instead of silently dropping it.
+            let digits = s.chars().filter(char::is_ascii_digit).count();
+            if digits >= 7
+                && s.chars()
+                    .all(|c| c.is_ascii_digit() || c.is_whitespace() || "+()-./".contains(c))
+            {
+                push_recipients(v, depth, out);
+                return;
+            }
+            for token in s.split_whitespace() {
+                let token = token.trim_matches(['<', '>', ',', ';', '"', '(', ')']);
+                if token.contains('@')
+                    || token.starts_with('+')
+                    || token.starts_with('#')
+                    || (token.chars().filter(char::is_ascii_digit).count() >= 7)
+                {
+                    push_recipients(&Value::String(token.into()), depth, out);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -816,14 +993,7 @@ fn walk_recipients(v: &Value, depth: usize, out: &mut Vec<String>) {
 /// order).
 pub fn recipients(args: &Value) -> Vec<String> {
     let mut out = Vec::new();
-    walk_recipients(args, 0, &mut out);
-    if let Some(obj) = args.as_object()
-        && obj.iter().any(|(k, v)| {
-            IMPLICIT_RECIPIENT_FLAGS.contains(&norm_key(k).as_str()) && (v == true || v == "true")
-        })
-    {
-        out.push(IMPLICIT_RECIPIENTS.to_string());
-    }
+    walk_recipients(args, 0, false, &mut out);
     let mut seen = std::collections::HashSet::new();
     out.retain(|r| seen.insert(r.clone()));
     out
@@ -861,6 +1031,9 @@ pub fn decide(
             ToolRule::Ask => Verdict::Ask(ask_reason(category).into()),
             ToolRule::Allow if category == Category::Purchase => {
                 Verdict::Ask("Purchases always ask first".into())
+            }
+            ToolRule::Allow if category == Category::Unclear => {
+                Verdict::Ask(ask_reason(category).into())
             }
             ToolRule::Allow => Verdict::Allow(AllowedBy::Override),
         };
@@ -1057,6 +1230,134 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unknown_and_disguised_delivery_tools_ask() {
+        let policy = Policy::default();
+        for tool in [
+            "frobnicate",
+            "sendemail",
+            "sendmail",
+            "emailsend",
+            "dispatch_message",
+            "relay_message",
+            "transmit_message",
+            "text_user",
+            "ping_user",
+            "push_to_remote",
+            "sync_to_remote",
+            "submit_draft",
+            "share_draft",
+            "deliver_draft",
+            "wire_money",
+            "discard",
+            "dispose",
+            "shred",
+            "kill",
+            "terminate",
+            "rm",
+            "unlink",
+            "bin",
+            "unshare",
+            "download_all",
+            "mirror",
+        ] {
+            let c = classify(tool, &json!({"readOnlyHint": true}));
+            assert!(
+                matches!(
+                    decide(&policy, tool, c, &[], &|_| false, &|_| false),
+                    Verdict::Ask(_)
+                ),
+                "{tool}: {c:?}"
+            );
+        }
+        let mut override_policy = Policy::default();
+        override_policy
+            .tools
+            .insert("frobnicate".into(), ToolRule::Allow);
+        assert!(matches!(
+            decide(
+                &override_policy,
+                "frobnicate",
+                classify("frobnicate", &Value::Null),
+                &[],
+                &|_| true,
+                &|_| true
+            ),
+            Verdict::Ask(_)
+        ));
+        assert_eq!(classify("sendemail", &Value::Null), Category::Send);
+        assert_eq!(classify("emailsend", &Value::Null), Category::Send);
+        for tool in [
+            "submit_draft",
+            "share_draft",
+            "compose_and_dispatch",
+            "draft_sendmail",
+        ] {
+            assert_eq!(classify(tool, &Value::Null), Category::Send);
+        }
+        assert_eq!(classify("update_draft", &Value::Null), Category::Write);
+        assert_eq!(classify("compose_email", &Value::Null), Category::Draft);
+    }
+
+    #[test]
+    fn hidden_recipients_and_implicit_audiences_ask() {
+        let p = Policy::default();
+        for args in [
+            json!({"destination": "stranger@example.test"}),
+            json!({"odd": "send to stranger@example.test now"}),
+            json!({"odd": "+15550102000"}),
+            json!({"odd": "@stranger"}),
+            json!({"guestEmails": ["stranger@example.test"]}),
+            json!({"invite": ["stranger@example.test"]}),
+            json!({"a":{"b":{"c":{"d":{"e":{"f":{"to":"stranger@example.test"}}}}}}}),
+        ] {
+            let r = audience("update_record", &args);
+            assert!(!r.is_empty(), "{args}");
+            assert!(
+                matches!(
+                    decide(
+                        &p,
+                        "update_record",
+                        Category::Write,
+                        &r,
+                        &|_| false,
+                        &|_| false
+                    ),
+                    Verdict::Ask(_)
+                ),
+                "{args}"
+            );
+        }
+        for flag in [
+            json!("yes"),
+            json!("1"),
+            json!(1),
+            json!("TRUE"),
+            json!(" true"),
+        ] {
+            assert!(
+                audience("send_email", &json!({"nested": {"reply_all": flag}}))
+                    .iter()
+                    .any(|r| r == IMPLICIT_RECIPIENTS)
+            );
+        }
+        for args in [
+            json!({"visibility":"public"}),
+            json!({"visibility":true}),
+            json!({"visibility":" yes"}),
+            json!({"anyone":true}),
+            json!({"public":"yes"}),
+            json!({"link-sharing":"TRUE"}),
+        ] {
+            let r = audience("share_file", &args);
+            assert!(r.iter().any(|r| r == PUBLIC_AUDIENCE), "{args}");
+            assert!(matches!(
+                decide(&p, "share_file", Category::Send, &r, &|_| true, &|_| true),
+                Verdict::Ask(_)
+            ));
+        }
+    }
+
+    #[test]
     fn parses_recipient_comments_quotes_and_groups() {
         for (raw, expected) in [
             (
@@ -1200,7 +1501,7 @@ mod tests {
         assert_eq!(c("search_threads"), Category::Read);
         assert_eq!(c("list_events"), Category::Read);
         assert_eq!(c("create_draft"), Category::Draft);
-        assert_eq!(c("draft_reply"), Category::Draft);
+        assert_eq!(c("draft_reply"), Category::Send);
         assert_eq!(c("send_draft"), Category::Send);
         assert_eq!(c("create_event"), Category::Write);
         assert_eq!(c("update_file"), Category::Write);
@@ -1214,7 +1515,7 @@ mod tests {
         assert_eq!(c("send_payment"), Category::Purchase);
         assert_eq!(c("export_all_contacts"), Category::Export);
         assert_eq!(c("share_file"), Category::Send);
-        assert_eq!(c("frobnicate"), Category::Write);
+        assert_eq!(c("frobnicate"), Category::Unclear);
     }
 
     #[test]
@@ -1397,7 +1698,7 @@ mod tests {
     #[test]
     fn annotations_help_but_risky_names_win() {
         let ro = json!({"readOnlyHint": true});
-        assert_eq!(classify("frobnicate", &ro), Category::Read);
+        assert_eq!(classify("frobnicate", &ro), Category::Unclear);
         assert_eq!(classify("send_message", &ro), Category::Send);
         let destructive = json!({"destructiveHint": true});
         assert_eq!(classify("frobnicate", &destructive), Category::Delete);
@@ -1467,7 +1768,7 @@ mod tests {
         assert_eq!(c("forward_draft"), Category::Send);
         assert_eq!(c("send_draft"), Category::Send);
         assert_eq!(c("create_draft"), Category::Draft);
-        assert_eq!(c("draft_reply"), Category::Draft);
+        assert_eq!(c("draft_reply"), Category::Send);
     }
 
     #[test]

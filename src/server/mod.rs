@@ -218,15 +218,13 @@ struct PairBody {
     device_name: String,
 }
 
-async fn pair(State(state): State<AppState>, JsonBody(body): JsonBody<PairBody>) -> ApiResult {
-    match auth::pair_device(
-        &state.db,
-        &state.pair_limiter,
-        &body.code,
-        &body.device_name,
-    )
-    .await
-    {
+async fn pair(
+    State(state): State<AppState>,
+    peer: Option<axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    JsonBody(body): JsonBody<PairBody>,
+) -> ApiResult {
+    let limiter = state.pair_limiter.for_source(peer.map(|p| p.0.0.ip()));
+    match auth::pair_device(&state.db, &limiter, &body.code, &body.device_name).await {
         Ok((token, device)) => {
             crate::info!("paired new device {}", device.id);
             ok(json!({"token": token, "device": device}))
@@ -239,7 +237,7 @@ async fn pair(State(state): State<AppState>, JsonBody(body): JsonBody<PairBody>)
         Err(PairError::Locked) => Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "locked",
-            "too many failed attempts; create a new code with `iris pair` later",
+            "too many failed attempts; create a new code with `iris pair`",
         )),
         Err(PairError::Internal(e)) => Err(e.into()),
     }
@@ -334,11 +332,16 @@ async fn revoke_device(
     let uid = user.id().to_string();
     if !state
         .db
-        .call(move |c| db::revoke_device(c, &uid, &id))
+        .call({
+            let id = id.clone();
+            move |c| db::revoke_device(c, &uid, &id)
+        })
         .await?
     {
         return Err(ApiError::not_found("device"));
     }
+    state.hub.revoke_device(&id);
+    state.browser.revoke_device(&id);
     ok(json!({"ok": true}))
 }
 
@@ -457,9 +460,21 @@ pub async fn serve(state: AppState) -> Result<()> {
             crate::warn!("browser tools are unavailable: {e}");
         }
     });
-    axum::serve(listener, router(state.clone()))
-        .with_graceful_shutdown(shutdown_signal(state.clone()))
+    let bound_url = if state.cfg.public_url.trim().is_empty() {
+        format!("http://{addr}")
+    } else {
+        state.cfg.public_url.clone()
+    };
+    state
+        .db
+        .call(move |c| db::set_setting(c, "server.bound_url", &bound_url))
         .await?;
+    axum::serve(
+        listener,
+        router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(state.clone()))
+    .await?;
     // Cancelled turns are still stopping their CLIs' process groups (TERM,
     // grace, KILL); the runtime must outlive that cleanup.
     wait_for_turns(&state, std::time::Duration::from_secs(9)).await;
@@ -662,6 +677,294 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn running_server_records_its_actual_ephemeral_address_for_pairing() {
+        let h = setup();
+        let mut cfg = h.state.cfg.clone();
+        cfg.bind = "127.0.0.1:0".into();
+        let state = AppState::new(cfg, h.state.paths.clone(), h.state.db.clone()).unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            serve(server_state).await.unwrap();
+        });
+        let url = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(url) = state
+                    .db
+                    .with(|c| db::get_setting(c, "server.bound_url"))
+                    .unwrap()
+                {
+                    break url;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let address: std::net::SocketAddr = url.strip_prefix("http://").unwrap().parse().unwrap();
+        assert_ne!(address.port(), 0);
+        assert_eq!(crate::pairing_url(&state.cfg, &state.db).unwrap(), url);
+        tokio::net::TcpStream::connect(address).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn pairing_route_limits_peer_ips_and_ignores_forwarded_headers() {
+        let h = setup();
+        async fn guess(app: &Router, peer: &str, code: &str, forwarded: &str) -> StatusCode {
+            let mut request = HttpRequest::builder()
+                .method("POST")
+                .uri("/api/pair")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", forwarded)
+                .body(Body::from(json!({"code":code}).to_string()))
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                peer.parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            app.clone().oneshot(request).await.unwrap().status()
+        }
+        let owner = h.state.db.with(db::owner_user_id).unwrap().unwrap();
+        let (code, _) = h
+            .state
+            .db
+            .with(|c| Ok(auth::create_pairing_code(c, &owner)))
+            .unwrap()
+            .unwrap();
+        for i in 1..=5 {
+            assert_eq!(
+                guess(
+                    &h.app,
+                    "192.0.2.1:1000",
+                    "ZZZZ-ZZZZ",
+                    &format!("192.0.2.{i}")
+                )
+                .await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            guess(&h.app, "192.0.2.1:2000", &code, "192.0.2.99").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            guess(&h.app, "192.0.2.2:1000", &code, "192.0.2.1").await,
+            StatusCode::OK
+        );
+        let (fresh, _) = h
+            .state
+            .db
+            .with(|c| Ok(auth::create_pairing_code(c, &owner)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            guess(&h.app, "192.0.2.1:1000", &fresh, "192.0.2.99").await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_subdomain_opt_in_defaults_false_and_survives_partial_updates() {
+        let h = setup();
+        let token = pair_as(&h, None).await;
+        let (status, created) = send(&h.app, "POST", "/api/credentials", Some(&token), Some(json!({"kind":"login", "label":"Example", "site":"https://example.test:8443", "password":"synthetic-password"}))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(created["credential"]["metadata"]["allow_subdomains"], false);
+        let id = created["credential"]["id"].as_str().unwrap();
+        let path = format!("/api/credentials/{id}");
+        for (patch, expected) in [
+            (json!({"allow_subdomains":true}), true),
+            (json!({"notes":"synthetic notes"}), true),
+            (json!({"allow_subdomains":false}), false),
+        ] {
+            let (status, updated) = send(&h.app, "PATCH", &path, Some(&token), Some(patch)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                updated["credential"]["metadata"]["allow_subdomains"],
+                expected
+            );
+            assert_eq!(
+                updated["credential"]["metadata"]["site"],
+                "https://example.test:8443"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn joined_at_scopes_history_cards_photos_activity_and_live_replays() {
+        let h = setup();
+        let owner_token = pair_as(&h, None).await;
+        let owner = h.state.db.with(db::owner_user_id).unwrap().unwrap();
+        let (_, created) = send(
+            &h.app,
+            "POST",
+            "/api/conversations",
+            Some(&owner_token),
+            Some(json!({"kind":"group", "title":"History boundary"})),
+        )
+        .await;
+        let cid = created["conversation"]["id"].as_str().unwrap().to_string();
+        let old_attachment = crate::util::new_id();
+        let new_attachment = crate::util::new_id();
+        std::fs::create_dir_all(h.state.paths.uploads_dir()).unwrap();
+        for id in [&old_attachment, &new_attachment] {
+            std::fs::write(h.state.paths.uploads_dir().join(id), b"image bytes").unwrap();
+        }
+        let insert = |id: &str, attachment: &str| {
+            h.state
+                .db
+                .with(|c| {
+                    db::insert_attachment(
+                        c,
+                        attachment,
+                        &owner,
+                        "image/png",
+                        11,
+                        "00",
+                        attachment,
+                    )?;
+                    db::insert_message(
+                        c,
+                        &db::NewMessage {
+                            conversation_id: &cid,
+                            role: "assistant",
+                            author_user_id: Some("guest"),
+                            content: id,
+                            attachments: &[attachment.into()],
+                            kind: "card",
+                            card: Some(&json!({"type":"action", "title":id})),
+                            meta: Some(&json!({"activity":[{"name":id}]})),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .unwrap()
+        };
+        h.state
+            .db
+            .with(|c| {
+                c.execute(
+                    "INSERT INTO users (id, display_name, created_at) VALUES ('guest', 'Guest', 0)",
+                    [],
+                )
+            })
+            .unwrap();
+        let old = insert("before joining", &old_attachment);
+        // Exercise the monotonic cursor: this message can be ahead of wall time.
+        h.state
+            .db
+            .with(|c| {
+                c.execute(
+                    "UPDATE messages SET created_at = ?2 WHERE id = ?1",
+                    rusqlite::params![old.id, crate::util::now_ms() + 1000],
+                )
+            })
+            .unwrap();
+        let (status, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/conversations/{cid}/members"),
+            Some(&owner_token),
+            Some(json!({"user_id":"guest"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let fresh = insert("after joining", &new_attachment);
+        let guest_token = pair_as(&h, Some("guest")).await;
+        let (_, messages) = send(
+            &h.app,
+            "GET",
+            &format!("/api/conversations/{cid}/messages?limit=1"),
+            Some(&guest_token),
+            None,
+        )
+        .await;
+        assert_eq!(messages["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(messages["messages"][0]["id"], fresh.id);
+        assert_eq!(messages["has_more"], false);
+        let (_, activity) = send(&h.app, "GET", "/api/activity", Some(&guest_token), None).await;
+        assert!(!activity.to_string().contains("before joining"));
+        assert!(activity.to_string().contains("after joining"));
+        let (_, photos) = send(&h.app, "GET", "/api/attachments", Some(&guest_token), None).await;
+        assert!(!photos.to_string().contains(&old_attachment));
+        assert!(photos.to_string().contains(&new_attachment));
+        for (id, expected) in [
+            (&old_attachment, StatusCode::NOT_FOUND),
+            (&new_attachment, StatusCode::OK),
+        ] {
+            let request = HttpRequest::builder()
+                .uri(format!("/api/attachments/{id}"))
+                .header("authorization", format!("Bearer {guest_token}"))
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                h.app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+        }
+        // An old card's update/replay and its streaming events are private too.
+        for event in [
+            json!({"type":"message.created", "conversation_id":cid, "message":old}),
+            json!({"type":"message.updated", "conversation_id":cid, "message":old}),
+            json!({"type":"message.delta", "conversation_id":cid, "message_id":old.id, "text":"private"}),
+            json!({"type":"message.activity", "conversation_id":cid, "message_id":old.id}),
+        ] {
+            assert!(!ws::event_visible(&h.state, "guest", &event.to_string()).await);
+            assert!(ws::event_visible(&h.state, &owner, &event.to_string()).await);
+        }
+        assert!(
+            ws::event_visible(
+                &h.state,
+                "guest",
+                &json!({"conversation_id":cid, "message":fresh}).to_string()
+            )
+            .await
+        );
+        // Ordinary owner history remains available.
+        let (_, messages) = send(
+            &h.app,
+            "GET",
+            &format!("/api/conversations/{cid}/messages"),
+            Some(&owner_token),
+            None,
+        )
+        .await;
+        assert_eq!(messages["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn device_revoke_signals_all_sockets_immediately() {
+        let h = setup();
+        let token = pair_as(&h, None).await;
+        let (_, me) = send(&h.app, "GET", "/api/me", Some(&token), None).await;
+        let device = me["device"]["id"].as_str().unwrap();
+        let mut first = h.state.hub.watch_device(device);
+        let mut second = h.state.hub.watch_device(device);
+        let other = h.state.hub.watch_device("another-device");
+        let (status, _) = send(
+            &h.app,
+            "DELETE",
+            &format!("/api/devices/{device}"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        tokio::time::timeout(std::time::Duration::from_millis(100), first.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(100), second.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*first.borrow() && *second.borrow() && !*other.borrow());
+        assert_eq!(
+            send(&h.app, "GET", "/api/me", Some(&token), None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]
@@ -2461,7 +2764,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 &t.h.app,
                 "GET",
                 &format!("/api/conversations/{gid}/messages"),
-                Some(&t.guest_t),
+                Some(&t.owner_t),
                 None,
             )
             .await;
@@ -2480,6 +2783,21 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert_eq!(reply["status"], "cancelled", "{reply}");
         assert_eq!(reply["content"], "");
         assert_eq!(reply["meta"]["activity"], json!([]));
+        let (_, guest_messages) = send(
+            &t.h.app,
+            "GET",
+            &format!("/api/conversations/{gid}/messages"),
+            Some(&t.guest_t),
+            None,
+        )
+        .await;
+        assert!(
+            guest_messages["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["id"] != reply_id)
+        );
         assert_eq!(t.runs(), 1, "no retry with the private context");
         // The owner's app is told the reply ended (it was streaming).
         let owner = t.h.state.db.with(db::owner_user_id).unwrap().unwrap();

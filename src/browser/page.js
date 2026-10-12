@@ -583,7 +583,8 @@ if (!globalThis.__iris) {
     }
 
     return { snapshot, point, focus, hasFocus, setText, choose, loginFields, cardFields, fillField, pageText, hasText, setSecrets,
-      protect: (list) => { if (list.includes(doc)) tainted = true; },
+      protect: (list, tab = false) => { tainted = tab || list.includes(doc); },
+      navigationState: () => ({ doc, path: location.pathname }),
       isTainted: () => tainted,
       info: () => ({ url: tainted ? location.origin : redact(location.href),
         title: tainted ? '' : clean(document.title, 300), origin: location.origin, doc, tainted }) };

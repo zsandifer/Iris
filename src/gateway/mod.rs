@@ -478,10 +478,78 @@ fn fingerprint(con: &Connector) -> String {
 
 /// Replace secret values in text shown to the owner or the agent.
 pub fn redact(text: &str, secrets: &[String]) -> String {
-    let mut out = text.to_string();
-    for s in secrets.iter().filter(|s| s.len() >= 4) {
-        out = out.replace(s.as_str(), "[hidden]");
+    use base64::{
+        Engine as _,
+        engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+    };
+    let mut forms = Vec::new();
+    for secret in secrets.iter().filter(|s| s.len() >= 4) {
+        forms.push((secret.clone(), secret.chars().count() >= 8));
+        if secret.chars().count() < 8 {
+            continue;
+        }
+        for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
+            forms.push((engine.encode(secret), true));
+        }
+        forms.push((crate::util::hex(secret.as_bytes()), true));
+        forms.push((secret.chars().rev().collect(), true));
+        let encoded: String = secret
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect();
+        forms.push((encoded.replace("%20", "+"), true));
+        forms.push((encoded, true));
+        forms.push((secret.bytes().map(|b| format!("%{b:02X}")).collect(), true));
     }
+    forms.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
+    let mut out = text.to_string();
+    for (form, insensitive) in forms {
+        if !insensitive {
+            out = out.replace(&form, "[hidden]");
+            continue;
+        }
+        out = replace_case_insensitive(&out, &form);
+    }
+    out
+}
+
+/// Fold Unicode case while tracking original byte boundaries. An expanding
+/// lowercase mapping must never turn a replacement offset into a UTF-8 split.
+fn replace_case_insensitive(text: &str, form: &str) -> String {
+    let folded: String = text.chars().flat_map(char::to_lowercase).collect();
+    let needle: String = form.chars().flat_map(char::to_lowercase).collect();
+    let mut chars = text.chars();
+    let (mut original_at, mut folded_at, mut from) = (0, 0, 0);
+    let mut out = String::new();
+    for (at, _) in folded.match_indices(&needle) {
+        while folded_at < at {
+            let c = chars.next().unwrap();
+            original_at += c.len_utf8();
+            folded_at += c.to_lowercase().map(char::len_utf8).sum::<usize>();
+        }
+        if folded_at != at {
+            continue;
+        }
+        let start = original_at;
+        while folded_at < at + needle.len() {
+            let c = chars.next().unwrap();
+            original_at += c.len_utf8();
+            folded_at += c.to_lowercase().map(char::len_utf8).sum::<usize>();
+        }
+        if folded_at != at + needle.len() {
+            continue;
+        }
+        out.push_str(&text[from..start]);
+        out.push_str("[hidden]");
+        from = original_at;
+    }
+    out.push_str(&text[from..]);
     out
 }
 

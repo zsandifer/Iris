@@ -115,6 +115,33 @@ async fn device_active(state: &AppState, device_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub(super) async fn event_visible(state: &AppState, uid: &str, raw: &str) -> bool {
+    let Ok(event) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    if event["conversation_id"].is_string() {
+        let mid = event["message_id"]
+            .as_str()
+            .or_else(|| event["message"]["id"].as_str());
+        if let Some(mid) = mid {
+            let (uid, mid) = (uid.to_string(), mid.to_string());
+            return state
+                .db
+                .call(move |c| crate::db::message_visible(c, &uid, &mid))
+                .await
+                .unwrap_or(false);
+        }
+    }
+    true
+}
+
+async fn browser_input(state: &AppState, device_id: &str, ev: &Value) -> crate::util::Result<()> {
+    if !device_active(state, device_id).await {
+        return Err("device revoked".into());
+    }
+    state.browser.user_input(device_id, ev).await
+}
+
 async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
     let user = match pre {
         Some(u) => Some(u),
@@ -130,18 +157,47 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
         return;
     };
     let uid = user.id().to_string();
-    // Subscribe before sending `ready` so no event can slip in between.
-    let mut rx = state.hub.subscribe();
+    let mut device_revoked = state.hub.watch_device(&user.device.id);
+    if *device_revoked.borrow() || !device_active(&state, &user.device.id).await {
+        return;
+    }
     let _online = state.hub.connect(&uid);
+    let mut input_worker: Option<tokio::task::JoinHandle<()>> = None;
+    // Cancellation wraps the whole connection, including slow sends and
+    // database reads, so revocation never waits for the ping or send timeout.
+    let revoked = tokio::select! {
+        biased;
+        _ = device_revoked.changed() => true,
+        revoked = pump(&state, &mut socket, &user, &mut input_worker) => revoked,
+    };
+    if let Some(w) = input_worker {
+        w.abort();
+    }
+    if revoked {
+        state.browser.revoke_device(&user.device.id);
+    }
+    let _ = send(&mut socket, Message::Close(None)).await;
+}
+
+/// Drive an authenticated socket. The caller can cancel this entire future
+/// on revocation, even while a send or a database read is awaiting completion.
+async fn pump(
+    state: &AppState,
+    socket: &mut WebSocket,
+    user: &AuthUser,
+    input_worker: &mut Option<tokio::task::JoinHandle<()>>,
+) -> bool {
+    let uid = user.id().to_string();
+    let mut rx = state.hub.subscribe();
     let ready = json!({
         "type": "ready",
         "user_id": uid,
         "device_id": user.device.id,
         "settings": state.settings_json(user.user.is_owner).await,
-        "harnesses": super::admin::harnesses_for(&state, &user),
+        "harnesses": super::admin::harnesses_for(state, user),
     });
-    if !send_json(&mut socket, &ready).await {
-        return;
+    if !send_json(socket, &ready).await {
+        return false;
     }
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.tick().await;
@@ -153,7 +209,6 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
     let (input_err_tx, mut input_err) = tokio::sync::mpsc::unbounded_channel::<String>();
     let mut input_tx: Option<tokio::sync::mpsc::Sender<Value>> = None;
     // Aborted with the socket: queued input never outlives it.
-    let mut input_worker: Option<tokio::task::JoinHandle<()>> = None;
     let mut revoked = false;
     let mut last_heard = tokio::time::Instant::now();
     loop {
@@ -183,10 +238,10 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
                             "browser.input" => {
                                 let tx = input_tx.get_or_insert_with(|| {
                                     let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(64);
-                                    let (st, dev, errs) = (state.clone(), user.device.id.clone(), input_err_tx.clone());
-                                    input_worker = Some(tokio::spawn(async move {
+                                    let (st, dev, errs) = ((*state).clone(), user.device.id.clone(), input_err_tx.clone());
+                                    *input_worker = Some(tokio::spawn(async move {
                                         while let Some(ev) = rx.recv().await {
-                                            if let Err(e) = st.browser.user_input(&dev, &ev).await {
+                                            if let Err(e) = browser_input(&st, &dev, &ev).await {
                                                 let _ = errs.send(e.to_string());
                                             }
                                         }
@@ -201,7 +256,7 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
                             }
                             _ => None,
                         };
-                        if let Some(r) = reply && !send_json(&mut socket, &r).await {
+                        if let Some(r) = reply && !send_json(socket, &r).await {
                             break;
                         }
                     }
@@ -221,7 +276,7 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
                 }
             }
             Some(msg) = input_err.recv() => {
-                if !send_json(&mut socket, &json!({"type": "browser.input_error", "message": msg})).await {
+                if !send_json(socket, &json!({"type": "browser.input_error", "message": msg})).await {
                     break;
                 }
             }
@@ -238,7 +293,7 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
                 w.last_sent = Some(Instant::now());
                 let frame = w.rx.borrow_and_update().clone();
                 if let Some(frame) = frame
-                    && !send(&mut socket, Message::Text(frame.json.clone().into())).await
+                    && !send(socket, Message::Text(frame.json.clone().into())).await
                 {
                     break;
                 }
@@ -247,14 +302,15 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
                 match ev {
                     Ok(env) => {
                         if env.audience.reaches(&uid, is_owner)
-                            && !send(&mut socket, Message::Text(env.json.clone().into())).await
+                            && event_visible(state, &uid, &env.json).await
+                            && !send(socket, Message::Text(env.json.clone().into())).await
                         {
                             break;
                         }
                     }
                     Err(RecvError::Lagged(_)) => {
                         // Too slow to keep up; tell the client to refetch.
-                        if !send_json(&mut socket, &json!({"type": "resync"})).await {
+                        if !send_json(socket, &json!({"type": "resync"})).await {
                             break;
                         }
                     }
@@ -264,34 +320,133 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
             _ = ping.tick() => {
                 ticks += 1;
                 if gone_quiet(last_heard, tokio::time::Instant::now())
-                    || !send(&mut socket, Message::Ping(Vec::new().into())).await
+                    || !send(socket, Message::Ping(Vec::new().into())).await
                 {
                     break;
                 }
-                // Drop sockets of revoked devices within about a minute.
-                if ticks.is_multiple_of(2) && !device_active(&state, &user.device.id).await {
-                    let _ = send_json(&mut socket, &json!({"type": "error", "code": "unauthorized", "message": "device revoked"})).await;
+                // Also catch revocation performed directly in the database.
+                if ticks.is_multiple_of(2) && !device_active(state, &user.device.id).await {
+                    let _ = send_json(socket, &json!({"type": "error", "code": "unauthorized", "message": "device revoked"})).await;
                     revoked = true;
                     break;
                 }
             }
         }
     }
-    if let Some(w) = input_worker {
-        w.abort();
-    }
-    // A revoked device loses control of Iris's browser at once.
-    if revoked
-        && matches!(state.browser.control(), crate::browser::Control::User { device_id, .. } if device_id == user.device.id)
-    {
-        state.browser.hand_back();
-    }
-    let _ = send(&mut socket, Message::Close(None)).await;
+    revoked
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn revocation_closes_a_live_websocket_without_waiting_for_a_ping() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let state = AppState::new(
+            crate::config::Config::default(),
+            paths,
+            crate::db::Db::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        let token = auth::generate_token();
+        let device = state
+            .db
+            .with(|c| {
+                let owner = crate::db::owner_user_id(c)?.unwrap();
+                crate::db::insert_device(c, &owner, "test", &auth::hash_token(&token))
+            })
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = super::super::router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(format!("GET /api/ws HTTP/1.1\r\nHost: {address}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nAuthorization: Bearer {token}\r\n\r\n").as_bytes()).await.unwrap();
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(stream.read_u8().await.unwrap());
+        }
+        assert!(
+            String::from_utf8(headers)
+                .unwrap()
+                .starts_with("HTTP/1.1 101")
+        );
+        async fn frame(stream: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+            let opcode = stream.read_u8().await.unwrap() & 15;
+            let mut len = (stream.read_u8().await.unwrap() & 127) as usize;
+            if len == 126 {
+                len = stream.read_u16().await.unwrap() as usize;
+            } else if len == 127 {
+                len = stream.read_u64().await.unwrap() as usize;
+            }
+            assert!(len <= 64 * 1024);
+            let mut body = vec![0; len];
+            stream.read_exact(&mut body).await.unwrap();
+            (opcode, body)
+        }
+        let (opcode, ready) = frame(&mut stream).await;
+        assert_eq!(opcode, 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&ready).unwrap()["type"],
+            "ready"
+        );
+        let user = auth_from_token(&state, &token).await.unwrap();
+        let _ =
+            super::super::revoke_device(State(state.clone()), user, axum::extract::Path(device.id))
+                .await
+                .unwrap();
+        let (opcode, _) = tokio::time::timeout(Duration::from_secs(1), frame(&mut stream))
+            .await
+            .unwrap();
+        assert_eq!(opcode, 8, "revoked sockets close immediately");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn every_browser_input_revalidates_its_device() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let state = AppState::new(
+            crate::config::Config::default(),
+            paths,
+            crate::db::Db::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        let device = state
+            .db
+            .with(|c| {
+                let owner = crate::db::owner_user_id(c)?.unwrap();
+                crate::db::insert_device(c, &owner, "test", "synthetic-hash")
+            })
+            .unwrap();
+        assert!(device_active(&state, &device.id).await);
+        state
+            .db
+            .with(|c| crate::db::revoke_device(c, &device.user_id, &device.id))
+            .unwrap();
+        for kind in ["navigate", "tap", "text", "key", "scroll"] {
+            assert_eq!(
+                browser_input(&state, &device.id, &json!({"kind":kind}))
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "device revoked"
+            );
+        }
+    }
 
     #[test]
     fn silent_clients_are_dropped_after_missed_pings() {

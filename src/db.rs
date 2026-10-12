@@ -590,14 +590,6 @@ pub fn consume_pairing_code(
     .optional()
 }
 
-/// Invalidate every outstanding pairing code (used after repeated failures).
-pub fn burn_pairing_codes(conn: &Connection) -> rusqlite::Result<usize> {
-    conn.execute(
-        "UPDATE pairing_codes SET used_at = ?1 WHERE used_at IS NULL",
-        [now_ms()],
-    )
-}
-
 pub fn insert_device(
     conn: &Connection,
     user_id: &str,
@@ -813,6 +805,13 @@ pub fn delete_conversation(conn: &Connection, id: &str) -> rusqlite::Result<bool
     )? > 0)
 }
 
+/// Joining must fall after all existing messages, including timestamps
+/// advanced beyond wall time by the monotonic message cursor.
+pub fn join_timestamp(conn: &Connection, conversation_id: &str) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT MAX(?2, COALESCE(MAX(created_at) + 1, ?2)) FROM messages WHERE conversation_id = ?1",
+        params![conversation_id, now_ms()], |r| r.get(0))
+}
+
 pub fn conversation_member_ids(conn: &Connection, id: &str) -> rusqlite::Result<Vec<String>> {
     let mut stmt =
         conn.prepare("SELECT user_id FROM conversation_members WHERE conversation_id = ?1")?;
@@ -1008,6 +1007,41 @@ pub fn list_messages(
     .collect()
 }
 
+/// User-visible history, filtered in SQL before paging (cards are messages).
+pub fn list_messages_for_member(
+    conn: &Connection,
+    user_id: &str,
+    conversation_id: &str,
+    before: Option<i64>,
+    limit: usize,
+) -> rusqlite::Result<Vec<Message>> {
+    let mut stmt = conn.prepare("SELECT * FROM (
+        SELECT m.* FROM messages m JOIN conversation_members cm ON cm.conversation_id = m.conversation_id
+        WHERE cm.user_id = ?1 AND m.conversation_id = ?2 AND m.created_at >= cm.joined_at
+            AND m.created_at < ?3 AND m.status != 'pending'
+        ORDER BY m.created_at DESC LIMIT ?4) ORDER BY created_at")?;
+    stmt.query_map(
+        params![
+            user_id,
+            conversation_id,
+            before.unwrap_or(i64::MAX),
+            limit as i64
+        ],
+        message_from_row,
+    )?
+    .collect()
+}
+
+/// Revalidate membership and its history boundary for a live/replayed event.
+pub fn message_visible(
+    conn: &Connection,
+    user_id: &str,
+    message_id: &str,
+) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM messages m JOIN conversation_members cm
+        ON cm.conversation_id = m.conversation_id WHERE cm.user_id = ?1 AND m.id = ?2 AND m.created_at >= cm.joined_at)", params![user_id, message_id], |r| r.get(0))
+}
+
 /// Messages created strictly after `after` and strictly before `before`.
 pub fn messages_between(
     conn: &Connection,
@@ -1173,7 +1207,7 @@ pub fn sent_photos(
          JOIN json_each(m.attachments) j
          JOIN attachments a ON a.id = j.value
          JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ?1
-         WHERE m.author_user_id = ?1 AND m.attachments != '[]'
+         WHERE m.author_user_id = ?1 AND m.attachments != '[]' AND m.created_at >= cm.joined_at
          GROUP BY a.id
          HAVING used_at < ?3 OR (used_at = ?3 AND (?4 = '' OR a.id < ?4))
          ORDER BY used_at DESC, a.id DESC
@@ -1227,7 +1261,7 @@ pub fn recent_activity(
          FROM messages m JOIN conversations c ON c.id = m.conversation_id
          WHERE m.role = 'assistant' AND m.created_at < ?3
            AND json_array_length(m.meta, '$.activity') > 0
-           AND (m.conversation_id IN (SELECT conversation_id FROM conversation_members WHERE user_id = ?1)
+           AND (EXISTS (SELECT 1 FROM conversation_members cm WHERE cm.user_id = ?1 AND cm.conversation_id = m.conversation_id AND m.created_at >= cm.joined_at)
                 OR (?2 AND c.kind = 'job' AND c.created_by = ?1))
            AND (c.kind != 'job' OR ?2)
          ORDER BY m.created_at DESC
@@ -1648,6 +1682,8 @@ mod tests {
             let side = create_conversation(&conn, &owner, "side", "", None)
                 .unwrap()
                 .id;
+            conn.execute("UPDATE conversation_members SET joined_at = 0", [])
+                .unwrap();
             let tx = conn.transaction().unwrap();
             for (i, conv) in [&main, &side, &main, &side].iter().enumerate() {
                 tx.execute(

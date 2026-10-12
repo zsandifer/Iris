@@ -255,9 +255,10 @@ async fn list_messages(
 ) -> ApiResult {
     member_conversation(&state, &user, &id).await?;
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let uid = user.id().to_string();
     let mut msgs = state
         .db
-        .call(move |c| db::list_messages(c, &id, q.before, limit + 1))
+        .call(move |c| db::list_messages_for_member(c, &uid, &id, q.before, limit + 1))
         .await?;
     // One extra row tells whether older messages exist.
     let has_more = msgs.len() > limit;
@@ -394,7 +395,7 @@ async fn add_member(
             c.execute(
                 "INSERT OR IGNORE INTO conversation_members (conversation_id, user_id, role, joined_at)
                  VALUES (?1, ?2, 'member', ?3)",
-                rusqlite::params![id, body.user_id, crate::util::now_ms()],
+                rusqlite::params![id, body.user_id, db::join_timestamp(c, &id)?],
             )?;
             Ok(true)
         })
@@ -558,7 +559,7 @@ async fn attachment_visible(state: &AppState, user_id: &str, id: &str) -> Result
             c.query_row(
                 "SELECT EXISTS(SELECT 1 FROM messages m
                     JOIN conversation_members cm ON cm.conversation_id = m.conversation_id
-                    WHERE cm.user_id = ?1 AND m.attachments LIKE ?2)",
+                    WHERE cm.user_id = ?1 AND m.created_at >= cm.joined_at AND m.attachments LIKE ?2)",
                 rusqlite::params![uid, pattern],
                 |r| r.get(0),
             )

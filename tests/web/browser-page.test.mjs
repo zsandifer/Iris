@@ -105,3 +105,15 @@ test('a username-only vault fill also blocks reads of the current document', () 
   assert.equal(iris.fillField(ref, 'pat@example.com', false, iris.info().doc).ok, true);
   assert.throws(() => iris.snapshot(12000), (error) => error.message === refusal);
 });
+
+test('tab protection survives a fresh document exposing a hex password', () => {
+  const hex = Buffer.from(password).toString('hex');
+  const { iris, document } = page([hex]);
+  document.location.href = `https://shop.test/sink#${hex}`;
+  iris.protect([], true);
+  for (const read of [() => iris.snapshot(12000), () => iris.hasText(hex), () => iris.pageText()]) {
+    assert.throws(read, (error) => error.message === refusal);
+  }
+  assert.equal(iris.info().url, 'https://shop.test');
+  assert.equal(iris.info().title, '');
+});

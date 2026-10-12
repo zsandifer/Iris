@@ -773,6 +773,7 @@ struct CredentialBody {
     label: Option<String>,
     // login
     site: Option<String>,
+    allow_subdomains: Option<bool>,
     username: Option<String>,
     password: Option<String>,
     notes: Option<String>,
@@ -829,7 +830,7 @@ fn credential_parts(kind: &str, b: &CredentialBody) -> Result<(Value, SecretFiel
             check_text("username", b.username.as_deref().unwrap_or(""), 300, false)?;
             check_text("password", b.password.as_deref().unwrap_or(""), 1000, false)?;
             check_text("notes", b.notes.as_deref().unwrap_or(""), 4000, false)?;
-            let meta = json!({"site": b.site, "username": b.username});
+            let meta = json!({"site": b.site, "username": b.username, "allow_subdomains": b.allow_subdomains});
             let mut secret = SecretFields::new();
             if let Some(p) = &b.password {
                 secret.insert("password".into(), p.clone().into());
@@ -912,7 +913,10 @@ async fn create_credential(
     let kind = body.kind.clone().unwrap_or_default();
     let label = body.label.clone().unwrap_or_default();
     check_text("label", &label, 200, true)?;
-    let (meta, secret) = credential_parts(&kind, &body)?;
+    let (mut meta, secret) = credential_parts(&kind, &body)?;
+    if kind == "login" && meta["allow_subdomains"].is_null() {
+        meta["allow_subdomains"] = false.into();
+    }
     let has_secret = if kind == "card" {
         secret.contains_key("number")
     } else {

@@ -199,6 +199,7 @@ pub struct Running {
     /// Documents Iris filled a secret into: no agent reads (a page can
     /// transform a value it was given in ways no redactor can recognize).
     secret_docs: Mutex<std::collections::HashSet<String>>,
+    filled_tabs: Mutex<std::collections::HashMap<String, (String, String)>>,
     /// Serializes recovering from a closed tab.
     recover_lock: tokio::sync::Mutex<()>,
     /// The owner's saved secrets were loaded for redaction (a page may show
@@ -419,6 +420,31 @@ impl Running {
     /// The screencast running now, if any.
     pub fn casting(&self) -> Option<Mode> {
         lock(&self.cast).as_ref().map(|(_, m)| *m)
+    }
+
+    pub fn taint_tab(&self, target: &str, doc: &str, path: &str) {
+        lock(&self.filled_tabs).insert(target.into(), (doc.into(), path.into()));
+    }
+
+    pub fn tab_tainted(&self, target: &str) -> bool {
+        lock(&self.filled_tabs).contains_key(target)
+    }
+
+    /// Only a new document following an explicit agent action can release
+    /// a filled tab. Query/fragment changes and script-only redirects cannot.
+    pub fn agent_navigated(&self, target: &str, action_doc: &str, new_doc: &str, path: &str) {
+        let mut tabs = lock(&self.filled_tabs);
+        if tabs.get(target).is_some_and(|(filled_doc, filled_path)| {
+            new_doc != action_doc && new_doc != filled_doc && path != filled_path
+        }) {
+            tabs.remove(target);
+        }
+    }
+
+    fn owner_acted(&self, target: &str) {
+        if let Some((doc, _)) = lock(&self.filled_tabs).remove(target) {
+            lock(&self.secret_docs).remove(&doc);
+        }
     }
 
     pub fn remember_secret_doc(&self, doc: &str) {
@@ -965,6 +991,7 @@ impl Browser {
             secrets: Mutex::default(),
             originals: Mutex::default(),
             secret_docs: Mutex::default(),
+            filled_tabs: Mutex::default(),
             recover_lock: tokio::sync::Mutex::new(()),
             seeded: AtomicBool::new(false),
         });
@@ -1517,6 +1544,12 @@ impl Browser {
         Ok(())
     }
 
+    pub fn revoke_device(&self, id: &str) {
+        if matches!(self.control(), Control::User { device_id, .. } if device_id == id) {
+            self.hand_back();
+        }
+    }
+
     pub fn hand_back(&self) {
         if self.control.send_replace(Control::Agent) != Control::Agent {
             crate::info!("browser: control handed back");
@@ -1592,6 +1625,7 @@ impl Browser {
             }
             _ => return Err("unknown input kind".into()),
         }
+        run.owner_acted(&page.target_id);
         Ok(())
     }
 }
@@ -1634,6 +1668,19 @@ mod tests {
         assert_eq!(kinds.iter().filter(|k| *k == "browser.active").count(), 0);
         assert!(kinds.contains(&"browser.done".to_string()));
         assert!(b.state_json()["active"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn revoked_controller_hands_control_back() {
+        let (_tmp, browser) = browser();
+        browser.control.send_replace(Control::User {
+            user_id: "owner".into(),
+            device_id: "device".into(),
+        });
+        browser.revoke_device("other-device");
+        assert!(matches!(browser.control(), Control::User { .. }));
+        browser.revoke_device("device");
+        assert_eq!(browser.control(), Control::Agent);
     }
 
     #[tokio::test]
@@ -1680,9 +1727,8 @@ mod tests {
         assert!(err.is_err());
     }
 
-    #[test]
-    fn secrets_are_redacted_in_every_form() {
-        let run = Running {
+    fn detached_run() -> Running {
+        Running {
             cdp: Cdp::detached(),
             child: Mutex::new(None),
             page: Mutex::default(),
@@ -1696,9 +1742,35 @@ mod tests {
             secrets: Mutex::default(),
             originals: Mutex::default(),
             secret_docs: Mutex::default(),
+            filled_tabs: Mutex::default(),
             recover_lock: tokio::sync::Mutex::new(()),
             seeded: AtomicBool::new(false),
-        };
+        }
+    }
+
+    #[test]
+    fn filled_tabs_survive_script_redirects_and_same_path_submissions() {
+        let run = detached_run();
+        run.taint_tab("tab", "fill-doc", "/login");
+        assert!(run.tab_tainted("tab"));
+        // A script redirect to /sink#hex(password) has no explicit action.
+        assert!(run.tab_tainted("tab"));
+        // An action without a new document cannot clear the redirect.
+        run.agent_navigated("tab", "sink-doc", "sink-doc", "/sink");
+        assert!(run.tab_tainted("tab"));
+        run.agent_navigated("tab", "sink-doc", "next-doc", "/login");
+        assert!(run.tab_tainted("tab"));
+        run.agent_navigated("tab", "next-doc", "clean-doc", "/account");
+        assert!(!run.tab_tainted("tab"));
+        run.remember_secret_doc("fill-doc");
+        run.taint_tab("tab", "fill-doc", "/login");
+        run.owner_acted("tab");
+        assert!(!run.tab_tainted("tab") && !run.has_secret_doc("fill-doc"));
+    }
+
+    #[test]
+    fn secrets_are_redacted_in_every_form() {
+        let run = detached_run();
         run.remember_secret("hunter2-long");
         run.remember_secret("4242424242424242");
         run.remember_secret("a b+c/d?e");

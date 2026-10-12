@@ -1919,3 +1919,85 @@ async fn owner_request(t: &T, method: &str, path: &str, body: Value) {
         response.status()
     );
 }
+
+#[test]
+fn encoded_connector_secrets_are_hidden() {
+    use base64::{
+        Engine as _,
+        engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+    };
+    let secret = "Canary+/ secret?";
+    let mut forms = vec![
+        secret.to_uppercase(),
+        secret.chars().rev().collect::<String>(),
+        crate::util::hex(secret.as_bytes()),
+        "Canary%2B%2F%20secret%3F".into(),
+        "Canary%2B%2F+secret%3F".into(),
+        secret.bytes().map(|b| format!("%{b:02X}")).collect(),
+    ];
+    for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
+        forms.push(engine.encode(secret));
+    }
+    assert_eq!(
+        redact("🔒 PÄssäÖ12345 end", &["pässÄö12345".into()]),
+        "🔒 [hidden] end"
+    );
+    assert_eq!(
+        redact("prefix i̇-CANARY8 suffix", &["İ-canary8".into()]),
+        "prefix [hidden] suffix"
+    );
+    let unicode_secret = "canaryÿÿÿ!";
+    for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
+        assert_eq!(
+            redact(&engine.encode(unicode_secret), &[unicode_secret.into()]),
+            "[hidden]"
+        );
+    }
+    assert_eq!(redact("ABCD123", &["Abcd123".into()]), "ABCD123");
+    for form in forms {
+        for echo in [
+            form.clone(),
+            form.to_ascii_uppercase(),
+            form.to_ascii_lowercase(),
+        ] {
+            assert_eq!(
+                redact(&format!("before {echo} after"), &[secret.into()]),
+                "before [hidden] after",
+                "{echo}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn concatenated_sends_count_against_the_send_tripwire() {
+    let t = setup(|cfg| cfg.safety.max_sends_per_hour = 1);
+    let mut connector = t.connector();
+    connector.config.args[1] = FAKE_SERVER.replace("send_message", "sendemail");
+    t.state
+        .db
+        .with(|c| {
+            entities::update_connector(c, &t.connector_id, None, Some(&connector.config), None)?;
+            db::set_setting(c, "safety.trusted_recipients", r#"["friend@example.test"]"#)
+        })
+        .unwrap();
+    let (token, _grant, _) = t.grant().await;
+    let first = t
+        .call(
+            &token,
+            "sendemail",
+            json!({"odd_destination":"friend@example.test"}),
+        )
+        .await;
+    assert!(!first["isError"].as_bool().unwrap_or(false), "{first}");
+    assert_eq!(t.calls()[0].category, "send");
+    let second = t
+        .call(
+            &token,
+            "sendemail",
+            json!({"odd_destination":"friend@example.test"}),
+        )
+        .await;
+    assert!(text(&second).contains("paused"), "{second}");
+    assert_eq!(t.calls_log().matches("sendemail").count(), 1);
+}

@@ -65,7 +65,8 @@ function CredentialForm({ kind, onDone }) {
   return html`<form class="form" onSubmit=${save}>
     <label class="lbl">Name</label><input class="field" required placeholder=${kind === 'card' ? 'Everyday card' : 'Grocery store'} onInput=${up('label')} />
     ${kind === 'login' ? html`
-      <label class="lbl">Website</label><input class="field" placeholder="example.com" autocapitalize="off" onInput=${up('site')} />
+      <label class="lbl">Website (exact address, including port)</label><input class="field" placeholder="https://example.com" autocapitalize="off" onInput=${up('site')} />
+      <label class="lbl"><input type="checkbox" checked=${!!f.allow_subdomains} onChange=${(e) => setF({ ...f, allow_subdomains: e.target.checked })} /> Also allow subdomains (same scheme and port)</label>
       <label class="lbl">Username or email</label><input class="field" autocapitalize="off" autocomplete="off" onInput=${up('username')} />
       <label class="lbl">Password</label><input class="field" type="password" autocomplete="new-password" required onInput=${up('password')} />`
     : html`
