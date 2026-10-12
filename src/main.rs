@@ -16,6 +16,7 @@ mod entities;
 mod events;
 mod feed;
 mod gateway;
+mod google_setup;
 mod harness;
 mod import;
 mod jobs;

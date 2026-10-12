@@ -960,7 +960,13 @@ pub async fn start(
     if con.transport == "http" {
         crate::connectors::check_credential_url(&con.config).map_err(StartError::Other)?;
     }
-    let (redirect, direct) = redirect_uri(state, origin);
+    let (redirect, direct) = if con.service == "google" {
+        (crate::google_setup::callback(&state.cfg.public_url).ok_or_else(|| StartError::Other(
+            "I need public_url set to Iris's HTTPS address first. Open Google setup, step 4, for help.".into()
+        ))?, true)
+    } else {
+        redirect_uri(state, origin)
+    };
     if o.mode == "discover" && (o.authorization_endpoint.is_none() || o.token_endpoint.is_none()) {
         let url = con
             .config
@@ -1041,6 +1047,26 @@ pub async fn start(
     save(state, &con.id, o.clone())
         .await
         .map_err(StartError::Other)?;
+    if con.service == "google" {
+        state
+            .db
+            .call(|c| {
+                crate::google_setup::save(
+                    c,
+                    &crate::google_setup::Progress {
+                        step: 6,
+                        sign_in: true,
+                        completed: false,
+                        issue: None,
+                    },
+                )
+            })
+            .await
+            .map_err(|_| {
+                StartError::Other("I couldn't save Google setup progress. Please try again.".into())
+            })?;
+        crate::connectors::broadcast_changed(state).await;
+    }
     // Exchanges of earlier flows were for the previous client/endpoints.
     state.oauth.bump(Some(&con.id));
     let epoch = state.oauth.epoch(&con.id);
@@ -1085,7 +1111,33 @@ pub async fn finish(
         .remove(flow_state)
         .filter(|f| now_ms() - f.created_at < FLOW_TTL_MS)
         .ok_or("This sign-in link expired or was already used. Start again from the app.")?;
+    let id = flow.connector_id.clone();
+    let con = state
+        .db
+        .call(move |c| entities::get_connector(c, &id))
+        .await
+        .ok()
+        .flatten()
+        .ok_or("That connection was removed.")?;
+    if state.oauth.epoch(&con.id) != flow.epoch {
+        return Err(
+            "That sign-in was replaced by a newer change. Start again from the app.".into(),
+        );
+    }
     if let Some(e) = error {
+        let _creds = credentials_lock(state).await;
+        if state.oauth.epoch(&con.id) != flow.epoch {
+            return Err(
+                "That sign-in was replaced by a newer change. Start again from the app.".into(),
+            );
+        }
+        if con.service == "google" {
+            return Err(crate::google_setup::report_issue(state, e)
+                .await
+                .map_err(|_| "I couldn't save the Google setup fix. Please try again.")?
+                .unwrap_or("I couldn't finish Google sign-in. Please try again.")
+                .into());
+        }
         if e == "access_denied" {
             crate::awareness::finish(
                 state,
@@ -1104,15 +1156,7 @@ pub async fn finish(
     let code = code
         .filter(|c| !c.is_empty())
         .ok_or("The service did not send a sign-in code.")?;
-    let id = flow.connector_id.clone();
     let flow_epoch = flow.epoch;
-    let con = state
-        .db
-        .call(move |c| entities::get_connector(c, &id))
-        .await
-        .ok()
-        .flatten()
-        .ok_or("That connection was removed.")?;
     let o = con
         .config
         .oauth
@@ -1151,6 +1195,22 @@ pub async fn finish(
             con.name,
             provider_error_code(&v)
         );
+        if con.service == "google" {
+            let _creds = credentials_lock(state).await;
+            if state.oauth.epoch(&con.id) != flow_epoch {
+                return Err(
+                    "That sign-in was replaced by a newer change. Start again from the app.".into(),
+                );
+            }
+            return Err(crate::google_setup::report_issue(
+                state,
+                v["error"].as_str().unwrap_or(""),
+            )
+            .await
+            .map_err(|_| "I couldn't save the Google setup fix. Please try again.")?
+            .unwrap_or("I couldn't finish Google sign-in. Please try again.")
+            .into());
+        }
         return Err(format!(
             "The service refused the sign-in ({}). Try again.",
             truncate_chars(
@@ -1170,6 +1230,29 @@ pub async fn finish(
         return Err(
             "That sign-in was replaced by a newer change. Start again from the app.".into(),
         );
+    }
+    // Google allows people to deselect individual services on consent. A
+    // partial grant must not light up all four services in Connections.
+    if con.service == "google"
+        && let Some(granted) = v["scope"].as_str()
+    {
+        let missing = crate::connectors::GOOGLE_SCOPES
+            .iter()
+            .filter(|s| {
+                s.starts_with("https://www.googleapis.com/auth/") && !s.contains("/userinfo.")
+            })
+            .any(|required| !granted.split_whitespace().any(|scope| scope == *required));
+        if missing {
+            return Err(
+                crate::google_setup::report_issue(state, "missing_permissions")
+                    .await
+                    .map_err(|_| "I couldn't save the Google setup fix. Please try again.")?
+                    .unwrap_or(
+                        "I need permission for all four Google services. Please sign in again.",
+                    )
+                    .into(),
+            );
+        }
     }
     // Built on the latest stored state; a new sign-in replaces the old
     // grant entirely (never keeps the previous account's refresh token).
@@ -1205,6 +1288,23 @@ pub async fn finish(
             )
         })
         .await;
+    if con.service == "google" {
+        state
+            .db
+            .call(|c| {
+                crate::google_setup::save(
+                    c,
+                    &crate::google_setup::Progress {
+                        step: 6,
+                        sign_in: true,
+                        completed: true,
+                        issue: None,
+                    },
+                )
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     // Any other exchange still under way is now stale.
     state.oauth.bump(Some(&con.id));
     drop(_creds);

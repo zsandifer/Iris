@@ -31,7 +31,7 @@ pub async fn status(
         "version": s.version,
     })).collect();
     let (uid, conv) = (owner.to_owned(), conversation.to_owned());
-    let Some((connectors, logins, wallet_cards, pending, notes)) = state.db.call(move |c| {
+    let Some((connectors, logins, wallet_cards, pending, notes, google_setup)) = state.db.call(move |c| {
         if db::owner_user_id(c)?.as_deref() != Some(&uid) || db::conversation_member_ids(c, &conv)? != [uid.clone()] {
             return Ok(None);
         }
@@ -69,7 +69,7 @@ pub async fn status(
         let mut stmt = c.prepare("SELECT content FROM messages WHERE conversation_id = ?1 AND kind = 'system_note' ORDER BY created_at DESC LIMIT 8")?;
         let mut notes = stmt.query_map([&conv], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         notes.reverse();
-        Ok(Some((connectors, logins, wallet_cards, pending, notes)))
+        Ok(Some((connectors, logins, wallet_cards, pending, notes, crate::google_setup::status(c)?)))
     }).await? else { return Ok(json!({"outcome": "not allowed"})); };
     let quiet = crate::notify::quiet_hours(state, owner).await;
     Ok(json!({
@@ -80,6 +80,7 @@ pub async fn status(
         "settings": {"agent_name": state.agent_name().await, "feed": crate::feed::enabled(state).await,
             "paused": state.is_paused().await, "quiet_hours": quiet.map(|q| json!({"start": q["start"], "end": q["end"]})), "voice_replies": false},
         "pending_cards": pending, "recent_system_notes": notes,
+        "google_setup": google_setup,
     }))
 }
 
@@ -170,6 +171,22 @@ pub async fn finish(state: &AppState, kind: &str, target: &str, outcome: &str, n
                     }
                     updates.push(db::update_message_card(c, &id, &card)?);
                     conversations.insert(m.conversation_id);
+                }
+                // A Google sign-in from Connections also informs the next
+                // private turn. Its timestamp makes repeated updates idempotent.
+                if kind == "connector" && service.as_deref() == Some("google") && outcome == "done"
+                    && let Some(at) = entities::get_connector(c, &target)?.and_then(|c| c.config.oauth.and_then(|o| o.connected_at)) {
+                    let key = format!("google.connected_note.{target}");
+                    let marker = at.to_string();
+                    if db::get_setting(c, &key)?.as_deref() != Some(&marker) {
+                        if conversations.is_empty() {
+                            let main = db::ensure_main_conversation(c, &owner)?;
+                            if db::conversation_member_ids(c, &main)? == [owner.clone()] {
+                                conversations.insert(main);
+                            }
+                        }
+                        db::set_setting(c, &key, &marker)?;
+                    }
                 }
                 let notes = conversations
                     .iter()

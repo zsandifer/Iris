@@ -8,7 +8,7 @@ use crate::entities::{self, ConnectorState};
 use crate::gateway::policy::{Mode, Policy, ToolRule};
 use crate::state::AppState;
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequest, Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -16,10 +16,34 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+/// Pasted keys must not be echoed by JSON type errors, even when a client
+/// sends a secret in the wrong field.
+struct GoogleJson<T>(T);
+
+impl<S: Send + Sync, T: serde::de::DeserializeOwned> FromRequest<S> for GoogleJson<T> {
+    type Rejection = ApiError;
+    async fn from_request(req: Request, state: &S) -> Result<Self, ApiError> {
+        axum::Json::<T>::from_request(req, state)
+            .await
+            .map(|axum::Json(body)| Self(body))
+            .map_err(|_| {
+                ApiError::bad_request(
+                    "I couldn't read that setup request. Please try again from Google setup.",
+                )
+            })
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/connectors/catalog", get(catalog))
         .route("/connectors/catalog/{service}", post(setup_service))
+        .route(
+            "/connectors/google/setup",
+            get(google_setup).put(google_progress),
+        )
+        .route("/connectors/google/setup/client", post(google_client))
+        .route("/connectors/google/setup/error", post(google_error))
         .route("/connectors/activity", get(activity))
         .route("/connectors/{id}/oauth/start", post(oauth_start))
         .route("/connectors/{id}/oauth/client", post(oauth_client))
@@ -81,6 +105,127 @@ async fn setup_service(
 
 // ------------------------------------------------------------------- oauth
 
+async fn google_setup(State(state): State<AppState>, user: AuthUser) -> ApiResult {
+    user.require_owner()?;
+    let progress = state.db.call(crate::google_setup::status).await?;
+    ok(
+        json!({"progress": progress, "pages": crate::google_setup::pages(),
+        "redirect_uri": crate::google_setup::callback(&state.cfg.public_url)}),
+    )
+}
+
+#[derive(Deserialize)]
+struct GoogleProgressBody {
+    step: u8,
+    #[serde(default)]
+    sign_in: bool,
+}
+
+async fn google_progress(
+    State(state): State<AppState>,
+    user: AuthUser,
+    GoogleJson(body): GoogleJson<GoogleProgressBody>,
+) -> ApiResult {
+    user.require_owner()?;
+    if !(1..=crate::google_setup::STEPS).contains(&body.step) || (body.sign_in && body.step != 6) {
+        return Err(ApiError::bad_request("I need a setup step from 1 to 6."));
+    }
+    if (body.step > 4 || body.sign_in)
+        && crate::google_setup::callback(&state.cfg.public_url).is_none()
+    {
+        return Err(ApiError::bad_request(
+            "I need public_url set to Iris's HTTPS address first. See the help link in step 4.",
+        ));
+    }
+    state
+        .db
+        .call(move |c| {
+            if body.sign_in
+                && !entities::list_connectors(c, false)?.iter().any(|c| {
+                    c.service == "google"
+                        && c.config
+                            .oauth
+                            .as_ref()
+                            .is_some_and(|o| o.client_id.is_some() && o.client_secret.is_some())
+                })
+            {
+                return Ok(Err(ApiError::bad_request(
+                    "I need your login key first. Paste it in step 6.",
+                )));
+            }
+            crate::google_setup::save(
+                c,
+                &crate::google_setup::Progress {
+                    step: body.step,
+                    sign_in: body.sign_in,
+                    completed: false,
+                    issue: None,
+                },
+            )?;
+            Ok(Ok(()))
+        })
+        .await??;
+    crate::connectors::broadcast_changed(&state).await;
+    google_setup(State(state), user).await
+}
+
+#[derive(Deserialize)]
+struct GoogleClientBody {
+    paste: String,
+    #[serde(default)]
+    validate_only: bool,
+}
+
+#[derive(Deserialize)]
+struct GoogleErrorBody {
+    code: String,
+}
+
+async fn google_error(
+    State(state): State<AppState>,
+    user: AuthUser,
+    GoogleJson(body): GoogleJson<GoogleErrorBody>,
+) -> ApiResult {
+    user.require_owner()?;
+    crate::google_setup::report_issue(&state, &body.code)
+        .await?
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "I don't recognize that sign-in problem. Please try signing in again.",
+            )
+        })?;
+    google_setup(State(state), user).await
+}
+
+async fn google_client(
+    State(state): State<AppState>,
+    user: AuthUser,
+    GoogleJson(body): GoogleJson<GoogleClientBody>,
+) -> ApiResult {
+    user.require_owner()?;
+    let client = crate::google_setup::parse(&body.paste).map_err(ApiError::bad_request)?;
+    if body.validate_only {
+        return ok(json!({"valid": true}));
+    }
+    if crate::google_setup::callback(&state.cfg.public_url).is_none() {
+        return Err(ApiError::bad_request(
+            "I need public_url set to Iris's HTTPS address first. See the help link in step 4.",
+        ));
+    }
+    crate::connectors::setup(
+        &state,
+        "google",
+        &crate::connectors::SetupBody {
+            client_id: Some(client.id),
+            client_secret: Some(client.secret),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(ApiError::bad_request)?;
+    google_setup(State(state), user).await
+}
+
 #[derive(Deserialize, Default)]
 struct StartBody {
     origin: Option<String>,
@@ -127,6 +272,11 @@ async fn oauth_client(
     user.require_owner()?;
     let _creds = crate::oauth::credentials_lock(&state).await;
     let con = connector(&state, &id).await?;
+    if con.service == "google" {
+        return Err(ApiError::bad_request(
+            "I need both parts of your Google login key together. Open Google setup to replace it.",
+        ));
+    }
     let client_id = body.client_id.trim().to_string();
     if client_id.is_empty() || client_id.len() > 500 {
         return Err(ApiError::bad_request("paste the Client ID"));
@@ -587,6 +737,8 @@ mod tests {
         /// Hold code exchanges this long (a slow provider).
         exchange_delay_ms: u64,
         echo_errors: bool,
+        token_error: &'static str,
+        granted_scopes: Option<String>,
         challenge: Option<String>,
         refreshed: bool,
         last_auth: Option<String>,
@@ -677,6 +829,12 @@ mod tests {
                     }
                     let mut g = p.lock().unwrap();
                     g.token_requests.push(form.clone());
+                    if !g.token_error.is_empty() {
+                        return (StatusCode::BAD_REQUEST, axum::Json(json!({
+                            "error": g.token_error,
+                            "error_description": form.values().cloned().collect::<Vec<_>>().join(" "),
+                        }))).into_response();
+                    }
                     if g.echo_errors {
                         let echoed = form.values().cloned().collect::<Vec<_>>().join(" ");
                         return (StatusCode::BAD_REQUEST, axum::Json(json!({
@@ -694,7 +852,7 @@ mod tests {
                             if ok {
                                 let life = if g.strict { 3600 } else { 1 };
                                 axum::Json(json!({"access_token": "at-1", "refresh_token": "rt-1",
-                                                  "expires_in": life, "token_type": "Bearer"}))
+                                                  "expires_in": life, "token_type": "Bearer", "scope": g.granted_scopes}))
                                 .into_response()
                             } else {
                                 (
@@ -1183,6 +1341,10 @@ mod tests {
     }
 
     async fn app() -> App {
+        app_with_public_url("").await
+    }
+
+    async fn app_with_public_url(public_url: &str) -> App {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths {
             config_file: tmp.path().join("config.toml"),
@@ -1196,6 +1358,7 @@ mod tests {
         }
         cfg.push.enabled = false;
         cfg.bind = "100.64.0.1:7420".into();
+        cfg.public_url = public_url.into();
         let state = AppState::new(cfg, paths, db).unwrap();
         let app = super::super::router(state.clone());
         let owner = state.db.with(crate::db::owner_user_id).unwrap().unwrap();
@@ -1303,8 +1466,530 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn google_setup_routes_are_owner_only() {
+        let a = app_with_public_url("https://iris.example").await;
+        let code = a.state.db.with(|c| {
+            c.execute("INSERT INTO users (id, display_name, is_owner, created_at) VALUES ('setup-guest', 'Guest', 0, 1)", [])?;
+            Ok(crate::auth::create_pairing_code(c, "setup-guest").unwrap().0)
+        }).unwrap();
+        let (_, paired) = send(&a.app, "POST", "/api/pair", "", Some(json!({"code": code}))).await;
+        let paired: Value = serde_json::from_str(&paired).unwrap();
+        let token = paired["token"].as_str().unwrap();
+        for (method, path, body) in [
+            ("GET", "/api/connectors/google/setup", None),
+            (
+                "PUT",
+                "/api/connectors/google/setup",
+                Some(json!({"step": 3})),
+            ),
+            (
+                "POST",
+                "/api/connectors/google/setup/client",
+                Some(
+                    json!({"paste": "123-example.apps.googleusercontent.com GOCSPX-guest-canary"}),
+                ),
+            ),
+            (
+                "POST",
+                "/api/connectors/google/setup/error",
+                Some(json!({"code": "access_denied"})),
+            ),
+        ] {
+            let (status, response) = send(&a.app, method, path, token, body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(!response.contains("guest-canary"));
+        }
+        assert_eq!(a.state.db.with(crate::google_setup::read).unwrap().step, 1);
+        assert!(
+            a.state
+                .db
+                .with(|c| entities::list_connectors(c, false))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn google_wizard_persists_progress_parses_privately_and_requires_https() {
+        const SECRET: &str = "GOCSPX-wizard-canary_123";
+        const ID: &str = "123-wizard-canary.apps.googleusercontent.com";
+        let insecure = app().await;
+        let (_, v) = call(&insecure, "GET", "/api/connectors/google/setup", None).await;
+        assert!(v["redirect_uri"].is_null());
+        let (s, _) = call(
+            &insecure,
+            "PUT",
+            "/api/connectors/google/setup",
+            Some(json!({"step": 5})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = call(
+            &insecure,
+            "POST",
+            "/api/connectors/google/setup/client",
+            Some(json!({"paste": format!("{ID} {SECRET}")})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        // An app origin cannot substitute for the configured HTTPS address.
+        crate::connectors::setup(
+            &insecure.state,
+            "google",
+            &crate::connectors::SetupBody {
+                client_id: Some(ID.into()),
+                client_secret: Some(SECRET.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cid = insecure
+            .state
+            .db
+            .with(|c| Ok(entities::list_connectors(c, false)?[0].id.clone()))
+            .unwrap();
+        let (s, _) = call(
+            &insecure,
+            "POST",
+            &format!("/api/connectors/{cid}/oauth/start"),
+            Some(json!({"origin": "https://iris.example"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        let a = app_with_public_url("https://iris.example/").await;
+        let (_, v) = call(&a, "GET", "/api/connectors/google/setup", None).await;
+        assert_eq!(v["progress"]["step"], 1);
+        assert_eq!(v["redirect_uri"], "https://iris.example/api/oauth/callback");
+        for step in [0, 7] {
+            let (s, _) = call(
+                &a,
+                "PUT",
+                "/api/connectors/google/setup",
+                Some(json!({"step": step})),
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+        }
+        let (s, _) = call(
+            &a,
+            "PUT",
+            "/api/connectors/google/setup",
+            Some(json!({"step": 3})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, v) = call(&a, "GET", "/api/connectors/google/setup", None).await;
+        assert_eq!(v["progress"]["summary"], "Google setup: step 3 of 6");
+        // A fresh connection sees the saved position, independent of AppState.
+        let reopened = rusqlite::Connection::open(a.state.paths.db_file()).unwrap();
+        assert_eq!(crate::google_setup::read(&reopened).unwrap().step, 3);
+        let (s, _) = call(
+            &a,
+            "PUT",
+            "/api/connectors/google/setup",
+            Some(json!({"step": 6, "sign_in": true})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let paste = json!({"installed": {"client_id": ID, "client_secret": SECRET}}).to_string();
+        let (s, v) = call(
+            &a,
+            "POST",
+            "/api/connectors/google/setup/client",
+            Some(json!({"paste": paste, "validate_only": true})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v, json!({"valid": true}));
+        assert!(
+            a.state
+                .db
+                .with(|c| entities::list_connectors(c, false))
+                .unwrap()
+                .is_empty()
+        );
+        let (s, v) = call(
+            &a,
+            "POST",
+            "/api/connectors/google/setup/client",
+            Some(json!({"paste": paste})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["progress"]["phase"], "sign_in");
+        assert!(!v.to_string().contains("canary"));
+        let con = a
+            .state
+            .db
+            .with(|c| Ok(entities::list_connectors(c, false)?[0].clone()))
+            .unwrap();
+        assert!(!serde_json::to_string(&con.config).unwrap().contains(SECRET));
+        assert_eq!(
+            a.state
+                .vault
+                .open_str(
+                    con.config
+                        .oauth
+                        .as_ref()
+                        .unwrap()
+                        .client_secret
+                        .as_ref()
+                        .unwrap(),
+                    &format!("connector:{}:oauth:client_secret", con.id)
+                )
+                .unwrap(),
+            SECRET
+        );
+        for (uri, body) in [
+            (
+                "/api/connectors/google/setup/client",
+                json!({"paste": format!("broken {SECRET}")}),
+            ),
+            ("/api/connectors/google/setup", json!({"step": SECRET})),
+            (
+                "/api/connectors/google/setup/error",
+                json!({"code": format!("invalid_client {SECRET}")}),
+            ),
+            (
+                "/api/connectors/google/setup/error",
+                json!({"code": {"secret": SECRET}}),
+            ),
+        ] {
+            let (s, v) = call(
+                &a,
+                if uri.ends_with("/setup") {
+                    "PUT"
+                } else {
+                    "POST"
+                },
+                uri,
+                Some(body),
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+            assert!(!v.to_string().contains(SECRET));
+        }
+        let (_, v) = call(&a, "GET", "/api/connectors", None).await;
+        assert!(!v.to_string().contains(SECRET));
+        let owner = a.state.db.with(crate::db::owner_user_id).unwrap().unwrap();
+        let conv = a
+            .state
+            .db
+            .with(|c| crate::db::ensure_main_conversation(c, &owner))
+            .unwrap();
+        let status = crate::awareness::status(&a.state, &owner, &conv, "codex", "test")
+            .await
+            .unwrap();
+        assert_eq!(status["google_setup"]["phase"], "sign_in");
+        assert!(!status.to_string().contains("canary"));
+        // Replacing the secret invalidates a previous grant even with the same ID.
+        a.state
+            .db
+            .with(|c| {
+                let mut cfg = con.config.clone();
+                cfg.oauth.as_mut().unwrap().refresh_token = Some("old-encrypted-token".into());
+                entities::update_connector(c, &con.id, None, Some(&cfg), None)?;
+                Ok(())
+            })
+            .unwrap();
+        let (s, _) = call(
+            &a,
+            "POST",
+            "/api/connectors/google/setup/client",
+            Some(json!({"paste": format!("{ID} GOCSPX-replacement")})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let cons = a
+            .state
+            .db
+            .with(|c| entities::list_connectors(c, false))
+            .unwrap();
+        assert_eq!(cons.len(), 1);
+        assert_eq!(cons[0].id, con.id);
+        assert!(
+            cons[0]
+                .config
+                .oauth
+                .as_ref()
+                .unwrap()
+                .refresh_token
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn google_errors_return_to_the_fix_step_without_echoing_provider_text() {
+        let a = app_with_public_url("https://iris.example").await;
+        let _ = call(
+            &a,
+            "POST",
+            "/api/connectors/google/setup/client",
+            Some(json!({"paste": "123-example.apps.googleusercontent.com GOCSPX-error-canary"})),
+        )
+        .await;
+        let con = a
+            .state
+            .db
+            .with(|c| Ok(entities::list_connectors(c, false)?[0].clone()))
+            .unwrap();
+        for (error, step) in [
+            ("redirect_uri_mismatch", 4),
+            ("access_denied", 3),
+            ("invalid_client", 6),
+        ] {
+            let (_, flow) = call(
+                &a,
+                "POST",
+                &format!("/api/connectors/{}/oauth/start", con.id),
+                Some(json!({})),
+            )
+            .await;
+            let q = crate::oauth::parse_query(flow["authorize_url"].as_str().unwrap());
+            let (_, html) = send(
+                &a.app,
+                "GET",
+                &format!("/api/oauth/callback?state={}&error={error}", q["state"]),
+                "",
+                None,
+            )
+            .await;
+            assert!(!html.contains("error-canary"));
+            let (_, setup) = call(&a, "GET", "/api/connectors/google/setup", None).await;
+            assert_eq!(setup["progress"]["step"], step);
+            assert_eq!(setup["progress"]["error"]["step"], step);
+            assert_eq!(setup["progress"]["phase"], "setup");
+        }
+        let (s, v) = call(
+            &a,
+            "POST",
+            "/api/connectors/google/setup/error",
+            Some(json!({"code": "redirect_uri_mismatch"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["progress"]["step"], 4);
+        let (s, v) = call(
+            &a,
+            "PUT",
+            "/api/connectors/google/setup",
+            Some(json!({"step": 5})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(v["progress"]["error"].is_null());
+        let (_, flow) = call(
+            &a,
+            "POST",
+            &format!("/api/connectors/{}/oauth/start", con.id),
+            Some(json!({})),
+        )
+        .await;
+        let q = crate::oauth::parse_query(flow["authorize_url"].as_str().unwrap());
+        let (_, html) = send(
+            &a.app,
+            "GET",
+            &format!(
+                "/api/oauth/callback?state={}&error=invalid_client%20GOCSPX-error-canary",
+                q["state"]
+            ),
+            "",
+            None,
+        )
+        .await;
+        assert!(!html.contains("error-canary"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn google_signin_resolves_the_card_and_reports_success_to_the_agent() {
+        let a = app_with_public_url("https://iris.example").await;
+        let owner = a.state.db.with(crate::db::owner_user_id).unwrap().unwrap();
+        let conv = a
+            .state
+            .db
+            .with(|c| crate::db::ensure_main_conversation(c, &owner))
+            .unwrap();
+        let req = crate::awareness::request(
+            &a.state,
+            &owner,
+            &conv,
+            "request_connector_setup",
+            &json!({"name": "google"}),
+        )
+        .await
+        .unwrap();
+        let card = a
+            .state
+            .db
+            .with(|c| crate::db::get_message(c, req["card_id"].as_str().unwrap()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(card.card.unwrap()["type"], "connect");
+        let _ = call(
+            &a,
+            "POST",
+            "/api/connectors/google/setup/client",
+            Some(json!({"paste": "123-example.apps.googleusercontent.com GOCSPX-success-canary"})),
+        )
+        .await;
+        let con = a
+            .state
+            .db
+            .with(|c| Ok(entities::list_connectors(c, false)?[0].clone()))
+            .unwrap();
+        let provider = fake_provider().await;
+        let base = provider.lock().unwrap().base.clone();
+        a.state
+            .db
+            .with(|c| {
+                let mut cfg = con.config.clone();
+                let o = cfg.oauth.as_mut().unwrap();
+                o.authorization_endpoint = Some(format!("{base}/auth/authorize"));
+                o.token_endpoint = Some(format!("{base}/auth/token"));
+                o.local = true;
+                entities::update_connector(c, &con.id, None, Some(&cfg), None)?;
+                Ok(())
+            })
+            .unwrap();
+        let (_, flow) = call(
+            &a,
+            "POST",
+            &format!("/api/connectors/{}/oauth/start", con.id),
+            Some(json!({})),
+        )
+        .await;
+        let q = crate::oauth::parse_query(flow["authorize_url"].as_str().unwrap());
+        provider.lock().unwrap().challenge = Some(q["code_challenge"].clone());
+        for scope in crate::connectors::GOOGLE_SCOPES {
+            assert!(q["scope"].split_whitespace().any(|s| s == *scope));
+        }
+        provider.lock().unwrap().token_error = "invalid_client";
+        let (_, refused) = send(
+            &a.app,
+            "GET",
+            &format!("/api/oauth/callback?state={}&code=the-code", q["state"]),
+            "",
+            None,
+        )
+        .await;
+        assert!(refused.contains("login key"));
+        assert!(!refused.contains("success-canary"));
+        let (_, setup) = call(&a, "GET", "/api/connectors/google/setup", None).await;
+        assert_eq!(setup["progress"]["error"]["step"], 6);
+        provider.lock().unwrap().token_error = "";
+        let (_, flow) = call(
+            &a,
+            "POST",
+            &format!("/api/connectors/{}/oauth/start", con.id),
+            Some(json!({})),
+        )
+        .await;
+        let q = crate::oauth::parse_query(flow["authorize_url"].as_str().unwrap());
+        provider.lock().unwrap().challenge = Some(q["code_challenge"].clone());
+        provider.lock().unwrap().granted_scopes =
+            Some("https://www.googleapis.com/auth/gmail.modify".into());
+        let (_, partial) = send(
+            &a.app,
+            "GET",
+            &format!("/api/oauth/callback?state={}&code=the-code", q["state"]),
+            "",
+            None,
+        )
+        .await;
+        assert!(partial.contains("all four services"));
+        let (_, setup) = call(&a, "GET", "/api/connectors/google/setup", None).await;
+        assert_eq!(setup["progress"]["phase"], "sign_in");
+        let current = a
+            .state
+            .db
+            .with(|c| entities::get_connector(c, &con.id))
+            .unwrap()
+            .unwrap();
+        assert!(current.config.oauth.unwrap().access_token.is_none());
+        provider.lock().unwrap().granted_scopes = Some(crate::connectors::GOOGLE_SCOPES.join(" "));
+        let (_, flow) = call(
+            &a,
+            "POST",
+            &format!("/api/connectors/{}/oauth/start", con.id),
+            Some(json!({})),
+        )
+        .await;
+        let q = crate::oauth::parse_query(flow["authorize_url"].as_str().unwrap());
+        provider.lock().unwrap().challenge = Some(q["code_challenge"].clone());
+        let (_, html) = send(
+            &a.app,
+            "GET",
+            &format!("/api/oauth/callback?state={}&code=the-code", q["state"]),
+            "",
+            None,
+        )
+        .await;
+        assert!(html.contains("Google is connected"), "{html}");
+        let (_, v) = call(&a, "GET", "/api/connectors/google/setup", None).await;
+        assert_eq!(v["progress"]["phase"], "connected");
+        let card = a
+            .state
+            .db
+            .with(|c| crate::db::get_message(c, req["card_id"].as_str().unwrap()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(card.card.unwrap()["state"], "done");
+        let status = crate::awareness::status(&a.state, &owner, &conv, "codex", "test")
+            .await
+            .unwrap();
+        assert_eq!(status["google_setup"]["phase"], "connected");
+        assert!(
+            status["recent_system_notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|note| note == "Google connected ✓")
+        );
+        assert!(!status.to_string().contains("success-canary"));
+        crate::login::on_connector_updated(&a.state, &con.id).await;
+        let count_notes = || {
+            a.state
+                .db
+                .with(|c| {
+                    Ok(crate::db::list_messages(c, &conv, None, 100)?
+                        .iter()
+                        .filter(|m| m.kind == "system_note")
+                        .count())
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            count_notes(),
+            1,
+            "repeated updates do not duplicate the note"
+        );
+        // Sign-in from Connections, with no outstanding chat card, still leaves a note.
+        let (_, flow) = call(
+            &a,
+            "POST",
+            &format!("/api/connectors/{}/oauth/start", con.id),
+            Some(json!({})),
+        )
+        .await;
+        let q = crate::oauth::parse_query(flow["authorize_url"].as_str().unwrap());
+        provider.lock().unwrap().challenge = Some(q["code_challenge"].clone());
+        let (_, html) = send(
+            &a.app,
+            "GET",
+            &format!("/api/oauth/callback?state={}&code=the-code", q["state"]),
+            "",
+            None,
+        )
+        .await;
+        assert!(html.contains("Google is connected"));
+        assert_eq!(count_notes(), 2);
+    }
+
+    #[tokio::test]
     async fn google_and_github_setup_from_the_catalog() {
-        let a = app().await;
+        let a = app_with_public_url("https://iris.example.ts.net").await;
         let (_, cat) = call(
             &a,
             "GET",
@@ -1369,10 +2054,12 @@ mod tests {
             q["redirect_uri"],
             "https://iris.example.ts.net/api/oauth/callback"
         );
-        assert!(q["scope"].contains("gmail.modify"));
+        for scope in crate::connectors::GOOGLE_SCOPES {
+            assert!(q["scope"].split_whitespace().any(|s| s == *scope));
+        }
         assert!(!q.contains_key("resource"));
         assert_eq!(v["paste"], false);
-        // Not on https: the owner pastes the address they land on.
+        // Google always uses public_url, regardless of the requesting origin.
         let (_, v) = call(
             &a,
             "POST",
@@ -1380,10 +2067,10 @@ mod tests {
             Some(json!({"origin": "http://100.64.0.1:7420"})),
         )
         .await;
-        assert_eq!(v["paste"], true);
+        assert_eq!(v["paste"], false);
         assert_eq!(
             v["redirect_uri"],
-            "http://127.0.0.1:7420/api/oauth/callback"
+            "https://iris.example.ts.net/api/oauth/callback"
         );
         let (s, v) = call(
             &a,

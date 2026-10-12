@@ -81,7 +81,13 @@ own personality. It is not a clone.
   through waiting → connected ✓ / failed, retry. While it is down, Iris uses
   the next-ranked model and says so once.
 - **Setup by chat:** "help me set up Google" returns a Connect card that
-  opens the step-by-step setup (and shows Connected once done). Installing
+  opens a saved Google wizard: six setup screens (project, all four APIs,
+  branding/audience, Web application login key, publish, one paste box),
+  then sign-in → Connected ✓. Each has progress dots, one sentence explaining
+  why, big Open/Copy/Done buttons and Back. Progress lives on the server and
+  appears in `system_status`; completion records a system note. Reported
+  Google errors point to the step to fix. One Google sign-in lights up Gmail,
+  Calendar, Drive and YouTube read-only. Installing
   a new engine works the same way: install → sign-in card → done. Engines
   that sign in with an API key (Gemini, OpenCode providers) get a key field
   right in the card, checked on save.
@@ -178,3 +184,8 @@ Shared and isolated turns see only trivial, non-personal status. Completion and
 decline outcomes appear as subtle centered system lines, enter the next turn's
 context, and never start a turn themselves. Stale setup/reconnect cards resolve
 to ✓; setup requests offer “No thanks.”
+
+All engine and connector sign-in links, and the wizard’s Google Console links,
+open in the owner’s real browser with a small Copy link fallback. iOS standalone
+PWAs use the `x-safari-https://` / `x-safari-http://` schemes; other browsers open
+a protected new tab. These flows never open Iris’s managed browser.
