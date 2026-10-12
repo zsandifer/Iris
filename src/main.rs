@@ -433,9 +433,18 @@ fn pair(paths: &Paths, user: Option<&str>) -> Result<()> {
     println!("Pairing code for {name}: {code}");
     println!(
         "Open {} and enter the code (valid for {mins} minutes).",
-        cfg.base_url()
+        pairing_url(&cfg, &db)?
     );
     Ok(())
+}
+
+fn pairing_url(cfg: &Config, db: &db::Db) -> Result<String> {
+    if !cfg.public_url.trim().is_empty() {
+        return Ok(cfg.base_url());
+    }
+    Ok(db
+        .with(|c| db::get_setting(c, "server.bound_url"))?
+        .unwrap_or_else(|| cfg.base_url()))
 }
 
 fn status(paths: Paths) -> Result<()> {
@@ -512,6 +521,17 @@ mod tests {
 
     fn parse(s: &str) -> Args {
         Args::parse(s.split_whitespace().map(String::from)).unwrap()
+    }
+
+    #[test]
+    fn pairing_uses_actual_listener_or_public_url() {
+        let db = db::Db::open_in_memory().unwrap();
+        let mut cfg = Config::default();
+        db.with(|c| db::set_setting(c, "server.bound_url", "http://127.0.0.1:7999"))
+            .unwrap();
+        assert_eq!(pairing_url(&cfg, &db).unwrap(), "http://127.0.0.1:7999");
+        cfg.public_url = "https://iris.example.test".into();
+        assert_eq!(pairing_url(&cfg, &db).unwrap(), "https://iris.example.test");
     }
 
     #[test]

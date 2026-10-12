@@ -369,6 +369,24 @@ CREATE TABLE push_queue (
 );
 CREATE INDEX push_queue_user ON push_queue(user_id, created_at);
 "#,
+    r#"
+-- A monotonic revision also prevents a running turn from restoring a
+-- stale session, even if someone leaves and rejoins in one millisecond.
+ALTER TABLE conversations ADD COLUMN membership_version INTEGER NOT NULL DEFAULT 0;
+-- Existing shared sessions may already contain history hidden by joined_at.
+DELETE FROM harness_sessions WHERE conversation_id IN (
+    SELECT cm.conversation_id FROM conversation_members cm
+    JOIN users u ON u.id = cm.user_id WHERE u.is_owner = 0
+);
+CREATE TRIGGER conversation_member_added AFTER INSERT ON conversation_members BEGIN
+    DELETE FROM harness_sessions WHERE conversation_id = NEW.conversation_id;
+    UPDATE conversations SET membership_version = membership_version + 1 WHERE id = NEW.conversation_id;
+END;
+CREATE TRIGGER conversation_member_removed AFTER DELETE ON conversation_members BEGIN
+    DELETE FROM harness_sessions WHERE conversation_id = OLD.conversation_id;
+    UPDATE conversations SET membership_version = membership_version + 1 WHERE id = OLD.conversation_id;
+END;
+"#,
 ];
 
 /// Run `f` in a write transaction taken up front (`BEGIN IMMEDIATE`), so a
@@ -671,14 +689,6 @@ pub fn consume_pairing_code(
     .optional()
 }
 
-/// Invalidate every outstanding pairing code (used after repeated failures).
-pub fn burn_pairing_codes(conn: &Connection) -> rusqlite::Result<usize> {
-    conn.execute(
-        "UPDATE pairing_codes SET used_at = ?1 WHERE used_at IS NULL",
-        [now_ms()],
-    )
-}
-
 pub fn insert_device(
     conn: &Connection,
     user_id: &str,
@@ -894,6 +904,13 @@ pub fn delete_conversation(conn: &Connection, id: &str) -> rusqlite::Result<bool
     )? > 0)
 }
 
+/// Joining must fall after all existing messages, including timestamps
+/// advanced beyond wall time by the monotonic message cursor.
+pub fn join_timestamp(conn: &Connection, conversation_id: &str) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT MAX(?2, COALESCE(MAX(created_at) + 1, ?2)) FROM messages WHERE conversation_id = ?1",
+        params![conversation_id, now_ms()], |r| r.get(0))
+}
+
 pub fn conversation_member_ids(conn: &Connection, id: &str) -> rusqlite::Result<Vec<String>> {
     let mut stmt =
         conn.prepare("SELECT user_id FROM conversation_members WHERE conversation_id = ?1")?;
@@ -1089,6 +1106,41 @@ pub fn list_messages(
     .collect()
 }
 
+/// User-visible history, filtered in SQL before paging (cards are messages).
+pub fn list_messages_for_member(
+    conn: &Connection,
+    user_id: &str,
+    conversation_id: &str,
+    before: Option<i64>,
+    limit: usize,
+) -> rusqlite::Result<Vec<Message>> {
+    let mut stmt = conn.prepare("SELECT * FROM (
+        SELECT m.* FROM messages m JOIN conversation_members cm ON cm.conversation_id = m.conversation_id
+        WHERE cm.user_id = ?1 AND m.conversation_id = ?2 AND m.created_at >= cm.joined_at
+            AND m.created_at < ?3 AND m.status != 'pending'
+        ORDER BY m.created_at DESC LIMIT ?4) ORDER BY created_at")?;
+    stmt.query_map(
+        params![
+            user_id,
+            conversation_id,
+            before.unwrap_or(i64::MAX),
+            limit as i64
+        ],
+        message_from_row,
+    )?
+    .collect()
+}
+
+/// Revalidate membership and its history boundary for a live/replayed event.
+pub fn message_visible(
+    conn: &Connection,
+    user_id: &str,
+    message_id: &str,
+) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM messages m JOIN conversation_members cm
+        ON cm.conversation_id = m.conversation_id WHERE cm.user_id = ?1 AND m.id = ?2 AND m.created_at >= cm.joined_at)", params![user_id, message_id], |r| r.get(0))
+}
+
 /// Messages created strictly after `after` and strictly before `before`.
 pub fn messages_between(
     conn: &Connection,
@@ -1106,7 +1158,8 @@ pub fn messages_between(
 
 /// The newest `limit` finished, non-empty messages strictly between `after`
 /// and `before`, oldest first: the replay for a harness session. Limited in
-/// SQL so a long unsynced history is never loaded whole.
+/// SQL so a long unsynced history is never loaded whole. Shared context
+/// starts at the latest join among current non-owner members.
 pub fn replay_messages(
     conn: &Connection,
     conversation_id: &str,
@@ -1118,6 +1171,11 @@ pub fn replay_messages(
         "SELECT * FROM (
              SELECT * FROM messages
              WHERE conversation_id = ?1 AND created_at > ?2 AND created_at < ?3
+               AND created_at >= COALESCE((
+                   SELECT MAX(cm.joined_at) FROM conversation_members cm
+                   JOIN users u ON u.id = cm.user_id
+                   WHERE cm.conversation_id = ?1 AND u.is_owner = 0
+               ), 0)
                AND status NOT IN ('streaming', 'pending') AND trim(content) != ''
              ORDER BY created_at DESC LIMIT ?4
          ) ORDER BY created_at",
@@ -1254,7 +1312,7 @@ pub fn sent_photos(
          JOIN json_each(m.attachments) j
          JOIN attachments a ON a.id = j.value
          JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ?1
-         WHERE m.author_user_id = ?1 AND m.attachments != '[]'
+         WHERE m.author_user_id = ?1 AND m.attachments != '[]' AND m.created_at >= cm.joined_at
          GROUP BY a.id
          HAVING used_at < ?3 OR (used_at = ?3 AND (?4 = '' OR a.id < ?4))
          ORDER BY used_at DESC, a.id DESC
@@ -1308,7 +1366,7 @@ pub fn recent_activity(
          FROM messages m JOIN conversations c ON c.id = m.conversation_id
          WHERE m.role = 'assistant' AND m.created_at < ?3
            AND json_array_length(m.meta, '$.activity') > 0
-           AND (m.conversation_id IN (SELECT conversation_id FROM conversation_members WHERE user_id = ?1)
+           AND (EXISTS (SELECT 1 FROM conversation_members cm WHERE cm.user_id = ?1 AND cm.conversation_id = m.conversation_id AND m.created_at >= cm.joined_at)
                 OR (?2 AND c.kind = 'job' AND c.created_by = ?1))
            AND (c.kind != 'job' OR ?2)
          ORDER BY m.created_at DESC
@@ -1338,6 +1396,18 @@ pub fn recent_activity(
         },
     )?
     .collect()
+}
+
+/// Monotonic revision for detecting membership changes during a CLI turn.
+pub fn conversation_membership_version(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT membership_version FROM conversations WHERE id = ?1",
+        [conversation_id],
+        |r| r.get(0),
+    )
 }
 
 // --------------------------------------------------------- harness sessions
@@ -1526,6 +1596,54 @@ mod tests {
             card(c)?;
             assert_eq!(synced_watermark(c, &conv, placeholder)?, c1);
             assert!(c1 < heartbeat);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn membership_migration_discards_existing_shared_sessions_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        let (private, shared) = {
+            let c = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
+                .unwrap();
+            let owner = ensure_owner(&c).unwrap();
+            let private = create_conversation(&c, &owner, "side", "Private", None)
+                .unwrap()
+                .id;
+            let shared = create_conversation(&c, &owner, "group", "Shared", None)
+                .unwrap()
+                .id;
+            c.execute(
+                "INSERT INTO users (id, display_name, created_at) VALUES ('guest', 'Guest', 0)",
+                [],
+            )
+            .unwrap();
+            c.execute("INSERT INTO conversation_members (conversation_id, user_id, joined_at) VALUES (?1, 'guest', 1)", [&shared]).unwrap();
+            for conv in [&private, &shared] {
+                set_harness_session(
+                    &c,
+                    conv,
+                    "claude",
+                    &HarnessSession {
+                        session_id: "old-session".into(),
+                        synced_at: 0,
+                        persona_hash: "test".into(),
+                    },
+                )
+                .unwrap();
+            }
+            (private, shared)
+        };
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            assert!(get_harness_session(c, &private, "claude")?.is_some());
+            assert!(get_harness_session(c, &shared, "claude")?.is_none());
             Ok(())
         })
         .unwrap();
@@ -1820,6 +1938,8 @@ mod tests {
             let side = create_conversation(&conn, &owner, "side", "", None)
                 .unwrap()
                 .id;
+            conn.execute("UPDATE conversation_members SET joined_at = 0", [])
+                .unwrap();
             let tx = conn.transaction().unwrap();
             for (i, conv) in [&main, &side, &main, &side].iter().enumerate() {
                 tx.execute(

@@ -58,15 +58,18 @@ pub fn create_pairing_code(conn: &rusqlite::Connection, user_id: &str) -> Result
     let code = generate_code();
     let ttl = CODE_TTL.as_millis() as i64;
     db::insert_pairing_code(conn, &hash_code(&code), user_id, ttl)?;
+    conn.execute("INSERT INTO settings (key, value, updated_at) VALUES ('pairing.generation', '1', ?1)
+        ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1, updated_at = excluded.updated_at", [crate::util::now_ms()])?;
     Ok((code, crate::util::now_ms() + ttl))
 }
 
-/// Throttles pairing attempts: after `MAX_FAILURES` bad codes within the
-/// window, every outstanding code is burned and new attempts are refused
-/// for the rest of the window. Attempts still being checked count against
-/// the limit too, so concurrent requests cannot queue more guesses.
+/// Throttles pairing attempts from one source for the rest of the window.
+/// Generating a new code resets failures without invalidating other codes.
+/// Attempts still being checked count against the limit too, so concurrent
+/// requests cannot queue more guesses.
 pub struct PairLimiter {
     state: Mutex<Limits>,
+    max_failures: u32,
 }
 
 #[derive(Default)]
@@ -74,6 +77,7 @@ struct Limits {
     failures: u32,
     in_flight: u32,
     window_start: Option<Instant>,
+    generation: u64,
 }
 
 const MAX_FAILURES: u32 = 5;
@@ -83,6 +87,7 @@ impl Default for PairLimiter {
     fn default() -> Self {
         Self {
             state: Mutex::new(Limits::default()),
+            max_failures: MAX_FAILURES,
         }
     }
 }
@@ -91,6 +96,7 @@ impl Default for PairLimiter {
 pub struct Attempt<'a> {
     limiter: &'a PairLimiter,
     done: bool,
+    generation: u64,
 }
 
 impl Attempt<'_> {
@@ -98,8 +104,10 @@ impl Attempt<'_> {
         self.done = true;
         let mut s = self.limiter.lock();
         s.in_flight -= 1;
-        s.failures = 0;
-        s.window_start = None;
+        if s.generation == self.generation {
+            s.failures = 0;
+            s.window_start = None;
+        }
     }
 
     /// Returns true if this failure tripped the lock.
@@ -107,11 +115,14 @@ impl Attempt<'_> {
         self.done = true;
         let mut s = self.limiter.lock();
         s.in_flight -= 1;
+        if s.generation != self.generation {
+            return false;
+        }
         if s.window_start.is_none() {
             s.window_start = Some(Instant::now());
         }
         s.failures += 1;
-        s.failures == MAX_FAILURES
+        s.failures == self.limiter.max_failures
     }
 }
 
@@ -128,6 +139,15 @@ impl PairLimiter {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    fn reset_generation(&self, generation: u64) {
+        let mut s = self.lock();
+        if generation > s.generation {
+            s.generation = generation;
+            s.failures = 0;
+            s.window_start = None;
+        }
+    }
+
     /// Start an attempt, or None while locked (or while enough attempts
     /// are already being checked to reach the limit).
     pub fn begin(&self) -> Option<Attempt<'_>> {
@@ -136,13 +156,14 @@ impl PairLimiter {
             s.failures = 0;
             s.window_start = None;
         }
-        if s.failures + s.in_flight >= MAX_FAILURES {
+        if s.failures + s.in_flight >= self.max_failures {
             return None;
         }
         s.in_flight += 1;
         Some(Attempt {
             limiter: self,
             done: false,
+            generation: s.generation,
         })
     }
 
@@ -150,12 +171,46 @@ impl PairLimiter {
     fn locked(&self) -> bool {
         self.begin().is_none()
     }
+}
 
-    #[cfg(test)]
-    fn record_success(&self) {
-        let mut s = self.lock();
-        s.failures = 0;
-        s.window_start = None;
+/// Peer IPs come from the listener, never forwarded headers. The bounded
+/// table falls back to a much higher global limit when no peer is available.
+pub struct PairLimiters {
+    sources: Mutex<std::collections::HashMap<std::net::IpAddr, std::sync::Arc<PairLimiter>>>,
+    fallback: std::sync::Arc<PairLimiter>,
+}
+
+impl Default for PairLimiters {
+    fn default() -> Self {
+        Self {
+            sources: Mutex::default(),
+            fallback: std::sync::Arc::new(PairLimiter {
+                max_failures: 500,
+                ..PairLimiter::default()
+            }),
+        }
+    }
+}
+
+impl PairLimiters {
+    pub fn for_source(&self, source: Option<std::net::IpAddr>) -> std::sync::Arc<PairLimiter> {
+        let Some(source) = source else {
+            return self.fallback.clone();
+        };
+        let mut sources = self.sources.lock().unwrap_or_else(|p| p.into_inner());
+        sources.retain(|_, limiter| {
+            let s = limiter.lock();
+            std::sync::Arc::strong_count(limiter) > 1
+                || s.in_flight > 0
+                || s.window_start.is_some_and(|t| t.elapsed() <= WINDOW)
+        });
+        if let Some(limiter) = sources.get(&source) {
+            return limiter.clone();
+        }
+        if sources.len() >= 1024 {
+            return self.fallback.clone();
+        }
+        sources.entry(source).or_default().clone()
     }
 }
 
@@ -172,6 +227,11 @@ pub async fn pair_device(
     code: &str,
     device_name: &str,
 ) -> std::result::Result<(String, Device), PairError> {
+    let generation = db
+        .call(|c| db::get_setting(c, "pairing.generation"))
+        .await
+        .map_err(PairError::Internal)?;
+    limiter.reset_generation(generation.and_then(|s| s.parse().ok()).unwrap_or(0));
     let Some(attempt) = limiter.begin() else {
         return Err(PairError::Locked);
     };
@@ -198,10 +258,7 @@ pub async fn pair_device(
             Ok((token, device))
         }
         Ok(None) => {
-            if attempt.failed() {
-                let _ = db.call(db::burn_pairing_codes).await;
-                crate::warn!("too many failed pairing attempts; outstanding codes revoked");
-            }
+            attempt.failed();
             Err(PairError::Invalid)
         }
         Err(e) => Err(PairError::Internal(e)),
@@ -306,7 +363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_failures_lock_and_burn_codes() {
+    async fn new_pairing_code_resets_lockout() {
         let db = Db::open_in_memory().unwrap();
         let limiter = PairLimiter::default();
         let (code, _) = db
@@ -326,12 +383,40 @@ mod tests {
             pair_device(&db, &limiter, &code, "x").await,
             Err(PairError::Locked)
         ));
-        // Even after the lock clears, the burned code no longer works.
-        limiter.record_success();
-        assert!(matches!(
-            pair_device(&db, &limiter, &code, "x").await,
-            Err(PairError::Invalid)
-        ));
+        // A new code from the CLI resets this source without a daemon restart.
+        let (fresh, _) = db
+            .with(|c| Ok(create_pairing_code(c, &db::owner_user_id(c)?.unwrap())))
+            .unwrap()
+            .unwrap();
+        assert!(pair_device(&db, &limiter, &fresh, "x").await.is_ok());
+        // Other outstanding codes are still valid.
+        assert!(pair_device(&db, &limiter, &code, "x").await.is_ok());
+    }
+
+    #[test]
+    fn pairing_limits_are_scoped_to_peer_ip() {
+        let limits = PairLimiters::default();
+        let a = limits.for_source(Some("192.0.2.1".parse().unwrap()));
+        for _ in 0..MAX_FAILURES {
+            a.begin().unwrap().failed();
+        }
+        assert!(
+            limits
+                .for_source(Some("192.0.2.1".parse().unwrap()))
+                .begin()
+                .is_none()
+        );
+        assert!(
+            limits
+                .for_source(Some("192.0.2.2".parse().unwrap()))
+                .begin()
+                .is_some()
+        );
+        let fallback = limits.for_source(None);
+        for _ in 0..MAX_FAILURES {
+            fallback.begin().unwrap().failed();
+        }
+        assert!(fallback.begin().is_some());
     }
 
     #[test]

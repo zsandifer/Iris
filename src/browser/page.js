@@ -37,7 +37,17 @@ if (!globalThis.__iris) {
     // out of the page passes through redact() first, before any
     // whitespace folding, cutting, or quoting could disguise a copy.
     let secrets = [];
+    let patterns = [];
+    let splitPatterns = [];
+    let digitPatterns = [];
+    const literalPattern = (x) => new RegExp(x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu');
+    let supplied = [];
     const setSecrets = (list) => {
+      // Rust supplies cached encoding variants. Most reads use the same
+      // list, so compile literal matching patterns only when it changes.
+      list ||= [];
+      if (list.length === supplied.length && list.every((x, i) => x === supplied[i])) return;
+      supplied = [...list];
       const all = new Set();
       for (const x of list || []) {
         all.add(x);
@@ -48,6 +58,10 @@ if (!globalThis.__iris) {
         all.add(enc.replace(/%20/g, '+'));
       }
       secrets = [...all].filter((x) => x.length >= 3).sort((a, b) => b.length - a.length);
+      patterns = secrets.map(literalPattern);
+      splitPatterns = secrets.map((x) => x.replace(/\s+/g, '')).filter((x) => x.length >= 3).map(literalPattern);
+      digitPatterns = secrets.filter((x) => /^\d{12,19}$/.test(x))
+        .map((x) => new RegExp(x.split('').join('[\\s.\\u00a0-]*'), 'g'));
     };
     // Percent-decoding that never throws: runs of escapes are decoded
     // together (multi-byte UTF-8, any letter case); bad runs byte by byte.
@@ -64,13 +78,12 @@ if (!globalThis.__iris) {
     });
     const decodings = (s) => [pct(s, false), pct(s.replace(/\+/g, ' '), false), pct(s, true), pct(s.replace(/\+/g, ' '), true)];
     // Card numbers in any grouping ("3782 822463 10005", "4242-4242-...").
-    const digitRes = () => secrets.filter((x) => /^\d{12,19}$/.test(x))
-      .map((x) => new RegExp(x.split('').join('[\\s.\\u00a0-]*'), 'g'));
-    const leaksRaw = (t) => secrets.some((x) => t.includes(x)) || digitRes().some((r) => { r.lastIndex = 0; return r.test(t); });
+    const digitRes = () => digitPatterns;
+    const leaksRaw = (t) => patterns.some((r) => { r.lastIndex = 0; return r.test(t); }) || digitRes().some((r) => { r.lastIndex = 0; return r.test(t); });
     const leaks = (t) => decodings(t).some(leaksRaw);
     const redact = (s) => {
       let out = String(s ?? '');
-      for (const x of secrets) if (out.includes(x)) out = out.split(x).join('••••');
+      for (const r of patterns) out = out.replace(r, '••••');
       for (const r of digitRes()) out = out.replace(r, '••••');
       // Still there once percent-decoded (an address in another escaping):
       // drop the query, or the whole piece if the rest still shows it.
@@ -214,16 +227,15 @@ if (!globalThis.__iris) {
           owner.push(i);
         }
       });
-      for (const x of secrets) {
-        const want = x.replace(/\s+/g, '');
-        if (want.length < 3) continue;
-        let at = all.indexOf(want);
-        while (at >= 0) {
+      for (const pattern of splitPatterns) {
+        pattern.lastIndex = 0;
+        for (const match of all.matchAll(pattern)) {
+          const at = match.index;
+          const end = at + match[0].length;
           // Whole inside one text node: redact() handles it in place.
-          if (owner[at] !== owner[at + want.length - 1]) {
-            for (let k = at; k < at + want.length; k++) split.add(nodes[owner[k]]);
+          if (owner[at] !== owner[end - 1]) {
+            for (let k = at; k < end; k++) split.add(nodes[owner[k]]);
           }
-          at = all.indexOf(want, at + 1);
         }
       }
     }
@@ -583,7 +595,8 @@ if (!globalThis.__iris) {
     }
 
     return { snapshot, point, focus, hasFocus, setText, choose, loginFields, cardFields, fillField, pageText, hasText, setSecrets,
-      protect: (list) => { if (list.includes(doc)) tainted = true; },
+      protect: (list, tab = false) => { tainted = tab || list.includes(doc); },
+      navigationState: () => ({ doc, path: location.pathname }),
       isTainted: () => tainted,
       info: () => ({ url: tainted ? location.origin : redact(location.href),
         title: tainted ? '' : clean(document.title, 300), origin: location.origin, doc, tainted }) };

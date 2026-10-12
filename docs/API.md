@@ -146,7 +146,8 @@ exchanging a short one-time **pairing code**.
 
 - On the server: `iris pair` creates a code for the owner. `iris pair --user
   <USER_ID>` creates one for another user. It prints the code and the URL to
-  open (`public_url` from config, or `http://<bind>`).
+  open (`public_url` from config, or the running server’s actual bound address,
+  including a `--bind` override; config’s bind address when no saved listener exists).
 - Through the API: the owner can call
   [`POST /api/users/{id}/pairing-code`](#post-apiusersidpairing-code) for any
   user, including additional people created with `POST /api/users`.
@@ -164,14 +165,21 @@ exchanging a short one-time **pairing code**.
 
 ### Lockout
 
-Failed attempts are counted globally (not per client) in memory:
+Failed attempts are counted per listener peer IP in memory (forwarded
+headers are not trusted). Five failed or concurrent attempts lock that
+source for 15 minutes. Other sources can still pair. When a peer address
+is unavailable, or the bounded source table is full, a fallback global
+limit allows 500 attempts in the same window. Behind a reverse proxy,
+clients sharing its peer address share its limit.
 
-- After **5 failed attempts within a 15-minute window** (the window starts at
-  the first failure), **every outstanding unused pairing code is burned**, and
-  further `POST /api/pair` requests get `429 locked` until the window ends.
-- A successful pairing resets the counter.
-- Burned codes stay invalid after the lock clears; create a new one.
-- Restarting the daemon clears the counter (codes already burned stay burned).
+A successful pairing clears that source's failures. Creating a new code
+with `iris pair` (or the owner API) clears existing lockouts on the next
+attempt, without restarting the daemon. Outstanding unused codes remain
+valid until used or expired. Restarting the daemon clears in-memory limits.
+
+Revoking a device immediately cancels all of its event sockets and hands
+back browser control if that device held it. Every queued browser input
+also revalidates the device before acting.
 
 ### Tokens
 
@@ -547,7 +555,11 @@ Any member.
 }
 ```
 
-Ordered by `joined_at`.
+Ordered by `joined_at`. A member can only read messages (including cards),
+attachment references, and activity created at or after their `joined_at`.
+The same boundary applies to live WebSocket events and replays, and direct
+attachment downloads. Uploaders retain access to their own uploads.
+Removing and re-adding a member gives them a new history boundary.
 
 #### `POST /api/conversations/{id}/members`
 
@@ -1387,6 +1399,13 @@ those servers on. Where a CLI's own server has the same name as one of
 Iris's, Iris's is passed as `iris_<name>` so the two are never merged. Add
 such services as connectors instead.
 
+Connector descriptions, results, and diagnostics redact known secret values.
+For secrets of at least eight characters, this also covers standard and
+URL-safe base64 (padded or unpadded), hex, URL encoding, reversal, and
+case-insensitive echoes. **Redaction is best-effort**: arbitrary transforms,
+splitting, or combinations can evade it. The approval gate remains the
+boundary for connector actions; redaction is not an authorization mechanism.
+
 **The approval gate.** Every call is classified from the real tool name,
 the server's own annotations (`readOnlyHint`, `destructiveHint`; risky words
 in the name win), and the real arguments: `read`, `draft`, `write`, `send`
@@ -1394,12 +1413,23 @@ in the name win), and the real arguments: `read`, `draft`, `write`, `send`
 and creating or changing things others see such as pull requests, issues,
 releases, and comments),
 `purchase` (buying, paying, ordering, booking), `delete`, `export`, or
-`unclear`. Operation arguments of multi-purpose tools (`method`, `action`,
+`unclear`. Unrecognized tool names are `unclear` and ask, including when
+the server supplies a read-only hint; an allow override also still asks
+when the category is unclear. Concatenated delivery verbs and names
+such as `dispatch_message`, `wire_money`, and `sync_to_remote` retain their
+risk. A draft exemption requires a leading draft/compose verb (or create
+with a draft noun), and no delivery verb anywhere. Operation arguments of multi-purpose tools (`method`, `action`,
 `operation`, `op`, `verb`, `command`, `event`) count too: the riskier
 reading wins, and an operation Iris cannot place on a tool that changes
 things is `unclear`. Recipients are read from
 the arguments (`to`, `cc`, `bcc`, `recipients`, `attendees`, `email`,
-`phone`, `channel`, ...). With the default rules:
+`phone`, `channel`, ...), including guest-email and invite arrays. For
+send/share/write calls, address-like strings under unknown keys are also
+recipients. Ambiguous values or nesting beyond the scan limit add an
+unreadable-audience placeholder that asks. Reply-all flags accept truthy
+booleans, numbers, and strings (`yes`, `1`, `TRUE`, with whitespace);
+public visibility, anyone access, and link sharing add a public audience.
+With the default rules:
 
 | Call | What happens |
 |---|---|
@@ -1546,7 +1576,7 @@ override. Modes, in plain words: `standard` "Reads freely · asks before
 sending, buying, or deleting" (default), `careful` "Reads freely · asks
 before any change", `read_only` "Only reads · never changes anything",
 `ask_always` "Asks every time". A tool set to `allow` runs without asking,
-except purchases, which always ask. Response `{"connector": {Connector}}`.
+except purchases and unclear actions, which always ask. Response `{"connector": {Connector}}`.
 
 #### `GET /api/connectors/{id}/tools`
 
@@ -1645,7 +1675,8 @@ The agent uses them only through Iris's browser: `fill_login` and
 `fill_card` ([browser tools](#the-browser-tools)) make Iris type the saved
 values into the current page itself. The secret never reaches a tool result,
 a message, or a log. A login is filled only into the site it was saved for
-(the page's host must be the saved `site` or a subdomain of it) over HTTPS
+(scheme, host, and port must match the saved `site`; subdomains require
+`allow_subdomains: true`) over HTTPS
 (plain HTTP only on this machine). Every card use needs the owner's OK on an
 [approval card](#server-cards).
 
@@ -1670,7 +1701,8 @@ Login fields:
 
 | Field | Type | Stored as | Notes |
 |---|---|---|---|
-| `site` | string | metadata | Max 300. |
+| `site` | string | metadata | Max 300. Full origin; bare domains mean HTTPS on port 443. |
+| `allow_subdomains` | bool | metadata | Optional, default false. Allows subdomains only on the same scheme and port. |
 | `username` | string | metadata | Max 300. |
 | `password` | string | secret | Max 1,000. |
 | `notes` | string | secret | Max 4,000. |
@@ -2756,7 +2788,7 @@ Metadata only; the encrypted secret is never returned.
 | `id` | string | |
 | `kind` | string | `login` or `card`. |
 | `label` | string | |
-| `metadata` | object | login: `{"site", "username"}`; card: `{"brand", "last4", "exp_month", "exp_year", "cardholder"}` (values may be `null`). |
+| `metadata` | object | login: `{"site", "username", "allow_subdomains"}`; card: `{"brand", "last4", "exp_month", "exp_year", "cardholder"}` (values may be `null`). |
 | `created_at`, `updated_at` | int | |
 | `last_used_at` | int or null | When Iris last filled it into a page. |
 
@@ -3184,9 +3216,14 @@ are masked on screen. JavaScript dialogs are answered (alerts and confirms
 accepted, prompts dismissed) and reported at the top of the next result.
 After a vault secret is filled, every agent read of that document refuses
 with "This page has your password filled in. Submit or leave the page first."
-This includes snapshots, text waits, screenshots, and tab titles/URLs beyond
-the origin. Existing refs still work for actions (including submit and Enter).
-A new document clears this restriction; same-document URL changes do not.
+This includes snapshots, text waits, screenshots, and tab titles/URLs.
+Tainted tabs are listed only by index. Existing refs still work for actions (including submit and Enter).
+The restriction follows the filled tab across script redirects and reloads.
+It clears after an explicit agent navigation/click (or Enter submission)
+loads a new document whose path differs from the fill page, or after the
+owner supplies browser input. Query/fragment changes and same-path
+submissions do not clear it. A script redirect immediately after input,
+including one carrying a transformed password in its fragment, stays tainted.
 The owner's live screencast is unaffected. Dialog reports contain only their
 kind and outcome, never page-controlled text.
 Text is read exactly as written (adjacent inline elements are not split
@@ -3229,7 +3266,8 @@ per-server timeout of the effective approval window plus 300 seconds, using
 the standard per-server MCP timeout fields.
 
 `fill_login` takes the saved login whose `site` matches the current page's
-host (a subdomain matches too; the most recently used wins), finds the
+origin (scheme, host, and port; subdomains only when the saved credential
+opts in via `allow_subdomains`; the most recently used matching login wins), finds the
 sign-in fields (also in same-origin frames), and fills the username and
 password itself (when the page has a password box, the password must go in,
 or the answer is `not found`). Each value is set on that exact element in one step from

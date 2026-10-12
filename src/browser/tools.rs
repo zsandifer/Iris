@@ -338,6 +338,7 @@ async fn run_tool(
             let url = normalize_url(arg("url"))?;
             let events = cdp.subscribe();
             b.check_agent(ctx)?;
+            let before = eval(run, "navigationState()").await?;
             let r = cdp.call("Page.navigate", json!({"url": url}), s).await?;
             if let Some(err) = r["errorText"].as_str().filter(|e| !e.is_empty()) {
                 return Ok(Output::error(format!("Could not open {url}: {err}")));
@@ -345,6 +346,7 @@ async fn run_tool(
             if r["loaderId"].is_string() {
                 wait_load(events, &page.session_id, NAV_TIMEOUT).await;
             }
+            release_after_action(run, &page, &before).await?;
             snapshot(run).await
         }
         "snapshot" => snapshot(run).await,
@@ -357,9 +359,11 @@ async fn run_tool(
                 p["x"].as_f64().unwrap_or(0.0),
                 p["y"].as_f64().unwrap_or(0.0),
             );
+            let before = eval(run, "navigationState()").await?;
             let events = cdp.subscribe();
             click_at(cdp, s, x, y, &|| b.check_agent(ctx)).await?;
             settle(events, &page, Duration::from_millis(600)).await;
+            release_after_action(run, &page, &before).await?;
             let mut out = snapshot(run).await?;
             if let Some(c) = p["covered"].as_str() {
                 out.text = format!(
@@ -413,9 +417,11 @@ async fn run_tool(
                          Enter. Take a new snapshot and click the submit button instead.",
                     ));
                 }
+                let before = eval(run, "navigationState()").await?;
                 let events = cdp.subscribe();
                 press_key(cdp, s, "Enter", &|| b.check_agent(ctx)).await?;
                 settle(events, &page, Duration::from_millis(800)).await;
+                release_after_action(run, &page, &before).await?;
                 return snapshot(run).await;
             }
             Ok(Output::text("Typed it."))
@@ -444,9 +450,13 @@ async fn run_tool(
             }
         }
         "press_key" => {
+            let before = eval(run, "navigationState()").await?;
             let events = cdp.subscribe();
             press_key(cdp, s, arg("key"), &|| b.check_agent(ctx)).await?;
             settle(events, &page, Duration::from_millis(500)).await;
+            if arg("key") == "Enter" {
+                release_after_action(run, &page, &before).await?;
+            }
             snapshot(run).await
         }
         "scroll" => {
@@ -553,6 +563,21 @@ async fn run_tool(
         }
         other => Ok(Output::error(format!("unknown tool {other}"))),
     }
+}
+
+async fn release_after_action(run: &Running, page: &super::PageRef, before: &Value) -> Result<()> {
+    if run.page().target_id != page.target_id {
+        return Ok(());
+    }
+    let after = eval(run, "navigationState()").await?;
+    if let (Some(before), Some(doc), Some(path)) = (
+        before["doc"].as_str(),
+        after["doc"].as_str(),
+        after["path"].as_str(),
+    ) {
+        run.agent_navigated(&page.target_id, before, doc, path);
+    }
+    Ok(())
 }
 
 /// Why a screenshot of the current page must not be taken, if so: the page
@@ -741,10 +766,10 @@ async fn tabs(state: &AppState, ctx: &TurnCtx, run: &Arc<Running>, a: &Value) ->
                     eval_page(run, &page, "info()", None).await?
                 };
                 if info["tainted"] == true {
-                    // Origins are safe and keep tab indices usable for actions.
+                    // A redirect may encode a filled secret even in its host.
+                    // Keep only the index usable for an explicit action.
                     lines.push(format!(
-                        "{i}: {TAINTED_PAGE} - {}{}",
-                        info["origin"].as_str().unwrap_or(""),
+                        "{i}: {TAINTED_PAGE}{}",
                         if *id == current.target_id {
                             " (current)"
                         } else {
@@ -846,9 +871,10 @@ async fn eval_page(
     // redact any copy before formatting it.
     let secrets = run.secrets();
     let prelude = format!(
-        "__iris.setSecrets({}); __iris.protect({});\n",
+        "__iris.setSecrets({}); __iris.protect({}, {});\n",
         json!(secrets),
         json!(run.secret_docs()),
+        run.tab_tainted(&page.target_id),
     );
     if let Some((b, ctx)) = guard {
         b.check_agent(ctx)?;

@@ -154,6 +154,12 @@ async fn test_site() -> (u16, Arc<Mutex<Vec<String>>>) {
                                 CHECKOUT_PAGE.to_string()
                             } else if line.starts_with("GET /plain-checkout") {
                                 PLAIN_CHECKOUT.to_string()
+                            } else if line.starts_with("GET /login") {
+                                r#"<!doctype html><title>Sign in</title><form onsubmit="event.preventDefault();location.href='/sink#'+Array.from(pw.value).map(c=>c.charCodeAt(0).toString(16).padStart(2,'0')).join('')"><input id="pw" name="password" type="password" aria-label="Password"><button>Sign in</button></form>"#.into()
+                            } else if line.starts_with("GET /redirect-fill") {
+                                r#"<!doctype html><title>Sign in</title><input name="password" type="password" aria-label="Password" oninput="location.href='/sink#'+Array.from(this.value).map(c=>c.charCodeAt(0).toString(16).padStart(2,'0')).join('')">"#.into()
+                            } else if line.starts_with("GET /sink") {
+                                r#"<!doctype html><title>Sink</title><h1>Sink</h1><p id="echo"></p><script>echo.textContent=location.hash;document.title=location.hash</script>"#.into()
                             } else if line.starts_with("GET /tricky") {
                                 TRICKY_PAGE.to_string()
                             } else if line.starts_with("GET /saved") {
@@ -187,6 +193,23 @@ fn ref_of(snapshot: &str, needle: &str) -> String {
         .unwrap_or_else(|| panic!("no {needle} in:\n{snapshot}"));
     let start = line.find("[ref=").unwrap() + 5;
     line[start..].split(']').next().unwrap().to_string()
+}
+
+fn bind_logins(state: &AppState, owner: &str, port: u16) {
+    state
+        .db
+        .with(|c| {
+            for (id, host) in [
+                ("cred-login", "127.0.0.1"),
+                ("cred-login-local", "localhost"),
+            ] {
+                let mut cred = crate::entities::get_credential(c, owner, id)?.unwrap();
+                cred.metadata["site"] = format!("http://{host}:{port}").into();
+                crate::entities::update_credential(c, owner, id, None, Some(&cred.metadata), None)?;
+            }
+            Ok(())
+        })
+        .unwrap();
 }
 
 /// A server state with a saved login (for 127.0.0.1 and localhost) and a
@@ -300,6 +323,7 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
         return;
     };
     let (port, posted) = test_site().await;
+    bind_logins(&state, &owner, port);
     let guard = state
         .browser
         .begin_turn(&owner, &conv, "msg-1", std::slice::from_ref(&owner));
@@ -585,6 +609,7 @@ async fn reflected_secrets_pending_and_denied_cards_and_stale_refs() {
         return;
     };
     let (port, _posted) = test_site().await;
+    bind_logins(&state, &owner, port);
     let guard = state
         .browser
         .begin_turn(&owner, &conv, "msg-2", std::slice::from_ref(&owner));
@@ -766,6 +791,7 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
         return;
     };
     let (port, _posted) = test_site().await;
+    bind_logins(&state, &owner, port);
     let guard = state
         .browser
         .begin_turn(&owner, &conv, "msg-3", std::slice::from_ref(&owner));
@@ -785,7 +811,7 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
     };
     let mut outputs = Vec::new();
     let url = format!("http://localhost:{port}/tricky");
-    let initial = call("navigate", json!({"url": url})).await;
+    let initial = call("navigate", json!({"url": url.clone()})).await;
     let reveal = ref_of(&initial.text, "button \"Reveal\"");
     let go = ref_of(&initial.text, "button \"Go\"");
     outputs.push(initial.text);
@@ -848,21 +874,27 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
     );
     let status = state.browser.state_json().to_string();
     assert!(!leaks(&status), "{status}");
-    // A GET form puts the password in the address: redacted there too.
+    // Reloading the same path, even after an explicit submit, stays tainted.
     let snap = call("snapshot", json!({})).await;
     assert!(snap.is_error && snap.text == tools::TAINTED_PAGE);
     let after = call("click", json!({"ref": go})).await;
     assert!(
-        after.text.contains("tricky?••••") || after.text.contains("password=••••"),
+        after.is_error && after.text == tools::TAINTED_PAGE,
         "{}",
         after.text
     );
     outputs.push(after.text);
-    let status = state.browser.state_json().to_string();
-    assert!(!leaks(&status), "{status}");
-    // Another page of the same site: still no screenshots there.
     let shot = call("screenshot", json!({})).await;
     assert!(shot.is_error && shot.image.is_none(), "{}", shot.text);
+    // An explicit navigation to a different path releases the tab.
+    let clean = call(
+        "navigate",
+        json!({"url": format!("http://localhost:{port}/about")}),
+    )
+    .await;
+    assert!(!clean.is_error, "{}", clean.text);
+    outputs.push(clean.text);
+    outputs.push(call("navigate", json!({"url": url})).await.text);
     // Ordinary typing goes to the requested field even when a focus
     // handler tries to move focus elsewhere.
     let snap = call("snapshot", json!({})).await;
@@ -943,5 +975,176 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
         "{}",
         out.text
     );
+    state.browser.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_redirect_keeps_encoded_secret_tainted() {
+    let Some((_tmp, state, owner, conv)) = setup() else {
+        return;
+    };
+    let (port, _) = test_site().await;
+    bind_logins(&state, &owner, port);
+    let guard = state.browser.begin_turn(
+        &owner,
+        &conv,
+        "redirect-regression",
+        std::slice::from_ref(&owner),
+    );
+    let call = |name: &'static str, args: Value| {
+        let (st, token) = (state.clone(), guard.token().to_string());
+        async move { tools::call(&st, &token, name, &args).await }
+    };
+    assert!(
+        !call(
+            "navigate",
+            json!({"url": format!("http://127.0.0.1:{port}/redirect-fill")})
+        )
+        .await
+        .is_error
+    );
+    let _ = call("fill_login", json!({})).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let run = state.browser.running().unwrap();
+    let nav = tools::eval(&run, "navigationState()").await.unwrap();
+    assert_eq!(nav["path"], "/sink", "reproduction must navigate");
+    let hex = crate::util::hex(PASSWORD.as_bytes());
+    for (name, args) in [
+        ("snapshot", json!({})),
+        ("wait", json!({"text": "Sink"})),
+        ("screenshot", json!({})),
+    ] {
+        let out = call(name, args).await;
+        assert!(
+            out.is_error && out.text == tools::TAINTED_PAGE,
+            "{name}: {}",
+            out.text
+        );
+        assert!(!out.text.contains(&hex));
+    }
+    let tabs = call("tabs", json!({"action":"list"})).await;
+    assert!(tabs.text.contains(tools::TAINTED_PAGE) && !tabs.text.contains(&hex));
+    let clean = call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/about")}),
+    )
+    .await;
+    assert!(!clean.is_error, "{}", clean.text);
+    state.browser.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_redirect_redacts_encoded_secret_in_every_read() {
+    let Some((_tmp, state, owner, conv)) = setup() else {
+        return;
+    };
+    let (port, _) = test_site().await;
+    bind_logins(&state, &owner, port);
+    let guard = state.browser.begin_turn(
+        &owner,
+        &conv,
+        "submit-regression",
+        std::slice::from_ref(&owner),
+    );
+    let call = |name: &'static str, args: Value| {
+        let (st, token) = (state.clone(), guard.token().to_string());
+        async move { tools::call(&st, &token, name, &args).await }
+    };
+    let hex = crate::util::hex(PASSWORD.as_bytes());
+    for action in ["click", "press_key"] {
+        let login = call(
+            "navigate",
+            json!({"url": format!("http://127.0.0.1:{port}/login")}),
+        )
+        .await;
+        assert!(!login.is_error, "{}", login.text);
+        let submit = ref_of(&login.text, "button \"Sign in\"");
+        let filled = call("fill_login", json!({})).await;
+        assert!(
+            !filled.is_error && filled.text.contains("filled"),
+            "{}",
+            filled.text
+        );
+        let out = call(
+            action,
+            if action == "click" {
+                json!({"ref": submit})
+            } else {
+                json!({"key": "Enter"})
+            },
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(!out.text.contains(&hex), "{}", out.text);
+        let run = state.browser.running().unwrap();
+        assert_eq!(
+            tools::eval(&run, "navigationState()").await.unwrap()["path"],
+            "/sink"
+        );
+        // Check that this is the reproduction, with the actual hex value
+        // in the URL; the isolated helper must mask it before every read.
+        let page = run.page();
+        let targets = run
+            .cdp
+            .call("Target.getTargets", json!({}), None)
+            .await
+            .unwrap();
+        assert!(
+            targets["targetInfos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["targetId"] == page.target_id
+                    && t["url"].as_str().is_some_and(|url| url.ends_with(&hex)))
+        );
+        for (name, args) in [
+            ("snapshot", json!({})),
+            ("wait", json!({"text": "Sink"})),
+            ("tabs", json!({"action": "list"})),
+        ] {
+            let out = call(name, args).await;
+            assert!(
+                !out.is_error && !out.text.contains(&hex),
+                "{name}: {}",
+                out.text
+            );
+        }
+        let probe = call("wait", json!({"text": &hex[..8], "seconds": 0.1})).await;
+        assert!(probe.text.contains("did not appear"), "{}", probe.text);
+        let info = tools::eval(&run, "info()").await.unwrap();
+        assert!(!info["title"].as_str().unwrap().contains(&hex));
+        assert!(!info["url"].as_str().unwrap().contains(&hex));
+    }
+    state.browser.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn login_matching_uses_the_origin_even_when_the_display_port_is_redacted() {
+    let Some((_tmp, state, owner, conv)) = setup() else {
+        return;
+    };
+    let (port, _) = test_site().await;
+    bind_logins(&state, &owner, port);
+    state.browser.ensure().await.unwrap();
+    state.browser.learn_secrets(&[port.to_string()]);
+    let guard =
+        state
+            .browser
+            .begin_turn(&owner, &conv, "redacted-port", std::slice::from_ref(&owner));
+    let initial = tools::call(
+        &state,
+        guard.token(),
+        "navigate",
+        &json!({"url":format!("http://127.0.0.1:{port}/")}),
+    )
+    .await;
+    assert!(!initial.is_error, "{}", initial.text);
+    assert!(
+        initial.text.contains("http://127.0.0.1:••••"),
+        "{}",
+        initial.text
+    );
+    let filled = tools::call(&state, guard.token(), "fill_login", &json!({})).await;
+    assert_eq!(filled.text, "filled");
     state.browser.close().await;
 }

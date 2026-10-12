@@ -20,39 +20,73 @@ use serde_json::{Value, json};
 /// An approval is good for one fill within this time.
 const APPROVAL_TTL_MS: i64 = 30 * 60 * 1000;
 
-/// (scheme, host) of a URL, lowercased; host without port or `www.`.
-pub fn origin_of(url: &str) -> Option<(String, String)> {
-    let (scheme, rest) = url.split_once("://")?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let hostport = authority.rsplit('@').next()?;
-    let host = if let Some(v6) = hostport.strip_prefix('[') {
-        v6.split(']').next()?.to_string()
+/// Parse a web origin. Bare saved sites default to HTTPS, including its
+/// default port; paths never broaden the authority being matched.
+fn login_origin(site: &str) -> Option<(String, String, u16)> {
+    let site = site.trim();
+    let url = if site.contains("://") {
+        site.to_string()
     } else {
-        hostport.split(':').next()?.to_string()
+        format!("https://{site}")
     };
-    let host = host.to_ascii_lowercase();
-    let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
-    (!host.is_empty()).then(|| (scheme.to_ascii_lowercase(), host))
-}
-
-/// A saved site ("example.com", "https://www.example.com/login") as a host.
-pub fn site_host(site: &str) -> Option<String> {
-    let s = site.trim();
-    if s.is_empty() {
+    let uri: axum::http::Uri = url.parse().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "https" => 443,
+        "http" => 80,
+        _ => return None,
+    };
+    let authority = uri.authority()?;
+    if authority.as_str().contains('@') {
         return None;
     }
-    if s.contains("://") {
-        return origin_of(s).map(|(_, h)| h);
+    let host = authority
+        .host()
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
     }
-    origin_of(&format!("https://{s}")).map(|(_, h)| h)
+    let explicit_port = if authority.as_str().starts_with('[') {
+        !authority.as_str().split_once(']')?.1.is_empty()
+    } else {
+        authority.as_str().contains(':')
+    };
+    let port = if explicit_port {
+        authority.port_u16()?
+    } else {
+        default_port
+    };
+    Some((scheme, host, port))
 }
 
-/// The page's host is the saved site or one of its subdomains.
-pub fn host_matches(page_host: &str, site: &str) -> bool {
-    page_host == site
-        || page_host
-            .strip_suffix(site)
-            .is_some_and(|rest| rest.ends_with('.'))
+pub fn origin_of(url: &str) -> Option<(String, String)> {
+    if !url.contains("://") {
+        return None;
+    }
+    let (scheme, host, _) = login_origin(url)?;
+    Some((scheme, host))
+}
+
+pub fn site_matches(page_url: &str, site: &str, allow_subdomains: bool) -> bool {
+    let (Some((ps, ph, pp)), Some((ss, sh, sp))) = (login_origin(page_url), login_origin(site))
+    else {
+        return false;
+    };
+    ps == ss
+        && pp == sp
+        && (ph == sh
+            || (allow_subdomains
+                && sh.parse::<std::net::IpAddr>().is_err()
+                && ph
+                    .strip_suffix(&sh)
+                    .is_some_and(|prefix| prefix.ends_with('.'))))
+}
+
+fn credential_matches(page_url: &str, c: &Credential) -> bool {
+    c.metadata["site"]
+        .as_str()
+        .is_some_and(|site| site_matches(page_url, site, c.metadata["allow_subdomains"] == true))
 }
 
 /// This machine: `localhost` (and its reserved subdomains) or a loopback
@@ -77,6 +111,7 @@ struct Pin {
     target: String,
     doc: String,
     origin: String,
+    path: String,
 }
 
 struct PageInfo {
@@ -87,16 +122,22 @@ struct PageInfo {
     /// The browser's own origin (scheme, host, and port).
     origin: String,
     doc: String,
+    path: String,
 }
 
 async fn page_info(run: &Running) -> Result<PageInfo> {
     let info = eval(run, "info()").await?;
+    let nav = eval(run, "navigationState()").await?;
     let url = info["url"].as_str().unwrap_or("").to_string();
-    let (scheme, host) = origin_of(&url).ok_or("this page has no web address")?;
+    // Display URLs are redacted and may even mask part of a port. Matching
+    // uses Chromium's origin, which is independent of that display text.
+    let origin = info["origin"].as_str().unwrap_or("").to_string();
+    let (scheme, host) = origin_of(&origin).ok_or("this page has no web address")?;
     Ok(PageInfo {
         title: info["title"].as_str().unwrap_or("").to_string(),
         doc: info["doc"].as_str().unwrap_or("").to_string(),
-        origin: info["origin"].as_str().unwrap_or("").to_string(),
+        origin,
+        path: nav["path"].as_str().ok_or("the page is not ready")?.into(),
         url,
         scheme,
         host,
@@ -173,8 +214,10 @@ async fn type_into(
     }
     // Any vault fill taints this document, including a username-only
     // sign-in step. Actions can continue, but agent reads must wait for
-    // a new document. Record it before the page sees the value.
+    // an explicit action loads a different path, or the owner acts. Record
+    // both document and tab before the page sees the value.
     run.remember_secret_doc(&pin.doc);
+    run.taint_tab(&pin.target, &pin.doc, &pin.path);
     // Checked again right before the single command that fills.
     let p = eval_mut(
         run,
@@ -303,8 +346,8 @@ pub async fn login(
     let pinned_target = run.page().target_id;
     let host = page.host.clone();
     if let Some(want) = site.filter(|s| !s.trim().is_empty()) {
-        match site_host(want) {
-            Some(w) if host_matches(&host, &w) => {}
+        match site_matches(&page.origin, want, false) {
+            true => {}
             _ => {
                 return Ok(Output::text(
                     "not found (the current page is not that site; open its sign-in page first)",
@@ -317,31 +360,25 @@ pub async fn login(
             "not found (this page is not secure, so saved logins are not filled here)",
         ));
     }
-    let mut matches: Vec<(Credential, String)> = credentials(state, &ctx.user_id, "login")
+    let mut matches: Vec<Credential> = credentials(state, &ctx.user_id, "login")
         .await
         .into_iter()
-        .filter_map(|c| {
-            let site = c.metadata["site"].as_str().and_then(site_host)?;
-            host_matches(&host, &site).then_some((c, site))
-        })
+        .filter(|c| credential_matches(&page.origin, c))
         .collect();
-    matches.sort_by_key(|(c, _)| std::cmp::Reverse(c.last_used_at.unwrap_or(c.updated_at)));
-    let Some((cred, _)) = matches.into_iter().next() else {
+    matches.sort_by_key(|c| std::cmp::Reverse(c.last_used_at.unwrap_or(c.updated_at)));
+    let Some(cred) = matches.into_iter().next() else {
         return Ok(Output::text("not found (no saved login for this site)"));
     };
     // The site check uses the very revision whose password is filled.
     let (cred, secret) = load(state, &ctx.user_id, &cred.id).await?;
-    if !cred.metadata["site"]
-        .as_str()
-        .and_then(site_host)
-        .is_some_and(|s| host_matches(&host, &s))
-    {
+    if !credential_matches(&page.origin, &cred) {
         return Ok(Output::text("not found (no saved login for this site)"));
     }
     let pin = Pin {
         target: pinned_target,
         doc: page.doc,
         origin: page.origin,
+        path: page.path,
     };
     let fields = eval(run, "loginFields()").await?;
     let (user_ref, pass_ref) = (fields["user"].as_str(), fields["pass"].as_str());
@@ -539,6 +576,7 @@ pub async fn card(
         target: pinned_target,
         doc: page.doc.clone(),
         origin: page.origin.clone(),
+        path: page.path.clone(),
     };
     let number = secret
         .get("number")
@@ -756,26 +794,89 @@ mod tests {
     fn origins_and_site_matching() {
         assert_eq!(
             origin_of("https://www.Shop.example:8443/cart?x=1").unwrap(),
-            ("https".into(), "shop.example".into())
+            ("https".into(), "www.shop.example".into())
         );
         assert_eq!(
-            origin_of("http://user@127.0.0.1:9000/login").unwrap().1,
+            origin_of("http://127.0.0.1:9000/login").unwrap().1,
             "127.0.0.1"
         );
         assert_eq!(origin_of("http://[::1]:80/").unwrap().1, "::1");
         assert!(origin_of("about:blank").is_none());
-        assert_eq!(site_host("example.com").unwrap(), "example.com");
-        assert_eq!(
-            site_host("https://www.example.com/login").unwrap(),
-            "example.com"
-        );
-        assert_eq!(site_host("  ").as_deref(), None);
-        assert!(host_matches("example.com", "example.com"));
-        assert!(host_matches("accounts.example.com", "example.com"));
-        // No lookalike or parent-domain matches.
-        assert!(!host_matches("badexample.com", "example.com"));
-        assert!(!host_matches("example.com.evil.test", "example.com"));
-        assert!(!host_matches("example.com", "accounts.example.com"));
+        assert!(!site_matches(
+            "https://example.test",
+            "https://example.test:bad",
+            true
+        ));
+        assert!(!site_matches(
+            "https://example.test",
+            "https://example.test:99999",
+            true
+        ));
+        assert!(site_matches(
+            "https://example.test/login",
+            "example.test",
+            false
+        ));
+        assert!(site_matches(
+            "https://example.test:443/login",
+            "https://example.test",
+            false
+        ));
+        assert!(!site_matches(
+            "https://example.test:8443/login",
+            "example.test",
+            false
+        ));
+        assert!(!site_matches(
+            "http://example.test/login",
+            "example.test",
+            false
+        ));
+        assert!(!site_matches(
+            "https://www.example.test/login",
+            "example.test",
+            false
+        ));
+        assert!(!site_matches(
+            "https://accounts.example.test/login",
+            "example.test",
+            false
+        ));
+        assert!(site_matches(
+            "https://accounts.example.test:8443/login",
+            "https://example.test:8443",
+            true
+        ));
+        assert!(!site_matches(
+            "https://accounts.example.test/login",
+            "https://example.test:8443",
+            true
+        ));
+        assert!(!site_matches(
+            "https://example.test.evil.test",
+            "example.test",
+            true
+        ));
+        assert!(!site_matches(
+            "https://badexample.test",
+            "example.test",
+            true
+        ));
+        assert!(site_matches(
+            "http://[::1]:8888/login",
+            "http://[::1]:8888",
+            false
+        ));
+        assert!(!site_matches(
+            "http://[::1]:8889/login",
+            "http://[::1]:8888",
+            false
+        ));
+        assert!(!site_matches(
+            "https://user@example.test",
+            "example.test",
+            true
+        ));
         assert!(secure_enough("https", "example.com"));
         assert!(secure_enough("http", "127.0.0.1"));
         assert!(secure_enough("http", "localhost"));

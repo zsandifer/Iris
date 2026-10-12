@@ -199,6 +199,7 @@ pub struct Running {
     /// Documents Iris filled a secret into: no agent reads (a page can
     /// transform a value it was given in ways no redactor can recognize).
     secret_docs: Mutex<std::collections::HashSet<String>>,
+    filled_tabs: Mutex<std::collections::HashMap<String, (String, String)>>,
     /// Serializes recovering from a closed tab.
     recover_lock: tokio::sync::Mutex<()>,
     /// The owner's saved secrets were loaded for redaction (a page may show
@@ -358,7 +359,8 @@ impl Running {
                 o.push(secret.to_string());
             }
         }
-        let mut forms = vec![secret.to_string()];
+        let mut forms = crate::gateway::encoded_secret_forms(secret);
+        forms.push(secret.to_string());
         // As it appears in addresses and submitted forms.
         let enc = uri_encode(secret);
         forms.push(enc.replace("%20", "+"));
@@ -387,18 +389,18 @@ impl Running {
         }
         let mut out = text.to_string();
         for s in secrets.iter() {
-            if out.contains(s.as_str()) {
-                out = out.replace(s.as_str(), "••••");
-            }
+            out = crate::gateway::replace_case_insensitive(&out, s, "••••");
         }
         // Card numbers in any grouping ("3782 822463 10005").
         for s in secrets.iter().filter(|s| is_card_number(s)) {
             out = redact_digit_run(&out, s).0;
         }
+        let folded_secrets: Vec<_> = secrets.iter().map(|s| s.to_lowercase()).collect();
         let leaks = |t: &str| {
             decodings(t).iter().any(|d| {
-                secrets.iter().any(|s| {
-                    d.contains(s.as_str()) || (is_card_number(s) && redact_digit_run(d, s).1)
+                let folded = d.to_lowercase();
+                folded_secrets.iter().any(|s| {
+                    folded.contains(s.as_str()) || (is_card_number(s) && redact_digit_run(d, s).1)
                 })
             })
         };
@@ -419,6 +421,31 @@ impl Running {
     /// The screencast running now, if any.
     pub fn casting(&self) -> Option<Mode> {
         lock(&self.cast).as_ref().map(|(_, m)| *m)
+    }
+
+    pub fn taint_tab(&self, target: &str, doc: &str, path: &str) {
+        lock(&self.filled_tabs).insert(target.into(), (doc.into(), path.into()));
+    }
+
+    pub fn tab_tainted(&self, target: &str) -> bool {
+        lock(&self.filled_tabs).contains_key(target)
+    }
+
+    /// A new document after a submit may be read, but all remembered secret
+    /// encodings stay redacted across redirects, including new paths.
+    pub fn agent_navigated(&self, target: &str, action_doc: &str, new_doc: &str, path: &str) {
+        let mut tabs = lock(&self.filled_tabs);
+        if tabs.get(target).is_some_and(|(filled_doc, filled_path)| {
+            new_doc != action_doc && new_doc != filled_doc && path != filled_path
+        }) {
+            tabs.remove(target);
+        }
+    }
+
+    fn owner_acted(&self, target: &str) {
+        if let Some((doc, _)) = lock(&self.filled_tabs).remove(target) {
+            lock(&self.secret_docs).remove(&doc);
+        }
     }
 
     pub fn remember_secret_doc(&self, doc: &str) {
@@ -447,11 +474,13 @@ impl Running {
     /// Whether text contains a remembered secret (also percent-encoded).
     pub fn shows_secret(&self, text: &str) -> bool {
         let secrets = lock(&self.secrets);
-        let all = decodings(text);
+        let mut all = decodings(text).to_vec();
+        all.push(text.to_string());
+        let folded: Vec<_> = all.iter().map(|t| t.to_lowercase()).collect();
         secrets.iter().any(|s| {
-            std::iter::once(text)
-                .chain(all.iter().map(String::as_str))
-                .any(|t| t.contains(s.as_str()) || (is_card_number(s) && redact_digit_run(t, s).1))
+            let needle = s.to_lowercase();
+            folded.iter().any(|t| t.contains(&needle))
+                || (is_card_number(s) && all.iter().any(|t| redact_digit_run(t, s).1))
         })
     }
 }
@@ -965,6 +994,7 @@ impl Browser {
             secrets: Mutex::default(),
             originals: Mutex::default(),
             secret_docs: Mutex::default(),
+            filled_tabs: Mutex::default(),
             recover_lock: tokio::sync::Mutex::new(()),
             seeded: AtomicBool::new(false),
         });
@@ -1517,6 +1547,12 @@ impl Browser {
         Ok(())
     }
 
+    pub fn revoke_device(&self, id: &str) {
+        if matches!(self.control(), Control::User { device_id, .. } if device_id == id) {
+            self.hand_back();
+        }
+    }
+
     pub fn hand_back(&self) {
         if self.control.send_replace(Control::Agent) != Control::Agent {
             crate::info!("browser: control handed back");
@@ -1592,6 +1628,7 @@ impl Browser {
             }
             _ => return Err("unknown input kind".into()),
         }
+        run.owner_acted(&page.target_id);
         Ok(())
     }
 }
@@ -1634,6 +1671,19 @@ mod tests {
         assert_eq!(kinds.iter().filter(|k| *k == "browser.active").count(), 0);
         assert!(kinds.contains(&"browser.done".to_string()));
         assert!(b.state_json()["active"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn revoked_controller_hands_control_back() {
+        let (_tmp, browser) = browser();
+        browser.control.send_replace(Control::User {
+            user_id: "owner".into(),
+            device_id: "device".into(),
+        });
+        browser.revoke_device("other-device");
+        assert!(matches!(browser.control(), Control::User { .. }));
+        browser.revoke_device("device");
+        assert_eq!(browser.control(), Control::Agent);
     }
 
     #[tokio::test]
@@ -1680,9 +1730,8 @@ mod tests {
         assert!(err.is_err());
     }
 
-    #[test]
-    fn secrets_are_redacted_in_every_form() {
-        let run = Running {
+    fn detached_run() -> Running {
+        Running {
             cdp: Cdp::detached(),
             child: Mutex::new(None),
             page: Mutex::default(),
@@ -1696,9 +1745,79 @@ mod tests {
             secrets: Mutex::default(),
             originals: Mutex::default(),
             secret_docs: Mutex::default(),
+            filled_tabs: Mutex::default(),
             recover_lock: tokio::sync::Mutex::new(()),
             seeded: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn filled_tabs_survive_script_redirects_and_same_path_submissions() {
+        let run = detached_run();
+        run.taint_tab("tab", "fill-doc", "/login");
+        assert!(run.tab_tainted("tab"));
+        // A script redirect to /sink#hex(password) has no explicit action.
+        assert!(run.tab_tainted("tab"));
+        // An action without a new document cannot clear the redirect.
+        run.agent_navigated("tab", "sink-doc", "sink-doc", "/sink");
+        assert!(run.tab_tainted("tab"));
+        run.agent_navigated("tab", "sink-doc", "next-doc", "/login");
+        assert!(run.tab_tainted("tab"));
+        run.agent_navigated("tab", "next-doc", "clean-doc", "/account");
+        assert!(!run.tab_tainted("tab"));
+        run.remember_secret_doc("fill-doc");
+        run.taint_tab("tab", "fill-doc", "/login");
+        run.owner_acted("tab");
+        assert!(!run.tab_tainted("tab") && !run.has_secret_doc("fill-doc"));
+    }
+
+    #[test]
+    fn review_regression_submit_redirect_redacts_filled_secret_encodings_on_new_paths() {
+        use base64::{
+            Engine as _,
+            engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
         };
+        let run = detached_run();
+        let password = "pÄss?word-long";
+        run.remember_secret(password);
+        run.remember_secret_doc("login-doc");
+        run.taint_tab("tab", "login-doc", "/login");
+        // A click/Enter invokes the page's submit handler, which opens a
+        // new document at /sink#hex(password), so it becomes readable.
+        run.agent_navigated("tab", "login-doc", "sink-doc", "/sink");
+        assert!(!run.tab_tainted("tab"));
+        let mut echoes = vec![
+            password.into(),
+            password.to_uppercase(),
+            crate::util::hex(password.as_bytes()),
+            crate::util::hex(password.as_bytes()).to_uppercase(),
+            password.chars().rev().collect(),
+            uri_encode(password),
+            password.bytes().map(|b| format!("%{b:02x}")).collect(),
+        ];
+        for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
+            echoes.push(engine.encode(password));
+        }
+        for echo in echoes {
+            for text in [
+                format!("https://shop.test/sink#{echo}"),
+                format!("https://shop.test/sink?password={echo}"),
+                format!("Title: {echo}"),
+                format!("Snapshot: {echo}"),
+            ] {
+                assert!(run.shows_secret(&text), "{text}");
+                assert!(!run.redact(&text).contains(&echo), "{text}");
+            }
+        }
+        // Filled values shorter than the gateway's encoding threshold
+        // need the same protection in the browser.
+        run.remember_secret("Ab3");
+        assert_eq!(run.redact("416233"), "••••");
+    }
+
+    #[test]
+    fn secrets_are_redacted_in_every_form() {
+        let run = detached_run();
         run.remember_secret("hunter2-long");
         run.remember_secret("4242424242424242");
         run.remember_secret("a b+c/d?e");
@@ -1718,7 +1837,10 @@ mod tests {
         assert_eq!(run.redact("Amex 3782 822463 10005."), "Amex ••••.");
         assert_eq!(run.redact("t\t3782\t8224\n6310005"), "t\t••••");
         run.remember_secret("pa/ss?word");
-        assert_eq!(run.redact("https://shop.test/pa%2fss%3fword?x=1"), "••••");
+        assert_eq!(
+            run.redact("https://shop.test/pa%2fss%3fword?x=1"),
+            "https://shop.test/••••?x=1"
+        );
         assert_eq!(decode_loose("p%c3%A4ss"), "päss");
         assert_eq!(decode_loose("p%E4ss"), "päss");
         // '+' as written, and Windows-1252 bytes.

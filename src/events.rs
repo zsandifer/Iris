@@ -43,6 +43,7 @@ pub struct Envelope {
 pub struct Hub {
     tx: broadcast::Sender<Arc<Envelope>>,
     online: Arc<Mutex<HashMap<String, usize>>>,
+    devices: Arc<Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
 }
 
 impl Default for Hub {
@@ -57,6 +58,29 @@ impl Hub {
         Self {
             tx,
             online: Arc::default(),
+            devices: Arc::default(),
+        }
+    }
+
+    /// All sockets of a device share a durable cancellation signal; it cannot
+    /// be lost when the event broadcast buffer overflows.
+    pub fn watch_device(&self, device_id: &str) -> tokio::sync::watch::Receiver<bool> {
+        let mut devices = self.devices.lock().unwrap_or_else(|p| p.into_inner());
+        devices.retain(|_, tx| tx.receiver_count() > 0);
+        devices
+            .entry(device_id.into())
+            .or_insert_with(|| tokio::sync::watch::channel(false).0)
+            .subscribe()
+    }
+
+    pub fn revoke_device(&self, device_id: &str) {
+        if let Some(tx) = self
+            .devices
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(device_id)
+        {
+            tx.send_replace(true);
         }
     }
 
@@ -123,6 +147,20 @@ impl Drop for OnlineGuard {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn revocation_cancels_all_device_sockets_only() {
+        let hub = Hub::new();
+        let mut a = hub.watch_device("a");
+        let mut b = hub.watch_device("a");
+        let other = hub.watch_device("b");
+        hub.revoke_device("a");
+        a.changed().await.unwrap();
+        b.changed().await.unwrap();
+        assert!(*a.borrow() && *b.borrow());
+        assert!(!*other.borrow());
+        assert!(*hub.watch_device("a").borrow());
+    }
 
     #[tokio::test]
     async fn audience_and_presence() {

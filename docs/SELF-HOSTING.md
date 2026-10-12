@@ -675,7 +675,8 @@ dropping them; when they end you get one summary notification.
 - Every route except the static console page, `/api/health`, and
   `/api/pair` requires a device token. Devices pair with a one-time code from
   `iris pair`; only SHA-256 hashes of codes and tokens are stored. Five bad
-  codes lock pairing for 15 minutes and burn outstanding codes.
+  codes lock that source IP for 15 minutes; `iris pair` clears the lockout.
+  Other source IPs and outstanding unused codes remain usable.
 - Saved logins, wallet cards, connector secrets and tokens, and engine API
   keys are encrypted with XChaCha20-Poly1305 using a key in `vault.key`
   (0600). The API never returns them.

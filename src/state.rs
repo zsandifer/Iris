@@ -1,7 +1,7 @@
 //! Shared server state: config, database, harness registry, model catalog,
 //! event hub, and runtime settings stored in the database.
 
-use crate::auth::PairLimiter;
+use crate::auth::PairLimiters;
 use crate::catalog::{Catalog, codex_cache_path};
 use crate::config::{Config, HarnessConfig, Paths};
 use crate::db::{self, Db};
@@ -118,7 +118,7 @@ pub struct Inner {
     pub vapid: Option<VapidKeys>,
     pub harnesses: BTreeMap<String, HarnessEntry>,
     pub limiter: Limiter,
-    pub pair_limiter: PairLimiter,
+    pub pair_limiter: PairLimiters,
     /// Cancel handles of running turns, by conversation id.
     pub running: Mutex<HashMap<String, watch::Sender<bool>>>,
     /// Set once shutdown begins: turns that start afterwards (queued behind
@@ -260,7 +260,7 @@ impl AppState {
             vault,
             vapid,
             harnesses,
-            pair_limiter: PairLimiter::default(),
+            pair_limiter: PairLimiters::default(),
             running: Mutex::default(),
             conv_locks: Mutex::default(),
             stopping: std::sync::atomic::AtomicBool::new(false),
