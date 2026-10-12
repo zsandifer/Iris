@@ -1487,7 +1487,7 @@ esac
             .find(|m| m["card"]["type"] == "engine_signin")
             .unwrap()
             .clone();
-        assert_eq!(card["card"]["state"], "connected");
+        assert_eq!(card["card"]["state"], "done");
         assert!(card["card"]["url"].is_null());
         // The code never reaches the database.
         let dump = h
@@ -2599,6 +2599,12 @@ esac
         .await;
         assert_eq!(s, StatusCode::OK, "{b}");
         assert_eq!(b["message"]["card"]["state"], "denied");
+        let notes = h
+            .state
+            .db
+            .with(|c| db::list_messages(c, &group, None, 100))
+            .unwrap();
+        assert_eq!(notes.iter().filter(|m| m.kind == "system_note").count(), 1);
         assert!(b["message"]["card"]["decided_at"].is_i64());
         assert_eq!(b["message"]["card"]["preview"]["to"], "friend@example.com");
         let (s, _) = send(
@@ -2610,6 +2616,126 @@ esac
         )
         .await;
         assert_eq!(s, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn setup_request_declines_are_once_and_never_execute_an_action() {
+        let h = setup();
+        let token = pair_as(&h, None).await;
+        let (owner, main) = h
+            .state
+            .db
+            .with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                let main = db::ensure_main_conversation(c, &owner)?;
+                Ok((owner, main))
+            })
+            .unwrap();
+        let response = crate::awareness::request(
+            &h.state,
+            &owner,
+            &main,
+            "request_engine_install",
+            &json!({"engine": "codex"}),
+        )
+        .await
+        .unwrap();
+        let path = format!(
+            "/api/messages/{}/decision",
+            response["card_id"].as_str().unwrap()
+        );
+        let (status, _) = send(
+            &h.app,
+            "POST",
+            &path,
+            Some(&token),
+            Some(json!({"approve": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, response) = send(
+            &h.app,
+            "POST",
+            &path,
+            Some(&token),
+            Some(json!({"approve": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["message"]["card"]["state"], "declined");
+        let (status, _) = send(
+            &h.app,
+            "POST",
+            &path,
+            Some(&token),
+            Some(json!({"approve": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(h.state.engine_ops.get("codex").is_none());
+        let messages = h
+            .state
+            .db
+            .with(|c| db::list_messages(c, &main, None, 100))
+            .unwrap();
+        assert_eq!(
+            messages.iter().filter(|m| m.kind == "system_note").count(),
+            1
+        );
+        assert!(h.state.running.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn saving_a_custom_connector_resolves_its_setup_request() {
+        let h = setup();
+        let token = pair_as(&h, None).await;
+        let (owner, main) = h
+            .state
+            .db
+            .with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                let main = db::ensure_main_conversation(c, &owner)?;
+                Ok((owner, main))
+            })
+            .unwrap();
+        let response = crate::awareness::request(
+            &h.state,
+            &owner,
+            &main,
+            "request_connector_setup",
+            &json!({"name": "custom"}),
+        )
+        .await
+        .unwrap();
+        let (status, body) = send(
+            &h.app,
+            "POST",
+            "/api/connectors",
+            Some(&token),
+            Some(json!({"name": "calendar", "transport": "stdio", "command": "synthetic-server"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let card = h
+            .state
+            .db
+            .with(|c| db::get_message(c, response["card_id"].as_str().unwrap()))
+            .unwrap()
+            .unwrap()
+            .card
+            .unwrap();
+        assert_eq!(card["state"], "done");
+        let messages = h
+            .state
+            .db
+            .with(|c| db::list_messages(c, &main, None, 100))
+            .unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.kind == "system_note" && m.content.contains("connected ✓"))
+        );
+        assert!(h.state.running.lock().unwrap().is_empty());
     }
 
     // ------------------------------------------------- turns with a fake CLI
@@ -2822,6 +2948,8 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert_eq!(reply["status"], "complete", "{reply}");
         let system = t.read(0, "system.md");
         assert!(!system.is_empty());
+        assert!(system.contains("## System status"));
+        assert!(!system.contains("\"saved_logins\"") && !system.contains("request_engine_signin"));
         assert!(!system.contains("owner-user-fact") && !system.contains("owner-memory-fact"));
         assert!(!system.contains(&memory));
         assert!(!t.read(0, "args").contains(&memory), "memory not writable");
@@ -2837,6 +2965,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         t.chat(&t.owner_t, &owner_main, "hi").await;
         let system = t.read(1, "system.md");
         assert!(system.contains("owner-user-fact") && system.contains("owner-memory-fact"));
+        assert!(
+            system.contains("## System status")
+                && system.contains("\"current_turn\"")
+                && system.contains("\"saved_logins\"")
+        );
         assert!(!t.read(1, "args").contains("--add-dir"));
         assert!(system.contains("read_memory") && system.contains("write_memory"));
         let guest_main = t.main_of(&t.guest_t).await;

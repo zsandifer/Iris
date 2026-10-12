@@ -236,6 +236,16 @@ async fn run_op(state: &AppState, name: &str, op: &'static str) {
         return;
     }
     if result.is_ok() {
+        if op == "install" {
+            crate::awareness::finish(
+                state,
+                "install",
+                name,
+                "done",
+                &format!("{} installed ✓", crate::login::engine_label(name)),
+            )
+            .await;
+        }
         let auth = state.recheck_auth(name).await;
         if op == "install" && auth != AuthState::Ok {
             crate::login::post_signin_card(state, name, true).await;
@@ -382,18 +392,30 @@ pub async fn update_setup_card(state: &AppState) {
                 return Ok(None);
             };
             let mut card = m.card.clone().unwrap_or(Value::Null);
+            let note = if done && !crate::awareness::resolved(&card) {
+                Some(crate::awareness::insert_note(
+                    c,
+                    &m.conversation_id,
+                    "Engine setup completed ✓",
+                )?)
+            } else {
+                None
+            };
             card["options"] = Value::Array(options);
             if done {
                 card["state"] = "done".into();
                 card["body"] =
                     "You're all set. You can add more engines any time in Settings.".into();
             }
-            db::update_message_card(c, &id, &card).map(Some)
+            db::update_message_card(c, &id, &card).map(|m| Some((m, note)))
         })
         .await
         .ok()
         .flatten();
-    if let Some(m) = updated {
+    if let Some((m, note)) = updated {
+        if let Some(note) = note {
+            crate::awareness::broadcast_created(state, &note).await;
+        }
         let conv = m.conversation_id.clone();
         let members = state
             .db

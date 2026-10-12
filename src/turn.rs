@@ -513,8 +513,8 @@ async fn run_locked(
         } else {
             Vec::new()
         };
-        let prompt = render_prompt(&ctx, &agent_name, &replay, &input.user_message);
-        let mut notices = state.harness_notices(&harness_name);
+        let mut prompt = render_prompt(&ctx, &agent_name, &replay, &input.user_message);
+        let mut notices = Vec::new();
         let caps = entry.harness.capabilities();
         if !caps.mcp {
             notices.push("App actions, memory updates and connected services are unavailable to this engine right now. Explain that briefly if the user asks for one; do not claim an action was saved or sent.".into());
@@ -532,7 +532,7 @@ async fn run_locked(
             );
         }
         let browser_token = browser_turn.as_ref().map(|g| g.token());
-        let (mcp_servers, _grant, browser_server) = if caps.mcp {
+        let (mut mcp_servers, grant, browser_server) = if caps.mcp {
             mcp_servers(
                 state,
                 &input.owner_user_id,
@@ -546,13 +546,30 @@ async fn run_locked(
         } else {
             (Vec::new(), None, None)
         };
-        if scope == Scope::Private {
-            notices.extend(crate::gateway::connector_notices(state, &input.owner_user_id).await);
+        if let Some(grant) = &grant {
+            let token = grant.status_token(&harness_name, d.cli_model());
+            let McpTransport::Stdio { env, .. } = &mut mcp_servers[0].transport;
+            env.insert("IRIS_STATUS_TOKEN".into(), token);
         }
+        let system_status = if scope == Scope::Private {
+            crate::awareness::status(
+                state,
+                &input.owner_user_id,
+                conv_id,
+                &harness_name,
+                d.cli_model(),
+            )
+            .await
+            .ok()
+        } else {
+            Some(
+                json!({"iris_version": env!("CARGO_PKG_VERSION"), "current_engine_working": entry.usable()}),
+            )
+        };
         let keys = crate::keys::env_for(state, &harness_name).await;
         let participants: Vec<String> = ctx.names.values().cloned().collect();
         // Reads persona files and indexes the memory tree: blocking I/O.
-        let system_prompt = {
+        let mut system_prompt = {
             let (paths, name, kind, purpose, app_tools) = (
                 state.paths.clone(),
                 agent_name.clone(),
@@ -580,6 +597,12 @@ async fn run_locked(
             .await
             .unwrap_or_default()
         };
+        if let Some(status) = system_status {
+            system_prompt.push_str(&format!("\n## System status\n\n{status}\n"));
+            if session.is_some() && !entry.harness.resume_updates_system_prompt() {
+                prompt = format!("<system_status>\n{status}\n</system_status>\n\n{prompt}");
+            }
+        }
         let prepared = (|| -> crate::util::Result<_> {
             Ok((
                 crate::agent::workdir(&state.cfg.agent, &state.paths, conv_id)?,
@@ -1677,7 +1700,16 @@ fn render_prompt(ctx: &Ctx, agent_name: &str, replay: &[Message], current: &Mess
             continue;
         }
         let line = match (m.role.as_str(), m.kind.as_str()) {
-            (_, "card") => format!("[{agent_name} showed a card: {}]", m.content.trim()),
+            (_, "card") => format!(
+                "[{agent_name} showed a card ({}): {}]",
+                if m.card.as_ref().is_some_and(crate::awareness::resolved) {
+                    "resolved"
+                } else {
+                    "awaiting action"
+                },
+                m.content.trim()
+            ),
+            (_, "system_note") => format!("[system note] {}", m.content.trim()),
             ("user", _) => format!("{}: {}", name_of(m), m.content.trim()),
             ("assistant", _) => format!("{agent_name}: {}", m.content.trim()),
             _ => format!("[context] {}", m.content.trim()),
@@ -1954,7 +1986,7 @@ mod tests {
         let cur = msg("user", "text", Some("u1"), "next");
         let p = render_prompt(&ctx("main"), "Nova", &replay, &cur);
         assert!(p.starts_with("<conversation_history>"));
-        assert!(p.contains("Sam: what's up\n\nNova: not much\n\n[Nova showed a card: Connect Google]\n\n[context] Feed post: Comets"));
+        assert!(p.contains("Sam: what's up\n\nNova: not much\n\n[Nova showed a card (awaiting action): Connect Google]\n\n[context] Feed post: Comets"));
         assert!(p.ends_with("</conversation_history>\n\nnext"));
     }
 
@@ -1965,6 +1997,21 @@ mod tests {
             render_prompt(&ctx("group"), "Iris", &[], &cur),
             "Riley: hi all"
         );
+    }
+
+    #[test]
+    fn replay_labels_outcome_notes_and_resolved_cards() {
+        let mut card = msg("assistant", "card", None, "Connect Google");
+        card.card = Some(json!({"type": "connect", "state": "done"}));
+        let note = msg("system", "system_note", None, "Google connected ✓");
+        let prompt = render_prompt(
+            &ctx("main"),
+            "Iris",
+            &[card, note],
+            &msg("user", "text", Some("u1"), "Check again"),
+        );
+        assert!(prompt.contains("card (resolved): Connect Google"));
+        assert!(prompt.contains("[system note] Google connected ✓"));
     }
 
     #[test]

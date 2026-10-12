@@ -1086,6 +1086,16 @@ pub async fn finish(
         .filter(|f| now_ms() - f.created_at < FLOW_TTL_MS)
         .ok_or("This sign-in link expired or was already used. Start again from the app.")?;
     if let Some(e) = error {
+        if e == "access_denied" {
+            crate::awareness::finish(
+                state,
+                "connector",
+                &flow.connector_id,
+                "declined",
+                "You declined the connection. Nothing was connected.",
+            )
+            .await;
+        }
         return Err(match e {
             "access_denied" => "You declined, so nothing was connected.".to_string(),
             _ => "The service reported a sign-in problem. Try again.".to_string(),

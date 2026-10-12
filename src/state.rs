@@ -429,6 +429,19 @@ impl AppState {
         if changed {
             self.broadcast_harness(&next);
         }
+        if !before.installed && next.installed {
+            crate::awareness::finish(
+                self,
+                "install",
+                entry.harness.name(),
+                "done",
+                &format!(
+                    "{} installed ✓",
+                    crate::login::engine_label(entry.harness.name())
+                ),
+            )
+            .await;
+        }
         if before.auth != next.auth {
             self.auth_transition(entry.harness.name(), before.auth, next.auth)
                 .await;
@@ -593,33 +606,6 @@ impl AppState {
         } else {
             Vec::new()
         }
-    }
-
-    /// Short notices for the system prompt about engines that need the
-    /// owner's attention, so the agent can mention them conversationally.
-    pub fn harness_notices(&self, active: &str) -> Vec<String> {
-        self.harnesses
-            .values()
-            .filter(|e| e.cfg.enabled && e.harness.name() != active)
-            .filter(|e| e.status().auth == AuthState::AuthRequired)
-            .map(|e| match e.harness.name() {
-                "claude" => "The Claude engine on the Iris server is signed out. The owner can \
-                    fix it by running `claude` on the server and using /login."
-                    .to_string(),
-                "codex" => "The Codex (ChatGPT) engine on the Iris server is signed out. The \
-                    owner can fix it by running `codex login` on the server."
-                    .to_string(),
-                "gemini" => "The Gemini engine on the Iris server is signed out. The owner can \
-                    fix it by adding a Gemini API key in the app (Settings, AI engine), or by \
-                    running `gemini` on the server and signing in."
-                    .to_string(),
-                "opencode" => "The OpenCode engine on the Iris server has no usable provider. \
-                    The owner can fix it by adding a provider key in the app (Settings, AI \
-                    engine), or with `opencode auth login` on the server."
-                    .to_string(),
-                other => format!("The {other} engine on the Iris server needs to be signed in."),
-            })
-            .collect()
     }
 
     // ---------------------------------------------------------------- slots

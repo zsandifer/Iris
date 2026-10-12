@@ -29,6 +29,7 @@ pub struct Bridge {
     /// resolve against it.
     pub workdir: Option<PathBuf>,
     pub agent: crate::config::AgentConfig,
+    pub status_token: Option<String>,
 }
 
 /// Tools available in shared (group) conversations.
@@ -133,6 +134,30 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 pub fn tool_definitions() -> Vec<Value> {
     let s = |d: &str| json!({"type": "string", "description": d});
     vec![
+        tool(
+            "system_status",
+            "Read fresh, non-sensitive Iris system status.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "request_engine_signin",
+            "Request an owner sign-in card; never signs in directly.",
+            json!({"engine": s("Engine name")}),
+            &["engine"],
+        ),
+        tool(
+            "request_engine_install",
+            "Request an owner install card; never installs directly.",
+            json!({"engine": s("Engine name")}),
+            &["engine"],
+        ),
+        tool(
+            "request_connector_setup",
+            "Request a catalog connect or reconnect card; never connects directly.",
+            json!({"name": {"type": "string", "enum": ["google", "github", "custom"]}}),
+            &["name"],
+        ),
         tool(
             "read_memory",
             "Read an owner memory Markdown file through Iris.",
@@ -285,7 +310,9 @@ impl Bridge {
                     .into_iter()
                     .filter(|t| {
                         let name = t["name"].as_str().unwrap_or("");
-                        (!self.shared || SHARED_TOOLS.contains(&name))
+                        (!crate::awareness::TOOLS.contains(&name)
+                            || (self.status_token.is_some() && self.private_status_context()))
+                            && (!self.shared || SHARED_TOOLS.contains(&name))
                             && (!matches!(name, "read_memory" | "write_memory")
                                 || self.owner_context())
                     })
@@ -329,6 +356,17 @@ impl Bridge {
                 .is_some_and(|o| o == self.user_id)
     }
 
+    fn private_status_context(&self) -> bool {
+        self.owner_context()
+            && self.conversation_id.as_ref().is_some_and(|conv| {
+                self.db
+                    .with(|c| {
+                        Ok(crate::db::conversation_member_ids(c, conv)? == [self.user_id.clone()])
+                    })
+                    .unwrap_or(false)
+            })
+    }
+
     fn call(&self, name: &str, a: &Value) -> std::result::Result<Value, String> {
         if self.shared && !SHARED_TOOLS.contains(&name) {
             return Err(format!("{name} is not available in shared conversations"));
@@ -336,6 +374,27 @@ impl Bridge {
         let s = |k: &str| a.get(k).and_then(Value::as_str);
         let uid = self.user_id.as_str();
         let db_err = |e: crate::util::BoxError| e.to_string();
+        if crate::awareness::TOOLS.contains(&name) {
+            if !self.private_status_context() {
+                return Ok(json!({"outcome": "not allowed"}));
+            }
+            let Some(token) = &self.status_token else {
+                return Ok(json!({"outcome": "not allowed"}));
+            };
+            let proxy = crate::gateway::proxy::Proxy {
+                socket: crate::gateway::socket_path(&self.paths),
+                connector: String::new(),
+                token: token.clone(),
+            };
+            let reply = proxy.forward_envelope(
+                &json!({"id": 1, "method": "tools/call", "params": {"name": name, "arguments": a}}),
+                true,
+            );
+            if reply.get("error").is_some() {
+                return Err("this private turn is no longer available".into());
+            }
+            return Ok(reply["result"].clone());
+        }
         match name {
             "read_memory" | "write_memory" => {
                 if !self.owner_context() {
@@ -715,6 +774,7 @@ mod tests {
             shared: false,
             workdir: None,
             agent: crate::config::AgentConfig::default(),
+            status_token: None,
         }
     }
 
@@ -723,6 +783,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut b = bridge(tmp.path());
         b.shared = true;
+        b.status_token = Some("turn-token".into());
         let tools = b
             .handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
             .unwrap();
@@ -733,6 +794,9 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(names, ["create_card"]);
+        for tool in crate::awareness::TOOLS {
+            assert_eq!(call(&b, tool, json!({}))["isError"], true);
+        }
         assert_eq!(call(&b, "list_goals", json!({}))["isError"], true);
         let r = call(&b, "create_card", json!({"type": "info", "title": "Hello"}));
         assert_eq!(r["isError"], false);

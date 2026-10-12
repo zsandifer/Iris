@@ -505,13 +505,12 @@ async fn trusted_recipients_skip_approval_and_the_send_tripwire_pauses() {
         .unwrap();
     assert_eq!(last.decision, "blocked");
     assert!(last.reason.contains("paused"), "{}", last.reason);
-    // And the next turn does not get it at all.
+    // The next turn can check Iris status, but has no permission for the paused connector.
     drop(_guard);
-    assert!(
-        grant_for_turn(&t.state, &t.owner, &t.main, "main", "m2")
-            .await
-            .is_none()
-    );
+    let (servers, _guard) = grant_for_turn(&t.state, &t.owner, &t.main, "main", "m2")
+        .await
+        .unwrap();
+    assert!(servers.is_empty());
 }
 
 #[tokio::test]
@@ -1830,13 +1829,15 @@ async fn wallet_approvals_use_the_gateway_and_never_resume_ended_turns() {
             assert!(t.state.setting("browser.disconnected").await.is_some());
             assert!(t.state.browser.ensure().await.is_err());
         }
+        let messages = t
+            .state
+            .db
+            .with(|c| db::list_messages(c, &t.main, None, 50))
+            .unwrap();
+        assert_eq!(messages.iter().filter(|m| m.kind == "card").count(), 1);
         assert_eq!(
-            t.state
-                .db
-                .with(|c| db::list_messages(c, &t.main, None, 50))
-                .unwrap()
-                .len(),
-            1
+            messages.iter().filter(|m| m.kind == "system_note").count(),
+            usize::from(matches!(action, "approve" | "deny"))
         );
         drop(guard);
     }

@@ -56,6 +56,14 @@ impl LoginStatus {
     pub fn finished(&self) -> bool {
         matches!(self.state, "connected" | "failed" | "cancelled")
     }
+
+    pub(crate) fn apply_to_card(&self, card: &mut Value) {
+        card["state"] = self.state.into();
+        card["url"] = self.url.clone().map_or(Value::Null, Value::from);
+        card["user_code"] = self.user_code.clone().map_or(Value::Null, Value::from);
+        card["error"] = self.error.clone().map_or(Value::Null, Value::from);
+        card["login_id"] = self.id.clone().into();
+    }
 }
 
 struct Session {
@@ -495,14 +503,17 @@ async fn publish(state: &AppState, harness: &str) {
             json!({"type": "harness.login", "login": status}),
         );
     }
-    update_card(state, harness, move |card| {
-        card["state"] = status.state.into();
-        card["url"] = status.url.clone().map_or(Value::Null, Value::from);
-        card["user_code"] = status.user_code.clone().map_or(Value::Null, Value::from);
-        card["error"] = status.error.clone().map_or(Value::Null, Value::from);
-        card["login_id"] = status.id.clone().into();
-    })
-    .await;
+    if status.state == "cancelled" {
+        crate::awareness::finish(
+            state,
+            "signin",
+            harness,
+            "declined",
+            &format!("You declined sign-in to {}.", engine_label(harness)),
+        )
+        .await;
+    }
+    update_card(state, harness, move |card| status.apply_to_card(card)).await;
 }
 
 fn card_key(harness: &str) -> String {
@@ -519,27 +530,32 @@ pub fn engine_label(harness: &str) -> &'static str {
     }
 }
 
-/// Update the stored sign-in card for a harness and broadcast it.
+/// Update every open sign-in card in the owner's private conversations and broadcast it.
 async fn update_card(state: &AppState, harness: &str, f: impl FnOnce(&mut Value) + Send + 'static) {
-    let key = card_key(harness);
-    let updated = state
-        .db
-        .call(move |c| {
-            let Some(id) = db::get_setting(c, &key)? else {
-                return Ok(None);
-            };
-            let Some(msg) = db::get_message(c, &id)? else {
-                return Ok(None);
-            };
-            let mut card = msg.card.clone().unwrap_or(Value::Null);
-            f(&mut card);
-            db::update_message_card(c, &id, &card).map(Some)
-        })
-        .await
-        .ok()
-        .flatten();
-    if let Some(m) = updated {
-        broadcast_updated(state, &m).await;
+    let harness = harness.to_owned();
+    let updated = state.db.call(move |c| db::write_tx(c, |c| {
+        let Some(owner) = db::owner_user_id(c)? else { return Ok(vec![]); };
+        let mut stmt = c.prepare("SELECT id FROM messages WHERE kind = 'card' AND json_extract(card, '$.type') = 'engine_signin' AND json_extract(card, '$.harness') = ?1
+            AND conversation_id IN (SELECT conversation_id FROM conversation_members WHERE user_id = ?2
+                AND (SELECT COUNT(*) FROM conversation_members m WHERE m.conversation_id = conversation_members.conversation_id) = 1)")?;
+        let ids = stmt.query_map(rusqlite::params![harness, owner], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut cards: Vec<_> = ids.iter().filter_map(|id| db::get_message(c, id).transpose()).collect::<rusqlite::Result<Vec<_>>>()?;
+        // Build the state patch once; every open card follows this same login session.
+        let mut patch = json!({});
+        f(&mut patch);
+        let mut updated = Vec::new();
+        for m in cards.drain(..) {
+            let mut card = m.card.unwrap_or(Value::Null);
+            if crate::awareness::resolved(&card) { continue; }
+            for (key, value) in patch.as_object().into_iter().flatten() { card[key] = value.clone(); }
+            updated.push(db::update_message_card(c, &m.id, &card)?);
+        }
+        Ok(updated)
+    })).await;
+    if let Ok(messages) = updated {
+        for m in messages {
+            broadcast_updated(state, &m).await;
+        }
     }
 }
 
@@ -634,6 +650,8 @@ pub async fn post_signin_card(state: &AppState, harness: &str, first_time: bool)
     let key = card_key(harness);
     let b = body.clone();
     let t = title.clone();
+    let login_state = state.clone();
+    let engine = harness.to_owned();
     let result = state
         .db
         .call(move |c| {
@@ -643,7 +661,10 @@ pub async fn post_signin_card(state: &AppState, harness: &str, first_time: bool)
             // Reuse an open card from this outage instead of stacking more.
             if let Some(id) = db::get_setting(c, &key)?
                 && let Some(m) = db::get_message(c, &id)?
-                && m.card.as_ref().is_some_and(|k| k["state"] != "connected")
+                && db::conversation_member_ids(c, &m.conversation_id)? == [owner.clone()]
+                && m.card
+                    .as_ref()
+                    .is_some_and(|k| !crate::awareness::resolved(k))
             {
                 let mut k = m.card.clone().unwrap_or(Value::Null);
                 k["body"] = b.into();
@@ -652,9 +673,16 @@ pub async fn post_signin_card(state: &AppState, harness: &str, first_time: bool)
                 for f in ["flow", "key_options", "instructions", "action_label"] {
                     k[f] = card[f].clone();
                 }
+                if let Some(login) = login_state.logins.status(&engine).filter(|s| !s.finished()) {
+                    login.apply_to_card(&mut k);
+                }
                 return db::update_message_card(c, &id, &k).map(|m| Some((owner, m, false)));
             }
             let main = db::ensure_main_conversation(c, &owner)?;
+            let mut card = card;
+            if let Some(login) = login_state.logins.status(&engine).filter(|s| !s.finished()) {
+                login.apply_to_card(&mut card);
+            }
             let m = crate::entities::insert_card(c, &main, &card, "assistant")?;
             db::set_setting(c, &key, &m.id)?;
             Ok(Some((owner, m, true)))
@@ -688,16 +716,21 @@ pub async fn post_signin_card(state: &AppState, harness: &str, first_time: bool)
 
 /// A harness is signed in again: close its card.
 pub async fn on_signed_in(state: &AppState, harness: &str) {
-    let label = engine_label(harness);
-    update_card(state, harness, move |card| {
-        if card["state"] != "connected" {
-            card["state"] = "connected".into();
-            card["body"] = format!("{label} is connected again.").into();
-            card["url"] = Value::Null;
-            card["user_code"] = Value::Null;
-            card["error"] = Value::Null;
-        }
-    })
+    crate::awareness::finish(
+        state,
+        "install",
+        harness,
+        "done",
+        &format!("{} installed ✓", engine_label(harness)),
+    )
+    .await;
+    crate::awareness::finish(
+        state,
+        "signin",
+        harness,
+        "done",
+        &format!("{} is signed in ✓", engine_label(harness)),
+    )
     .await;
 }
 
@@ -721,7 +754,9 @@ pub async fn on_connector_auth_error(state: &AppState, server: &str) {
             let key = format!("connector_card.{}", con.id);
             if let Some(id) = db::get_setting(c, &key)?
                 && let Some(m) = db::get_message(c, &id)?
-                && m.card.as_ref().is_some_and(|k| k["state"] != "connected")
+                && m.card
+                    .as_ref()
+                    .is_some_and(|k| !crate::awareness::resolved(k))
             {
                 return Ok(None);
             }
@@ -779,35 +814,174 @@ pub async fn on_connector_auth_error(state: &AppState, server: &str) {
 
 /// The owner updated a connector's settings: close its reconnect card.
 pub async fn on_connector_updated(state: &AppState, connector_id: &str) {
-    let key = format!("connector_card.{connector_id}");
-    let updated = state
+    let id = connector_id.to_owned();
+    let con = state
         .db
-        .call(move |c| {
-            let Some(id) = db::get_setting(c, &key)? else {
-                return Ok(None);
-            };
-            let Some(m) = db::get_message(c, &id)? else {
-                return Ok(None);
-            };
-            let mut card = m.card.clone().unwrap_or(Value::Null);
-            if card["state"] == "connected" {
-                return Ok(None);
-            }
-            card["state"] = "connected".into();
-            card["body"] = "Connected again. I'll use it from now on.".into();
-            db::update_message_card(c, &id, &card).map(Some)
-        })
+        .call(move |c| crate::entities::get_connector(c, &id))
         .await
         .ok()
         .flatten();
-    if let Some(m) = updated {
-        broadcast_updated(state, &m).await;
+    if let Some(con) = con.filter(|c| c.active()) {
+        let note = format!("{} connected ✓", crate::gateway::service_label(&con));
+        crate::awareness::finish(state, "connector", &con.id, "done", &note).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn new_signin_cards_follow_the_running_login_and_all_private_cards_receive_updates() {
+        for (engine, flow, waiting) in [
+            ("codex", LoginFlow::DeviceCode, "waiting_for_approval"),
+            ("claude", LoginFlow::CodePaste, "waiting_for_code"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = crate::browser::tools::tests::test_state(tmp.path());
+            state.set_serving();
+            state
+                .harness(engine)
+                .unwrap()
+                .status
+                .write()
+                .unwrap()
+                .installed = true;
+            let (owner, main, side, untouched) = state.db.with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                let main = db::ensure_main_conversation(c, &owner)?;
+                let side = db::create_conversation(c, &owner, "side", "Private", None)?.id;
+                let shared = db::create_conversation(c, &owner, "side", "Shared", None)?.id;
+                c.execute("INSERT INTO users (id, display_name, is_owner, created_at) VALUES ('guest', 'Guest', 0, 1)", [])?;
+                c.execute("INSERT INTO conversation_members (conversation_id, user_id, role, joined_at) VALUES (?1, 'guest', 'member', 1)", [&shared])?;
+                let guest = db::create_conversation(c, "guest", "side", "Guest", None)?.id;
+                let mut untouched = vec![];
+                for (conv, harness, status) in [(&shared, engine, "needs_reconnect"), (&guest, engine, "needs_reconnect"), (&main, engine, "done"), (&main, "gemini", "needs_reconnect")] {
+                    untouched.push(crate::entities::insert_card(c, conv, &json!({"type": "engine_signin", "harness": harness, "state": status}), "assistant")?);
+                }
+                Ok((owner, main, side, untouched))
+            }).unwrap();
+            state.logins.lock().insert(
+                engine.into(),
+                Session {
+                    status: LoginStatus {
+                        id: "login-session".into(),
+                        harness: engine.into(),
+                        flow,
+                        state: "starting",
+                        url: None,
+                        user_code: None,
+                        error: None,
+                        started_at: now_ms(),
+                    },
+                    stdin: None,
+                    cancel: watch::channel(false).0,
+                },
+            );
+            let args = json!({"engine": engine});
+            let first =
+                crate::awareness::request(&state, &owner, &main, "request_engine_signin", &args)
+                    .await
+                    .unwrap();
+            let card = state
+                .db
+                .with(|c| db::get_message(c, first["card_id"].as_str().unwrap()))
+                .unwrap()
+                .unwrap()
+                .card
+                .unwrap();
+            assert_eq!(card["state"], "starting");
+            on_line(
+                &state,
+                engine,
+                "login-session",
+                flow,
+                "https://signin.example/device",
+            )
+            .await;
+            if flow == LoginFlow::DeviceCode {
+                on_line(&state, engine, "login-session", flow, "ABCD-12345").await;
+            }
+            let second =
+                crate::awareness::request(&state, &owner, &side, "request_engine_signin", &args)
+                    .await
+                    .unwrap();
+            post_signin_card(&state, engine, false).await;
+            // Exercise automatic creation as well as refreshing an existing card.
+            state
+                .db
+                .with(|c| {
+                    c.execute("DELETE FROM settings WHERE key = ?1", [card_key(engine)])?;
+                    Ok(())
+                })
+                .unwrap();
+            post_signin_card(&state, engine, true).await;
+            let third = state
+                .db
+                .with(|c| db::get_setting(c, &card_key(engine)))
+                .unwrap()
+                .unwrap();
+            let ids = [
+                first["card_id"].as_str().unwrap(),
+                second["card_id"].as_str().unwrap(),
+                &third,
+            ];
+            for id in ids {
+                let card = state
+                    .db
+                    .with(|c| db::get_message(c, id))
+                    .unwrap()
+                    .unwrap()
+                    .card
+                    .unwrap();
+                assert_eq!(card["state"], waiting);
+                assert_eq!(card["url"], "https://signin.example/device");
+                assert_eq!(
+                    card["user_code"],
+                    if flow == LoginFlow::DeviceCode {
+                        json!("ABCD-12345")
+                    } else {
+                        Value::Null
+                    }
+                );
+                assert_eq!(card["login_id"], "login-session");
+            }
+            for next in ["verifying", "failed", "starting"] {
+                state.logins.update(engine, |s| {
+                    s.state = next;
+                    s.url = None;
+                    s.user_code = None;
+                    s.error = (next == "failed").then(|| "Try again.".into());
+                });
+                let mut events = state.hub.subscribe();
+                publish(&state, engine).await;
+                let mut updated = std::collections::BTreeSet::new();
+                while let Ok(event) = events.try_recv() {
+                    assert!(!event.audience.includes("guest"));
+                    let value: Value = serde_json::from_str(&event.json).unwrap();
+                    if value["type"] == "message.updated" {
+                        assert_eq!(value["message"]["card"]["state"], next);
+                        updated.insert(value["message"]["id"].as_str().unwrap().to_owned());
+                    }
+                }
+                assert_eq!(updated, ids.map(str::to_owned).into_iter().collect());
+                state
+                    .db
+                    .with(|c| {
+                        for id in ids {
+                            let card = db::get_message(c, id)?.unwrap().card.unwrap();
+                            assert_eq!(card["state"], next);
+                            assert!(card["url"].is_null() && card["user_code"].is_null());
+                        }
+                        for before in &untouched {
+                            assert_eq!(db::get_message(c, &before.id)?.unwrap().card, before.card);
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }
+    }
 
     #[test]
     fn strips_ansi_and_finds_codex_device_code() {

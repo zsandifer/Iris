@@ -67,6 +67,7 @@ pub struct Grant {
     /// Connector names this turn may use.
     pub connectors: Vec<String>,
     cancel: watch::Sender<bool>,
+    current_turn: Mutex<(String, String)>,
 }
 
 /// Removes the grant (and cancels its pending approvals) when the turn
@@ -74,6 +75,16 @@ pub struct Grant {
 pub struct GrantGuard {
     state: AppState,
     token: String,
+}
+
+impl GrantGuard {
+    pub fn status_token(&self, engine: &str, model: &str) -> String {
+        if let Some(grant) = self.state.gateway.grant(&self.token) {
+            *grant.current_turn.lock().unwrap_or_else(|p| p.into_inner()) =
+                (engine.into(), model.into());
+        }
+        self.token.clone()
+    }
 }
 
 impl Drop for GrantGuard {
@@ -238,9 +249,6 @@ pub async fn grant_for_turn(
         .filter(|c| c.active())
         .map(|c| c.name.clone())
         .collect();
-    if names.is_empty() {
-        return None;
-    }
     let card_conversation_id = if conversation_kind == "job" {
         let o = owner.clone();
         state
@@ -268,6 +276,7 @@ pub async fn grant_for_turn(
                 private_conversation: (conversation_kind != "job")
                     .then(|| conversation_id.to_string()),
                 connectors: names.clone(),
+                current_turn: Mutex::default(),
                 cancel,
             }),
         );
@@ -299,51 +308,6 @@ pub async fn grant_for_turn(
             token,
         },
     ))
-}
-
-/// Notes for the system prompt about the owner's connected services.
-pub async fn connector_notices(state: &AppState, user_id: &str) -> Vec<String> {
-    let uid = user_id.to_string();
-    let Ok(Some(list)) = state
-        .db
-        .call(move |c| {
-            (db::owner_user_id(c)?.as_deref() == Some(uid.as_str()))
-                .then(|| entities::list_connectors(c, true))
-                .transpose()
-        })
-        .await
-    else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for con in &list {
-        let label = service_label(con);
-        if let Some(reason) = &con.paused_reason {
-            out.push(format!(
-                "{label} is paused because {reason}. The owner can resume it in the app."
-            ));
-        } else if con.auth_state != "ok" {
-            out.push(format!(
-                "{label} needs the owner to sign in again; there is a Reconnect card in the Main \
-                 chat."
-            ));
-        } else if let Some(account) = con.config.oauth.as_ref().and_then(|o| o.account.as_ref()) {
-            out.push(format!(
-                "{label} (the `{}` tools) is available now, connected as {account}; when one of \
-                 its tools asks for the user's email address, use that one.",
-                con.name
-            ));
-        } else {
-            // The current state, so an earlier pause or sign-out in the
-            // conversation is not mistaken for the present.
-            out.push(format!(
-                "{label} (the `{}` tools) is connected and working now; if earlier messages said it \
-                 was paused, off, or signed out, that is over, so use it when asked.",
-                con.name
-            ));
-        }
-    }
-    out
 }
 
 // ----------------------------------------------------------------- socket
@@ -403,6 +367,53 @@ pub async fn handle(state: &AppState, msg: &Value) -> Value {
     let Some(grant) = state.gateway.grant(token) else {
         return rpc_error(id, -32001, "this turn has ended");
     };
+    if msg["awareness"] == true {
+        let (owner, conv) = (grant.owner_user_id.clone(), grant.conversation_id.clone());
+        let allowed = !*grant.cancel.borrow()
+            && state
+                .db
+                .call(move |c| {
+                    Ok(db::owner_user_id(c)?.as_deref() == Some(&owner)
+                        && db::conversation_member_ids(c, &conv)? == [owner])
+                })
+                .await
+                .unwrap_or(false);
+        if !allowed {
+            return rpc_error(id, -32001, "not allowed");
+        }
+        let tool = req["params"]["name"].as_str().unwrap_or("");
+        if req["method"] != "tools/call" || !crate::awareness::TOOLS.contains(&tool) {
+            return rpc_error(id, -32601, "method not found");
+        }
+        let result = if tool == "system_status" {
+            let (engine, model) = grant
+                .current_turn
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            crate::awareness::status(
+                state,
+                &grant.owner_user_id,
+                &grant.conversation_id,
+                &engine,
+                &model,
+            )
+            .await
+        } else {
+            crate::awareness::request(
+                state,
+                &grant.owner_user_id,
+                &grant.card_conversation_id,
+                tool,
+                &req["params"]["arguments"],
+            )
+            .await
+        };
+        return match result {
+            Ok(value) => json!({"jsonrpc": "2.0", "id": id, "result": value}),
+            Err(_) => rpc_error(id, -32002, "I couldn't check system status right now"),
+        };
+    }
     if !grant.connectors.iter().any(|c| c == name) {
         return rpc_error(id, -32001, "this connection is not available in this turn");
     }
@@ -1940,6 +1951,7 @@ pub(crate) async fn approve_browser_card(
         private_conversation: Some(ctx.conversation_id.clone()),
         connectors: Vec::new(),
         cancel: ctx.cancellation(),
+        current_turn: Mutex::default(),
     };
     let st = state.clone();
     tokio::spawn(async move { hold_approval(&st, &grant, SOURCE, card, None).await })

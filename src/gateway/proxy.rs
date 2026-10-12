@@ -59,10 +59,14 @@ impl Proxy {
 
     /// Send one request to the daemon and wait for its answer.
     pub fn forward(&self, req: &Value) -> Value {
+        self.forward_envelope(req, false)
+    }
+
+    pub fn forward_envelope(&self, req: &Value, awareness: bool) -> Value {
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let attempt = || -> std::io::Result<Value> {
             let mut s = UnixStream::connect(&self.socket)?;
-            let msg = json!({"token": self.token, "connector": self.connector, "request": req});
+            let msg = json!({"token": self.token, "connector": self.connector, "request": req, "awareness": awareness});
             let mut line = msg.to_string().into_bytes();
             line.push(b'\n');
             s.write_all(&line)?;
