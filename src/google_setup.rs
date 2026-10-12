@@ -231,6 +231,51 @@ pub fn callback(public_url: &str) -> Option<String> {
     Some(format!("{base}/api/oauth/callback"))
 }
 
+/// Branding needs a domain, not the callback URL. This small PSL subset is
+/// only setup guidance, never a security boundary. Rules modeled on
+/// https://publicsuffix.org/list/public_suffix_list.dat; longest match wins.
+pub fn authorized_domain(public_url: &str) -> Option<String> {
+    let callback = callback(public_url)?;
+    let uri = callback.parse::<ureq::http::Uri>().ok()?;
+    let host = uri.host()?.trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<_> = host.split('.').collect();
+    if host.parse::<std::net::IpAddr>().is_ok()
+        || host.len() > 253
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+    {
+        return None;
+    }
+    const SUFFIXES: &str = "ts.net co.uk org.uk me.uk ac.uk com.au net.au org.au
+        co.nz org.nz co.jp co.in com.br com.cn com.sg co.za com.mx com.tr
+        github.io appspot.com pages.dev vercel.app netlify.app
+        com net org edu gov mil int io dev app ai info biz me cloud online site xyz tech
+        uk au nz jp in br cn sg za mx tr us ca de fr nl ch it es se no fi eu";
+    let suffix_len = SUFFIXES
+        .split_ascii_whitespace()
+        .filter(|suffix| {
+            host == *suffix
+                || host
+                    .strip_suffix(suffix)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
+        .map(|suffix| suffix.split('.').count())
+        .max();
+    let start = match suffix_len {
+        Some(len) => labels.len().checked_sub(len + 1)?,
+        // Unknown suffix: use the requested conservative fallback.
+        None => usize::from(labels.len() >= 3),
+    };
+    Some(labels[start..].join("."))
+}
+
 /// A deliberately small projection shared by the app and system_status.
 pub fn status(c: &rusqlite::Connection) -> rusqlite::Result<Value> {
     let con = entities::list_connectors(c, false)?
@@ -411,6 +456,44 @@ mod tests {
     use super::*;
     const ID: &str = "123-example.apps.googleusercontent.com";
     const SECRET: &str = "GOCSPX-paste-canary_123";
+
+    #[test]
+    fn branding_domain_uses_public_suffixes_and_strips_url_parts() {
+        for (url, domain) in [
+            (
+                "https://laptop.tail-example.ts.net:8446",
+                "tail-example.ts.net",
+            ),
+            ("https://tail-example.ts.net/iris/", "tail-example.ts.net"),
+            ("https://chat.home.example.com:8446/iris", "example.com"),
+            ("https://IRIS.Example.COM./", "example.com"),
+            ("https://iris.example.co.uk", "example.co.uk"),
+            ("https://iris.example.com.au", "example.com.au"),
+            ("https://iris.owner.github.io", "owner.github.io"),
+            ("https://iris.home.example", "home.example"),
+            ("https://iris.office.home.example", "office.home.example"),
+            ("https://iris.example", "iris.example"),
+            ("https://example", "example"),
+        ] {
+            assert_eq!(authorized_domain(url).as_deref(), Some(domain), "{url}");
+        }
+        for url in [
+            "",
+            "not a URL",
+            "http://iris.example",
+            "https://127.0.0.1",
+            "https://[::1]",
+            "https://user@iris.example",
+            "https://iris.example?x=1",
+            "https://iris.example#fragment",
+            "https://ts.net",
+            "https://com",
+            "https://iris..example",
+            "https://-iris.example",
+        ] {
+            assert_eq!(authorized_domain(url), None, "{url}");
+        }
+    }
 
     #[test]
     fn extracts_and_validates_project_ids() {

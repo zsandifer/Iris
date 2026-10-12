@@ -5,6 +5,7 @@
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
+use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
 pub struct Asset {
@@ -68,14 +69,57 @@ fn find(path: &str) -> Option<(usize, &'static Asset)> {
     ASSETS.iter().enumerate().find(|(_, a)| a.path == path)
 }
 
+/// Hash paths and bytes with explicit lengths; no build id, time, or filesystem metadata.
+fn cache_name<'a>(version: &str, assets: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> String {
+    let mut assets: Vec<_> = assets.into_iter().collect();
+    assets.sort_unstable_by_key(|(path, _)| *path);
+    let mut hash = Sha256::new();
+    for (path, body) in assets {
+        hash.update((path.len() as u64).to_be_bytes());
+        hash.update(path.as_bytes());
+        hash.update((body.len() as u64).to_be_bytes());
+        hash.update(body);
+    }
+    format!(
+        "iris-shell-{version}-{}",
+        &crate::util::hex(&hash.finalize())[..20]
+    )
+}
+
+fn render_worker(source: &[u8], name: &str) -> String {
+    std::str::from_utf8(source)
+        .expect("UTF-8 service worker")
+        .replace("__IRIS_SHELL_CACHE__", name)
+}
+
+fn embedded_body(asset: &'static Asset) -> &'static [u8] {
+    if asset.path != "sw.js" {
+        return asset.body;
+    }
+    static WORKER: OnceLock<String> = OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            let name = cache_name(
+                env!("CARGO_PKG_VERSION"),
+                ASSETS.iter().map(|a| (a.path, a.body)),
+            );
+            render_worker(asset.body, &name)
+        })
+        .as_bytes()
+}
+
 /// Strong ETags (content hashes), computed once.
 fn etags() -> &'static [String] {
     static TAGS: OnceLock<Vec<String>> = OnceLock::new();
     TAGS.get_or_init(|| {
-        use sha2::{Digest, Sha256};
         ASSETS
             .iter()
-            .map(|a| format!("\"{}\"", &crate::util::hex(&Sha256::digest(a.body))[..20]))
+            .map(|a| {
+                format!(
+                    "\"{}\"",
+                    &crate::util::hex(&Sha256::digest(embedded_body(a)))[..20]
+                )
+            })
             .collect()
     })
 }
@@ -119,8 +163,23 @@ pub async fn serve(uri: Uri, headers: HeaderMap) -> Response {
     // Development: `IRIS_WEB_DIR=web iris serve` serves the files from disk
     // (only the listed paths) so app changes need no rebuild.
     if let Some(dir) = std::env::var_os("IRIS_WEB_DIR")
-        && let Ok(body) = tokio::fs::read(std::path::Path::new(&dir).join(asset.path)).await
+        && let Ok(mut body) = tokio::fs::read(std::path::Path::new(&dir).join(asset.path)).await
     {
+        if asset.path == "sw.js" {
+            // Development bundles use the bytes actually served from disk, too.
+            let mut assets = Vec::with_capacity(ASSETS.len());
+            for a in ASSETS {
+                let bytes = tokio::fs::read(std::path::Path::new(&dir).join(a.path))
+                    .await
+                    .unwrap_or_else(|_| a.body.to_vec());
+                assets.push((a.path, bytes));
+            }
+            let name = cache_name(
+                env!("CARGO_PKG_VERSION"),
+                assets.iter().map(|(p, b)| (*p, b.as_slice())),
+            );
+            body = render_worker(&body, &name).into_bytes();
+        }
         let mut h = HeaderMap::new();
         h.insert(header::CONTENT_TYPE, HeaderValue::from_static(asset.mime));
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -161,7 +220,7 @@ pub async fn serve(uri: Uri, headers: HeaderMap) -> Response {
         return (StatusCode::NOT_MODIFIED, h).into_response();
     }
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static(asset.mime));
-    (h, asset.body).into_response()
+    (h, embedded_body(asset)).into_response()
 }
 
 #[cfg(test)]
@@ -189,7 +248,12 @@ mod tests {
         let mut listed: Vec<String> = ASSETS.iter().map(|a| a.path.to_string()).collect();
         listed.sort();
         assert_eq!(files, listed, "web/ and ASSETS differ");
-        let sw = std::str::from_utf8(find("sw.js").unwrap().1.body).unwrap();
+        let sw = std::str::from_utf8(embedded_body(find("sw.js").unwrap().1)).unwrap();
+        assert!(!sw.contains("__IRIS_SHELL_CACHE__"));
+        assert!(sw.contains(&cache_name(
+            env!("CARGO_PKG_VERSION"),
+            ASSETS.iter().map(|a| (a.path, a.body))
+        )));
         for a in ASSETS {
             assert!(
                 sw.contains(&format!("'/{}'", a.path)),
@@ -197,6 +261,54 @@ mod tests {
                 a.path
             );
         }
+    }
+
+    #[test]
+    fn cache_name_tracks_asset_bytes_paths_and_version() {
+        let assets = [("app.js", b"first".as_slice())];
+        let name = cache_name("0.1.0", assets);
+        assert_eq!(name, cache_name("0.1.0", assets));
+        assert_ne!(name, cache_name("0.1.0", [("app.js", b"other".as_slice())]));
+        assert_ne!(
+            name,
+            cache_name("0.1.0", [("other.js", b"first".as_slice())])
+        );
+        assert_ne!(name, cache_name("0.2.0", assets));
+        let pair = [
+            ("app.js", b"first".as_slice()),
+            ("app.css", b"style".as_slice()),
+        ];
+        assert_eq!(
+            cache_name("0.1.0", pair),
+            cache_name("0.1.0", [pair[1], pair[0]])
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_response_and_etag_include_the_bundle_hash() {
+        let (_, asset) = find("sw.js").unwrap();
+        let body = embedded_body(asset);
+        assert_ne!(body, asset.body);
+        let response = serve(Uri::from_static("/sw.js"), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response.headers()[header::ETAG].clone();
+        assert_eq!(
+            etag.to_str().unwrap(),
+            format!("\"{}\"", &crate::util::hex(&Sha256::digest(body))[..20])
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            body
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, etag);
+        assert_eq!(
+            serve(Uri::from_static("/sw.js"), headers).await.status(),
+            StatusCode::NOT_MODIFIED
+        );
     }
 
     #[test]

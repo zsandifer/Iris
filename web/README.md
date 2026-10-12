@@ -44,8 +44,14 @@ Rules:
   every JS module in `SHELL` in `sw.js` (a test checks both). Imports must
   be relative (`./x.js`).
 
+The server names the service-worker cache `iris-shell-<version>-<bundle hash>`
+from the Iris package version and the paths and bytes of every embedded asset
+(including the worker template). Web changes invalidate it automatically;
+identical bundles keep the same name. There is no manual cache version to bump.
+
 Development: `IRIS_WEB_DIR=web iris serve ...` serves these files from disk,
-so a browser reload picks up changes without rebuilding. For screenshots or
+so a browser reload picks up changes without rebuilding. The development worker
+also hashes the files served from disk. For screenshots or
 a quick look with content, seed a fresh data directory with fake demo data:
 
 ```sh
