@@ -2264,14 +2264,7 @@ mod tests {
         assert_eq!(
             ids,
             [
-                "google",
-                "github",
-                "notion",
-                "todoist",
-                "linear",
-                "atlassian",
-                "canva",
-                "custom"
+                "google", "github", "notion", "todoist", "linear", "canva", "custom"
             ]
         );
         assert_eq!(
@@ -2379,7 +2372,7 @@ mod tests {
                 .cloned()
                 .unwrap()
         };
-        for id in ["notion", "todoist", "linear", "atlassian", "canva"] {
+        for id in ["notion", "todoist", "linear", "canva"] {
             let e = entry(&cat, id);
             assert_eq!(e["setup"], "oauth_sign_in", "{id}");
             assert_eq!(e["missing"], json!([]), "{id}");
@@ -2521,7 +2514,9 @@ mod tests {
             .find(|t| t["name"] == "request_connector_setup")
             .unwrap();
         let names = &setup["inputSchema"]["properties"]["name"]["enum"];
-        for id in ["google", "github", "notion", "atlassian", "canva", "custom"] {
+        for id in [
+            "google", "github", "notion", "todoist", "linear", "canva", "custom",
+        ] {
             assert!(names.as_array().unwrap().iter().any(|n| n == id), "{names}");
         }
     }

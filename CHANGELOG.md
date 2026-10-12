@@ -12,8 +12,8 @@ All notable changes to Iris are documented here, following
   from the app, automatic model ranking and effort selection.
 - Google, GitHub and custom connections through a gateway with approval cards
   and rules for trusted people; a guided Google setup wizard.
-- One-tap connections to Notion, Todoist, Linear, Atlassian (Jira,
-  Confluence) and Canva through their hosted MCP servers.
+- One-tap connections to Notion, Todoist, Linear and Canva through their
+  hosted MCP servers.
 - Google adds Docs, Sheets, Slides, Forms, Tasks and Contacts; existing
   Google connections keep working and are asked to sign in again to add them.
 - Iris’s computer: watch its browser, take over, and fill saved logins securely.

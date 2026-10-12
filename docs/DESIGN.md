@@ -89,8 +89,8 @@ own personality. It is not a clone.
   Google errors point to the step to fix. One Google sign-in lights up Gmail,
   Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts and YouTube
   read-only; a connection from before the newer services shows “Sign in
-  again to add Docs, Sheets and more”. Notion, Todoist, Linear, Atlassian
-  and Canva are one Connect button, then approve on the service's page.
+  again to add Docs, Sheets and more”. Notion, Todoist, Linear and
+  Canva are one Connect button, then approve on the service's page.
   Installing
   a new engine works the same way: install → sign-in card → done. Engines
   that sign in with an API key (Gemini, OpenCode providers) get a key field

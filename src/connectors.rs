@@ -1,8 +1,8 @@
 //! The small built-in catalog of services to connect: Google (Gmail,
-//! Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts), GitHub, services with a hosted MCP server the owner just
-//! signs in to (Notion, Todoist, Linear, Atlassian, Canva), and a custom MCP
-//! server. Each entry says how the connector is set up; the app walks the
-//! owner through it.
+//! Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts), GitHub,
+//! services with a hosted MCP server the owner just signs in to (Notion,
+//! Todoist, Linear, Canva), and a custom MCP server. Each entry says how
+//! the connector is set up; the app walks the owner through it.
 //!
 //! - Google runs the open-source Google Workspace MCP server
 //!   (`workspace-mcp`, started with `uvx`) on this machine in its external
@@ -99,12 +99,6 @@ pub const CATALOG: &[CatalogEntry] = &[
         "Linear",
         "Issues, projects, and cycles",
         "https://mcp.linear.app/mcp",
-    ),
-    sign_in(
-        "atlassian",
-        "Atlassian",
-        "Jira issues and Confluence pages",
-        "https://mcp.atlassian.com/v1/mcp",
     ),
     sign_in(
         "canva",
@@ -559,14 +553,7 @@ mod tests {
         assert_eq!(
             ids,
             [
-                "google",
-                "github",
-                "notion",
-                "todoist",
-                "linear",
-                "atlassian",
-                "canva",
-                "custom"
+                "google", "github", "notion", "todoist", "linear", "canva", "custom"
             ]
         );
         assert!(catalog_entry("google").is_some());

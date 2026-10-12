@@ -21,7 +21,6 @@ const SERVICES = {
   notion: { name: 'Notion', bg: '#191919', mark: 'N' },
   todoist: { name: 'Todoist', bg: '#e44332', mark: 'T' },
   linear: { name: 'Linear', bg: '#5e6ad2', mark: 'L' },
-  atlassian: { name: 'Atlassian', bg: '#0052cc', mark: 'A' },
   canva: { name: 'Canva', bg: '#00a3a8', mark: 'C' },
 };
 export const CATALOG_IDS = [...Object.keys(SERVICES), 'custom'];

@@ -532,8 +532,8 @@ out each tool call the CLI makes, nothing more.
 ## Connections and approvals
 
 Connections (MCP servers) give Iris your services: Google (Gmail, Calendar,
-Drive, Docs and more), GitHub, Notion, Todoist, Linear, Jira and Confluence,
-Canva, or any MCP server. Add them in the app under Iris, Connections, or
+Drive, Docs and more), GitHub, Notion, Todoist, Linear, Canva, or any MCP
+server. Add them in the app under Iris, Connections, or
 just ask in chat ("help me set up Google"); Iris posts a Connect card that
 opens the step-by-step setup.
 
@@ -675,13 +675,12 @@ elsewhere on your private network needs HTTPS to receive credentials.
   checked. Iris then turns on the new services. If you changed the Google
   server's arguments under Advanced settings, Iris leaves them as they are;
   add `docs sheets slides forms tasks contacts` after `--tools` yourself.
-- **Notion, Todoist, Linear, Atlassian (Jira, Confluence), Canva**: one tap.
+- **Notion, Todoist, Linear, Canva**: one tap.
   Iris connects to the service's own hosted MCP server, registers itself
   with the service, and you approve access on the service's page. Nothing to
   create or paste. These start with “Reads freely · asks before any change”.
   If Iris is not on HTTPS, you paste the address your browser ends on back
-  into the app, as with any sign-in. Atlassian may require a site admin to
-  allow its Rovo MCP server for your organization.
+  into the app, as with any sign-in.
 - **GitHub** uses GitHub's remote MCP server with a fine-grained personal
   access token, or your own GitHub OAuth app.
 - **Custom**: any MCP server by web address (with sign-in, a header such as

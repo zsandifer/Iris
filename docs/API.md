@@ -1673,7 +1673,6 @@ Creates (or updates) the connector named after the service. Response
   | `notion` | `https://mcp.notion.com/mcp` |
   | `todoist` | `https://ai.todoist.net/mcp` |
   | `linear` | `https://mcp.linear.app/mcp` |
-  | `atlassian` | `https://mcp.atlassian.com/v1/mcp` (Jira, Confluence) |
   | `canva` | `https://mcp.canva.com/mcp` |
 
   Each was checked to publish OAuth metadata with a registration endpoint
@@ -2881,7 +2880,7 @@ The API view (`public_json`); secret values are never included.
 | `name` | string | MCP server name and tool prefix. |
 | `description` | string | |
 | `transport` | string | `stdio` or `http`. |
-| `service` | string | Catalog entry: `google`, `github`, a one-tap service (`notion`, `todoist`, `linear`, `atlassian`, `canva`), or `custom`. |
+| `service` | string | Catalog entry: `google`, `github`, a one-tap service (`notion`, `todoist`, `linear`, `canva`), or `custom`. |
 | `enabled` | bool | |
 | `command` | string or null | Program (stdio, or an http server Iris starts). |
 | `args` | string[] | |
@@ -3330,7 +3329,7 @@ a new turn. Resolved cards are explicitly described as resolved in replay histor
 | `system_status` | none; owner private turn only | The allowlisted status object described above |
 | `request_engine_signin` | `engine: "claude" \| "codex" \| "gemini" \| "opencode"` | `{"outcome", "card_id"?}`; sign-in card or already signed in |
 | `request_engine_install` | `engine` (same names) | `{"outcome", "card_id"?}`; install card or already installed |
-| `request_connector_setup` | `name`: a catalog id (`"google"`, `"github"`, `"notion"`, `"todoist"`, `"linear"`, `"atlassian"`, `"canva"`, `"custom"`) | `{"outcome", "card_id"?}`; connect/reconnect card or already connected (a Google connection that `needs_more_access` gets an "Add more Google services" `connector_reconnect` card instead); paused/disabled connectors return `connector paused by owner` / `connector disabled by owner` with a Resume action card |
+| `request_connector_setup` | `name`: a catalog id (`"google"`, `"github"`, `"notion"`, `"todoist"`, `"linear"`, `"canva"`, `"custom"`) | `{"outcome", "card_id"?}`; connect/reconnect card or already connected (a Google connection that `needs_more_access` gets an "Add more Google services" `connector_reconnect` card instead); paused/disabled connectors return `connector paused by owner` / `connector disabled by owner` with a Resume action card |
 | `list_goals` | `include_done?: bool` (default false) | `{"goals": [Goal]}` |
 | `create_goal` | `title: string` (required, max 300), `status_text?: string` (max 2,000), `suggested?: bool` (a proposal the user confirms; default false) | `{"goal": Goal}` |
 | `update_goal` | `id: string` (required), `title?` (non-blank, max 300), `status_text?` (max 2,000), `done?: bool` | `{"goal": Goal}`; error `no goal with that id` |
