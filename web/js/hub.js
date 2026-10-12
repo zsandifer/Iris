@@ -2,7 +2,7 @@
 // lives in computer.js).
 import { html, useEffect, useState } from './h.js';
 import { get, post, patch, put, del, seg } from './api.js';
-import { S, set, useStore, go, toast, isOwner } from './store.js';
+import { S, set, useStore, go, back, toast, isOwner } from './store.js';
 import {
   Icon, Avatar, Row, Group, Page, Empty, Spinner, Toggle, LetterTile,
   agentName, ago, since, confirmSheet,
@@ -174,7 +174,7 @@ export function FileEditor({ area, path }) {
   };
   const remove = async () => {
     if (!(await confirmSheet({ title: `Delete ${path}?`, yes: 'Delete', danger: true }))) return;
-    try { await del(url); history.back(); } catch (e) { toast(e.message); }
+    try { await del(url); back(); } catch (e) { toast(e.message); }
   };
   const name = path.split('/').pop();
   return html`<${Page} title=${system ? fill(FRIENDLY[path] || path) : name} sub=${system ? path : `${area}/${path}`}
