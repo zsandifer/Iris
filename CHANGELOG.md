@@ -22,6 +22,10 @@ All notable changes to Iris are documented here, following
 - Google adds Docs, Sheets, Slides, Forms, Tasks and Contacts; existing
   Google connections keep working and are asked to sign in again to add them.
 - Iris’s computer: watch its browser, take over, and fill saved logins securely.
+- Iris’s own browser lives at one fixed path that `deploy/setup-engines.sh`
+  approves for Chrome’s sandbox where AppArmor restricts user namespaces
+  (Ubuntu 23.10+); when the sandbox cannot start, the app shows the exact
+  command for that server.
 - A personal For you feed, Ideas, Goals, Library and push notifications.
 - Optional separation of Iris and its agents into different OS users.
 - Self-awareness of setup and connection status, with sign-in and setup cards.

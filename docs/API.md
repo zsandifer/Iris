@@ -2271,8 +2271,9 @@ without use. Chrome's own password manager and form autofill are turned off
 in that profile.
 
 Where the browser comes from: `browser.command` in the config; else the copy
-installed from the app (`POST /api/browser/install`, into the engines
-directory); else `chromium`, `chromium-browser`, `google-chrome-stable`,
+installed from the app (`POST /api/browser/install`, at the fixed path
+`<engines dir>/chromium/app/chrome` that `deploy/setup-engines.sh` approves
+for Chrome's sandbox); else `chromium`, `chromium-browser`, `google-chrome-stable`,
 `google-chrome`, or `chrome` on `PATH` (snap wrappers are skipped); else
 Playwright's browser cache (`$PLAYWRIGHT_BROWSERS_PATH` or
 `~/.cache/ms-playwright`).
@@ -2302,6 +2303,7 @@ Playwright's browser cache (`$PLAYWRIGHT_BROWSERS_PATH` or
 | `sandbox` | bool or null | Chrome's sandbox is on (null while closed). |
 | `sandbox_unavailable` | bool | The last start failed only because this system cannot start Chrome's sandbox (for example Ubuntu's AppArmor restriction on unprivileged user namespaces). The app then offers [`POST /api/browser/sandbox`](#post-apibrowsersandbox-owner). |
 | `allow_no_sandbox` | bool | The owner allowed running without the sandbox on such a system. |
+| `sandbox_fix` | object or null | Only with `sandbox_unavailable` and only where AppArmor restricts unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns = 1`): the one-time root step that lets the sandbox start on this machine, `{"kind", "path", "command"}`. `path` is the real path of the browser Iris would start (null if none). `kind` `"apparmor"`: that browser, everything in its directory, and every ancestor are owned by root (or the engines admin user of the privilege split) and not group/other writable, and `command` writes `/etc/apparmor.d/iris-browser` for exactly that path and loads it with `apparmor_parser -r`. `kind` `"setup"`: the browser could be replaced by an unprivileged user, so no profile is offered for it; `command` runs `deploy/setup-engines.sh` (from the Iris source folder) for the account Iris runs as, after which Iris's own browser is installed from the app into the protected engines directory; with it, `install_browser` (bool) is true when the privilege split is configured and that browser is not installed yet, so the app offers [`POST /api/browser/install`](#post-apibrowserinstall-owner). Show `command` to copy; never run it from a client. Holds paths, never secrets. Computed by `GET /api/browser` (live `browser.state` events from the browser itself omit it). |
 | `version` | string or null | Browser version while open. |
 | `error` | string or null | Why the last start failed (for example missing system libraries, with the command that fixes it). |
 | `managed`, `managed_version` | bool, string or null | Installed from the app. |
@@ -2338,7 +2340,9 @@ example a site's sign-in page). Only `http` and `https`; a bare domain gets
 
 `{"allow_without": true | false}`. Iris always starts Chrome with its
 sandbox; where the sandbox cannot start, the browser stays off until the
-owner either fixes the server (see the self-hosting guide) or allows
+owner either fixes the server (`sandbox_fix` in
+[BrowserStatus](#browserstatus) has the command; see the self-hosting
+guide) or allows
 running without it here. The choice is saved. `false` takes it back (and
 closes a browser running without the sandbox, including one that was
 starting). Returns `{"browser":
@@ -2349,7 +2353,10 @@ starting). Returns `{"browser":
 Install (or update) Chromium for Iris, like
 [`POST /api/engines/browser/install`](#post-apienginesnameinstall-post-apienginesnameupdate):
 the official `playwright-core` npm package, then its `install chromium` into
-`<engines dir>/chromium/browsers`, linked as `<engines dir>/bin/browser`.
+`<engines dir>/chromium/browsers`; the build then moves to the fixed
+`<engines dir>/chromium/app` (`app/chrome` on Linux), linked as
+`<engines dir>/bin/browser`, and the download directory is removed. An
+update that pins the same Chromium build downloads nothing.
 Needs Node.js. Returns `{"started": bool, "browser": {BrowserStatus}}`;
 progress arrives as `browser.state`. If Chromium then fails to start for
 missing system libraries, `error` says so; the fix needs root once on the
@@ -2414,7 +2421,7 @@ was emitted). Events are delivered only to the users listed under
 | `models.changed` | `{"slots": [{Slot}]}` | All users |
 | `harness.login` | `{"login": {LoginStatus}}` | The owner |
 | `engines.changed` | `{"engines": [...]}` (as in `GET /api/engines`) | All users |
-| `browser.state` | `{"browser": {BrowserStatus}}` (may omit the setup fields `managed`, `managed_version`, `requires`, `install`; merge into what you have) | The owner |
+| `browser.state` | `{"browser": {BrowserStatus}}` (may omit the setup fields `managed`, `managed_version`, `requires`, `install`, `sandbox_fix`; merge into what you have) | The owner |
 | `browser.active` | `{"conversation_id", "message_id"}` | Conversation members |
 | `browser.done` | `{"conversation_id", "message_id"}` | Conversation members |
 | `connectors.changed` | `{}` | The owner |
