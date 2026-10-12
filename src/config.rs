@@ -3,8 +3,9 @@
 //! Runtime state never lives in the repository:
 //! - config: `$XDG_CONFIG_HOME/iris/config.toml` (default `~/.config/iris`)
 //! - data:   `$XDG_DATA_HOME/iris` (default `~/.local/share/iris`) holding
-//!   `iris.db`, `persona/`, `memory/`, `workspace/` (harness cwd), `uploads/`,
-//!   `library/`, and private key files.
+//!   `iris.db`, `persona/`, `memory/`, `uploads/`,
+//!   `library/`, and private key files. Conversation workdirs are outside
+//!   this private tree, in a sibling workspace or the dedicated agent tree.
 
 use crate::util::Result;
 use serde::{Deserialize, Serialize};
@@ -33,8 +34,26 @@ pub struct Config {
     pub feed: JobConfig,
     pub push: PushConfig,
     pub engines: EnginesConfig,
+    pub agent: AgentConfig,
     pub browser: BrowserConfig,
     pub safety: SafetyConfig,
+}
+
+/// Optional OS privilege split. Paths are provisioned once by the root setup script.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentConfig {
+    pub user: String,
+    pub launcher: String,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            user: String::new(),
+            launcher: "/usr/local/bin/iris".into(),
+        }
+    }
 }
 
 /// Iris's own browser: a headless Chromium the agent drives through the
@@ -340,6 +359,7 @@ impl Default for Config {
             feed: JobConfig::feed_default(),
             push: PushConfig::default(),
             engines: EnginesConfig::default(),
+            agent: AgentConfig::default(),
             browser: BrowserConfig::default(),
             safety: SafetyConfig::default(),
         }
@@ -423,6 +443,15 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        if !self.agent.user.is_empty()
+            && (!crate::agent::valid_scope(&self.agent.user)
+                || !Path::new(&self.agent.launcher).is_absolute())
+        {
+            return Err(
+                "agent.user must be a valid account name and agent.launcher an absolute path"
+                    .into(),
+            );
+        }
         if self.max_concurrent_turns == 0 {
             return Err("max_concurrent_turns must be at least 1".into());
         }
@@ -551,7 +580,13 @@ impl Paths {
     /// Working directory for harness subprocesses. Claude Code scopes
     /// sessions by cwd, so this must stay stable for `--resume` to work.
     pub fn workspace_dir(&self) -> PathBuf {
-        self.data_dir.join("workspace")
+        // Keep even single-user workdirs outside the denied private data tree.
+        let name = self
+            .data_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        self.data_dir.with_file_name(format!("{name}-workspace"))
     }
     /// User-uploaded attachments (images, avatar).
     pub fn uploads_dir(&self) -> PathBuf {

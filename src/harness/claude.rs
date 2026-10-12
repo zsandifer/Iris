@@ -92,7 +92,7 @@ impl Harness for Claude {
         write_private_file(&prompt_file, spec.system_prompt.as_bytes())?;
         inv.temp_files.push(prompt_file.clone());
 
-        if spec.isolated {
+        {
             for var in [
                 "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
                 "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
@@ -137,6 +137,7 @@ impl Harness for Claude {
         // and approvals. Someone else's chat also gets none of the owner's
         // CLAUDE.md files or auto memory (environment above).
         a.push("--strict-mcp-config".into());
+        a.extend(["--setting-sources", ""].map(String::from));
 
         let mut allowed = self.cfg.allowed_tools.clone();
         if !spec.mcp_servers.is_empty() {
@@ -163,6 +164,17 @@ impl Harness for Claude {
             a.push(dir.to_string_lossy().into_owned());
         }
         a.extend(self.cfg.extra_args.iter().cloned());
+        let mut deny = vec!["Bash".to_string()];
+        for path in &spec.protected_paths {
+            // Claude Code 2.1.x anchors `/path` at the working directory;
+            // `//path` is absolute (docs/en/permissions#read-and-edit).
+            let pattern = format!("/{}", path.display());
+            for tool in ["Read", "Edit", "Write", "Glob", "Grep"] {
+                deny.push(format!("{tool}({pattern}/**)"));
+                deny.push(format!("{tool}({pattern})"));
+            }
+        }
+        a.extend(["--disallowedTools".into(), deny.join(",")]);
         inv.stdin = user_message_line(spec)?;
         Ok(inv)
     }
@@ -650,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_invocation() {
+    fn builds_invocation_with_absolute_permission_denials() {
         let tmp = tempfile::tempdir().unwrap();
         let img = tmp.path().join("a.png");
         std::fs::write(&img, b"PNG").unwrap();
@@ -681,6 +693,18 @@ mod tests {
             key_env: vec![],
             isolated: false,
             own_mcp_servers: Vec::new(),
+            protected_paths: vec![
+                "/private/iris".into(),
+                "/private/config".into(),
+                "/private/config/config.toml".into(),
+                "/home/agent/.claude/.credentials.json".into(),
+                "/home/agent/.claude.json".into(),
+                "/home/agent/.codex/auth.json".into(),
+                "/home/agent/.gemini/oauth_creds.json".into(),
+                "/home/agent/.gemini/google_accounts.json".into(),
+                "/home/agent/.local/share/opencode/auth.json".into(),
+            ],
+            split: false,
         };
         let inv = Claude::new(HarnessConfig::claude_default())
             .build(&spec)
@@ -715,7 +739,41 @@ mod tests {
             .build(&spec)
             .unwrap();
         assert!(plain.args.contains(&"--strict-mcp-config".to_string()));
-        assert!(!plain.env.iter().any(|(k, _)| k.contains("MEMORY")));
+        assert!(
+            plain
+                .env
+                .contains(&("CLAUDE_CODE_DISABLE_AUTO_MEMORY".into(), "1".into()))
+        );
+        assert!(
+            plain
+                .env
+                .contains(&("CLAUDE_CODE_DISABLE_CLAUDE_MDS".into(), "1".into()))
+        );
+        let deny_index = plain
+            .args
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .unwrap();
+        let denied: Vec<_> = plain.args[deny_index + 1].split(',').collect();
+        assert_eq!(denied[0], "Bash");
+        for path in [
+            "//private/iris",
+            "//private/config",
+            "//private/config/config.toml",
+            "//home/agent/.claude/.credentials.json",
+            "//home/agent/.claude.json",
+            "//home/agent/.codex/auth.json",
+            "//home/agent/.gemini/oauth_creds.json",
+            "//home/agent/.gemini/google_accounts.json",
+            "//home/agent/.local/share/opencode/auth.json",
+        ] {
+            for tool in ["Read", "Edit", "Write", "Glob", "Grep"] {
+                for suffix in ["", "/**"] {
+                    assert!(denied.contains(&format!("{tool}({path}{suffix})").as_str()));
+                }
+            }
+        }
+        assert_eq!(denied.len(), 1 + spec.protected_paths.len() * 10);
         let mut iso = spec.clone();
         iso.isolated = true;
         let inv = Claude::new(HarnessConfig::claude_default())

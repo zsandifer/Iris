@@ -192,7 +192,7 @@ pub fn harnesses_for(state: &AppState, user: &AuthUser) -> Vec<Value> {
                     Some(f) => serde_json::to_value(f).unwrap_or(Value::Null),
                     None => "manual".into(),
                 };
-                v["login_hint"] = e.harness.manual_login_hint().into();
+                v["login_hint"] = crate::login::manual_login_hint(state, e.harness.as_ref()).into();
                 v["key_options"] = serde_json::to_value(crate::keys::options(e.harness.name()))
                     .unwrap_or_default();
                 v["login"] = serde_json::to_value(state.logins.status(e.harness.name()))

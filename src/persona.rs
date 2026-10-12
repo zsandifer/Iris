@@ -248,14 +248,12 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
         collect_memory(&memory_dir, &memory_dir, 0, &mut entries);
         entries.retain(|(rel, _, _)| rel != "MEMORY.md");
         entries.sort_by(|a, b| a.0.cmp(&b.0));
-        out.push_str(&format!(
-            "\n## Memory\n\nLong-term memory is stored as Markdown files in `{}`. \
-             Read a file when its topic comes up instead of guessing. When you \
-             learn something durable about the user, update the relevant file \
-             (or MEMORY.md for short, always-relevant facts) if you are able to \
-             write files.\n",
-            memory_dir.display()
-        ));
+        out.push_str(
+            "\n## Memory\n\nLong-term memory is stored by Iris as Markdown files. \
+             Use the Iris read_memory tool to read a file when its topic comes up. \
+             Use write_memory to update durable facts (MEMORY.md for short, \
+             always-relevant facts). These tools are only available in the owner's private chats.\n",
+        );
         if entries.is_empty() {
             out.push_str("\n(No other memory files yet.)\n");
         } else {

@@ -2353,6 +2353,7 @@ n=0
 while ! mkdir "{d}/runs/$n" 2>/dev/null; do n=$((n+1)); done
 r="{d}/runs/$n"
 printf '%s\n' "$@" > "$r/args"
+pwd > "$r/cwd"
 prev=""
 for a in "$@"; do
   case "$prev" in
@@ -2556,7 +2557,28 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         t.chat(&t.owner_t, &owner_main, "hi").await;
         let system = t.read(1, "system.md");
         assert!(system.contains("owner-user-fact") && system.contains("owner-memory-fact"));
-        assert!(t.read(1, "args").contains(&memory));
+        assert!(!t.read(1, "args").contains("--add-dir"));
+        assert!(system.contains("read_memory") && system.contains("write_memory"));
+        let guest_main = t.main_of(&t.guest_t).await;
+        assert_eq!(
+            t.read(0, "cwd").trim(),
+            t.h.state
+                .paths
+                .workspace_dir()
+                .join(guest_main)
+                .to_str()
+                .unwrap()
+        );
+        assert_eq!(
+            t.read(1, "cwd").trim(),
+            t.h.state
+                .paths
+                .workspace_dir()
+                .join(&owner_main)
+                .to_str()
+                .unwrap()
+        );
+        assert_ne!(t.read(0, "cwd"), t.read(1, "cwd"));
         // Only Iris's MCP servers there too (the CLI's own would bypass the
         // connector gateway).
         assert!(t.read(1, "args").contains("--strict-mcp-config"));

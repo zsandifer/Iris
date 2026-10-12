@@ -72,9 +72,11 @@ pub struct TurnSpec {
     pub mcp_servers: Vec<McpServer>,
     /// Harness working directory (stable, so sessions can be resumed).
     pub cwd: PathBuf,
-    /// Extra directories the agent may write (memory).
+    /// Additional directories supported by adapters; Iris supplies none.
+    /// Memory is accessed through the service-side MCP bridge.
     pub writable_dirs: Vec<PathBuf>,
-    /// Private directory for per-turn files (0700).
+    /// Per-turn files: private in single-user mode, service-owned and
+    /// group-readable (0750) outside the private data tree in split mode.
     pub run_dir: PathBuf,
     /// Stable key for per-conversation state some CLIs keep on disk
     /// (the conversation id).
@@ -89,6 +91,8 @@ pub struct TurnSpec {
     /// MCP servers configured in the CLI itself, for CLIs that can only
     /// switch them off by name (see `Harness::own_mcp_servers_args`).
     pub own_mcp_servers: Vec<String>,
+    pub protected_paths: Vec<PathBuf>,
+    pub split: bool,
 }
 
 /// The names Iris's MCP servers get in a CLI whose own configuration
@@ -135,6 +139,7 @@ pub struct Invocation {
     pub env: Vec<(String, String)>,
     /// Working directory override (defaults to `TurnSpec::cwd`).
     pub cwd: Option<PathBuf>,
+    pub program: Option<PathBuf>,
 }
 
 /// What a harness can do. Features degrade per flag: images are dropped
@@ -496,5 +501,189 @@ mod tests {
             assert_eq!(set.len(), 2, "{out:?}");
             assert!(!out.contains(&"mail".to_string()), "{out:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    use crate::config::{AgentConfig, HarnessConfig};
+
+    fn spec(dir: &Path) -> TurnSpec {
+        TurnSpec {
+            turn_id: "turn1".into(),
+            prompt: "synthetic user text".into(),
+            images: Vec::new(),
+            system_prompt: "synthetic system prompt".into(),
+            model: "synthetic-model".into(),
+            effort: None,
+            resume: None,
+            mcp_servers: Vec::new(),
+            cwd: dir.join("conversation"),
+            writable_dirs: Vec::new(),
+            run_dir: dir.join("run"),
+            scope: "conversation".into(),
+            key_env: Vec::new(),
+            isolated: false,
+            own_mcp_servers: Vec::new(),
+            protected_paths: vec![
+                "/private/iris".into(),
+                "/private/config".into(),
+                "/agent/home/.codex/auth.json".into(),
+            ],
+            split: false,
+        }
+    }
+
+    #[test]
+    fn every_turn_disables_project_context_and_denies_private_files_in_both_modes() {
+        for split in [false, true] {
+            for isolated in [false, true] {
+                for resume in [false, true] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let mut spec = spec(tmp.path());
+                    std::fs::create_dir_all(&spec.cwd).unwrap();
+                    std::fs::create_dir_all(&spec.run_dir).unwrap();
+                    // These files must never become implicit instructions, including in private turns.
+                    for name in ["AGENTS.md", "CLAUDE.md", "GEMINI.md"] {
+                        std::fs::write(spec.cwd.join(name), "injected").unwrap();
+                    }
+                    spec.split = split;
+                    spec.isolated = isolated;
+                    spec.resume = resume.then(|| "synthetic-session".into());
+                    let harnesses: Vec<Box<dyn Harness>> = vec![
+                        Box::new(claude::Claude::new(HarnessConfig::claude_default())),
+                        Box::new(codex::Codex::new(HarnessConfig::codex_default())),
+                        Box::new(gemini::Gemini::new(HarnessConfig::gemini_default())),
+                        Box::new(opencode::OpenCode::new(HarnessConfig::opencode_default())),
+                    ];
+                    for h in harnesses {
+                        let mut inv = h.build(&spec).unwrap();
+                        assert_eq!(inv.cwd.as_deref().unwrap_or(&spec.cwd), spec.cwd);
+                        match h.name() {
+                            "claude" => {
+                                assert!(inv.env.contains(&(
+                                    "CLAUDE_CODE_DISABLE_CLAUDE_MDS".into(),
+                                    "1".into()
+                                )));
+                                let deny = inv
+                                    .args
+                                    .iter()
+                                    .position(|a| a == "--disallowedTools")
+                                    .unwrap();
+                                for tool in ["Read", "Edit", "Write", "Glob", "Grep"] {
+                                    assert!(
+                                        inv.args[deny + 1]
+                                            .contains(&format!("{tool}(//private/iris/**)"))
+                                    );
+                                }
+                                assert!(inv.args[deny + 1].contains("Bash"));
+                                assert!(
+                                    inv.args.windows(2).any(|a| a == ["--setting-sources", ""])
+                                );
+                            }
+                            "codex" => {
+                                assert!(inv.args.contains(&"project_doc_max_bytes=0".into()));
+                                let profiles = inv
+                                    .args
+                                    .iter()
+                                    .find(|a| a.starts_with("permissions="))
+                                    .unwrap();
+                                let table: toml::Table = toml::from_str(profiles).unwrap();
+                                assert_eq!(
+                                    table["permissions"]["iris"]["filesystem"]["/private/iris"]
+                                        .as_str(),
+                                    Some("deny")
+                                );
+                                assert_eq!(table["permissions"]["iris"]["filesystem"]["/agent/home/.codex/auth.json"].as_str(), Some("deny"));
+                                assert_eq!(
+                                    table["permissions"]["iris"]["filesystem"][":slash_tmp"]
+                                        .as_str(),
+                                    Some("read")
+                                );
+                            }
+                            "gemini" => {
+                                assert!(
+                                    inv.env.contains(&(
+                                        "GEMINI_RESTRICTED_MODE".into(),
+                                        "true".into()
+                                    ))
+                                );
+                                assert!(!inv.args.contains(&"--skip-trust".into()));
+                                let file = inv.args.iter().position(|a| a == "--policy").unwrap();
+                                let policy = std::fs::read_to_string(&inv.args[file + 1]).unwrap();
+                                for tool in [
+                                    "run_shell_command",
+                                    "read_file",
+                                    "write_file",
+                                    "grep",
+                                    "glob",
+                                ] {
+                                    assert!(policy.contains(&format!("toolName = \"{tool}\"")));
+                                }
+                                assert!(!h.capabilities().mcp);
+                            }
+                            "opencode" => {
+                                assert!(inv.env.contains(&(
+                                    "OPENCODE_DISABLE_PROJECT_CONFIG".into(),
+                                    "1".into()
+                                )));
+                                let file = &inv
+                                    .env
+                                    .iter()
+                                    .find(|(k, _)| k == "OPENCODE_CONFIG")
+                                    .unwrap()
+                                    .1;
+                                let cfg: Value =
+                                    serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+                                assert_eq!(cfg["permission"]["read"], "deny");
+                                assert_eq!(cfg["permission"]["bash"], "deny");
+                                assert_eq!(cfg["permission"]["edit"]["/private/iris/**"], "deny");
+                                assert!(inv.args.contains(&"--pure".into()));
+                            }
+                            _ => unreachable!(),
+                        }
+                        let cfg = AgentConfig {
+                            user: if split {
+                                "iris-agent".into()
+                            } else {
+                                String::new()
+                            },
+                            ..Default::default()
+                        };
+                        crate::agent::wrap(&cfg, h.name(), &spec.scope, &mut inv).unwrap();
+                        assert_eq!(inv.program.is_some(), split);
+                        assert!(
+                            !inv.args
+                                .iter()
+                                .any(|a| a.contains("synthetic system prompt"))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_image_files_are_shared_per_turn_without_changing_uploads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("upload.png");
+        std::fs::write(&original, "synthetic image").unwrap();
+        let mut spec = spec(tmp.path());
+        std::fs::create_dir(&spec.run_dir).unwrap();
+        spec.images.push(ImageInput {
+            path: original.clone(),
+            mime: "image/png".into(),
+        });
+        assert!(crate::agent::copy_images(&mut spec).unwrap().is_empty());
+        assert_eq!(spec.images[0].path, original);
+        spec.split = true;
+        let files = crate::agent::copy_images(&mut spec).unwrap();
+        assert!(spec.images[0].path.starts_with(&spec.run_dir));
+        assert_eq!(files, [spec.images[0].path.clone()]);
+        assert_eq!(
+            std::fs::read(&files[0]).unwrap(),
+            std::fs::read(original).unwrap()
+        );
     }
 }

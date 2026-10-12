@@ -186,6 +186,7 @@ Iris to the open internet.
 | `[harness.*]` | | `command`, `models`, `efforts`, permission mode, sandbox, extra args. |
 | `[router]` | | Shared-chat opt-in, rankings override, optional model classifier (below). |
 | `[engines]` | | Engines directory, privileged install helper, daily auto-update. |
+| `[agent]` | `user = ""`, `launcher = "/usr/local/bin/iris"` | Optional OS isolation for CLI turns, status probes and sign-in. |
 | `[heartbeat]`, `[feed]` | disabled | Scheduled jobs with active hours. |
 | `[push]` | enabled | Web Push (VAPID). Needs `vapid_subject` (a `mailto:` URL) unless `public_url` is `https:`. |
 | `[safety]` | | Approval timeout (300 s) and tripwires: sends (5), calls (200), and data read (25 MB) per connector per hour. |
@@ -201,7 +202,7 @@ Data directory layout:
 ├── iris.db          # SQLite (WAL), 0600
 ├── persona/         # IDENTITY.md, SOUL.md, USER.md, TOOLS.md, ...
 ├── memory/          # MEMORY.md plus notes the agent reads and writes
-├── workspace/       # working directory for the CLIs
+├── workspace-legacy/ # old shared cwd, quarantined on upgrade
 ├── library/         # artifacts and media the agent saved
 ├── uploads/         # images you sent, custom avatar
 ├── run/             # per-turn private files (prompt, MCP config), gateway.sock
@@ -295,6 +296,166 @@ install rights.
   for both are added from the app.
 - `uv`, if you want to connect Google.
 - The optional privilege split (`deploy/setup-engines.sh`, as root).
+
+### Isolate the agent from Iris's private data
+
+Use a dedicated Linux account for CLI reasoning and tools. The Iris service
+account owns its database, vault key, config, persona and memory (directories
+0700, files 0600). The `iris-agent` account owns only its CLI home and its
+conversation directories. Linux permissions enforce the boundary even if a
+CLI's tool permissions are bypassed. This protects secrets stored by Iris;
+the agent still receives the system prompt, user messages, selected engine
+API keys, and approved connector results needed for its turn.
+
+Initialize Iris and stop its service as your existing service account first.
+The following commands are examples with the synthetic service account
+`iris-service`; replace it with the account that already runs Iris. Run the
+root commands through your administrator:
+
+```sh
+# Build from the updated checkout, then as iris-service:
+cargo build --release
+install -Dm755 target/release/iris ~/.local/bin/iris
+iris init
+systemctl --user stop iris
+
+# As root, from the checkout; install the root-owned launcher first:
+install -Dm755 target/release/iris /usr/local/bin/iris
+# Installs engine administration AND calls setup-agent-user.sh:
+sh deploy/setup-engines.sh iris-service /usr/local/bin/iris /opt/iris/engines iris-agent
+```
+
+The setup is idempotent. It creates `iris-agent` and its dedicated group,
+`/var/lib/iris-agent/home` (0700), a workspace parent (service-owned 0730,
+agent group), and a turn runtime directory (service-owned 0750, agent group).
+The launcher creates `workspace/<conversation-id>` as `iris-agent`, mode
+0700. The service cannot read these directories directly; library saves use
+a bounded, descriptor-relative file read by the fixed launcher. The script
+validates the exact sudoers rule with `visudo -cf`, installs the root-owned
+path policy `/etc/iris-agent.json`, locks down data/config permissions, and
+prints every change. It adds the service user to the agent group for sharing
+only per-turn files and installs `NoNewPrivileges=no` as a service drop-in.
+It grants **no sudo permissions to the agent account**. It supports one Iris
+service installation per machine. For custom data/config locations, supply
+arguments five and six to `setup-engines.sh` (or run
+`setup-agent-user.sh SERVICE AGENT BINARY DATA CONFIG ENGINES` separately).
+Keep managed engines outside the private data directory, readable by the
+agent and writable only by Iris's engine administrator. The root policy can
+register other absolute CLI paths; their real targets and every ancestor
+must be protected from agent, group and world writes.
+
+Add the printed engine settings and these settings to the service account's
+config:
+
+```toml
+[engines]
+dir = "/opt/iris/engines"
+helper = ["sudo", "-n", "-u", "iris", "/usr/local/bin/iris", "engines"]
+
+[agent]
+user = "iris-agent"
+launcher = "/usr/local/bin/iris"
+```
+
+Restart the service user's **user manager**, so its supplementary group
+membership is refreshed (restarting only the Iris unit is insufficient).
+This stops that user's other user services too; the administrator can run
+`loginctl terminate-user iris-service`, after the user has saved their work.
+Then sign in again as `iris-service`, run `systemctl --user daemon-reload`
+and `systemctl --user start iris`. Existing CLI sign-ins belong to the old
+account: use the app to sign Claude/Codex in again. Gemini's interactive
+sign-in and OpenCode provider setup must also run **as iris-agent**, with
+`HOME=/var/lib/iris-agent/home`, using `runuser` from an administrator's
+terminal. Never copy subscription credential files. `iris status`,
+`/api/harnesses` and `/api/engines` report the mode, CLI user, and auth state
+for that account; Gemini has no auth-status command, so its status stays
+unknown until a turn reports it.
+
+After engines are installed and Iris has created its vault key, run as the
+service account:
+
+```sh
+sh deploy/setup-agent-user.sh --check iris-service iris-agent /usr/local/bin/iris
+sh scripts/e2e/isolation.sh iris-agent
+```
+
+These read-only checks run the exact launcher as `iris-agent`, prove that
+opening `vault.key`, `iris.db` and config returns `PermissionDenied`, and
+verify its UID. They never use arbitrary sudo commands. Root setup is
+required before enabling the split; Iris refuses mismatched accounts,
+paths, unsafe permissions or unregistered CLI paths.
+
+All conversations now have separate working directories. In single-user
+mode the workspace tree is a sibling of the data directory (`iris-workspace`
+by default), keeping it outside the harnesses' denied data paths. On first
+startup old `data/workspace` contents are renamed to
+`data/workspace-legacy` with mode 0700. Existing contents in an unscoped new
+workspace are preserved as `data/workspace-legacy-unscoped`. No files are
+executed or copied into conversation directories, and an existing archive
+is never overwritten. Old CLI sessions are invalidated once so their
+implicit instructions are not resumed; conversation history remains in
+Iris. Changing the agent account also resets CLI sessions.
+
+The agent reads and updates Markdown memory through the existing Iris MCP
+bridge's owner-only `read_memory` / `write_memory` tools, rather than direct
+file access. Split-mode MCP stdio processes are authenticated per-turn
+proxies: the actual bridge and gateway proxies run on Iris's side. Only
+prompt/config/image files and proxy sockets are shared with the agent group
+(0750 directories, 0640 files, 0660 sockets); they are removed when the turn
+ends or at the next startup after a crash. Connector secrets remain in Iris.
+
+Harness restrictions apply in **both** modes, including private and resumed
+turns:
+
+- Claude disables CLAUDE.md and auto-memory loading, disables all settings
+  sources, uses strict MCP configuration, denies Read/Edit/Write/Glob/Grep
+  on Iris data/config and CLI credential files, and denies Bash entirely
+  (shell path patterns cannot cover arbitrary command syntax).
+- Codex retains `workspace-write`, limits writable roots to the conversation,
+  excludes `/tmp` and `$TMPDIR`, disables project documents with
+  `project_doc_max_bytes=0`, and disables CLI memories/apps/plugins. Its named
+  `permissions.iris` profile denies reads of Iris data/config and credential
+  files. Verified against installed Codex CLI 0.162.1 help and its strict
+  config parser: `sandbox_workspace_write.denied_paths` is unsupported;
+  named filesystem profiles support `deny`. See the
+  [official config reference](https://developers.openai.com/codex/config-reference/).
+- Gemini 0.63's `context.fileName=[]` **does not disable GEMINI.md**. Iris
+  uses `GEMINI_RESTRICTED_MODE=true`, which disables initial and just-in-time
+  project context, and CLI policy rules deny shell and local file tools.
+  Extensions are off. Restricted mode also disables MCP and workspace
+  settings, so Gemini cannot use Iris memory, app or connector tools;
+  its capabilities report `mcp=false`. Google sign-in still belongs to the
+  agent account. A user setting requiring folder trust can make Gemini refuse
+  headless runs; Iris never bypasses this by trusting project files. See
+  [Gemini's trust behavior](https://github.com/google-gemini/gemini-cli/blob/v0.63.0/packages/core/src/utils/trust.ts)
+  and [memory context implementation](https://github.com/google-gemini/gemini-cli/blob/v0.63.0/packages/core/src/context/memoryContextManager.ts).
+- OpenCode disables project configuration, Claude context and external
+  plugins (`--pure`) in every turn. Version 1.19 still attaches nested
+  AGENTS.md through its built-in Read tool, so Iris withholds Read, Glob,
+  Grep, Bash and external-directory access; app/connector MCP tools remain
+  available. Edit rules deny private data/config/credential paths. See
+  [OpenCode's instruction loading](https://github.com/anomalyco/opencode/blob/v1.19.0/packages/opencode/src/session/instruction.ts).
+
+Split-mode launch refuses nonempty global Codex/Gemini/OpenCode instruction
+files, which those CLIs cannot completely suppress. Keep the dedicated CLI
+home free of global instruction files. CLI updates may change these
+capabilities; reverify the documented switches before relaxing restrictions.
+
+With `[agent] user = ""`, Iris continues to run CLIs under its own account
+and existing sign-ins remain usable. The conversation layout and harness
+rules still apply, but **there is no OS boundary**: arbitrary code executing
+as that account can read the vault and database. Use the split for secret
+protection. It does not isolate different conversations from each other at
+the Unix-user level, restrict network access, or protect the CLI's own
+subscription credentials against arbitrary code running as that CLI user.
+
+Rollback: as root run
+`sh deploy/setup-agent-user.sh --uninstall iris-service iris-agent /usr/local/bin/iris`,
+set `[agent] user = ""`, and restart Iris. The script removes its policy,
+sudoers rule and service drop-in. It retains the account, home, workspaces
+and service group membership to avoid deleting sign-ins or generated files;
+remove those manually only after saving anything you need. Sign in as the
+service account again. The engine-admin split is independent and remains.
 
 ## Iris's computer (browser)
 
@@ -492,20 +653,18 @@ Both are off by default, respect active hours, and can be triggered manually
 - Saved logins, wallet cards, connector secrets and tokens, and engine API
   keys are encrypted with XChaCha20-Poly1305 using a key in `vault.key`
   (0600). The API never returns them.
-- Connections run on Iris's side behind the approval gate; the CLI only
-  gets a proxy and a per-turn token. Note that the agent's CLI runs as the
-  same user as Iris: the gate stops a confused or misled agent from acting
-  without you through connections, but an agent with unrestricted shell
-  access could read anything that user can. Keep the CLIs' sandboxes on.
-- Data directory files are created with owner-only permissions.
-- The CLIs run with your user's permissions, in their own process groups,
-  with a timeout. Claude Code runs headless with `--permission-mode
-  acceptEdits --permission-prompts none` and a small allow-list; Codex runs
-  with its `workspace-write` sandbox limited to `workspace/` and `memory/`;
-  Gemini CLI runs with `--approval-mode auto_edit` (anything needing approval
-  is not run); OpenCode, which has no OS sandbox, may edit files in
-  `workspace/` and `memory/` while shell commands stay behind an approval
-  that headless runs reject. Adjust all of them in `config.toml`.
+- Connections run on Iris's side behind the approval gate; the CLI gets
+  authenticated per-turn proxies. In split mode Linux permissions prevent
+  the agent account from reading Iris's vault, database and private files.
+  Single-user mode has no such OS boundary.
+- Data directory files are created with owner-only permissions. Memory
+  reads and writes go through the owner-only Iris MCP bridge.
+- CLI turns use a separate working directory for each conversation, a
+  timeout and process-group management. Project documents are disabled for
+  every turn. Claude and Codex have private-path deny rules; Gemini runs
+  restricted with MCP disabled; OpenCode's file-read and shell tools are
+  withheld. The precise CLI limitations are documented in the isolation
+  setup above.
 - Engines installed from the app come only from official sources and are
   verified (checksum or npm integrity); see the privilege split above.
 - Iris's browser is driven over a private pipe (no DevTools port is opened),
@@ -574,16 +733,10 @@ Contributor notes, architecture, and invariants are in
   notes, and connectors.
 - **Logins and cards inside cross-origin frames** (for example embedded
   payment widgets) cannot be filled; take over and type them yourself.
-- **Full engine isolation in other people's chats**: MCP servers the
-  engines have configured themselves (including claude.ai connectors) are
-  off in every Iris turn; in other people's chats Iris also switches off
-  Claude Code's CLAUDE.md files and auto memory, Codex's ChatGPT apps,
-  plugins, and memories, Gemini CLI's extensions, and OpenCode's plugins
-  and Claude Code files. Codex always loads a global `AGENTS.md` (or
-  `AGENTS.override.md`) from its home folder and cannot be told not to, so
-  while one exists Iris does not use Codex for other people's chats.
-  Gemini CLI's global `GEMINI.md` context still applies, so keep personal
-  details out of it if you add people.
+- **CLI context controls**: project instructions are disabled for every
+  turn, and all conversations have separate directories. Gemini restricted
+  mode disables MCP; OpenCode's built-in file reads are withheld because
+  they can inject nested instruction files. See the isolation setup above.
 - **Gemini CLI and OpenCode sign-in from the app**: both need one step on
   the server (see above).
 
