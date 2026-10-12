@@ -120,7 +120,7 @@ const CAPTCHA_SLIDER: &str = r##"<!doctype html><body style="margin:0">
 <div id="h" style="position:absolute;left:10px;top:10px;width:40px;height:40px;background:#36c"></div>
 <script>
 let start = null, moves = 0;
-h.onpointerdown = (e) => { start = e.clientX - h.offsetLeft; h.setPointerCapture(e.pointerId); };
+h.onpointerdown = (e) => { start = e.clientX - h.offsetLeft; h.setPointerCapture(e.pointerId); parent.postMessage('slider-down', '*'); };
 h.onpointermove = (e) => {
   if (start === null) return;
   moves++;
@@ -137,6 +137,14 @@ h.onpointerup = () => {
 };
 parent.postMessage('ready-slider', '*');
 </script></body>"##;
+
+/// A sign-in that checks with its server first and moves on only later
+/// (past the first settle window).
+const LATE_LOGIN_PAGE: &str = r#"<!doctype html><html><head><title>Late</title></head><body>
+<form onsubmit="event.preventDefault(); setTimeout(() => location.href = '/about', 2500)">
+<input name="email" autocomplete="username" aria-label="Email">
+<input name="password" type="password" aria-label="Password"><button>Sign in</button>
+</form></body></html>"#;
 
 const CHECKOUT_PAGE: &str = r#"<!doctype html><html><head><title>Checkout</title></head><body>
 <h1>Pay</h1>
@@ -269,6 +277,8 @@ async fn test_site() -> (u16, Arc<Mutex<Vec<String>>>) {
                                 CAPTCHA_GRID.to_string()
                             } else if line.starts_with("GET /captcha-slider") {
                                 CAPTCHA_SLIDER.to_string()
+                            } else if line.starts_with("GET /late-login") {
+                                LATE_LOGIN_PAGE.to_string()
                             } else if line.starts_with("GET /two-step") {
                                 TWO_STEP_PAGE.to_string()
                             } else if line.starts_with("GET /tricky") {
@@ -1408,9 +1418,19 @@ async fn does_the_web_basics_and_solves_captchas() {
         )
         .await
     });
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    // Take over once the button is down, while the drag is still moving.
+    for _ in 0..400 {
+        if status().await.contains("slider-down") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     state.browser.take_over(&owner, "phone").await.unwrap();
-    let _ = dragging.await;
+    let out = tokio::time::timeout(Duration::from_secs(10), dragging)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.text, super::TAKEN_OVER);
     let mut released = false;
     for _ in 0..20 {
         if status().await.contains("slider-failed") {
@@ -1570,4 +1590,36 @@ async fn does_the_web_basics_and_solves_captchas() {
     call("tabs", json!({"action": "close", "index": 0})).await;
 
     state.browser.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sign_in_that_moves_on_late_is_followed() {
+    let Some((_tmp, state, owner, conv)) = setup() else {
+        return;
+    };
+    let (port, _) = test_site().await;
+    bind_logins(&state, &owner, port);
+    let guard = state
+        .browser
+        .begin_turn(&owner, &conv, "late", std::slice::from_ref(&owner));
+    let call = |name: &'static str, args: Value| {
+        let (st, token) = (state.clone(), guard.token().to_string());
+        async move { tools::call(&st, &token, name, &args).await }
+    };
+    let out = call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/late-login")}),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.text);
+    let out = call("fill_login", json!({"submit": true})).await;
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains("A test shop."), "{}", out.text);
+    assert!(!out.text.contains(PASSWORD));
+    let out = call("snapshot", json!({})).await;
+    assert!(
+        !out.is_error && out.text.contains("A test shop."),
+        "{}",
+        out.text
+    );
 }

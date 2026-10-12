@@ -491,6 +491,9 @@ async fn run_tool(
             }
             settle(events, &page, Duration::from_millis(600)).await;
             release_after_action(run, &page, &before).await?;
+            if eval(run, "info()").await?["tainted"] == true {
+                return Ok(Output::text(STILL_SIGNING_IN));
+            }
             Ok(Output::text(if name == "drag" {
                 "Dragged. Take a screenshot to see the result."
             } else {
