@@ -17,6 +17,8 @@ test('Back always goes one layer up and climbs out of settings', () => {
   assert.equal(up(`iris/connections/${id}/edit`), `iris/connections/${id}`);
   assert.equal(up(`iris/connections/${id}`), 'iris/connections');
   assert.equal(up('iris/computer?view=watch'), 'iris/computer');
+  assert.equal(up(`iris/computer?view=control&return=chat%2F${id}`), `chat/${id}`);
+  assert.equal(up('iris/computer?view=watch&return=settings'), 'iris/computer');
   assert.equal(up('iris/files/memory/notes/a.md?edit=1'), 'iris/files/memory/notes');
   assert.equal(up('iris/files/memory'), 'iris/files');
   assert.equal(up('iris/files/system/SOUL.md'), 'iris/files');

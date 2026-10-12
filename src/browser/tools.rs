@@ -95,6 +95,30 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "click",
             "Click an element (by ref from the latest snapshot). Returns the updated snapshot.",
+            json!({"ref": r(), "double": {"type": "boolean", "description": "Double-click"}}),
+            &["ref"],
+        ),
+        tool(
+            "click_at",
+            "Click a point on the latest screenshot (x, y in its pixels). For what the snapshot \
+             cannot reach: CAPTCHA checkboxes and picture grids, frames from other sites, maps, \
+             canvases. Take a new screenshot afterwards to see the result.",
+            json!({"x": {"type": "number", "minimum": 0}, "y": {"type": "number", "minimum": 0},
+                   "double": {"type": "boolean", "description": "Double-click"}}),
+            &["x", "y"],
+        ),
+        tool(
+            "drag",
+            "Drag from one point on the latest screenshot to another (pixels), like a finger: \
+             sliders, slide-to-verify puzzles, reordering.",
+            json!({"from_x": {"type": "number", "minimum": 0}, "from_y": {"type": "number", "minimum": 0},
+                   "to_x": {"type": "number", "minimum": 0}, "to_y": {"type": "number", "minimum": 0}}),
+            &["from_x", "from_y", "to_x", "to_y"],
+        ),
+        tool(
+            "hover",
+            "Move the mouse over an element (by ref), to open hover menus or tooltips. Returns \
+             the updated snapshot.",
             json!({"ref": r()}),
             &["ref"],
         ),
@@ -154,9 +178,11 @@ pub fn definitions() -> Vec<Value> {
             "fill_login",
             "Sign in with the user's saved login for the current page's site. Iris types the \
              username and password into the page itself; you never see them. Answers \
-             `filled` or `not found`. Afterwards click the sign-in button (for two-step \
-             forms, call it again on the password step).",
-            json!({"site": s("Site the login is for, e.g. example.com (default: the current page)")}),
+             `filled` or `not found`. Set `submit` to press Enter in the filled field \
+             afterwards (best: the page cannot be read until the sign-in moves on). For \
+             two-step forms, call it again on the password step.",
+            json!({"site": s("Site the login is for, e.g. example.com (default: the current page)"),
+                   "submit": {"type": "boolean", "description": "Press Enter after filling to sign in"}}),
             &[],
         ),
         tool(
@@ -187,12 +213,21 @@ quick reading, ordinary web search or fetch tools are fine.
 - `navigate`, then work from the snapshot's refs (`click`, `type`,
   `select_option`, `press_key`); `screenshot` when you need to see the page.
 - Signing in: never ask the user for a password and never type one. Call
-  `fill_login` on the sign-in page; it answers `filled` or `not found`. If
-  `not found`, ask the user to add the login in Logins & wallet, or to take
+  `fill_login` with `submit: true` on the sign-in page. Until the sign-in
+  moves to a new page you cannot read the page; if it asks for a password
+  next, call `fill_login` again; for codes or checks, ask the user to take
+  over. If it answers `not found`, ask the user to add the login in Logins & wallet, or to take
   over the browser and sign in themselves.
 - Paying: call `fill_card` on the payment form. The user approves every use
   in the chat; tell them you are waiting for their OK. Do not place an order
   they have not clearly asked for.
+- Things the snapshot shows as a frame from another site (CAPTCHAs, embedded
+  widgets), maps, and canvases: `screenshot`, then `click_at` or `drag` on
+  what you see, and `screenshot` again to check.
+- CAPTCHAs: you may solve them for the user. Click the \"I'm not a robot\"
+  box; for picture puzzles pick the tiles, then the verify button; drag
+  sliders. If a new puzzle keeps coming after two or three tries, ask the
+  user to take over.
 - If a tool says the user has taken over, wait and try again later.
 ";
 
@@ -351,7 +386,22 @@ async fn run_tool(
         }
         "snapshot" => snapshot(run).await,
         "click" => {
-            let p = eval_mut(run, b, ctx, &format!("point({})", json!(arg("ref")))).await?;
+            let at = format!("point({})", json!(arg("ref")));
+            let mut p = eval_mut(run, b, ctx, &at).await?;
+            if let Some(e) = p["error"].as_str() {
+                return Ok(Output::error(stale_message(e)));
+            }
+            // Moving the mouse can change the page (a hover menu closing
+            // shifts what is below it): move first, then aim again.
+            b.check_agent(ctx)?;
+            cdp.call(
+                "Input.dispatchMouseEvent",
+                json!({"type": "mouseMoved", "x": p["x"], "y": p["y"]}),
+                s,
+            )
+            .await?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            p = eval_mut(run, b, ctx, &at).await?;
             if let Some(e) = p["error"].as_str() {
                 return Ok(Output::error(stale_message(e)));
             }
@@ -361,10 +411,15 @@ async fn run_tool(
             );
             let before = eval(run, "navigationState()").await?;
             let events = cdp.subscribe();
-            click_at(cdp, s, x, y, &|| b.check_agent(ctx)).await?;
+            let clicks = if a["double"].as_bool().unwrap_or(false) {
+                2
+            } else {
+                1
+            };
+            click_n(cdp, s, x, y, clicks, &|| b.check_agent(ctx)).await?;
             settle(events, &page, Duration::from_millis(600)).await;
             release_after_action(run, &page, &before).await?;
-            let mut out = snapshot(run).await?;
+            let mut out = snapshot_after(run).await?;
             if let Some(c) = p["covered"].as_str() {
                 out.text = format!(
                     "(Note: the click landed on an element on top of it: \"{c}\".)\n\n{}",
@@ -372,6 +427,78 @@ async fn run_tool(
                 );
             }
             Ok(out)
+        }
+        "click_at" | "drag" | "hover" => {
+            let num = |k: &str| a[k].as_f64().filter(|v| v.is_finite() && *v >= 0.0);
+            let guard = || b.check_agent(ctx);
+            let before = eval(run, "navigationState()").await?;
+            let events = cdp.subscribe();
+            if name == "hover" {
+                let p = eval_mut(run, b, ctx, &format!("point({})", json!(arg("ref")))).await?;
+                if let Some(e) = p["error"].as_str() {
+                    return Ok(Output::error(stale_message(e)));
+                }
+                let (x, y) = (
+                    p["x"].as_f64().unwrap_or(0.0),
+                    p["y"].as_f64().unwrap_or(0.0),
+                );
+                guard()?;
+                cdp.call(
+                    "Input.dispatchMouseEvent",
+                    json!({"type": "mouseMoved", "x": x, "y": y}),
+                    s,
+                )
+                .await?;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                return snapshot_after(run).await;
+            }
+            let (Some(x), Some(y)) = (
+                num(if name == "drag" { "from_x" } else { "x" }),
+                num(if name == "drag" { "from_y" } else { "y" }),
+            ) else {
+                return Ok(Output::error(
+                    "Give the point as x and y in screenshot pixels.",
+                ));
+            };
+            let vv = &cdp.call("Page.getLayoutMetrics", json!({}), s).await?["cssVisualViewport"];
+            let (w, h) = (
+                vv["clientWidth"].as_f64().unwrap_or(super::VIEW_W as f64),
+                vv["clientHeight"].as_f64().unwrap_or(VIEW_H as f64),
+            );
+            let inside = |x: f64, y: f64| x <= w && y <= h;
+            if name == "drag" {
+                let (Some(tx), Some(ty)) = (num("to_x"), num("to_y")) else {
+                    return Ok(Output::error("Give the end point as to_x and to_y."));
+                };
+                if !inside(x, y) || !inside(tx, ty) {
+                    return Ok(Output::error(format!(
+                        "That is off the screen (it is {w:.0} by {h:.0}); take a new screenshot."
+                    )));
+                }
+                drag(cdp, s, (x, y), (tx, ty), &guard).await?;
+            } else {
+                if !inside(x, y) {
+                    return Ok(Output::error(format!(
+                        "That is off the screen (it is {w:.0} by {h:.0}); take a new screenshot."
+                    )));
+                }
+                let clicks = if a["double"].as_bool().unwrap_or(false) {
+                    2
+                } else {
+                    1
+                };
+                click_n(cdp, s, x, y, clicks, &guard).await?;
+            }
+            settle(events, &page, Duration::from_millis(600)).await;
+            release_after_action(run, &page, &before).await?;
+            if eval(run, "info()").await?["tainted"] == true {
+                return Ok(Output::text(STILL_SIGNING_IN));
+            }
+            Ok(Output::text(if name == "drag" {
+                "Dragged. Take a screenshot to see the result."
+            } else {
+                "Clicked. Take a screenshot to see the result."
+            }))
         }
         "type" => {
             let text = a.get("text").and_then(Value::as_str).unwrap_or("");
@@ -422,7 +549,7 @@ async fn run_tool(
                 press_key(cdp, s, "Enter", &|| b.check_agent(ctx)).await?;
                 settle(events, &page, Duration::from_millis(800)).await;
                 release_after_action(run, &page, &before).await?;
-                return snapshot(run).await;
+                return snapshot_after(run).await;
             }
             Ok(Output::text("Typed it."))
         }
@@ -457,7 +584,7 @@ async fn run_tool(
             if arg("key") == "Enter" {
                 release_after_action(run, &page, &before).await?;
             }
-            snapshot(run).await
+            snapshot_after(run).await
         }
         "scroll" => {
             let pages = a["pages"].as_f64().unwrap_or(1.0).clamp(0.1, 10.0);
@@ -556,7 +683,50 @@ async fn run_tool(
         }
         "tabs" => tabs(state, ctx, run, a).await,
         "fill_login" => {
-            super::fill::login(state, ctx, run, a.get("site").and_then(Value::as_str)).await
+            let out =
+                super::fill::login(state, ctx, run, a.get("site").and_then(Value::as_str)).await?;
+            if out.text != "filled" || !a["submit"].as_bool().unwrap_or(false) {
+                return Ok(out);
+            }
+            // Enter goes to whatever has focus: only if it is still a
+            // field that was just filled (the last one filled keeps it).
+            let fields = eval(run, "loginFields()").await?;
+            let mut focused = false;
+            for r in [&fields["pass"], &fields["user"]]
+                .iter()
+                .filter_map(|v| v.as_str())
+            {
+                let f = eval_mut(run, b, ctx, &format!("hasFocus({})", json!(r))).await?;
+                focused |= f["ok"] == true;
+            }
+            if !focused {
+                return Ok(Output::text(
+                    "filled, but the page moved the focus elsewhere, so I did not press Enter. \
+                     Ask the user to take over and tap the sign-in button.",
+                ));
+            }
+            let before = eval(run, "navigationState()").await?;
+            let events = cdp.subscribe();
+            press_key(cdp, s, "Enter", &|| b.check_agent(ctx)).await?;
+            settle(events, &page, Duration::from_millis(1500)).await;
+            // Scripted sign-ins often check the password with the server
+            // before moving on: give a late navigation a few seconds.
+            for _ in 0..20 {
+                if run.page().target_id != page.target_id {
+                    break;
+                }
+                // Mid-navigation the page cannot answer: keep waiting.
+                if let Ok(now) = eval(run, "navigationState()").await
+                    && now["doc"] != before["doc"]
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            release_after_action(run, &page, &before).await?;
+            let mut out = snapshot_after(run).await?;
+            out.text = format!("filled and submitted.\n\n{}", out.text);
+            Ok(out)
         }
         "fill_card" => {
             super::fill::card(state, ctx, run, a.get("card").and_then(Value::as_str)).await
@@ -917,6 +1087,22 @@ async fn eval_page(
     Ok(result["value"].clone())
 }
 
+/// Still on a page Iris filled sign-in details into (sites like X keep every
+/// sign-in step on one page): the action ran, the page just cannot be read.
+pub(crate) const STILL_SIGNING_IN: &str = "Done. The page still has the user's sign-in details in it, so it \
+    cannot be read until the sign-in moves to a new page. If it now asks for the password, call \
+    fill_login again with submit; if it asks for a code or a check, ask the user to take over \
+    the browser.";
+
+/// The snapshot after an action. A page that is still locked by a fill is
+/// not a failure of the action.
+async fn snapshot_after(run: &Running) -> Result<Output> {
+    match snapshot(run).await {
+        Err(e) if e.to_string() == TAINTED_PAGE => Ok(Output::text(STILL_SIGNING_IN)),
+        r => r,
+    }
+}
+
 pub async fn snapshot(run: &Running) -> Result<Output> {
     let v = eval(run, &format!("snapshot({SNAPSHOT_CHARS})")).await?;
     let mut text = format!(
@@ -962,6 +1148,98 @@ pub async fn click_at(
     cdp.call("Input.dispatchMouseEvent", ev("mouseReleased"), s)
         .await?;
     Ok(())
+}
+
+/// One or two clicks (a double-click) at a point.
+async fn click_n(
+    cdp: &Cdp,
+    s: Option<&str>,
+    x: f64,
+    y: f64,
+    clicks: u8,
+    guard: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<()> {
+    click_at(cdp, s, x, y, guard).await?;
+    if clicks < 2 {
+        return Ok(());
+    }
+    guard()?;
+    let ev = |t: &str| json!({"type": t, "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 2});
+    cdp.send("Input.dispatchMouseEvent", ev("mousePressed"), s);
+    cdp.call("Input.dispatchMouseEvent", ev("mouseReleased"), s)
+        .await?;
+    Ok(())
+}
+
+/// Press, move in small steps (pages watch the movement), release. The
+/// release is always sent, even if control changes on the way.
+async fn drag(
+    cdp: &Cdp,
+    s: Option<&str>,
+    (x, y): (f64, f64),
+    (tx, ty): (f64, f64),
+    guard: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<()> {
+    guard()?;
+    let ev = |t: &str, x: f64, y: f64| json!({"type": t, "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1});
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        json!({"type": "mouseMoved", "x": x, "y": y}),
+        s,
+    )
+    .await?;
+    guard()?;
+    // The whole call is dropped on takeover or turn end: the release is
+    // queued on drop, so the button is never left held.
+    let mut held = Held {
+        cdp,
+        session: s.map(String::from),
+        at: (x, y),
+        armed: true,
+    };
+    cdp.send("Input.dispatchMouseEvent", ev("mousePressed", x, y), s);
+    let mut moved = Ok(());
+    const STEPS: u32 = 12;
+    for i in 1..=STEPS {
+        if let Err(e) = guard() {
+            moved = Err(e);
+            break;
+        }
+        let f = i as f64 / STEPS as f64;
+        let (mx, my) = (x + (tx - x) * f, y + (ty - y) * f);
+        let _ = cdp
+            .call("Input.dispatchMouseEvent", ev("mouseMoved", mx, my), s)
+            .await;
+        held.at = (mx, my);
+        tokio::time::sleep(Duration::from_millis(16)).await;
+    }
+    let (rx, ry) = if moved.is_ok() { (tx, ty) } else { held.at };
+    held.armed = false;
+    cdp.call("Input.dispatchMouseEvent", ev("mouseReleased", rx, ry), s)
+        .await?;
+    moved
+}
+
+/// A pressed mouse button, released when dropped unless disarmed.
+struct Held<'a> {
+    cdp: &'a Cdp,
+    session: Option<String>,
+    at: (f64, f64),
+    armed: bool,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let (x, y) = self.at;
+            self.cdp.send(
+                "Input.dispatchMouseEvent",
+                json!({"type": "mouseReleased", "x": x, "y": y, "button": "left",
+                       "buttons": 0, "clickCount": 1}),
+                self.session.as_deref(),
+            );
+        }
+    }
 }
 
 /// (key, code, Windows virtual key code, text) for named keys.

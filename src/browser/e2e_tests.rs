@@ -1,8 +1,10 @@
 //! End-to-end tests against a real Chromium, when one is installed (they
-//! pass trivially otherwise). A tiny local web server plays a sign-in page
-//! and a checkout page; the tests drive them through the same tool entry
-//! point the MCP bridge uses and check that secrets reach the page but
-//! never a tool result.
+//! pass trivially otherwise, except in CI, where `IRIS_REQUIRE_BROWSER`
+//! makes a missing Chromium a failure). A tiny local web server plays a
+//! sign-in page, a checkout page, and a page of web basics with CAPTCHA-
+//! style widgets; the tests drive them through the same tool entry point
+//! the MCP bridge uses and check that secrets reach the page but never a
+//! tool result.
 
 use super::tools;
 use crate::config::{Config, Paths};
@@ -36,6 +38,113 @@ const LOGIN_PAGE: &str = r#"<!doctype html><html><head><title>Test Shop sign in<
 </form>
 <p>New here? <a href="/about">About the shop</a></p>
 </body></html>"#;
+
+/// A one-page, two-step sign-in (like X): the username step swaps itself
+/// for a password step without a new document or path.
+const TWO_STEP_PAGE: &str = r#"<!doctype html><html><head><title>Two step</title></head><body>
+<form id="f" method="post" action="/login"><div id="step">
+<input name="email" autocomplete="username" aria-label="Phone, email, or username">
+</div><button>Next</button></form>
+<script>
+f.onsubmit = (e) => {
+  if (document.querySelector('input[type=password]')) return;
+  e.preventDefault();
+  const u = f.email.value;
+  step.innerHTML = '<input type="hidden" name="email"><input type="password" name="password" aria-label="Password">';
+  f.email.value = u;
+};
+</script></body></html>"#;
+
+/// Everyday web basics on one page, plus three CAPTCHA-style widgets, each
+/// in a frame from another origin (like reCAPTCHA, hCaptcha, Turnstile) so
+/// the snapshot cannot reach into them. Results land in `#status`.
+const BASICS_PAGE: &str = r##"<!doctype html><html><head><title>Basics</title>
+<meta name="viewport" content="width=device-width">
+<style>body{margin:8px;font:16px sans-serif} iframe{border:0;display:block;margin:4px 0}
+#menu .items{display:none} #menu:hover .items{display:block}</style></head><body>
+<h1>Basics</h1>
+<p id="status">Status:</p>
+<iframe title="Robot check" src="http://localhost:PORT/captcha-box" width="300" height="80"></iframe>
+<iframe title="Picture check" src="http://localhost:PORT/captcha-grid" width="270" height="310"></iframe>
+<iframe title="Slider check" src="http://localhost:PORT/captcha-slider" width="320" height="60"></iframe>
+<input id="q" aria-label="Search" onkeydown="if (event.key === 'Enter') say('searched ' + this.value)">
+<button ondblclick="say('doubled')">Double me</button>
+<div id="menu"><button>Menu</button><div class="items"><a href="/about">Hidden item</a></div></div>
+<button onclick="alert('Hello'); say('after-alert')">Alert me</button>
+<button onclick="setTimeout(() => say('loaded-late'), 1500)">Load later</button>
+<a href="/about" target="_blank">Open popup</a>
+<a href="/about">About link</a>
+<div id="host"></div>
+<iframe title="Inner" srcdoc="<button onclick=&quot;this.textContent='Inner clicked'&quot;>Inner button</button>"></iframe>
+<div style="height:3000px"></div><p>Bottom of page</p>
+<script>
+function say(t) { document.getElementById('status').textContent += ' ' + t; }
+addEventListener('message', (e) => say(String(e.data)));
+document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML =
+  '<button onclick="this.textContent = \'Shadow clicked\'">Shadow button</button>';
+</script></body></html>"##;
+
+/// "I'm not a robot": a box that only counts when the box itself is clicked.
+const CAPTCHA_BOX: &str = r##"<!doctype html><body style="margin:0">
+<div id="box" role="checkbox" aria-label="I'm not a robot"
+  style="position:absolute;left:20px;top:20px;width:40px;height:40px;border:2px solid #555"></div>
+<script>
+box.onclick = () => { box.style.background = 'green'; parent.postMessage('robot-passed', '*'); };
+parent.postMessage('ready-box', '*');
+</script></body>"##;
+
+/// Pick the right tiles (unlabeled colors only a screenshot shows), then Verify.
+const CAPTCHA_GRID: &str = r##"<!doctype html><body style="margin:0">
+<div id="g" style="display:grid;grid-template-columns:repeat(3,90px);grid-auto-rows:90px"></div>
+<div id="v" style="position:absolute;left:0;top:270px;width:270px;height:40px;background:#36c"></div>
+<script>
+const want = [0, 4, 8], picked = new Set();
+for (let i = 0; i < 9; i++) {
+  const t = document.createElement('div');
+  t.style.background = want.includes(i) ? 'red' : 'gray';
+  t.style.outline = '1px solid white';
+  t.onclick = () => { picked.has(i) ? picked.delete(i) : picked.add(i); t.style.opacity = picked.has(i) ? 0.5 : 1; };
+  g.appendChild(t);
+}
+v.onclick = () => {
+  const ok = picked.size === want.length && want.every((i) => picked.has(i));
+  parent.postMessage(ok ? 'grid-passed' : 'grid-failed', '*');
+  picked.clear();
+};
+parent.postMessage('ready-grid', '*');
+</script></body>"##;
+
+/// Slide to verify: drag the handle to the end of the track.
+const CAPTCHA_SLIDER: &str = r##"<!doctype html><body style="margin:0">
+<div style="position:absolute;left:10px;top:10px;width:300px;height:40px;background:#ddd"></div>
+<div id="h" style="position:absolute;left:10px;top:10px;width:40px;height:40px;background:#36c"></div>
+<script>
+let start = null, moves = 0;
+h.onpointerdown = (e) => { start = e.clientX - h.offsetLeft; h.setPointerCapture(e.pointerId); parent.postMessage('slider-down', '*'); };
+h.onpointermove = (e) => {
+  if (start === null) return;
+  moves++;
+  h.style.left = Math.max(10, Math.min(270, e.clientX - start)) + 'px';
+};
+h.onpointerup = () => {
+  if (start === null) return;
+  start = null;
+  // A jump straight to the end is a robot: a person moves on the way.
+  const ok = h.offsetLeft >= 260 && moves > 3;
+  parent.postMessage(ok ? 'slider-passed' : 'slider-failed', '*');
+  // A failed try snaps back, like real sliders.
+  if (!ok) { h.style.left = '10px'; moves = 0; }
+};
+parent.postMessage('ready-slider', '*');
+</script></body>"##;
+
+/// A sign-in that checks with its server first and moves on only later
+/// (past the first settle window).
+const LATE_LOGIN_PAGE: &str = r#"<!doctype html><html><head><title>Late</title></head><body>
+<form onsubmit="event.preventDefault(); setTimeout(() => location.href = '/about', 2500)">
+<input name="email" autocomplete="username" aria-label="Email">
+<input name="password" type="password" aria-label="Password"><button>Sign in</button>
+</form></body></html>"#;
 
 const CHECKOUT_PAGE: &str = r#"<!doctype html><html><head><title>Checkout</title></head><body>
 <h1>Pay</h1>
@@ -160,6 +269,18 @@ async fn test_site() -> (u16, Arc<Mutex<Vec<String>>>) {
                                 r#"<!doctype html><title>Sign in</title><input name="password" type="password" aria-label="Password" oninput="location.href='/sink#'+Array.from(this.value).map(c=>c.charCodeAt(0).toString(16).padStart(2,'0')).join('')">"#.into()
                             } else if line.starts_with("GET /sink") {
                                 r#"<!doctype html><title>Sink</title><h1>Sink</h1><p id="echo"></p><script>echo.textContent=location.hash;document.title=location.hash</script>"#.into()
+                            } else if line.starts_with("GET /basics") {
+                                BASICS_PAGE.replace("PORT", &port.to_string())
+                            } else if line.starts_with("GET /captcha-box") {
+                                CAPTCHA_BOX.to_string()
+                            } else if line.starts_with("GET /captcha-grid") {
+                                CAPTCHA_GRID.to_string()
+                            } else if line.starts_with("GET /captcha-slider") {
+                                CAPTCHA_SLIDER.to_string()
+                            } else if line.starts_with("GET /late-login") {
+                                LATE_LOGIN_PAGE.to_string()
+                            } else if line.starts_with("GET /two-step") {
+                                TWO_STEP_PAGE.to_string()
                             } else if line.starts_with("GET /tricky") {
                                 TRICKY_PAGE.to_string()
                             } else if line.starts_with("GET /saved") {
@@ -195,6 +316,28 @@ fn ref_of(snapshot: &str, needle: &str) -> String {
     line[start..].split(']').next().unwrap().to_string()
 }
 
+/// Where a frame from another site sits on the screenshot, from its
+/// snapshot line (`... frame at x=8 y=60, 300x80: ...`).
+fn frame_at(snapshot: &str, title: &str) -> (f64, f64) {
+    let line = snapshot
+        .lines()
+        .find(|l| l.contains(&format!("iframe \"{title}\"")))
+        .unwrap_or_else(|| panic!("no {title} frame in:\n{snapshot}"));
+    let num = |key: &str| -> f64 {
+        let i = line
+            .find(key)
+            .unwrap_or_else(|| panic!("no {key} in {line}"))
+            + key.len();
+        line[i..]
+            .split(|c: char| !c.is_ascii_digit() && c != '-')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    (num(" x="), num(" y="))
+}
+
 fn bind_logins(state: &AppState, owner: &str, port: u16) {
     state
         .db
@@ -216,6 +359,11 @@ fn bind_logins(state: &AppState, owner: &str, port: u16) {
 /// wallet card. None when no Chromium is installed.
 fn setup() -> Option<(tempfile::TempDir, AppState, String, String)> {
     if super::launch::find("").is_none() {
+        // CI sets this so the browser tests can never pass by skipping.
+        assert!(
+            std::env::var_os("IRIS_REQUIRE_BROWSER").is_none(),
+            "IRIS_REQUIRE_BROWSER is set but no Chromium was found"
+        );
         eprintln!("no Chromium found; skipping the browser end-to-end test");
         return None;
     }
@@ -649,7 +797,7 @@ async fn reflected_secrets_pending_and_denied_cards_and_stale_refs() {
     let out = call("click", json!({"ref": show})).await;
     outputs.push(out.text.clone());
     assert!(
-        out.is_error && out.text == tools::TAINTED_PAGE,
+        !out.is_error && out.text == tools::STILL_SIGNING_IN,
         "{}",
         out.text
     );
@@ -879,7 +1027,7 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
     assert!(snap.is_error && snap.text == tools::TAINTED_PAGE);
     let after = call("click", json!({"ref": go})).await;
     assert!(
-        after.is_error && after.text == tools::TAINTED_PAGE,
+        !after.is_error && after.text == tools::STILL_SIGNING_IN,
         "{}",
         after.text
     );
@@ -1147,4 +1295,331 @@ async fn login_matching_uses_the_origin_even_when_the_display_port_is_redacted()
     let filled = tools::call(&state, guard.token(), "fill_login", &json!({})).await;
     assert_eq!(filled.text, "filled");
     state.browser.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_page_two_step_sign_in_submits_without_reading() {
+    let Some((_tmp, state, owner, conv)) = setup() else {
+        return;
+    };
+    let (port, posted) = test_site().await;
+    bind_logins(&state, &owner, port);
+    let guard = state
+        .browser
+        .begin_turn(&owner, &conv, "two-step", std::slice::from_ref(&owner));
+    let call = |name: &'static str, args: Value| {
+        let (st, token) = (state.clone(), guard.token().to_string());
+        async move { tools::call(&st, &token, name, &args).await }
+    };
+    let out = call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/two-step")}),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.text);
+    // Username step: filled and submitted, but the page stays locked.
+    let out = call("fill_login", json!({"submit": true})).await;
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains(tools::STILL_SIGNING_IN), "{}", out.text);
+    // Password step on the same page: signs in and the page reads again.
+    let out = call("fill_login", json!({"submit": true})).await;
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains("Welcome back"), "{}", out.text);
+    assert!(!out.text.contains(PASSWORD));
+    let p = posted.lock().unwrap();
+    let body = p.first().expect("the form was posted");
+    assert!(body.contains("password=S3cret-Pa55-xyz%21"), "{body}");
+}
+
+/// Every basic the agent relies on, against a real Chromium: typing and
+/// Enter, keys, double-click, hover menus, dialogs, delayed text, shadow
+/// DOM, same-site frames, scrolling, Back, popups and tabs, screenshots,
+/// and three CAPTCHA-style widgets in frames from another site (checkbox,
+/// picture grid, slider) solved by position from the screenshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn does_the_web_basics_and_solves_captchas() {
+    let Some((_tmp, state, owner, conv)) = setup() else {
+        return;
+    };
+    let (port, _) = test_site().await;
+    let guard = state
+        .browser
+        .begin_turn(&owner, &conv, "basics", std::slice::from_ref(&owner));
+    let call = |name: &'static str, args: Value| {
+        let (st, token) = (state.clone(), guard.token().to_string());
+        async move {
+            let out = tools::call(&st, &token, name, &args).await;
+            assert!(!out.is_error, "{name} {args}: {}", out.text);
+            out
+        }
+    };
+    let status = || async {
+        let run = state.browser.running().unwrap();
+        run.cdp
+            .call(
+                "Runtime.evaluate",
+                json!({"expression": "document.getElementById('status')?.textContent ?? ''",
+                       "returnByValue": true}),
+                Some(&run.page().session_id),
+            )
+            .await
+            .unwrap()["result"]["value"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    let url = format!("http://127.0.0.1:{port}/basics");
+    call("navigate", json!({"url": url})).await;
+    // The frames say when they are ready; waiting for text sees it.
+    for ready in ["ready-box", "ready-grid", "ready-slider"] {
+        let out = call("wait", json!({"text": ready, "seconds": 10})).await;
+        assert!(out.text.contains(ready), "{}", out.text);
+    }
+    let snap = call("snapshot", json!({})).await.text;
+    assert!(snap.contains("another site's frame at x="), "{snap}");
+
+    // A screenshot is available to look at the puzzles.
+    let shot = call("screenshot", json!({})).await;
+    assert!(shot.image.as_ref().is_some_and(|i| i.len() > 1000));
+
+    // Checkbox CAPTCHA: a click beside the box does nothing, on it passes.
+    let (bx, by) = frame_at(&snap, "Robot check");
+    call("click_at", json!({"x": bx + 200.0, "y": by + 40.0})).await;
+    assert!(!status().await.contains("robot-passed"));
+    call("click_at", json!({"x": bx + 40.0, "y": by + 40.0})).await;
+    assert!(
+        status().await.contains("robot-passed"),
+        "{}",
+        status().await
+    );
+
+    // Picture CAPTCHA: a wrong pick fails, the right tiles pass.
+    let (gx, gy) = frame_at(&snap, "Picture check");
+    let tile = |i: usize| json!({"x": gx + 45.0 + 90.0 * (i % 3) as f64, "y": gy + 45.0 + 90.0 * (i / 3) as f64});
+    let verify = json!({"x": gx + 135.0, "y": gy + 290.0});
+    call("click_at", tile(1)).await;
+    call("click_at", verify.clone()).await;
+    assert!(status().await.contains("grid-failed"), "{}", status().await);
+    for i in [0, 4, 8] {
+        call("click_at", tile(i)).await;
+    }
+    call("click_at", verify).await;
+    assert!(status().await.contains("grid-passed"), "{}", status().await);
+
+    // Taking over mid-drag lets go of the button (the page sees pointerup).
+    let (sx, sy) = frame_at(&snap, "Slider check");
+    let (st, tk) = (state.clone(), guard.token().to_string());
+    let dragging = tokio::spawn(async move {
+        tools::call(
+            &st,
+            &tk,
+            "drag",
+            &json!({"from_x": sx + 30.0, "from_y": sy + 30.0, "to_x": sx + 305.0, "to_y": sy + 30.0}),
+        )
+        .await
+    });
+    // Take over once the button is down, while the drag is still moving.
+    for _ in 0..400 {
+        if status().await.contains("slider-down") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    state.browser.take_over(&owner, "phone").await.unwrap();
+    let out = tokio::time::timeout(Duration::from_secs(10), dragging)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.text, super::TAKEN_OVER);
+    let mut released = false;
+    for _ in 0..20 {
+        if status().await.contains("slider-failed") {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(released, "the button stayed held: {}", status().await);
+    state.browser.hand_back();
+
+    // Slider CAPTCHA: drag the handle all the way, moving on the way.
+    call(
+        "drag",
+        json!({"from_x": sx + 30.0, "from_y": sy + 30.0, "to_x": sx + 305.0, "to_y": sy + 30.0}),
+    )
+    .await;
+    let st = status().await;
+    assert!(st.contains("slider-passed"), "{st}");
+
+    // Off-screen points are refused, not clicked somewhere else.
+    let out = tools::call(
+        &state,
+        guard.token(),
+        "click_at",
+        &json!({"x": 5000, "y": 10}),
+    )
+    .await;
+    assert!(
+        out.is_error && out.text.contains("off the screen"),
+        "{}",
+        out.text
+    );
+
+    // Typing, then Enter as its own key press.
+    let search = ref_of(&snap, "textbox \"Search\"");
+    call("type", json!({"ref": search, "text": "otters"})).await;
+    call("press_key", json!({"key": "Enter"})).await;
+    assert!(
+        status().await.contains("searched otters"),
+        "{}",
+        status().await
+    );
+    // Typing with submit.
+    call(
+        "type",
+        json!({"ref": search, "text": "beavers", "submit": true}),
+    )
+    .await;
+    assert!(status().await.contains("searched beavers"));
+
+    // Double-click.
+    let dbl = ref_of(&snap, "button \"Double me\"");
+    call("click", json!({"ref": dbl, "double": true})).await;
+    assert!(status().await.contains("doubled"));
+
+    // Hover opens a menu that is hidden otherwise.
+    assert!(!snap.contains("Hidden item"));
+    let out = call("hover", json!({"ref": ref_of(&snap, "button \"Menu\"")})).await;
+    assert!(out.text.contains("Hidden item"), "{}", out.text);
+
+    // Dialogs are answered and reported, and the page carries on.
+    let out = call(
+        "click",
+        json!({"ref": ref_of(&snap, "button \"Alert me\"")}),
+    )
+    .await;
+    assert!(out.text.contains("alert was accepted"), "{}", out.text);
+    assert!(status().await.contains("after-alert"));
+
+    // Waiting for text that shows up later.
+    call(
+        "click",
+        json!({"ref": ref_of(&snap, "button \"Load later\"")}),
+    )
+    .await;
+    let out = call("wait", json!({"text": "loaded-late", "seconds": 10})).await;
+    assert!(out.text.contains("loaded-late"), "{}", out.text);
+
+    // Shadow DOM and a same-site frame are readable and clickable.
+    let out = call(
+        "click",
+        json!({"ref": ref_of(&snap, "button \"Shadow button\"")}),
+    )
+    .await;
+    assert!(out.text.contains("Shadow clicked"), "{}", out.text);
+    let out = call(
+        "click",
+        json!({"ref": ref_of(&snap, "button \"Inner button\"")}),
+    )
+    .await;
+    assert!(out.text.contains("Inner clicked"), "{}", out.text);
+
+    // Scrolling moves the page.
+    call("scroll", json!({"direction": "down", "pages": 3})).await;
+    let run = state.browser.running().unwrap();
+    let y = run
+        .cdp
+        .call(
+            "Runtime.evaluate",
+            json!({"expression": "scrollY", "returnByValue": true}),
+            Some(&run.page().session_id),
+        )
+        .await
+        .unwrap()["result"]["value"]
+        .as_f64()
+        .unwrap();
+    assert!(y > 500.0, "scrollY {y}");
+    call("scroll", json!({"direction": "up", "pages": 10})).await;
+
+    // A link, then Back.
+    let snap = call("snapshot", json!({})).await.text;
+    let out = call(
+        "click",
+        json!({"ref": ref_of(&snap, "link \"About link\"")}),
+    )
+    .await;
+    assert!(out.text.contains("A test shop."), "{}", out.text);
+    let out = call("back", json!({})).await;
+    assert!(out.text.contains("Basics"), "{}", out.text);
+
+    // A link that opens a new tab is followed; tabs list, switch, close.
+    let snap = call("snapshot", json!({})).await.text;
+    call(
+        "click",
+        json!({"ref": ref_of(&snap, "link \"Open popup\"")}),
+    )
+    .await;
+    let mut followed = false;
+    for _ in 0..50 {
+        let out = call("snapshot", json!({})).await;
+        if out.text.contains("A test shop.") {
+            followed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(followed, "the new tab was not followed");
+    let list = call("tabs", json!({"action": "list"})).await.text;
+    let basics: u64 = list
+        .lines()
+        .find(|l| l.contains("/basics"))
+        .and_then(|l| l.split(':').next())
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no basics tab in {list}"));
+    let out = call("tabs", json!({"action": "select", "index": basics})).await;
+    assert!(out.text.contains("Basics"), "{}", out.text);
+    let out = call(
+        "tabs",
+        json!({"action": "new", "url": format!("http://127.0.0.1:{port}/about")}),
+    )
+    .await;
+    assert!(out.text.contains("A test shop."), "{}", out.text);
+    let list = call("tabs", json!({"action": "list"})).await.text;
+    let n = list.lines().filter(|l| l.contains(':')).count();
+    assert!(n >= 3, "{list}");
+    call("tabs", json!({"action": "close", "index": 0})).await;
+
+    state.browser.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sign_in_that_moves_on_late_is_followed() {
+    let Some((_tmp, state, owner, conv)) = setup() else {
+        return;
+    };
+    let (port, _) = test_site().await;
+    bind_logins(&state, &owner, port);
+    let guard = state
+        .browser
+        .begin_turn(&owner, &conv, "late", std::slice::from_ref(&owner));
+    let call = |name: &'static str, args: Value| {
+        let (st, token) = (state.clone(), guard.token().to_string());
+        async move { tools::call(&st, &token, name, &args).await }
+    };
+    let out = call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/late-login")}),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.text);
+    let out = call("fill_login", json!({"submit": true})).await;
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains("A test shop."), "{}", out.text);
+    assert!(!out.text.contains(PASSWORD));
+    let out = call("snapshot", json!({})).await;
+    assert!(
+        !out.is_error && out.text.contains("A test shop."),
+        "{}",
+        out.text
+    );
 }

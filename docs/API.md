@@ -3532,7 +3532,10 @@ does all the deciding.
 |---|---|---|
 | `navigate` | `url` (http(s); a bare domain gets `https://`) | Snapshot of the page |
 | `snapshot` | none | Snapshot: `Page:` title, `URL:`, then one line per heading, text block, image with alt text, and interactive element (`- button "Sign in" [ref=e3]`, with `value=`, `[checked]`, `[disabled]`, `[expanded]`, link targets, select options). Up to 12,000 characters. |
-| `click` | `ref` | Clicks the element's center with real mouse events, waits for a navigation it starts, returns the new snapshot |
+| `click` | `ref`, `double?` | Clicks (or double-clicks) the element's center with real mouse events, waits for a navigation it starts, returns the new snapshot |
+| `click_at` | `x`, `y` (screenshot pixels), `double?` | Clicks that point; for frames from other sites (CAPTCHAs, widgets), maps, canvases. `Clicked. ...` |
+| `drag` | `from_x`, `from_y`, `to_x`, `to_y` (screenshot pixels) | Press, move in steps, release (sliders, slide-to-verify). `Dragged. ...` |
+| `hover` | `ref` | Moves the mouse over the element (hover menus), returns the snapshot |
 | `type` | `ref`, `text` (max 5,000), `submit?` | Replaces the field's content; with `submit`, presses Enter and returns the new snapshot |
 | `select_option` | `ref`, `value` (option text or value) | `Selected "..."` |
 | `press_key` | `key` | Snapshot |
@@ -3541,7 +3544,7 @@ does all the deciding.
 | `screenshot` | none | Text plus an `image` content block (JPEG of the visible page, 500 px wide) |
 | `wait` | `text?`, `seconds?` (max 30) | Snapshot once the text appears, or after the time |
 | `tabs` | `action` (`list`, `new`, `select`, `close`), `index?`, `url?` | Tab list or snapshot. Tabs a page opens become the current tab. |
-| `fill_login` | `site?` | `filled`, or `not found (<reason>)` |
+| `fill_login` | `site?`, `submit?` | `filled`, or `not found (<reason>)`; with `submit`, presses Enter in the filled field and answers `filled and submitted.` plus the next snapshot |
 | `fill_card` | `card?` (name or last 4 digits) | `filled` (or `filled (but ...)` naming parts that could not be filled), `denied (...)`, `not filled (...)` (expired/cancelled), or `not found (...)` |
 
 Refs are valid until the page changes (they are unique per document, so an
@@ -3553,7 +3556,11 @@ accepted, prompts dismissed) and reported at the top of the next result.
 After a vault secret is filled, every agent read of that document refuses
 with "This page has your password filled in. Submit or leave the page first."
 This includes snapshots, text waits, screenshots, and tab titles/URLs.
-Tainted tabs are listed only by index. Existing refs still work for actions (including submit and Enter).
+Tainted tabs are listed only by index. Existing refs still work for actions (including submit and Enter);
+an action that runs on a page that is still tainted answers with a note
+saying so (not an error), since one-page sign-ins like X keep every step on
+the same document. Frames from other sites appear in snapshots with their
+position on the screenshot, for `click_at`.
 The restriction follows the filled tab across script redirects and reloads.
 It clears after an explicit agent navigation/click (or Enter submission)
 loads a new document whose path differs from the fill page, or after the

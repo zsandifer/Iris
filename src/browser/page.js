@@ -319,7 +319,21 @@ if (!globalThis.__iris) {
             let doc = null;
             try { doc = el.contentDocument; } catch { doc = null; }
             if (doc && doc.body) walk(doc.body, depth + 1, true);
-            else push(`- iframe ${q(clean(el.title || el.name || ''))} (contents not readable)`);
+            else {
+              // Another site's frame (CAPTCHAs, widgets): where it is on the
+              // screenshot, so it can be clicked by position.
+              const r = el.getBoundingClientRect();
+              let x = r.left, y = r.top;
+              let win = el.ownerDocument.defaultView;
+              while (win && win.frameElement) {
+                const fr = win.frameElement.getBoundingClientRect();
+                x += fr.left; y += fr.top;
+                win = win.frameElement.ownerDocument.defaultView;
+              }
+              const at = r.width >= 1 && r.height >= 1
+                ? ` at x=${Math.round(x)} y=${Math.round(y)}, ${Math.round(r.width)}x${Math.round(r.height)}` : '';
+              push(`- iframe ${q(clean(el.title || el.name || ''))} (another site's frame${at}: use screenshot and click_at)`);
+            }
             flush();
             return;
           } else if (t === 'br') {

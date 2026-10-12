@@ -115,6 +115,9 @@ export function parentRoute(hash) {
   const [path, query = ''] = raw.split('?');
   const parts = path.split('/').filter(Boolean);
   const q = new URLSearchParams(query);
+  // A screen opened from a chat (like the browser) closes back to it.
+  const from = q.get('return');
+  if (from && /^chat(\/|$)/.test(from)) return from;
   // A view of the same screen (?view=…, ?edit=…) sits one layer above it.
   if (query && !(parts[1] === 'files' && q.has('edit'))) return parts.join('/') || 'chat';
   const [tab, sub, a] = parts;

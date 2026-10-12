@@ -19,7 +19,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # The browser end-to-end tests (web basics, CAPTCHAs, sign-ins) use
+      # the runner's Chrome and fail rather than skip without it.
       - run: cargo test
+        env:
+          IRIS_REQUIRE_BROWSER: "1"
       # The phone app (web/js) has no build step; its tests use node's own
       # runner and no packages.
       - uses: actions/setup-node@v7
