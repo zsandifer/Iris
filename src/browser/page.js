@@ -9,6 +9,9 @@ if (!globalThis.__iris) {
     const ids = new WeakMap(); // element -> ref
     const secret = new WeakSet(); // fields filled from the vault
     let next = 1;
+    let tainted = false;
+    const TAINTED = 'This page has your password filled in. Submit or leave the page first.';
+    const assertReadable = () => { if (tainted) throw new Error(TAINTED); };
     // Refs and this id are unique per document, so a ref from an earlier
     // page can never point at an element of a later one.
     const letters = () => Array.from(crypto.getRandomValues(new Uint8Array(3)), (b) => 'abcdefghijklmnopqrstuvwxyz'[b % 26]).join('');
@@ -203,7 +206,9 @@ if (!globalThis.__iris) {
       let all = '';
       const owner = [];
       nodes.forEach((n, i) => {
-        for (const ch of n.nodeValue) {
+        // indexOf and length use UTF-16 code units, including surrogate pairs.
+        for (let k = 0; k < n.nodeValue.length; k++) {
+          const ch = n.nodeValue[k];
           if (/\s/.test(ch)) continue;
           all += ch;
           owner.push(i);
@@ -232,6 +237,7 @@ if (!globalThis.__iris) {
     };
 
     function snapshot(max) {
+      assertReadable();
       const lines = [];
       let size = 0;
       let full = false;
@@ -356,7 +362,7 @@ if (!globalThis.__iris) {
       }
       const hit = document.elementFromPoint(x, y);
       let covered = null;
-      if (hit && e.ownerDocument === document && hit !== e && !e.contains(hit) && !hit.contains(e)) {
+      if (!tainted && hit && e.ownerDocument === document && hit !== e && !e.contains(hit) && !hit.contains(e)) {
         covered = clean(hit.innerText || hit.getAttribute('aria-label') || hit.tagName.toLowerCase(), 60);
       }
       return { x, y, covered };
@@ -411,6 +417,8 @@ if (!globalThis.__iris) {
         e.style.setProperty('-webkit-text-security', 'disc', 'important');
         if (!maskedNow(e)) return { ok: false };
       }
+      // Before focus, setters, or events can reflect a transformed secret.
+      tainted = true;
       e.focus();
       const proto = t === 'input' ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
@@ -468,6 +476,7 @@ if (!globalThis.__iris) {
     // visible before a screenshot (never returned to the agent). Masked
     // fields and password fields show dots, so their values are left out.
     function pageText() {
+      assertReadable();
       return docs().map((d) => {
         const out = [d.title, d.location.href, d.body ? d.body.innerText : ''];
         // Open shadow roots too: innerText skips them.
@@ -496,7 +505,7 @@ if (!globalThis.__iris) {
       e.value = o.value;
       e.dispatchEvent(new Event('input', { bubbles: true }));
       e.dispatchEvent(new Event('change', { bubbles: true }));
-      return { ok: true, chosen: clean(o.text, 60) };
+      return { ok: true, chosen: tainted ? '' : clean(o.text, 60) };
     }
 
     // Every same-origin document (main page and readable iframes).
@@ -566,11 +575,17 @@ if (!globalThis.__iris) {
 
     // On the redacted text only: no way to guess a secret piece by piece.
     function hasText(text) {
-      const want = String(text).toLowerCase();
-      return docs().some((d) => redact(d.body ? d.body.innerText : '').toLowerCase().includes(want));
+      // Use the snapshot's masking and visibility rules, including secrets
+      // split across blocks, controls, frames, and shadow roots. Do not cap
+      // the snapshot: waits must also find text beyond the usual read limit.
+      const masked = snapshot(Infinity).text.toLowerCase();
+      return masked.includes(String(text).toLowerCase());
     }
 
     return { snapshot, point, focus, hasFocus, setText, choose, loginFields, cardFields, fillField, pageText, hasText, setSecrets,
-      info: () => ({ url: location.href, title: document.title, origin: location.origin, doc }) };
+      protect: (list) => { if (list.includes(doc)) tainted = true; },
+      isTainted: () => tainted,
+      info: () => ({ url: tainted ? location.origin : redact(location.href),
+        title: tainted ? '' : clean(document.title, 300), origin: location.origin, doc, tainted }) };
   })();
 }

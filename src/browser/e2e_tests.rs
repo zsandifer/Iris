@@ -48,18 +48,22 @@ const CHECKOUT_PAGE: &str = r#"<!doctype html><html><head><title>Checkout</title
 </form></body></html>"#;
 
 /// A sign-in page that echoes what is typed into its password field: in a
-/// dialog, a paragraph, and another field (all must be redacted).
+/// dialog, a paragraph, another field, and transformed metadata. Reads
+/// must refuse until submission loads a new document.
 const REFLECT_PAGE: &str = r#"<!doctype html><html><head><title>Echo sign in</title></head><body>
-<h1>Echo</h1><form>
+<h1>Echo</h1><form method="post" action="/login">
 <input name="email" type="email" autocomplete="username" aria-label="Email">
 <input id="pw" name="password" type="password" aria-label="Password"
   oninput="document.getElementById('echo').textContent = 'You typed ' + this.value;
            document.getElementById('copy').value = this.value; alert('Got ' + this.value);
            const v = this.value, a = v.slice(0, 6), b = v.slice(6);
+           document.title = btoa([...v].reverse().join(''));
+           history.replaceState(null, '', '/reflect#' + btoa(v));
            document.getElementById('split').innerHTML = 'Split: <span>' + a + '</span><span>' + b + '</span>';
            document.getElementById('blocks').innerHTML = '<p>' + a + '</p><p>' + b + '</p><span>' + a + '</span><button>' + b + '</button>'">
 <input id="copy" aria-label="Copy">
 <button type="button" onclick="pw.type = 'text'">Show password</button>
+<button type="submit">Sign in</button>
 </form><p id="echo"></p><p id="split"></p><div id="blocks"></div></body></html>"#;
 
 /// A saved password shown in a masked field (never filled by Iris), one
@@ -358,15 +362,18 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
     assert_eq!(out.text, "filled");
 
     let out = call("snapshot", json!({})).await;
-    assert!(out.text.contains("pat@example.com"), "{}", out.text);
-    assert!(out.text.contains("value=\"••••\""), "{}", out.text);
+    assert!(
+        out.is_error && out.text == tools::TAINTED_PAGE,
+        "{}",
+        out.text
+    );
     outputs.push(out.text.clone());
 
     // Never a picture of a page Iris typed a secret into.
     let shot = call("screenshot", json!({})).await;
     assert!(shot.is_error && shot.image.is_none(), "{}", shot.text);
 
-    let sign_in = ref_of(&out.text, "button \"Sign in\"");
+    let sign_in = ref_of(&snap, "button \"Sign in\"");
     let out = call("click", json!({"ref": sign_in})).await;
     assert!(out.text.contains("Welcome back"), "{}", out.text);
     outputs.push(out.text);
@@ -433,6 +440,32 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
     let out = waiting.await.unwrap();
     assert!(out.text.contains("A test shop"), "{}", out.text);
 
+    let admitted = tokio::spawn(call(
+        "wait",
+        json!({"text": "owner-only text", "seconds": 30}),
+    ));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if state.browser.state_json()["busy"] == true {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    state.browser.take_over(&owner, "dev-1").await.unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(2), admitted)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        stopped.is_error && stopped.text == super::TAKEN_OVER && stopped.image.is_none(),
+        "{}",
+        stopped.text
+    );
+    state.browser.hand_back();
+
     // Cards: the owner approves on a card in the chat, then Iris fills.
     let out = call(
         "navigate",
@@ -440,6 +473,7 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
     )
     .await;
     assert!(out.text.contains("Card number"), "{}", out.text);
+    let pay = ref_of(&out.text, "button \"Pay now\"");
     let approver = decide_next(&state, &conv, true);
     let out = call("fill_card", json!({})).await;
     approver.await.unwrap();
@@ -450,7 +484,11 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
     let snap = call("snapshot", json!({})).await;
     assert!(!snap.text.contains("4242424242424242"), "{}", snap.text);
     outputs.push(snap.text.clone());
-    let pay = ref_of(&snap.text, "button \"Pay now\"");
+    assert!(
+        snap.is_error && snap.text == tools::TAINTED_PAGE,
+        "{}",
+        snap.text
+    );
     call("click", json!({"ref": pay})).await;
     {
         let p = posted.lock().unwrap();
@@ -564,28 +602,63 @@ async fn reflected_secrets_pending_and_denied_cards_and_stale_refs() {
     )
     .await;
     let stale = ref_of(&out.text, "button \"Show password\"");
+    let submit = ref_of(&out.text, "button \"Sign in\"");
     let out = call("fill_login", json!({})).await;
     assert!(out.text.ends_with("filled"), "{}", out.text);
     assert!(out.text.contains("Dialog"), "{}", out.text);
     outputs.push(out.text);
     let snap = call("snapshot", json!({})).await;
-    assert!(snap.text.contains("You typed ••••"), "{}", snap.text);
-    // Split across inline elements, blocks, and a button: every piece hidden.
-    assert!(snap.text.contains("Split: ••••"), "{}", snap.text);
+    assert!(
+        snap.is_error && snap.text == tools::TAINTED_PAGE,
+        "{}",
+        snap.text
+    );
     assert!(
         !snap.text.contains("S3cret-") && !snap.text.contains("Pa55-xyz"),
         "{}",
         snap.text
     );
     outputs.push(snap.text.clone());
-    // Revealed as plain text: still masked in what the agent reads.
-    let show = ref_of(&snap.text, "button \"Show password\"");
+    // Revealed as plain text: actions still work, reads still refuse.
+    let show = stale.clone();
     let out = call("click", json!({"ref": show})).await;
     outputs.push(out.text.clone());
-    assert!(out.text.contains("textbox \"Password\""), "{}", out.text);
+    assert!(
+        out.is_error && out.text == tools::TAINTED_PAGE,
+        "{}",
+        out.text
+    );
     // Pixels cannot be redacted: no screenshot while the page shows it.
     let shot = call("screenshot", json!({})).await;
     assert!(shot.is_error && shot.image.is_none(), "{}", shot.text);
+
+    // Text queries refuse without waiting for the requested deadline, and
+    // tab metadata cannot disclose transformed titles or URL fragments.
+    let waiting = tokio::time::timeout(
+        Duration::from_secs(2),
+        call("wait", json!({"text": "S3", "seconds": 30})),
+    )
+    .await
+    .unwrap();
+    assert!(
+        waiting.is_error && waiting.text == tools::TAINTED_PAGE,
+        "{}",
+        waiting.text
+    );
+    let list = call("tabs", json!({"action": "list"})).await;
+    assert!(list.text.contains(tools::TAINTED_PAGE), "{}", list.text);
+    assert!(
+        !list.text.contains("/reflect") && !list.text.contains('#'),
+        "{}",
+        list.text
+    );
+    // Submission still uses the pre-fill ref and a new document is readable.
+    let submitted = call("click", json!({"ref": submit})).await;
+    assert!(
+        !submitted.is_error && submitted.text.contains("Welcome back"),
+        "{}",
+        submitted.text
+    );
 
     // Refs from an earlier page never hit an element of a later one.
     call(
@@ -645,7 +718,11 @@ async fn reflected_secrets_pending_and_denied_cards_and_stale_refs() {
     approver.await.unwrap();
     assert_eq!(out.text, "filled");
     let snap = call("snapshot", json!({})).await;
-    assert!(snap.text.contains("value=\"08/31\""), "{}", snap.text);
+    assert!(
+        snap.is_error && snap.text == tools::TAINTED_PAGE,
+        "{}",
+        snap.text
+    );
     outputs.push(snap.text);
 
     // The text check on its own, on a site Iris never filled: a saved
@@ -708,7 +785,10 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
     };
     let mut outputs = Vec::new();
     let url = format!("http://localhost:{port}/tricky");
-    outputs.push(call("navigate", json!({"url": url})).await.text);
+    let initial = call("navigate", json!({"url": url})).await;
+    let reveal = ref_of(&initial.text, "button \"Reveal\"");
+    let go = ref_of(&initial.text, "button \"Go\"");
+    outputs.push(initial.text);
     let out = call("fill_login", json!({})).await;
     assert_eq!(out.text, "filled");
     // The focus handler could not redirect the secret into another field.
@@ -735,9 +815,12 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
     // Snapshot and title: the long, quoted secret never shows, not even cut.
     let snap = call("snapshot", json!({})).await;
     outputs.push(snap.text.clone());
-    assert!(snap.text.starts_with("Page: Hi ••••"), "{}", snap.text);
+    assert!(
+        snap.is_error && snap.text == tools::TAINTED_PAGE,
+        "{}",
+        snap.text
+    );
     // Revealed and unmasked by the page, with no other copy: no screenshot.
-    let reveal = ref_of(&snap.text, "button \"Reveal\"");
     outputs.push(call("click", json!({"ref": reveal})).await.text);
     let shot = call("screenshot", json!({})).await;
     assert!(shot.is_error && shot.image.is_none(), "{}", shot.text);
@@ -746,12 +829,7 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
     assert!(out.text.starts_with("not filled"), "{}", out.text);
     let card = approvals(&state, &conv).await.pop().unwrap().card.unwrap();
     assert!(!leaks(&card.to_string()), "{card}");
-    assert!(
-        card["preview"]["subject"]
-            .as_str()
-            .unwrap()
-            .contains("••••")
-    );
+    assert!(!card["preview"]["subject"].as_str().unwrap().contains("Hi "));
     // Switching tabs and back: the app's status shows no echoed secret.
     outputs.push(call("tabs", json!({"action": "new"})).await.text);
     // Tab order is the browser's; pick the tricky page's tab by its address.
@@ -759,7 +837,7 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
     outputs.push(list.clone());
     let index: u64 = list
         .lines()
-        .find(|l| l.contains("/tricky"))
+        .find(|l| l.contains(tools::TAINTED_PAGE))
         .and_then(|l| l.split(':').next())
         .and_then(|n| n.trim().parse().ok())
         .unwrap_or_else(|| panic!("no tricky tab in {list}"));
@@ -772,7 +850,7 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
     assert!(!leaks(&status), "{status}");
     // A GET form puts the password in the address: redacted there too.
     let snap = call("snapshot", json!({})).await;
-    let go = ref_of(&snap.text, "button \"Go\"");
+    assert!(snap.is_error && snap.text == tools::TAINTED_PAGE);
     let after = call("click", json!({"ref": go})).await;
     assert!(
         after.text.contains("tricky?••••") || after.text.contains("password=••••"),

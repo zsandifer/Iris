@@ -168,10 +168,13 @@ async fn type_into(
         // it, or not filled at all: redaction and the screenshot block
         // must survive restarts.
         run.remember_secret(text);
-        run.remember_secret_doc(&pin.doc);
         save_history(state, run)?;
         b.taint_origin(&pin.origin)?;
     }
+    // Any vault fill taints this document, including a username-only
+    // sign-in step. Actions can continue, but agent reads must wait for
+    // a new document. Record it before the page sees the value.
+    run.remember_secret_doc(&pin.doc);
     // Checked again right before the single command that fills.
     let p = eval_mut(
         run,

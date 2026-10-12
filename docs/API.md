@@ -2911,10 +2911,17 @@ does all the deciding.
 
 Refs are valid until the page changes (they are unique per document, so an
 old ref never hits an element of a newer page); a stale ref gets an error
-asking for a new snapshot. Values of password fields, card fields, and
-fields Iris filled from the vault are shown as `••••` in snapshots and
-masked on screen. JavaScript dialogs are answered (alerts and confirms
+asking for a new snapshot. Values of password fields and card fields are
+shown as `••••` in readable snapshots. Fields Iris fills from the vault
+are masked on screen. JavaScript dialogs are answered (alerts and confirms
 accepted, prompts dismissed) and reported at the top of the next result.
+After a vault secret is filled, every agent read of that document refuses
+with "This page has your password filled in. Submit or leave the page first."
+This includes snapshots, text waits, screenshots, and tab titles/URLs beyond
+the origin. Existing refs still work for actions (including submit and Enter).
+A new document clears this restriction; same-document URL changes do not.
+The owner's live screencast is unaffected. Dialog reports contain only their
+kind and outcome, never page-controlled text.
 Text is read exactly as written (adjacent inline elements are not split
 apart), and a secret split across elements, blocks, or controls is found on
 the page's whole text first, hiding every piece. `wait` matches only the
@@ -2946,7 +2953,9 @@ could not be told apart from ordinary text).
 
 Each call waits while the owner has taken over, and checks again once it
 holds the page and right before every command that changes the page, so a
-queued or slow call never acts under the owner's control. When the turn
+queued or slow call never acts under the owner's control. Takeover also
+cancels admitted calls and discards their captured text or pixels before
+returning them, even if control is immediately handed back. When the turn
 ends (finished, cancelled, or failed), its calls stop at once, even in the
 middle of a wait, and nothing more is done for it. Every harness gets a
 per-server timeout of the effective approval window plus 300 seconds, using

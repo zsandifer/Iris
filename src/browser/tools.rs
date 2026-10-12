@@ -23,6 +23,8 @@ pub const SERVER_ALT: &str = "iris_browser";
 /// Helpers injected into an isolated world of each page.
 const PAGE_JS: &str = include_str!("page.js");
 const SNAPSHOT_CHARS: usize = 12_000;
+pub(crate) const TAINTED_PAGE: &str =
+    "This page has your password filled in. Submit or leave the page first.";
 const NAV_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Result of one tool call.
@@ -253,11 +255,9 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Ou
 
     b.set_busy(true);
     let started = std::time::Instant::now();
-    // An ended turn stops its tool at once (and frees the page).
-    let result = tokio::select! {
-        r = run_tool(state, &ctx, &run, name, args) => r,
-        _ = ctx.wait_ended() => Err(super::TURN_ENDED.into()),
-    };
+    // Takeover invalidates admitted calls too, including captured pixels
+    // and polling reads. A hand-back cannot revive an old operation.
+    let result = while_agent(b, &ctx, run_tool(state, &ctx, &run, name, args)).await;
     let mut out = match result {
         Ok(o) => o,
         Err(e) => Output::error(format!("{e}")),
@@ -276,6 +276,28 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Ou
         started.elapsed().as_millis()
     );
     out
+}
+
+/// Cancel an admitted operation on a control change and check once more
+/// immediately before releasing its result, even if it completed first.
+async fn while_agent<T>(
+    b: &super::Browser,
+    ctx: &TurnCtx,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let mut control = b.control.subscribe();
+    b.check_agent(ctx)?;
+    let result = tokio::select! {
+        biased;
+        _ = ctx.wait_ended() => Err(super::TURN_ENDED.into()),
+        _ = control.changed() => Err(super::TAKEN_OVER.into()),
+        r = work => r,
+    };
+    b.check_agent(ctx)?;
+    if control.has_changed().unwrap_or(true) {
+        return Err(super::TAKEN_OVER.into());
+    }
+    result
 }
 
 /// The managed profile is private to the owner, including its cookies.
@@ -414,6 +436,7 @@ async fn run_tool(
                     "That is not a dropdown; click it and pick from what appears instead.",
                 )),
                 Some(e) => Ok(Output::error(stale_message(e))),
+                None if r["chosen"] == "" => Ok(Output::text("Selected it.")),
                 None => Ok(Output::text(format!(
                     "Selected \"{}\".",
                     r["chosen"].as_str().unwrap_or("")
@@ -497,6 +520,9 @@ async fn run_tool(
             let secs = a["seconds"].as_f64().unwrap_or(0.0).clamp(0.0, 30.0);
             let text = arg("text");
             if text.is_empty() {
+                if eval(run, "info()").await?["tainted"] == true {
+                    return Err(TAINTED_PAGE.into());
+                }
                 let secs = if secs == 0.0 { 1.0 } else { secs };
                 tokio::time::sleep(Duration::from_secs_f64(secs)).await;
                 return Ok(Output::text(format!("Waited {secs} seconds.")));
@@ -504,10 +530,10 @@ async fn run_tool(
             let deadline = std::time::Instant::now()
                 + Duration::from_secs_f64(if secs == 0.0 { 10.0 } else { secs });
             loop {
+                b.check_agent(ctx)?;
                 let found = eval(run, &format!("hasText({})", json!(text)))
-                    .await
-                    .ok()
-                    .and_then(|v| v.as_bool())
+                    .await?
+                    .as_bool()
                     .unwrap_or(false);
                 if found {
                     return snapshot(run).await;
@@ -539,8 +565,8 @@ async fn screenshot_safe(
 ) -> Result<Option<&'static str>> {
     const TAINTED: &str = "No screenshots of this page: it shows a site where Iris has filled saved \
         sign-in or card details. Use snapshot instead.";
-    if run.has_secret_doc(info["doc"].as_str().unwrap_or("")) {
-        return Ok(Some(TAINTED));
+    if info["tainted"] == true || run.has_secret_doc(info["doc"].as_str().unwrap_or("")) {
+        return Ok(Some(TAINTED_PAGE));
     }
     let page = run.page();
     let tree = run
@@ -601,6 +627,23 @@ fn stale_message(e: &str) -> String {
         "rejected" => "The page did not accept that text (it changed or cleared it).".into(),
         "hidden" => "That element is not visible right now; take a new snapshot.".into(),
         _ => "That ref is not on the page anymore; take a new snapshot.".into(),
+    }
+}
+
+/// Temporary tab metadata sessions must also detach if takeover cancels
+/// the read while it is awaiting a CDP response.
+struct TabAttachment<'a> {
+    cdp: &'a Cdp,
+    session_id: String,
+}
+
+impl Drop for TabAttachment<'_> {
+    fn drop(&mut self) {
+        self.cdp.send(
+            "Target.detachFromTarget",
+            json!({"sessionId": self.session_id}),
+            None,
+        );
     }
 }
 
@@ -669,17 +712,58 @@ async fn tabs(state: &AppState, ctx: &TurnCtx, run: &Arc<Running>, a: &Value) ->
             Ok(Output::text("Closed the tab."))
         }
         _ => {
-            let current = run.page().target_id;
-            let lines: Vec<String> = pages
-                .iter()
-                .enumerate()
-                .map(|(i, (id, title, url))| {
-                    format!(
-                        "{i}: {title} - {url}{}",
-                        if *id == current { " (current)" } else { "" }
-                    )
-                })
-                .collect();
+            let current = run.page();
+            let mut lines = Vec::new();
+            for (i, (id, _, _)) in pages.iter().enumerate() {
+                // Target metadata is raw page text. Check the document in
+                // its isolated world before returning a title or full URL.
+                let info = if *id == current.target_id {
+                    eval(run, "info()").await?
+                } else {
+                    let attached = cdp
+                        .call(
+                            "Target.attachToTarget",
+                            json!({"targetId": id, "flatten": true}),
+                            None,
+                        )
+                        .await?;
+                    let session = attached["sessionId"]
+                        .as_str()
+                        .ok_or("the tab is not ready")?;
+                    let attachment = TabAttachment {
+                        cdp,
+                        session_id: session.to_string(),
+                    };
+                    let page = super::PageRef {
+                        target_id: id.clone(),
+                        session_id: attachment.session_id.clone(),
+                    };
+                    eval_page(run, &page, "info()", None).await?
+                };
+                if info["tainted"] == true {
+                    // Origins are safe and keep tab indices usable for actions.
+                    lines.push(format!(
+                        "{i}: {TAINTED_PAGE} - {}{}",
+                        info["origin"].as_str().unwrap_or(""),
+                        if *id == current.target_id {
+                            " (current)"
+                        } else {
+                            ""
+                        }
+                    ));
+                } else {
+                    lines.push(format!(
+                        "{i}: {} - {}{}",
+                        info["title"].as_str().unwrap_or(""),
+                        info["url"].as_str().unwrap_or(""),
+                        if *id == current.target_id {
+                            " (current)"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+            }
             Ok(Output::text(lines.join("\n")))
         }
     }
@@ -737,7 +821,15 @@ async fn eval_inner(
     call: &str,
     guard: Option<(&super::Browser, &TurnCtx)>,
 ) -> Result<Value> {
-    let page = run.page();
+    eval_page(run, &run.page(), call, guard).await
+}
+
+async fn eval_page(
+    run: &Running,
+    page: &super::PageRef,
+    call: &str,
+    guard: Option<(&super::Browser, &TurnCtx)>,
+) -> Result<Value> {
     let s = Some(page.session_id.as_str());
     let world = run
         .cdp
@@ -753,19 +845,30 @@ async fn eval_inner(
     // Secrets Iris typed go to its isolated world only, so the helpers can
     // redact any copy before formatting it.
     let secrets = run.secrets();
-    let prelude = if secrets.is_empty() {
-        String::new()
-    } else {
-        format!("__iris.setSecrets({});\n", json!(secrets))
-    };
+    let prelude = format!(
+        "__iris.setSecrets({}); __iris.protect({});\n",
+        json!(secrets),
+        json!(run.secret_docs()),
+    );
     if let Some((b, ctx)) = guard {
         b.check_agent(ctx)?;
     }
+    let expression = format!(
+        r#"{PAGE_JS}
+{prelude}
+(() => {{
+    try {{ return {{ value: __iris.{call} }}; }}
+    catch (e) {{
+        return {{ error: __iris.isTainted() ? {} : String(e) }};
+    }}
+}})()"#,
+        json!(TAINTED_PAGE),
+    );
     let r = run
         .cdp
         .call(
             "Runtime.evaluate",
-            json!({"expression": format!("{PAGE_JS}\n{prelude}__iris.{call}"), "contextId": ctx,
+            json!({"expression": expression, "contextId": ctx,
                    "returnByValue": true}),
             s,
         )
@@ -781,7 +884,11 @@ async fn eval_inner(
         )
         .into());
     }
-    Ok(r["result"]["value"].clone())
+    let result = &r["result"]["value"];
+    if let Some(error) = result["error"].as_str() {
+        return Err(error.to_string().into());
+    }
+    Ok(result["value"].clone())
 }
 
 pub async fn snapshot(run: &Running) -> Result<Output> {
@@ -1040,6 +1147,45 @@ pub(crate) mod tests {
         // Unknown and expired tokens are refused.
         assert!(call(&state, &token, "snapshot", &json!({})).await.is_error);
         assert!(call(&state, "", "snapshot", &json!({})).await.is_error);
+    }
+
+    #[tokio::test]
+    async fn admitted_reads_are_cancelled_and_captured_content_is_discarded_on_takeover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let b = &state.browser;
+        let turn = b.begin_turn("owner", "conv", "m", &[]);
+        let ctx = b.turn(turn.token()).unwrap();
+
+        // A screenshot response completes in the same poll as a takeover
+        // and immediate hand-back. Checking only the current state leaks it.
+        let result = while_agent(b, &ctx, async {
+            b.control.send_replace(super::super::Control::User {
+                user_id: "owner".into(),
+                device_id: "phone".into(),
+            });
+            b.hand_back();
+            Ok(Output {
+                text: "captured during takeover".into(),
+                image: Some("private pixels".into()),
+                is_error: false,
+            })
+        })
+        .await;
+        assert_eq!(result.unwrap_err().to_string(), super::super::TAKEN_OVER);
+
+        // A polling read must stop without waiting for its deadline.
+        let read = while_agent(b, &ctx, async {
+            b.control.send_replace(super::super::Control::User {
+                user_id: "owner".into(),
+                device_id: "phone".into(),
+            });
+            std::future::pending::<Result<Output>>().await
+        });
+        let result = tokio::time::timeout(Duration::from_millis(200), read)
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap_err().to_string(), super::super::TAKEN_OVER);
     }
 
     #[test]

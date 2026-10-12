@@ -196,8 +196,8 @@ pub struct Running {
     /// what the agent reads. Memory only; gone when the browser closes.
     secrets: Mutex<Vec<String>>,
     originals: Mutex<Vec<String>>,
-    /// Documents Iris filled a secret into: never screenshotted (a page can
-    /// paint a value it was given in ways no text check sees).
+    /// Documents Iris filled a secret into: no agent reads (a page can
+    /// transform a value it was given in ways no redactor can recognize).
     secret_docs: Mutex<std::collections::HashSet<String>>,
     /// Serializes recovering from a closed tab.
     recover_lock: tokio::sync::Mutex<()>,
@@ -427,6 +427,10 @@ impl Running {
 
     pub fn has_secret_doc(&self, doc: &str) -> bool {
         lock(&self.secret_docs).contains(doc)
+    }
+
+    pub fn secret_docs(&self) -> Vec<String> {
+        lock(&self.secret_docs).iter().cloned().collect()
     }
 
     /// The secrets themselves (not their encoded forms), for the encrypted
@@ -1270,11 +1274,8 @@ impl Browser {
                 }
                 "Page.javascriptDialogOpening" if current => {
                     let kind = ev.params["type"].as_str().unwrap_or("alert");
-                    // Redact before cutting, so no prefix of a secret survives.
-                    let msg = crate::util::truncate_chars(
-                        &run.redact(ev.params["message"].as_str().unwrap_or("")),
-                        200,
-                    );
+                    // Dialog text is page-controlled and may transform a filled
+                    // secret. Report only the outcome, never its contents.
                     // Alerts and confirms follow from what was just clicked;
                     // prompts would need text, so they are dismissed.
                     let accept = kind != "prompt";
@@ -1285,7 +1286,7 @@ impl Browser {
                             d.remove(0);
                         }
                         d.push(format!(
-                            "{kind} \"{msg}\" was {}",
+                            "{kind} was {}",
                             if accept { "accepted" } else { "dismissed" }
                         ));
                     }

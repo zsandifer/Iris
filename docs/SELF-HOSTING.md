@@ -277,8 +277,11 @@ After pairing your phone you should not need the server again:
 
 For a stricter setup, `deploy/setup-engines.sh` (run once as root) creates a
 separate `iris` system user that owns the engines directory and performs
-installs through a narrow sudo rule. The user running Iris can then run the
-engines but cannot modify them, and never needs download or install rights.
+installs through a narrow sudo rule. The rule includes install, update, and
+uninstall for `browser` (managed Chromium); rerun the script if your rule
+was created before browser support was added. The user running Iris can
+then run the engines but cannot modify them, and never needs download or
+install rights.
 
 ### What still needs the server
 
@@ -331,7 +334,11 @@ out each tool call the CLI makes, nothing more.
   (`fill_login`) or card (`fill_card`) on the current page; Iris types it in
   from the vault and the agent only hears `filled` or `not found`. Logins go
   only to the site they were saved for, over HTTPS. Every card use asks you
-  first with an approval card in the chat.
+  first with an approval card in the chat. After a secret is filled, the agent
+  cannot read that document, query its text, or screenshot it: it can still
+  click the submit button, press Enter, or navigate. Reads resume on a new
+  document (navigation, reload, or a submission that loads a page). The live
+  view on your phone stays available.
 - **Who gets it.** Only the owner's own conversations and jobs (the profile
   holds the owner's sign-ins); never shared chats.
 - **Sandbox.** Iris always starts Chrome with its sandbox. Some systems
