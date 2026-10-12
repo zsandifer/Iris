@@ -1,5 +1,6 @@
-// Connections: the small catalog (Google, GitHub, custom MCP server), the
-// step-by-step setup guides, signing a service in through Iris's callback,
+// Connections: the small catalog (Google, GitHub, one-tap services such as
+// Notion, custom MCP server), the step-by-step setup guides, signing a
+// service in through Iris's callback,
 // each connection's rules ("Reads freely · asks before sending"), its
 // actions, recent use, and the trusted people list.
 import { html, useEffect, useRef, useState } from './h.js';
@@ -13,13 +14,22 @@ import {
 import { ExternalLink } from './external-link.js';
 import { googlePasteError } from './google-paste.js';
 
-const BRAND = { google: '#4285f4', github: '#24292f' };
+// The catalog services Iris sets up itself: name, tile color, and mark.
+const SERVICES = {
+  google: { name: 'Google', bg: '#4285f4', mark: 'G' },
+  github: { name: 'GitHub', bg: '#24292f', mark: 'GH' },
+  notion: { name: 'Notion', bg: '#191919', mark: 'N' },
+  todoist: { name: 'Todoist', bg: '#e44332', mark: 'T' },
+  linear: { name: 'Linear', bg: '#5e6ad2', mark: 'L' },
+  atlassian: { name: 'Atlassian', bg: '#0052cc', mark: 'A' },
+  canva: { name: 'Canva', bg: '#00a3a8', mark: 'C' },
+};
+export const CATALOG_IDS = [...Object.keys(SERVICES), 'custom'];
 
 export function ServiceTile({ c, size = 30 }) {
-  const svc = c.service || c.id;
-  if (BRAND[svc]) {
-    const name = svc === 'google' ? 'G' : 'GH';
-    return html`<div class="tile brand" style=${`width:${size}px;height:${size}px;border-radius:9px;background:${BRAND[svc]};font-size:${svc === 'github' ? 11 : 14}px`}>${name}</div>`;
+  const b = SERVICES[c.service || c.id];
+  if (b) {
+    return html`<div class="tile brand" style=${`width:${size}px;height:${size}px;border-radius:9px;background:${b.bg};font-size:${b.mark.length > 1 ? 11 : 14}px`}>${b.mark}</div>`;
   }
   return html`<${LetterTile} name=${c.name || c.label} size=${size} />`;
 }
@@ -30,7 +40,7 @@ export function humanize(tool) {
   return w ? w[0].toUpperCase() + w.slice(1) : tool;
 }
 
-export const labelOf = (c) => ({ google: 'Google', github: 'GitHub' }[c?.service] || c?.name || 'Connection');
+export const labelOf = (c) => SERVICES[c?.service]?.name || c?.name || 'Connection';
 
 export function statusOf(c) {
   if (!c.enabled) return 'Off';
@@ -92,7 +102,7 @@ export function Connections() {
 
 /** Sign a connection in with the service's own page; finishes through
  * Iris's callback, or by pasting the address when Iris isn't on https. */
-export function ServiceSignIn({ con, label, onDone }) {
+export function ServiceSignIn({ con, label, onDone, auto = false }) {
   useStore();
   const [flow, setFlow] = useState(null);
   const [client, setClient] = useState(null);
@@ -119,6 +129,8 @@ export function ServiceSignIn({ con, label, onDone }) {
     }
     setBusy(false);
   };
+  // Right after one tap on Connect: go straight to the service's page link.
+  useEffect(() => { if (auto) start(); }, []);
   const paste = async (e) => {
     e.preventDefault();
     setBusy(true);
@@ -385,6 +397,38 @@ function GitHubSetup({ entry, con }) {
           : html`<small class="mu">Save the app first.</small>`}</li></ol>`}`;
 }
 
+/** A service with its own hosted server: one Connect button, then approve
+ * on the service's page. Iris registers itself, so there is nothing to
+ * create or paste. */
+function OneTapSetup({ entry, con }) {
+  useStore();
+  const [saved, setSaved] = useState(con || null);
+  const [fresh, setFresh] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const live = (S.connectors || []).find((c) => c.id === saved?.id) || saved;
+  const open = (c) => go(`iris/connections/${c.id}`, true);
+  const connect = async () => {
+    setBusy(true);
+    try {
+      const r = await post(`/connectors/catalog/${seg(entry.id)}`, {});
+      await loadConnectors();
+      if (!r.needs_sign_in) { open(r.connector); return; }
+      setFresh(true);
+      setSaved(r.connector);
+    } catch (e) { toast(e.message); }
+    setBusy(false);
+  };
+  if (live?.auth_state === 'ok') {
+    return html`<div class="ok-line"><${Icon} name="check" /> Connected ✓</div>
+      <button class="b1 wide gap" onClick=${() => open(live)}>Done</button>`;
+  }
+  return html`<p>You'll approve access on ${entry.label}'s own page. Nothing to create or paste.</p>
+    <p class="mu">${agentName()} reads freely and asks you before changing, sending, or deleting anything. You can change that later.</p>
+    ${live ? html`<${ServiceSignIn} con=${live} label=${entry.label} auto=${fresh}
+        onDone=${() => { toast(`${entry.label} is connected`); open(live); }} />`
+      : html`<button class="b1 wide" disabled=${busy} onClick=${connect}>${busy ? 'Connecting…' : 'Connect'}</button>`}`;
+}
+
 export function AddService({ service }) {
   useStore();
   const cat = useCatalog();
@@ -395,7 +439,7 @@ export function AddService({ service }) {
   if (cat && !entry) return html`<${Page} title="Connect"><${Empty} icon="plug" title="Unknown service">Pick one from Connections.<//><//>`;
   if (service === 'google' && entry) return html`<${GoogleSetup} entry=${entry} con=${con} />`;
   return html`<${Page} title=${`Connect ${entry?.label || ''}`} sub=${entry?.description}>
-    ${!cat ? html`<${Spinner} />` : html`<${GitHubSetup} entry=${entry} con=${con} />`}
+    ${!cat ? html`<${Spinner} />` : entry.setup === 'oauth_sign_in' ? html`<${OneTapSetup} entry=${entry} con=${con} />` : html`<${GitHubSetup} entry=${entry} con=${con} />`}
   <//>`;
 }
 
