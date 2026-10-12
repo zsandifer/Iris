@@ -229,6 +229,65 @@ ALTER TABLE goals ADD COLUMN suggested INTEGER NOT NULL DEFAULT 0;
 -- activity log's page cursor); this keeps finding the newest one cheap.
 CREATE INDEX messages_created ON messages(created_at);
 "#,
+    r#"
+-- Connector gateway: per-connector approval rules, catalog service, the
+-- tripwire pause, and sign-in state for OAuth connectors.
+ALTER TABLE connectors ADD COLUMN policy TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE connectors ADD COLUMN service TEXT NOT NULL DEFAULT 'custom';
+ALTER TABLE connectors ADD COLUMN paused_reason TEXT;
+ALTER TABLE connectors ADD COLUMN paused_at INTEGER;
+ALTER TABLE connectors ADD COLUMN auth_state TEXT NOT NULL DEFAULT 'ok';
+-- Connectors saved before the gateway keep running in the workspace (they
+-- may use paths relative to it); new ones get a private folder.
+ALTER TABLE connectors ADD COLUMN workspace_cwd INTEGER NOT NULL DEFAULT 1;
+
+-- Every connector tool call that went through the gateway (activity log,
+-- rate limits). `summary` is a short preview (recipients, subject).
+CREATE TABLE connector_calls (
+    id              TEXT PRIMARY KEY,
+    connector_id    TEXT,
+    connector_name  TEXT NOT NULL,
+    tool            TEXT NOT NULL,
+    category        TEXT NOT NULL,
+    decision        TEXT NOT NULL,
+    outcome         TEXT,
+    reason          TEXT NOT NULL DEFAULT '',
+    summary         TEXT NOT NULL DEFAULT '',
+    conversation_id TEXT,
+    message_id      TEXT,
+    card_message_id TEXT,
+    result_bytes    INTEGER NOT NULL DEFAULT 0,
+    created_at      INTEGER NOT NULL,
+    admitted_at     INTEGER,
+    finished_at     INTEGER
+);
+CREATE INDEX connector_calls_recent ON connector_calls(connector_id, created_at);
+CREATE INDEX connector_calls_time ON connector_calls(created_at);
+-- The tripwires' hourly usage (by when calls ran).
+CREATE INDEX connector_calls_admitted ON connector_calls(connector_id, admitted_at);
+
+-- Recipients the owner approved a message or invite to.
+CREATE TABLE known_recipients (
+    address    TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
+
+-- API keys for engines (Gemini CLI, OpenCode providers, optionally Claude
+-- Code or Codex), sealed with the vault; passed to the CLI per turn.
+CREATE TABLE engine_keys (
+    harness    TEXT NOT NULL,
+    env        TEXT NOT NULL,
+    ciphertext TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (harness, env)
+);
+"#,
+    r#"
+-- Browser wallet approvals share the gateway cards and cancellation states.
+CREATE INDEX messages_pending_approvals ON messages(conversation_id, created_at)
+    WHERE kind = 'card' AND json_extract(card, '$.type') = 'approval'
+      AND json_extract(card, '$.state') = 'pending';
+"#,
 ];
 
 /// Run `f` in a write transaction taken up front (`BEGIN IMMEDIATE`), so a
@@ -1477,6 +1536,100 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn a_database_at_the_release_schema_upgrades_with_connectors_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..3] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 3).unwrap();
+            conn.execute(
+                "INSERT INTO connectors (id, name, transport, config, created_at, updated_at)
+                 VALUES ('c1', 'old', 'stdio', '{}', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            let v: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            assert_eq!(v as usize, MIGRATIONS.len());
+            let (cwd, policy): (i64, String) = c.query_row(
+                "SELECT workspace_cwd, policy FROM connectors WHERE id = 'c1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!((cwd, policy.as_str()), (1, "{}"));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn main_schema_upgrades_with_gateway_data_and_browser_approvals_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            // origin/main schema is version 4; branch migrations start after it.
+            conn.execute_batch(include_str!("../tests/fixtures/main-schema-v4.sql"))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO connectors (id, name, transport, config, created_at, updated_at, policy)
+                 VALUES ('c1', 'saved', 'stdio', '{}', 1, 1, ?1)",
+                [r#"{"mode":"ask"}"#],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO known_recipients VALUES ('reader@example.test', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO engine_keys VALUES ('codex', 'SYNTHETIC_KEY', 'sealed', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            let v: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            assert_eq!(v as usize, MIGRATIONS.len());
+            let policy: String =
+                c.query_row("SELECT policy FROM connectors WHERE id = 'c1'", [], |r| {
+                    r.get(0)
+                })?;
+            assert_eq!(policy, r#"{"mode":"ask"}"#);
+            let key: String =
+                c.query_row("SELECT ciphertext FROM engine_keys", [], |r| r.get(0))?;
+            assert_eq!(key, "sealed");
+            let recipients: i64 =
+                c.query_row("SELECT COUNT(*) FROM known_recipients", [], |r| r.get(0))?;
+            assert_eq!(recipients, 1);
+            c.prepare("SELECT * FROM connector_calls")?;
+            let owner = owner_user_id(c)?.unwrap();
+            let conv = ensure_main_conversation(c, &owner)?;
+            let card = crate::entities::approval_card(&crate::entities::ApprovalRequest {
+                service: "wallet",
+                approver_user_id: &owner,
+                ..Default::default()
+            });
+            crate::entities::insert_card(c, &conv, &card, "assistant")?;
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM messages INDEXED BY messages_pending_approvals
+                WHERE kind = 'card' AND json_extract(card, '$.type') = 'approval'
+                  AND json_extract(card, '$.state') = 'pending'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(n, 1);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

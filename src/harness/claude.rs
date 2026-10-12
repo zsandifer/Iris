@@ -6,7 +6,12 @@
 //! - Input: `--input-format stream-json` on stdin, which also carries images
 //!   as base64 content blocks.
 //! - Resume: `--resume <session_id>` (sessions are scoped by cwd).
-//! - MCP: `--mcp-config <private json file>`.
+//! - MCP: `--mcp-config <private json file>`. Servers with a tool timeout
+//!   (Iris's connector gateway, whose calls can wait for the owner's
+//!   approval) get a per-server `timeout` (ms), and automatic
+//!   backgrounding of long MCP calls is turned off
+//!   (`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0`) so the turn waits for the
+//!   answer.
 
 use super::{
     Activity, AuthState, Capabilities, Harness, HarnessEvent, Invocation, McpTransport,
@@ -32,14 +37,14 @@ impl Claude {
 pub fn mcp_config_json(servers: &[super::McpServer]) -> Value {
     let mut map = serde_json::Map::new();
     for s in servers {
-        let v = match &s.transport {
+        let mut v = match &s.transport {
             McpTransport::Stdio { command, args, env } => {
                 json!({"type": "stdio", "command": command, "args": args, "env": env})
             }
-            McpTransport::Http { url, headers } => {
-                json!({"type": "http", "url": url, "headers": headers})
-            }
         };
+        if let Some(t) = s.timeout_secs {
+            v["timeout"] = (t * 1000).into();
+        }
         map.insert(s.name.clone(), v);
     }
     json!({ "mcpServers": map })
@@ -121,18 +126,17 @@ impl Harness for Claude {
         a.push("--append-system-prompt-file".into());
         a.push(prompt_file.to_string_lossy().into_owned());
         a.extend(["--system-prompt-snapshot", "off"].map(String::from));
-        if spec.isolated {
-            // Someone else's chat: only Iris's MCP servers (not the owner's
-            // user, project, or claude.ai ones), and none of the owner's
-            // CLAUDE.md files or auto memory.
-            a.push("--strict-mcp-config".into());
-        }
         if !self.cfg.permission_mode.is_empty() {
             a.push("--permission-mode".into());
             a.push(self.cfg.permission_mode.clone());
         }
         // Nobody can answer an interactive approval in a headless turn.
         a.extend(["--permission-prompts", "none"].map(String::from));
+        // Only Iris's MCP servers in every turn (not the owner's user,
+        // project, or claude.ai ones): those would bypass Iris's gateway
+        // and approvals. Someone else's chat also gets none of the owner's
+        // CLAUDE.md files or auto memory (environment above).
+        a.push("--strict-mcp-config".into());
 
         let mut allowed = self.cfg.allowed_tools.clone();
         if !spec.mcp_servers.is_empty() {
@@ -142,6 +146,10 @@ impl Harness for Claude {
             inv.temp_files.push(file.clone());
             a.push("--mcp-config".into());
             a.push(file.to_string_lossy().into_owned());
+            if spec.mcp_servers.iter().any(|s| s.timeout_secs.is_some()) {
+                inv.env
+                    .push(("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS".into(), "0".into()));
+            }
             allowed.extend(spec.mcp_servers.iter().map(|s| format!("mcp__{}", s.name)));
         }
         if !allowed.is_empty() {
@@ -664,11 +672,13 @@ mod tests {
                     args: vec!["mcp".into()],
                     env: BTreeMap::new(),
                 },
+                timeout_secs: Some(420),
             }],
             cwd: tmp.path().into(),
             writable_dirs: vec![tmp.path().join("memory")],
             run_dir: tmp.path().into(),
             scope: "c1".into(),
+            key_env: vec![],
             isolated: false,
             own_mcp_servers: Vec::new(),
         };
@@ -680,10 +690,16 @@ mod tests {
         assert!(args.contains("--model haiku --effort low --resume sess-1"));
         assert!(args.contains("--system-prompt-snapshot off"));
         assert!(args.contains("--permission-prompts none"));
+        assert!(args.contains("--strict-mcp-config"));
         assert!(args.contains("--allowedTools Read,Glob,Grep,WebSearch,WebFetch,mcp__iris"));
         assert_eq!(inv.temp_files.len(), 2);
         let mcp: Value =
             serde_json::from_slice(&std::fs::read(&inv.temp_files[1]).unwrap()).unwrap();
+        assert_eq!(mcp["mcpServers"]["iris"]["timeout"], 420_000);
+        assert!(
+            inv.env
+                .contains(&("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS".into(), "0".into()))
+        );
         assert_eq!(mcp["mcpServers"]["iris"]["command"], "/usr/bin/iris");
         assert_eq!(
             std::fs::read_to_string(&inv.temp_files[0]).unwrap(),
@@ -694,11 +710,11 @@ mod tests {
         assert_eq!(stdin["message"]["content"][1]["source"]["data"], "UE5H");
         // The prompt never appears on the command line.
         assert!(!inv.args.iter().any(|a| a == "hi"));
-        // Someone else's chat: none of the CLI's own MCP servers or memory.
+        // Someone else's chat: none of the CLI's own memory either.
         let plain = Claude::new(HarnessConfig::claude_default())
             .build(&spec)
             .unwrap();
-        assert!(!plain.args.contains(&"--strict-mcp-config".to_string()));
+        assert!(plain.args.contains(&"--strict-mcp-config".to_string()));
         assert!(!plain.env.iter().any(|(k, _)| k.contains("MEMORY")));
         let mut iso = spec.clone();
         iso.isolated = true;

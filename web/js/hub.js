@@ -2,7 +2,7 @@
 // lives in computer.js).
 import { html, useEffect, useState } from './h.js';
 import { get, post, patch, put, del, seg } from './api.js';
-import { S, set, useStore, go, toast, isOwner, mainId } from './store.js';
+import { S, set, useStore, go, toast, isOwner } from './store.js';
 import {
   Icon, Avatar, Row, Group, Page, Empty, Spinner, Toggle, LetterTile,
   agentName, ago, since, confirmSheet,
@@ -40,123 +40,6 @@ export function Hub() {
       <${Row} icon="folder" title="System files" sub="Personality, memory, and notes" onClick=${() => go('iris/files')} />`}
       <${Row} icon="sliders" title="Settings" onClick=${() => go('settings')} />
     <//>
-  <//>`;
-}
-
-// ------------------------------------------------------------- connections
-
-const POPULAR = [
-  ['Google', 'Gmail, Calendar, and Drive', '#4285f4'],
-  ['Spotify', 'Music and podcasts', '#1db954'],
-  ['Reddit', 'Feeds your For you', '#ff4500'],
-  ['Notion', 'Notes and docs', '#111'],
-  ['GitHub', 'Code and issues', '#24292f'],
-];
-
-function askIris(service) {
-  const cid = mainId();
-  set({ drafts: { ...S.drafts, [cid]: `Help me connect ${service}` } });
-  go(`chat/${cid}`);
-}
-
-export function Connections() {
-  const [data, reload] = useData('/connectors');
-  const service = S.route.query.get('service');
-  const list = data?.connectors || [];
-  return html`<${Page} title="Connections" sub=${`Services ${agentName()} can use for you. Or just ask: "help me set up Spotify".`}>
-    ${service && html`<div class="lock">Connecting ${service} takes a sign-in on its own site. Tap Ask ${agentName()} below and I'll walk you through it, or add it yourself as a custom connection.</div>`}
-    ${!data ? html`<${Spinner} />` : html`
-      <${Group} label="Connected">
-        ${list.length ? list.map((c) => html`<${Row} icon=${html`<${LetterTile} name=${c.name} />`} title=${c.name}
-          sub=${c.enabled ? (c.description || 'On') : 'Off'} onClick=${() => go(`iris/connections/${c.id}`)} />`)
-          : html`<div class="r"><div class="rt mu">Nothing connected yet</div></div>`}
-      <//>
-      <${Group} label="Popular">
-        ${POPULAR.map(([name, sub, color]) => html`<${Row} icon=${html`<div class="tile" style=${`background:${color}`}>${name[0]}</div>`}
-          title=${name} sub=${sub} chevron=${false} right=${html`<button class="cn" onClick=${() => askIris(name)}>Ask ${agentName()}</button>`} />`)}
-        <${Row} icon="plus" title="Custom (MCP server)" sub="For tinkerers: any MCP server" onClick=${() => go('iris/connections/new')} />
-      <//>`}
-  <//>`;
-}
-
-function KeyValues({ label, keys, value, onChange, placeholder }) {
-  return html`<label class="lbl">${label}</label>
-    <textarea class="field mono" rows="3" value=${value} placeholder=${placeholder}
-      onInput=${(e) => onChange(e.target.value)} />
-    ${keys?.length > 0 && html`<small class="mu">Saved: ${keys.join(', ')} (values hidden). Leave empty to keep them.</small>`}`;
-}
-
-const parseKV = (text) => Object.fromEntries(text.split('\n').map((l) => l.trim()).filter(Boolean).map((l) => {
-  const i = l.search(/[=:]/);
-  return i < 0 ? [l, ''] : [l.slice(0, i).trim(), l.slice(i + 1).trim()];
-}));
-
-export function ConnectorForm({ id }) {
-  const isNew = id === 'new';
-  const [c, setC] = useState(null);
-  const [f, setF] = useState({ name: '', description: '', transport: 'stdio', command: '', args: '', url: '', env: '', headers: '' });
-  const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    if (isNew) return;
-    get('/connectors').then((r) => {
-      const x = r.connectors.find((k) => k.id === id);
-      if (!x) return toast('That connection is gone.');
-      setC(x);
-      setF({ name: x.name, description: x.description, transport: x.transport, command: x.command || '', args: (x.args || []).join('\n'), url: x.url || '', env: '', headers: '' });
-    }).catch((e) => toast(e.message));
-  }, [id]);
-  const up = (k) => (v) => setF({ ...f, [k]: v });
-  const save = async (e) => {
-    e.preventDefault();
-    setBusy(true);
-    const body = { description: f.description };
-    if (f.transport === 'stdio') {
-      body.command = f.command.trim();
-      body.args = f.args.split('\n').map((a) => a.trim()).filter(Boolean);
-      if (f.env.trim() || isNew) body.env = parseKV(f.env);
-    } else {
-      body.url = f.url.trim();
-      if (f.headers.trim() || isNew) body.headers = parseKV(f.headers);
-    }
-    try {
-      if (isNew) await post('/connectors', { ...body, name: f.name.trim(), transport: f.transport });
-      else await patch(`/connectors/${seg(id)}`, body);
-      toast('Saved');
-      go('iris/connections');
-    } catch (err) { toast(err.message); }
-    setBusy(false);
-  };
-  const toggle = async (on) => {
-    try { setC((await post(`/connectors/${seg(id)}/${on ? 'connect' : 'disconnect'}`)).connector); } catch (e) { toast(e.message); }
-  };
-  const remove = async () => {
-    if (!(await confirmSheet({ title: `Remove ${c.name}?`, body: `${agentName()} won't be able to use it anymore.`, yes: 'Remove', danger: true }))) return;
-    try { await del(`/connectors/${seg(id)}`); go('iris/connections'); } catch (e) { toast(e.message); }
-  };
-  if (!isNew && !c) return html`<${Page} title="Connection"><${Spinner} /><//>`;
-  return html`<${Page} title=${isNew ? 'Custom connection' : c.name}
-    sub=${isNew ? 'Add any MCP server. Secrets are encrypted on your server and never shown again.' : (c.description || 'A connected service')}>
-    ${!isNew && html`<${Group}><${Row} title="On" sub="Off means it isn't offered to me" right=${html`<${Toggle} on=${c.enabled} onChange=${toggle} label="Connection on" />`} /><//>`}
-    <form class="form" onSubmit=${save}>
-      ${isNew && html`<label class="lbl">Name</label>
-        <input class="field" value=${f.name} placeholder="e.g. calendar" pattern="[A-Za-z0-9_\\-]{1,48}" required onInput=${(e) => up('name')(e.target.value)} />
-        <label class="lbl">How it runs</label>
-        <div class="seg">${['stdio', 'http'].map((t) => html`<button type="button" class=${f.transport === t ? 'on' : ''} onClick=${() => up('transport')(t)}>${t === 'stdio' ? 'Program on the server' : 'Web address'}</button>`)}</div>`}
-      <label class="lbl">Description</label>
-      <input class="field" value=${f.description} placeholder="What it's for" onInput=${(e) => up('description')(e.target.value)} />
-      ${f.transport === 'stdio' ? html`
-        <label class="lbl">Command</label>
-        <input class="field mono" value=${f.command} placeholder="npx" required onInput=${(e) => up('command')(e.target.value)} />
-        <label class="lbl">Arguments (one per line)</label>
-        <textarea class="field mono" rows="3" value=${f.args} placeholder=${'-y\nsome-mcp-server'} onInput=${(e) => up('args')(e.target.value)} />
-        <${KeyValues} label="Secrets (KEY=value, one per line)" keys=${c?.env_keys} value=${f.env} onChange=${up('env')} placeholder="API_TOKEN=..." />`
-      : html`
-        <label class="lbl">URL</label>
-        <input class="field mono" type="url" value=${f.url} placeholder="https://..." required onInput=${(e) => up('url')(e.target.value)} />
-        <${KeyValues} label="Headers (Name: value, one per line)" keys=${c?.header_keys} value=${f.headers} onChange=${up('headers')} placeholder="Authorization: Bearer ..." />`}
-      <button class="b1 wide" disabled=${busy}>${isNew ? 'Add connection' : 'Save'}</button>
-    </form>
-    ${!isNew && html`<${Group}><${Row} title="Remove connection" danger onClick=${remove} chevron=${false} /><//>`}
   <//>`;
 }
 

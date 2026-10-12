@@ -105,9 +105,6 @@ async fn put_settings(
     if let Some(allow) = body.allow_claude_for_shared {
         writes.push(("allow_claude_for_shared", allow.then(|| "true".to_string())));
     }
-    if let Some(p) = body.paused {
-        writes.push(("paused", p.then(|| "true".to_string())));
-    }
     if let Some(p) = &body.feed_prompt {
         check_text("feed_prompt", p, 4000, false)?;
         writes.push((
@@ -115,12 +112,6 @@ async fn put_settings(
             (!p.trim().is_empty()).then(|| p.trim().to_string()),
         ));
     }
-    // Pause changes are ordered: the saved value and the live state always
-    // end up the same, whatever requests overlap.
-    let _switch = match body.paused {
-        Some(_) => Some(state.browser.switch_lock.lock().await),
-        None => None,
-    };
     state
         .db
         .call(move |c| {
@@ -133,26 +124,8 @@ async fn put_settings(
             Ok(())
         })
         .await?;
-    if let Some(p) = body.paused
-        && p != state.browser.is_paused()
-    {
-        crate::info!("owner {} Iris", if p { "paused" } else { "resumed" });
-        if p {
-            // Flag first, so a turn starting right now sees it; then stop
-            // every running turn (their CLI process groups are killed) and
-            // end their browser work at once.
-            state.browser.init_paused(true);
-            state.browser.end_turns(None);
-            for tx in state
-                .running
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .values()
-            {
-                let _ = tx.send(true);
-            }
-        }
-        state.browser.set_paused(p).await;
+    if let Some(p) = body.paused {
+        super::connect::set_paused(&state, p).await?;
     }
     ok(state.broadcast_settings().await)
 }
@@ -220,6 +193,8 @@ pub fn harnesses_for(state: &AppState, user: &AuthUser) -> Vec<Value> {
                     None => "manual".into(),
                 };
                 v["login_hint"] = e.harness.manual_login_hint().into();
+                v["key_options"] = serde_json::to_value(crate::keys::options(e.harness.name()))
+                    .unwrap_or_default();
                 v["login"] = serde_json::to_value(state.logins.status(e.harness.name()))
                     .unwrap_or(Value::Null);
             }
@@ -351,14 +326,32 @@ async fn cancel_login(
     ok(json!({"cancelled": crate::login::cancel(&state, &name).await}))
 }
 
+/// Harness list plus, for the owner, which API keys are saved (names
+/// only).
+async fn harnesses_with_keys(state: &AppState, user: &AuthUser) -> Vec<Value> {
+    let mut list = harnesses_for(state, user);
+    if user.user.is_owner {
+        for h in &mut list {
+            let name = h["name"].as_str().unwrap_or("").to_string();
+            let saved = state
+                .db
+                .call(move |c| entities::engine_keys(c, &name))
+                .await
+                .unwrap_or_default();
+            h["keys"] = saved.into_iter().map(|(env, _, _)| env).collect();
+        }
+    }
+    list
+}
+
 async fn list_harnesses(State(state): State<AppState>, user: AuthUser) -> ApiResult {
-    ok(json!({"harnesses": harnesses_for(&state, &user)}))
+    ok(json!({"harnesses": harnesses_with_keys(&state, &user).await}))
 }
 
 async fn refresh_harnesses(State(state): State<AppState>, user: AuthUser) -> ApiResult {
     user.require_owner()?;
     state.recheck_harnesses().await;
-    ok(json!({"harnesses": harnesses_for(&state, &user)}))
+    ok(json!({"harnesses": harnesses_with_keys(&state, &user).await}))
 }
 
 /// Advanced "AI engine" view: every model the CLIs offer, plus slots.
@@ -458,6 +451,9 @@ struct ConnectorBody {
     url: Option<String>,
     headers: Option<BTreeMap<String, String>>,
     enabled: Option<bool>,
+    /// http connectors: `"oauth"` signs in with the MCP authorization spec
+    /// (`POST /api/connectors/{id}/oauth/start`).
+    auth: Option<String>,
 }
 
 fn check_keys(field: &str, m: &BTreeMap<String, String>) -> Result<(), ApiError> {
@@ -501,6 +497,7 @@ fn build_config(
         check_keys("header", h)?;
         cfg.headers = seal_connector_secrets(state, id, "headers", h)?;
     }
+    crate::connectors::check_transport_security(transport, &cfg).map_err(ApiError::bad_request)?;
     match transport {
         "stdio" if cfg.command.is_none() => {
             Err(ApiError::bad_request("stdio connectors need a command"))
@@ -537,16 +534,48 @@ async fn create_connector(
     check_text("description", &description, 500, false)?;
     let transport = body.transport.clone().unwrap_or_else(|| "stdio".into());
     let id = new_id();
-    let cfg = build_config(&state, &id, &transport, &body, None)?;
+    let mut cfg = build_config(&state, &id, &transport, &body, None)?;
+    let oauth = match body.auth.as_deref() {
+        None | Some("") | Some("none") | Some("secrets") => false,
+        Some("oauth") if transport == "http" => true,
+        Some("oauth") => {
+            return Err(ApiError::bad_request(
+                "sign-in (OAuth) is for connections with a web address",
+            ));
+        }
+        Some(_) => return Err(ApiError::bad_request("auth must be oauth or none")),
+    };
+    if oauth {
+        cfg.oauth = Some(entities::OAuthConfig {
+            mode: "discover".into(),
+            ..Default::default()
+        });
+    }
+    crate::connectors::check_transport_security(&transport, &cfg).map_err(ApiError::bad_request)?;
     let enabled = body.enabled.unwrap_or(true);
     let res = state
         .db
         .call(move |c| {
-            entities::insert_connector(c, &id, &name, &description, &transport, &cfg, enabled)
+            let con =
+                entities::insert_connector(c, &id, &name, &description, &transport, &cfg, enabled)?;
+            if oauth {
+                entities::set_connector_state(
+                    c,
+                    &con.id,
+                    &entities::ConnectorState {
+                        auth_state: Some("needs_sign_in"),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            entities::get_connector(c, &con.id).map(|c| c.expect("inserted"))
         })
         .await;
     match res {
-        Ok(con) => ok(json!({"connector": con.public_json()})),
+        Ok(con) => {
+            crate::connectors::broadcast_changed(&state).await;
+            ok(json!({"connector": con.public_json()}))
+        }
         Err(e) if e.to_string().contains("UNIQUE") => Err(ApiError::new(
             StatusCode::CONFLICT,
             "conflict",
@@ -572,15 +601,18 @@ async fn update_connector(
         || body.url.is_some()
         || body.headers.is_some();
     let (st, cid) = (state.clone(), id.clone());
+    // Held so a token refresh in flight cannot write back older sign-in
+    // state over this change.
+    let _creds = crate::oauth::credentials_lock(&state).await;
     // Read, merge, and write in one database call, so concurrent patches
     // to different fields cannot undo each other.
-    let con = state
+    let (con, url_changed) = state
         .db
         .call(move |c| {
             let Some(existing) = entities::get_connector(c, &id)? else {
                 return Ok(Err(ApiError::not_found("connector")));
             };
-            let cfg = if touches_config {
+            let mut cfg = if touches_config {
                 match build_config(&st, &id, &existing.transport, &body, Some(&existing.config)) {
                     Ok(cfg) => Some(cfg),
                     Err(e) => return Ok(Err(e)),
@@ -588,28 +620,108 @@ async fn update_connector(
             } else {
                 None
             };
-            Ok(entities::update_connector(
+            // A new address means a different service: its sign-in starts
+            // over.
+            let url_changed = touches_config
+                && existing.config.oauth.is_some()
+                && body
+                    .url
+                    .as_deref()
+                    .is_some_and(|u| Some(u) != existing.config.url.as_deref());
+            if let Some(cfg) = cfg.as_mut() {
+                cfg.oauth = match existing.config.oauth {
+                    // Fixed provider endpoints: only the grant goes.
+                    Some(o) if url_changed && o.mode == "preset" => Some(entities::OAuthConfig {
+                        access_token: None,
+                        refresh_token: None,
+                        expires_at: None,
+                        account: None,
+                        connected_at: None,
+                        ..o
+                    }),
+                    Some(o) if url_changed => Some(entities::OAuthConfig {
+                        mode: o.mode,
+                        client_id: (o.client_source == "owner")
+                            .then_some(o.client_id)
+                            .flatten(),
+                        client_secret: (o.client_source == "owner")
+                            .then_some(o.client_secret)
+                            .flatten(),
+                        client_source: if o.client_source == "owner" {
+                            o.client_source
+                        } else {
+                            String::new()
+                        },
+                        ..Default::default()
+                    }),
+                    // The latest sign-in state (a refresh may have rotated
+                    // tokens).
+                    other => other,
+                };
+            }
+            let Some(con) = entities::update_connector(
                 c,
                 &id,
                 body.description.as_deref(),
                 cfg.as_ref(),
                 body.enabled,
             )?
-            .ok_or_else(|| ApiError::not_found("connector")))
+            else {
+                return Ok(Err(ApiError::not_found("connector")));
+            };
+            if url_changed {
+                entities::set_connector_state(
+                    c,
+                    &id,
+                    &entities::ConnectorState {
+                        auth_state: Some("needs_sign_in"),
+                        ..Default::default()
+                    },
+                )?;
+                if let Some(con) = entities::get_connector(c, &id)? {
+                    return Ok(Ok((con, true)));
+                }
+            }
+            Ok(Ok((con, url_changed)))
         })
         .await??;
+    if url_changed {
+        // Sign-ins under way were for the old address.
+        crate::oauth::forget_flows(&state, Some(&cid));
+    }
+    drop(_creds);
+    let enabled = con.enabled;
+    if touches_config {
+        // Approvals were for the old settings.
+        crate::gateway::cancel_approvals(&state, Some(&cid));
+    }
+    if !enabled {
+        crate::gateway::cancel_approvals(&state, Some(&cid));
+        crate::oauth::forget_flows(&state, Some(&cid));
+    }
+    if touches_config || !enabled {
+        crate::gateway::stop(&state, &cid).await;
+    }
     if touches_config {
         crate::login::on_connector_updated(&state, &cid).await;
     }
+    crate::connectors::broadcast_changed(&state).await;
     ok(json!({"connector": con.public_json()}))
 }
 
 async fn set_enabled(state: &AppState, id: String, enabled: bool) -> ApiResult {
+    let cid = id.clone();
     let con = state
         .db
         .call(move |c| entities::update_connector(c, &id, None, None, Some(enabled)))
         .await?
         .ok_or_else(|| ApiError::not_found("connector"))?;
+    if !enabled {
+        crate::gateway::cancel_approvals(state, Some(&cid));
+        crate::oauth::forget_flows(state, Some(&cid));
+        crate::gateway::stop(state, &cid).await;
+    }
+    crate::connectors::broadcast_changed(state).await;
     ok(json!({"connector": con.public_json()}))
 }
 
@@ -637,6 +749,7 @@ async fn delete_connector(
     Path(id): Path<String>,
 ) -> ApiResult {
     user.require_owner()?;
+    let cid = id.clone();
     if !state
         .db
         .call(move |c| entities::delete_connector(c, &id))
@@ -644,6 +757,11 @@ async fn delete_connector(
     {
         return Err(ApiError::not_found("connector"));
     }
+    crate::gateway::cancel_approvals(&state, Some(&cid));
+    crate::oauth::forget_flows(&state, Some(&cid));
+    crate::gateway::stop(&state, &cid).await;
+    let _ = std::fs::remove_dir_all(crate::gateway::connector_dir(&state, &cid));
+    crate::connectors::broadcast_changed(&state).await;
     ok(json!({"ok": true}))
 }
 
@@ -974,7 +1092,8 @@ async fn subscribe_push(
                 &body.keys.auth,
             )
         })
-        .await?;
+        .await?
+        .ok_or_else(|| ApiError::not_found("device"))?;
     ok(json!({"subscription": sub}))
 }
 
@@ -1019,6 +1138,13 @@ async fn run_job(
 ) -> Result<Response, ApiError> {
     user.require_owner()?;
     let job = crate::jobs::Job::parse(&name).ok_or_else(|| ApiError::not_found("job"))?;
+    if state.is_paused().await {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "paused",
+            "Iris is paused; resume it first",
+        ));
+    }
     let started = crate::jobs::trigger(&state, job);
     Ok((
         StatusCode::ACCEPTED,

@@ -162,7 +162,7 @@ pub fn definitions() -> Vec<Value> {
             "Fill the payment form on the current page with a card from the user's wallet. \
              The user is always asked to approve first (a card in the chat); Iris types the \
              card details itself and you never see them. Answers `filled`, `denied`, \
-             `waiting for approval`, or `not found`.",
+             `not filled` (expired or cancelled), or `not found`.",
             json!({"card": s("Which card, by its name or last 4 digits (needed only if several are saved)")}),
             &[],
         ),
@@ -210,6 +210,9 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Ou
             "The owner has paused Iris's computer, so the browser is off. Tell them if you \
              need it.",
         );
+    }
+    if !access_allowed(state, &ctx).await {
+        return Output::error(super::TURN_ENDED);
     }
     b.mark_used(&ctx);
     // Wait while the owner has control, then hold the page; control is
@@ -273,6 +276,27 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Ou
         started.elapsed().as_millis()
     );
     out
+}
+
+/// The managed profile is private to the owner, including its cookies.
+pub(crate) async fn access_allowed(state: &AppState, ctx: &TurnCtx) -> bool {
+    if ctx.is_ended() || state.is_paused().await || !state.browser.enabled() {
+        return false;
+    }
+    let (user, conv) = (ctx.user_id.clone(), ctx.conversation_id.clone());
+    state
+        .db
+        .call(move |c| {
+            if crate::db::owner_user_id(c)?.as_deref() != Some(user.as_str()) {
+                return Ok(false);
+            }
+            let Some(_chat) = crate::db::get_conversation(c, &user, &conv)? else {
+                return Ok(false);
+            };
+            Ok(crate::db::conversation_member_ids(c, &conv)? == [user])
+        })
+        .await
+        .unwrap_or(false)
 }
 
 async fn run_tool(
@@ -969,60 +993,20 @@ pub(crate) mod tests {
         AppState::new(cfg, paths, db).unwrap()
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn card_approval_follow_up_respects_stop() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(tmp.path());
-        let (owner, conv) = state
-            .db
-            .with(|c| {
-                let u = crate::db::owner_user_id(c)?.unwrap();
-                let m = crate::db::ensure_main_conversation(c, &u)?;
-                Ok((u, m))
-            })
-            .unwrap();
-        let approved = || {
-            let mut card = crate::entities::approval_card(&crate::entities::ApprovalRequest {
-                title: "Use your card",
-                service: "wallet",
-                approver_user_id: &owner,
-                ..Default::default()
-            });
-            card["state"] = "approved".into();
-            card["wallet"] = json!({"credential_id": "c", "origin": "https://s.test", "revision": 1, "used_at": null});
-            state
-                .db
-                .with(|c| crate::entities::insert_card(c, &conv, &card, "assistant"))
-                .unwrap()
-        };
-        let follow_ups = || {
-            state
-                .db
-                .with(|c| crate::db::list_messages(c, &conv, None, 50))
-                .unwrap()
-                .iter()
-                .filter(|m| m.content == "I approved the card. Go ahead.")
-                .count()
-        };
-        // Stop pressed after approving: no follow-up.
-        let m = approved();
-        super::super::fill::resume_after_approval(state.clone(), m.id, conv.clone(), owner.clone());
-        crate::turn::cancel(&state, &conv);
-        tokio::time::sleep(Duration::from_millis(3000)).await;
-        assert_eq!(follow_ups(), 0);
-        // Otherwise the chat carries on once nothing runs.
-        let m = approved();
-        super::super::fill::resume_after_approval(state.clone(), m.id, conv.clone(), owner.clone());
-        tokio::time::sleep(Duration::from_millis(3000)).await;
-        assert_eq!(follow_ups(), 1);
-    }
-
     #[tokio::test]
     async fn queued_calls_respect_take_over_and_turn_end() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(tmp.path());
         let b = state.browser.clone();
-        let g = b.begin_turn("u", "c", "m", &[]);
+        let (owner, conv) = state
+            .db
+            .with(|c| {
+                let owner = crate::db::owner_user_id(c)?.unwrap();
+                let conv = crate::db::ensure_main_conversation(c, &owner)?;
+                Ok((owner, conv))
+            })
+            .unwrap();
+        let g = b.begin_turn(&owner, &conv, "m", &[]);
         let token = g.token().to_string();
         // Another call holds the page.
         let held = b.op_lock.lock().await;

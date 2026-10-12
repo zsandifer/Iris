@@ -17,16 +17,20 @@ js/
 ├── store.js          state, loaders, WebSocket event handling
 ├── api.js            REST client, authed image URLs, WebSocket
 ├── chat.js           chat, status phrases, receipts, composer (photos, voice input)
-├── cards.js          chat cards (result, connect, sign-in, setup, approval, ...)
+├── cards.js          chat cards (result, connect, sign-in, API keys, approval, ...)
 ├── status.js         tool activity to plain-language phrases
 ├── feed.js           For you: story cards, posts, full-screen stories
 ├── lists.js          Ideas, Goals, Library
-├── hub.js            Iris hub: Connections, Logins & wallet, files
 ├── computer.js       Iris's computer: live view, chat peek, Watch / Take over
+├── hub.js            Iris hub: Logins & wallet, files
+├── connect.js        Connections: catalog, setup guides, sign-in, rules, trusted people
 ├── settings.js       Settings, AI engine, devices, people, activity log
 ├── push.js           Web Push subscription
 ├── md.js             small, safe Markdown renderer
+├── photo.js          shared photo dialog, history, pinch and pan gestures
+├── photo-math.js     pure photo zoom and pan geometry
 ├── ui.js             icons, rows, sheets, time helpers
+├── viewport.js       visible viewport sizing and phone keyboard detection
 └── h.js              Preact + htm exports
 ```
 
@@ -48,3 +52,26 @@ a quick look with content, seed a fresh data directory with fake demo data:
 iris init --config $T/config.toml --data-dir $T/data
 iris demo-seed --config $T/config.toml --data-dir $T/data --assets scripts/demo/images
 ```
+
+The standalone iPhone keyboard regression uses an external Playwright
+install with its WebKit browser; it adds no app dependencies:
+
+```sh
+NODE_PATH=/path/to/node_modules node scripts/e2e/keyboard.mjs /tmp/keyboard-frames.json
+```
+
+It checks synchronous composer pre-shrink on pointerdown/touchstart using
+an orientation-specific remembered keyboard height, reconciliation when
+the real resize arrives, and restoration on blur or the 700ms deadline.
+It also resizes the viewport and injects document scrolling and visual viewport
+pans, recording every animation frame. The header stays at zero in visible
+viewport coordinates (its layout `getBoundingClientRect().top` minus
+`visualViewport.offsetTop`), with stable height and avatar. Native iPhone
+keyboard animation still needs a device check.
+
+`scripts/e2e/photos.mjs` uses the same Playwright setup and an iPhone
+descriptor to check photo surfaces, safe areas, focus, history, dismissals,
+carousel taps, story pause, reduced motion, and zoom/pan bounds. It uses
+native taps and injected touch lists for pinch gestures (Playwright's
+touchscreen API provides only single-touch taps). Set `WEBKIT` to the
+installed browser's `pw_run.sh` if its version differs from Playwright's.

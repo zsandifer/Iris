@@ -16,6 +16,7 @@ function initialState() {
     live: {},            // assistant message id -> {text, acts: Activity[], queued, cid}
     logins: {},          // harness -> LoginStatus (owner)
     engines: null,       // GET /api/engines (owner)
+    connectors: null,    // GET /api/connectors (owner)
     slots: null,         // Slot[]
     feed: null,          // {posts, hasMore}
     ideas: null,
@@ -59,6 +60,9 @@ export function set(patch) {
  * data, drafts, open sheets and overlays, and any ad hoc keys.
  */
 export function resetUserState() {
+  connectorsLoading = null;
+  connectorsTried = false;
+  userGen++;
   const fresh = initialState();
   for (const k of Object.keys(S)) if (!(k in fresh)) delete S[k];
   set(fresh);
@@ -121,9 +125,20 @@ export const mainId = () => S.me?.main_conversation_id;
 
 // ----------------------------------------------------------------- loaders
 
+// conversation.created events that arrive while a list request is in flight
+// may be newer than its answer: each running load collects them.
+const convWatch = new Set();
+
 export async function loadConvs() {
-  const { conversations } = await get('/conversations');
-  set({ convs: conversations });
+  const seen = [];
+  convWatch.add(seen);
+  try {
+    const { conversations } = await get('/conversations');
+    const ids = new Set(conversations.map((c) => c.id));
+    set({ convs: [...conversations, ...seen.filter((c) => !ids.has(c.id))] });
+  } finally {
+    convWatch.delete(seen);
+  }
 }
 
 export async function loadArchived() {
@@ -183,7 +198,12 @@ function mergeSnapshot(list, snap) {
   const out = snap.map((m) => (have.has(m.id) ? newer(m, have.get(m.id)) : m));
   for (const m of list) {
     if (ids.has(m.id)) continue;
-    if (m.created_at >= newest || (joined && m.created_at <= oldest.created_at)) out.push(m);
+    if (m.created_at >= newest) out.push(m);
+    else if (joined && m.created_at <= oldest.created_at) {
+      // Outside the latest page, so only a cached copy: it cannot be
+      // confirmed as still streaming, and nothing would ever settle it.
+      out.push(m.status === 'streaming' ? { ...m, status: 'interrupted' } : m);
+    }
   }
   return { list: out.sort((x, y) => x.created_at - y.created_at), joined };
 }
@@ -360,6 +380,27 @@ async function loadPages(kind, want) {
     more = m && list.length > had; // stop if a page brings nothing new
   } while (more && list.length < Math.min(want, MAX_RELOAD));
   return [list, more];
+}
+let connectorsLoading = null;
+let userGen = 0;
+/** Load the owner's connectors; concurrent callers share one request. */
+export function loadConnectors() {
+  if (!isOwner()) return Promise.resolve();
+  const gen = userGen;
+  const req = connectorsLoading || get('/connectors')
+    // Dropped if the user signed out meanwhile.
+    .then((r) => { if (gen === userGen) set({ connectors: r.connectors }); })
+    .finally(() => { if (connectorsLoading === req) connectorsLoading = null; });
+  connectorsLoading = req;
+  return req;
+}
+
+let connectorsTried = false;
+/** Load connectors once for cards that only need them for display. */
+export function ensureConnectors() {
+  if (S.connectors || connectorsTried || !isOwner()) return;
+  connectorsTried = true;
+  loadConnectors().catch(() => {});
 }
 
 /**
@@ -553,6 +594,7 @@ export function handleEvent(ev) {
       set({});
       break;
     case 'conversation.created':
+      for (const seen of convWatch) seen.push(ev.conversation);
       if (S.convs && !S.convs.some((c) => c.id === ev.conversation.id)) {
         set({ convs: [...S.convs, ev.conversation] });
       }
@@ -579,6 +621,9 @@ export function handleEvent(ev) {
       break;
     case 'engines.changed':
       if (S.engines) set({ engines: { ...S.engines, engines: ev.engines } });
+      break;
+    case 'connectors.changed':
+      if (S.connectors) loadConnectors().catch(() => {});
       break;
     default:
       break;
@@ -618,6 +663,7 @@ export function refreshAll() {
   if (S.slots) loadSlots().catch(() => {});
   if (S.engines) loadEngines().catch(() => {});
   loadBrowser().catch(() => {});
+  if (S.connectors) loadConnectors().catch(() => {});
 }
 
 /** Send a message (text and/or attachment ids) and track the reply. */

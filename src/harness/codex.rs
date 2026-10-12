@@ -11,14 +11,14 @@
 //! - Resume: `codex exec resume <thread_id>`. `resume` does not accept
 //!   `-s`/`--add-dir`, so sandbox settings are always passed as `-c`
 //!   overrides, identically for new and resumed threads.
-//! - MCP: `-c mcp_servers.<name>.<key>=<toml value>` per server. Connector
-//!   secrets never go on the command line (other local users can read
-//!   argv): a stdio server's environment is written to a private file in
-//!   the run directory and applied by `iris mcp-exec`, which then execs the
-//!   real command; HTTP headers travel as `env_http_headers`, naming
-//!   variables set only in Codex's own environment. Their names contain
-//!   `SECRET`, so Codex's default shell environment policy keeps them out
-//!   of commands the agent runs.
+//! - MCP: `-c mcp_servers.<name>.<key>=<toml value>` per server. Every
+//!   server Iris passes is a local stdio program (its bridge, and one
+//!   connector gateway proxy per connector). Environment values (the
+//!   gateway's per-turn token) never go on the command line (other local
+//!   users can read argv): they are written to a private file in the run
+//!   directory and applied by `iris mcp-exec`, which then execs the real
+//!   command. Gateway proxies get `tool_timeout_sec` so a call can wait for
+//!   the owner's approval.
 //! - Prompt on stdin (`-`); images via `-i <file>`.
 
 use super::{
@@ -126,11 +126,6 @@ pub struct McpSetup {
     pub temp_files: Vec<PathBuf>,
 }
 
-/// Prefix of the variables that carry connector HTTP headers. It contains
-/// `SECRET` so Codex's default `shell_environment_policy` excludes them
-/// from commands the agent runs.
-const SECRET_ENV_PREFIX: &str = "IRIS_MCP_SECRET_";
-
 /// Register the given MCP servers. `exe` is the Iris binary (it wraps stdio
 /// servers that need environment variables); `run_dir`/`turn_id` name the
 /// private per-turn files.
@@ -148,15 +143,11 @@ pub fn mcp_setup(
         // pre-approved, matching `--allowedTools mcp__<name>` for Claude.
         out.overrides
             .push(format!("{p}.default_tools_approval_mode=\"approve\""));
-        // Iris's browser tools may wait for the owner (take-over, card
-        // approval) longer than Codex's 60 s default.
-        if [
-            crate::browser::tools::SERVER,
-            crate::browser::tools::SERVER_ALT,
-        ]
-        .contains(&s.name.as_str())
-        {
-            out.overrides.push(format!("{p}.tool_timeout_sec=180"));
+        if let Some(t) = s.timeout_secs {
+            // Connector calls can wait for the owner's approval; the first
+            // start of a connector may download its server.
+            out.overrides.push(format!("{p}.tool_timeout_sec={t}"));
+            out.overrides.push(format!("{p}.startup_timeout_sec=120"));
         }
         match &s.transport {
             McpTransport::Stdio { command, args, env } => {
@@ -181,15 +172,6 @@ pub fn mcp_setup(
                         .push(format!("{p}.command={}", toml_str(&exe.to_string_lossy())));
                     out.overrides
                         .push(format!("{p}.args={}", toml_str_array(&wrapped)));
-                }
-            }
-            McpTransport::Http { url, headers } => {
-                out.overrides.push(format!("{p}.url={}", toml_str(url)));
-                for (j, (k, v)) in headers.iter().filter(|(k, _)| bare_key(k)).enumerate() {
-                    let var = format!("{SECRET_ENV_PREFIX}{i}_{j}");
-                    out.overrides
-                        .push(format!("{p}.env_http_headers.{k}={}", toml_str(&var)));
-                    out.env.push((var, v.clone()));
                 }
             }
         }
@@ -244,27 +226,34 @@ impl Harness for Codex {
             }
         }
         let exe = std::env::current_exe()?;
-        let mcp = mcp_setup(&spec.mcp_servers, &exe, &spec.run_dir, &spec.turn_id)?;
+        // Codex merges `-c` overrides into a server of the same name in its
+        // own config (whose `url` would then clash with Iris's `command`):
+        // Iris's servers get names Codex itself does not use.
+        let servers = super::unclaimed_servers(&spec.mcp_servers, &spec.own_mcp_servers);
+        let mcp = mcp_setup(&servers, &exe, &spec.run_dir, &spec.turn_id)?;
         overrides.extend(mcp.overrides);
-        if spec.isolated {
-            // Someone else's chat: none of the owner's ChatGPT apps,
-            // plugins, memories, or MCP servers configured in Codex itself.
-            for f in ["apps", "plugins", "memories"] {
-                overrides.push(format!("features.{f}=false"));
+        // MCP servers configured in Codex itself are off in every turn:
+        // they would bypass Iris's gateway and approvals.
+        for name in &spec.own_mcp_servers {
+            if !bare_key(name) {
+                return Err(format!("cannot switch off Codex MCP server {name:?}").into());
             }
+            overrides.push(format!("mcp_servers.{name}.enabled=false"));
+        }
+        // Hosted ChatGPT apps (`codex_apps`) and plugins are connectors
+        // that would bypass Iris's gateway and approvals: off in every turn.
+        // Verified with codex-cli 0.162.1: `features list` and the
+        // `-c features.<name>=false` overrides in `exec --help`.
+        for f in ["apps", "plugins"] {
+            overrides.push(format!("features.{f}=false"));
+        }
+        if spec.isolated {
+            // Someone else's chat: none of the owner's memories either.
+            overrides.push("features.memories=false".into());
             // No AGENTS.md from the shared workspace (an owner's turn could
             // have written one). The global one cannot be switched off; see
             // `can_isolate`.
             overrides.push("project_doc_max_bytes=0".into());
-            for name in &spec.own_mcp_servers {
-                if spec.mcp_servers.iter().any(|s| &s.name == name) {
-                    continue;
-                }
-                if !bare_key(name) {
-                    return Err(format!("cannot switch off Codex MCP server {name:?}").into());
-                }
-                overrides.push(format!("mcp_servers.{name}.enabled=false"));
-            }
         }
         for o in overrides {
             a.push("-c".into());
@@ -312,7 +301,8 @@ impl Harness for Codex {
     }
 
     /// Codex merges `-c mcp_servers` with its own config, so its own
-    /// servers are switched off by name in isolated turns.
+    /// servers are switched off by name (names only; the rest of the
+    /// output is discarded).
     fn own_mcp_servers_args(&self) -> Option<Vec<String>> {
         Some(vec!["mcp".into(), "list".into(), "--json".into()])
     }
@@ -657,11 +647,6 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("API_TOKEN".to_string(), "env-secret-value".to_string());
         env.insert("bad key".to_string(), "x".to_string());
-        let mut headers = BTreeMap::new();
-        headers.insert(
-            "Authorization".to_string(),
-            "Bearer header-secret".to_string(),
-        );
         let mut spec = TurnSpec {
             turn_id: "t".into(),
             prompt: "hello".into(),
@@ -681,6 +666,7 @@ mod tests {
                         args: vec!["mcp".into(), "--conversation".into(), "c1".into()],
                         env: BTreeMap::new(),
                     },
+                    timeout_secs: None,
                 },
                 McpServer {
                     name: "notes".into(),
@@ -689,21 +675,16 @@ mod tests {
                         args: vec!["-y".into(), "notes-mcp".into()],
                         env,
                     },
-                },
-                McpServer {
-                    name: "web".into(),
-                    transport: McpTransport::Http {
-                        url: "https://mcp.example.com".into(),
-                        headers,
-                    },
+                    timeout_secs: Some(420),
                 },
             ],
             cwd: "/w".into(),
             writable_dirs: vec!["/m".into()],
             run_dir: run.path().into(),
             scope: "c1".into(),
+            key_env: vec![],
             isolated: false,
-            own_mcp_servers: Vec::new(),
+            own_mcp_servers: vec!["mine".into()],
         };
         let mut cfg = HarnessConfig::codex_default();
         cfg.sandbox = "workspace-write".into();
@@ -779,20 +760,18 @@ mod tests {
         let mode = std::fs::metadata(&env_file).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "env file is private");
         assert!(inv.temp_files.contains(&env_file));
-        // HTTP headers: named variables in Codex's own environment.
-        assert!(inv.args.contains(
-            &r#"mcp_servers.web.env_http_headers.Authorization="IRIS_MCP_SECRET_2_0""#.to_string()
-        ));
+        assert!(inv.env.is_empty(), "nothing secret in Codex's environment");
         assert!(
             inv.args
-                .contains(&r#"mcp_servers.web.url="https://mcp.example.com""#.to_string())
+                .contains(&"mcp_servers.mine.enabled=false".to_string())
         );
-        assert_eq!(
-            inv.env,
-            vec![(
-                "IRIS_MCP_SECRET_2_0".to_string(),
-                "Bearer header-secret".to_string()
-            )]
+        assert!(
+            !inv.args
+                .contains(&"mcp_servers.notes.enabled=false".to_string())
+        );
+        assert!(
+            inv.args
+                .contains(&"mcp_servers.notes.tool_timeout_sec=420".to_string())
         );
         assert!(
             inv.args
@@ -813,8 +792,22 @@ mod tests {
         // A resumed thread already has the instructions.
         assert_eq!(inv.stdin, b"hello");
 
-        // Someone else's chat: Codex's own apps, plugins, memories, and MCP
-        // servers are switched off (Iris's own servers stay).
+        // Apps and plugins would bypass the gateway, including in owner
+        // chats and jobs; memories are only disabled for isolated turns.
+        for resume in [None, Some("th-1".to_string())] {
+            for scope in ["c1", "job:scheduled"] {
+                spec.resume = resume.clone();
+                spec.scope = scope.into();
+                let inv = h.build(&spec).unwrap();
+                for flag in ["features.apps=false", "features.plugins=false"] {
+                    assert!(inv.args.contains(&flag.to_string()), "{scope}: {flag}");
+                }
+                assert!(!inv.args.contains(&"features.memories=false".to_string()));
+            }
+        }
+        // Someone else's chat: Codex's own apps, plugins, and memories are
+        // switched off too (its own MCP servers are off in every turn;
+        // Iris's own servers stay, renamed if Codex has one by that name).
         spec.isolated = true;
         spec.own_mcp_servers = vec!["personal".into(), "notes".into()];
         let inv = h.build(&spec).unwrap();
@@ -823,12 +816,19 @@ mod tests {
             "features.plugins=false",
             "features.memories=false",
             "mcp_servers.personal.enabled=false",
+            "mcp_servers.notes.enabled=false",
         ] {
             assert!(inv.args.contains(&o.to_string()), "{o}");
         }
         assert!(
+            inv.args
+                .iter()
+                .any(|a| a.starts_with("mcp_servers.iris_notes.command="))
+        );
+        assert!(
             !inv.args
-                .contains(&"mcp_servers.notes.enabled=false".to_string())
+                .iter()
+                .any(|a| a.starts_with("mcp_servers.notes.command="))
         );
         assert!(inv.args.contains(&"project_doc_max_bytes=0".to_string()));
         spec.own_mcp_servers = vec!["has space".into()];

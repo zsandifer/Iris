@@ -126,6 +126,10 @@ impl TurnCtx {
         *self.ended.borrow()
     }
 
+    pub(crate) fn cancellation(&self) -> watch::Sender<bool> {
+        self.ended.clone()
+    }
+
     /// Resolves when the turn ends.
     pub async fn wait_ended(&self) {
         let mut rx = self.ended.subscribe();
@@ -479,6 +483,8 @@ pub struct Shared {
     pub(crate) op_lock: tokio::sync::Mutex<()>,
     /// "Pause Iris" in the app: no turns, jobs, or browsing until resumed.
     paused: AtomicBool,
+    /// Disconnect everything disables browser tools until the owner reopens it.
+    disconnected: AtomicBool,
     /// The owner agreed (in the app) to run without Chrome's sandbox on a
     /// system where it cannot start.
     allow_no_sandbox: AtomicBool,
@@ -493,9 +499,6 @@ pub struct Shared {
     /// Orders changes of the saved safety switches (pause, sandbox).
     pub switch_lock: tokio::sync::Mutex<()>,
     secret_source: Mutex<Option<SecretSource>>,
-    /// Bumped by Stop per conversation: work queued before it (a card
-    /// approval's continuation) is dropped.
-    stops: Mutex<HashMap<String, u64>>,
 }
 
 #[derive(Clone)]
@@ -542,13 +545,13 @@ impl Browser {
             last_input: AtomicI64::new(0),
             op_lock: tokio::sync::Mutex::new(()),
             paused: AtomicBool::new(false),
+            disconnected: AtomicBool::new(false),
             allow_no_sandbox: AtomicBool::new(false),
             maintenance: AtomicBool::new(false),
             tainted: Mutex::new(load_tainted(&dir.join("tainted-origins.json"))),
             tainted_file: dir.join("tainted-origins.json"),
             switch_lock: tokio::sync::Mutex::new(()),
             secret_source: Mutex::new(None),
-            stops: Mutex::default(),
         }))
     }
 
@@ -579,17 +582,6 @@ impl Browser {
                 run.remember_secret(s);
             }
         }
-    }
-
-    /// Stop was pressed in a conversation.
-    pub fn note_stop(&self, conversation_id: &str) {
-        *lock(&self.stops)
-            .entry(conversation_id.to_string())
-            .or_default() += 1;
-    }
-
-    pub fn stop_count(&self, conversation_id: &str) -> u64 {
-        lock(&self.stops).get(conversation_id).copied().unwrap_or(0)
     }
 
     /// Remember (on disk, before anything is filled) that Iris fills a
@@ -638,7 +630,7 @@ impl Browser {
     }
 
     pub fn enabled(&self) -> bool {
-        self.cfg.enabled
+        self.cfg.enabled && !self.disconnected.load(Ordering::SeqCst)
     }
 
     pub fn executable(&self) -> Option<PathBuf> {
@@ -651,6 +643,14 @@ impl Browser {
 
     pub fn control(&self) -> Control {
         self.control.borrow().clone()
+    }
+
+    pub fn set_disconnected(&self, disconnected: bool) {
+        self.disconnected.store(disconnected, Ordering::SeqCst);
+        if disconnected {
+            self.end_turns(None);
+        }
+        self.broadcast_state();
     }
 
     pub fn is_paused(&self) -> bool {
@@ -784,6 +784,11 @@ impl Browser {
         if ctx.is_ended() {
             return Err(TURN_ENDED.into());
         }
+        if self.disconnected.load(Ordering::SeqCst) {
+            return Err(
+                "The browser is disconnected; the owner can reopen it in Iris’s computer.".into(),
+            );
+        }
         if self.is_paused() {
             return Err("The owner paused Iris, so the browser is off.".into());
         }
@@ -813,6 +818,7 @@ impl Browser {
         let control = self.control();
         json!({
             "enabled": self.cfg.enabled,
+            "disconnected": self.disconnected.load(Ordering::SeqCst),
             "available": self.executable().is_some(),
             "running": run.is_some(),
             "paused": self.is_paused(),
@@ -877,6 +883,11 @@ impl Browser {
                 "the browser is turned off in the server's config ([browser] enabled)".into(),
             );
         }
+        if self.disconnected.load(Ordering::SeqCst) {
+            return Err(
+                "The browser is disconnected; the owner can reopen it in Iris’s computer.".into(),
+            );
+        }
         if self.is_paused() {
             return Err("Iris is paused".into());
         }
@@ -888,6 +899,11 @@ impl Browser {
             return Err("the browser is being updated; try again in a minute".into());
         }
         // Pause may have come while waiting for the lock.
+        if self.disconnected.load(Ordering::SeqCst) {
+            return Err(
+                "The browser is disconnected; the owner can reopen it in Iris’s computer.".into(),
+            );
+        }
         if self.is_paused() {
             return Err("Iris is paused".into());
         }
@@ -979,6 +995,11 @@ impl Browser {
         }
         // Paused, or the owner took back running without the sandbox,
         // while it was starting: do not publish it.
+        if self.disconnected.load(Ordering::SeqCst) {
+            return Err(
+                "The browser is disconnected; the owner can reopen it in Iris’s computer.".into(),
+            );
+        }
         if self.is_paused() {
             Self::shut(&run).await;
             return Err("Iris is paused".into());

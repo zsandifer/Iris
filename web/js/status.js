@@ -51,7 +51,8 @@ function browserPhrase(tool, sum) {
 }
 
 const SERVICES = [
-  [/mail|inbox|imap/, (t) => (/send|draft|reply|compose/.test(t) ? ['Getting an email ready', 'Got an email ready'] : ['Reading your email', 'Read your email'])],
+  [/mail|inbox|imap/, (t) => (/send/.test(t) ? ['Sending an email', 'Sent an email']
+    : /draft|reply|compose/.test(t) ? ['Getting an email ready', 'Got an email ready'] : ['Reading your email', 'Read your email'])],
   [/calendar|gcal|event/, (t) => (/create|add|insert|update/.test(t) ? ['Updating your calendar', 'Updated your calendar'] : ['Checking your calendar', 'Checked your calendar'])],
   [/drive|docs|sheets|notion|dropbox|files?\b/, () => ['Looking through your documents', 'Looked through your documents']],
   [/browser|playwright|puppeteer|chrome|navigate/, () => ['Browsing the web', 'Browsed the web']],
@@ -84,7 +85,13 @@ export function describe(a) {
     if (server === 'browser' || server === 'iris_browser') return browserPhrase(tool, sum);
     const key = `${server} ${tool}`.toLowerCase();
     for (const [re, f] of SERVICES) if (re.test(key)) return f(tool.toLowerCase());
-    return [`Checking ${title(server)}`, `Checked ${title(server)}`];
+    const t = tool.toLowerCase();
+    const svc = title(server);
+    if (/delete|remove|trash/.test(t)) return [`Deleting something in ${svc}`, `Deleted something in ${svc}`];
+    if (/buy|pay|order|checkout|purchase/.test(t)) return [`Placing an order with ${svc}`, `Placed an order with ${svc}`];
+    if (/send|reply|forward|post|publish|^message|sms|invite|share/.test(t)) return [`Sending a message with ${svc}`, `Sent a message with ${svc}`];
+    if (/create|update|add|edit|set|move|write/.test(t)) return [`Updating ${svc}`, `Updated ${svc}`];
+    return [`Checking ${svc}`, `Checked ${svc}`];
   }
   if (a.kind === 'file_change' || /^(edit|write|multiedit|notebookedit|write_file|replace|apply_patch)$/.test(low)) {
     return memory ? ['Writing that down', 'Wrote it down in my notes'] : ['Writing a file', 'Wrote a file'];

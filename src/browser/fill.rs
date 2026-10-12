@@ -16,13 +16,7 @@ use crate::entities::{self, Credential};
 use crate::state::AppState;
 use crate::util::{Result, now_ms};
 use serde_json::{Value, json};
-use std::time::Duration;
 
-/// How long `fill_card` waits for the owner's decision in one call.
-#[cfg(not(test))]
-const APPROVAL_WAIT: Duration = Duration::from_secs(45);
-#[cfg(test)]
-const APPROVAL_WAIT: Duration = Duration::from_secs(3);
 /// An approval is good for one fill within this time.
 const APPROVAL_TTL_MS: i64 = 30 * 60 * 1000;
 
@@ -405,39 +399,6 @@ fn card_name(c: &Credential) -> String {
     )
 }
 
-/// The most recent approval card for this card on this site.
-async fn latest_approval(
-    state: &AppState,
-    conv: &str,
-    cred_id: &str,
-    origin: &str,
-) -> Option<db::Message> {
-    let (conv, cid, origin) = (conv.to_string(), cred_id.to_string(), origin.to_string());
-    state
-        .db
-        .call(move |c| {
-            let id: Option<String> = c
-                .query_row(
-                    "SELECT id FROM messages
-                     WHERE conversation_id = ?1 AND kind = 'card'
-                       AND json_extract(card, '$.type') = 'approval'
-                       AND json_extract(card, '$.wallet.credential_id') = ?2
-                       AND json_extract(card, '$.wallet.origin') = ?3
-                     ORDER BY created_at DESC LIMIT 1",
-                    rusqlite::params![conv, cid, origin],
-                    |r| r.get(0),
-                )
-                .ok();
-            match id {
-                Some(id) => db::get_message(c, &id),
-                None => Ok(None),
-            }
-        })
-        .await
-        .ok()
-        .flatten()
-}
-
 /// Whether an earlier approval card still answers this request: same card
 /// revision (an edit needs a new OK), not expired, and not used yet.
 fn reusable(c: &Value, created_at: i64, revision: i64, now: i64) -> bool {
@@ -454,7 +415,7 @@ fn reusable(c: &Value, created_at: i64, revision: i64, now: i64) -> bool {
     }
 }
 
-/// `fill_card`: answers "filled", "denied", "waiting for approval", or
+/// `fill_card`: answers "filled", "denied", "not filled", or
 /// "not found (...)".
 pub async fn card(
     state: &AppState,
@@ -522,35 +483,29 @@ pub async fn card(
 
     // The owner approves every use of a card, for this card as it is now.
     let revision = card.updated_at;
-    let mut approval = latest_approval(state, &ctx.conversation_id, &card.id, &origin).await;
-    if !approval.as_ref().is_some_and(|m| {
-        m.card
-            .as_ref()
-            .is_some_and(|c| reusable(c, m.created_at, revision, now_ms()))
-    }) {
-        approval = Some(ask_approval(state, ctx, run, card, &page, &origin).await?);
-    }
-    let msg = approval.expect("set above");
-    match wait_decision(state, ctx, &msg.id).await.as_deref() {
-        Some("approved") => {}
-        Some("denied") => {
+    let (answer, msg) = ask_approval(state, ctx, run, card, &page, &origin).await;
+    match answer {
+        crate::gateway::Answer::Approved => {}
+        crate::gateway::Answer::Denied => {
             return Ok(Output::text(
                 "denied (the user said no; do not use the card or try another way)",
             ));
         }
-        _ => {
+        crate::gateway::Answer::Expired | crate::gateway::Answer::Cancelled => {
             return Ok(Output::text(
-                "waiting for approval (the user was asked in the chat; tell them, and call \
-                 fill_card again once they approve)",
+                "not filled (the approval expired or was cancelled; nothing was done)",
             ));
         }
     }
+    let Some(msg) = msg else {
+        return Ok(Output::text("not filled (the approval was cancelled)"));
+    };
     // While waiting, the owner may have taken over or the page moved on.
     b.check_agent(ctx)?;
     let (card, secret) = load(state, &ctx.user_id, &card.id).await?;
     if card.updated_at != revision {
         return Ok(Output::text(
-            "waiting for approval (the card was edited since the user approved; call \
+            "not filled (the card was edited since the user approved; call \
              fill_card again to ask)",
         ));
     }
@@ -573,7 +528,7 @@ pub async fn card(
         .await?;
     if !consumed {
         return Ok(Output::text(
-            "waiting for approval (that OK was already used or has expired; call fill_card \
+            "not filled (that OK was already used or has expired; call fill_card \
              again to ask)",
         ));
     }
@@ -714,11 +669,14 @@ async fn ask_approval(
     card: &Credential,
     page: &PageInfo,
     origin: &str,
-) -> Result<db::Message> {
-    let name = card_name(card);
+) -> (crate::gateway::Answer, Option<db::Message>) {
+    let name = crate::gateway::policy::reveal_hidden(&run.redact(&card_name(card)));
     // Page-derived text is stored: a page may have echoed an earlier secret.
-    let (url, page_title) = (run.redact(&page.url), run.redact(&page.title));
-    let host = &run.redact(&page.host);
+    let (url, page_title) = (
+        crate::gateway::policy::reveal_hidden(&run.redact(&page.url)),
+        crate::gateway::policy::reveal_hidden(&run.redact(&page.title)),
+    );
+    let host = &crate::gateway::policy::reveal_hidden(&run.redact(&page.host));
     let exp = match (
         card.metadata["exp_month"].as_u64(),
         card.metadata["exp_year"].as_u64(),
@@ -729,7 +687,8 @@ async fn ask_approval(
     let preview = format!(
         "Fill your {name}{exp} (\"{}\") into the payment form on this page:\n{}\n\n\
          Approving lets me fill it in this once, to finish what you asked for.",
-        card.label, url
+        crate::gateway::policy::reveal_hidden(&run.redact(&card.label)),
+        url
     );
     let title_text = format!("Use your {name} on {host}");
     let mut value = entities::approval_card(&entities::ApprovalRequest {
@@ -743,119 +702,7 @@ async fn ask_approval(
     });
     value["wallet"] = json!({"credential_id": card.id, "origin": origin,
                              "revision": card.updated_at, "used_at": null});
-    let conv = ctx.conversation_id.clone();
-    let msg = state
-        .db
-        .call(move |c| entities::insert_card(c, &conv, &value, "assistant"))
-        .await?;
-    state.hub.to_users(
-        &ctx.audience,
-        json!({"type": "message.created", "conversation_id": msg.conversation_id, "message": msg}),
-    );
-    if !state.hub.is_online(&ctx.user_id) {
-        let title = state.agent_name().await;
-        crate::notify::push_users(
-            state,
-            std::slice::from_ref(&ctx.user_id),
-            json!({
-                "title": title,
-                "body": format!("Can I use your {name} on {host}? Tap to approve or deny."),
-                "conversation_id": msg.conversation_id,
-                "message_id": msg.id,
-                "kind": "approval",
-            }),
-        );
-    }
-    crate::info!("browser: asked to approve card {} ({})", card.id, msg.id);
-    Ok(msg)
-}
-
-/// Poll the approval card's state for a while ("approved"/"denied", or
-/// None if still pending or the turn ended).
-async fn wait_decision(state: &AppState, ctx: &TurnCtx, message_id: &str) -> Option<String> {
-    let deadline = tokio::time::Instant::now() + APPROVAL_WAIT;
-    loop {
-        if ctx.is_ended() {
-            return None;
-        }
-        let id = message_id.to_string();
-        let st = state
-            .db
-            .call(move |c| db::get_message(c, &id))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|m| m.card)
-            .and_then(|c| c["state"].as_str().map(String::from));
-        match st.as_deref() {
-            Some("approved") | Some("denied") => return st,
-            Some("pending") if tokio::time::Instant::now() < deadline => {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                    _ = ctx.wait_ended() => return None,
-                }
-            }
-            _ => return None,
-        }
-    }
-}
-
-/// The owner approved a card after `fill_card` stopped waiting (the turn
-/// may even be over). Once no turn runs in that chat and the approval is
-/// still unused, continue with a short message from the owner, so Iris
-/// picks it up (`fill_card` then finds the approval).
-pub fn resume_after_approval(state: AppState, message_id: String, conv: String, approver: String) {
-    // Pressing Stop after approving means: do not carry on.
-    let stops = state.browser.stop_count(&conv);
-    tokio::spawn(async move {
-        // Give a waiting fill_card its chance to take it first.
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
-        loop {
-            let busy = state
-                .running
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(&conv);
-            if !busy {
-                break;
-            }
-            if tokio::time::Instant::now() > deadline {
-                return;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        let id = message_id.clone();
-        let card = state
-            .db
-            .call(move |c| db::get_message(c, &id))
-            .await
-            .ok()
-            .flatten();
-        let still_open = card.is_some_and(|m| {
-            m.card.as_ref().is_some_and(|c| {
-                c["state"] == "approved"
-                    && c["wallet"]["used_at"].is_null()
-                    && now_ms() - m.created_at < APPROVAL_TTL_MS
-            })
-        });
-        if !still_open || state.browser.stop_count(&conv) != stops {
-            return;
-        }
-        if let Err(e) = crate::turn::start_chat_turn(
-            &state,
-            &conv,
-            Some(&approver),
-            "I approved the card. Go ahead.",
-            &[],
-            crate::router::Purpose::Chat,
-            &approver,
-        )
-        .await
-        {
-            crate::warn!("browser: could not continue after card approval {message_id}: {e}");
-        }
-    });
+    crate::gateway::approve_browser_card(state, ctx, value).await
 }
 
 #[cfg(test)]

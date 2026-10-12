@@ -1,9 +1,10 @@
 // For you: story cards per topic, Instagram-like posts, full-screen stories.
 import { html, useEffect, useRef, useState } from './h.js';
-import { post as apiPost, seg } from './api.js';
+import { post as apiPost, seg, sessionGen } from './api.js';
 import { S, set, useStore, loadFeed, go, toast, isOwner, touchList } from './store.js';
 import { Icon, Img, LetterTile, Empty, Spinner, ago, hostOf, safeUrl } from './ui.js';
 import { md, plain } from './md.js';
+import { photoIsOpen } from './photo.js';
 
 const photos = (p) => (p.images?.length ? p.images : p.image_url ? [p.image_url] : []);
 const sourceName = (p) => p.source_name || hostOf(p.source_url) || 'For you';
@@ -45,10 +46,12 @@ export function findPost(id) {
   return S.library?.saved.find((x) => x.id === id) || S.feed?.posts.find((x) => x.id === id);
 }
 
-async function like(p) {
+export async function like(p) {
   const liked = !p.liked;
+  const gen = sessionGen();
   markLiked(p, liked);
   try { await apiPost(`/feed/${seg(p.id)}/like`, { liked }); } catch (e) {
+    if (gen !== sessionGen()) return; // another session now: not ours to roll back
     toast(e.message);
     markLiked(p, !liked);
   }
@@ -130,7 +133,7 @@ export function FeedScreen() {
   return html`<div class="scr tabscr feed" onScroll=${onScroll}>
     ${tps.length > 0 && html`<div class="rail" role="list">
       ${tps.map((t, i) => html`<button class="stile" role="listitem" onClick=${() => set({ story: { t: i, s: 0 } })}>
-        <${Img} src=${photos(t.stories[0])[0]} alt="" cls="stile-im" />
+        <${Img} src=${photos(t.stories[0])[0]} alt=${t.stories[0].title} cls="stile-im" />
         <div class="stile-src"><${Favicon} p=${t.stories[0]} size=${22} /></div>
         <small>${t.name}</small>
       </button>`)}
@@ -153,6 +156,13 @@ export function StoryViewer() {
   const tps = S.feed ? topics(S.feed.posts) : [];
   const touch = useRef(null);
   const [paused, setPaused] = useState(false);
+  const [photoOpen, setPhotoOpen] = useState(photoIsOpen);
+  useEffect(() => {
+    const change = () => setPhotoOpen(photoIsOpen());
+    document.addEventListener('iris-photo-change', change);
+    change();
+    return () => document.removeEventListener('iris-photo-change', change);
+  }, []);
   const topic = st && tps[st.t];
   const p = topic?.stories[st.s];
 
@@ -171,14 +181,15 @@ export function StoryViewer() {
   };
 
   useEffect(() => {
-    if (!p || paused) return undefined;
+    if (!p || paused || photoOpen) return undefined;
     const id = setTimeout(() => step(1), STORY_MS);
     return () => clearTimeout(id);
-  }, [st?.t, st?.s, paused, !!p]);
+  }, [st?.t, st?.s, paused, photoOpen, !!p]);
 
   useEffect(() => {
     if (!st) return undefined;
     const key = (e) => {
+      if (photoIsOpen()) return;
       if (e.key === 'Escape') close();
       if (e.key === 'ArrowRight') step(1);
       if (e.key === 'ArrowLeft') step(-1);
@@ -200,16 +211,17 @@ export function StoryViewer() {
     if (Math.abs(dy) > 70 && Math.abs(dy) > Math.abs(dx)) return dy < 0 ? discuss(p) : close();
     if (Math.abs(dx) > 60) return topicStep(dx < 0 ? 1 : -1);
     if (Date.now() - t0.t > 500) return undefined;
+    if (e.target.closest('.viewer-im')) return; // its click opens the photo
     const w = e.currentTarget.clientWidth;
     step(e.clientX - e.currentTarget.getBoundingClientRect().left < w * 0.3 ? -1 : 1);
   };
 
   const img = photos(p)[0];
   return html`<div class="viewer" onPointerDown=${down} onPointerUp=${up} onPointerCancel=${() => setPaused(false)}>
-    ${img ? html`<${Img} src=${img} alt="" cls="viewer-im" />` : html`<div class="viewer-im viewer-blank" />`}
+    ${img ? html`<${Img} src=${img} alt=${p.title} cls="viewer-im" />` : html`<div class="viewer-im viewer-blank" />`}
     <div class="viewer-shade" />
     <div class="bars">${topic.stories.map((_, i) => html`<i class=${i < st.s ? 'f' : ''}>
-      ${i === st.s && html`<b class=${'run' + (paused ? ' paused' : '')} style=${`animation-duration:${STORY_MS}ms`} key=${`${st.t}-${st.s}`} />`}</i>`)}</div>
+      ${i === st.s && html`<b class=${'run' + (paused || photoOpen ? ' paused' : '')} style=${`animation-duration:${STORY_MS}ms`} key=${`${st.t}-${st.s}`} />`}</i>`)}</div>
     <div class="viewer-top"><${Favicon} p=${p} size=${28} /><div><b>${topic.name}</b><small>${sourceName(p)} · ${ago(p.created_at)}</small></div>
       <button class="x" aria-label="Close" onClick=${close}><${Icon} name="x" size=${24} /></button></div>
     <div class="viewer-tx">

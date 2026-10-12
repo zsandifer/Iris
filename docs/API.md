@@ -28,7 +28,8 @@ if the two ever disagree, the code wins and this file has a bug.
    - [3.15 Jobs](#315-jobs)
    - [3.16 Voice](#316-voice)
    - [3.17 Engines (install and update)](#317-engines-install-and-update)
-   - [3.18 Iris's computer (browser)](#318-iriss-computer-browser)
+   - [3.18 Safety: pause, disconnect, trusted people](#318-safety-pause-disconnect-trusted-people)
+   - [3.19 Iris's computer (browser)](#319-iriss-computer-browser)
 4. [WebSocket: `GET /api/ws`](#4-websocket-get-apiws)
 5. [Turn lifecycle](#5-turn-lifecycle)
 6. [Data model](#6-data-model)
@@ -82,7 +83,9 @@ Errors produced by Iris use this shape:
 | `invalid_code` | 401 | `POST /api/pair` with a wrong, used, or expired code. |
 | `forbidden` | 403 | Owner-only route called by a non-owner (`only the owner can do this`), or a creator-only group action by another member (`only the person who created this group can do that`). |
 | `not_found` | 404 | Unknown resource (message is `<thing> not found`), or an unknown route (`route not found`). |
-| `conflict` | 409 | Creating a connector whose name already exists. |
+| `conflict` | 409 | Creating a connector whose name already exists; deciding an approval card that is no longer pending. |
+| `needs_client` | 409 | `POST /api/connectors/{id}/oauth/start` for a service without dynamic registration and no saved client. |
+| `paused` | 409 | Running a job while Iris is paused. |
 | `too_large` | 413 | Uploaded image larger than `max_upload_bytes`. |
 | `unsupported_media_type` | 415 | Uploaded bytes are not PNG, JPEG, GIF, or WebP. |
 | `locked` | 429 | Pairing is locked after repeated failures (see [section 2](#2-authentication-and-pairing)). |
@@ -114,6 +117,7 @@ uploads are additionally checked against `max_upload_bytes` itself
 | `GET /` and the app's static files, `GET /console` (test console) | none |
 | `GET /api/health` | none |
 | `POST /api/pair` | none (rate limited) |
+| `GET /api/oauth/callback` | none: a browser navigation from a service's sign-in page, tied to a sign-in the owner started by a one-time, 15-minute `state` (see [3.12](#312-connectors)) |
 | everything else under `/api` | `Authorization: Bearer iris_<64 hex chars>` |
 
 The scheme name `Bearer` is case-insensitive. The WebSocket can also
@@ -276,6 +280,22 @@ All paths are under `/api`. "Any" means any authenticated user.
 | DELETE | `/connectors/{id}` | **Owner** | Delete a connector |
 | POST | `/connectors/{id}/connect` | **Owner** | Enable |
 | POST | `/connectors/{id}/disconnect` | **Owner** | Disable |
+| POST | `/connectors/{id}/resume` | **Owner** | Turn on and clear a tripwire pause |
+| PUT | `/connectors/{id}/policy` | **Owner** | Approval rules |
+| GET | `/connectors/{id}/tools` | **Owner** | Its tools and what the rules do with each |
+| POST | `/connectors/{id}/oauth/start` | **Owner** | Start signing it in (OAuth) |
+| POST | `/connectors/{id}/oauth/client` | **Owner** | Save the owner's own OAuth client |
+| GET | `/connectors/catalog` | **Owner** | Services to connect (Google, GitHub, custom) |
+| POST | `/connectors/catalog/{service}` | **Owner** | Set up a catalog service |
+| GET | `/connectors/activity` | **Owner** | Connector calls, newest first |
+| POST | `/oauth/complete` | **Owner** | Finish a sign-in with the address the browser landed on |
+| GET | `/oauth/callback` | none | Where services send the browser after sign-in |
+| GET | `/safety` | **Owner** | Pause state, trusted people, limits |
+| PUT | `/safety` | **Owner** | Pause or resume Iris; set trusted people |
+| POST | `/safety/disconnect-all` | **Owner** | Turn every connector off |
+| GET | `/harnesses/{name}/keys` | **Owner** | Saved API keys (names only) |
+| PUT | `/harnesses/{name}/keys/{env}` | **Owner** | Save an engine API key (checked right away) |
+| DELETE | `/harnesses/{name}/keys/{env}` | **Owner** | Remove an engine API key |
 | GET | `/credentials` | **Owner** | List credential metadata |
 | POST | `/credentials` | **Owner** | Create a credential |
 | PATCH | `/credentials/{id}` | **Owner** | Update a credential |
@@ -868,12 +888,14 @@ work.
 #### `POST /api/messages/{id}/decision`
 
 Approve or deny an [`approval` card](#server-cards). Body `{"approve": true |
-false}`. Only the card's `approver_user_id` may decide (`403`), only once
-(`409 conflict`, "this was already decided"). `404` if the caller is not a
-member of the message's conversation; `400` if the message is not an
-approval card. Sets the card's `state` to `approved` or `denied` and
-`decided_at`, broadcasts `message.updated`, and returns `{"message":
-{Message}}`.
+false}`. Only the card's `approver_user_id` may decide (`403`), only while it
+is `pending` (`409 conflict`, "this was already decided or has expired").
+`404` if the caller is not a member of the message's conversation; `400` if
+the message is not an approval card. Sets the card's `state` to `approved`
+or `denied` and `decided_at`, releases the connector call the gateway is
+holding for it (approved: it runs exactly as previewed; denied: it never
+runs and the agent is told), broadcasts `message.updated`, and returns
+`{"message": {Message}}`.
 
 ### 3.8 Library
 
@@ -1025,6 +1047,10 @@ Returns the [Settings](#settings) object directly (not wrapped):
 }
 ```
 
+`paused` is true while the owner has paused Iris
+([3.18](#318-safety-pause-disconnect-trusted-people)); change it with
+`PUT /api/safety`.
+
 #### `PUT /api/settings` (Owner)
 
 All fields optional; only supplied fields change.
@@ -1073,9 +1099,11 @@ Each entry is a [HarnessStatus](#harnessstatus) plus `label` (e.g.
 `"Codex (ChatGPT)"`) and `capabilities` (`{"images", "effort", "mcp",
 "resume"}`, all bool). For the owner it also has `login_flow`
 (`"code_paste"`, `"device_code"`, or `"manual"`), `login_hint` (the one
-server step when the flow is manual), and `login` (the current
-[LoginStatus](#loginstatus) or `null`). `path` is only filled in for the
-owner.
+server step when the flow is manual), `login` (the current
+[LoginStatus](#loginstatus) or `null`), `key_options` (the API keys the
+engine accepts: `[{"env", "label", "url", "provider"}]`), and `keys` (names
+of the keys saved, e.g. `["GEMINI_API_KEY"]`). `path` is only filled in for
+the owner.
 
 #### `POST /api/harnesses/refresh` (Owner)
 
@@ -1107,8 +1135,12 @@ writes.
 |---|---|---|---|
 | `claude` | `code_paste` | `claude auth login --claudeai` | Opens `url`, approves, copies the code shown, sends it with `/login/code`. |
 | `codex` | `device_code` | `codex login --device-auth` | Opens `url`, enters `user_code`. Finishes by itself. |
-| `gemini` | `manual` | (none; Gemini CLI signs in only in an interactive terminal) | Runs `gemini` on the server once (`login_hint`). |
-| `opencode` | `manual` | (none) | Runs `opencode auth login` on the server, or configures a local provider. |
+| `gemini` | `manual` | (none; Gemini CLI signs in only in an interactive terminal) | Adds a Gemini API key in the app ([engine keys](#engine-api-keys)), or runs `gemini` on the server once (`login_hint`). |
+| `opencode` | `manual` | (none) | Adds a provider key in the app ([engine keys](#engine-api-keys)), or runs `opencode auth login` on the server, or configures a local provider. |
+
+For Gemini CLI and OpenCode the sign-in card uses `flow: "api_key"` with
+`key_options`: the app shows a key field (and, for OpenCode, a provider
+picker) and saves it with `PUT /api/harnesses/{name}/keys/{env}`.
 
 ##### `POST /api/harnesses/{name}/login` (Owner)
 
@@ -1133,6 +1165,46 @@ back in `waiting_for_code` with `error` set.
 ##### `DELETE /api/harnesses/{name}/login` (Owner)
 
 Stops the login process. `{"cancelled": true | false}`.
+
+#### Engine API keys
+
+An engine can also run on an API key the owner adds from the app: how
+Gemini CLI and OpenCode providers sign in without a terminal, and an
+optional alternative to the subscription for Claude Code and Codex (billed
+per use by the provider). Keys are sealed with the vault, never returned or
+logged, and passed to that engine's CLI through its documented environment
+variable for every turn and probe (after `strip_api_key_env` removed any
+inherited ones). Subscription sign-ins are never read or touched.
+
+| Engine | Variables |
+|---|---|
+| `claude` | `ANTHROPIC_API_KEY` (used for everything while saved) |
+| `codex` | `CODEX_API_KEY` (read by `codex exec`; used for everything while saved) |
+| `gemini` | `GEMINI_API_KEY` (Iris also selects `gemini-api-key` auth in the per-conversation workspace settings) |
+| `opencode` | `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`, `XAI_API_KEY`, `OPENCODE_API_KEY` |
+
+##### `GET /api/harnesses/{name}/keys` (Owner)
+
+`{"keys": [{"env", "label", "saved_at"}], "key_options": [{"env", "label",
+"url", "provider"}]}`.
+
+##### `PUT /api/harnesses/{name}/keys/{env}` (Owner)
+
+`{"value": "..."}` (one line, no spaces, max 4,096). `env` must be one of the
+engine's `key_options` (`400`). Checks the key first with one tiny real
+request through the engine's own CLI (for OpenCode, with a model of that
+provider), then saves it. Returns the `GET` body plus `auth`: `ok` (saved;
+the engine is marked signed in and its sign-in card turns `connected`),
+`auth_required` (the provider refused it; **it is not saved**, and a key
+saved earlier stays), or `unknown` (could not check, for example the engine
+is turned off; saved and used from the next turn). For OpenCode the per-run
+config also points each provider at Iris's variable, so a key added in the
+app wins over one saved with `opencode auth login`.
+
+##### `DELETE /api/harnesses/{name}/keys/{env}` (Owner)
+
+Removes the key and re-checks the engines. Returns the `GET` body plus
+`removed` (bool).
 
 #### `GET /api/models`
 
@@ -1170,17 +1242,135 @@ as `router: "fallback"`) and the slot shows `pin_unavailable: true`.
 
 ### 3.12 Connectors
 
-Connectors are MCP servers passed to the harness CLI on every turn while
-enabled, **but only in the owner's own conversations** (the Iris owner is
-the only member) and scheduled jobs; other people's chats and shared
-conversations get no connectors. All routes are **owner-only**. Secrets
-never appear on a CLI's command line (Codex gets stdio environments through
-a private file and `iris mcp-exec`, and header values through its own
-environment).
+Connectors are MCP servers the owner connected (Gmail, GitHub, any MCP
+server). **They are never handed to the CLI.** Each turn gets one small
+stdio proxy per usable connector (`iris mcp-gateway`, under the connector's
+name, so tools still appear as `<connector>/<tool>`), and the proxy forwards
+`tools/list` and `tools/call` to the Iris daemon over a private Unix socket
+(`<data dir>/run/gateway.sock`, 0600) with a token valid only for that
+turn. The daemon runs the real server: a stdio program it starts with the
+connector's secrets in the environment (working directory
+`<data dir>/connectors/<id>`, outside the agent's workspace), a remote
+Streamable HTTP server it calls with the connector's headers or OAuth token,
+or a program that serves HTTP on a loopback port (`{port}` in its arguments,
+environment, and URL is replaced with a free port). The agent never sees a
+connector secret, and Iris never decides what to call: it forwards the
+CLI's calls and enforces the owner's rules on them.
 
-Secret values (`env` values and `headers` values) are encrypted at rest and
-**never returned**; responses list only their key names. See
-[Connector](#connector).
+Who gets them: turns in the **owner's** own conversations (the owner is the
+only member) and the owner's scheduled jobs, for connectors that are on,
+not paused, and signed in. All routes are **owner-only**. Shared
+conversations (more than one member) and other people's conversations get
+none. Programs stop after `safety.idle_minutes` without use and start again
+on the next call. Connectors saved before the gateway existed keep running
+in the workspace folder (they may use paths relative to it); new ones run
+in a private folder.
+
+MCP servers configured in a CLI itself (outside Iris) are turned off in
+every Iris turn, the owner's included, so nothing bypasses the gateway:
+Claude Code runs with `--strict-mcp-config`, Gemini CLI with
+`--allowed-mcp-server-names`, and Codex and OpenCode get `enabled = false`
+for the servers their own listings report (`codex mcp list --json`,
+`opencode debug config`; names only, read before each turn). If that
+listing fails, the engine is skipped for the turn rather than run with
+those servers on. Where a CLI's own server has the same name as one of
+Iris's, Iris's is passed as `iris_<name>` so the two are never merged. Add
+such services as connectors instead.
+
+**The approval gate.** Every call is classified from the real tool name,
+the server's own annotations (`readOnlyHint`, `destructiveHint`; risky words
+in the name win), and the real arguments: `read`, `draft`, `write`, `send`
+(email, messages, posts, replies, sharing, invites, approving or merging,
+and creating or changing things others see such as pull requests, issues,
+releases, and comments),
+`purchase` (buying, paying, ordering, booking), `delete`, `export`, or
+`unclear`. Operation arguments of multi-purpose tools (`method`, `action`,
+`operation`, `op`, `verb`, `command`, `event`) count too: the riskier
+reading wins, and an operation Iris cannot place on a tool that changes
+things is `unclear`. Recipients are read from
+the arguments (`to`, `cc`, `bcc`, `recipients`, `attendees`, `email`,
+`phone`, `channel`, ...). With the default rules:
+
+| Call | What happens |
+|---|---|
+| read, draft | Runs. |
+| write | Runs, unless it reaches someone new (a recipient not trusted and never approved before), which asks. |
+| send | Runs without asking only when every recipient is a [trusted person](#318-safety-pause-disconnect-trusted-people) and the server cannot add others (a reply-all flag counts as "everyone else on the thread"; publishing a pull request, issue, comment, or post counts as "everyone who can see it", whoever is assigned); otherwise asks. Sending, publishing, or forwarding an existing draft is a send; composing one is a draft. |
+| purchase | Always asks, whatever the rules. |
+| delete, export, unclear | Asks. |
+
+Asking means: Iris holds the call, posts an [`approval` card](#server-cards)
+built from the exact arguments in the turn's chat (the owner's Main chat for
+scheduled jobs), sends a push (`kind: "approval"`), and waits. Approved: the
+held call runs unchanged and its recipients become known. Denied, no answer
+within `safety.approval_timeout_secs` (default 300, and at most a minute
+less than `turn_timeout_secs`; the card becomes `expired`), or the turn
+ended, Iris was paused, or the connector was turned off, removed, or paused
+(the card becomes `cancelled`): it never runs, and the agent gets an error
+result saying so. Stopping a turn, or someone joining its chat, ends its
+connector access at once (before the CLI has finished exiting). Right
+before any call runs (and again after starting the connector), Iris checks
+that the connector still exists, is on, unpaused, and signed in, that it is
+the same target and account the owner approved, that its current rules and
+trusted people still allow the call, that the turn is still running, that
+its chat is still the owner's alone, and that Iris is not paused. Editing a connector's
+settings or signing it in again cancels its waiting approvals. A request too large to show in full on the card (over 64,000
+characters) is refused rather than approved unseen. Tools that would ask are marked in their description; tools the
+rules turn off are left out of `tools/list`.
+
+**Tripwires.** Checked and recorded in one step right before a call runs
+(so concurrent calls, or several approvals released together, cannot all
+pass), counting calls that ran in the last hour through one connector: more than `safety.max_sends_per_hour` sends (default 5), more
+than `safety.max_calls_per_hour` calls (200), or more than
+`safety.max_read_mb_per_hour` MB of results (25, a bulk export) pauses the
+connector: the call is refused, an `action` card "I paused <service>" with a
+Resume button is posted in the Main chat, and the owner gets a push (`kind:
+"safety"`). Calls already admitted finish; waiting approvals for that
+connector are cancelled. The data limit is also checked right after each
+result. The hour counts from when calls ran, not when they were asked. Every call (ran, asked, refused, including calls refused because the
+connector was paused, off, or signed out) is recorded in the
+[connector activity log](#get-apiconnectorsactivity).
+
+**Sign-in (OAuth 2.1 + PKCE).** A connector with `auth: "oauth"` signs in on
+the service's own page:
+
+- `discover` (custom remote MCP servers, GitHub): Iris follows the MCP
+  authorization spec: the 401's `WWW-Authenticate` `resource_metadata`, or
+  `/.well-known/oauth-protected-resource[/<path>]` (RFC 9728), then the
+  authorization server's metadata (RFC 8414 path insertion, then OpenID
+  discovery), requires S256 PKCE support, registers itself with dynamic
+  client registration (RFC 7591) when offered, and sends the RFC 8707
+  `resource` parameter. Without registration the owner pastes the client
+  ID (and secret) of an OAuth app they created (`409 needs_client`).
+  Every address Iris fetches while signing in must be https, must not
+  resolve to a loopback, private, or link-local address, and is not
+  followed through redirects (loopback is allowed only when the connector
+  itself is on this machine).
+- `preset` (Google): fixed endpoints and scopes, the owner's own OAuth
+  client (`access_type=offline`).
+
+The redirect URI is `<base>/api/oauth/callback`, where base is `public_url`
+or the app's origin. If that is not https (and not this machine), the
+redirect goes to `http://127.0.0.1:<port>/api/oauth/callback` instead; the
+browser lands on a page that does not load, and the owner pastes that
+address into the app (`POST /api/oauth/complete`). Tokens are sealed with the
+vault, refreshed a minute before they expire, and sent only to the
+connector. A refused token (401/403 at startup, while listing, or on a
+call, after one refresh and retry, or a refused refresh) marks the
+connector `needs_reconnect` and posts a `connector_reconnect` card (`auth:
+"oauth"`) whose button signs in again. A sign-in server that cannot be
+reached or is having trouble (HTTP 429/5xx, `temporarily_unavailable`)
+fails only that call. A new sign-in replaces the previous grant entirely;
+changing a connector's web address clears its sign-in. A sign-in whose code
+exchange was overtaken by a newer change (another sign-in, a new client, a
+new address, or setting it up again) is refused instead of saving its
+tokens. Private addresses are allowed during sign-in only when every
+address the connector's host resolves to is private. Tool error results
+are scrubbed of the connector's secrets before the agent sees them.
+
+Secret values (`env` values, `headers` values, OAuth client secrets and
+tokens) are encrypted at rest and **never returned**; responses list only
+key names. See [Connector](#connector).
 
 #### `GET /api/connectors`
 
@@ -1193,14 +1383,20 @@ Secret values (`env` values and `headers` values) are encrypted at rest and
 | `name` | string | | Required. 1 to 48 characters of `A-Z a-z 0-9 _ -`, not `iris` (reserved). Unique (`409 conflict`). Used as the MCP server name and tool prefix. |
 | `description` | string | `""` | Max 500. |
 | `transport` | string | `"stdio"` | `"stdio"` or `"http"`. |
-| `command` | string | | stdio: required, max 500. |
-| `args` | string[] | `[]` | stdio arguments. |
-| `env` | object | `{}` | stdio environment, `{"KEY": "secret value"}`. |
+| `command` | string | | stdio: required, max 500. http: optional; a program Iris starts that serves the URL (use `{port}`). |
+| `args` | string[] | `[]` | Program arguments. |
+| `env` | object | `{}` | Program environment, `{"KEY": "secret value"}`. |
 | `url` | string | | http: required. Must start with `http://` or `https://`, max 2,000. |
 | `headers` | object | `{}` | http headers, `{"Authorization": "Bearer ..."}`. |
+| `auth` | string | `"none"` | http only: `"oauth"` signs in with the MCP authorization spec (the connector starts as `needs_sign_in`; continue with `POST /api/connectors/{id}/oauth/start`). |
 | `enabled` | bool | `true` | |
 
 Keys in `env` and `headers` must be 1 to 100 characters of `A-Z a-z 0-9 _ -`.
+HTTP connectors with OAuth or saved headers require an `https://` URL.
+Plain HTTP is allowed only for `localhost` or a loopback IP (such as
+`127.0.0.1` or `[::1]`). Creation and configuration updates reject unsafe
+addresses; the gateway also refuses to attach credentials to unsafe
+addresses saved by older versions. OAuth discovery follows the same rule.
 
 ```json
 {
@@ -1217,17 +1413,117 @@ Response `{"connector": {Connector}}`.
 
 #### `PATCH /api/connectors/{id}`
 
-Same fields except `name` and `transport`, which cannot be changed (they are
-ignored if sent). Supplying `env` or `headers` **replaces** the whole map.
-Response `{"connector": {Connector}}`.
+Same fields except `name`, `transport`, and `auth`, which cannot be changed
+(they are ignored if sent). Supplying `env` or `headers` **replaces** the
+whole map. Changing the configuration restarts the connector and closes its
+reconnect card. Response `{"connector": {Connector}}`.
 
 #### `POST /api/connectors/{id}/connect`, `POST /api/connectors/{id}/disconnect`
 
-Set `enabled` to `true` / `false`. Response `{"connector": {Connector}}`.
+Set `enabled` to `true` / `false` (turning it off stops its program).
+Response `{"connector": {Connector}}`.
+
+#### `POST /api/connectors/{id}/resume`
+
+Turns the connector on and clears a tripwire pause. Response
+`{"connector": {Connector}}`.
+
+#### `PUT /api/connectors/{id}/policy`
+
+`{"mode"?: "standard" | "careful" | "read_only" | "ask_always", "tools"?:
+{"<tool>": "allow" | "ask" | "block" | null}}`. `null` removes a tool's
+override. Modes, in plain words: `standard` "Reads freely · asks before
+sending, buying, or deleting" (default), `careful` "Reads freely · asks
+before any change", `read_only` "Only reads · never changes anything",
+`ask_always` "Asks every time". A tool set to `allow` runs without asking,
+except purchases, which always ask. Response `{"connector": {Connector}}`.
+
+#### `GET /api/connectors/{id}/tools`
+
+Starts the connector if needed and lists its tools:
+`{"tools": [{"name", "label", "description", "category", "rule", "effect"}],
+"error": null}`, where `effect` is `runs`, `asks`, `asks unless trusted`, or
+`off`. If it cannot start: `{"tools": [], "error": "...", "detail": "<last
+line the program printed, or null>"}`.
+
+#### `GET /api/connectors/catalog`
+
+`?origin=<the app's origin>`. The services Iris knows how to set up:
+
+```json
+{
+  "services": [{
+    "id": "google", "label": "Google", "description": "Gmail, Calendar, and Drive",
+    "setup": "google_client", "missing": [], "connector_id": null, "connected": false,
+    "redirect_uri": "https://iris.example.ts.net/api/oauth/callback", "redirect_direct": true
+  }],
+  "modes": [{"mode": "standard", "label": "Reads freely · asks before sending, buying, or deleting"}]
+}
+```
+
+`missing` lists programs the service needs on the server (Google needs
+`uvx`). `redirect_uri` is the address to register with the service;
+`redirect_direct: false` means the owner will paste the final address back.
+
+#### `POST /api/connectors/catalog/{service}`
+
+Creates (or updates) the connector named after the service. Response
+`{"connector": {Connector}, "needs_sign_in": bool}`.
+
+- `google`: `{"client_id", "client_secret"}` from the owner's Google Cloud
+  project (a "Web application" OAuth client; the client ID must end in
+  `.apps.googleusercontent.com`). Iris runs the open-source Google
+  Workspace MCP server (`uvx workspace-mcp@2.1.0 --transport streamable-http
+  --tools gmail calendar drive`) on a loopback port in its external OAuth
+  mode and passes the owner's access token with every request. No client
+  secret ships with Iris.
+- `github`: `{"token"}` (a personal access token, sent as a bearer header to
+  `https://api.githubcopilot.com/mcp/`), or `{"client_id",
+  "client_secret"}` of the owner's GitHub OAuth app (then sign in).
+
+#### `POST /api/connectors/{id}/oauth/start`
+
+`{"origin": "<the app's origin>"}`. Discovers and registers as needed and
+returns `{"authorize_url", "redirect_uri", "paste": bool}`. Turning the
+connector off or removing it drops a sign-in in progress. The app opens
+`authorize_url`; when the owner approves, the service sends the browser to
+`GET /api/oauth/callback`, or (when `paste`) the owner pastes the address
+they landed on into `POST /api/oauth/complete`. `409 needs_client` when the
+service has no dynamic registration and no client is saved (the message
+names the callback address to register). A new start replaces an unfinished
+one for the same connector.
+
+#### `POST /api/connectors/{id}/oauth/client`
+
+`{"client_id", "client_secret"?}`: the owner's own OAuth client for a
+`discover` connector. Clears saved tokens. Response `{"connector":
+{Connector}}`.
+
+#### `GET /api/oauth/callback`
+
+`?state&code` (or `?state&error`). No device token. Finishes the sign-in the
+`state` belongs to (one use, 15 minutes): exchanges the code with the PKCE
+verifier, stores the tokens, marks the connector `ok` (it never turns a
+connector on by itself), closes its reconnect card, and broadcasts
+`connectors.changed`. Answers with a small
+HTML page ("Google is connected. You can close this page and go back to
+Iris.", or what went wrong).
+
+#### `POST /api/oauth/complete`
+
+`{"url": "<the address the browser landed on>"}` (max 8,000). Same as the
+callback. Response `{"connected": "<service label>"}`; `400` with a friendly
+message otherwise.
+
+#### `GET /api/connectors/activity`
+
+`?connector_id&before&limit` (limit 1..200, default 50). Every gated call,
+newest first: `{"items": [{ConnectorCall}], "has_more": bool}`.
 
 #### `DELETE /api/connectors/{id}`
 
-`{"ok": true}`.
+Stops it and deletes it with its saved secrets, tokens, and working
+directory. `{"ok": true}`.
 
 ### 3.13 Credentials
 
@@ -1476,9 +1772,48 @@ When the server starts and no engine can answer, Iris posts one
 with install actions. Installing one is followed by its sign-in card; the
 setup card becomes `done` once any engine is signed in.
 
+### 3.18 Safety: pause, disconnect, trusted people
+
+Owner only.
+
+#### `GET /api/safety`
+
+```json
+{
+  "paused": false, "paused_at": null,
+  "trusted_recipients": ["sam@example.com", "+15550102000"],
+  "pending_approvals": 0,
+  "limits": {"approval_timeout_secs": 300, "max_sends_per_hour": 5,
+             "max_calls_per_hour": 200, "max_read_mb_per_hour": 25}
+}
+```
+
+#### `PUT /api/safety`
+
+`{"paused"?: bool, "trusted_recipients"?: string[]}`. Returns the `GET` body.
+
+- **Pause Iris** (`paused: true`): cancels every running turn (their waiting
+  approvals become `cancelled`), and until resumed no turn or scheduled job
+  starts and no connector call runs. A message sent while paused is stored
+  and answered right away with a friendly "I'm paused" reply
+  (`meta.error.kind: "paused"`, no push); `POST /api/jobs/{name}/run` and
+  `POST /api/feed/refresh` answer `409 paused`. Broadcasts
+  `settings.changed` (`settings.paused`).
+- **Trusted people** (max 200): messages and emails only to these
+  recipients run without approval. Entries are normalized like the gate
+  does (the address inside `Name <addr>`, lowercased; phone numbers as
+  digits with an optional leading `+`).
+
+#### `POST /api/safety/disconnect-all`
+
+**Disconnect everything**: turns every connector off, stops their programs,
+cancels waiting approvals, and disconnects and closes the browser. Reopen it
+with `POST /api/browser/start` to reconnect browser tools. `{"disconnected": <how many were on>,
+"connectors": [{Connector}]}`. Turn them back on one by one.
+
 ---
 
-### 3.18 Iris's computer (browser)
+### 3.19 Iris's computer (browser)
 
 Owner only. Iris's own headless Chromium, which the agent drives through
 the [browser tools](#the-browser-tools) and the owner can watch and take
@@ -1509,6 +1844,7 @@ Playwright's browser cache (`$PLAYWRIGHT_BROWSERS_PATH` or
 | `available` | bool | A browser executable was found. |
 | `running` | bool | The browser is open. |
 | `paused` | bool | "Pause Iris" is on. |
+| `disconnected` | bool | Browser tools are disabled after Disconnect everything; reopening the browser reconnects them. |
 | `url`, `title` | string | Current page (empty while closed). |
 | `controller` | string | `agent`, or `user` while the owner has taken over. |
 | `controller_device_id` | string or null | The device in control. |
@@ -1528,7 +1864,8 @@ Playwright's browser cache (`$PLAYWRIGHT_BROWSERS_PATH` or
 #### `POST /api/browser/start`, `POST /api/browser/stop`
 
 Open (`503 browser_unavailable` with the reason if it cannot start) or close
-the browser. Closing is graceful, so cookies are saved. Both return
+the browser. Starting reconnects browser tools after Disconnect everything.
+Closing is graceful, so cookies are saved. Both return
 `{"browser": {BrowserStatus}}`.
 
 #### `POST /api/browser/takeover` (Owner)
@@ -1633,6 +1970,7 @@ was emitted). Events are delivered only to the users listed under
 | `browser.state` | `{"browser": {BrowserStatus}}` (may omit the setup fields `managed`, `managed_version`, `requires`, `install`; merge into what you have) | The owner |
 | `browser.active` | `{"conversation_id", "message_id"}` | Conversation members |
 | `browser.done` | `{"conversation_id", "message_id"}` | Conversation members |
+| `connectors.changed` | `{}` | The owner |
 
 Example:
 
@@ -1644,7 +1982,9 @@ Event details:
 
 - **`message.updated`**: a stored message changed after it was created; so
   far only server cards whose `state` moves (sign-in, setup, connector
-  reconnect). Replace the message by id.
+  reconnect, approvals). Replace the message by id.
+- **`connectors.changed`**: a connector was added, changed, signed in,
+  paused, resumed, or removed; refetch `GET /api/connectors`.
 - **`models.changed`**: a slot's automatic choice changed (a model was
   installed or disappeared, a CLI signed in or out, the codex models cache
   changed; checked every minute) or the owner pinned/unpinned a slot.
@@ -1772,15 +2112,20 @@ After `POST /api/conversations/{id}/messages` (or `POST
    enabled connectors, and starts the CLI. In shared conversations (more than
    one member) the bridge runs in cards-only mode; connectors and the
    owner's private files are only passed in the owner's own conversations
-   (see [section 3.3](#33-conversations-and-messages)).
+   (see [section 3.3](#33-conversations-and-messages)). Connectors reach the
+   CLI only as gateway proxies ([3.12](#312-connectors)); a connector call
+   that needs approval posts its `approval` card (`message.created`) and
+   pushes right away, while the turn waits.
 5. While the CLI runs, Iris emits `message.delta` and `message.activity`.
 6. On a "not signed in" error with no text yet, the harness is marked
    `auth_required` (a `harness.status` event, plus a reconnect card if the
    owner had used it) and the turn is retried on the next-ranked engine. On a failed session resume with no text yet, the turn is
    retried with a fresh session. At most 3 attempts in total.
 7. Iris saves the final message and emits `message.completed`, then
-   `message.created` for each card message the agent created during the turn
-   (and a `connector_reconnect` card if a connector refused its sign-in),
+   `message.created` for each card the agent created during the turn
+   through the bridge (server cards such as approvals were sent as they
+   were posted; a `connector_reconnect` card is posted if a connector
+   refused its sign-in),
    then `entities.changed` if applicable, then sends a reply push if
    applicable.
 
@@ -1851,6 +2196,7 @@ A Main chat message posted by the heartbeat job has
 | `paused_policy` | A conversation with more than one person, Claude is the only usable engine, and the owner has not allowed Claude for shared chats | `only Claude is available and this conversation is shared` | "I can't reply in this group chat yet. The only AI engine on the server is Claude, and Claude subscriptions are for one person, so I stay out of shared conversations unless the owner turns that on." The first time per conversation an `action` card offers the owner the opt-in. |
 | `no_engine` | No usable engine at all (none installed, all disabled, or every harness failed to start) | `no usable engine` / `no engine available` | "I can't reach any AI engine on the server right now. One of Claude, Codex, Gemini, or OpenCode needs to be installed and signed in; I can walk you through it in Settings." |
 | `timeout` | No result within `turn_timeout_secs` (default 600) | `no result after 600s` | "That took too long, so I stopped. Want me to try again?" |
+| `paused` | The owner paused Iris | `the owner paused Iris` | "I'm paused right now, so I didn't do anything. You can resume me from my computer screen in the app whenever you're ready." (no "stuck" push) |
 | `harness_error` | The CLI reported an error, or exited without a result | The CLI's error text | "Something went wrong on my end. Want me to try again?" |
 | `internal` | Iris could not build the CLI command | `could not build command: ...` | "Something went wrong on my end. Want me to try again?" |
 | `paused` | The owner turned on "Pause Iris" (the engine is not run; no "stuck" push) | `the owner paused Iris` | "I'm paused right now, so I'm not doing anything. You can turn me back on in my computer settings whenever you want me again." |
@@ -1985,7 +2331,7 @@ the top of a Discuss chat has `role: "system"`.
 
 | Field | Type | Notes |
 |---|---|---|
-| `type` | string | Agent cards: one of `link`, `connect`, `info`, `feed_post`, `idea`, `goal`, `result` (one concrete result such as a place or product: image, details, one action). Server cards (below): `action`, `engine_signin`, `engine_setup`, `connector_reconnect`, `approval`. |
+| `type` | string | Agent cards: one of `link`, `connect` (with `service` `google`, `github`, or `custom` it opens Iris's own setup and needs no `url`), `info`, `feed_post`, `idea`, `goal`, `result` (one concrete result such as a place or product: image, details, one action). Server cards (below): `action`, `engine_signin`, `engine_setup`, `connector_reconnect`, `approval`. |
 | `title` | string | Required, non-blank, max 300. |
 | `body` | string | Optional, max 4,000. |
 | `url` | string | Optional; must be `http://` or `https://`, max 2,000. Required for `link` and `connect`. |
@@ -2010,8 +2356,15 @@ changes are re-sent as `message.updated`.
 | `action` | `action: {"method", "path", "body"}` | Call that Iris API route with that JSON body when the owner taps `action_label` (e.g. `PUT /api/settings {"allow_claude_for_shared": true}`). |
 | `engine_signin` | `harness`, `flow` (`code_paste`, `device_code`, `manual`), `state` (`needs_reconnect`, `starting`, `waiting_for_code`, `waiting_for_approval`, `verifying`, `connected`, `failed`, `cancelled`), `url`, `user_code`, `error`, `instructions` (manual flow), `login_id` | Start with `POST /api/harnesses/{harness}/login`. For `waiting_for_code`, show `url` and a code field (`/login/code`); for `waiting_for_approval`, show `url` and `user_code`; for `manual`, show `instructions` and a "Check again" button (the same `POST`). |
 | `engine_setup` | `state` (`needs_setup`, `done`), `options: [{"harness", "label", "installed", "requires", "action": {"method", "path"}}]` | Each option installs that engine (`POST /api/engines/{name}/install`). |
-| `connector_reconnect` | `connector_id`, `service`, `state` (`needs_reconnect`, `connected`) | Open the connector's settings so the owner can update its credentials (`PATCH /api/connectors/{id}`); the card turns `connected` when they do. |
-| `approval` | `service`, `preview: {"to", "subject", "body"}`, `action_label` (e.g. "Send"), `approver_user_id`, `owner_only: false`, `state` (`pending`, `approved`, `denied`), `decided_at`; wallet approvals (`service: "wallet"`) add `wallet: {"credential_id", "origin", "revision", "used_at"}` | Show the preview exactly as given with Deny / `action_label`; decide with [`POST /api/messages/{id}/decision`](#post-apimessagesiddecision). The preview is built by Iris from the real action, never from agent text. For `wallet`, `preview.to` is the site and `preview.subject` the page title (the app labels them Site and Page); one approval fills the card once (`used_at` is set when it does) and expires after 30 minutes. |
+| `connector_reconnect` | `connector_id`, `service`, `auth` (`oauth` or `secrets`), `state` (`needs_reconnect`, `connected`) | `oauth`: sign in again (`POST /api/connectors/{id}/oauth/start`). `secrets`: open the connector's settings so the owner can update its credentials (`PATCH /api/connectors/{id}`). The card turns `connected` when they do. |
+| `approval` | `service`, `preview: {"to", "subject", "body", "fields": [{"label", "value"}]}`, `details` (the complete arguments, pretty JSON; requests too large to show in full are refused), `reason` (why it asks, e.g. "Sends a message to someone new: sam@example.com"), `tool`, `category`, `connector_id`, `turn_message_id` (the reply of the turn that asked; absent for scheduled jobs), `action_label` (`Send`, `Pay`, `Delete`, or `Allow`), `approver_user_id`, `owner_only: false`, `state` (`pending`, `approved`, `denied`, `expired`, `cancelled`), `expires_at`, `decided_at` | Show the preview exactly as given with Deny / `action_label`; decide with [`POST /api/messages/{id}/decision`](#post-apimessagesiddecision). Built by the gateway from the real arguments of the held call, never from agent text; characters that could hide or reorder text are shown as `[U+XXXX]`, and a body over 4,000 characters is cut with a note (the full text is in `details`). |
+
+Wallet approval cards use this same gate with `service: "wallet"`,
+`action_label: "Fill card"`, and `wallet: {"credential_id", "origin",
+"revision", "used_at"}`. The preview labels are Site and Page. One approval
+fills once in its original running turn, on the approved document/origin.
+The preview comes from the real page and saved card; it contains no vault secret.
+
 
 ### Attachment
 
@@ -2086,22 +2439,52 @@ The API view (`public_json`); secret values are never included.
 | Field | Type | Notes |
 |---|---|---|
 | `id` | string | |
-| `name` | string | MCP server name. |
+| `name` | string | MCP server name and tool prefix. |
 | `description` | string | |
 | `transport` | string | `stdio` or `http`. |
+| `service` | string | Catalog entry: `google`, `github`, or `custom`. |
 | `enabled` | bool | |
-| `command` | string or null | stdio. |
-| `args` | string[] | stdio. |
+| `command` | string or null | Program (stdio, or an http server Iris starts). |
+| `args` | string[] | |
 | `url` | string or null | http. |
 | `env_keys` | string[] | Names of stored env variables (values hidden). |
 | `header_keys` | string[] | Names of stored headers (values hidden). |
+| `auth` | string | `oauth` or `secrets`. |
+| `oauth` | object or null | `{"mode", "client_configured", "client_source", "connected", "connected_at", "account", "scopes", "redirect_uri"}`; `account` is the signed-in email when the service reports one. Never tokens or secrets. |
+| `auth_state` | string | `ok`, `needs_sign_in`, or `needs_reconnect`. |
+| `policy` | object | `{"mode", "tools"?}` (see `PUT /api/connectors/{id}/policy`). |
+| `rules` | string | The mode in plain words, e.g. "Reads freely · asks before sending, buying, or deleting". |
+| `paused`, `paused_reason`, `paused_at` | bool, string or null, int or null | Set by a tripwire; cleared by `resume`. |
 | `created_at`, `updated_at` | int | |
 
 ```json
-{"id": "...", "name": "calendar", "description": "", "transport": "stdio", "enabled": true,
- "command": "npx", "args": ["-y", "some-calendar-mcp"], "url": null,
- "env_keys": ["API_TOKEN"], "header_keys": [], "created_at": 1760000000000, "updated_at": 1760000000000}
+{"id": "...", "name": "calendar", "description": "", "transport": "stdio", "service": "custom",
+ "enabled": true, "command": "npx", "args": ["-y", "some-calendar-mcp"], "url": null,
+ "env_keys": ["API_TOKEN"], "header_keys": [], "auth": "secrets", "oauth": null,
+ "auth_state": "ok", "policy": {"mode": "standard"},
+ "rules": "Reads freely · asks before sending, buying, or deleting",
+ "paused": false, "paused_reason": null, "paused_at": null,
+ "created_at": 1760000000000, "updated_at": 1760000000000}
 ```
+
+### ConnectorCall
+
+One call through the gateway (the connector activity log).
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string | |
+| `connector_id`, `connector_name` | string | |
+| `tool` | string | Tool name. |
+| `category` | string | `read`, `draft`, `write`, `send`, `purchase`, `delete`, `export`, or `unclear`. |
+| `decision` | string | `auto` (rules let it run), `trusted` (only trusted recipients), `approved`, `denied`, `expired`, `cancelled`, `blocked` (rules or a tripwire refused it), or `pending`. |
+| `outcome` | string or null | `ok` or `error` once it ran; null if it did not run. |
+| `reason` | string | Why it asked or was refused. |
+| `summary` | string | Short preview: recipients and subject (never the body). |
+| `conversation_id`, `message_id` | string or null | The turn that made the call. |
+| `card_message_id` | string or null | Its approval card. |
+| `result_bytes` | int | Size of the result. |
+| `created_at`, `finished_at` | int, int or null | |
 
 ### Credential
 
@@ -2230,6 +2613,7 @@ Stored as `meta.routing` (plus `notes`).
 | `feed_prompt` | string \| null | Effective feed prompt (default if unset); `null` for everyone but the owner, who also gets it in `settings.changed` events. |
 | `paused` | bool | "Pause Iris" is on (see [`PUT /api/settings`](#put-apisettings-owner)). |
 | `voice` | object | Always `{"enabled": false, "status": "not_implemented"}`. |
+| `paused` | bool | The owner paused Iris. |
 
 ---
 
@@ -2384,8 +2768,14 @@ access other than reading a file to save into the Library.
 ### How it is launched
 
 Every turn passes this MCP server to the CLI under the server name **`iris`**
-(reserved; connectors cannot use it), alongside every enabled connector
-(none in shared conversations):
+(reserved; connectors cannot use it), alongside one connector gateway proxy
+(`<iris> mcp-gateway --data-dir <DATA_DIR> --connector <name>`, with the
+turn's token in `IRIS_GATEWAY_TOKEN`) per usable connector (none in shared
+conversations or other people’s chats; see [3.12](#312-connectors)). Per-call timeouts are raised
+for the proxies so a call can wait for the owner's approval (Claude Code
+`timeout` plus `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0`, Codex
+`tool_timeout_sec`/`startup_timeout_sec`, Gemini CLI and OpenCode
+`timeout`).
 
 ```
 <path to iris binary> mcp --data-dir <DATA_DIR> --user <USER_ID> --conversation <CONVERSATION_ID> [--shared] [--workdir <DIR>]
@@ -2475,7 +2865,7 @@ All tools are available in normal mode; only `create_card` in shared mode.
 | `save_to_library` | `title` (required, max 300), exactly one of `content` or `path`, `mime?`, `kind?: "artifact" \| "media"`, `description?` (max 2,000) | `{"item": LibraryItem}` |
 | `list_library` | `kind?: "artifact" \| "media"` | `{"items": [LibraryItem]}` (max 500) |
 | `create_card` | `type` (required, one of the [card types](#card)), `title` (required), `body?`, `url?`, `image_url?`, `action_label?`, `service?`, `ref_id?` (id of a related goal, idea, or feed post) | `{"card_message_id": "...", "shown": true}` |
-| `list_connectors` | none | `{"connectors": [{"name", "description", "transport", "enabled"}]}` |
+| `list_connectors` | none | `{"connectors": [{"name", "service", "description", "enabled", "signed_in", "paused", "rules"}], "available_to_connect": [{"service", "name", "description"}]}` |
 
 `create_card` validates with the [Card](#card) rules and inserts a card
 message (`role: "assistant"`) into the current conversation. Clients receive
@@ -2517,7 +2907,7 @@ does all the deciding.
 | `wait` | `text?`, `seconds?` (max 30) | Snapshot once the text appears, or after the time |
 | `tabs` | `action` (`list`, `new`, `select`, `close`), `index?`, `url?` | Tab list or snapshot. Tabs a page opens become the current tab. |
 | `fill_login` | `site?` | `filled`, or `not found (<reason>)` |
-| `fill_card` | `card?` (name or last 4 digits) | `filled` (or `filled (but ...)` naming parts that could not be filled), `denied (...)`, `waiting for approval (...)`, or `not found (...)` |
+| `fill_card` | `card?` (name or last 4 digits) | `filled` (or `filled (but ...)` naming parts that could not be filled), `denied (...)`, `not filled (...)` (expired/cancelled), or `not found (...)` |
 
 Refs are valid until the page changes (they are unique per document, so an
 old ref never hits an element of a newer page); a stale ref gets an error
@@ -2558,9 +2948,9 @@ Each call waits while the owner has taken over, and checks again once it
 holds the page and right before every command that changes the page, so a
 queued or slow call never acts under the owner's control. When the turn
 ends (finished, cancelled, or failed), its calls stop at once, even in the
-middle of a wait, and nothing more is done for it. Codex gets a 180 s tool
-timeout for this server (its default is 60 s); OpenCode gets the same
-(`timeout: 180000`).
+middle of a wait, and nothing more is done for it. Every harness gets a
+per-server timeout of the effective approval window plus 300 seconds, using
+the standard per-server MCP timeout fields.
 
 `fill_login` takes the saved login whose `site` matches the current page's
 host (a subdomain matches too; the most recently used wins), finds the
@@ -2577,14 +2967,12 @@ no sign-in field, changed while filling, or nothing is saved for it.
 
 `fill_card` picks the card (the only one, or the one named), checks the
 page has a card number field, and posts an [approval card](#server-cards)
-in the conversation (with a push to the owner if no app is open), built
-from the real page and card. It waits up to 45 seconds for the decision;
-after that it answers `waiting for approval`, and calling it again on the
-same site later picks up the decision. When the owner approves after
-`fill_card` stopped waiting, the server waits until no turn runs in that
-chat and, if the approval is still unused, continues with a message from
-the owner ("I approved the card. Go ahead."), which leads to that call
-(not after the owner pressed Stop in that chat). An approval is for the card as it was: editing the card asks again.
+in the conversation with a push to the owner, built from the real page and
+card. It uses the connector gateway's approval waiter and effective
+`safety.approval_timeout_secs`: denial, expiry, Stop, Pause Iris, Disconnect
+everything, or loss of private membership prevents the fill. An approval
+only releases the held call; it never starts a later turn. The card must
+still have the same revision when filled; editing it requires another OK.
 After approval (still unexpired and unused when it is consumed), Iris fills
 the card number, expiry, CVC, and name itself the same way, on the approved
 page only; each approval fills once and is bound to the browser's exact
@@ -2654,6 +3042,8 @@ use.
 | A chat turn fails (`status: "error"`), same setting | Same | `stuck` (body "I got stuck on that. Tap to try again.") |
 | A CLI the owner used went signed out (reconnect card posted) | The owner | `engine_signin` |
 | A connector refused its sign-in (reconnect card posted) | The owner | `connector_reconnect` |
+| A connector call waits for approval (approval card posted) | The owner | `approval` |
+| A tripwire paused a connector | The owner | `safety` |
 | `POST /api/push/test` | The caller | `test` |
 
 Cancelled and scheduled turns do not trigger reply pushes. Users inside
@@ -2678,7 +3068,7 @@ The decrypted payload is a JSON object:
 | `title` | The agent name. |
 | `body` | Message text cut to 180 characters (with `…` when cut). Test: `Notifications are working.` |
 | `conversation_id`, `message_id` | Omitted in test pushes. |
-| `kind` | `reply`, `stuck`, `heartbeat`, `engine_signin`, `connector_reconnect`, or `test`. |
+| `kind` | `reply`, `stuck`, `heartbeat`, `engine_signin`, `connector_reconnect`, `approval`, `safety`, or `test`. |
 
 Requests use `TTL: 86400` and `Urgency: normal`.
 
@@ -2699,14 +3089,11 @@ Requests use `TTL: 86400` and `Urgency: normal`.
   and `settings.voice` is `{"enabled": false, "status": "not_implemented"}`.
   The planned shape is `POST /api/voice/speak {"message_id"}` returning
   `audio/mpeg` from a local TTS engine.
-- **Approvals**: the `approval` card and its decision route are used for
-  every wallet card fill (`fill_card`). Routing other risky tool calls
-  (sending email or messages, purchases through connectors, new recipients)
-  through the card is planned via the CLI's own permission hook (for Claude
-  Code, `--permission-prompt-tool` served by `iris mcp`).
-- **Connector sign-in (OAuth)**: connectors are configured as MCP servers
-  with secrets; "Connect" in the app asks the agent to walk the user
-  through it or opens the custom connector form.
+- **Approvals for the CLIs' own tools**: connector calls go through the
+  approval gate. The CLIs' built-in tools (shell, file edits, web fetch)
+  are limited by each CLI's sandbox and permission settings
+  ([Security model](SELF-HOSTING.md#security-model)) rather than by
+  approval cards.
 - **Browser limits**: logins and cards in cross-origin frames (for example
   embedded payment widgets from another domain) cannot be filled; the agent
   is told `not found` and can ask the owner to take over.

@@ -38,6 +38,7 @@ state (conversations, goals, feed, and so on) in SQLite.
 - [Engines and models](#engines-and-models)
 - [Engines from the app](#engines-from-the-app)
 - [Iris's computer (browser)](#iriss-computer-browser)
+- [Connections and approvals](#connections-and-approvals)
 - [Proactive jobs](#proactive-jobs)
 - [Security model](#security-model)
 - [Subscription terms](#subscription-terms)
@@ -58,8 +59,15 @@ phone / browser ──HTTPS (Tailscale) or loopback──▶ iris serve (axum, S
                                                      ▼
           claude -p ... | codex exec --json ... | gemini -o stream-json | opencode run --format json
                                                      │
-                                                     └─▶ iris mcp (stdio) ─▶ goals, ideas, feed,
-                                                                             library, cards
+                                                     ├─▶ iris mcp (stdio) ─▶ goals, ideas, feed,
+                                                     │                       library, cards
+                                                     └─▶ iris mcp-gateway (stdio, one per connector)
+                                                           │ private socket, per-turn token
+                                                           ▼
+                                        iris serve: approval gate, tripwires, activity log
+                                                           │ secrets and tokens from the vault
+                                                           ▼
+                                        connector servers (Gmail, GitHub, any MCP server)
 ```
 
 - **Persona**: `IDENTITY.md`, `SOUL.md`, `USER.md`, `TOOLS.md`,
@@ -78,10 +86,12 @@ phone / browser ──HTTPS (Tailscale) or loopback──▶ iris serve (axum, S
   can create goals, ideas, feed posts, library items, and cards (for example
   a "Connect Google" card). It is a CRUD bridge into Iris's database, not a
   tool layer.
-- **Connectors**: MCP servers you add in the app are passed to the CLI on
-  every turn, through each CLI's own MCP configuration. Their secrets are
-  encrypted at rest. If a connector's sign-in expires, Iris posts a
-  "Reconnect" card.
+- **Connectors**: services you connect in the app (Google, GitHub, any MCP
+  server) are reached through Iris's gateway, never handed to the CLI. Iris
+  runs them with their secrets from the encrypted vault, so the agent never
+  sees a password or token, and holds anything that sends, buys, deletes,
+  exports, or reaches someone new until you approve it on a card. See
+  [Connections and approvals](#connections-and-approvals).
 - **Streaming**: CLI output is normalized into text deltas and tool activity
   and pushed to your devices over a WebSocket.
 
@@ -100,6 +110,8 @@ See [docs/API.md](API.md) for every route, event, and data type.
   or OpenCode from the app (Claude Code installs natively)
 - Optional, for Iris's own browser: Chromium or Chrome, or Node.js to
   install Chromium from the app
+- [uv](https://docs.astral.sh/uv/) (`uvx`) on the server if you want to
+  connect Google (Gmail, Calendar, Drive)
 
 Iris resolves the CLIs from its engines directory, then `PATH` (plus
 `~/.local/bin` and similar), and reports their versions. It never pins or
@@ -176,6 +188,7 @@ Iris to the open internet.
 | `[engines]` | | Engines directory, privileged install helper, daily auto-update. |
 | `[heartbeat]`, `[feed]` | disabled | Scheduled jobs with active hours. |
 | `[push]` | enabled | Web Push (VAPID). Needs `vapid_subject` (a `mailto:` URL) unless `public_url` is `https:`. |
+| `[safety]` | | Approval timeout (300 s) and tripwires: sends (5), calls (200), and data read (25 MB) per connector per hour. |
 
 Paths follow XDG: `$XDG_CONFIG_HOME/iris/config.toml` and
 `$XDG_DATA_HOME/iris/`. Override with `--config`, `--data-dir`, or
@@ -191,7 +204,8 @@ Data directory layout:
 ├── workspace/       # working directory for the CLIs
 ├── library/         # artifacts and media the agent saved
 ├── uploads/         # images you sent, custom avatar
-├── run/             # per-turn private files (prompt, MCP config)
+├── run/             # per-turn private files (prompt, MCP config), gateway.sock
+├── connectors/      # private working folders of connector programs
 ├── engines/         # CLIs installed from the app (single-user mode)
 ├── vault.key        # 32-byte key for encrypted secrets, 0600
 ├── vapid.json       # Web Push key pair, 0600
@@ -250,6 +264,14 @@ After pairing your phone you should not need the server again:
   approve, and paste the code back into the app; for Codex you open the link
   and enter the code shown. Iris passes the code to the CLI and never stores
   or logs it, and never reads the CLI's credential files.
+- **API keys.** Gemini CLI and OpenCode providers (OpenRouter, Anthropic,
+  OpenAI, Google, Groq, DeepSeek, Mistral, xAI, OpenCode Zen) sign in with
+  an API key you paste into their card or Settings, AI engine. Claude Code
+  and Codex can optionally use an API key instead of your subscription
+  (billed per use; while a key is saved, that engine uses it). Keys are
+  encrypted in the vault, checked once with a tiny request (a refused key
+  is not kept), and passed to the engine's CLI through its own environment
+  variable on each run. Subscription sign-ins are never touched.
 - **First run.** If no engine works yet, a "Set up an AI engine" card walks
   you through install, then sign-in.
 
@@ -264,10 +286,11 @@ engines but cannot modify them, and never needs download or install rights.
   `iris pair` (or running it as a service).
 - Node.js, if you want Codex, Gemini CLI, or OpenCode installed from the
   app.
-- Signing in to **Gemini CLI** (it can only sign in from an interactive
-  terminal: run `gemini` once) and adding providers to **OpenCode**
-  (`opencode auth login`, or configuring Ollama / LM Studio). Iris shows
-  these steps in the card when needed.
+- Signing in to **Gemini CLI** with a Google account instead of an API key
+  (it can only do that in an interactive terminal: run `gemini` once), and
+  local models for **OpenCode** (configuring Ollama / LM Studio). API keys
+  for both are added from the app.
+- `uv`, if you want to connect Google.
 - The optional privilege split (`deploy/setup-engines.sh`, as root).
 
 ## Iris's computer (browser)
@@ -332,7 +355,108 @@ out each tool call the CLI makes, nothing more.
   EOF2
   sudo apparmor_parser -r /etc/apparmor.d/iris-chrome
   ```
+- **Approval lifetime.** Wallet fills use the gateway’s approval wait and
+  cancellation rules. Denial, expiry, Stop, Pause, or Disconnect prevents
+  the held fill; a late approval never restarts a turn.
 - **Turning it off.** `[browser] enabled = false` removes the tools.
+## Connections and approvals
+
+Connections (MCP servers) give Iris your services: Gmail, Calendar, Drive,
+GitHub, or any MCP server. Add them in the app under Iris, Connections, or
+just ask in chat ("help me set up Google"); Iris posts a Connect card that
+opens the step-by-step setup.
+
+**How they run.** A connection is never handed to the AI CLI. Each turn
+gets one small proxy per connection (`iris mcp-gateway`) that forwards to
+`iris serve` over a private socket with a token valid only for that turn.
+Iris runs the real server itself: a program it starts with the
+connection's secrets in its environment (in a private folder outside the
+agent's workspace), or a remote server it calls with the connection's
+token. Secrets and tokens live in the encrypted vault and never reach the
+agent. This works the same with Claude Code, Codex, Gemini CLI, and
+OpenCode, and MCP servers you configured in a CLI yourself are switched
+off in Iris's turns so nothing goes around the gateway. Codex's hosted
+ChatGPT apps and plugins are also disabled in every turn, including your
+own chats and scheduled jobs, with `features.apps=false` and
+`features.plugins=false` (verified against Codex CLI 0.162.1). Connect
+those services through Iris to use its approval rules. Only your own
+personal chats and your scheduled jobs use connections; shared chats and
+other people's chats never do. Idle
+connection programs stop after `safety.idle_minutes`.
+
+**The approval gate.** Iris looks at every call's real tool name, the
+server's own hints, and the real arguments:
+
+- Reading, searching, and drafting run on their own.
+- Sending email or messages (and posting, replying, sharing, inviting,
+  publishing pull requests, issues, or comments) asks first, unless every
+  recipient is on your **trusted people** list and the service cannot add
+  others (reply-all always asks).
+- Buying or paying always asks. Deleting and bulk exports ask.
+- Anything else that reaches someone new (for example a calendar invite to a
+  new address) asks; once you approve someone, they are no longer new.
+
+Asking means Iris holds the call, posts an approval card built from the
+exact arguments (who, subject, the exact text, and the complete raw
+request), sends a push, and waits up to `safety.approval_timeout_secs`. On
+approve the held call runs unchanged, after Iris checks again that the
+connection is still on and allowed; on deny, timeout, when the turn ends,
+or when you pause Iris or turn the connection off, it never runs and the
+agent is told. Multi-purpose tools are judged by the operation they are
+asked to do, and an operation Iris can't place asks first. Each connection's rules can be
+changed in plain words (reads freely and asks before sending, buying, or
+deleting; asks before any change; only reads; asks every time), and each of
+its actions can be set to run, ask, or never. Purchases always ask.
+
+**Tripwires.** More than 5 sends, 200 calls, or 25 MB of data read through
+one connection in an hour (all in `[safety]`) pauses that connection and
+notifies you with a Resume button. Every call is in the activity log
+(Settings, Activity log, Connected services).
+
+**Pause Iris** (Iris's computer) cancels whatever is running (including
+waiting approvals, and stops connection programs) and starts nothing new
+(chats, check-ins, connection calls) until you resume. A request already
+handed to a remote service before the pause cannot be recalled.
+**Disconnect everything** turns every connection off at once, cancels browser
+approvals, and closes and disconnects the browser. Reopen it in Iris’s
+computer to enable browser tools again.
+
+**Signing in to services.** Connections that use OAuth (the MCP sign-in
+standard, OAuth 2.1 with PKCE) sign in on the service's own page and come
+back to Iris at `<your Iris address>/api/oauth/callback`. When Iris is on
+an https address (for example with `tailscale serve`, or `public_url`), it
+completes by itself. Otherwise the provider sends your browser to
+`http://127.0.0.1:<port>/api/oauth/callback`, which won't load on your
+phone; copy that page's address back into the app. Iris registers itself
+automatically with services that allow it (dynamic client registration);
+for others you paste the client ID and secret of an app you create there.
+Tokens are refreshed automatically; when a service refuses them, a
+Reconnect card signs you in again.
+
+Use HTTPS for connector URLs that receive OAuth tokens or saved headers.
+Plain HTTP is allowed only for local servers at `localhost` or a loopback
+IP (`127.0.0.1`, `[::1]`). This also applies to OAuth discovery; a server
+elsewhere on your private network needs HTTPS to receive credentials.
+
+- **Google** (Gmail, Calendar, Drive) runs the open-source
+  [Google Workspace MCP server](https://github.com/taylorwilsdon/google_workspace_mcp)
+  (`uvx workspace-mcp`) on this machine, in its mode where Iris does the
+  sign-in and hands it a fresh token on each request. You need `uv` on the
+  server and your own Google OAuth client: the app walks you through
+  creating a Google Cloud project, turning on the three APIs, setting up
+  the consent screen (add yourself as a test user; publish it to avoid
+  re-signing in every 7 days), and creating a "Web application" client
+  with the redirect URI the app shows. Paste the client ID and secret, then
+  sign in. No client secret ships with Iris.
+- **GitHub** uses GitHub's remote MCP server with a fine-grained personal
+  access token, or your own GitHub OAuth app.
+- **Custom**: any MCP server by web address (with sign-in, a header such as
+  `Authorization`, or nothing) or by program (`npx ...`, `uvx ...`) with
+  secrets as environment variables.
+
+To try the gate end to end with a real engine and a fake messenger
+(nothing is ever sent), run `scripts/e2e/connectors.sh` (needs Node.js and
+Python 3).
 
 ## Proactive jobs
 
@@ -357,9 +481,14 @@ Both are off by default, respect active hours, and can be triggered manually
   `/api/pair` requires a device token. Devices pair with a one-time code from
   `iris pair`; only SHA-256 hashes of codes and tokens are stored. Five bad
   codes lock pairing for 15 minutes and burn outstanding codes.
-- Saved logins, wallet cards, and connector secrets are encrypted with
-  XChaCha20-Poly1305 using a key in `vault.key` (0600). The API never returns
-  them.
+- Saved logins, wallet cards, connector secrets and tokens, and engine API
+  keys are encrypted with XChaCha20-Poly1305 using a key in `vault.key`
+  (0600). The API never returns them.
+- Connections run on Iris's side behind the approval gate; the CLI only
+  gets a proxy and a per-turn token. Note that the agent's CLI runs as the
+  same user as Iris: the gate stops a confused or misled agent from acting
+  without you through connections, but an agent with unrestricted shell
+  access could read anything that user can. Keep the CLIs' sandboxes on.
 - Data directory files are created with owner-only permissions.
 - The CLIs run with your user's permissions, in their own process groups,
   with a timeout. Claude Code runs headless with `--permission-mode
@@ -435,18 +564,18 @@ Contributor notes, architecture, and invariants are in
 - **Per-person memory**: people you add chat with Iris in their own chats
   and in shared chats, but only the owner has long-term memory, persona
   notes, and connectors.
-- **Full engine isolation in other people's chats**: there Iris switches
-  off what the engines have configured themselves: Claude Code's MCP
-  servers (including claude.ai connectors), CLAUDE.md files, and auto
-  memory; Codex's MCP servers, ChatGPT apps, plugins, and memories; Gemini
-  CLI's MCP servers and extensions; OpenCode's plugins and Claude Code
-  files. Codex always loads a global `AGENTS.md` (or `AGENTS.override.md`)
-  from its home folder and cannot be told not to, so while one exists Iris
-  does not use Codex for other people's chats. Gemini CLI's global
-  `GEMINI.md` context and MCP servers in OpenCode's own global config still
-  apply, so keep personal details out of those if you add people.
 - **Logins and cards inside cross-origin frames** (for example embedded
   payment widgets) cannot be filled; take over and type them yourself.
+- **Full engine isolation in other people's chats**: MCP servers the
+  engines have configured themselves (including claude.ai connectors) are
+  off in every Iris turn; in other people's chats Iris also switches off
+  Claude Code's CLAUDE.md files and auto memory, Codex's ChatGPT apps,
+  plugins, and memories, Gemini CLI's extensions, and OpenCode's plugins
+  and Claude Code files. Codex always loads a global `AGENTS.md` (or
+  `AGENTS.override.md`) from its home folder and cannot be told not to, so
+  while one exists Iris does not use Codex for other people's chats.
+  Gemini CLI's global `GEMINI.md` context still applies, so keep personal
+  details out of it if you add people.
 - **Gemini CLI and OpenCode sign-in from the app**: both need one step on
   the server (see above).
 

@@ -1,13 +1,15 @@
 // Chat: messages, live status phrases, receipts, cards, and the composer.
 import { html, useEffect, useLayoutEffect, useRef, useState } from './h.js';
-import { post, api, seg, isId } from './api.js';
-import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId, convFor, lookUpConv } from './store.js';
+import { post, put, api, seg, isId } from './api.js';
+import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId, isOwner, convFor, lookUpConv } from './store.js';
 import { Icon, Img, Avatar, agentName, stamp, Spinner } from './ui.js';
+import { openPhoto } from './photo.js';
 import { md } from './md.js';
 import { Card } from './cards.js';
 import { statusPhrase, receipt, seconds } from './status.js';
 import { pushState, enablePush } from './push.js';
 import { BrowserPeek } from './computer.js';
+import { focusComposer, prepareComposerFocus } from './viewport.js';
 
 const GAP = 30 * 60 * 1000;
 
@@ -31,7 +33,7 @@ function Receipt({ meta }) {
 
 function Photos({ ids, mine }) {
   return html`<div class=${'photos' + (mine ? ' mine' : '')}>
-    ${ids.map((id) => html`<button class="photo" onClick=${() => set({ lightbox: `/api/attachments/${seg(id)}` })}>
+    ${ids.map((id) => html`<button class="photo" onClick=${() => openPhoto(`/api/attachments/${seg(id)}`, 'Photo')}>
       <${Img} src=${`/api/attachments/${seg(id)}`} alt="Photo" /></button>`)}
   </div>`;
 }
@@ -52,6 +54,8 @@ function Assistant({ m, list }) {
     const running = (live?.acts || []).some((a) => a.status === 'started');
     // Only while Iris is browsing in this turn: a live thumbnail.
     const peek = S.browsing[m.id] && html`<${BrowserPeek} />`;
+    const waiting = list.some((x) => x.card?.type === 'approval' && x.card.turn_message_id === m.id && x.card.state === 'pending');
+    if (waiting) return html`${text && html`<div class="b" dangerouslySetInnerHTML=${{ __html: md(text) }} />`}<div class="status shimmer" aria-live="polite">Waiting for your OK…</div>${peek}`;
     if (!text) return html`<${StatusLine} live=${live} />${peek}`;
     return html`<div class="b" dangerouslySetInnerHTML=${{ __html: md(text) }} />
       ${running && html`<${StatusLine} live=${live} />`}${peek}`;
@@ -67,11 +71,11 @@ function Assistant({ m, list }) {
   return html`<${Receipt} meta=${m.meta} />
     ${content ? html`<div class=${'b' + (failed ? ' b-err' : '')} dangerouslySetInnerHTML=${{ __html: md(content) }} />`
       : m.status === 'cancelled' ? html`<div class="note">Stopped.</div>` : null}
-    ${failed && retryFor(list, m) && html`<button class="retry" onClick=${retry}><${Icon} name="refresh" size=${15} /> Try again</button>`}`;
+    ${failed && m.meta?.error?.kind !== 'paused' && retryFor(list, m) && html`<button class="retry" onClick=${retry}><${Icon} name="refresh" size=${15} /> Try again</button>`}`;
 }
 
-function Message({ m, list, members }) {
-  if (m.kind === 'card') return html`<${Card} m=${m} />`;
+function Message({ m, list, members, composing }) {
+  if (m.kind === 'card') return html`<${Card} m=${m} inactive=${composing} />`;
   if (m.role === 'user') {
     const mine = m.author_user_id === S.me?.user?.id;
     const who = !mine && members?.[m.author_user_id];
@@ -101,6 +105,17 @@ function NotifyPrompt() {
   </div>`;
 }
 
+/** Shown while the owner has paused Iris. */
+function PausedBanner() {
+  if (!S.settings?.paused) return null;
+  const resume = async () => {
+    try { await put('/safety', { paused: false }); toast(`${agentName()} is back`); } catch (e) { toast(e.message); }
+  };
+  return html`<div class="paused-bar" role="status"><${Icon} name="pause" size=${15} />
+    <span class="grow">${agentName()} is paused and won't reply or do anything until you resume.</span>
+    ${isOwner() && html`<button class="b1 sm" onClick=${resume}>Resume</button>`}</div>`;
+}
+
 function Welcome() {
   return html`<div class="welcome">
     <${Avatar} size=${72} />
@@ -119,6 +134,7 @@ export function ChatScreen({ cid }) {
   const box = S.msgs[cid];
   const list = box?.list || [];
   const [members, setMembers] = useState(null);
+  const [composing, setComposing] = useState(false);
 
   useEffect(() => {
     stick.current = true;
@@ -151,6 +167,17 @@ export function ChatScreen({ cid }) {
     prevHeight.current = el.scrollHeight;
   });
 
+  // Resizing the viewport or a growing composer does not render this
+  // component. Follow the bottom through those changes, too.
+  useLayoutEffect(() => {
+    const el = scr.current;
+    const observer = new ResizeObserver(() => {
+      if (stick.current) el.scrollTop = el.scrollHeight;
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
   const lastId = list.at(-1)?.id;
   useEffect(() => {
     if (lastId && isId(cid) && document.visibilityState === 'visible') post(`/conversations/${seg(cid)}/read`).catch(() => {});
@@ -165,23 +192,44 @@ export function ChatScreen({ cid }) {
     }
   };
 
+  // Like native chat apps: tapping the conversation or dragging it puts
+  // the keyboard away. Taps on controls still do their own thing first.
+  const typing = () => {
+    const a = document.activeElement;
+    return a && a !== document.body && a.closest?.('.composer') ? a : null;
+  };
+  const dismissOnTap = (e) => {
+    if (!e.target.closest?.('a, button, input, textarea, select, [role="button"]')) typing()?.blur();
+  };
+  const dismissOnDrag = () => typing()?.blur();
+
   const running = list.some((m) => m.status === 'streaming');
+  // Approval cards belong before the reply of the turn that asked.
+  const asks = {};
+  for (const m of list) {
+    const t = m.card?.type === 'approval' && m.card.turn_message_id;
+    if (t && list.some((x) => x.id === t)) (asks[t] ||= []).push(m);
+  }
+  const held = new Set(Object.values(asks).flat().map((m) => m.id));
   let prev = 0;
   const rows = [];
   for (const m of list) {
+    if (held.has(m.id)) continue;
     if (!prev || m.created_at - prev > GAP) rows.push(html`<div class="ts" key=${'t' + m.id}>${stamp(m.created_at)}</div>`);
     prev = m.created_at;
-    rows.push(html`<div class="row" key=${m.id}><${Message} m=${m} list=${list} members=${members} /></div>`);
+    for (const a of asks[m.id] || []) rows.push(html`<div class="row" key=${a.id}><${Message} m=${a} list=${list} members=${members} composing=${composing} /></div>`);
+    rows.push(html`<div class="row" key=${m.id}><${Message} m=${m} list=${list} members=${members} composing=${composing} /></div>`);
   }
   const isMain = cid === mainId();
-  return html`<div class="chat">
-    <div class="scr" ref=${scr} onScroll=${onScroll}>
+  return html`<div class=${'chat' + (S.settings?.paused ? ' paused' : '')}>
+    <${PausedBanner} />
+    <div class="scr" ref=${scr} onScroll=${onScroll} onClick=${dismissOnTap} onTouchMove=${dismissOnDrag}>
       ${box?.loading && box?.hasMore && html`<${Spinner} />`}
       ${!box ? html`<${Spinner} />` : !list.length && isMain ? html`<${Welcome} />` : null}
       ${isMain && box && !box.hasMore && html`<${NotifyPrompt} />`}
       ${rows}
     </div>
-    <${Composer} cid=${cid} running=${running} />
+    <${Composer} cid=${cid} running=${running} onFocus=${() => { stick.current = true; setComposing(true); }} onBlur=${() => setComposing(false)} />
   </div>`;
 }
 
@@ -209,10 +257,13 @@ async function shrink(file) {
 const MAX_PHOTOS = 4; // per message (server limit)
 const unpreview = (list) => list.forEach((a) => a.preview && URL.revokeObjectURL(a.preview));
 
-function Composer({ cid, running }) {
+function Composer({ cid, running, onFocus, onBlur }) {
   const [text, setText] = useState('');
   const [atts, setAtts] = useState([]);
   const [rec, setRec] = useState(null);
+  const [unsent, setUnsent] = useState([]);
+  const textNow = useRef('');
+  textNow.current = text;
   const ta = useRef();
   const file = useRef();
   // Photo previews are object URLs: revoke each when its photo is sent,
@@ -229,7 +280,7 @@ function Composer({ cid, running }) {
     if (d) {
       setText(d);
       set({ drafts: { ...S.drafts, [cid]: undefined } });
-      setTimeout(() => ta.current?.focus(), 50);
+      setTimeout(() => focusComposer(ta.current), 50);
     }
   }, [cid]);
 
@@ -281,8 +332,11 @@ function Composer({ cid, running }) {
     } catch (e) {
       toast(e.message);
       if (!mine.current.mounted) { unpreview(sent); return; }
-      // Put the text and photos back (ahead of any added meanwhile).
-      setText(t);
+      // Put the text back only if the composer is still empty (or still
+      // holds it); a newer draft stays, and the failed one waits for a tap.
+      const cur = textNow.current.trim();
+      if (!cur || cur === t) setText(t);
+      else if (t || sent.length) { unpreview(sent); setUnsent((u) => [...u, { t, ids: sent.map((a) => a.id) }]); return; }
       setAtts((cur) => {
         const all = [...sent, ...cur];
         unpreview(all.slice(MAX_PHOTOS));
@@ -310,6 +364,16 @@ function Composer({ cid, running }) {
 
   const stop = () => post(`/conversations/${seg(cid)}/cancel`).catch((e) => toast(e.message));
 
+  const onComposerPointerDown = (e) => {
+    const el = ta.current;
+    if (e.isPrimary === false || e.button > 0 || !el
+      || e.target.closest('button, input, a')) return;
+    if (document.activeElement === el) prepareComposerFocus(el);
+    else focusComposer(el);
+    // Leave the default gesture intact for native caret placement,
+    // selection, and scrolling within a multiline draft.
+  };
+
   let action;
   if (canSend) action = html`<button class="send" aria-label="Send" onClick=${send}><${Icon} name="send" size=${20} /></button>`;
   else if (rec) action = html`<button class="send rec" aria-label="Stop listening" onClick=${mic}><${Icon} name="stop" size=${18} fill /></button>`;
@@ -317,16 +381,26 @@ function Composer({ cid, running }) {
   else if (Speech && !text.trim()) action = html`<button class="send" aria-label="Talk" onClick=${mic}><${Icon} name="mic" size=${20} /></button>`;
   else action = html`<button class="send" aria-label="Send" disabled><${Icon} name="send" size=${20} /></button>`;
 
+  const retry = async (u) => {
+    setUnsent((l) => l.filter((x) => x !== u));
+    try { await sendMessage(cid, u.t, u.ids); } catch (e) {
+      toast(e.message);
+      if (mine.current.mounted) setUnsent((l) => [...l, u]);
+    }
+  };
+
   return html`<div class="composer">
+    ${unsent.map((u) => html`<button class="note" onClick=${() => retry(u)}>Not sent, tap to retry: ${u.t || 'photo'}</button>`)}
     ${atts.length > 0 && html`<div class="att-row">${atts.map((a) => html`<div class="att" key=${a.key}>
-      <img src=${a.preview} alt="" />${a.uploading && html`<div class="att-busy"><${Spinner} /></div>`}
+      <${Img} src=${a.preview} alt="Photo to send" />${a.uploading && html`<div class="att-busy"><${Spinner} /></div>`}
       <button class="att-x" aria-label="Remove photo" onClick=${() => { URL.revokeObjectURL(a.preview); setAtts((cur) => cur.filter((x) => x.key !== a.key)); }}><${Icon} name="x" size=${12} /></button>
     </div>`)}</div>`}
-    <div class=${'inp' + (rec ? ' listening' : '')}>
+    <div class=${'inp' + (rec ? ' listening' : '')} onPointerDown=${onComposerPointerDown} onTouchStart=${onComposerPointerDown}>
       <button class="pl" aria-label="Add photos" onClick=${() => file.current.click()} disabled=${atts.length >= MAX_PHOTOS}><${Icon} name="plus" size=${20} /></button>
-      <input ref=${file} type="file" accept="image/*" multiple hidden onChange=${pick} />
+      <input ref=${file} type="file" accept="image/*" multiple hidden tabindex="-1" onChange=${pick} />
       <textarea ref=${ta} rows="1" value=${text} placeholder=${rec ? 'Listening…' : `Talk to ${agentName()}…`}
         aria-label="Message" enterkeyhint=${touch ? 'enter' : 'send'}
+        onFocus=${onFocus} onBlur=${onBlur}
         onInput=${(e) => setText(e.target.value)}
         onKeyDown=${(e) => { if (e.key === 'Enter' && !e.shiftKey && !touch && !e.isComposing) { e.preventDefault(); send(); } }} />
       ${action}

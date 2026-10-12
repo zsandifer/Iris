@@ -17,10 +17,6 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 const MAX_REQUEST: usize = 256 * 1024;
-/// Upper bound for one call as seen by the tool process (waits for the
-/// owner's approval or for take-over to end are shorter).
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(180);
-
 /// Socket path: in the run directory, or (when that path is too long for a
 /// Unix socket) in a private per-user directory under the runtime dir.
 pub fn path(paths: &Paths) -> PathBuf {
@@ -114,7 +110,7 @@ pub fn forward(socket: &Path, token: &str, name: &str, arguments: &Value) -> Val
         Ok(s) => s,
         Err(_) => return fail("The browser is not available right now (Iris is not running)."),
     };
-    let _ = stream.set_read_timeout(Some(CLIENT_TIMEOUT));
+    // The harness enforces the per-server timeout (approval window plus execution).
     let mut req = json!({"token": token, "name": name, "arguments": arguments}).to_string();
     req.push('\n');
     if stream.write_all(req.as_bytes()).is_err() {

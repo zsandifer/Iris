@@ -215,6 +215,7 @@ pub async fn start(state: &AppState, harness: &str) -> Result<LoginStatus> {
     let mut cmd = Command::new(&program);
     cmd.args(&spec.args)
         .current_dir(state.paths.workspace_dir())
+        .env("PWD", state.paths.workspace_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -554,7 +555,21 @@ pub async fn post_signin_card(state: &AppState, harness: &str, first_time: bool)
         ),
         None => "Until then I can't reply, because no other AI engine is available.".into(),
     };
-    let (title, body) = if first_time {
+    // Engines without a headless sign-in take an API key from the app.
+    let key_options = crate::keys::options(harness);
+    let api_key = flow.is_none() && !key_options.is_empty();
+    let (title, body) = if first_time && api_key {
+        (
+            format!("Set up {label}"),
+            if harness == "opencode" {
+                "OpenCode is installed. Add a key for one of its providers to start using it \
+                 (or point it at a local model on the server)."
+                    .to_string()
+            } else {
+                format!("{label} is installed. Add an API key to start using it.")
+            },
+        )
+    } else if first_time {
         (
             format!("Sign in to {label}"),
             format!("{label} is installed. Sign in with your account to start using it."),
@@ -573,11 +588,14 @@ pub async fn post_signin_card(state: &AppState, harness: &str, first_time: bool)
         "flow": match flow {
             Some(LoginFlow::CodePaste) => "code_paste",
             Some(LoginFlow::DeviceCode) => "device_code",
+            None if api_key => "api_key",
             None => "manual",
         },
+        "key_options": if api_key { serde_json::to_value(key_options).unwrap_or(Value::Null) } else { Value::Null },
         "instructions": if flow.is_none() { Value::from(hint) } else { Value::Null },
         "state": "needs_reconnect",
         "action_label": match (flow.is_some(), first_time) {
+            _ if api_key => "Save key",
             (true, true) => "Sign in",
             (true, false) => "Reconnect",
             (false, _) => "Check again",
@@ -602,6 +620,9 @@ pub async fn post_signin_card(state: &AppState, harness: &str, first_time: bool)
                 k["body"] = b.into();
                 k["title"] = t.into();
                 k["state"] = "needs_reconnect".into();
+                for f in ["flow", "key_options", "instructions", "action_label"] {
+                    k[f] = card[f].clone();
+                }
                 return db::update_message_card(c, &id, &k).map(|m| Some((owner, m, false)));
             }
             let main = db::ensure_main_conversation(c, &owner)?;
@@ -675,18 +696,27 @@ pub async fn on_connector_auth_error(state: &AppState, server: &str) {
             {
                 return Ok(None);
             }
+            let label = crate::gateway::service_label(&con);
+            let oauth = con.config.oauth.is_some();
             let card = json!({
                 "type": "connector_reconnect",
-                "title": format!("Reconnect {}", con.name),
-                "body": format!(
-                    "{} refused my request, so its sign-in has probably expired or been \
-                     revoked. Update its credentials and I'll keep using it.",
-                    con.name
-                ),
+                "title": format!("Reconnect {label}"),
+                "body": if oauth {
+                    format!(
+                        "{label}'s sign-in expired or was revoked, so I can't use it right now. \
+                         Sign in again and I'll pick up where I left off."
+                    )
+                } else {
+                    format!(
+                        "{label} refused my request, so its sign-in has probably expired or been \
+                         revoked. Update its credentials and I'll keep using it."
+                    )
+                },
                 "connector_id": con.id,
-                "service": con.name,
+                "service": con.service,
+                "auth": if oauth { "oauth" } else { "secrets" },
                 "state": "needs_reconnect",
-                "action_label": "Update",
+                "action_label": if oauth { "Sign in again" } else { "Update" },
                 "owner_only": true,
             });
             let main = db::ensure_main_conversation(c, &owner)?;
@@ -735,7 +765,7 @@ pub async fn on_connector_updated(state: &AppState, connector_id: &str) {
                 return Ok(None);
             }
             card["state"] = "connected".into();
-            card["body"] = "Updated. I'll try it again next time.".into();
+            card["body"] = "Connected again. I'll use it from now on.".into();
             db::update_message_card(c, &id, &card).map(Some)
         })
         .await

@@ -19,6 +19,7 @@ agent_name = "Iris"
 max_concurrent_turns = 2
 
 # A turn that runs longer than this is killed (with its process group).
+# Approval cards wait at most a minute less than this.
 turn_timeout_secs = 600
 
 # Tokio worker threads. A small number keeps idle memory low.
@@ -26,7 +27,8 @@ worker_threads = 2
 
 # Remove ANTHROPIC_API_KEY / OPENAI_API_KEY / CODEX_API_KEY from the
 # environment of harness subprocesses so the CLIs use their own signed-in
-# subscription instead of pay-per-token API billing.
+# subscription instead of pay-per-token API billing. API keys the owner
+# adds in the app (Settings > AI engine) are still passed.
 strip_api_key_env = true
 
 # Largest accepted upload (images, avatar), in bytes.
@@ -182,3 +184,20 @@ command = ""
 # Close the browser after this many idle minutes (frees memory). Sign-ins
 # persist in its profile under <data dir>/browser.
 idle_mins = 10
+
+# Connected services (connectors) are reached through Iris's gateway, which
+# holds actions that send messages, buy things, delete, export, or reach
+# someone new until you approve them in the app.
+[safety]
+# How long an approval card waits for your answer; after that the action is
+# dropped and Iris tells you.
+approval_timeout_secs = 300
+# Tripwires: a connection is paused (and you are notified) when, within an
+# hour, it sends more than this many messages...
+max_sends_per_hour = 5
+# ...is used more than this many times...
+max_calls_per_hour = 200
+# ...or reads more than this many MB (a bulk export).
+max_read_mb_per_hour = 25
+# Stop a connection's program after this many idle minutes.
+idle_minutes = 5

@@ -184,7 +184,8 @@ pub fn spawn_scheduler(state: AppState) {
             // tick (at most one runs a day, and each engine only once).
             let st = state.clone();
             tokio::spawn(async move { crate::setup::maybe_auto_update(&st).await });
-            if state.browser.is_paused() {
+            crate::gateway::reap_idle(&state).await;
+            if state.is_paused().await {
                 continue;
             }
             for job in Job::ALL {

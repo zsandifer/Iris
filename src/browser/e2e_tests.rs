@@ -203,6 +203,7 @@ fn setup() -> Option<(tempfile::TempDir, AppState, String, String)> {
     for h in cfg.harness.values_mut() {
         h.enabled = false;
     }
+    cfg.safety.approval_timeout_secs = 2;
     let state = AppState::new(cfg, paths, db).unwrap();
     // Test machines often cannot start Chrome's sandbox.
     state.browser.init_allow_no_sandbox(true);
@@ -258,6 +259,35 @@ async fn approvals(state: &AppState, conv: &str) -> Vec<crate::db::Message> {
         .into_iter()
         .filter(|m| m.card.as_ref().is_some_and(|c| c["type"] == "approval"))
         .collect()
+}
+
+/// Simulate the owner's decision route: persist, then release the gateway waiter.
+fn decide_next(state: &AppState, conv: &str, approve: bool) -> tokio::task::JoinHandle<()> {
+    let (st, conv) = (state.clone(), conv.to_string());
+    tokio::spawn(async move {
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if let Some(m) = approvals(&st, &conv)
+                .await
+                .into_iter()
+                .find(|m| m.card.as_ref().is_some_and(|c| c["state"] == "pending"))
+            {
+                let id = m.id.clone();
+                let mut card = m.card.unwrap();
+                assert!(!card.to_string().contains(CARD));
+                assert!(!card.to_string().contains(PASSWORD));
+                card["state"] = if approve { "approved" } else { "denied" }.into();
+                card["decided_at"] = crate::util::now_ms().into();
+                st.db
+                    .call(move |db| crate::db::update_message_card(db, &m.id, &card))
+                    .await
+                    .unwrap();
+                crate::gateway::decided(&st, &id, approve);
+                return;
+            }
+        }
+        panic!("no pending wallet approval");
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -410,45 +440,13 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
     )
     .await;
     assert!(out.text.contains("Card number"), "{}", out.text);
-    let approver = {
-        let st = state.clone();
-        let conv = conv.clone();
-        tokio::spawn(async move {
-            for _ in 0..100 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let c = conv.clone();
-                let pending = st
-                    .db
-                    .call(move |db| crate::db::list_messages(db, &c, None, 20))
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .find(|m| m.card.as_ref().is_some_and(|c| c["type"] == "approval"));
-                if let Some(m) = pending {
-                    let mut card = m.card.unwrap();
-                    assert_eq!(card["preview"]["to"], "127.0.0.1");
-                    assert!(!card.to_string().contains(CARD));
-                    card["state"] = "approved".into();
-                    st.db
-                        .call(move |db| crate::db::update_message_card(db, &m.id, &card))
-                        .await
-                        .unwrap();
-                    return true;
-                }
-            }
-            false
-        })
-    };
+    let approver = decide_next(&state, &conv, true);
     let out = call("fill_card", json!({})).await;
-    assert!(approver.await.unwrap());
+    approver.await.unwrap();
     assert_eq!(out.text, "filled");
     // One approval fills once.
     let again = call("fill_card", json!({"card": "4242"})).await;
-    assert!(
-        again.text.starts_with("waiting for approval"),
-        "{}",
-        again.text
-    );
+    assert!(again.text.starts_with("not filled"), "{}", again.text);
     let snap = call("snapshot", json!({})).await;
     assert!(!snap.text.contains("4242424242424242"), "{}", snap.text);
     outputs.push(snap.text.clone());
@@ -502,6 +500,7 @@ async fn browses_fills_logins_and_cards_without_leaking_them() {
     for h in cfg.harness.values_mut() {
         h.enabled = false;
     }
+    cfg.safety.approval_timeout_secs = 2;
     let state = AppState::new(cfg, paths, db).unwrap();
     state.browser.init_allow_no_sandbox(true);
     let guard = state
@@ -601,30 +600,18 @@ async fn reflected_secrets_pending_and_denied_cards_and_stale_refs() {
         out.text
     );
 
-    // Cards: nothing is typed while the OK is pending, or after a no.
+    // A denied held call types nothing; an expired call cannot be revived.
     let url = format!("http://localhost:{port}/plain-checkout");
     call("navigate", json!({"url": url})).await;
+    let denier = decide_next(&state, &conv, false);
     let out = call("fill_card", json!({})).await;
-    assert!(out.text.starts_with("waiting for approval"), "{}", out.text);
-    let snap = call("snapshot", json!({})).await;
-    assert!(!snap.text.contains("value="), "{}", snap.text);
-    let pending = approvals(&state, &conv).await;
-    assert_eq!(pending.len(), 1);
-    let (id, mut card) = (pending[0].id.clone(), pending[0].card.clone().unwrap());
-    assert_eq!(card["state"], "pending");
-    card["state"] = "denied".into();
-    card["decided_at"] = crate::util::now_ms().into();
-    state
-        .db
-        .call(move |db| crate::db::update_message_card(db, &id, &card))
-        .await
-        .unwrap();
-    let out = call("fill_card", json!({})).await;
+    denier.await.unwrap();
     assert!(out.text.starts_with("denied"), "{}", out.text);
     let snap = call("snapshot", json!({})).await;
     assert!(!snap.text.contains("value="), "{}", snap.text);
-    // Still just the one card: a fresh "no" is not asked again at once.
-    assert_eq!(approvals(&state, &conv).await.len(), 1);
+    let denied = approvals(&state, &conv).await;
+    assert_eq!(denied.len(), 1);
+    assert_eq!(denied[0].card.as_ref().unwrap()["state"], "denied");
 
     // An OK for one origin never covers another (same host, other port).
     let (port_b, _) = test_site().await;
@@ -634,53 +621,26 @@ async fn reflected_secrets_pending_and_denied_cards_and_stale_refs() {
     )
     .await;
     let out = call("fill_card", json!({})).await;
-    assert!(out.text.starts_with("waiting for approval"), "{}", out.text);
+    assert!(out.text.starts_with("not filled"), "{}", out.text);
     let pending = approvals(&state, &conv).await;
-    let (id, mut card) = (
-        pending.last().unwrap().id.clone(),
-        pending.last().unwrap().card.clone().unwrap(),
+    assert_eq!(
+        pending.last().unwrap().card.as_ref().unwrap()["state"],
+        "expired"
     );
-    card["state"] = "approved".into();
-    state
-        .db
-        .call(move |db| crate::db::update_message_card(db, &id, &card))
-        .await
-        .unwrap();
     call(
         "navigate",
         json!({"url": format!("http://127.0.0.1:{port_b}/plain-checkout")}),
     )
     .await;
     let out = call("fill_card", json!({})).await;
-    assert!(out.text.starts_with("waiting for approval"), "{}", out.text);
+    assert!(out.text.starts_with("not filled"), "{}", out.text);
     assert_eq!(approvals(&state, &conv).await.len(), pending.len() + 1);
 
     // Card fields found by name alone are masked once filled, also when the
     // page reformats the number; the rest of the form is filled too.
     let url = format!("http://127.0.0.1:{port}/plain-checkout");
     call("navigate", json!({"url": url})).await;
-    let approver = {
-        let st = state.clone();
-        let conv = conv.clone();
-        tokio::spawn(async move {
-            for _ in 0..100 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                if let Some(m) = approvals(&st, &conv)
-                    .await
-                    .into_iter()
-                    .find(|m| m.card.as_ref().is_some_and(|c| c["state"] == "pending"))
-                {
-                    let mut card = m.card.unwrap();
-                    card["state"] = "approved".into();
-                    st.db
-                        .call(move |db| crate::db::update_message_card(db, &m.id, &card))
-                        .await
-                        .unwrap();
-                    return;
-                }
-            }
-        })
-    };
+    let approver = decide_next(&state, &conv, true);
     let out = call("fill_card", json!({})).await;
     approver.await.unwrap();
     assert_eq!(out.text, "filled");
@@ -783,7 +743,7 @@ async fn hostile_pages_cannot_extract_or_redirect_secrets() {
     assert!(shot.is_error && shot.image.is_none(), "{}", shot.text);
     // A card approval built from this page does not store the echoed secret.
     let out = call("fill_card", json!({})).await;
-    assert!(out.text.starts_with("waiting for approval"), "{}", out.text);
+    assert!(out.text.starts_with("not filled"), "{}", out.text);
     let card = approvals(&state, &conv).await.pop().unwrap().card.unwrap();
     assert!(!leaks(&card.to_string()), "{card}");
     assert!(

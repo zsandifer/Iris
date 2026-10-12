@@ -61,6 +61,12 @@ fn not_running(e: crate::util::BoxError) -> ApiError {
 
 async fn start(State(state): State<AppState>, user: AuthUser) -> ApiResult {
     user.require_owner()?;
+    let _switch = state.browser.switch_lock.lock().await;
+    state
+        .db
+        .call(|c| crate::db::delete_setting(c, "browser.disconnected"))
+        .await?;
+    state.browser.set_disconnected(false);
     state.browser.ensure().await.map_err(not_running)?;
     ok(json!({"browser": status_json(&state)}))
 }

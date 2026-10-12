@@ -8,16 +8,35 @@ let unauthorizedHandler = () => {};
 // earlier token are dropped, so one user's data never reaches the next.
 let generation = 0;
 
+/** Changes whenever the signed-in token does; compare across awaits. */
+export const sessionGen = () => generation;
 export const hasToken = () => !!token;
 export function setToken(t) {
   const next = t || '';
-  if (next !== token) {
+  const changed = next !== token;
+  const hadSession = !!token;
+  if (changed) {
     generation++;
     clearBlobs();
   }
   token = next;
   if (token) localStorage.setItem(TOKEN_KEY, token);
   else localStorage.removeItem(TOKEN_KEY);
+  if (changed && hadSession) restartApp();
+}
+
+/**
+ * The session ended or changed: drop session-scoped caches and reload the
+ * page at the app root, so no promise, catch handler or rollback from the
+ * old session can touch the next one's UI. (The generation guards stay as
+ * a second line of defense until the reload lands.)
+ */
+export const restarts = { count: 0 };
+function restartApp() {
+  restarts.count++;
+  try { sessionStorage.clear(); } catch { /* unavailable */ }
+  try { globalThis.caches?.keys().then((ks) => ks.forEach((k) => globalThis.caches.delete(k))).catch(() => {}); } catch { /* unavailable */ }
+  if (typeof location.replace === 'function') location.replace('/');
 }
 export function onUnauthorized(fn) { unauthorizedHandler = fn; }
 

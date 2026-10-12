@@ -2,7 +2,7 @@
 // computer screen, full-screen Watch), Take over / Hand back with taps,
 // scrolling and typing forwarded to the page, browser setup, and Pause.
 import { html, useEffect, useRef, useState } from './h.js';
-import { get, post, put, wsSend, seg } from './api.js';
+import { get, post, put, wsSend } from './api.js';
 import { S, set, useStore, go, toast, frames, loadBrowser } from './store.js';
 import { Icon, Row, Group, Page, Spinner, Toggle, agentName, confirmSheet, stamp, hostOf } from './ui.js';
 import { activityTitle, placeLabel } from './hub.js';
@@ -96,7 +96,7 @@ function Viewer({ control }) {
   }, []);
 
   const takeOver = async () => {
-    try { setBrowserState((await post('/browser/takeover')).browser); go('iris/computer?view=control'); } catch (e) { toast(e.message); }
+    try { if (S.browser?.disconnected) setBrowserState((await post('/browser/start')).browser); setBrowserState((await post('/browser/takeover')).browser); go('iris/computer?view=control'); } catch (e) { toast(e.message); }
   };
   const handBack = async () => {
     try { setBrowserState((await post('/browser/handback')).browser); } catch (e) { toast(e.message); }
@@ -282,6 +282,8 @@ export function Computer() {
   useStore();
   const view = S.route.query.get('view');
   const [act, setAct] = useState(null);
+  const [safety, setSafety] = useState(null);
+  useEffect(() => { get('/safety').then(setSafety).catch(() => {}); }, [S.settings?.paused]);
   useEffect(() => { loadBrowser().catch(() => {}); }, []);
   useEffect(() => { get('/activity?limit=8').then(setAct).catch(() => {}); }, []);
   if (view === 'watch' || view === 'control') return html`<${Viewer} control=${view === 'control'} />`;
@@ -290,7 +292,7 @@ export function Computer() {
   const paused = !!S.settings?.paused;
   const working = Object.keys(S.live).length > 0;
   const takeOver = async () => {
-    try { setBrowserState((await post('/browser/takeover')).browser); go('iris/computer?view=control'); } catch (e) { toast(e.message); }
+    try { if (S.browser?.disconnected) setBrowserState((await post('/browser/start')).browser); setBrowserState((await post('/browser/takeover')).browser); go('iris/computer?view=control'); } catch (e) { toast(e.message); }
   };
   const watch = async () => {
     if (!b?.running) {
@@ -299,14 +301,16 @@ export function Computer() {
     go('iris/computer?view=watch');
   };
   const pause = async (on) => {
-    if (on && !(await confirmSheet({ title: `Pause ${agentName()}?`, body: `${agentName()} stops what it's doing, closes its browser, and won't reply or run check-ins until you turn it back on.`, yes: 'Pause' }))) return;
-    try { set({ settings: await put('/settings', { paused: on }) }); toast(on ? `${agentName()} is paused` : `${agentName()} is back on`); } catch (e) { toast(e.message); }
+    if (on && !(await confirmSheet({ title: `Pause ${agentName()}?`, body: `${agentName()} stops what it's doing, closes its browser, cancels approvals, stops connected services, and won't reply or run check-ins until you turn it back on.`, yes: 'Pause' }))) return;
+    try { const safety = await put('/safety', { paused: on }); setSafety(safety); set({ settings: { ...S.settings, paused: safety.paused } }); toast(on ? `${agentName()} is paused` : `${agentName()} is back on`); } catch (e) { toast(e.message); }
   };
   const disconnectAll = async () => {
-    if (!(await confirmSheet({ title: 'Disconnect everything?', body: `${agentName()} will stop using every connected service until you turn them back on in Connections.`, yes: 'Disconnect', danger: true }))) return;
+    if (!(await confirmSheet({ title: 'Disconnect everything?', body: `${agentName()} will stop using every connected service and its browser; waiting approvals are cancelled. Reconnect services in Connections or reopen the browser here.`, yes: 'Disconnect', danger: true }))) return;
     try {
-      const { connectors } = await get('/connectors');
-      await Promise.all(connectors.filter((c) => c.enabled).map((c) => post(`/connectors/${seg(c.id)}/disconnect`)));
+      const { connectors } = await post('/safety/disconnect-all');
+      set({ connectors });
+      await loadBrowser();
+      setSafety(await get('/safety'));
       toast('All connections are off');
     } catch (e) { toast(e.message); }
   };
@@ -322,7 +326,7 @@ export function Computer() {
   else {
     screen = html`<div class="screen"><${Icon} name="monitor" size=${30} />
       <b>${working ? `${agentName()} is working` : `${agentName()} is idle`}</b>
-      <small>${b.error ? `The browser couldn't start: ${b.error}` : `The browser opens when ${agentName()} needs it. You can also open it to sign in to a site yourself.`}</small></div>`;
+      <small>${b.error ? `The browser couldn't start: ${b.error}` : b.disconnected ? 'The browser is disconnected. Open it below to reconnect.' : `The browser opens when ${agentName()} needs it. You can also open it to sign in to a site yourself.`}</small></div>`;
   }
   const usable = b?.available && !paused && !(b.sandbox_unavailable && !b.running);
   const host = hostOf(b?.url);
@@ -341,10 +345,11 @@ export function Computer() {
       ${act?.items.length > 0 && html`<${Row} title="See all activity" accent onClick=${() => go('settings/activity')} />`}
     <//>
     <${Group} label="Safety" note=${`Pausing stops ${agentName()} right away. Disconnecting turns off every connection at once.`}>
-      <${Row} title=${`Pause ${agentName()}`} sub=${paused ? 'Paused: not replying or browsing' : null}
+      <${Row} title=${`Pause ${agentName()}`} sub=${paused ? 'Paused: not replying or browsing' : safety?.pending_approvals ? `${safety.pending_approvals} waiting for your OK` : 'Running'}
         right=${html`<${Toggle} on=${paused} onChange=${pause} label=${`Pause ${agentName()}`} />`} />
       ${b?.running && html`<${Row} title="Close the browser" sub="Sign-ins are kept" chevron=${false}
         onClick=${async () => { try { setBrowserState((await post('/browser/stop')).browser); } catch (e) { toast(e.message); } }} />`}
+      <${Row} icon="users" title="Trusted people" sub="Messages to them don’t need your OK" onClick=${() => go('iris/connections/trusted')} />
       <${Row} title="Disconnect everything" danger chevron=${false} onClick=${disconnectAll} />
     <//>
   <//>`;
