@@ -1040,6 +1040,7 @@ impl Connector {
 fn connector_from_row(r: &rusqlite::Row) -> rusqlite::Result<Connector> {
     let config: String = r.get("config")?;
     let policy: String = r.get("policy")?;
+    let service: String = r.get("service")?;
     Ok(Connector {
         id: r.get("id")?,
         name: r.get("name")?,
@@ -1047,8 +1048,10 @@ fn connector_from_row(r: &rusqlite::Row) -> rusqlite::Result<Connector> {
         transport: r.get("transport")?,
         config: serde_json::from_str(&config).unwrap_or_default(),
         enabled: r.get("enabled")?,
-        policy: crate::gateway::policy::Policy::parse(&policy),
-        service: r.get("service")?,
+        // Rules an older Iris saved, in today's format (saved on the next
+        // change).
+        policy: crate::gateway::policy::Policy::parse(&policy).upgraded(&service),
+        service,
         paused_reason: r.get("paused_reason")?,
         paused_at: r.get("paused_at")?,
         auth_state: r.get("auth_state")?,

@@ -1,8 +1,9 @@
-//! The small built-in catalog of services to connect: Google (Gmail,
-//! Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts), GitHub,
+//! The built-in catalog of services to connect: Google (Gmail, Calendar,
+//! Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts, YouTube), GitHub,
 //! services with a hosted MCP server the owner just signs in to (Notion,
-//! Todoist, Linear, Canva), and a custom MCP server. Each entry says how
-//! the connector is set up; the app walks the owner through it.
+//! Todoist, Linear, Sentry, Stripe and more), and a custom MCP server. Each
+//! entry says how the connector is set up and which group it is shown in;
+//! the app walks the owner through it.
 //!
 //! - Google runs the open-source Google Workspace MCP server
 //!   (`workspace-mcp`, started with `uvx`) on this machine in its external
@@ -16,9 +17,15 @@
 //!   server at a fixed address. Signing in is the same MCP authorization
 //!   flow as a custom connection (discovery, dynamic client registration,
 //!   PKCE): Iris registers itself, so the owner only approves access on the
-//!   service's page. Each address was checked to publish a registration
-//!   endpoint that accepts Iris's callback; services that only allow
-//!   pre-registered apps are left to the custom path.
+//!   service's page. Each address was checked live: an unauthenticated
+//!   request is refused with 401, discovery finds the sign-in server's
+//!   metadata with a registration endpoint, registration with Iris's exact
+//!   request succeeds for both an https and a loopback callback, and the
+//!   sign-in page loads. Services that only allow pre-registered or
+//!   allowlisted apps (Vercel, Dropbox, Box, Square, Spotify, Figma, Asana,
+//!   Intercom, HubSpot), that need no sign-in (Instacart's recipe server),
+//!   or whose server is not officially documented are left to the custom
+//!   path.
 
 use crate::entities::{self, ConnectorConfig, ConnectorState, OAuthConfig};
 use crate::events::Audience;
@@ -41,7 +48,17 @@ pub struct CatalogEntry {
     pub url: Option<&'static str>,
     /// The approval rules a new connection starts with.
     pub mode: Mode,
+    /// The group it is listed in (`GROUPS`); empty for `custom`.
+    pub group: &'static str,
 }
+
+/// The catalog's groups, in the order the app shows them.
+pub const GROUPS: &[(&str, &str)] = &[
+    ("productivity", "Productivity"),
+    ("development", "Development"),
+    ("money", "Money"),
+    ("lifestyle", "Lifestyle"),
+];
 
 /// A service whose hosted MCP server the owner only signs in to. Its tools
 /// change shared work (pages, issues, tasks, designs), so every change asks
@@ -51,6 +68,7 @@ const fn sign_in(
     label: &'static str,
     description: &'static str,
     url: &'static str,
+    group: &'static str,
 ) -> CatalogEntry {
     CatalogEntry {
         id,
@@ -60,6 +78,20 @@ const fn sign_in(
         setup: "oauth_sign_in",
         url: Some(url),
         mode: Mode::Careful,
+        group,
+    }
+}
+
+/// A money service: every action asks, reads included.
+const fn money(
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+    url: &'static str,
+) -> CatalogEntry {
+    CatalogEntry {
+        mode: Mode::AskAlways,
+        ..sign_in(id, label, description, url, "money")
     }
 }
 
@@ -71,8 +103,80 @@ pub const CATALOG: &[CatalogEntry] = &[
         requires: &["uvx"],
         setup: "google_client",
         url: None,
-        mode: Mode::Standard,
+        // Reads run; every change asks (per action, see gateway/google.rs).
+        mode: Mode::Careful,
+        group: "productivity",
     },
+    sign_in(
+        "notion",
+        "Notion",
+        "Pages, notes, and databases",
+        "https://mcp.notion.com/mcp",
+        "productivity",
+    ),
+    sign_in(
+        "todoist",
+        "Todoist",
+        "Tasks, projects, and due dates",
+        "https://ai.todoist.net/mcp",
+        "productivity",
+    ),
+    sign_in(
+        "airtable",
+        "Airtable",
+        "Bases, tables, records, and comments",
+        "https://mcp.airtable.com/mcp",
+        "productivity",
+    ),
+    sign_in(
+        "monday",
+        "monday.com",
+        "Boards, items, updates, and docs",
+        "https://mcp.monday.com/mcp",
+        "productivity",
+    ),
+    sign_in(
+        "miro",
+        "Miro",
+        "Boards: read and add sticky notes, shapes, and more",
+        "https://mcp.miro.com/",
+        "productivity",
+    ),
+    sign_in(
+        "canva",
+        "Canva",
+        "Designs, folders, and brand templates",
+        "https://mcp.canva.com/mcp",
+        "productivity",
+    ),
+    sign_in(
+        "calcom",
+        "Cal.com",
+        "Bookings, event types, and availability",
+        "https://mcp.cal.com/mcp",
+        "productivity",
+    ),
+    sign_in(
+        "granola",
+        "Granola",
+        "Meeting notes and transcripts",
+        "https://mcp.granola.ai/mcp",
+        "productivity",
+    ),
+    sign_in(
+        "fireflies",
+        "Fireflies",
+        "Meeting transcripts and summaries",
+        "https://api.fireflies.ai/mcp",
+        "productivity",
+    ),
+    sign_in(
+        "zapier",
+        "Zapier",
+        "Actions in the apps you connected to Zapier",
+        "https://mcp.zapier.com/api/v1/connect",
+        "productivity",
+    ),
     CatalogEntry {
         id: "github",
         label: "GitHub",
@@ -81,30 +185,77 @@ pub const CATALOG: &[CatalogEntry] = &[
         setup: "token_or_oauth",
         url: None,
         mode: Mode::Standard,
+        group: "development",
     },
-    sign_in(
-        "notion",
-        "Notion",
-        "Pages, notes, and databases",
-        "https://mcp.notion.com/mcp",
-    ),
-    sign_in(
-        "todoist",
-        "Todoist",
-        "Tasks, projects, and due dates",
-        "https://ai.todoist.net/mcp",
-    ),
     sign_in(
         "linear",
         "Linear",
         "Issues, projects, and cycles",
         "https://mcp.linear.app/mcp",
+        "development",
     ),
     sign_in(
-        "canva",
-        "Canva",
-        "Designs, folders, and brand templates",
-        "https://mcp.canva.com/mcp",
+        "sentry",
+        "Sentry",
+        "Issues, errors, traces, and releases",
+        "https://mcp.sentry.dev/mcp",
+        "development",
+    ),
+    sign_in(
+        "cloudflare",
+        "Cloudflare",
+        "Your Cloudflare account and its docs",
+        "https://mcp.cloudflare.com/mcp",
+        "development",
+    ),
+    sign_in(
+        "supabase",
+        "Supabase",
+        "Projects, databases, functions, and logs",
+        "https://mcp.supabase.com/mcp",
+        "development",
+    ),
+    sign_in(
+        "netlify",
+        "Netlify",
+        "Sites, deploys, and settings",
+        "https://netlify-mcp.netlify.app/mcp",
+        "development",
+    ),
+    sign_in(
+        "neon",
+        "Neon",
+        "Postgres projects, branches, and queries",
+        "https://mcp.neon.tech/mcp",
+        "development",
+    ),
+    sign_in(
+        "huggingface",
+        "Hugging Face",
+        "Models, datasets, Spaces, and papers",
+        // Without `?login` the server answers anonymously and never asks
+        // to sign in.
+        "https://huggingface.co/mcp?login",
+        "development",
+    ),
+    money(
+        "stripe",
+        "Stripe",
+        "Customers, payments, invoices, and subscriptions",
+        "https://mcp.stripe.com",
+    ),
+    money(
+        "mercury",
+        "Mercury",
+        "Business bank accounts and transactions",
+        "https://mcp.mercury.com/mcp",
+    ),
+    sign_in(
+        "readwise",
+        "Readwise",
+        "Your highlights and Reader documents",
+        "https://mcp2.readwise.io/mcp",
+        "lifestyle",
     ),
     CatalogEntry {
         id: "custom",
@@ -114,6 +265,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         setup: "custom",
         url: None,
         mode: Mode::Standard,
+        group: "",
     },
 ];
 
@@ -248,15 +400,75 @@ pub async fn broadcast_changed(state: &AppState) {
     }
 }
 
+/// How a catalog row's connection is doing, for its "View" / "Connect".
+fn row_state(con: Option<&entities::Connector>, part: Option<&str>) -> &'static str {
+    match con {
+        None => "not_connected",
+        Some(c) if c.auth_state != "ok" => "needs_sign_in",
+        Some(c) if !c.enabled => "off",
+        Some(c) if c.paused_reason.is_some() => "paused",
+        Some(c) if part.is_some_and(|p| c.policy.is_off(p)) => "off",
+        Some(_) => "connected",
+    }
+}
+
+/// The catalog's rows by group, in display order: Google is listed as its
+/// services (one connection behind them all), YouTube under Lifestyle.
+/// Only groups with rows are included; `custom` is not in a group.
+pub fn catalog_groups(existing: &[entities::Connector]) -> Vec<Value> {
+    let con_for = |service: &str| {
+        existing
+            .iter()
+            .find(|c| c.service == service && service != "custom")
+    };
+    let mut rows: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+    for e in CATALOG.iter().filter(|e| !e.group.is_empty()) {
+        let con = con_for(e.id);
+        if e.id == "google" {
+            for svc in crate::gateway::google::SERVICES {
+                let group = if svc.id == "youtube" {
+                    "lifestyle"
+                } else {
+                    e.group
+                };
+                rows.entry(group).or_default().push(json!({
+                    "service": e.id,
+                    "part": svc.id,
+                    "label": svc.label,
+                    "description": svc.description,
+                    "connector_id": con.map(|c| c.id.clone()),
+                    "state": row_state(con, Some(svc.id)),
+                }));
+            }
+            continue;
+        }
+        rows.entry(e.group).or_default().push(json!({
+            "service": e.id,
+            "part": null,
+            "label": e.label,
+            "description": e.description,
+            "connector_id": con.map(|c| c.id.clone()),
+            "state": row_state(con, None),
+        }));
+    }
+    GROUPS
+        .iter()
+        .filter_map(|(id, label)| {
+            let r = rows.remove(id)?;
+            Some(json!({"id": id, "label": label, "rows": r}))
+        })
+        .collect()
+}
+
 /// Catalog for the app, with what is already connected.
-pub async fn catalog_json(state: &AppState, origin: Option<&str>) -> Vec<Value> {
+pub async fn catalog_json(state: &AppState, origin: Option<&str>) -> (Vec<Value>, Vec<Value>) {
     let existing = state
         .db
         .call(|c| entities::list_connectors(c, false))
         .await
         .unwrap_or_default();
     let (redirect_uri, direct) = crate::oauth::redirect_uri(state, origin);
-    CATALOG
+    let services = CATALOG
         .iter()
         .map(|e| {
             let con = existing
@@ -273,6 +485,7 @@ pub async fn catalog_json(state: &AppState, origin: Option<&str>) -> Vec<Value> 
                 "label": e.label,
                 "description": e.description,
                 "setup": e.setup,
+                "group": e.group,
                 "missing": missing,
                 "connector_id": con.map(|c| c.id.clone()),
                 "connected": con.is_some_and(|c| c.active()),
@@ -280,7 +493,8 @@ pub async fn catalog_json(state: &AppState, origin: Option<&str>) -> Vec<Value> 
                 "redirect_direct": if e.id == "google" { crate::google_setup::callback(&state.cfg.public_url).is_some() } else { direct },
             })
         })
-        .collect()
+        .collect();
+    (services, catalog_groups(&existing))
 }
 
 /// What the owner sends to set up a catalog service.
@@ -500,10 +714,7 @@ pub async fn setup(
     let is_new = existing.is_none();
     // A new connection starts with the service's rules; the owner's own
     // choice is kept when it is set up again.
-    let policy = is_new.then(|| Policy {
-        mode: entry.mode,
-        ..Default::default()
-    });
+    let policy = is_new.then(|| Policy::new(entry.mode));
     state
         .db
         .call(move |c| {
@@ -560,11 +771,63 @@ mod tests {
         assert_eq!(
             ids,
             [
-                "google", "github", "notion", "todoist", "linear", "canva", "custom"
+                "google",
+                "notion",
+                "todoist",
+                "airtable",
+                "monday",
+                "miro",
+                "canva",
+                "calcom",
+                "granola",
+                "fireflies",
+                "zapier",
+                "github",
+                "linear",
+                "sentry",
+                "cloudflare",
+                "supabase",
+                "netlify",
+                "neon",
+                "huggingface",
+                "stripe",
+                "mercury",
+                "readwise",
+                "custom"
             ]
         );
         assert!(catalog_entry("google").is_some());
-        assert!(catalog_entry("spotify").is_none());
+        // Checked and left out (see the module docs).
+        for gone in [
+            "spotify",
+            "dropbox",
+            "box",
+            "vercel",
+            "square",
+            "instacart",
+            "paypal",
+        ] {
+            assert!(catalog_entry(gone).is_none(), "{gone}");
+        }
+        // Every entry but custom is in a known group; custom is last.
+        for e in CATALOG {
+            if e.id == "custom" {
+                assert!(e.group.is_empty());
+            } else {
+                assert!(GROUPS.iter().any(|(g, _)| *g == e.group), "{}", e.id);
+            }
+        }
+        assert_eq!(CATALOG.last().unwrap().id, "custom");
+        // The app draws a tile for every service and Google part.
+        let app = include_str!("../web/js/catalog.js");
+        for id in CATALOG
+            .iter()
+            .map(|e| e.id)
+            .filter(|i| *i != "custom")
+            .chain(crate::gateway::google::SERVICES.iter().map(|s| s.id))
+        {
+            assert!(app.contains(&format!("\n  {id}: {{")), "{id}");
+        }
         // No client secret ships with Iris.
         assert!(GOOGLE_SCOPES.iter().all(|s| !s.contains("secret")));
     }
@@ -718,15 +981,118 @@ mod tests {
                     crate::oauth::check_secure_url(url).is_ok(),
                     "{url} is a public https address"
                 );
-                assert_eq!(e.mode, Mode::Careful, "{}", e.id);
+                // Money services ask for everything; the rest for changes.
+                let want = if e.group == "money" {
+                    Mode::AskAlways
+                } else {
+                    Mode::Careful
+                };
+                assert_eq!(e.mode, want, "{}", e.id);
                 assert!(e.requires.is_empty());
                 // The connector is named after the service: a valid MCP
                 // server name that is not reserved.
                 assert!(e.id.bytes().all(|b| b.is_ascii_lowercase()), "{}", e.id);
             } else {
                 assert!(e.url.is_none(), "{}", e.id);
-                assert_eq!(e.mode, Mode::Standard, "{}", e.id);
+                // Google's rules are per action (reads run, changes ask).
+                let want = if e.id == "google" {
+                    Mode::Careful
+                } else {
+                    Mode::Standard
+                };
+                assert_eq!(e.mode, want, "{}", e.id);
             }
         }
+    }
+
+    fn con(id: &str, service: &str, auth: &str, enabled: bool) -> entities::Connector {
+        entities::Connector {
+            id: id.into(),
+            name: service.into(),
+            description: String::new(),
+            transport: "http".into(),
+            config: ConnectorConfig::default(),
+            enabled,
+            policy: Policy::new(Mode::Careful),
+            service: service.into(),
+            paused_reason: None,
+            paused_at: None,
+            auth_state: auth.into(),
+            workspace_cwd: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn catalog_groups_list_google_services_and_connection_states() {
+        let rows = |groups: &[Value], id: &str| -> Vec<Value> {
+            groups
+                .iter()
+                .find(|g| g["id"] == id)
+                .map(|g| g["rows"].as_array().unwrap().clone())
+                .unwrap_or_default()
+        };
+        let groups = catalog_groups(&[]);
+        // Only groups with rows, in order.
+        let ids: Vec<&str> = groups.iter().map(|g| g["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["productivity", "development", "money", "lifestyle"]);
+        let productivity = rows(&groups, "productivity");
+        let labels: Vec<&str> = productivity
+            .iter()
+            .map(|r| r["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            labels[..9],
+            [
+                "Gmail",
+                "Google Calendar",
+                "Google Drive",
+                "Google Docs",
+                "Google Sheets",
+                "Google Slides",
+                "Google Forms",
+                "Google Tasks",
+                "Google Contacts"
+            ]
+        );
+        assert!(labels.contains(&"Notion"));
+        assert!(!labels.contains(&"Google"));
+        let lifestyle = rows(&groups, "lifestyle");
+        assert_eq!(lifestyle[0]["label"], "YouTube");
+        assert_eq!(lifestyle[0]["part"], "youtube");
+        let money: Vec<String> = rows(&groups, "money")
+            .iter()
+            .map(|r| r["service"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(money, ["stripe", "mercury"]);
+        assert!(
+            groups
+                .iter()
+                .flat_map(|g| g["rows"].as_array().unwrap())
+                .all(|r| r["service"] != "custom" && r["state"] == "not_connected")
+        );
+
+        // One Google connection is behind every Google row; a service the
+        // owner turned off shows as off, the others as connected.
+        let mut google = con("g1", "google", "ok", true);
+        google.policy.off.insert("drive".into());
+        let groups = catalog_groups(&[google, con("n1", "notion", "needs_sign_in", true)]);
+        let productivity = rows(&groups, "productivity");
+        let row = |label: &str| {
+            productivity
+                .iter()
+                .find(|r| r["label"] == label)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(row("Gmail")["state"], "connected");
+        assert_eq!(row("Gmail")["connector_id"], "g1");
+        assert_eq!(row("Google Drive")["state"], "off");
+        assert_eq!(row("Notion")["state"], "needs_sign_in");
+        assert_eq!(row("Todoist")["state"], "not_connected");
+        assert_eq!(rows(&groups, "lifestyle")[0]["state"], "connected");
+        let off = catalog_groups(&[con("g1", "google", "ok", false)]);
+        assert_eq!(rows(&off, "productivity")[0]["state"], "off");
     }
 }

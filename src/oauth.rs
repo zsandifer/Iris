@@ -677,6 +677,59 @@ async fn save(state: &AppState, id: &str, oauth: OAuthConfig) -> Result<(), Stri
         .map_err(|e| e.to_string())
 }
 
+/// Sign a connection out: forget its tokens and account (the client Iris
+/// registered or the owner created, the endpoints, and the rules stay, so
+/// connecting again is one sign-in). Calls waiting for approval and
+/// sign-ins under way are cancelled, and its server stops. Iris does not
+/// revoke the grant at the provider.
+pub async fn sign_out(state: &AppState, id: &str) -> Result<Option<entities::Connector>, String> {
+    let creds = credentials_lock(state).await;
+    let cid = id.to_string();
+    let con = state
+        .db
+        .call(move |c| {
+            let Some(con) = entities::get_connector(c, &cid)? else {
+                return Ok(None);
+            };
+            let Some(mut o) = con.config.oauth.clone() else {
+                return Ok(Some(Err(
+                    "This connection doesn't sign in with an account.",
+                )));
+            };
+            o.access_token = None;
+            o.refresh_token = None;
+            o.expires_at = None;
+            o.account = None;
+            o.connected_at = None;
+            let mut cfg = con.config.clone();
+            cfg.oauth = Some(o);
+            entities::update_connector(c, &cid, None, Some(&cfg), None)?;
+            Ok(entities::set_connector_state(
+                c,
+                &cid,
+                &ConnectorState {
+                    auth_state: Some("needs_sign_in"),
+                    ..Default::default()
+                },
+            )?
+            .map(Ok))
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let con = match con {
+        None => return Ok(None),
+        Some(Err(e)) => return Err(e.into()),
+        Some(Ok(c)) => c,
+    };
+    forget_flows(state, Some(id));
+    drop(creds);
+    crate::gateway::cancel_approvals(state, Some(id));
+    crate::gateway::stop(state, id).await;
+    crate::info!("connector {}: signed out by the owner", con.name);
+    crate::connectors::broadcast_changed(state).await;
+    Ok(Some(con))
+}
+
 /// Store an OAuth client the owner created (Google, GitHub OAuth app...).
 pub fn seal_client_secret(state: &AppState, id: &str, secret: &str) -> Result<String, String> {
     seal(state, id, "client_secret", secret)

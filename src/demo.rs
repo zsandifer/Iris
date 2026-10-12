@@ -673,22 +673,62 @@ fn seed_all(c: &Connection, paths: &Paths, assets: &Path, vault: &Vault) -> Resu
     )?;
 
     // --------------------------------------------------- connections, wallet
-    for (name, desc) in [
-        ("gmail", "Reads freely · asks before sending"),
-        ("calendar", "Reads · asks before inviting"),
-        ("youtube", "Feeds your For you"),
-    ] {
-        entities::insert_connector(
-            c,
-            &new_id(),
-            name,
-            desc,
-            "http",
-            &entities::ConnectorConfig {
-                url: Some(format!("https://mcp.example/{name}")),
+    // One Google connection (every Google service) and one one-tap
+    // service, both signed in to a fake account. The tokens are sealed
+    // placeholders; no server is started for the demo.
+    for (service, desc, cfg) in [
+        (
+            "google",
+            crate::connectors::GOOGLE_DESCRIPTION,
+            entities::ConnectorConfig {
+                url: Some("http://127.0.0.1:{port}/mcp".into()),
+                oauth: Some(entities::OAuthConfig {
+                    mode: "preset".into(),
+                    client_id: Some("demo.apps.googleusercontent.com".into()),
+                    client_source: "owner".into(),
+                    scopes: crate::connectors::GOOGLE_SCOPES
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    account: Some("alex@example.com".into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
-            true,
+        ),
+        (
+            "notion",
+            "Pages, notes, and databases",
+            entities::ConnectorConfig {
+                url: Some("https://mcp.example/notion".into()),
+                oauth: Some(entities::OAuthConfig {
+                    client_id: Some("demo-client".into()),
+                    client_source: "dcr".into(),
+                    ..entities::OAuthConfig::discover()
+                }),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let id = new_id();
+        let mut cfg = cfg;
+        if let Some(o) = cfg.oauth.as_mut() {
+            o.refresh_token =
+                Some(vault.seal_str("demo-only", &format!("connector:{id}:oauth:refresh_token"))?);
+        }
+        entities::insert_connector(c, &id, service, desc, "http", &cfg, true)?;
+        let mode = crate::connectors::catalog_entry(service)
+            .map(|e| e.mode)
+            .unwrap_or_default();
+        entities::set_connector_state(
+            c,
+            &id,
+            &entities::ConnectorState {
+                service: Some(service),
+                auth_state: Some("ok"),
+                policy: Some(&crate::gateway::policy::Policy::new(mode)),
+                ..Default::default()
+            },
         )?;
     }
     for (kind, label, meta, secret) in [

@@ -46,6 +46,10 @@ pub async fn status(
                 });
                 rules.push_str(&format!("; tool overrides: {} run, {} ask, {} blocked (purchases still ask)", counts[0], counts[1], counts[2]));
             }
+            if !con.policy.off.is_empty() {
+                let off: Vec<&str> = con.policy.off.iter().map(|s| crate::gateway::google::service(s).map_or(s.as_str(), |x| x.label)).collect();
+                rules.push_str(&format!("; turned off by the owner: {}", off.join(", ")));
+            }
             json!({"name": con.name, "status": status, "rules": rules})
         }).collect();
         let credentials = entities::list_credentials(c, &uid)?;
