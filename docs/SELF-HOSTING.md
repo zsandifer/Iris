@@ -111,7 +111,8 @@ See [docs/API.md](API.md) for every route, event, and data type.
 - Optional, for Iris's own browser: Chromium or Chrome, or Node.js to
   install Chromium from the app
 - [uv](https://docs.astral.sh/uv/) (`uvx`) on the server if you want to
-  connect Google (Gmail, Calendar, Drive, YouTube read-only)
+  connect Google (Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks,
+  Contacts, YouTube read-only)
 
 Iris resolves the CLIs from its engines directory, then `PATH` (plus
 `~/.local/bin` and similar), and reports their versions. It never pins or
@@ -530,8 +531,9 @@ out each tool call the CLI makes, nothing more.
 - **Turning it off.** `[browser] enabled = false` removes the tools.
 ## Connections and approvals
 
-Connections (MCP servers) give Iris your services: Gmail, Calendar, Drive,
-GitHub, or any MCP server. Add them in the app under Iris, Connections, or
+Connections (MCP servers) give Iris your services: Google (Gmail, Calendar,
+Drive, Docs and more), GitHub, Notion, Todoist, Linear, Jira and Confluence,
+Canva, or any MCP server. Add them in the app under Iris, Connections, or
 just ask in chat ("help me set up Google"); Iris posts a Connect card that
 opens the step-by-step setup.
 
@@ -609,7 +611,8 @@ elsewhere on your private network needs HTTPS to receive credentials.
 
 - **Google**: open **Iris hub → Connections → Google**, or ask “help me
   set up Google” and tap the chat card. One setup and one sign-in connect
-  Gmail, Calendar, Drive and YouTube read-only. Iris uses your **own** Google
+  Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts and
+  YouTube read-only. Iris uses your **own** Google
   OAuth client so Gmail actions pass through Iris’s approval gate. Google
   secrets and tokens stay encrypted on Iris’s side; the agent never gets them.
 
@@ -619,7 +622,9 @@ elsewhere on your private network needs HTTPS to receive credentials.
 
   1. Create a Google Cloud project named **Iris**. Keep that project selected
      in Google’s project picker for the remaining steps.
-  2. Enable Gmail, Calendar, Drive and YouTube together with the Open button.
+  2. Enable all ten APIs (Gmail, Calendar, Drive, YouTube Data, Docs,
+     Sheets, Slides, Forms, Tasks, and People for Contacts) together with
+     the Open button; single links for each are under it.
   3. On **Branding**, fill all three required fields: **App name**: **Iris**;
      **User support email**: pick your Gmail; **Developer contact information**:
      your Gmail (at the very bottom of the page, easy to miss). In **Authorized
@@ -644,8 +649,8 @@ elsewhere on your private network needs HTTPS to receive credentials.
      client ID and secret together, into the **one box in the app**.
      Labels, line breaks and either order work. Never paste the key in chat.
 
-  Then tap **Sign in with Google**, open its sign-in page, approve access to
-  all four services, and return to Iris for **Connected ✓**. Reported sign-in
+  Then tap **Sign in with Google**, open its sign-in page, approve access
+  with every box checked, and return to Iris for **Connected ✓**. Reported sign-in
   errors take you back to the step to fix; if Google stops on its own page,
   use **Google showed a problem** in Iris. Done records your progress; Iris
   cannot check the settings in your Google Cloud console.
@@ -659,7 +664,24 @@ elsewhere on your private network needs HTTPS to receive credentials.
   [Google Workspace MCP server](https://github.com/taylorwilsdon/google_workspace_mcp)
   (`uvx workspace-mcp`) in external OAuth mode, with a fresh token on each
   request. YouTube read-only also powers subscriptions and likes in For you.
-  No client secret ships with Iris.
+  No client secret ships with Iris. Google Chat is not included: its API
+  only works for Business or Enterprise Workspace accounts and needs a Chat
+  app configured in your project.
+
+  **Already connected before Docs, Sheets and the rest?** Google keeps
+  working as before. Connections shows “Sign in again to add Docs, Sheets
+  and more”: open Google, tap **Turn on Google services** (enabling the APIs
+  that are already on is harmless), then sign in again with every box
+  checked. Iris then turns on the new services. If you changed the Google
+  server's arguments under Advanced settings, Iris leaves them as they are;
+  add `docs sheets slides forms tasks contacts` after `--tools` yourself.
+- **Notion, Todoist, Linear, Atlassian (Jira, Confluence), Canva**: one tap.
+  Iris connects to the service's own hosted MCP server, registers itself
+  with the service, and you approve access on the service's page. Nothing to
+  create or paste. These start with “Reads freely · asks before any change”.
+  If Iris is not on HTTPS, you paste the address your browser ends on back
+  into the app, as with any sign-in. Atlassian may require a site admin to
+  allow its Rovo MCP server for your organization.
 - **GitHub** uses GitHub's remote MCP server with a fine-grained personal
   access token, or your own GitHub OAuth app.
 - **Custom**: any MCP server by web address (with sign-in, a header such as
