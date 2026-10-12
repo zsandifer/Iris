@@ -191,7 +191,7 @@ export function Page({ title, sub, children, onBack, right }) {
       <div class="grow" />
       ${right}
     </div>
-    <h1 class="ttl">${title}</h1>
+    ${title && html`<h1 class="ttl">${title}</h1>`}
     ${sub && html`<div class="sub">${sub}</div>`}
     ${children}
   </div>`;

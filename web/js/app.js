@@ -13,7 +13,7 @@ import { FeedScreen, StoryViewer, FeedSettings } from './feed.js';
 import { IdeasScreen, GoalsScreen, LibraryScreen } from './lists.js';
 import { Hub, Logins, Files, FileEditor, Folder } from './hub.js';
 import { Computer } from './computer.js';
-import { Connections, AddService, GoogleHttpsHelp, ConnectorPage, ConnectorForm, TrustedPeople, CATALOG_IDS } from './connect.js';
+import { Connections, CatalogGroup, AddService, GoogleHttpsHelp, ConnectorPage, ConnectorForm, TrustedPeople, CATALOG_IDS } from './connect.js';
 import { Settings, AiEngine, Devices, People, ActivityLog } from './settings.js';
 import { isIOS, standalone, syncPush, resetPush } from './push.js';
 import { trackViewport, blockZoom } from './viewport.js';
@@ -245,7 +245,9 @@ function Screen() {
         if (a === 'google-help') return html`<${GoogleHttpsHelp} />`;
         if (a === 'new') return html`<${ConnectorForm} id="new" key="new" />`;
         if (a === 'trusted') return html`<${TrustedPeople} />`;
+        if (a === 'group' && okSeg(rest[0] || '')) return html`<${CatalogGroup} id=${rest[0]} key=${`group-${rest[0]}`} />`;
         if (isId(a) && rest[0] === 'edit') return html`<${ConnectorForm} id=${a} key=${`${a}-edit`} />`;
+        if (isId(a) && rest[0] && okSeg(rest[0])) return html`<${ConnectorPage} id=${a} part=${rest[0]} key=${`${a}-${rest[0]}`} />`;
         if (isId(a)) return html`<${ConnectorPage} id=${a} key=${a} />`;
         return html`<${Connections} />`;
       }

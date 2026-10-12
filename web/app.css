@@ -537,3 +537,22 @@ details.alt p { margin: 8px 0; }
 .external-links { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
 .external-links > .wide { display: flex; align-items: center; justify-content: center; min-height: 48px; text-decoration: none; }
 .external-links > .lk-m { padding: 8px 4px; font-size: 13px; }
+
+/* ------------------------------------------------------------ connections catalog */
+.cat-head { display: flex; align-items: baseline; justify-content: space-between; margin: 18px 0 6px 4px; }
+.cat-head span { color: var(--mu); font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; }
+.see-all { display: inline-flex; align-items: center; gap: 1px; border: 0; background: none; color: var(--mu); font-size: 13px; padding: 2px 0 2px 8px; }
+.row-act { margin-left: auto; color: var(--ac); font-size: 14px; font-weight: 600; flex: none; }
+.row-act.connect { color: var(--ac); opacity: .85; }
+.svc-hero { display: flex; flex-direction: column; align-items: center; text-align: center; margin: 0 0 6px; }
+.svc-hero .tile { box-shadow: 0 4px 14px var(--shade); }
+.svc-hero .ttl { margin-top: 12px; }
+.svc-hero .sub { max-width: 320px; }
+.r.perm { gap: 8px; }
+.perm-pick { position: relative; display: inline-flex; align-items: center; gap: 3px; margin-left: auto; flex: none;
+  color: var(--mu); font-size: 14px; padding: 4px 0 4px 8px; }
+.perm-pick select { position: absolute; inset: 0; width: 100%; opacity: 0; font-size: 16px; cursor: pointer; }
+.perm-pick select:disabled { cursor: default; }
+.perm-pick:has(select:focus-visible) { outline: 2px solid var(--ac); outline-offset: 2px; border-radius: 8px; }
+.perm-pick:has(select:disabled) { opacity: .5; }
+.page:has(.cat-head, .svc-hero) .grp + .grp { margin-top: 14px; }
