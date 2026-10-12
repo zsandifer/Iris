@@ -297,10 +297,7 @@ async fn oauth_client(
         .config
         .oauth
         .clone()
-        .unwrap_or_else(|| entities::OAuthConfig {
-            mode: "discover".into(),
-            ..Default::default()
-        });
+        .unwrap_or_else(entities::OAuthConfig::discover);
     o.client_id = Some(client_id);
     o.client_secret = match body.client_secret.as_deref().map(str::trim) {
         Some(s) if !s.is_empty() => Some(
@@ -2075,7 +2072,19 @@ mod tests {
             .iter()
             .map(|s| s["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, ["google", "github", "custom"]);
+        assert_eq!(
+            ids,
+            [
+                "google",
+                "github",
+                "notion",
+                "todoist",
+                "linear",
+                "atlassian",
+                "canva",
+                "custom"
+            ]
+        );
         assert_eq!(
             cat["services"][0]["redirect_uri"],
             "https://iris.example.ts.net/api/oauth/callback"
@@ -2166,6 +2175,166 @@ mod tests {
         assert_eq!(v["connector"]["header_keys"], json!(["Authorization"]));
         assert_eq!(v["connector"]["auth_state"], "ok");
         assert!(!v.to_string().contains("github_pat_example"));
+    }
+
+    #[tokio::test]
+    async fn one_tap_services_sign_in_like_a_custom_server_and_ask_before_changes() {
+        let a = app().await;
+        let (_, cat) = call(&a, "GET", "/api/connectors/catalog", None).await;
+        let entry = |cat: &Value, id: &str| {
+            cat["services"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        for id in ["notion", "todoist", "linear", "atlassian", "canva"] {
+            let e = entry(&cat, id);
+            assert_eq!(e["setup"], "oauth_sign_in", "{id}");
+            assert_eq!(e["missing"], json!([]), "{id}");
+            assert_eq!(e["connected"], false, "{id}");
+            // Not on https here: the owner pastes the final address back.
+            assert_eq!(
+                e["redirect_uri"], "http://127.0.0.1:7420/api/oauth/callback",
+                "{id}"
+            );
+        }
+
+        // One tap: no fields, nothing to paste.
+        let (s, v) = call(
+            &a,
+            "POST",
+            "/api/connectors/catalog/notion",
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["needs_sign_in"], true);
+        let con = &v["connector"];
+        let id = con["id"].as_str().unwrap().to_string();
+        assert_eq!(con["name"], "notion");
+        assert_eq!(con["service"], "notion");
+        assert_eq!(con["transport"], "http");
+        assert_eq!(con["url"], "https://mcp.notion.com/mcp");
+        assert_eq!(con["auth"], "oauth");
+        assert_eq!(con["oauth"]["mode"], "discover");
+        assert_eq!(con["oauth"]["client_configured"], false);
+        assert_eq!(con["auth_state"], "needs_sign_in");
+        assert_eq!(con["description"], "Pages, notes, and databases");
+        // Reads run; every change asks first.
+        assert_eq!(con["policy"]["mode"], "careful");
+
+        // Exactly what the custom path stores for a server that follows the
+        // MCP sign-in standard, so the same discovery, registration and PKCE
+        // flow signs it in.
+        let (s, v) = call(
+            &a,
+            "POST",
+            "/api/connectors",
+            Some(json!({"name": "other", "transport": "http",
+                "url": "https://mcp.notion.com/mcp", "auth": "oauth"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let other = v["connector"]["id"].as_str().unwrap().to_string();
+        let (one_tap, custom) = {
+            let (id, other) = (id.clone(), other.clone());
+            a.state
+                .db
+                .with(move |c| {
+                    Ok((
+                        entities::get_connector(c, &id)?.unwrap(),
+                        entities::get_connector(c, &other)?.unwrap(),
+                    ))
+                })
+                .unwrap()
+        };
+        assert_eq!(one_tap.config, custom.config);
+        assert_eq!(custom.policy.mode, Mode::Standard);
+
+        // Setting it up again keeps the connection, the owner's rules and a
+        // sign-in under way.
+        let (s, _) = call(
+            &a,
+            "PUT",
+            &format!("/api/connectors/{id}/policy"),
+            Some(json!({"mode": "standard"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, v) = call(
+            &a,
+            "POST",
+            "/api/connectors/catalog/notion",
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["connector"]["id"], id.as_str());
+        assert_eq!(v["needs_sign_in"], true);
+        assert_eq!(v["connector"]["policy"]["mode"], "standard");
+        {
+            let id = id.clone();
+            a.state
+                .db
+                .with(move |c| {
+                    entities::set_connector_state(
+                        c,
+                        &id,
+                        &ConnectorState {
+                            auth_state: Some("ok"),
+                            ..Default::default()
+                        },
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let (_, v) = call(
+            &a,
+            "POST",
+            "/api/connectors/catalog/notion",
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(v["needs_sign_in"], false);
+        let (_, cat) = call(&a, "GET", "/api/connectors/catalog", None).await;
+        assert_eq!(entry(&cat, "notion")["connector_id"], id.as_str());
+        assert_eq!(entry(&cat, "notion")["connected"], true);
+
+        // A custom connection already named after the service is not taken
+        // over.
+        let (s, _) = call(
+            &a,
+            "POST",
+            "/api/connectors",
+            Some(json!({"name": "linear", "transport": "http",
+                "url": "https://linear.example.com/mcp", "auth": "oauth"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, v) = call(
+            &a,
+            "POST",
+            "/api/connectors/catalog/linear",
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(entry(&cat, "linear")["connector_id"], Value::Null);
+
+        // The agent can ask for any of them by name.
+        let tools = crate::mcp::tool_definitions();
+        let setup = tools
+            .iter()
+            .find(|t| t["name"] == "request_connector_setup")
+            .unwrap();
+        let names = &setup["inputSchema"]["properties"]["name"]["enum"];
+        for id in ["google", "github", "notion", "atlassian", "canva", "custom"] {
+            assert!(names.as_array().unwrap().iter().any(|n| n == id), "{names}");
+        }
     }
 
     #[tokio::test]

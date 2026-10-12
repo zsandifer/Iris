@@ -945,10 +945,11 @@ pub async fn start(
         .ok()
         .flatten()
         .ok_or_else(|| StartError::Other("connection not found".into()))?;
-    let mut o = con.config.oauth.clone().unwrap_or_else(|| OAuthConfig {
-        mode: "discover".into(),
-        ..Default::default()
-    });
+    let mut o = con
+        .config
+        .oauth
+        .clone()
+        .unwrap_or_else(OAuthConfig::discover);
     // Reconnecting an older Google grant must request today's scopes too.
     if con.service == "google" && o.mode == "preset" {
         for scope in crate::connectors::GOOGLE_SCOPES {

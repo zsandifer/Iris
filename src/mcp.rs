@@ -155,7 +155,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "request_connector_setup",
             "Request a catalog connect or reconnect card; never connects directly.",
-            json!({"name": {"type": "string", "enum": ["google", "github", "custom"]}}),
+            json!({"name": {"type": "string", "enum": crate::connectors::CATALOG.iter().map(|e| e.id).collect::<Vec<_>>()}}),
             &["name"],
         ),
         tool(

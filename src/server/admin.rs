@@ -546,10 +546,7 @@ async fn create_connector(
         Some(_) => return Err(ApiError::bad_request("auth must be oauth or none")),
     };
     if oauth {
-        cfg.oauth = Some(entities::OAuthConfig {
-            mode: "discover".into(),
-            ..Default::default()
-        });
+        cfg.oauth = Some(entities::OAuthConfig::discover());
     }
     crate::connectors::check_transport_security(&transport, &cfg).map_err(ApiError::bad_request)?;
     let enabled = body.enabled.unwrap_or(true);

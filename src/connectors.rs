@@ -1,6 +1,8 @@
 //! The small built-in catalog of services to connect: Google (Gmail,
-//! Calendar, Drive), GitHub, and a custom MCP server. Each entry says how
-//! the connector is set up; the app walks the owner through it.
+//! Calendar, Drive), GitHub, services with a hosted MCP server the owner just
+//! signs in to (Notion, Todoist, Linear, Atlassian, Canva), and a custom MCP
+//! server. Each entry says how the connector is set up; the app walks the
+//! owner through it.
 //!
 //! - Google runs the open-source Google Workspace MCP server
 //!   (`workspace-mcp`, started with `uvx`) on this machine in its external
@@ -10,9 +12,17 @@
 //!   ships with Iris: the owner creates one in their Google Cloud project.
 //! - GitHub is GitHub's remote MCP server, reached with a personal access
 //!   token or the owner's own GitHub OAuth app.
+//! - One-tap services (`oauth_sign_in`) are the vendor's own hosted MCP
+//!   server at a fixed address. Signing in is the same MCP authorization
+//!   flow as a custom connection (discovery, dynamic client registration,
+//!   PKCE): Iris registers itself, so the owner only approves access on the
+//!   service's page. Each address was checked to publish a registration
+//!   endpoint that accepts Iris's callback; services that only allow
+//!   pre-registered apps are left to the custom path.
 
 use crate::entities::{self, ConnectorConfig, ConnectorState, OAuthConfig};
 use crate::events::Audience;
+use crate::gateway::policy::{Mode, Policy};
 use crate::state::AppState;
 use crate::util::new_id;
 use serde_json::{Value, json};
@@ -24,8 +34,33 @@ pub struct CatalogEntry {
     pub description: &'static str,
     /// Programs the server needs (checked on PATH).
     pub requires: &'static [&'static str],
-    /// How the owner signs in: `google_client`, `token_or_oauth`, `custom`.
+    /// How the owner signs in: `google_client`, `token_or_oauth`,
+    /// `oauth_sign_in`, `custom`.
     pub setup: &'static str,
+    /// `oauth_sign_in`: the service's hosted MCP server.
+    pub url: Option<&'static str>,
+    /// The approval rules a new connection starts with.
+    pub mode: Mode,
+}
+
+/// A service whose hosted MCP server the owner only signs in to. Its tools
+/// change shared work (pages, issues, tasks, designs), so every change asks
+/// first until the owner relaxes the rules.
+const fn sign_in(
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+    url: &'static str,
+) -> CatalogEntry {
+    CatalogEntry {
+        id,
+        label,
+        description,
+        requires: &[],
+        setup: "oauth_sign_in",
+        url: Some(url),
+        mode: Mode::Careful,
+    }
 }
 
 pub const CATALOG: &[CatalogEntry] = &[
@@ -35,6 +70,8 @@ pub const CATALOG: &[CatalogEntry] = &[
         description: "Gmail, Calendar, Drive, and YouTube read-only",
         requires: &["uvx"],
         setup: "google_client",
+        url: None,
+        mode: Mode::Standard,
     },
     CatalogEntry {
         id: "github",
@@ -42,13 +79,47 @@ pub const CATALOG: &[CatalogEntry] = &[
         description: "Code, issues, and pull requests",
         requires: &[],
         setup: "token_or_oauth",
+        url: None,
+        mode: Mode::Standard,
     },
+    sign_in(
+        "notion",
+        "Notion",
+        "Pages, notes, and databases",
+        "https://mcp.notion.com/mcp",
+    ),
+    sign_in(
+        "todoist",
+        "Todoist",
+        "Tasks, projects, and due dates",
+        "https://ai.todoist.net/mcp",
+    ),
+    sign_in(
+        "linear",
+        "Linear",
+        "Issues, projects, and cycles",
+        "https://mcp.linear.app/mcp",
+    ),
+    sign_in(
+        "atlassian",
+        "Atlassian",
+        "Jira issues and Confluence pages",
+        "https://mcp.atlassian.com/v1/mcp",
+    ),
+    sign_in(
+        "canva",
+        "Canva",
+        "Designs, folders, and brand templates",
+        "https://mcp.canva.com/mcp",
+    ),
     CatalogEntry {
         id: "custom",
         label: "Custom",
         description: "Any MCP server: a web address or a program on the server",
         requires: &[],
         setup: "custom",
+        url: None,
+        mode: Mode::Standard,
     },
 ];
 
@@ -192,6 +263,14 @@ pub async fn setup(
             entry.id
         ));
     }
+    // Setting up a one-tap service again keeps its sign-in (and any sign-in
+    // under way) as long as it still points at the service's server.
+    if let (Some(url), Some(c)) = (entry.url, &existing)
+        && c.config.url.as_deref() == Some(url)
+        && c.config.oauth.is_some()
+    {
+        return Ok((c.id.clone(), c.auth_state != "ok"));
+    }
     let id = existing
         .as_ref()
         .map(|c| c.id.clone())
@@ -199,6 +278,19 @@ pub async fn setup(
     let seal_env =
         |m: BTreeMap<String, String>| crate::server::seal_connector_secrets(state, &id, "env", &m);
     let (transport, cfg, description, needs_sign_in) = match entry.id {
+        _ if entry.setup == "oauth_sign_in" => {
+            let url = entry.url.ok_or("unknown service")?;
+            (
+                "http",
+                ConnectorConfig {
+                    url: Some(url.into()),
+                    oauth: Some(OAuthConfig::discover()),
+                    ..Default::default()
+                },
+                entry.description,
+                true,
+            )
+        }
         "google" => {
             let old = existing.as_ref().and_then(|c| c.config.oauth.clone());
             let client_id = clean(&body.client_id)
@@ -301,7 +393,7 @@ pub async fn setup(
                     headers: BTreeMap::new(),
                     oauth: Some(o),
                 },
-                "Gmail, Calendar, Drive, and YouTube read-only",
+                entry.description,
                 !signed_in,
             )
         }
@@ -321,7 +413,7 @@ pub async fn setup(
                         headers,
                         ..Default::default()
                     },
-                    "Code, issues, and pull requests",
+                    entry.description,
                     false,
                 )
             } else {
@@ -330,11 +422,10 @@ pub async fn setup(
                 let secret = clean(&body.client_secret)
                     .ok_or("paste your GitHub OAuth app's Client secret too")?;
                 let o = OAuthConfig {
-                    mode: "discover".into(),
                     client_id: Some(client_id),
                     client_secret: Some(crate::oauth::seal_client_secret(state, &id, &secret)?),
                     client_source: "owner".into(),
-                    ..Default::default()
+                    ..OAuthConfig::discover()
                 };
                 (
                     "http",
@@ -343,7 +434,7 @@ pub async fn setup(
                         oauth: Some(o),
                         ..Default::default()
                     },
-                    "Code, issues, and pull requests",
+                    entry.description,
                     true,
                 )
             }
@@ -353,6 +444,12 @@ pub async fn setup(
     check_transport_security(transport, &cfg)?;
     let (cid, svc, name) = (id.clone(), entry.id.to_string(), entry.id.to_string());
     let is_new = existing.is_none();
+    // A new connection starts with the service's rules; the owner's own
+    // choice is kept when it is set up again.
+    let policy = is_new.then(|| Policy {
+        mode: entry.mode,
+        ..Default::default()
+    });
     state
         .db
         .call(move |c| {
@@ -367,6 +464,7 @@ pub async fn setup(
                 &ConnectorState {
                     service: Some(&svc),
                     auth_state: Some(if needs_sign_in { "needs_sign_in" } else { "ok" }),
+                    policy: policy.as_ref(),
                     ..Default::default()
                 },
             )?;
@@ -405,10 +503,44 @@ mod tests {
     #[test]
     fn catalog_is_small_and_known() {
         let ids: Vec<&str> = CATALOG.iter().map(|e| e.id).collect();
-        assert_eq!(ids, ["google", "github", "custom"]);
+        assert_eq!(
+            ids,
+            [
+                "google",
+                "github",
+                "notion",
+                "todoist",
+                "linear",
+                "atlassian",
+                "canva",
+                "custom"
+            ]
+        );
         assert!(catalog_entry("google").is_some());
         assert!(catalog_entry("spotify").is_none());
         // No client secret ships with Iris.
         assert!(GOOGLE_SCOPES.iter().all(|s| !s.contains("secret")));
+    }
+
+    #[test]
+    fn one_tap_services_are_hosted_https_servers_that_ask_before_changes() {
+        for e in CATALOG {
+            if e.setup == "oauth_sign_in" {
+                let url = e.url.expect("a one-tap service has its server's address");
+                assert!(url.starts_with("https://"), "{url}");
+                assert!(
+                    crate::oauth::check_secure_url(url).is_ok(),
+                    "{url} is a public https address"
+                );
+                assert_eq!(e.mode, Mode::Careful, "{}", e.id);
+                assert!(e.requires.is_empty());
+                // The connector is named after the service: a valid MCP
+                // server name that is not reserved.
+                assert!(e.id.bytes().all(|b| b.is_ascii_lowercase()), "{}", e.id);
+            } else {
+                assert!(e.url.is_none(), "{}", e.id);
+                assert_eq!(e.mode, Mode::Standard, "{}", e.id);
+            }
+        }
     }
 }
