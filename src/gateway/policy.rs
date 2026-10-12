@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What a tool call does, from the gate's point of view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,14 +119,78 @@ pub enum ToolRule {
 pub struct Policy {
     #[serde(default)]
     pub mode: Mode,
-    /// Tool name -> override. Purchases still ask when set to `allow`.
+    /// Rule key -> override: a tool name, or for Google a friendly action
+    /// id (`gmail.send`, see `google.rs`). Purchases and unclear calls still
+    /// ask when set to `allow`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tools: BTreeMap<String, ToolRule>,
+    /// Parts of the connection the owner turned off (Google services such
+    /// as `gmail`): their tools are hidden and refused.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub off: BTreeSet<String>,
+    /// Format of these rules (see `upgraded`).
+    #[serde(default)]
+    pub version: u8,
 }
+
+/// Rules format: since 2, Google rules are keyed by friendly action.
+pub const POLICY_VERSION: u8 = 2;
 
 impl Policy {
     pub fn parse(raw: &str) -> Self {
         serde_json::from_str(raw).unwrap_or_default()
+    }
+
+    /// New rules for a connection.
+    pub fn new(mode: Mode) -> Self {
+        Policy {
+            mode,
+            version: POLICY_VERSION,
+            ..Default::default()
+        }
+    }
+
+    /// Rules saved by an older Iris, in today's format. For Google, a rule
+    /// on a tool becomes the rule of every action that tool performs (the
+    /// strictest wins when tools share an action), and the old default
+    /// ("standard": ordinary changes run) becomes today's Google default
+    /// (reads run, every change asks). Idempotent.
+    pub fn upgraded(mut self, service: &str) -> Self {
+        if self.version >= POLICY_VERSION {
+            return self;
+        }
+        if service == "google" {
+            let strictness = |r: &ToolRule| match r {
+                ToolRule::Allow => 0,
+                ToolRule::Ask => 1,
+                ToolRule::Block => 2,
+            };
+            let old = std::mem::take(&mut self.tools);
+            let mut actions: BTreeMap<String, ToolRule> = BTreeMap::new();
+            for (tool, rule) in old {
+                let ids = super::google::tool_actions(&tool);
+                if ids.is_empty() {
+                    self.tools.insert(tool, rule);
+                    continue;
+                }
+                for id in ids {
+                    let e = actions.entry((*id).to_string()).or_insert(rule);
+                    if strictness(&rule) > strictness(e) {
+                        *e = rule;
+                    }
+                }
+            }
+            self.tools.extend(actions);
+            if self.mode == Mode::Standard {
+                self.mode = Mode::Careful;
+            }
+        }
+        self.version = POLICY_VERSION;
+        self
+    }
+
+    pub fn is_off(&self, part: &str) -> bool {
+        self.off.contains(part)
     }
 }
 
@@ -686,7 +750,7 @@ fn norm_key(k: &str) -> String {
 }
 
 /// An unparseable audience is never trusted or remembered after approval.
-const UNREADABLE_RECIPIENTS: &str = "recipients Iris cannot read unambiguously";
+pub const UNREADABLE_RECIPIENTS: &str = "recipients Iris cannot read unambiguously";
 
 fn atext(c: u8) -> bool {
     c.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&c)
@@ -1147,6 +1211,191 @@ pub fn decide(
             _ => Verdict::Ask(ask_reason(category).into()),
         },
     }
+}
+
+// ---------------------------------------------------------------- subjects
+
+/// What the rules see of one call (or, without arguments, of one tool):
+/// the rule keys it falls under and what it does under each.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Subject {
+    /// The part of the connection the tool belongs to (a Google service),
+    /// which the owner can turn off as a whole.
+    pub part: Option<&'static str>,
+    /// (rule key, category): a Google tool's friendly actions, or the tool
+    /// itself with its general classification.
+    pub keys: Vec<(String, Category)>,
+    /// Every action the tool can perform (Google): when the owner turned
+    /// all of them off, the tool is hidden and refused whatever it is
+    /// asked to do.
+    pub every: &'static [&'static str],
+}
+
+impl Subject {
+    /// The riskiest thing the call does (for cards, logs, and tripwires).
+    pub fn category(&self) -> Category {
+        self.keys
+            .iter()
+            .fold(Category::Read, |c, (_, k)| c.riskier(*k))
+    }
+
+    /// Without the tool's definition Iris cannot trust its hints.
+    pub fn unverified(mut self) -> Self {
+        for (_, c) in &mut self.keys {
+            *c = c.riskier(Category::Unclear);
+        }
+        self
+    }
+}
+
+/// Place one call. `service` is the connector's catalog service; `action`
+/// the tool name without a catalog service's own prefix (`action_name`).
+pub fn subject(
+    service: &str,
+    tool: &str,
+    action: &str,
+    annotations: &Value,
+    args: &Value,
+) -> Subject {
+    if service == "google"
+        && let Some(part) = super::google::tool_service(tool)
+    {
+        let every = super::google::tool_actions(tool);
+        if let Some(keys) = super::google::call_actions(tool, args) {
+            // A one-action tool the server marks destructive (deleting rows
+            // while resizing, batch edits) keeps that risk; tools placed by
+            // their arguments already say what each call does.
+            let destructive =
+                !super::google::placed_by_arguments(tool) && annotations["destructiveHint"] == true;
+            return Subject {
+                part: Some(part),
+                keys: keys
+                    .into_iter()
+                    .map(|(k, c)| {
+                        let c = if destructive {
+                            c.riskier(Category::Delete)
+                        } else {
+                            c
+                        };
+                        (k.to_string(), c)
+                    })
+                    .collect(),
+                every,
+            };
+        }
+        // A value the table does not know: the tool's own (empty) rule and
+        // the general classification, which asks when it cannot place it.
+        return Subject {
+            part: Some(part),
+            keys: vec![(tool.to_string(), classify_call(action, annotations, args))],
+            every,
+        };
+    }
+    Subject {
+        part: None,
+        keys: vec![(tool.to_string(), classify_call(action, annotations, args))],
+        every: &[],
+    }
+}
+
+/// Place a tool for its listing (no arguments yet): every action it can
+/// perform, each at its riskiest.
+pub fn tool_subject(service: &str, tool: &str, action: &str, annotations: &Value) -> Subject {
+    if service == "google"
+        && let Some(part) = super::google::tool_service(tool)
+    {
+        let every = super::google::tool_actions(tool);
+        return Subject {
+            part: Some(part),
+            keys: every
+                .iter()
+                .filter_map(|id| super::google::action(id))
+                .map(|a| (a.id.to_string(), a.category))
+                .collect(),
+            every,
+        };
+    }
+    Subject {
+        part: None,
+        keys: vec![(tool.to_string(), classify(action, annotations))],
+        every: &[],
+    }
+}
+
+/// The whole tool is off: its part of the connection is off, or every
+/// action it can perform is.
+pub fn tool_off(policy: &Policy, s: &Subject) -> Option<String> {
+    if let Some(part) = s.part
+        && policy.is_off(part)
+    {
+        let label = super::google::service(part).map_or(part, |x| x.label);
+        return Some(format!("the owner turned {label} off"));
+    }
+    if !s.every.is_empty()
+        && s.every
+            .iter()
+            .all(|k| policy.tools.get(*k) == Some(&ToolRule::Block))
+    {
+        return Some("the owner turned this action off".into());
+    }
+    None
+}
+
+/// Decide a placed call: refused if its tool is off or any of its actions
+/// is; held if any asks; otherwise it runs.
+pub fn judge(
+    policy: &Policy,
+    s: &Subject,
+    recipients: &[String],
+    trusted: &dyn Fn(&str) -> bool,
+    known: &dyn Fn(&str) -> bool,
+) -> Verdict {
+    if let Some(reason) = tool_off(policy, s) {
+        return Verdict::Block(reason);
+    }
+    let mut ask = None;
+    let mut by = None;
+    for (key, category) in &s.keys {
+        match decide(policy, key, *category, recipients, trusted, known) {
+            Verdict::Block(r) => return Verdict::Block(r),
+            Verdict::Ask(r) => {
+                ask.get_or_insert(r);
+            }
+            Verdict::Allow(b) => {
+                by = Some(match (by, b) {
+                    (Some(AllowedBy::Trusted), _) | (_, AllowedBy::Trusted) => AllowedBy::Trusted,
+                    (Some(AllowedBy::Override), _) | (_, AllowedBy::Override) => {
+                        AllowedBy::Override
+                    }
+                    _ => AllowedBy::Rules,
+                });
+            }
+        }
+    }
+    match (ask, by) {
+        (Some(r), _) => Verdict::Ask(r),
+        (None, Some(b)) => Verdict::Allow(b),
+        // No keys: nothing Iris can place runs on its own.
+        (None, None) => Verdict::Ask(ask_reason(Category::Unclear).into()),
+    }
+}
+
+/// What an owner rule key does with no recipients: `allow`, `ask`, or
+/// `off`, and whether it is the rules' default (no override).
+pub fn effect(policy: &Policy, key: &str, category: Category) -> &'static str {
+    let none = |_: &str| false;
+    match decide(policy, key, category, &[], &none, &none) {
+        Verdict::Allow(_) => "allow",
+        Verdict::Ask(_) => "ask",
+        Verdict::Block(_) => "off",
+    }
+}
+
+/// `effect` without the owner's override for this key.
+pub fn default_effect(policy: &Policy, key: &str, category: Category) -> &'static str {
+    let mut p = policy.clone();
+    p.tools.remove(key);
+    effect(&p, key, category)
 }
 
 // ----------------------------------------------------------------- preview
@@ -2041,6 +2290,127 @@ mod tests {
         assert_eq!(Policy::parse("garbage"), Policy::default());
         let raw = serde_json::to_string(&p).unwrap();
         assert_eq!(Policy::parse(&raw), p);
+    }
+
+    #[test]
+    fn a_call_with_several_actions_needs_every_one_allowed() {
+        let none = |_: &str| false;
+        let mut p = Policy::new(Mode::Careful);
+        let args = json!({"file_id": "f", "trashed": true, "name": "n"});
+        let s = subject(
+            "google",
+            "update_drive_file",
+            "update_drive_file",
+            &Value::Null,
+            &args,
+        );
+        assert_eq!(s.part, Some("drive"));
+        assert_eq!(s.category(), Category::Delete);
+        assert!(matches!(judge(&p, &s, &[], &none, &none), Verdict::Ask(_)));
+        p.tools.insert("drive.edit".into(), ToolRule::Allow);
+        assert!(matches!(judge(&p, &s, &[], &none, &none), Verdict::Ask(_)));
+        p.tools.insert("drive.trash".into(), ToolRule::Allow);
+        assert_eq!(
+            judge(&p, &s, &[], &none, &none),
+            Verdict::Allow(AllowedBy::Override)
+        );
+        p.tools.insert("drive.trash".into(), ToolRule::Block);
+        assert!(matches!(
+            judge(&p, &s, &[], &none, &none),
+            Verdict::Block(_)
+        ));
+        // Unverified (no tool definition): an allowed action still asks.
+        p.tools.insert("drive.trash".into(), ToolRule::Allow);
+        assert!(matches!(
+            judge(&p, &s.clone().unverified(), &[], &none, &none),
+            Verdict::Ask(_)
+        ));
+        // A one-action tool the server marks destructive keeps that risk
+        // (under the standard rules its edits ask); an explicit Allow runs.
+        let hint = json!({"destructiveHint": true});
+        let resize = subject(
+            "google",
+            "resize_sheet_dimensions",
+            "resize_sheet_dimensions",
+            &hint,
+            &json!({}),
+        );
+        assert_eq!(resize.keys, [("sheets.edit".to_string(), Category::Delete)]);
+        let std = Policy::new(Mode::Standard);
+        assert!(matches!(
+            judge(&std, &resize, &[], &none, &none),
+            Verdict::Ask(_)
+        ));
+        let plain = subject(
+            "google",
+            "format_sheet_range",
+            "format_sheet_range",
+            &Value::Null,
+            &json!({}),
+        );
+        assert_eq!(
+            judge(&std, &plain, &[], &none, &none),
+            Verdict::Allow(AllowedBy::Rules)
+        );
+        // Placed by arguments: the hint does not turn a create into a delete.
+        let create = subject(
+            "google",
+            "manage_event",
+            "manage_event",
+            &hint,
+            &json!({"action": "create"}),
+        );
+        assert_eq!(
+            create.keys,
+            [("calendar.events.create".to_string(), Category::Write)]
+        );
+        // Outside Google, or for a tool the table does not know, the tool
+        // name and the general classification decide.
+        let other = subject(
+            "notion",
+            "update_drive_file",
+            "update_drive_file",
+            &Value::Null,
+            &args,
+        );
+        assert_eq!(other.part, None);
+        assert_eq!(other.keys[0].0, "update_drive_file");
+        let unknown = subject(
+            "google",
+            "make_coffee",
+            "make_coffee",
+            &Value::Null,
+            &json!({}),
+        );
+        assert_eq!(unknown.part, None);
+        assert_eq!(
+            unknown.keys,
+            [("make_coffee".to_string(), Category::Unclear)]
+        );
+        // Effects for the owner's screen.
+        assert_eq!(effect(&p, "drive.trash", Category::Delete), "allow");
+        assert_eq!(default_effect(&p, "drive.trash", Category::Delete), "ask");
+        assert_eq!(effect(&p, "drive.read", Category::Read), "allow");
+    }
+
+    #[test]
+    fn upgrading_rules_is_idempotent_and_keeps_new_choices() {
+        let mut old = Policy::default();
+        old.tools
+            .insert("search_gmail_messages".into(), ToolRule::Allow);
+        old.tools
+            .insert("get_gmail_message_content".into(), ToolRule::Block);
+        let up = old.upgraded("google");
+        // Both tools are "Read email": the stricter rule wins.
+        assert_eq!(up.tools.get("gmail.read"), Some(&ToolRule::Block));
+        assert_eq!(up.mode, Mode::Careful);
+        // Today's rules are never touched again, even "standard" chosen
+        // by the owner.
+        let mut now = up.clone();
+        now.mode = Mode::Standard;
+        assert_eq!(now.clone().upgraded("google"), now);
+        let raw = serde_json::to_string(&now).unwrap();
+        assert_eq!(Policy::parse(&raw).upgraded("google"), now);
     }
 
     #[test]

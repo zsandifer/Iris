@@ -48,8 +48,10 @@ pub fn routes() -> Router<AppState> {
         .route("/connectors/{id}/oauth/start", post(oauth_start))
         .route("/connectors/{id}/oauth/client", post(oauth_client))
         .route("/connectors/{id}/resume", post(resume))
+        .route("/connectors/{id}/oauth/sign-out", post(oauth_sign_out))
         .route("/connectors/{id}/policy", axum::routing::put(put_policy))
         .route("/connectors/{id}/tools", get(tools))
+        .route("/connectors/{id}/permissions", get(permissions))
         .route("/oauth/complete", post(oauth_complete))
         .route("/oauth/callback", get(oauth_callback))
         .route("/safety", get(get_safety).put(put_safety))
@@ -83,8 +85,10 @@ async fn catalog(
     Query(q): Query<OriginQuery>,
 ) -> ApiResult {
     user.require_owner()?;
+    let (services, groups) = crate::connectors::catalog_json(&state, q.origin.as_deref()).await;
     ok(json!({
-        "services": crate::connectors::catalog_json(&state, q.origin.as_deref()).await,
+        "services": services,
+        "groups": groups,
         "modes": Mode::ALL.iter().map(|m| json!({"mode": m, "label": m.describe()})).collect::<Vec<_>>(),
     }))
 }
@@ -433,8 +437,11 @@ async fn resume(
 #[derive(Deserialize)]
 struct PolicyBody {
     mode: Option<Mode>,
-    /// Tool name -> "allow" | "ask" | "block" | null (back to the rules).
+    /// Rule key (a tool name, or a Google action id) -> "allow" | "ask" |
+    /// "block" | null (back to the rules).
     tools: Option<BTreeMap<String, Option<ToolRule>>>,
+    /// Google: service id -> on (`true`) or off (`false`).
+    services: Option<BTreeMap<String, bool>>,
 }
 
 async fn put_policy(
@@ -448,6 +455,13 @@ async fn put_policy(
     if changes.keys().any(|t| t.is_empty() || t.len() > 200) {
         return Err(ApiError::bad_request("invalid tool name"));
     }
+    let services = body.services.unwrap_or_default();
+    if services
+        .keys()
+        .any(|s| crate::gateway::google::service(s).is_none())
+    {
+        return Err(ApiError::bad_request("unknown service"));
+    }
     let mode = body.mode;
     // Read, merge, and save in one database call, so concurrent changes to
     // different rules cannot undo each other.
@@ -457,9 +471,31 @@ async fn put_policy(
             let Some(con) = entities::get_connector(c, &id)? else {
                 return Ok(Err(ApiError::not_found("connector")));
             };
+            if !services.is_empty() && con.service != "google" {
+                return Ok(Err(ApiError::bad_request(
+                    "only a Google connection has services to turn on or off",
+                )));
+            }
+            // A Google tool's rules are its actions' rules.
+            if con.service == "google"
+                && changes
+                    .keys()
+                    .any(|k| !crate::gateway::google::tool_actions(k).is_empty())
+            {
+                return Ok(Err(ApiError::bad_request(
+                    "set the rules of this tool's actions instead",
+                )));
+            }
             let mut p: Policy = con.policy.clone();
             if let Some(m) = mode {
                 p.mode = m;
+            }
+            for (svc, on) in services {
+                if on {
+                    p.off.remove(&svc);
+                } else {
+                    p.off.insert(svc);
+                }
             }
             for (tool, rule) in changes {
                 match rule {
@@ -504,6 +540,166 @@ async fn tools(State(state): State<AppState>, user: AuthUser, Path(id): Path<Str
             "error": e,
             "detail": state.gateway.last_error(&con.id),
         })),
+    }
+}
+
+#[derive(Deserialize)]
+struct PermissionsQuery {
+    /// Google: the service whose actions to show.
+    service: Option<String>,
+}
+
+/// One row of a permission screen.
+fn permission_row(
+    policy: &Policy,
+    key: &str,
+    label: &str,
+    description: &str,
+    category: crate::gateway::policy::Category,
+) -> Value {
+    use crate::gateway::policy::{self as pol, Category};
+    let rule = policy.tools.get(key);
+    let mut choices = vec!["allow", "ask", "off"];
+    // `allow` would still ask for these, so it is not offered.
+    let note = match category {
+        Category::Purchase => {
+            choices.retain(|c| *c != "allow");
+            Some("Purchases and payments always ask")
+        }
+        Category::Unclear => {
+            choices.retain(|c| *c != "allow");
+            Some("I can't tell exactly what this does, so it always asks")
+        }
+        Category::Send
+            if rule.is_none() && matches!(policy.mode, Mode::Standard | Mode::Careful) =>
+        {
+            Some("Asks unless it only reaches people you trust")
+        }
+        _ => None,
+    };
+    json!({
+        "id": key,
+        "label": label,
+        "description": description,
+        "category": category,
+        "rule": rule,
+        "value": pol::effect(policy, key, category),
+        "default": pol::default_effect(policy, key, category),
+        "choices": choices,
+        "note": note,
+    })
+}
+
+/// Rows split into "Read permissions" and "Write and delete permissions".
+fn permission_sections(rows: Vec<(bool, Value)>) -> Vec<Value> {
+    let (read, write): (Vec<_>, Vec<_>) = rows.into_iter().partition(|(r, _)| *r);
+    [
+        ("read", "Read permissions", read),
+        ("write", "Write and delete permissions", write),
+    ]
+    .into_iter()
+    .filter(|(_, _, rows)| !rows.is_empty())
+    .map(|(id, label, rows)| {
+        json!({"id": id, "label": label, "actions": rows.into_iter().map(|(_, v)| v).collect::<Vec<_>>()})
+    })
+    .collect()
+}
+
+/// A connection's permission screen: for a Google service, its friendly
+/// actions (no need to start the server); otherwise the tools the server
+/// lists (for Google, the ones that belong to no service), each with what
+/// the rules do with it.
+async fn permissions(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    Query(q): Query<PermissionsQuery>,
+) -> ApiResult {
+    use crate::gateway::{google, policy::Category};
+    user.require_owner()?;
+    let con = connector(&state, &id).await?;
+    let account = con.config.oauth.as_ref().and_then(|o| o.account.clone());
+    if let Some(svc) = q.service.as_deref() {
+        let s = google::service(svc)
+            .filter(|_| con.service == "google")
+            .ok_or_else(|| ApiError::not_found("service"))?;
+        use crate::gateway::policy::effect;
+        let rows = s
+            .actions
+            .iter()
+            .map(|a| {
+                let mut row = permission_row(&con.policy, a.id, a.label, "", a.category);
+                // Without the owner's choice, the starting rules may treat
+                // the kinds of call it groups differently.
+                if let Some(also) = a.also
+                    && row["rule"].is_null()
+                    && effect(&con.policy, a.id, also) != effect(&con.policy, a.id, a.category)
+                {
+                    row["note"] = "Some of these run on their own and some ask, under your \
+                                   starting rules"
+                        .into();
+                }
+                (matches!(a.category, Category::Read | Category::Export), row)
+            })
+            .collect();
+        return ok(json!({
+            "service": {"id": s.id, "label": s.label, "description": s.description,
+                        "on": !con.policy.is_off(s.id)},
+            "account": account,
+            "sections": permission_sections(rows),
+            "error": null,
+            "detail": null,
+        }));
+    }
+    let (tools, error) = if !con.enabled {
+        (
+            Vec::new(),
+            Some("Turn the connection on to see what it can do.".to_string()),
+        )
+    } else {
+        match crate::gateway::describe_tools(&state, &con).await {
+            Ok(t) => (t, None),
+            Err(e) => (Vec::new(), Some(e)),
+        }
+    };
+    let rows = tools
+        .iter()
+        // A Google tool's actions are on its service's screen.
+        .filter(|t| t["actions"].as_array().is_none_or(|a| a.is_empty()))
+        .filter_map(|t| {
+            let name = t["name"].as_str()?;
+            let category: Category = serde_json::from_value(t["category"].clone()).ok()?;
+            Some((
+                category == Category::Read,
+                permission_row(
+                    &con.policy,
+                    name,
+                    t["label"].as_str().unwrap_or(name),
+                    t["description"].as_str().unwrap_or(""),
+                    category,
+                ),
+            ))
+        })
+        .collect();
+    ok(json!({
+        "service": null,
+        "account": account,
+        "sections": permission_sections(rows),
+        "detail": error.as_ref().and_then(|_| state.gateway.last_error(&con.id)),
+        "error": error,
+    }))
+}
+
+async fn oauth_sign_out(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> ApiResult {
+    user.require_owner()?;
+    match crate::oauth::sign_out(&state, &id).await {
+        Ok(Some(con)) => ok(json!({"connector": con.public_json()})),
+        Ok(None) => Err(ApiError::not_found("connector")),
+        Err(e) => Err(ApiError::bad_request(e)),
     }
 }
 
@@ -2275,12 +2471,40 @@ mod tests {
             .iter()
             .map(|s| s["id"].as_str().unwrap())
             .collect();
+        let all: Vec<&str> = crate::connectors::CATALOG.iter().map(|e| e.id).collect();
+        assert_eq!(ids, all);
+        // Grouped rows: Google as its services, custom in no group.
+        let groups = cat["groups"].as_array().unwrap();
+        let gids: Vec<&str> = groups.iter().map(|g| g["id"].as_str().unwrap()).collect();
+        assert_eq!(gids, ["productivity", "development", "money", "lifestyle"]);
+        let labels = |g: &Value| -> Vec<String> {
+            g["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["label"].as_str().unwrap().to_string())
+                .collect()
+        };
         assert_eq!(
-            ids,
+            labels(&groups[0])[..5],
             [
-                "google", "github", "notion", "todoist", "linear", "canva", "custom"
+                "Gmail",
+                "Google Calendar",
+                "Google Drive",
+                "Google Docs",
+                "Google Sheets"
             ]
         );
+        assert!(labels(&groups[3]).contains(&"YouTube".to_string()));
+        assert!(groups.iter().all(|g| {
+            g["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["service"] != "custom" && r["state"] == "not_connected")
+        }));
+        assert_eq!(groups[0]["rows"][0]["service"], "google");
+        assert_eq!(groups[0]["rows"][0]["part"], "gmail");
         assert_eq!(
             cat["services"][0]["redirect_uri"],
             "https://iris.example.ts.net/api/oauth/callback"
@@ -2617,6 +2841,246 @@ mod tests {
         .await;
         assert_eq!(v["removed"], true);
         assert!(crate::keys::env_for(&a.state, "gemini").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn google_service_permissions_switches_and_sign_out() {
+        let a = app_with_public_url("https://iris.example.ts.net").await;
+        let (s, v) = call(
+            &a,
+            "POST",
+            "/api/connectors/catalog/google",
+            Some(json!({"client_id": "123-abc.apps.googleusercontent.com", "client_secret": "GOCSPX-test"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let id = v["connector"]["id"].as_str().unwrap().to_string();
+        assert_eq!(v["connector"]["policy"]["mode"], "careful");
+        let perms = |svc: &str| format!("/api/connectors/{id}/permissions?service={svc}");
+        let (s, v) = call(&a, "GET", &perms("calendar"), None).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["service"]["label"], "Google Calendar");
+        assert_eq!(v["service"]["on"], true);
+        let row = |v: &Value, id: &str| -> Value {
+            v["sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|s| s["actions"].as_array().unwrap().clone())
+                .find(|a| a["id"] == id)
+                .unwrap()
+        };
+        assert_eq!(v["sections"][0]["label"], "Read permissions");
+        assert_eq!(v["sections"][1]["label"], "Write and delete permissions");
+        // Defaults: reads run, changes ask, invitations ask unless trusted.
+        assert_eq!(row(&v, "calendar.events.read")["value"], "allow");
+        assert_eq!(row(&v, "calendar.events.create")["value"], "ask");
+        assert_eq!(row(&v, "calendar.events.delete")["value"], "ask");
+        let invite = row(&v, "calendar.events.invite");
+        assert_eq!(invite["value"], "ask");
+        assert!(invite["note"].as_str().unwrap().contains("trust"));
+        assert_eq!(invite["choices"], json!(["allow", "ask", "off"]));
+
+        // Under starting rules where label edits run but deletions ask, the
+        // grouped row says so.
+        let policy = format!("/api/connectors/{id}/policy");
+        call(&a, "PUT", &policy, Some(json!({"mode": "standard"}))).await;
+        let (_, v) = call(&a, "GET", &perms("gmail"), None).await;
+        assert!(
+            row(&v, "gmail.labels")["note"]
+                .as_str()
+                .unwrap()
+                .contains("Some of these")
+        );
+        assert!(row(&v, "gmail.trash")["note"].is_null());
+        call(&a, "PUT", &policy, Some(json!({"mode": "careful"}))).await;
+        let (_, v) = call(&a, "GET", &perms("gmail"), None).await;
+        assert!(row(&v, "gmail.labels")["note"].is_null());
+
+        // Rules and the service switch.
+        let (s, v) = call(
+            &a,
+            "PUT",
+            &format!("/api/connectors/{id}/policy"),
+            Some(json!({"tools": {"calendar.events.create": "allow", "calendar.events.delete": "block"},
+                        "services": {"calendar": false, "youtube": false}})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["connector"]["policy"]["off"],
+            json!(["calendar", "youtube"])
+        );
+        let (_, v) = call(&a, "GET", &perms("calendar"), None).await;
+        assert_eq!(v["service"]["on"], false);
+        let create = row(&v, "calendar.events.create");
+        assert_eq!(
+            (
+                create["rule"].clone(),
+                create["value"].clone(),
+                create["default"].clone()
+            ),
+            (json!("allow"), json!("allow"), json!("ask"))
+        );
+        assert_eq!(row(&v, "calendar.events.delete")["value"], "off");
+        let (_, v) = call(
+            &a,
+            "PUT",
+            &format!("/api/connectors/{id}/policy"),
+            Some(json!({"services": {"calendar": true}})),
+        )
+        .await;
+        assert_eq!(v["connector"]["policy"]["off"], json!(["youtube"]));
+        let (_, cat) = call(&a, "GET", "/api/connectors/catalog", None).await;
+        let rows: Vec<Value> = cat["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["rows"].as_array().unwrap().clone())
+            .collect();
+        let state_of =
+            |label: &str| rows.iter().find(|r| r["label"] == label).unwrap()["state"].clone();
+        assert_eq!(state_of("YouTube"), "needs_sign_in");
+        // Unknown services, and services on a connection that has none.
+        for body in [
+            json!({"services": {"chat": false}}),
+            json!({"services": {"Gmail": false}}),
+        ] {
+            let (s, _) = call(
+                &a,
+                "PUT",
+                &format!("/api/connectors/{id}/policy"),
+                Some(body),
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+        }
+        let (s, _) = call(&a, "GET", &perms("chat"), None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _) = call(
+            &a,
+            "PUT",
+            &format!("/api/connectors/{id}/policy"),
+            Some(json!({"tools": {"manage_event": "allow"}})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (_, v) = call(
+            &a,
+            "POST",
+            "/api/connectors",
+            Some(json!({"name": "mail", "command": "/bin/true"})),
+        )
+        .await;
+        let custom = v["connector"]["id"].as_str().unwrap().to_string();
+        let (s, _) = call(
+            &a,
+            "PUT",
+            &format!("/api/connectors/{custom}/policy"),
+            Some(json!({"services": {"gmail": false}})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = call(
+            &a,
+            "GET",
+            &format!("/api/connectors/{custom}/permissions?service=gmail"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _) = call(
+            &a,
+            "POST",
+            &format!("/api/connectors/{custom}/oauth/sign-out"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // Signing out forgets the tokens and account, keeps the client and
+        // the rules.
+        let sealed = a
+            .state
+            .vault
+            .seal_str("tok", &format!("connector:{id}:oauth:refresh_token"))
+            .unwrap();
+        let access = a
+            .state
+            .vault
+            .seal_str("atok", &format!("connector:{id}:oauth:access_token"))
+            .unwrap();
+        let cid = id.clone();
+        a.state
+            .db
+            .with(move |c| {
+                let mut cfg = entities::get_connector(c, &cid)?.unwrap().config;
+                let o = cfg.oauth.as_mut().unwrap();
+                o.refresh_token = Some(sealed);
+                o.access_token = Some(access);
+                o.expires_at = Some(crate::util::now_ms() + 3_600_000);
+                o.account = Some("owner@example.com".into());
+                entities::update_connector(c, &cid, None, Some(&cfg), None)?;
+                entities::set_connector_state(
+                    c,
+                    &cid,
+                    &ConnectorState {
+                        auth_state: Some("ok"),
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+        let (_, v) = call(&a, "GET", &perms("gmail"), None).await;
+        assert_eq!(v["account"], "owner@example.com");
+        // A sign-in started before signing out can't finish afterwards.
+        let (s, flow) = call(
+            &a,
+            "POST",
+            &format!("/api/connectors/{id}/oauth/start"),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{flow}");
+        let q = crate::oauth::parse_query(flow["authorize_url"].as_str().unwrap());
+        assert_eq!(crate::oauth::pending_flows(&a.state, &id), 1);
+        let (s, v) = call(
+            &a,
+            "POST",
+            &format!("/api/connectors/{id}/oauth/sign-out"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let c = &v["connector"];
+        assert_eq!(c["auth_state"], "needs_sign_in");
+        assert_eq!(crate::oauth::pending_flows(&a.state, &id), 0);
+        assert_eq!(c["oauth"]["connected"], false);
+        assert_eq!(c["oauth"]["account"], Value::Null);
+        assert_eq!(c["oauth"]["client_configured"], true);
+        assert_eq!(c["policy"]["off"], json!(["youtube"]));
+        assert_eq!(c["policy"]["tools"]["calendar.events.create"], "allow");
+        let (s, html) = send(
+            &a.app,
+            "GET",
+            &format!("/api/oauth/callback?state={}&code=the-code", q["state"]),
+            "",
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(html.contains("didn"), "{html}");
+        let con = a
+            .state
+            .db
+            .with(|c| entities::get_connector(c, &id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(con.auth_state, "needs_sign_in");
+        let o = con.config.oauth.unwrap();
+        assert!(o.refresh_token.is_none() && o.access_token.is_none() && o.expires_at.is_none());
+        let (s, _) = call(&a, "POST", "/api/connectors/nope/oauth/sign-out", None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

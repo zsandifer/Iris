@@ -856,9 +856,14 @@ async fn dispatch_checks_the_target_again_after_startup() {
     let (token, _guard, _) = t.grant().await;
     let grant = t.state.gateway.grant(&token).unwrap();
     let con = t.connector();
+    let read = policy::Subject {
+        part: None,
+        keys: vec![("search_messages".into(), Category::Read)],
+        every: &[],
+    };
     let gate = Gate {
         tool: "search_messages",
-        category: Category::Read,
+        subject: &read,
         recipients: &[],
         decided_by: "auto",
         target: target(&con),
@@ -1652,9 +1657,14 @@ async fn security_regression_old_account_cannot_replace_a_new_session_token() {
         assert_eq!(text(&reply), "Bearer refreshed-account-token");
         let (token, _guard, _) = t.grant().await;
         let grant = t.state.gateway.grant(&token).unwrap();
+        let read = policy::Subject {
+            part: None,
+            keys: vec![("search_messages".into(), Category::Read)],
+            every: &[],
+        };
         let gate = Gate {
             tool: "search_messages",
-            category: Category::Read,
+            subject: &read,
             recipients: &[],
             decided_by: "auto",
             target: target(&new),
@@ -1739,9 +1749,14 @@ async fn security_regression_long_upstream_secrets_are_scrubbed_before_truncatio
     let s = session(&t.state, &con).await.unwrap();
     let (token, _guard, _) = t.grant().await;
     let grant = t.state.gateway.grant(&token).unwrap();
+    let read = policy::Subject {
+        part: None,
+        keys: vec![("search_messages".into(), Category::Read)],
+        every: &[],
+    };
     let gate = Gate {
         tool: "search_messages",
-        category: Category::Read,
+        subject: &read,
         recipients: &[],
         decided_by: "auto",
         target: target(&con),
@@ -2061,4 +2076,365 @@ async fn concatenated_sends_count_against_the_send_tripwire() {
         .await;
     assert!(text(&second).contains("paused"), "{second}");
     assert_eq!(t.calls_log().matches("sendemail").count(), 1);
+}
+
+/// The fake server with Google Workspace MCP tool names, set up as the
+/// Google connection with the given rules.
+fn as_google(t: &T, p: &policy::Policy) {
+    let script = FAKE_SERVER
+        .replace(
+            r#""name":"search_messages""#,
+            r#""name":"search_gmail_messages""#,
+        )
+        .replace(r#""name":"send_message""#, r#""name":"send_gmail_message""#)
+        .replace(r#""name":"delete_message""#, r#""name":"manage_event""#)
+        .replace(r#""name":"create_event""#, r#""name":"list_calendars""#)
+        .replace(r#""name":"export_everything""#, r#""name":"get_events""#);
+    let id = t.connector_id.clone();
+    let p = p.clone();
+    t.state
+        .db
+        .with(move |c| {
+            let mut cfg = entities::get_connector(c, &id)?.unwrap().config;
+            cfg.args = vec!["-c".into(), script];
+            entities::update_connector(c, &id, None, Some(&cfg), None)?;
+            entities::set_connector_state(
+                c,
+                &id,
+                &ConnectorState {
+                    service: Some("google"),
+                    policy: Some(&p),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn set_policy(t: &T, p: &policy::Policy) {
+    let (id, p) = (t.connector_id.clone(), p.clone());
+    t.state
+        .db
+        .with(move |c| {
+            entities::set_connector_state(
+                c,
+                &id,
+                &ConnectorState {
+                    policy: Some(&p),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+}
+
+async fn listed(t: &T, token: &str) -> Vec<String> {
+    let list = handle(
+        &t.state,
+        &json!({"token": token, "connector": "chat",
+                "request": {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}}),
+    )
+    .await;
+    list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn google_actions_allow_ask_and_off_are_enforced_in_the_gateway() {
+    let t = setup(|_| {});
+    let mode = crate::connectors::catalog_entry("google").unwrap().mode;
+    let mut p = policy::Policy::new(mode);
+    as_google(&t, &p);
+    let (token, _guard, _) = t.grant().await;
+
+    // Defaults: reads run.
+    let r = t
+        .call(&token, "search_gmail_messages", json!({"query": "x"}))
+        .await;
+    assert_eq!(text(&r), "ok search_gmail_messages secret=[hidden]", "{r}");
+    assert_eq!(t.calls()[0].decision, "auto");
+    assert_eq!(listed(&t, &token).await.len(), 6);
+
+    // Defaults: a plain new event asks.
+    let (state, tok) = (t.state.clone(), token.clone());
+    let held = tokio::spawn(async move {
+        handle(
+            &state,
+            &json!({"token": tok, "connector": "chat", "request": {
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "manage_event", "arguments": {
+                    "action": "create", "summary": "Lunch"}}}}),
+        )
+        .await
+    });
+    let card = t.pending_card().await;
+    t.decide(&card.id, false);
+    assert_eq!(held.await.unwrap()["result"]["isError"], true);
+    assert!(!t.calls_log().contains("manage_event"));
+
+    // Allow: creating events runs; an invitation is its own action and
+    // still asks; deleting is off and refused while the tool stays listed.
+    p.tools
+        .insert("calendar.events.create".into(), policy::ToolRule::Allow);
+    p.tools
+        .insert("calendar.events.delete".into(), policy::ToolRule::Block);
+    set_policy(&t, &p);
+    let r = t
+        .call(
+            &token,
+            "manage_event",
+            json!({"action": "create", "summary": "Lunch"}),
+        )
+        .await;
+    assert_eq!(text(&r), "ok manage_event secret=[hidden]", "{r}");
+    let r = t
+        .call(
+            &token,
+            "manage_event",
+            json!({"action": "delete", "event_id": "e1"}),
+        )
+        .await;
+    assert!(text(&r).contains("turned this action off"), "{r}");
+    assert_eq!(t.calls_log().matches("manage_event").count(), 1);
+    let tools = listed(&t, &token).await;
+    assert!(tools.contains(&"manage_event".to_string()));
+    let (state, tok) = (t.state.clone(), token.clone());
+    let held = tokio::spawn(async move {
+        handle(
+            &state,
+            &json!({"token": tok, "connector": "chat", "request": {
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": {"name": "manage_event", "arguments": {
+                    "action": "create", "summary": "Lunch",
+                    "attendees": ["sam@example.com"]}}}}),
+        )
+        .await
+    });
+    let card = t.pending_card().await;
+    t.decide(&card.id, false);
+    assert_eq!(held.await.unwrap()["result"]["isError"], true);
+    // An argument value the table does not know falls back to the general
+    // classification and asks.
+    let (state, tok) = (t.state.clone(), token.clone());
+    let held = tokio::spawn(async move {
+        handle(
+            &state,
+            &json!({"token": tok, "connector": "chat", "request": {
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": {"name": "manage_event", "arguments": {"action": "purge_all"}}}}),
+        )
+        .await
+    });
+    let card = t.pending_card().await;
+    t.decide(&card.id, false);
+    assert_eq!(held.await.unwrap()["result"]["isError"], true);
+    assert_eq!(t.calls_log().matches("manage_event").count(), 1);
+
+    // Off for every action a tool performs: hidden and refused, whatever
+    // it is asked to do.
+    p.tools.insert("gmail.send".into(), policy::ToolRule::Block);
+    for id in google::tool_actions("manage_event") {
+        p.tools.insert((*id).into(), policy::ToolRule::Block);
+    }
+    set_policy(&t, &p);
+    let tools = listed(&t, &token).await;
+    assert!(!tools.contains(&"send_gmail_message".to_string()));
+    assert!(!tools.contains(&"manage_event".to_string()));
+    let r = t
+        .call(
+            &token,
+            "send_gmail_message",
+            json!({"to": "sam@example.com"}),
+        )
+        .await;
+    assert!(text(&r).contains("turned this action off"), "{r}");
+    let r = t
+        .call(&token, "manage_event", json!({"action": "purge_all"}))
+        .await;
+    assert!(text(&r).contains("turned this action off"), "{r}");
+
+    // A service turned off as a whole: its tools are hidden and refused.
+    p.off.insert("calendar".into());
+    set_policy(&t, &p);
+    let tools = listed(&t, &token).await;
+    assert_eq!(tools, ["search_gmail_messages", "read_archive"]);
+    let r = t.call(&token, "list_calendars", json!({})).await;
+    assert!(text(&r).contains("turned Google Calendar off"), "{r}");
+    assert!(!t.calls_log().contains("list_calendars"));
+    // Allowing an action does not bring back a service that is off.
+    p.tools
+        .insert("calendar.calendars.read".into(), policy::ToolRule::Allow);
+    set_policy(&t, &p);
+    let r = t.call(&token, "list_calendars", json!({})).await;
+    assert!(text(&r).contains("turned Google Calendar off"), "{r}");
+    p.off.clear();
+    set_policy(&t, &p);
+    let r = t.call(&token, "list_calendars", json!({})).await;
+    assert_eq!(text(&r), "ok list_calendars secret=[hidden]", "{r}");
+    // The activity log keeps the real tool names.
+    assert!(t.calls().iter().any(|c| c.tool == "manage_event"));
+}
+
+#[tokio::test]
+async fn a_google_action_turned_off_while_its_call_waits_is_not_sent() {
+    let t = setup(|_| {});
+    let mut p = policy::Policy::new(policy::Mode::Careful);
+    as_google(&t, &p);
+    let (token, _guard, _) = t.grant().await;
+    let (state, tok) = (t.state.clone(), token.clone());
+    let held = tokio::spawn(async move {
+        handle(
+            &state,
+            &json!({"token": tok, "connector": "chat", "request": {
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "send_gmail_message", "arguments": {
+                    "to": "sam@example.com", "subject": "Hi", "body": "Hello"}}}}),
+        )
+        .await
+    });
+    let card = t.pending_card().await;
+    p.off.insert("gmail".into());
+    set_policy(&t, &p);
+    t.decide(&card.id, true);
+    let r = held.await.unwrap()["result"].clone();
+    assert_eq!(r["isError"], true);
+    assert!(text(&r).contains("turned Gmail off"), "{r}");
+    assert!(!t.calls_log().contains("send_gmail_message"));
+}
+
+#[tokio::test]
+async fn a_google_action_set_to_off_while_its_call_waits_is_not_sent() {
+    let t = setup(|_| {});
+    let mut p = policy::Policy::new(policy::Mode::Careful);
+    as_google(&t, &p);
+    let (token, _guard, _) = t.grant().await;
+    let (state, tok) = (t.state.clone(), token.clone());
+    let held = tokio::spawn(async move {
+        handle(
+            &state,
+            &json!({"token": tok, "connector": "chat", "request": {
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "send_gmail_message", "arguments": {
+                    "to": "sam@example.com", "subject": "Hi", "body": "Hello"}}}}),
+        )
+        .await
+    });
+    let card = t.pending_card().await;
+    // Only this action is turned off; Gmail stays on.
+    p.tools.insert("gmail.send".into(), policy::ToolRule::Block);
+    set_policy(&t, &p);
+    t.decide(&card.id, true);
+    let r = held.await.unwrap()["result"].clone();
+    assert_eq!(r["isError"], true);
+    assert!(text(&r).contains("turned this action off"), "{r}");
+    assert!(!t.calls_log().contains("send_gmail_message"));
+}
+
+#[tokio::test]
+async fn an_older_google_connection_keeps_its_rules_as_actions() {
+    let t = setup(|_| {});
+    // Saved by an older Iris: the old default and rules on tools.
+    let mut old = policy::Policy::default();
+    old.tools
+        .insert("send_gmail_message".into(), policy::ToolRule::Allow);
+    old.tools
+        .insert("manage_event".into(), policy::ToolRule::Block);
+    old.tools
+        .insert("some_unknown_tool".into(), policy::ToolRule::Ask);
+    as_google(&t, &old);
+    let con = t.connector();
+    assert_eq!(con.policy.mode, policy::Mode::Careful);
+    assert_eq!(con.policy.version, policy::POLICY_VERSION);
+    assert_eq!(
+        con.policy.tools.get("gmail.send"),
+        Some(&policy::ToolRule::Allow)
+    );
+    for id in google::tool_actions("manage_event") {
+        assert_eq!(
+            con.policy.tools.get(*id),
+            Some(&policy::ToolRule::Block),
+            "{id}"
+        );
+    }
+    assert!(!con.policy.tools.contains_key("send_gmail_message"));
+    assert_eq!(
+        con.policy.tools.get("some_unknown_tool"),
+        Some(&policy::ToolRule::Ask)
+    );
+    let (token, _guard, _) = t.grant().await;
+    assert!(
+        !listed(&t, &token)
+            .await
+            .contains(&"manage_event".to_string())
+    );
+    let r = t
+        .call(
+            &token,
+            "send_gmail_message",
+            json!({"to": "sam@example.com"}),
+        )
+        .await;
+    assert_eq!(text(&r), "ok send_gmail_message secret=[hidden]", "{r}");
+    // A connection that is not Google keeps the old default.
+    let mut other = policy::Policy::default();
+    other
+        .tools
+        .insert("manage_event".into(), policy::ToolRule::Block);
+    let up = other.clone().upgraded("notion");
+    assert_eq!(up.mode, policy::Mode::Standard);
+    assert_eq!(up.tools, other.tools);
+}
+
+#[tokio::test]
+async fn a_saved_forwarding_destination_is_never_trusted() {
+    let t = setup(|_| {});
+    t.state
+        .db
+        .with(|c| db::set_setting(c, "safety.trusted_recipients", r#"["me@example.com"]"#))
+        .unwrap();
+    let mut p = policy::Policy::new(policy::Mode::Careful);
+    p.tools
+        .insert("gmail.filters".into(), policy::ToolRule::Allow);
+    p.tools
+        .insert("gmail.trash".into(), policy::ToolRule::Allow);
+    // The fake server's send_message stands in for the filter tool.
+    let script = FAKE_SERVER.replace(
+        r#""name":"send_message""#,
+        r#""name":"manage_gmail_filter""#,
+    );
+    as_google(&t, &p);
+    let id = t.connector_id.clone();
+    t.state
+        .db
+        .with(move |c| {
+            let mut cfg = entities::get_connector(c, &id)?.unwrap().config;
+            cfg.args = vec!["-c".into(), script];
+            entities::update_connector(c, &id, None, Some(&cfg), None)?;
+            Ok(())
+        })
+        .unwrap();
+    let (token, _guard, _) = t.grant().await;
+    // Only the trusted owner appears in the call; the saved filter forwards
+    // to someone the call does not show, so it asks.
+    let (state, tok) = (t.state.clone(), token.clone());
+    let held = tokio::spawn(async move {
+        handle(
+            &state,
+            &json!({"token": tok, "connector": "chat", "request": {
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "manage_gmail_filter", "arguments": {
+                    "action": "update", "filter_id": "f1",
+                    "criteria": {"to": "me@example.com"}}}}}),
+        )
+        .await
+    });
+    let card = t.pending_card().await;
+    t.decide(&card.id, false);
+    assert_eq!(held.await.unwrap()["result"]["isError"], true);
+    assert!(!t.calls_log().contains("manage_gmail_filter"));
 }

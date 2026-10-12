@@ -12,8 +12,13 @@ All notable changes to Iris are documented here, following
   from the app, automatic model ranking and effort selection.
 - Google, GitHub and custom connections through a gateway with approval cards
   and rules for trusted people; a guided Google setup wizard.
-- One-tap connections to Notion, Todoist, Linear and Canva through their
-  hosted MCP servers.
+- One-tap connections through vendors' hosted MCP servers: Notion, Todoist,
+  Airtable, monday.com, Miro, Canva, Cal.com, Granola, Fireflies, Zapier,
+  Linear, Sentry, Cloudflare, Supabase, Netlify, Neon, Hugging Face,
+  Readwise, and (asking before every action) Stripe and Mercury.
+- Connections grouped by Productivity, Development, Money and Lifestyle, with
+  Google listed as its services; each service has a permission screen with
+  Allow / Ask / Off per action and an on/off switch, enforced in the gateway.
 - Google adds Docs, Sheets, Slides, Forms, Tasks and Contacts; existing
   Google connections keep working and are asked to sign in again to add them.
 - Iris’s computer: watch its browser, take over, and fill saved logins securely.

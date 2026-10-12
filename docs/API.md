@@ -298,11 +298,13 @@ All paths are under `/api`. "Any" means any authenticated user.
 | POST | `/connectors/{id}/connect` | **Owner** | Enable |
 | POST | `/connectors/{id}/disconnect` | **Owner** | Disable |
 | POST | `/connectors/{id}/resume` | **Owner** | Turn on and clear a tripwire pause |
-| PUT | `/connectors/{id}/policy` | **Owner** | Approval rules |
+| PUT | `/connectors/{id}/policy` | **Owner** | Approval rules (per action, Google services on/off) |
 | GET | `/connectors/{id}/tools` | **Owner** | Its tools and what the rules do with each |
+| GET | `/connectors/{id}/permissions` | **Owner** | A service's permission screen: actions with Allow / Ask / Off |
 | POST | `/connectors/{id}/oauth/start` | **Owner** | Start signing it in (OAuth) |
+| POST | `/connectors/{id}/oauth/sign-out` | **Owner** | Sign it out (keeps its client and rules) |
 | POST | `/connectors/{id}/oauth/client` | **Owner** | Save the owner's own OAuth client |
-| GET | `/connectors/catalog` | **Owner** | Services to connect (Google, GitHub, custom) |
+| GET | `/connectors/catalog` | **Owner** | Services to connect, by group (Google as its services, GitHub, one-tap services, custom) |
 | POST | `/connectors/catalog/{service}` | **Owner** | Set up a catalog service |
 | GET | `/connectors/google/setup` | **Owner** | Saved Google wizard progress, Console links and exact callback |
 | PUT | `/connectors/google/setup` | **Owner** | Save a wizard step or return to sign-in |
@@ -1474,6 +1476,57 @@ settings or signing it in again cancels its waiting approvals. A request too lar
 characters) is refused rather than approved unseen. Tools that would ask are marked in their description; tools the
 rules turn off are left out of `tools/list`.
 
+**Google: rules per service and action.** Google is one connection with
+one sign-in for every scope, so what Iris may do in each Google service is
+enforced here, in the gateway. Every tool of `workspace-mcp@2.1.0` belongs
+to a service (`gmail`, `calendar`, `drive`, `docs`, `sheets`, `slides`,
+`forms`, `tasks`, `contacts`; `youtube` has no tools: it is what For you
+reads) and performs one or more friendly actions, each with a rule key such
+as `gmail.send` or `calendar.events.invite`. Multi-purpose tools are placed
+by their real arguments: `manage_event` with `action: "create"` is
+"Create events", or "Create events with invitations" when it has
+`attendees`; `action: "update"` is "Update events and notify guests" unless
+`send_updates` is `"none"` and no attendees are given (Google tells guests
+by default), and deleting also notifies guests unless `send_updates` is
+`"none"`; `update_drive_file` with `trashed: true` is "Move files to the
+trash", with new `content`/`file_url`/`file_path` (unless `mode` is
+`append` or `prepend`) it replaces the file (a deletion for the starting
+rules), and with sharing settings or `add_parents` (moving into a folder
+gives its people access) also "Share files, change who has access, or put
+them in folders", as is creating, copying, or importing a file (Drive, Docs,
+Sheets) into a folder other than My Drive's root; populating a Docs tab
+replaces its content (a deletion) unless `replace_existing` is `false`; Gmail labels that add
+`TRASH` are "Move email to the trash" (other label changes in the same call
+are also "Label, archive and mark email"); filters with a `forward` or
+`TRASH` action also need "Filters that forward email to someone" or "Move
+email to the trash", as does updating or applying a filter without giving
+its action, or applying one by `filter_id` (the server keeps or applies the
+saved one, whatever action is given); applying a filter also changes
+labels on existing mail; a one-action tool the server marks destructive
+(`batch_update_doc`, `resize_sheet_dimensions`...) counts as a deletion for
+the starting rules; comments on Docs, Sheets and Slides
+are their own "Comment on ..." actions. Arguments are read the way the
+server reads them (it accepts `addLabelIds` for `add_label_ids`, JSON
+strings for objects and lists, and strips and lowercases `action`). A filter create or update without its action keeps a saved forwarding
+destination the call does not show, so it is never treated as going only
+to trusted people. A call
+that performs several actions needs every one of them allowed. A tool or argument value the table
+does not know (`action: "purge"`, a newer server's tool) is classified as
+above under its tool name, which asks for anything it cannot place. The
+owner's rule for an action (`allow`, `ask`, `block`) is stored in the
+connector's `policy.tools` under the action key; without one, the
+connection's mode decides (Google starts `careful`: reads run, every
+change, send, or deletion asks, sends only to trusted people run). `block`
+on an action refuses calls that perform it; when every action a tool can
+perform is blocked, the tool is also left out of `tools/list` and refused
+whatever its arguments. Turning a service off (`policy.off`) hides and
+refuses all of its tools, whatever the action rules say, and turning
+`youtube` off stops For you from reading YouTube. Rules saved by an older
+Iris are read in this format: a rule on a Google tool becomes the rule of
+every action it performs (the strictest wins when tools share an action),
+and a Google connection still on the old `standard` default moves to
+`careful`.
+
 **Tripwires.** Checked and recorded in one step right before a call runs
 (so concurrent calls, or several approvals released together, cannot all
 pass), counting calls that ran in the last hour through one connector: more than `safety.max_sends_per_hour` sends (default 5), more
@@ -1599,8 +1652,11 @@ Turns the connector on and clears a tripwire pause. Response
 #### `PUT /api/connectors/{id}/policy`
 
 `{"mode"?: "standard" | "careful" | "read_only" | "ask_always", "tools"?:
-{"<tool>": "allow" | "ask" | "block" | null}}`. `null` removes a tool's
-override. Modes, in plain words: `standard` "Reads freely · asks before
+{"<tool or action>": "allow" | "ask" | "block" | null}, "services"?:
+{"<google service>": true | false}}`. `null` removes an override. For
+Google, rules on tools the [action table](#connectors) knows are keyed by
+action (`gmail.send`); `services` turns a Google service on or off (only
+for a Google connection; unknown services are `400`). Modes, in plain words: `standard` "Reads freely · asks before
 sending, buying, or deleting" (default), `careful` "Reads freely · asks
 before any change", `read_only` "Only reads · never changes anything",
 `ask_always` "Asks every time". A tool set to `allow` runs without asking,
@@ -1609,25 +1665,91 @@ except purchases and unclear actions, which always ask. Response `{"connector": 
 #### `GET /api/connectors/{id}/tools`
 
 Starts the connector if needed and lists its tools:
-`{"tools": [{"name", "label", "description", "category", "rule", "effect"}],
-"error": null}`, where `effect` is `runs`, `asks`, `asks unless trusted`, or
-`off`. If it cannot start: `{"tools": [], "error": "...", "detail": "<last
-line the program printed, or null>"}`.
+`{"tools": [{"name", "label", "description", "category", "rule", "actions",
+"service", "effect"}], "error": null}`, where `effect` is `runs`, `asks`,
+`asks unless trusted`, or `off`. For Google, `actions` lists the action
+keys the tool can perform (their rules apply instead of `rule`) and
+`service` its Google service; both are empty/null otherwise. If it cannot
+start: `{"tools": [], "error": "...", "detail": "<last line the program
+printed, or null>"}`.
+
+#### `GET /api/connectors/{id}/permissions`
+
+A service's permission screen. `?service=<google service>` (Google only;
+`404` otherwise) lists that service's actions from the action table without
+starting the server. Without it, the tools the server lists (starting it if
+needed; for Google only tools that belong to no service):
+
+```json
+{
+  "service": {"id": "calendar", "label": "Google Calendar",
+              "description": "Manage calendar events and scheduling", "on": true},
+  "account": "owner@example.com",
+  "sections": [
+    {"id": "read", "label": "Read permissions", "actions": [
+      {"id": "calendar.events.read", "label": "See events", "description": "",
+       "category": "read", "rule": null, "value": "allow", "default": "allow",
+       "choices": ["allow", "ask", "off"], "note": null}]},
+    {"id": "write", "label": "Write and delete permissions", "actions": [
+      {"id": "calendar.events.invite", "label": "Create events with invitations",
+       "category": "send", "rule": null, "value": "ask", "default": "ask",
+       "choices": ["allow", "ask", "off"],
+       "note": "Asks unless it only reaches people you trust"}]}
+  ],
+  "error": null, "detail": null
+}
+```
+
+`service` is null without `?service`. `account` is the account the
+service reported when signing in (the OpenID email), or null. `rule` is the
+owner's override (`allow`, `ask`, `block`) or null; `value` is what happens
+now and `default` what happens without the override (`allow`, `ask`, `off`).
+Purchases and actions Iris cannot place leave `allow` out of `choices`
+(they always ask). A `note` also says when the starting rules treat the
+kinds of call a grouped action covers differently. The app saves every
+choice as an explicit rule (choosing Ask over an "asks unless trusted"
+default stores `ask`, which asks even for trusted people). Sections without actions are left out. If the server
+cannot start: `"sections": [], "error": "...", "detail": "..."`.
+
+#### `POST /api/connectors/{id}/oauth/sign-out`
+
+Forgets a signed-in connector's tokens and account (`auth_state` becomes
+`needs_sign_in`); its OAuth client, endpoints, and rules stay, so
+connecting again is one sign-in. Cancels its waiting approvals and sign-ins
+under way and stops its server. Iris does not revoke the grant at the
+provider. `400` for a connector without OAuth. Response
+`{"connector": {Connector}}`.
 
 #### `GET /api/connectors/catalog`
 
-`?origin=<the app's origin>`. The services Iris knows how to set up:
+`?origin=<the app's origin>`. The services Iris knows how to set up, and
+the same services by group as the app lists them:
 
 ```json
 {
   "services": [{
     "id": "google", "label": "Google", "description": "Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts, and YouTube read-only",
-    "setup": "google_client", "missing": [], "connector_id": null, "connected": false,
+    "setup": "google_client", "group": "productivity", "missing": [], "connector_id": null, "connected": false,
     "redirect_uri": "https://iris.example.ts.net/api/oauth/callback", "redirect_direct": true
+  }],
+  "groups": [{
+    "id": "productivity", "label": "Productivity",
+    "rows": [{"service": "google", "part": "gmail", "label": "Gmail",
+              "description": "Read, organize, draft and send email",
+              "connector_id": null, "state": "not_connected"}]
   }],
   "modes": [{"mode": "standard", "label": "Reads freely · asks before sending, buying, or deleting"}]
 }
 ```
+
+`groups` are `productivity`, `development`, `money`, and `lifestyle`, in
+that order, each only when it has rows; rows are in display order (the app
+shows the first five and a "See all"). Google is listed as its services
+(`part`: `gmail`, `calendar`, `drive`, `docs`, `sheets`, `slides`, `forms`,
+`tasks`, `contacts` under Productivity, `youtube` under Lifestyle), all
+backed by the one Google connector. `state` is `not_connected`,
+`needs_sign_in`, `off` (the connection, or that Google service, is off),
+`paused`, or `connected`. `custom` is in no group.
 
 `setup` says how the owner connects it: `google_client` (the Google setup
 wizard), `token_or_oauth` (GitHub), `oauth_sign_in` (one tap: the service's
@@ -1668,22 +1790,46 @@ Creates (or updates) the connector named after the service. Response
   server with `auth: "oauth"`) and returns `needs_sign_in: true`; continue
   with `POST /api/connectors/{id}/oauth/start`, which registers Iris with the
   service and returns its sign-in page. A new connection starts with the
-  `careful` rules (reads run; every change, send, or deletion asks).
-  Setting one up again while it still points at the service's server
+  `careful` rules (reads run; every change, send, or deletion asks); money
+  services (`stripe`, `mercury`) start with `ask_always` (every action,
+  reads included, asks). Setting one up again while it still points at the service's server
   changes nothing (sign-in, rules, and a sign-in under way are kept) and
   reports whether it still needs signing in.
 
-  | `service` | Server |
-  |---|---|
-  | `notion` | `https://mcp.notion.com/mcp` |
-  | `todoist` | `https://ai.todoist.net/mcp` |
-  | `linear` | `https://mcp.linear.app/mcp` |
-  | `canva` | `https://mcp.canva.com/mcp` |
+  | `service` | Group | Server |
+  |---|---|---|
+  | `notion` | Productivity | `https://mcp.notion.com/mcp` |
+  | `todoist` | Productivity | `https://ai.todoist.net/mcp` |
+  | `airtable` | Productivity | `https://mcp.airtable.com/mcp` |
+  | `monday` | Productivity | `https://mcp.monday.com/mcp` |
+  | `miro` | Productivity | `https://mcp.miro.com/` |
+  | `canva` | Productivity | `https://mcp.canva.com/mcp` |
+  | `calcom` | Productivity | `https://mcp.cal.com/mcp` |
+  | `granola` | Productivity | `https://mcp.granola.ai/mcp` |
+  | `fireflies` | Productivity | `https://api.fireflies.ai/mcp` |
+  | `zapier` | Productivity | `https://mcp.zapier.com/api/v1/connect` |
+  | `linear` | Development | `https://mcp.linear.app/mcp` |
+  | `sentry` | Development | `https://mcp.sentry.dev/mcp` |
+  | `cloudflare` | Development | `https://mcp.cloudflare.com/mcp` |
+  | `supabase` | Development | `https://mcp.supabase.com/mcp` |
+  | `netlify` | Development | `https://netlify-mcp.netlify.app/mcp` |
+  | `neon` | Development | `https://mcp.neon.tech/mcp` |
+  | `huggingface` | Development | `https://huggingface.co/mcp?login` (without `?login` it answers anonymously) |
+  | `stripe` | Money | `https://mcp.stripe.com` |
+  | `mercury` | Money | `https://mcp.mercury.com/mcp` |
+  | `readwise` | Lifestyle | `https://mcp2.readwise.io/mcp` |
 
-  Each was checked to publish OAuth metadata with a registration endpoint
-  that accepts Iris's callback addresses. Services whose hosted server only
-  accepts pre-registered apps (for example Asana's) are not in the catalog;
-  connect them as a custom connection with your own OAuth app.
+  Each address was checked live: an unauthenticated request gets 401,
+  discovery finds the sign-in server's metadata with a registration
+  endpoint, registration with Iris's exact request succeeds for both an
+  https and a loopback callback, and the sign-in page loads. Services that
+  failed are not in the catalog: their registration refuses Iris or only
+  allows listed callbacks (Vercel, Square, Dropbox, Intercom, Figma,
+  ClickUp's documented allowlist, Calendly for loopback), they publish no
+  registration endpoint (Box, Asana, HubSpot, Spotify, Instacart's shopping
+  server), they need no sign-in (Instacart's recipe server), or their
+  documented address does not answer (PayPal). Connect them as a custom
+  connection with your own OAuth app.
 
 Tools of a catalog service are classified without the service's own name
 in front (`notion-search` reads like `search`); per-tool rules and the
@@ -2885,7 +3031,7 @@ The API view (`public_json`); secret values are never included.
 | `name` | string | MCP server name and tool prefix. |
 | `description` | string | |
 | `transport` | string | `stdio` or `http`. |
-| `service` | string | Catalog entry: `google`, `github`, a one-tap service (`notion`, `todoist`, `linear`, `canva`), or `custom`. |
+| `service` | string | Catalog entry: `google`, `github`, a one-tap service (`notion`, `todoist`, `linear`, `sentry`, `stripe`, ...; see [the catalog](#post-apiconnectorscatalogservice)), or `custom`. |
 | `enabled` | bool | |
 | `command` | string or null | Program (stdio, or an http server Iris starts). |
 | `args` | string[] | |
@@ -2895,7 +3041,7 @@ The API view (`public_json`); secret values are never included.
 | `auth` | string | `oauth` or `secrets`. |
 | `oauth` | object or null | `{"mode", "client_configured", "client_source", "connected", "connected_at", "account", "scopes", "redirect_uri", "needs_more_access"}`; `account` is the signed-in email when the service reports one. `needs_more_access` is true for a signed-in Google connection whose grant predates scopes Iris now requests (it keeps working; signing in again adds them). Never tokens or secrets. |
 | `auth_state` | string | `ok`, `needs_sign_in`, or `needs_reconnect`. |
-| `policy` | object | `{"mode", "tools"?}` (see `PUT /api/connectors/{id}/policy`). |
+| `policy` | object | `{"mode", "tools"?, "off"?, "version"}` (see `PUT /api/connectors/{id}/policy`): `tools` maps a tool name or Google action key to `allow`, `ask`, or `block`; `off` lists Google services turned off; `version` is the rules format (2). |
 | `rules` | string | The mode in plain words, e.g. "Reads freely · asks before sending, buying, or deleting". |
 | `paused`, `paused_reason`, `paused_at` | bool, string or null, int or null | Set by a tripwire; cleared by `resume`. |
 | `created_at`, `updated_at` | int | |
@@ -3334,7 +3480,7 @@ a new turn. Resolved cards are explicitly described as resolved in replay histor
 | `system_status` | none; owner private turn only | The allowlisted status object described above |
 | `request_engine_signin` | `engine: "claude" \| "codex" \| "gemini" \| "opencode"` | `{"outcome", "card_id"?}`; sign-in card or already signed in |
 | `request_engine_install` | `engine` (same names) | `{"outcome", "card_id"?}`; install card or already installed |
-| `request_connector_setup` | `name`: a catalog id (`"google"`, `"github"`, `"notion"`, `"todoist"`, `"linear"`, `"canva"`, `"custom"`) | `{"outcome", "card_id"?}`; connect/reconnect card or already connected (a Google connection that `needs_more_access` gets an "Add more Google services" `connector_reconnect` card instead); paused/disabled connectors return `connector paused by owner` / `connector disabled by owner` with a Resume action card |
+| `request_connector_setup` | `name`: a catalog id (`"google"`, `"github"`, `"notion"`, `"todoist"`, `"linear"`, `"sentry"`, `"stripe"`, ..., `"custom"`; the tool's schema lists every one) | `{"outcome", "card_id"?}`; connect/reconnect card or already connected (a Google connection that `needs_more_access` gets an "Add more Google services" `connector_reconnect` card instead); paused/disabled connectors return `connector paused by owner` / `connector disabled by owner` with a Resume action card |
 | `list_goals` | `include_done?: bool` (default false) | `{"goals": [Goal]}` |
 | `create_goal` | `title: string` (required, max 300), `status_text?: string` (max 2,000), `suggested?: bool` (a proposal the user confirms; default false) | `{"goal": Goal}` |
 | `update_goal` | `id: string` (required), `title?` (non-blank, max 300), `status_text?` (max 2,000), `done?: bool` | `{"goal": Goal}`; error `no goal with that id` |

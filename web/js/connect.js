@@ -1,8 +1,8 @@
-// Connections: the small catalog (Google, GitHub, one-tap services such as
-// Notion, custom MCP server), the step-by-step setup guides, signing a
-// service in through Iris's callback,
-// each connection's rules ("Reads freely · asks before sending"), its
-// actions, recent use, and the trusted people list.
+// Connections: the catalog by group (Google as its services, GitHub,
+// one-tap services such as Notion, custom MCP servers), the step-by-step
+// setup guides, signing a service in through Iris's callback, each
+// service's permission screen (Allow / Ask / Off per action), recent use,
+// and the trusted people list.
 import { html, useEffect, useRef, useState } from './h.js';
 import { get, post, put, patch, del, seg, ApiError } from './api.js';
 import { S, set, useStore, go, toast, loadConnectors } from './store.js';
@@ -13,24 +13,19 @@ import {
 
 import { ExternalLink } from './external-link.js';
 import { googlePasteError } from './google-paste.js';
+import {
+  SERVICES, CATALOG_IDS, GOOGLE_PARTS, brandOf, topRows, rowAction, rowStatus, rowTarget, ruleFor, pickerValue, CHOICE_LABEL,
+} from './catalog.js';
 
-// The catalog services Iris sets up itself: name, tile color, and mark.
-const SERVICES = {
-  google: { name: 'Google', bg: '#4285f4', mark: 'G' },
-  github: { name: 'GitHub', bg: '#24292f', mark: 'GH' },
-  notion: { name: 'Notion', bg: '#191919', mark: 'N' },
-  todoist: { name: 'Todoist', bg: '#e44332', mark: 'T' },
-  linear: { name: 'Linear', bg: '#5e6ad2', mark: 'L' },
-  canva: { name: 'Canva', bg: '#00a3a8', mark: 'C' },
-};
-export const CATALOG_IDS = [...Object.keys(SERVICES), 'custom'];
+export { CATALOG_IDS };
 
 export function ServiceTile({ c, size = 30 }) {
-  const b = SERVICES[c.service || c.id];
+  const b = brandOf(c);
   if (b) {
-    return html`<div class="tile brand" style=${`width:${size}px;height:${size}px;border-radius:9px;background:${b.bg};font-size:${b.mark.length > 1 ? 11 : 14}px`}>${b.mark}</div>`;
+    const font = Math.round(size * (b.mark.length > 2 ? 0.3 : b.mark.length > 1 ? 0.37 : 0.47));
+    return html`<div class="tile brand" aria-hidden="true" style=${`width:${size}px;height:${size}px;border-radius:${Math.round(size * 0.3)}px;background:${b.bg};color:${b.fg || '#fff'};font-size:${font}px`}>${b.mark}</div>`;
   }
-  return html`<${LetterTile} name=${c.name || c.label} size=${size} />`;
+  return html`<${LetterTile} name=${c.name || c.label} size=${size} radius=${Math.round(size * 0.3)} />`;
 }
 
 /** "send_message" -> "Send message". */
@@ -70,30 +65,60 @@ export function callRow(it, showConnector) {
 
 // ------------------------------------------------------------- the list
 
+function useCatalog() {
+  const [cat, setCat] = useState(null);
+  const load = () => get(`/connectors/catalog?origin=${encodeURIComponent(location.origin)}`).then(setCat).catch((e) => toast(e.message));
+  // Reload when a connection changes (connected, signed out, turned off).
+  useEffect(() => { load(); }, [S.connectors]);
+  return cat;
+}
+
+function CatalogRow({ row }) {
+  const action = rowAction(row);
+  return html`<${Row} icon=${html`<${ServiceTile} c=${row} size=${31} />`} title=${row.label} sub=${rowStatus(row)}
+    chevron=${false} onClick=${() => go(rowTarget(row))}
+    right=${html`<span class=${'row-act' + (action === 'Connect' ? ' connect' : '')}>${action}</span>`} />`;
+}
+
+function GroupHead({ label, more, onMore }) {
+  return html`<div class="cat-head"><span>${label}</span>
+    ${more && html`<button class="see-all" onClick=${onMore}>See all<${Icon} name="chev" size=${14} /></button>`}</div>`;
+}
+
 export function Connections() {
   useStore();
-  const [cat, setCat] = useState(null);
-  useEffect(() => {
-    loadConnectors().catch((e) => toast(e.message));
-    get(`/connectors/catalog?origin=${encodeURIComponent(location.origin)}`).then(setCat).catch(() => {});
-  }, []);
-  const list = S.connectors || [];
-  const services = (cat?.services || []).filter((s) => s.id !== 'custom' && !s.connector_id);
-  return html`<${Page} title="Connections" sub=${`Services ${agentName()} can use for you. Or just ask: "help me set up Google".`}>
-    ${!S.connectors ? html`<${Spinner} />` : html`
-      <${Group} label="Connected" note=${list.length ? `${agentName()} asks you before sending, buying, deleting, or contacting someone new.` : null}>
-        ${list.length ? list.map((c) => html`<${Row} icon=${html`<${ServiceTile} c=${c} />`} title=${labelOf(c)}
-          sub=${c.service === 'google' && c.auth_state === 'ok' && c.enabled && !c.paused ? (c.oauth?.needs_more_access ? 'Sign in again to add Docs, Sheets and more' : 'Gmail ✓ · Calendar ✓ · Drive ✓ · Docs ✓ · and more') : statusOf(c)} onClick=${() => go(`iris/connections/${c.id}`)} />`)
-          : html`<div class="r"><div class="rt mu">Nothing connected yet</div></div>`}
+  useEffect(() => { loadConnectors().catch((e) => toast(e.message)); }, []);
+  const cat = useCatalog();
+  const custom = (S.connectors || []).filter((c) => c.service === 'custom');
+  return html`<${Page} title="Connections" sub=${`Services ${agentName()} can use for you. Or just ask: "help me set up Gmail".`}>
+    ${!cat ? html`<${Spinner} />` : html`
+      ${(cat.groups || []).map((g) => {
+        const { rows, more } = topRows(g);
+        return html`<${GroupHead} label=${g.label} more=${more} onMore=${() => go(`iris/connections/group/${g.id}`)} />
+          <${Group}>${rows.map((r) => html`<${CatalogRow} row=${r} key=${r.service + (r.part || '')} />`)}<//>`;
+      })}
+      <${GroupHead} label="Custom" />
+      <${Group}>
+        ${custom.map((c) => html`<${Row} icon=${html`<${ServiceTile} c=${c} size=${31} />`} title=${c.name} sub=${statusOf(c) === c.rules ? null : statusOf(c)}
+          chevron=${false} onClick=${() => go(`iris/connections/${c.id}`)} right=${html`<span class="row-act">View</span>`} />`)}
+        <${Row} icon="plus" title="Custom connection" sub="Any MCP server, by web address or program" chevron=${false}
+          onClick=${() => go('iris/connections/new')} right=${html`<span class="row-act connect">Connect</span>`} />
       <//>
-      <${Group} label="Add a connection">
-        ${services.map((s) => html`<${Row} icon=${html`<${ServiceTile} c=${s} />`} title=${s.label} sub=${s.description}
-          onClick=${() => go(`iris/connections/add/${s.id}`)} />`)}
-        <${Row} icon="plus" title="Custom (MCP server)" sub="For tinkerers: any MCP server, by web address or program" onClick=${() => go('iris/connections/new')} />
-      <//>
-      <${Group} note="Messages only to these people don't need your OK.">
+      <${Group} note=${`${agentName()} asks you before sending, buying, deleting, or contacting someone new. Messages only to these people don't need your OK.`}>
         <${Row} icon="users" title="Trusted people" onClick=${() => go('iris/connections/trusted')} />
       <//>`}
+  <//>`;
+}
+
+/** Every service in one catalog group. */
+export function CatalogGroup({ id }) {
+  useStore();
+  useEffect(() => { if (!S.connectors) loadConnectors().catch(() => {}); }, []);
+  const cat = useCatalog();
+  const g = cat?.groups?.find((x) => x.id === id);
+  if (cat && !g) return html`<${Page} title="Connections"><${Empty} icon="plug" title="Nothing here">Pick a service from Connections.<//><//>`;
+  return html`<${Page} title=${g?.label || 'Connections'}>
+    ${!g ? html`<${Spinner} />` : html`<${Group}>${g.rows.map((r) => html`<${CatalogRow} row=${r} key=${r.service + (r.part || '')} />`)}<//>`}
   <//>`;
 }
 
@@ -188,12 +213,6 @@ function Copy({ text }) {
 
 function Ext({ href, children }) {
   return html`<${ExternalLink} url=${href}>${children}<//>`;
-}
-
-function useCatalog() {
-  const [cat, setCat] = useState(null);
-  useEffect(() => { get(`/connectors/catalog?origin=${encodeURIComponent(location.origin)}`).then(setCat).catch((e) => toast(e.message)); }, []);
-  return cat;
 }
 
 // The Google APIs the setup turns on, one link each (for when the combined
@@ -432,7 +451,7 @@ function OneTapSetup({ entry, con }) {
       <button class="b1 wide gap" onClick=${() => open(live)}>Done</button>`;
   }
   return html`<p>You'll approve access on ${entry.label}'s own page. Nothing to create or paste.</p>
-    <p class="mu">${agentName()} reads freely and asks you before changing, sending, or deleting anything. You can change that later.</p>
+    <p class="mu">${entry.group === 'money' ? `${agentName()} asks you before every action, even reading.` : `${agentName()} reads freely and asks you before changing, sending, or deleting anything.`} You can change that later.</p>
     ${live ? html`<${ServiceSignIn} con=${live} label=${entry.label} auto=${fresh}
         onDone=${() => { toast(`${entry.label} is connected`); open(live); }} />`
       : html`<button class="b1 wide" disabled=${busy} onClick=${connect}>${busy ? 'Connecting…' : 'Connect'}</button>`}`;
@@ -460,83 +479,175 @@ const MODES = [
   ['read_only', 'Only reads, never changes anything'],
   ['ask_always', 'Asks every time'],
 ];
-const EFFECT = { runs: 'Runs on its own', asks: 'Asks you first', off: 'Off', 'asks unless trusted': 'Asks unless to someone you trust' };
 
-function ToolSheet({ con, tool, onSaved }) {
-  const choose = async (rule) => {
+function ModeSheet({ con, onSaved }) {
+  const choose = async (m) => {
     closeSheet();
+    try { onSaved((await put(`/connectors/${seg(con.id)}/policy`, { mode: m })).connector); } catch (e) { toast(e.message); }
+  };
+  return html`<div class="sheet-body"><h3>Starting rules</h3>
+    <p class="mu">What each action does until you choose Allow, Ask or Off for it. Purchases and payments always ask.</p>
+    <div class="grp">${MODES.map(([m, l]) => html`<div class="r tap" role="button" tabindex="0" onClick=${() => choose(m)}><div class="rt">${l}</div>
+      <div class=${'rad' + (con.policy?.mode === m ? ' on' : '')} /></div>`)}</div></div>`;
+}
+
+/** Allow / Ask / Off for one action (a native picker, styled quietly). */
+function PermissionRow({ a, onChoose, disabled }) {
+  return html`<div class="r perm">
+    <div class="rt">${a.label}${(a.note || a.description) && html`<small>${a.note || brief(a.description)}</small>`}</div>
+    <label class="perm-pick">
+      <span>${CHOICE_LABEL[a.value] || a.value}</span>
+      <svg class="ic" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round"><path d="M8 9l4-4 4 4M8 15l4 4 4-4" /></svg>
+      <select aria-label=${`${a.label}: ${CHOICE_LABEL[a.value] || a.value}`} value=${pickerValue(a)} disabled=${disabled}
+        onChange=${(e) => onChoose(a, e.target.value)}>
+        <option value="" disabled hidden>${CHOICE_LABEL[a.value] || a.value}</option>
+        ${a.choices.map((c) => html`<option value=${c}>${CHOICE_LABEL[c]}</option>`)}
+      </select>
+    </label>
+  </div>`;
+}
+
+function PermissionSections({ perms, con, onSaved, disabled }) {
+  const choose = async (a, choice) => {
     try {
-      const r = await put(`/connectors/${seg(con.id)}/policy`, { tools: { [tool.name]: rule } });
+      const r = await put(`/connectors/${seg(con.id)}/policy`, { tools: { [a.id]: ruleFor(choice) } });
       onSaved(r.connector);
     } catch (e) { toast(e.message); }
   };
-  const opts = [[null, 'Follow the rules above'], ['allow', 'Always run on its own'], ['ask', 'Always ask me'], ['block', 'Never']];
-  return html`<div class="sheet-body"><h3>${tool.label}</h3>${tool.description && html`<p class="mu">${tool.description}</p>`}
-    <div class="grp">${opts.map(([v, l]) => html`<div class="r tap" onClick=${() => choose(v)}><div class="rt">${l}</div>
-      <div class=${'rad' + ((tool.rule || null) === v ? ' on' : '')} /></div>`)}</div>
-    ${tool.category === 'purchase' && html`<p class="gnote">Purchases and payments always ask, whatever you pick.</p>`}</div>`;
+  return perms.sections.map((sec) => html`<${Group} label=${sec.label}>
+    ${sec.actions.map((a) => html`<${PermissionRow} a=${a} key=${a.id} disabled=${disabled} onChoose=${choose} />`)}<//>`);
 }
 
-export function ConnectorPage({ id }) {
+const cap = (t) => (t ? t[0].toUpperCase() + t.slice(1) : t);
+/** The first sentence of a server's tool description, kept short. */
+const brief = (d) => {
+  const first = String(d || '').split(/(?<=\.)\s|\n/)[0].trim();
+  return first.length > 110 ? `${first.slice(0, 107)}…` : first;
+};
+
+function Hero({ c, title, sub }) {
+  return html`<div class="svc-hero"><${ServiceTile} c=${c} size=${64} /><h1 class="ttl">${title}</h1>${sub && html`<div class="sub">${sub}</div>`}</div>`;
+}
+
+/**
+ * A service's permission screen. `part` is a Google service (Gmail,
+ * Calendar...); without it, the whole connection: for Google its
+ * services, otherwise the tools its server lists.
+ */
+export function ConnectorPage({ id, part = null }) {
   useStore();
-  const [tools, setTools] = useState(null);
+  const [perms, setPerms] = useState(null);
   const [recent, setRecent] = useState(null);
   const con = (S.connectors || []).find((c) => c.id === id);
-  const loadTools = () => get(`/connectors/${seg(id)}/tools`).then(setTools).catch((e) => setTools({ tools: [], error: e.message }));
+  const google = con?.service === 'google';
+  const svc = part && GOOGLE_PARTS[part] ? part : null;
+  const loadPerms = () => get(`/connectors/${seg(id)}/permissions${svc ? `?service=${encodeURIComponent(svc)}` : ''}`)
+    .then(setPerms).catch((e) => setPerms({ sections: [], error: e.message }));
   useEffect(() => {
     if (!S.connectors) loadConnectors().catch(() => {});
     get(`/connectors/activity?connector_id=${encodeURIComponent(id)}&limit=8`).then((r) => setRecent(r.items)).catch(() => setRecent([]));
   }, [id]);
-  useEffect(() => { if (con?.enabled && con.auth_state === 'ok') loadTools(); }, [id, con?.enabled, con?.auth_state, con?.updated_at]);
+  const ready = con && con.enabled && con.auth_state === 'ok';
+  // A Google service's actions need no running server; other lists do.
+  useEffect(() => { if (con && (svc || ready)) loadPerms(); }, [id, svc, con?.enabled, con?.auth_state, con?.updated_at]);
   if (!con) return html`<${Page} title="Connection">${S.connectors ? html`<${Empty} icon="plug" title="Not found">That connection is gone.<//>` : html`<${Spinner} />`}<//>`;
-  const label = labelOf(con);
-  const replace = (c) => set({ connectors: S.connectors.map((x) => (x.id === c.id ? c : x)) });
+  if (part && (!google || !svc)) return html`<${Page} title="Connection"><${Empty} icon="plug" title="Not found">That service isn't part of this connection.<//><//>`;
+
+  const label = svc ? GOOGLE_PARTS[svc].name : labelOf(con);
+  const replace = (c) => { set({ connectors: S.connectors.map((x) => (x.id === c.id ? c : x)) }); };
+  const saved = (c) => { replace(c); loadPerms(); };
+  const needsSignIn = con.oauth && con.auth_state !== 'ok';
+  const account = perms?.account || con.oauth?.account;
+  const partOff = svc && (con.policy?.off || []).includes(svc);
+  const serviceOn = con.enabled && !partOff;
+  const turnOn = async () => {
+    try { replace((await post(`/connectors/${seg(id)}/connect`)).connector); } catch (e) { toast(e.message); }
+  };
   const toggle = async (on) => {
-    try { replace((await post(`/connectors/${seg(id)}/${on ? 'connect' : 'disconnect'}`)).connector); } catch (e) { toast(e.message); }
+    try {
+      if (svc) {
+        // Turning a Google service on also turns the Google connection on.
+        if (on && !con.enabled) replace((await post(`/connectors/${seg(id)}/connect`)).connector);
+        if (on === partOff) saved((await put(`/connectors/${seg(id)}/policy`, { services: { [svc]: on } })).connector);
+      } else replace((await post(`/connectors/${seg(id)}/${on ? 'connect' : 'disconnect'}`)).connector);
+    } catch (e) { toast(e.message); }
   };
   const resume = async () => {
-    try { replace((await post(`/connectors/${seg(id)}/resume`)).connector); toast(`${label} is back on`); } catch (e) { toast(e.message); }
-  };
-  const mode = async (m) => {
-    try { replace((await put(`/connectors/${seg(id)}/policy`, { mode: m })).connector); loadTools(); } catch (e) { toast(e.message); }
+    try { replace((await post(`/connectors/${seg(id)}/resume`)).connector); toast(`${labelOf(con)} is back on`); } catch (e) { toast(e.message); }
   };
   const remove = async () => {
-    if (!(await confirmSheet({ title: `Remove ${label}?`, body: `${agentName()} won't be able to use it anymore. Its saved secrets and sign-in are deleted from this server.`, yes: 'Remove', danger: true }))) return;
-    try { await del(`/connectors/${seg(id)}`); await loadConnectors(); go('iris/connections'); } catch (e) { toast(e.message); }
+    if (!(await confirmSheet({ title: `Remove ${labelOf(con)}?`, body: `${agentName()} won't be able to use it anymore. Its saved secrets, sign-in and rules are deleted from this server.`, yes: 'Remove', danger: true }))) return;
+    try { await del(`/connectors/${seg(id)}`); await loadConnectors(); go('iris/connections', true); } catch (e) { toast(e.message); }
   };
-  const needsSignIn = con.oauth && con.auth_state !== 'ok';
-  return html`<${Page} title=${label} sub=${con.oauth?.account ? `Connected as ${con.oauth.account}` : con.description || 'A connected service'}>
-    ${con.paused && html`<div class="warn-box"><b>Paused.</b> I stopped using ${label} because ${con.paused_reason}. Check the recent activity below, then resume it if everything looks right.
+  // Disconnect signs out (keeping the rules) where there is a sign-in;
+  // otherwise it removes the connection.
+  const disconnect = async () => {
+    if (!con.oauth) { remove(); return; }
+    const body = google
+      ? `This signs ${agentName()} out of Google, so Gmail, Calendar, Drive and every other Google service stop working until you connect again. Your choices here are kept.`
+      : `This signs ${agentName()} out of ${label}. Your choices here are kept, so connecting again is one sign-in.`;
+    if (!(await confirmSheet({ title: `Disconnect ${google ? 'Google' : label}?`, body, yes: 'Disconnect', danger: true }))) return;
+    try { replace((await post(`/connectors/${seg(id)}/oauth/sign-out`)).connector); toast(`${google ? 'Google' : label} is disconnected`); } catch (e) { toast(e.message); }
+  };
+  const signInSheet = () => openSheet(() => html`<div class="sheet-body"><h3>Sign in to ${labelOf(con)}</h3>
+    <p class="mu">Choose the account on ${labelOf(con)}'s page. It replaces the one signed in now.</p>
+    <${ServiceSignIn} con=${con} label=${labelOf(con)} onDone=${closeSheet} /></div>`);
+  const sub = svc ? perms?.service?.description || '' : con.description || 'A connected service';
+  const tileFor = svc ? { service: 'google', part: svc } : con;
+  const parts = google && !svc ? Object.entries(GOOGLE_PARTS) : [];
+  const otherTools = !svc && perms?.sections?.length > 0;
+
+  return html`<${Page} title=${null}>
+    <${Hero} c=${tileFor} title=${label} sub=${sub} />
+    ${svc && !con.enabled && html`<div class="warn-box"><b>Google is off.</b> ${agentName()} isn't using any Google service right now.
+      <div class="act"><button class="b1 sm" onClick=${turnOn}>Turn Google on</button></div></div>`}
+    ${con.paused && html`<div class="warn-box"><b>Paused.</b> I stopped using ${labelOf(con)} because ${con.paused_reason}. Check the recent activity below, then resume it if everything looks right.
       <div class="act"><button class="b1 sm" onClick=${resume}>Resume</button></div></div>`}
     ${!needsSignIn && con.enabled && con.oauth?.needs_more_access && html`<div class="card-x wide-card"><b>Google can do more now</b>
       <p>Sign in again to add Docs, Sheets, Slides, Forms, Tasks, Contacts and Gmail filters. Everything you use today keeps working until then.</p>
       <div class="act"><button onClick=${() => go('iris/connections/add/google')}>Add Google services</button></div></div>`}
-    ${needsSignIn && con.enabled && html`<div class="card-x wide-card"><b>${con.auth_state === 'needs_reconnect' ? `Sign in to ${label} again` : `Sign in to ${label}`}</b>
-      <p>${con.auth_state === 'needs_reconnect' ? 'The sign-in expired or was revoked.' : 'One more step: approve access on its own page.'}</p>
-      <${ServiceSignIn} con=${con} label=${label} onDone=${() => loadConnectors()} /></div>`}
-    <${Group}><${Row} title="On" sub="Off means I don't use it at all" right=${html`<${Toggle} on=${con.enabled} onChange=${toggle} label="Connection on" />`} /><//>
-    <${Group} label="What I can do on my own" note="Purchases and payments always ask. Messages only to your trusted people don't.">
-      ${MODES.map(([m, l]) => html`<div class="r tap" onClick=${() => mode(m)}><div class="rt">${l}</div><div class=${'rad' + (con.policy?.mode === m ? ' on' : '')} /></div>`)}
-    <//>
-    ${con.enabled && !needsSignIn && html`<${Group} label="Actions" note=${tools?.error ? null : 'Tap one to change what it does.'}>
-      ${!tools ? html`<div class="r"><div class="rt mu">Starting ${label}…</div></div>`
-        : tools.error ? html`<div class="r"><div class="rt">${tools.error}${tools.detail && html`<small class="mono">${tools.detail}</small>`}</div></div>`
-        : tools.tools.map((t) => html`<${Row} title=${t.label} sub=${EFFECT[t.effect] || t.effect} value=${t.rule ? 'custom' : ''}
-            onClick=${() => openSheet(() => html`<${ToolSheet} con=${con} tool=${t} onSaved=${(c) => { replace(c); loadTools(); }} />`)} />`)}
+    ${needsSignIn && con.enabled && html`<div class="card-x wide-card"><b>${con.auth_state === 'needs_reconnect' ? `Sign in to ${labelOf(con)} again` : `Connect ${labelOf(con)}`}</b>
+      <p>${con.auth_state === 'needs_reconnect' ? 'The sign-in expired or was revoked.' : `Approve access on ${labelOf(con)}'s own page.`}</p>
+      <${ServiceSignIn} con=${con} label=${labelOf(con)} onDone=${() => loadConnectors()} /></div>`}
+
+    ${!needsSignIn && html`<${Group}><${Row} title="Disconnect" danger chevron=${false} onClick=${disconnect} /><//>`}
+
+    ${con.oauth && !needsSignIn && html`<${Group}>
+      ${account && html`<${Row} icon=${html`<${LetterTile} name=${account} size=${31} radius=${16} />`} title=${account} chevron=${false} />`}
+      <${Row} icon="refresh" title=${account ? 'Use another account' : 'Sign in again'} accent chevron=${false} onClick=${signInSheet} />
     <//>`}
-    <${Group} label="Recently">
+
+    <${Group} note=${svc === 'youtube' ? `${agentName()} reads your subscriptions and likes to find stories for For you. It never changes anything on YouTube.` : null}>
+      <${Row} title=${svc ? `Use ${label}` : 'On'} sub=${serviceOn ? null : `${agentName()} doesn't use ${label} at all`}
+        right=${html`<${Toggle} on=${serviceOn} onChange=${toggle} label=${svc ? `Use ${label}` : 'Connection on'} />`} />
+    <//>
+
+    ${parts.length > 0 && html`<${Group} label="Services">
+      ${parts.map(([p, b]) => html`<${Row} icon=${html`<${ServiceTile} c=${{ service: 'google', part: p }} size=${31} />`} title=${b.name}
+        sub=${(con.policy?.off || []).includes(p) ? 'Off' : null} onClick=${() => go(`iris/connections/${id}/${p}`)} />`)}<//>`}
+
+    ${(svc || ready) && html`${!perms ? html`<${Group}><div class="r"><div class="rt mu">${svc ? 'Loading…' : `Starting ${label}…`}</div></div><//>`
+      : perms.error ? html`<${Group} label=${google && !svc ? 'Other actions' : 'Permissions'}><div class="r"><div class="rt">${google && !svc ? `I couldn't check Google for other actions: ${perms.error}` : cap(perms.error)}${perms.detail && html`<small class="mono">${perms.detail}</small>`}</div></div><//>`
+      : html`${google && otherTools && html`<div class="gl">Other actions</div>`}
+        <${PermissionSections} perms=${perms} con=${con} onSaved=${saved} disabled=${!serviceOn} />
+        ${!perms.sections.length && !google && html`<${Group}><div class="r"><div class="rt mu">${label} didn't list any actions.</div></div><//>`}
+        ${perms.sections.length > 0 && html`<div class="gnote">Allow runs on its own. Ask waits for your OK. Off hides it from ${agentName()}. Purchases and payments always ask.</div>`}`}`}
+
+    ${!svc && html`<${Group} label="Recently">
       ${!recent ? html`<${Spinner} />` : recent.length ? recent.map((it) => callRow(it, false)) : html`<div class="r"><div class="rt mu">Not used yet</div></div>`}
-    <//>
-    ${con.oauth && html`<${Group} label="Signing in">
-      <${Row} title="Sign in again" sub=${con.oauth.account ? `Now signed in as ${con.oauth.account}` : 'Use another account or refresh access'}
-        onClick=${() => openSheet(() => html`<div class="sheet-body"><h3>Sign in to ${label}</h3><${ServiceSignIn} con=${con} label=${label} onDone=${closeSheet} /></div>`)} />
-      <${Row} title="Sign-in app" sub=${con.oauth.client_configured ? (con.oauth.client_source === 'dcr' ? 'Registered by Iris automatically' : 'Your own OAuth client') : 'Not set up yet'}
-        onClick=${() => (con.service === 'custom' ? openSheet(() => html`<${ClientSheet} con=${con} />`) : go(`iris/connections/add/${con.service}`))} />
     <//>`}
-    <${Group}>
-      <${Row} title="Advanced settings" sub=${con.transport === 'stdio' ? 'Program, arguments, secrets' : 'Web address, headers'} onClick=${() => go(`iris/connections/${id}/edit`)} />
-      <${Row} title="Remove connection" danger onClick=${remove} chevron=${false} />
-    <//>
+
+    ${svc ? html`<${Group}>
+        <${Row} icon=${html`<${ServiceTile} c=${con} size=${31} />`} title="Google connection" sub="All services, recent use, and settings" onClick=${() => go(`iris/connections/${id}`)} />
+      <//>`
+    : html`<${Group} label="Settings">
+        <${Row} title="Starting rules" sub=${con.rules} onClick=${() => openSheet(() => html`<${ModeSheet} con=${con} onSaved=${saved} />`)} />
+        ${con.oauth && html`<${Row} title="Sign-in app" sub=${con.oauth.client_configured ? (con.oauth.client_source === 'dcr' ? 'Registered by Iris automatically' : 'Your own OAuth client') : 'Not set up yet'}
+          onClick=${() => (con.service === 'custom' ? openSheet(() => html`<${ClientSheet} con=${con} />`) : go(`iris/connections/add/${con.service}`))} />`}
+        <${Row} title="Advanced settings" sub=${con.transport === 'stdio' ? 'Program, arguments, secrets' : 'Web address, headers'} onClick=${() => go(`iris/connections/${id}/edit`)} />
+        <${Row} title="Remove connection" danger onClick=${remove} chevron=${false} />
+      <//>`}
   <//>`;
 }
 

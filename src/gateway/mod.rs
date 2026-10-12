@@ -21,6 +21,7 @@
 //! Iris does not decide what to call or run any tool itself; it forwards
 //! the CLI's calls and enforces the owner's rules on them.
 
+pub mod google;
 pub mod policy;
 pub mod proxy;
 pub mod upstream;
@@ -973,26 +974,56 @@ pub async fn list_tools(state: &AppState, con: &Connector) -> Result<Vec<Value>,
         }
         Err(CallError::Other(e)) => return Err(e),
     };
-    let none = |_: &str| false;
     Ok(tools
         .into_iter()
         .filter_map(|mut t| {
             let name = t["name"].as_str()?.to_string();
-            let cat = policy::classify(policy::action_name(&name, &con.service), &t["annotations"]);
-            match policy::decide(&con.policy, &name, cat, &[], &none, &none) {
-                Verdict::Block(_) => None,
-                Verdict::Ask(_) => {
-                    let d = t["description"].as_str().unwrap_or("").trim().to_string();
-                    t["description"] = format!(
-                        "{d}{}(Iris asks the user to approve this before it runs. Wait for \
-                         the result; if they say no, do not retry.)",
-                        if d.is_empty() { "" } else { " " }
-                    )
-                    .into();
-                    Some(t)
-                }
-                Verdict::Allow(_) => Some(t),
+            let action = policy::action_name(&name, &con.service);
+            let s = policy::tool_subject(&con.service, &name, action, &t["annotations"]);
+            if policy::tool_off(&con.policy, &s).is_some() {
+                return None;
             }
+            let mut notes = Vec::new();
+            let effects: Vec<(&str, &'static str)> = s
+                .keys
+                .iter()
+                .map(|(k, c)| (k.as_str(), policy::effect(&con.policy, k, *c)))
+                .collect();
+            if effects.iter().all(|(_, e)| *e == "off") {
+                return None;
+            }
+            let off: Vec<&str> = effects
+                .iter()
+                .filter(|(_, e)| *e == "off")
+                .filter_map(|(k, _)| google::action(k).map(|a| a.label))
+                .collect();
+            if !off.is_empty() {
+                notes.push(format!(
+                    "The user turned some of what this tool does off, and Iris refuses it: {}.",
+                    off.join("; ")
+                ));
+            }
+            if effects.iter().any(|(_, e)| *e == "ask") {
+                notes.push(
+                    if effects.iter().all(|(_, e)| *e == "ask") {
+                        "Iris asks the user to approve this before it runs."
+                    } else {
+                        "Iris may ask the user to approve this before it runs."
+                    }
+                    .to_string(),
+                );
+                notes.push("Wait for the result; if they say no, do not retry.".into());
+            }
+            if !notes.is_empty() {
+                let d = t["description"].as_str().unwrap_or("").trim().to_string();
+                t["description"] = format!(
+                    "{d}{}({})",
+                    if d.is_empty() { "" } else { " " },
+                    notes.join(" ")
+                )
+                .into();
+            }
+            Some(t)
         })
         .collect())
 }
@@ -1032,20 +1063,24 @@ pub async fn describe_tools(state: &AppState, con: &Connector) -> Result<Vec<Val
         .iter()
         .filter_map(|t| {
             let name = t["name"].as_str()?;
-            let cat = policy::classify(
-                policy::action_name(name, &con.service),
-                &t["annotations"],
-            );
-            let verdict = policy::decide(&con.policy, name, cat, &[], &none, &none);
+            let action = policy::action_name(name, &con.service);
+            let s = policy::tool_subject(&con.service, name, action, &t["annotations"]);
+            let cat = s.category();
+            let verdict = policy::judge(&con.policy, &s, &[], &none, &none);
             Some(json!({
                 "name": name,
                 "label": policy::humanize(name),
                 "description": truncate_chars(t["description"].as_str().unwrap_or(""), 300),
                 "category": cat,
                 "rule": con.policy.tools.get(name),
-"effect": match verdict {
+                // Google: the friendly actions this tool performs, whose
+                // rules apply instead of a rule on the tool.
+                "actions": s.every,
+                "service": s.part,
+                "effect": match verdict {
                     Verdict::Ask(_)
                         if cat == Category::Send
+                            && s.every.is_empty()
                             && matches!(con.policy.mode, policy::Mode::Standard | policy::Mode::Careful)
                             && !con.policy.tools.contains_key(name) =>
                     {
@@ -1139,7 +1174,7 @@ pub(crate) fn target(con: &Connector) -> String {
 /// Everything needed to decide a call again right before it runs.
 struct Gate<'a> {
     tool: &'a str,
-    category: Category,
+    subject: &'a policy::Subject,
     recipients: &'a [String],
     decided_by: &'static str,
     target: String,
@@ -1183,10 +1218,9 @@ async fn gate_refusal(
         .call(entities::known_recipients)
         .await
         .unwrap_or_default();
-    match policy::decide(
+    match policy::judge(
         &now.policy,
-        gate.tool,
-        gate.category,
+        gate.subject,
         gate.recipients,
         &|r| trusted.iter().any(|t| t == r),
         &|r| known.iter().any(|k| k == r),
@@ -1221,8 +1255,8 @@ pub async fn call_tool(
 ) -> Value {
     if let Some(r) = refusal(state, grant, con).await {
         // Recorded too (without starting the connector to learn more).
-        let category =
-            policy::classify_call(policy::action_name(tool, &con.service), &Value::Null, args);
+        let action = policy::action_name(tool, &con.service);
+        let category = policy::subject(&con.service, tool, action, &Value::Null, args).category();
         let preview = policy::preview(&service_label(con), tool, category, args);
         record(
             state,
@@ -1259,7 +1293,7 @@ pub async fn call_tool(
         .unwrap_or(Value::Null);
     // Classified by what it does; rules and records keep the real name.
     let action = policy::action_name(tool, &con.service);
-    let mut category = policy::classify_call(action, &annotations, args);
+    let mut subject = policy::subject(&con.service, tool, action, &annotations, args);
     if found.is_none() {
         // Fail closed: without the tool's definition Iris cannot trust its
         // read-only hints, so the call asks.
@@ -1267,9 +1301,15 @@ pub async fn call_tool(
             "connector {}: tool definition unavailable; approval required",
             con.id
         );
-        category = category.riskier(Category::Unclear);
+        subject = subject.unverified();
     }
-    let recipients = policy::audience(action, args);
+    let category = subject.category();
+    let mut recipients = policy::audience(action, args);
+    if con.service == "google" && google::hidden_audience(tool, args) {
+        // A saved forwarding destination the call does not show is never
+        // trusted.
+        recipients.push(policy::UNREADABLE_RECIPIENTS.to_string());
+    }
     let label = service_label(con);
     let preview = policy::preview(&label, tool, category, args);
     let trusted = state.trusted_recipients().await;
@@ -1278,17 +1318,13 @@ pub async fn call_tool(
         .call(entities::known_recipients)
         .await
         .unwrap_or_default();
-    let judge = |policy: &policy::Policy| {
-        policy::decide(
-            policy,
-            tool,
-            category,
-            &recipients,
-            &|r| trusted.iter().any(|t| t == r),
-            &|r| known.iter().any(|k| k == r),
-        )
-    };
-    let mut verdict = judge(&con.policy);
+    let mut verdict = policy::judge(
+        &con.policy,
+        &subject,
+        &recipients,
+        &|r| trusted.iter().any(|t| t == r),
+        &|r| known.iter().any(|k| k == r),
+    );
     if found.is_none() && matches!(verdict, Verdict::Allow(_)) {
         verdict = Verdict::Ask("Iris could not verify this action's definition".into());
     }
@@ -1368,7 +1404,7 @@ pub async fn call_tool(
     // still running, and Iris not paused.
     let gate = Gate {
         tool,
-        category,
+        subject: &subject,
         recipients: &recipients,
         decided_by,
         target: bound_target,

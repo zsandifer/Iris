@@ -17,9 +17,13 @@ pub async fn access_token(state: &AppState, user_id: &str) -> Option<String> {
             if db::owner_user_id(c)?.as_deref() != Some(uid.as_str()) {
                 return Ok(None);
             }
-            Ok(entities::list_connectors(c, true)?
-                .into_iter()
-                .find(|c| c.service == "google" && c.active() && c.config.oauth.is_some()))
+            Ok(entities::list_connectors(c, true)?.into_iter().find(|c| {
+                c.service == "google"
+                        && c.active()
+                        && c.config.oauth.is_some()
+                        // The owner turned YouTube off for Iris.
+                        && !c.policy.is_off("youtube")
+            }))
         })
         .await
         .ok()
@@ -186,6 +190,39 @@ mod tests {
             })
             .unwrap();
         assert!(access_token(&state, &owner).await.is_none());
+        // Signed in, but the owner turned YouTube off for Iris.
+        let mut policy = crate::gateway::policy::Policy::new(Default::default());
+        policy.off.insert("youtube".into());
+        state
+            .db
+            .with(|c| {
+                entities::set_connector_state(
+                    c,
+                    "google-test",
+                    &ConnectorState {
+                        auth_state: Some("ok"),
+                        policy: Some(&policy),
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+        assert!(access_token(&state, &owner).await.is_none());
+        policy.off.clear();
+        state
+            .db
+            .with(|c| {
+                entities::set_connector_state(
+                    c,
+                    "google-test",
+                    &ConnectorState {
+                        policy: Some(&policy),
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+        assert!(access_token(&state, &owner).await.is_some());
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@ const SHELL = [
   '/js/api.js',
   '/js/app.js',
   '/js/cards.js',
+  '/js/catalog.js',
   '/js/chat.js',
   '/js/computer.js',
   '/js/connect.js',
