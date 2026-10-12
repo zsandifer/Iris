@@ -249,7 +249,7 @@ code { font-family: var(--mono); font-size: .88em; background: var(--sf2); borde
 .viewer { position: absolute; inset: 0; z-index: 20; background: #000; color: #fff; touch-action: none; user-select: none; -webkit-user-select: none; }
 .viewer-im, .viewer .img-ph { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .viewer-blank { background: linear-gradient(160deg, #6d5bd0, #1d1925); }
-.viewer-shade { position: absolute; inset: 0; background: linear-gradient(rgba(0,0,0,.45), transparent 22%, transparent 45%, rgba(0,0,0,.8)); }
+.viewer-shade { position: absolute; inset: 0; pointer-events: none; background: linear-gradient(rgba(0,0,0,.45), transparent 22%, transparent 45%, rgba(0,0,0,.8)); }
 .bars { position: absolute; top: calc(var(--sat) + 10px); left: 12px; right: 12px; display: flex; gap: 4px; }
 .bars i { flex: 1; height: 3px; border-radius: 2px; background: rgba(255,255,255,.35); overflow: hidden; position: relative; }
 .bars i.f { background: #fff; }
@@ -395,10 +395,32 @@ code { font-family: var(--mono); font-size: .88em; background: var(--sf2); borde
 @keyframes rise { from { transform: translateY(40px); opacity: .4; } }
 .toast { position: absolute; left: 50%; transform: translateX(-50%); bottom: calc(var(--nav-h) + 78px); z-index: 40; background: var(--ink); color: var(--bg);
   border-radius: 14px; padding: 10px 15px; font-size: 13.5px; max-width: 86%; box-shadow: 0 6px 20px rgba(0,0,0,.25); animation: fade .2s; text-align: center; }
-.lightbox { position: absolute; inset: 0; z-index: 25; background: rgba(0,0,0,.94); display: grid; place-items: center; }
-.lightbox img { max-width: 100%; max-height: 86dvh; }
-.lightbox .x { position: absolute; top: calc(var(--sat) + 12px); right: 12px; background: none; border: 0; color: #fff; }
-.lb-go { position: absolute; bottom: calc(var(--sab) + 24px); }
+.photo-tap { cursor: zoom-in; }
+.photo-open #app .scr, .photo-open #app .page, .photo-open #app .sheet,
+.photo-open #app .drw-scroll, .photo-open #app .car { overflow: hidden; }
+.photo-viewer { position: fixed; inset: 0; z-index: 1100; background: rgba(12, 9, 18, .72);
+  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); color: #fff;
+  touch-action: none; overscroll-behavior: none; user-select: none; -webkit-user-select: none;
+  animation: photo-in 160ms ease-out; transition: opacity 160ms ease-out; }
+.photo-stage { position: absolute; inset: calc(var(--sat) + 16px) calc(var(--sar) + 16px) calc(var(--sab) + 16px) calc(var(--sal) + 16px);
+  display: grid; place-items: center; }
+.photo-layer { width: 0; height: 0; overflow: hidden; border-radius: 14px; touch-action: none;
+  animation: photo-scale 160ms ease-out; transition: transform 160ms ease-out; isolation: isolate; }
+.photo-layer img { display: block; width: 100%; height: 100%; object-fit: contain; transform-origin: center;
+  will-change: transform; touch-action: none; }
+.photo-close { position: absolute; top: calc(var(--sat) + 20px); right: calc(var(--sar) + 20px);
+  width: 44px; height: 44px; display: grid; place-items: center; border-radius: 50%; border: 1px solid rgba(255,255,255,.65);
+  background: rgba(12,9,18,.85); color: #fff; font-size: 34px; line-height: 1; padding: 0;
+  box-shadow: 0 2px 10px rgba(0,0,0,.3); }
+.photo-action { position: absolute; bottom: calc(var(--sab) + 24px); left: 50%; transform: translateX(-50%); }
+.photo-error { position: absolute; text-align: center; }
+.photo-viewer.leaving { opacity: 0; pointer-events: none; }
+.photo-viewer.leaving .photo-layer { transform: scale(.96); }
+@keyframes photo-in { from { opacity: 0; } }
+@keyframes photo-scale { from { transform: scale(.96); } }
+@media (prefers-reduced-motion: reduce) {
+  .photo-viewer, .photo-layer { animation: none; transition: none; }
+}
 
 /* ------------------------------------------------------------ pairing */
 .pair, .boot { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px; }

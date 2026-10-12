@@ -3,6 +3,7 @@ import { html, useEffect, useLayoutEffect, useRef, useState } from './h.js';
 import { post, put, api, seg, isId } from './api.js';
 import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId, isOwner, convFor, lookUpConv } from './store.js';
 import { Icon, Img, Avatar, agentName, stamp, Spinner } from './ui.js';
+import { openPhoto } from './photo.js';
 import { md } from './md.js';
 import { Card } from './cards.js';
 import { statusPhrase, receipt, seconds } from './status.js';
@@ -31,7 +32,7 @@ function Receipt({ meta }) {
 
 function Photos({ ids, mine }) {
   return html`<div class=${'photos' + (mine ? ' mine' : '')}>
-    ${ids.map((id) => html`<button class="photo" onClick=${() => set({ lightbox: `/api/attachments/${seg(id)}` })}>
+    ${ids.map((id) => html`<button class="photo" onClick=${() => openPhoto(`/api/attachments/${seg(id)}`, 'Photo')}>
       <${Img} src=${`/api/attachments/${seg(id)}`} alt="Photo" /></button>`)}
   </div>`;
 }
@@ -388,7 +389,7 @@ function Composer({ cid, running, onFocus, onBlur }) {
   return html`<div class="composer">
     ${unsent.map((u) => html`<button class="note" onClick=${() => retry(u)}>Not sent, tap to retry: ${u.t || 'photo'}</button>`)}
     ${atts.length > 0 && html`<div class="att-row">${atts.map((a) => html`<div class="att" key=${a.key}>
-      <img src=${a.preview} alt="" />${a.uploading && html`<div class="att-busy"><${Spinner} /></div>`}
+      <${Img} src=${a.preview} alt="Photo to send" />${a.uploading && html`<div class="att-busy"><${Spinner} /></div>`}
       <button class="att-x" aria-label="Remove photo" onClick=${() => { URL.revokeObjectURL(a.preview); setAtts((cur) => cur.filter((x) => x.key !== a.key)); }}><${Icon} name="x" size=${12} /></button>
     </div>`)}</div>`}
     <div class=${'inp' + (rec ? ' listening' : '')} onPointerDown=${onComposerPointerDown} onTouchStart=${onComposerPointerDown}>

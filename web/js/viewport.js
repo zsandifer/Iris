@@ -39,6 +39,8 @@ export function focusComposer(el) {
 export function blockZoom(doc = document) {
   const stop = (e) => e.preventDefault();
   for (const t of ['gesturestart', 'gesturechange', 'gestureend']) doc.addEventListener(t, stop, { passive: false });
+  // Photo gestures consume touch data at the image layer first. Preventing
+  // the browser default here still allows those handlers to receive events.
   doc.addEventListener('touchmove', (e) => { if (e.touches.length > 1) e.preventDefault(); }, { passive: false });
 }
 
