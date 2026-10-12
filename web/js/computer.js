@@ -220,13 +220,30 @@ function setBrowserState(browser) {
 
 // -------------------------------------------------------------- the page
 
-/** Chrome's sandbox cannot start on this server: explain, and let the
- * owner choose to run without it (or fix the server). */
-function NoSandbox() {
+/** A shell command to run on the server, selectable, with a Copy button. */
+function Command({ text }) {
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(text); toast('Copied'); }
+    catch { toast('I couldn’t copy it. Select the command and copy it.'); }
+  };
+  return html`<div class="cmd-box">
+    <pre class="mono" aria-label="Command to run on your server">${text}</pre>
+    <button class="b2" type="button" onClick=${copy}><${Icon} name="copy" size=${15} /> Copy</button>
+  </div>`;
+}
+
+/** Chrome's sandbox cannot start on this server: explain, show the exact
+ * command that fixes it on this machine, and let the owner choose to run
+ * without it instead. */
+function NoSandbox({ b }) {
+  // The status with the command for this machine (live updates carry
+  // only the browser's own state).
+  useEffect(() => { loadBrowser().catch(() => {}); }, []);
+  const fix = b.sandbox_fix;
   const allow = async () => {
     const ok = await confirmSheet({
       title: 'Run the browser without its sandbox?',
-      body: `The sandbox keeps a bad website from reaching the rest of your server. Without it, ${agentName()}'s browser still works, but a browser bug could expose your server. The safer fix is on the server (see "Iris's computer" in the self-hosting guide).`,
+      body: `The sandbox keeps a bad website from reaching the rest of your server. Without it, ${agentName()}'s browser still works, but a browser bug could expose your server. ${fix?.command ? 'The safer fix is the one-time command shown here.' : 'The safer fix is on the server (see "Iris\'s computer" in the self-hosting guide).'}`,
       yes: 'Run without it',
       danger: true,
     });
@@ -241,10 +258,24 @@ function NoSandbox() {
     try { setBrowserState((await post('/browser/start')).browser); } catch (e) { toast(e.message); }
     loadBrowser().catch(() => {});
   };
+  const install = async () => {
+    try { setBrowserState((await post('/browser/install')).browser); } catch (e) { toast(e.message); }
+  };
+  const installing = b.install?.state === 'running';
+  let how = html`<small>This server blocks the sandbox Chrome uses to keep websites away from the rest of the system (common on Ubuntu). You can allow it on the server once, or run without it.</small>`;
+  if (fix?.kind === 'apparmor') {
+    how = html`<small>This server blocks the sandbox Chrome uses to keep websites away from the rest of the system (common on Ubuntu). Run this once on your server to allow it for this browser only, then tap Try again.</small>
+      <${Command} text=${fix.command} />`;
+  } else if (fix?.kind === 'setup') {
+    how = html`<small>This server blocks the sandbox Chrome uses to keep websites away from the rest of the system (common on Ubuntu). The browser I found isn't protected well enough to allow it safely. Run this once on your server from the Iris source folder and follow what it prints${fix.install_browser ? '' : ' (then restart Iris)'}. Then set up my own browser here and tap Try again.</small>
+      <${Command} text=${fix.command} />
+      ${fix.install_browser && b.requires !== 'nodejs' && html`<button class="b2" disabled=${installing} onClick=${install}>${installing ? 'Setting up the browser…' : 'Set up the browser'}</button>`}
+      ${b.install?.state === 'failed' && html`<small class="err-line">That didn't work: ${b.install.error}</small>`}`;
+  }
   return html`<div class="screen">
     <${Icon} name="lock" size=${30} />
     <b>The browser's safety sandbox can't run here</b>
-    <small>This server blocks the sandbox Chrome uses to keep websites away from the rest of the system (common on Ubuntu). You can allow it on the server once, or run without it.</small>
+    ${how}
     <div class="row-btns"><button class="b2" onClick=${retry}>Try again</button>
       <button class="b1" onClick=${allow}>Run without the sandbox</button></div>
   </div>`;
@@ -321,7 +352,7 @@ export function Computer() {
     screen = html`<div class="screen"><${Icon} name="pause" size=${30} /><b>${agentName()} is paused</b>
       <small>Nothing runs until you turn ${agentName()} back on below.</small></div>`;
   } else if (!b.available) screen = html`<${Setup} b=${b} />`;
-  else if (b.sandbox_unavailable && !b.running) screen = html`<${NoSandbox} />`;
+  else if (b.sandbox_unavailable && !b.running) screen = html`<${NoSandbox} b=${b} />`;
   else if (b.running) screen = html`<${LiveScreen} b=${b} />`;
   else {
     screen = html`<div class="screen"><${Icon} name="monitor" size=${30} />

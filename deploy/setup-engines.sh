@@ -11,6 +11,11 @@
 # Without this script Iris still works in single-user mode: it installs
 # engines into its own data directory as the agent user.
 #
+# Where AppArmor restricts unprivileged user namespaces (Ubuntu 23.10 and
+# later), it also allows Chrome's sandbox for exactly Iris's own browser
+# (<engines-dir>/chromium/app/chrome, installed from the app) with the
+# AppArmor profile /etc/apparmor.d/iris-browser.
+#
 # Usage (as root):
 #   sh deploy/setup-engines.sh <service-user> [iris-binary] [engines-dir] [agent-user] [data-dir] [config-file]
 # With agent-user, also calls setup-agent-user.sh to isolate CLI turns.
@@ -39,6 +44,9 @@ if [ -z "$AGENT_USER" ] || ! id "$AGENT_USER" >/dev/null 2>&1; then
 fi
 case "$IRIS_BIN$ENGINES_DIR" in
     *[!A-Za-z0-9/._-]*) echo "Paths may only contain letters, digits, / . _ -" >&2; exit 1 ;;
+esac
+case "$ENGINES_DIR" in
+    */|*//*|*/./*|*/../*|*/.|*/..) echo "Give the engines directory as a plain absolute path (no trailing /, . or ..)." >&2; exit 1 ;;
 esac
 if [ ! -x "$IRIS_BIN" ]; then
     echo "$IRIS_BIN is missing. Install it first, e.g.: install -Dm755 target/release/iris $IRIS_BIN" >&2
@@ -148,6 +156,39 @@ else
 fi
 printf '%s\n' "$DROPIN" | $AS_AGENT sh -c 'umask 022 && mkdir -p "$1" && cat > "$1/engines.conf"' sh "$DROPIN_DIR"
 
+# 5. Chrome's sandbox for Iris's browser. Ubuntu 23.10 and later restrict
+#    unprivileged user namespaces with AppArmor, and Chrome's sandbox needs
+#    one. Allow exactly Iris's own browser: it lives at one fixed path in
+#    the engines directory, which only the admin user can change (and only
+#    by installing Chromium from its official source through the rule
+#    above). Nothing else gains user namespaces. Without the restriction
+#    this step does nothing; rerunning it rewrites and reloads the profile.
+BROWSER_BIN="$ENGINES_DIR/chromium/app/chrome"
+APPARMOR_PROFILE=/etc/apparmor.d/iris-browser
+browser_profile() { # path of the browser executable
+    printf '%s\n' "# Iris's browser: allow Chrome's sandbox (user namespaces) for this one program."
+    printf '%s\n' 'abi <abi/4.0>,' 'include <tunables/global>' ''
+    printf 'profile iris-browser "%s" flags=(unconfined) {\n' "$1"
+    printf '%s\n' '  userns,' '}'
+}
+if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || true)" = 1 ]; then
+    if ! command -v apparmor_parser >/dev/null 2>&1 || [ ! -e /etc/apparmor.d/abi/4.0 ]; then
+        echo "AppArmor restricts user namespaces here, but apparmor_parser or AppArmor 4 is missing:" >&2
+        echo "Chrome's sandbox for Iris's browser was not set up." >&2
+    else
+        PROFILE_TMP="$(mktemp)"
+        browser_profile "$BROWSER_BIN" > "$PROFILE_TMP"
+        # Load first; only a profile that loads is installed for boot.
+        if apparmor_parser -r "$PROFILE_TMP"; then
+            install -m 0644 -o root -g root "$PROFILE_TMP" "$APPARMOR_PROFILE"
+            echo "Allowed Chrome's sandbox for Iris's browser ($BROWSER_BIN): $APPARMOR_PROFILE"
+        else
+            echo "Could not load the AppArmor profile for Iris's browser; Chrome's sandbox stays blocked." >&2
+        fi
+        rm -f "$PROFILE_TMP"
+    fi
+fi
+
 echo "Done. Add to $AGENT_HOME/.config/iris/config.toml:"
 echo ""
 echo "  [engines]"
@@ -155,7 +196,8 @@ echo "  dir = \"$ENGINES_DIR\""
 echo "  helper = [\"sudo\", \"-n\", \"-u\", \"$ADMIN_USER\", \"$IRIS_BIN\", \"engines\"]"
 echo ""
 echo "Then, as $AGENT_USER: systemctl --user daemon-reload && systemctl --user restart iris"
-echo "Engines need Node.js (npm) on the server for Codex, Gemini CLI, and OpenCode."
+echo "Engines need Node.js (npm) on the server for Codex, Gemini CLI, OpenCode, and the browser."
+echo "Then set up the browser in the app (Iris's computer) so Iris uses its own, approved copy."
 
 # Optional second split: CLI turns as a dedicated account, data private to
 # the service account (the historical first argument names that account).

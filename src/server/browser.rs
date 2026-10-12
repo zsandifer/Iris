@@ -35,7 +35,51 @@ pub fn status_json(state: &AppState) -> Value {
         Value::Null
     };
     v["install"] = json!(state.engine_ops.get("browser"));
+    v["sandbox_fix"] = if v["sandbox_unavailable"] == true {
+        let mut fix = sandbox_fix(state, &root);
+        if fix["kind"] == "setup" {
+            // With the privilege split in place, installing Iris's own
+            // browser (into the protected engines directory) is the step
+            // the app can offer.
+            fix["install_browser"] =
+                (!state.cfg.engines.helper.is_empty() && v["managed"] == false).into();
+        }
+        fix
+    } else {
+        Value::Null
+    };
     v
+}
+
+/// The exact step that lets Chrome's sandbox start on this machine (see
+/// `browser::apparmor`). Trusted owners of the browser's files: root, and
+/// with the privilege split the engines admin user.
+fn sandbox_fix(state: &AppState, root: &std::path::Path) -> Value {
+    use crate::browser::apparmor;
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let split = !state.cfg.engines.helper.is_empty();
+    let mut trusted = vec![0];
+    if split
+        && let Ok(m) = std::fs::metadata(root)
+        && m.uid() != me
+    {
+        trusted.push(m.uid());
+    }
+    let setup = apparmor::setup_command(
+        &apparmor::current_user()
+            .or_else(|| std::env::var("USER").ok())
+            .unwrap_or_else(|| "IRIS_USER".into()),
+        apparmor::root_owned_iris().as_deref(),
+        split.then_some(root),
+    );
+    apparmor::sandbox_fix(
+        apparmor::userns_restricted(),
+        state.browser.executable().as_deref(),
+        &trusted,
+        &setup,
+    )
 }
 
 /// Send the full status (with install state) to the owner's apps.

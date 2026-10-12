@@ -181,8 +181,10 @@ auto_update = true
 # logins and cards are filled in by Iris itself; the agent never sees them.
 [browser]
 enabled = true
-# Chromium or Chrome executable. Empty: the one installed from the app,
-# then PATH (chromium, google-chrome, ...), then Playwright's browser cache.
+# Chromium or Chrome executable. Empty: the one installed from the app
+# (<engines dir>/chromium/app/chrome; deploy/setup-engines.sh approves that
+# path for Chrome's sandbox on Ubuntu 23.10+), then PATH (chromium,
+# google-chrome, ...), then Playwright's browser cache. Set, it always wins.
 command = ""
 # Close the browser after this many idle minutes (frees memory). Sign-ins
 # persist in its profile under <data dir>/browser.

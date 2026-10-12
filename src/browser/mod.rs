@@ -19,6 +19,7 @@
 //!
 //! The browser starts on first use and closes after `browser.idle_mins`.
 
+pub mod apparmor;
 pub mod cdp;
 #[cfg(test)]
 mod e2e_tests;
