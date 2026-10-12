@@ -14,7 +14,7 @@ import {
 import { ExternalLink } from './external-link.js';
 import { googlePasteError } from './google-paste.js';
 import {
-  SERVICES, CATALOG_IDS, GOOGLE_PARTS, brandOf, topRows, rowAction, rowStatus, rowTarget, ruleFor, CHOICE_LABEL,
+  SERVICES, CATALOG_IDS, GOOGLE_PARTS, brandOf, topRows, rowAction, rowStatus, rowTarget, ruleFor, pickerValue, CHOICE_LABEL,
 } from './catalog.js';
 
 export { CATALOG_IDS };
@@ -499,8 +499,9 @@ function PermissionRow({ a, onChoose, disabled }) {
       <span>${CHOICE_LABEL[a.value] || a.value}</span>
       <svg class="ic" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"
         stroke-linecap="round" stroke-linejoin="round"><path d="M8 9l4-4 4 4M8 15l4 4 4-4" /></svg>
-      <select aria-label=${`${a.label}: ${CHOICE_LABEL[a.value] || a.value}`} value=${a.value} disabled=${disabled}
+      <select aria-label=${`${a.label}: ${CHOICE_LABEL[a.value] || a.value}`} value=${pickerValue(a)} disabled=${disabled}
         onChange=${(e) => onChoose(a, e.target.value)}>
+        <option value="" disabled hidden>${CHOICE_LABEL[a.value] || a.value}</option>
         ${a.choices.map((c) => html`<option value=${c}>${CHOICE_LABEL[c]}</option>`)}
       </select>
     </label>

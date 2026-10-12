@@ -2308,6 +2308,34 @@ async fn a_google_action_turned_off_while_its_call_waits_is_not_sent() {
 }
 
 #[tokio::test]
+async fn a_google_action_set_to_off_while_its_call_waits_is_not_sent() {
+    let t = setup(|_| {});
+    let mut p = policy::Policy::new(policy::Mode::Careful);
+    as_google(&t, &p);
+    let (token, _guard, _) = t.grant().await;
+    let (state, tok) = (t.state.clone(), token.clone());
+    let held = tokio::spawn(async move {
+        handle(
+            &state,
+            &json!({"token": tok, "connector": "chat", "request": {
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "send_gmail_message", "arguments": {
+                    "to": "sam@example.com", "subject": "Hi", "body": "Hello"}}}}),
+        )
+        .await
+    });
+    let card = t.pending_card().await;
+    // Only this action is turned off; Gmail stays on.
+    p.tools.insert("gmail.send".into(), policy::ToolRule::Block);
+    set_policy(&t, &p);
+    t.decide(&card.id, true);
+    let r = held.await.unwrap()["result"].clone();
+    assert_eq!(r["isError"], true);
+    assert!(text(&r).contains("turned this action off"), "{r}");
+    assert!(!t.calls_log().contains("send_gmail_message"));
+}
+
+#[tokio::test]
 async fn an_older_google_connection_keeps_its_rules_as_actions() {
     let t = setup(|_| {});
     // Saved by an older Iris: the old default and rules on tools.

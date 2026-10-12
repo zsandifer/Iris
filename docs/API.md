@@ -1494,8 +1494,11 @@ trash" and with sharing settings "Share files"; Gmail labels that add
 are also "Label, archive and mark email"); filters with a `forward` or
 `TRASH` action also need "Filters that forward email to someone" or "Move
 email to the trash", as does updating or applying a filter without giving
-its action (the server keeps or applies the saved one); applying a filter
-also changes labels on existing mail; comments on Docs, Sheets and Slides
+its action, or applying one by `filter_id` (the server keeps or applies the
+saved one, whatever action is given); applying a filter also changes
+labels on existing mail; a one-action tool the server marks destructive
+(`batch_update_doc`, `resize_sheet_dimensions`...) counts as a deletion for
+the starting rules; comments on Docs, Sheets and Slides
 are their own "Comment on ..." actions. Arguments are read the way the
 server reads them (it accepts `addLabelIds` for `add_label_ids`, JSON
 strings for objects and lists, and strips and lowercases `action`). A call

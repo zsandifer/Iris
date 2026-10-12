@@ -1262,9 +1262,24 @@ pub fn subject(
     {
         let every = super::google::tool_actions(tool);
         if let Some(keys) = super::google::call_actions(tool, args) {
+            // A one-action tool the server marks destructive (deleting rows
+            // while resizing, batch edits) keeps that risk; tools placed by
+            // their arguments already say what each call does.
+            let destructive =
+                !super::google::placed_by_arguments(tool) && annotations["destructiveHint"] == true;
             return Subject {
                 part: Some(part),
-                keys: keys.into_iter().map(|(k, c)| (k.to_string(), c)).collect(),
+                keys: keys
+                    .into_iter()
+                    .map(|(k, c)| {
+                        let c = if destructive {
+                            c.riskier(Category::Delete)
+                        } else {
+                            c
+                        };
+                        (k.to_string(), c)
+                    })
+                    .collect(),
                 every,
             };
         }
@@ -2310,6 +2325,45 @@ mod tests {
             judge(&p, &s.clone().unverified(), &[], &none, &none),
             Verdict::Ask(_)
         ));
+        // A one-action tool the server marks destructive keeps that risk
+        // (under the standard rules its edits ask); an explicit Allow runs.
+        let hint = json!({"destructiveHint": true});
+        let resize = subject(
+            "google",
+            "resize_sheet_dimensions",
+            "resize_sheet_dimensions",
+            &hint,
+            &json!({}),
+        );
+        assert_eq!(resize.keys, [("sheets.edit".to_string(), Category::Delete)]);
+        let std = Policy::new(Mode::Standard);
+        assert!(matches!(
+            judge(&std, &resize, &[], &none, &none),
+            Verdict::Ask(_)
+        ));
+        let plain = subject(
+            "google",
+            "format_sheet_range",
+            "format_sheet_range",
+            &Value::Null,
+            &json!({}),
+        );
+        assert_eq!(
+            judge(&std, &plain, &[], &none, &none),
+            Verdict::Allow(AllowedBy::Rules)
+        );
+        // Placed by arguments: the hint does not turn a create into a delete.
+        let create = subject(
+            "google",
+            "manage_event",
+            "manage_event",
+            &hint,
+            &json!({"action": "create"}),
+        );
+        assert_eq!(
+            create.keys,
+            [("calendar.events.create".to_string(), Category::Write)]
+        );
         // Outside Google, or for a tool the table does not know, the tool
         // name and the general classification decide.
         let other = subject(

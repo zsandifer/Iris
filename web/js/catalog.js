@@ -87,3 +87,12 @@ export const CHOICE_LABEL = { allow: 'Allow', ask: 'Ask', off: 'Off' };
 export function ruleFor(choice) {
   return choice === 'off' ? 'block' : choice;
 }
+
+/**
+ * What the picker has selected: the owner's own rule, or nothing while the
+ * starting rules decide (so choosing the value it shows still saves it).
+ */
+export function pickerValue(a) {
+  if (!a.rule) return '';
+  return a.rule === 'block' ? 'off' : a.rule;
+}

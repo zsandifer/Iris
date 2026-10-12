@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  SERVICES, GOOGLE_PARTS, CATALOG_IDS, brandOf, topRows, rowAction, rowStatus, rowTarget, ruleFor,
+  SERVICES, GOOGLE_PARTS, CATALOG_IDS, brandOf, topRows, rowAction, rowStatus, rowTarget, ruleFor, pickerValue,
 } from '../../web/js/catalog.js';
 
 const id = '0123456789abcdef0123456789abcdef';
@@ -41,6 +41,13 @@ test('a choice is always saved as an explicit rule; off is stored as block', () 
   assert.equal(ruleFor('ask'), 'ask');
   assert.equal(ruleFor('allow'), 'allow');
   assert.equal(ruleFor('off'), 'block');
+});
+
+test('without an own rule nothing is selected, so picking the shown value still saves it', () => {
+  assert.equal(pickerValue({ rule: null, value: 'ask' }), '');
+  assert.equal(pickerValue({ rule: 'ask', value: 'ask' }), 'ask');
+  assert.equal(pickerValue({ rule: 'block', value: 'off' }), 'off');
+  assert.equal(pickerValue({ rule: 'allow', value: 'ask' }), 'allow');
 });
 
 test('every catalog service and Google part has a local tile', () => {

@@ -434,7 +434,12 @@ fn selector(args: &Value, key: &str) -> Option<String> {
 fn given(args: &Value, key: &str) -> bool {
     match args.get(key) {
         None | Some(Value::Null) => false,
-        Some(Value::String(s)) => !s.trim().is_empty(),
+        // The server decodes objects and lists sent as JSON strings.
+        Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
+            Ok(Value::Object(o)) => !o.is_empty(),
+            Ok(Value::Array(a)) => !a.is_empty(),
+            _ => !s.trim().is_empty(),
+        },
         Some(Value::Array(a)) => !a.is_empty(),
         Some(Value::Object(o)) => !o.is_empty(),
         Some(_) => true,
@@ -552,6 +557,36 @@ fn label_tokens(v: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
+/// Tools whose call is placed by its arguments (everything else performs
+/// its one action, and keeps the server's destructive hint).
+pub fn placed_by_arguments(name: &str) -> bool {
+    matches!(
+        name,
+        "modify_gmail_message_labels"
+            | "batch_modify_gmail_message_labels"
+            | "manage_gmail_label"
+            | "manage_gmail_filter"
+            | "manage_event"
+            | "manage_out_of_office"
+            | "manage_focus_time"
+            | "update_drive_file"
+            | "manage_drive_access"
+            | "manage_document_comment"
+            | "manage_spreadsheet_comment"
+            | "manage_presentation_comment"
+            | "manage_doc_tab"
+            | "modify_sheet_values"
+            | "manage_sheet_tab"
+            | "manage_named_range"
+            | "manage_conditional_formatting"
+            | "manage_task"
+            | "manage_task_list"
+            | "manage_contact"
+            | "manage_contacts_batch"
+            | "manage_contact_group"
+    )
+}
+
 /// What one call does: each action it performs, with the call's category
 /// for that action. `None` when the tool or an argument value that chooses
 /// what it does is unknown (the caller falls back to the general
@@ -587,7 +622,10 @@ pub fn call_actions(name: &str, args: &Value) -> Option<Vec<(&'static str, Categ
             let fa = args.get("filter_action");
             // Without a new action, the server keeps (update) or applies
             // (apply by filter_id) the saved one, which Iris cannot see.
-            let unseen = !given(args, "filter_action");
+            // Applying by filter_id always uses the saved filter, whatever
+            // action is also given.
+            let unseen =
+                !given(args, "filter_action") || (a == "apply" && given(args, "filter_id"));
             let forwards = unseen || has_key(fa, "forward");
             let trashes = unseen || mentions(fa, "trash");
             let mut out = Vec::new();
@@ -879,6 +917,26 @@ mod tests {
     }
 
     #[test]
+    fn tools_placed_by_arguments_are_listed() {
+        // Every tool with its own arm in call_actions is in the list, and
+        // the others return their one action whatever the arguments.
+        for t in SERVER_TOOLS {
+            if placed_by_arguments(t) {
+                continue;
+            }
+            assert_eq!(tool_actions(t).len(), 1, "{t}");
+            let a = call_actions(t, &json!({})).unwrap();
+            assert_eq!(
+                call_actions(t, &json!({"action": "delete", "trashed": true})).unwrap(),
+                a,
+                "{t}"
+            );
+        }
+        assert!(!placed_by_arguments("resize_sheet_dimensions"));
+        assert!(!placed_by_arguments("batch_update_doc"));
+    }
+
+    #[test]
     fn a_call_only_performs_actions_its_tool_declares() {
         let samples = [
             json!({}),
@@ -1117,6 +1175,37 @@ mod tests {
                 ("gmail.forward_filters", Send),
                 ("gmail.trash", Delete)
             ])
+        );
+        // Applying by id uses the saved filter, whatever action is given;
+        // "{}" (a JSON string the server decodes) is no action at all.
+        assert_eq!(
+            c(
+                "manage_gmail_filter",
+                json!({"action": "apply", "filter_id": "f1", "filter_action": {"addLabelIds": ["STARRED"]}})
+            ),
+            Some(vec![
+                ("gmail.filters", Write),
+                ("gmail.organize", Write),
+                ("gmail.trash", Delete)
+            ])
+        );
+        assert_eq!(
+            c(
+                "manage_gmail_filter",
+                json!({"action": "update", "filter_id": "f1", "criteria": {"from": "x@example.com"}, "filter_action": "{}"})
+            ),
+            Some(vec![
+                ("gmail.filters", Write),
+                ("gmail.forward_filters", Send),
+                ("gmail.trash", Delete)
+            ])
+        );
+        assert_eq!(
+            c(
+                "manage_event",
+                json!({"action": "create", "summary": "x", "attendees": "[]"})
+            ),
+            Some(vec![("calendar.events.create", Write)])
         );
         assert_eq!(
             c(
