@@ -155,8 +155,22 @@ pub fn status(c: &rusqlite::Connection) -> rusqlite::Result<Value> {
     let con = entities::list_connectors(c, false)?
         .into_iter()
         .find(|c| c.service == "google");
+    let has_client = con.as_ref().is_some_and(|c| {
+        c.config
+            .oauth
+            .as_ref()
+            .is_some_and(|o| o.client_id.is_some())
+    });
     let p = if db::get_setting(c, SETTING)?.is_some() {
-        read(c)?
+        let mut p = read(c)?;
+        // Saved progress can outlive the connector (removed, then re-added):
+        // without a saved key, resume at the paste step instead of sign-in.
+        if p.sign_in && !has_client {
+            p.sign_in = false;
+            p.completed = false;
+            p.step = STEPS;
+        }
+        p
     } else if con.as_ref().is_some_and(|c| {
         c.config
             .oauth
@@ -313,6 +327,27 @@ mod tests {
     use super::*;
     const ID: &str = "123-example.apps.googleusercontent.com";
     const SECRET: &str = "GOCSPX-paste-canary_123";
+
+    #[test]
+    fn stale_sign_in_progress_resumes_at_the_paste_step_without_a_connector() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let st = db
+            .with(|c| {
+                save(
+                    c,
+                    &Progress {
+                        step: STEPS,
+                        sign_in: true,
+                        completed: true,
+                        issue: None,
+                    },
+                )?;
+                status(c)
+            })
+            .unwrap();
+        assert_eq!(st["phase"], "setup");
+        assert_eq!(st["step"], STEPS);
+    }
 
     #[test]
     fn parses_google_downloads_and_freeform_pairs() {

@@ -250,7 +250,8 @@ function GoogleSetup({ entry, con }) {
       ${p.error && html`<div class="warn-box" role="alert">${p.error.message}</div>`}
       ${entry.missing?.length > 0 && p.phase === 'sign_in' && html`<div class="warn-box">I need the Google helper installed on my server before I can use this connection. Ask whoever runs your Iris server to install uv.</div>`}
       ${p.phase === 'connected' ? html`<div class="ok-line"><${Icon} name="check" /> Connected ✓</div><p>Gmail, Calendar, Drive and YouTube read-only are ready. ${agentName()} uses your approval rules for Google actions.</p>
-        <button class="b1 wide" onClick=${() => go('iris/connections')}>Done</button>`
+        <button class="b1 wide" onClick=${() => go('iris/connections')}>Done</button>
+        <button class="b2 wide gap" disabled=${busy} onClick=${() => advance(6)}>Replace login key</button>`
       : p.phase === 'sign_in' ? html`<p>Google asks your permission so I can use all four services with your approval rules.</p>
         <p>“Google hasn't verified this app” is expected for your own private app. Tap <b>Advanced → Go to Iris</b>, then approve access to all four services.</p>
         ${!setup.redirect_uri ? html`<div class="warn-box">I need my server’s HTTPS address set first.</div><button class="b1 wide" onClick=${() => advance(4)}>Set up HTTPS</button>` : con ? html`<${ServiceSignIn} con=${con} label="Google" onDone=${reload} />` : html`<${Spinner} />`}
