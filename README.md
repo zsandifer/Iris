@@ -179,14 +179,17 @@ Iris is **early** and moving fast. What works today:
   approval cards for sends, purchases, deletions and new recipients,
   trusted people, tripwires, Pause Iris and Disconnect everything
 - ✅ For you feed with stories, Ideas, Goals, Library, system file editing
-- ✅ Push notifications, quiet hours, an encrypted credentials vault
+- ✅ Automatic feed sources (RSS, YouTube, Reddit, Hacker News, Bluesky,
+  Mastodon) with rule-based ranking, adaptive size, and two small model
+  calls a day
+- ✅ Push notifications, quiet hours with a digest afterwards, an encrypted
+  credentials vault
 - ✅ Iris's own browser: watch it live, take over from your phone, and let
   Iris sign in with saved logins (cards always ask first)
 - 🧪 Shared chats with more than one person (preview)
 
 On the way:
 
-- 🚧 Automatic feed sources (RSS, YouTube, Reddit) with adaptive size
 - 🚧 Voice replies
 - 🚧 A character for Iris
 

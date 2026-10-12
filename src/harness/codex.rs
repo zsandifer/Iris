@@ -179,6 +179,25 @@ pub fn mcp_setup(
     Ok(out)
 }
 
+/// Codex features that give the model tools (shell, apps, browser, image
+/// viewing, code mode, ...), disabled for tool-less helper calls.
+const CODEX_TOOL_FEATURES: &[&str] = &[
+    "shell_tool",
+    "unified_exec",
+    "apps",
+    "plugins",
+    "browser_use",
+    "browser_use_external",
+    "in_app_browser",
+    "computer_use",
+    "image_generation",
+    "view_image",
+    "code_mode_host",
+    "tool_suggest",
+    "goals",
+    "sleep_tool",
+];
+
 impl Harness for Codex {
     fn name(&self) -> &'static str {
         "codex"
@@ -190,6 +209,7 @@ impl Harness for Codex {
             effort: true,
             mcp: true,
             resume: true,
+            tool_less: true,
         }
     }
 
@@ -204,7 +224,18 @@ impl Harness for Codex {
             a.push("-i".into());
             a.push(img.path.to_string_lossy().into_owned());
         }
-        a.extend(["--json", "--skip-git-repo-check", "-m"].map(String::from));
+        a.extend(["--json", "--skip-git-repo-check"].map(String::from));
+        if !spec.tools {
+            a.extend(["--ignore-user-config", "--ignore-rules", "--ephemeral"].map(String::from));
+            // Every tool-providing feature off, so the model has no tools at
+            // all (verified with codex-cli 0.162: without these it runs
+            // shell commands; with them it reports none).
+            for feature in CODEX_TOOL_FEATURES {
+                a.push("--disable".into());
+                a.push((*feature).into());
+            }
+        }
+        a.push("-m".into());
         a.push(spec.model.clone());
         let mut overrides = Vec::new();
         if let Some(e) = &spec.effort {
@@ -213,12 +244,16 @@ impl Harness for Codex {
         overrides.push(developer_instructions_arg(DEVELOPER_NOTE));
         // Preserve read-only; more permissive modes remain confined to the
         // conversation's working directory by the workspace profile.
-        let (sandbox, parent) = if self.cfg.sandbox == "read-only" {
+        let (sandbox, parent) = if !spec.tools || self.cfg.sandbox == "read-only" {
             ("read-only", ":read-only")
         } else {
             ("workspace-write", ":workspace")
         };
         overrides.push(format!("sandbox_mode={}", toml_str(sandbox)));
+        if !spec.tools {
+            overrides.push("approval_policy=\"never\"".into());
+            overrides.push("web_search=\"disabled\"".into());
+        }
         // Codex 0.162.1's config/permissions.rs recognizes these special
         // paths. Named profiles ignore legacy sandbox_workspace_write flags;
         // override the inherited temp write grants in the active profile.
@@ -282,7 +317,10 @@ impl Harness for Codex {
             // have written one). The global one cannot be switched off; see
             // `can_isolate`.
         }
-        a.extend(self.cfg.extra_args.iter().cloned());
+        // Operator extra arguments may add tools: omit them for helpers.
+        if spec.tools {
+            a.extend(self.cfg.extra_args.iter().cloned());
+        }
         for o in overrides {
             a.push("-c".into());
             a.push(o);
@@ -592,6 +630,7 @@ mod tests {
             writable_dirs: vec!["/unrelated-memory".into()],
             run_dir: run_dir.into(),
             scope: "c1".into(),
+            tools: true,
             key_env: Vec::new(),
             isolated: false,
             own_mcp_servers: Vec::new(),
@@ -808,6 +847,7 @@ mod tests {
             writable_dirs: vec!["/m".into()],
             run_dir: run.path().into(),
             scope: "c1".into(),
+            tools: true,
             key_env: vec![],
             isolated: false,
             own_mcp_servers: vec!["mine".into()],

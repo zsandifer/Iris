@@ -317,8 +317,10 @@ impl Default for JobConfig {
 impl JobConfig {
     fn feed_default() -> Self {
         Self {
-            interval_mins: 360,
-            ..Self::default()
+            enabled: true,
+            interval_mins: 60,
+            active_start: "06:00".into(),
+            active_end: "22:00".into(),
         }
     }
 }
@@ -705,7 +707,8 @@ mod tests {
     #[test]
     fn partial_tables_keep_specific_defaults() {
         let cfg =
-            Config::parse("[harness.codex]\nenabled = false\n[feed]\nenabled = true\n").unwrap();
+            Config::parse("[harness.codex]\nenabled = false\n[feed]\nactive_start = \"07:00\"\n")
+                .unwrap();
         let codex = &cfg.harness["codex"];
         assert!(!codex.enabled);
         assert_eq!(codex.command, "codex");
@@ -714,7 +717,8 @@ mod tests {
         assert_eq!(codex.efforts, HarnessConfig::codex_default().efforts);
         assert_eq!(cfg.harness["claude"], HarnessConfig::claude_default());
         assert!(cfg.feed.enabled);
-        assert_eq!(cfg.feed.interval_mins, 360);
+        assert_eq!(cfg.feed.interval_mins, 60);
+        assert_eq!(cfg.feed.active_start, "07:00");
     }
 
     #[test]

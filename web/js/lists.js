@@ -6,7 +6,7 @@ import {
 } from './store.js';
 import { Icon, Img, Empty, Spinner, ago, since, openSheet, closeSheet, confirmSheet, hostOf, useBlob } from './ui.js';
 import { md } from './md.js';
-import { Post, findPost } from './feed.js';
+import { Post, findPost, photos } from './feed.js';
 import { openPhoto } from './photo.js';
 
 function Head({ title, sub }) {
@@ -186,7 +186,7 @@ function Saved({ posts, limit }) {
     });
   };
   return html`<div class="grp">${list.map((p) => html`<div class="r tap" onClick=${() => show(p)}>
-    <div class="ri thumb">${(p.images?.[0] || p.image_url) ? html`<${Img} src=${p.images?.[0] || p.image_url} alt=${p.title} />` : html`<${Icon} name="heart" size=${16} />`}</div>
+    <div class="ri thumb">${photos(p)[0] ? html`<${Img} src=${photos(p)[0]} alt=${p.title} />` : html`<${Icon} name="heart" size=${16} />`}</div>
     <div class="rt">${p.title}<small>${p.source_name || hostOf(p.source_url) || p.topic || 'Saved post'}</small></div>
     <${Icon} name="chev" size=${16} cls="rc" /></div>`)}</div>`;
 }

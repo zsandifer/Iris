@@ -13,6 +13,7 @@ mod demo;
 mod engines;
 mod entities;
 mod events;
+mod feed;
 mod gateway;
 mod harness;
 mod import;

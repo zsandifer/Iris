@@ -18,7 +18,7 @@ function initialState() {
     engines: null,       // GET /api/engines (owner)
     connectors: null,    // GET /api/connectors (owner)
     slots: null,         // Slot[]
-    feed: null,          // {posts, hasMore}
+    feed: null,          // {posts, hasMore, status}
     ideas: null,
     goals: null,
     library: null,
@@ -307,7 +307,7 @@ export async function loadFeed(more = false) {
   if (!more) {
     const apply = refreshOf('feed');
     const r = await get('/feed?limit=30');
-    apply(() => set({ feed: { posts: r.posts, hasMore: r.has_more } }));
+    apply(() => set({ feed: { posts: r.posts, hasMore: r.has_more, status: r.status } }));
     return;
   }
   const last = S.feed?.posts?.at(-1);
@@ -317,7 +317,7 @@ export async function loadFeed(more = false) {
   // This page only follows the list it was asked for.
   if (!fits() || S.feed?.posts.at(-1)?.id !== last.id) return;
   grew('feed');
-  set({ feed: { posts: appendNew(S.feed.posts, r.posts), hasMore: r.has_more } });
+  set({ feed: { posts: appendNew(S.feed.posts, r.posts), hasMore: r.has_more, status: r.status } });
 }
 
 /**

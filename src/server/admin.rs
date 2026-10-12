@@ -1149,7 +1149,7 @@ async fn run_job(
             "Iris is paused; resume it first",
         ));
     }
-    let started = crate::jobs::trigger(&state, job);
+    let started = crate::jobs::trigger(&state, job, true);
     Ok((
         StatusCode::ACCEPTED,
         axum::Json(json!({"started": started})),

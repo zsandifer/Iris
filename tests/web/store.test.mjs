@@ -414,3 +414,33 @@ test('a cached older streaming reply outside the latest page is not kept live', 
   assert.notEqual(a.status, 'streaming');
   assert.equal(S.live.a, undefined);
 });
+
+
+test('feed refresh and paging retain adaptive status and drop stale status', async () => {
+  let release;
+  let status = { daily_size: 10, last_batch_at: 100, running: false };
+  const first = { id: 'feed-status-first', created_at: 100 };
+  route({ '/api/feed': (q, opts) => {
+    if (q.get('before')) return new Promise((r) => {
+      const old = status;
+      release = () => r(reply(opts, { body: { posts: [{ id: 'feed-status-old', created_at: 99 }], has_more: false, status: old } }));
+    });
+    return reply(opts, { body: { posts: [first], has_more: true, status } });
+  } });
+  await loadFeed();
+  assert.deepEqual(S.feed.status, status);
+  const pending = loadFeed(true);
+  await tick();
+  status = { daily_size: 12, last_batch_at: 101, running: true };
+  await loadFeed();
+  release();
+  await pending;
+  assert.deepEqual(S.feed.status, status, 'a stale page cannot restore old batch status');
+  const page = loadFeed(true);
+  await tick();
+  release();
+  await page;
+  assert.deepEqual(S.feed.status, status);
+  assert.equal(S.feed.posts.length, 2);
+  assert.equal(S.feed.hasMore, false);
+});

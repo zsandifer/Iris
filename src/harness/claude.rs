@@ -83,6 +83,7 @@ impl Harness for Claude {
             effort: true,
             mcp: true,
             resume: true,
+            tool_less: true,
         }
     }
 
@@ -126,6 +127,28 @@ impl Harness for Claude {
         a.push("--append-system-prompt-file".into());
         a.push(prompt_file.to_string_lossy().into_owned());
         a.extend(["--system-prompt-snapshot", "off"].map(String::from));
+        a.extend(["--setting-sources", ""].map(String::from));
+        let mut deny = vec!["Bash".to_string()];
+        for path in &spec.protected_paths {
+            // Claude Code 2.1.x anchors `/path` at the working directory;
+            // `//path` is absolute (docs/en/permissions#read-and-edit).
+            let pattern = format!("/{}", path.display());
+            for tool in ["Read", "Edit", "Write", "Glob", "Grep"] {
+                deny.push(format!("{tool}({pattern}/**)"));
+                deny.push(format!("{tool}({pattern})"));
+            }
+        }
+        if !spec.tools {
+            // No built-in tools and no MCP servers from the user's settings.
+            // `--tools` is variadic, so a flag always follows it.
+            a.extend(["--tools", "", "--strict-mcp-config"].map(String::from));
+            a.extend(["--permission-prompts", "none"].map(String::from));
+            a.extend(["--disallowedTools".into(), deny.join(",")]);
+            // No operator `extra_args` here: they could add MCP servers or
+            // tools back.
+            inv.stdin = user_message_line(spec)?;
+            return Ok(inv);
+        }
         if !self.cfg.permission_mode.is_empty() {
             a.push("--permission-mode".into());
             a.push(self.cfg.permission_mode.clone());
@@ -137,7 +160,6 @@ impl Harness for Claude {
         // and approvals. Someone else's chat also gets none of the owner's
         // CLAUDE.md files or auto memory (environment above).
         a.push("--strict-mcp-config".into());
-        a.extend(["--setting-sources", ""].map(String::from));
 
         let mut allowed = self.cfg.allowed_tools.clone();
         if !spec.mcp_servers.is_empty() {
@@ -164,16 +186,6 @@ impl Harness for Claude {
             a.push(dir.to_string_lossy().into_owned());
         }
         a.extend(self.cfg.extra_args.iter().cloned());
-        let mut deny = vec!["Bash".to_string()];
-        for path in &spec.protected_paths {
-            // Claude Code 2.1.x anchors `/path` at the working directory;
-            // `//path` is absolute (docs/en/permissions#read-and-edit).
-            let pattern = format!("/{}", path.display());
-            for tool in ["Read", "Edit", "Write", "Glob", "Grep"] {
-                deny.push(format!("{tool}({pattern}/**)"));
-                deny.push(format!("{tool}({pattern})"));
-            }
-        }
         a.extend(["--disallowedTools".into(), deny.join(",")]);
         inv.stdin = user_message_line(spec)?;
         Ok(inv)
@@ -690,6 +702,7 @@ mod tests {
             writable_dirs: vec![tmp.path().join("memory")],
             run_dir: tmp.path().into(),
             scope: "c1".into(),
+            tools: true,
             key_env: vec![],
             isolated: false,
             own_mcp_servers: Vec::new(),

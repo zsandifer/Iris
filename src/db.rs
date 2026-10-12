@@ -289,6 +289,87 @@ CREATE INDEX messages_pending_approvals ON messages(conversation_id, created_at)
       AND json_extract(card, '$.state') = 'pending';
 "#,
     r#"
+-- The For you pipeline (src/feed). Posts gain a story hook, the source's
+-- favicon, local copies of their photos ({original url: cached file}),
+-- the source kind, a canonical link key, and page facts (price, event).
+ALTER TABLE feed_posts ADD COLUMN hook TEXT;
+ALTER TABLE feed_posts ADD COLUMN favicon_url TEXT;
+ALTER TABLE feed_posts ADD COLUMN cached TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE feed_posts ADD COLUMN source_kind TEXT;
+ALTER TABLE feed_posts ADD COLUMN url_key TEXT;
+ALTER TABLE feed_posts ADD COLUMN facts TEXT NOT NULL DEFAULT '{}';
+CREATE INDEX feed_posts_user_recent ON feed_posts(user_id, created_at);
+
+-- Where the pipeline looks. origin: user (added in the app), suggested (by
+-- the daily interests call), google (YouTube subscriptions).
+CREATE TABLE feed_sources (
+    id            TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind          TEXT NOT NULL CHECK (kind IN ('rss', 'youtube', 'reddit', 'hn', 'bluesky', 'mastodon')),
+    value         TEXT NOT NULL,
+    label         TEXT,
+    topic         TEXT,
+    origin        TEXT NOT NULL DEFAULT 'user' CHECK (origin IN ('user', 'suggested', 'google')),
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    -- Removed by the user: kept (hidden) so suggestions and imports do not
+    -- bring it back; adding it again clears this.
+    removed       INTEGER NOT NULL DEFAULT 0,
+    -- The owner turned it on or off by hand: automatic trimming leaves it.
+    decided       INTEGER NOT NULL DEFAULT 0,
+    state         TEXT NOT NULL DEFAULT '{}',
+    last_fetch_at INTEGER,
+    last_ok_at    INTEGER,
+    last_error    TEXT,
+    fail_count    INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    UNIQUE (user_id, kind, value)
+);
+
+-- Links and titles already shown, so nothing repeats.
+CREATE TABLE feed_seen (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    key     TEXT NOT NULL,
+    seen_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, key)
+);
+
+-- Per local day: posts published, feed opens, and whether the user reached
+-- the end of the day's posts (drives the adaptive daily size).
+CREATE TABLE feed_days (
+    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    day         TEXT NOT NULL,
+    published   INTEGER NOT NULL DEFAULT 0,
+    opened      INTEGER NOT NULL DEFAULT 0,
+    reached_end INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, day)
+);
+
+-- Prices of saved (liked) products, checked daily for drops. A watch is
+-- active while any liked post links to its URL (post_id is the first).
+CREATE TABLE feed_watches (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    post_id     TEXT,
+    url         TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    price       REAL NOT NULL,
+    currency    TEXT NOT NULL DEFAULT '',
+    checked_at  INTEGER,
+    created_at  INTEGER NOT NULL,
+    UNIQUE (user_id, url)
+);
+
+-- Notifications held during quiet hours, delivered as a digest after.
+CREATE TABLE push_queue (
+    id         TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    payload    TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX push_queue_user ON push_queue(user_id, created_at);
+"#,
+    r#"
 -- A monotonic revision also prevents a running turn from restoring a
 -- stale session, even if someone leaves and rejoins in one millisecond.
 ALTER TABLE conversations ADD COLUMN membership_version INTEGER NOT NULL DEFAULT 0;
@@ -1748,6 +1829,97 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn a_database_at_main_schema_upgrades_with_feed_and_gateway_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        let owner;
+        {
+            let conn = Connection::open(&path).unwrap();
+            // Main shipped migrations 1–5; the feed is migration 6.
+            conn.execute_batch(include_str!("../tests/fixtures/main-schema-v4.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../tests/fixtures/main-migration-v5.sql"))
+                .unwrap();
+            owner = ensure_owner(&conn).unwrap();
+            let conv = ensure_main_conversation(&conn, &owner).unwrap();
+            let card = crate::entities::approval_card(&crate::entities::ApprovalRequest {
+                service: "wallet",
+                approver_user_id: &owner,
+                ..Default::default()
+            });
+            crate::entities::insert_card(&conn, &conv, &card, "assistant").unwrap();
+            conn.execute(
+                r#"INSERT INTO connectors (id, name, transport, config, policy, paused_reason,
+                     paused_at, auth_state, workspace_cwd, created_at, updated_at)
+                 VALUES ('c1', 'mail', 'stdio', '{}', '{"default":"ask"}', 'tripwire',
+                     2, 'ok', 0, 1, 1)"#,
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO connector_calls (id, connector_id, connector_name, tool,
+                     category, decision, created_at) VALUES ('call1', 'c1', 'mail',
+                     'send_message', 'send', 'ask', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                r#"INSERT INTO feed_posts (id, user_id, title, body, images, source_name, why,
+                     created_at, updated_at) VALUES ('p1', ?1, 'A story', 'A description',
+                     '["https://example.com/photo.jpg"]', 'Example', 'Your interests', 1, 1)"#,
+                [&owner],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            let v: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            assert_eq!(v as usize, MIGRATIONS.len());
+            let (policy, reason, cwd): (String, String, i64) = c.query_row(
+                "SELECT policy, paused_reason, workspace_cwd FROM connectors WHERE id = 'c1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            assert_eq!(policy, r#"{"default":"ask"}"#);
+            assert_eq!(reason, "tripwire");
+            assert_eq!(cwd, 0);
+            let calls: i64 =
+                c.query_row("SELECT COUNT(*) FROM connector_calls", [], |r| r.get(0))?;
+            assert_eq!(calls, 1);
+
+            let pending: i64 = c.query_row(
+                "SELECT COUNT(*) FROM messages INDEXED BY messages_pending_approvals
+                 WHERE kind = 'card' AND json_extract(card, '$.type') = 'approval'
+                   AND json_extract(card, '$.state') = 'pending'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(pending, 1);
+            let posts = crate::entities::list_feed(c, &owner, None, 10)?;
+            assert_eq!(posts.len(), 1);
+            assert_eq!(posts[0].title, "A story");
+            assert_eq!(posts[0].source_name.as_deref(), Some("Example"));
+            assert!(posts[0].hook.is_none());
+            let source =
+                crate::feed::store::add_source(c, &owner, "hn", "front_page", None, None, "user")?;
+            assert_eq!(
+                crate::feed::store::list_sources(c, &owner)?[0].id,
+                source.unwrap().id
+            );
+            c.execute(
+                "INSERT INTO push_queue (id, user_id, payload, created_at)
+                VALUES ('push1', ?1, '{}', 1)",
+                [&owner],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        // Reopening an upgraded DB must not try to apply the feed twice.
+        drop(db);
+        Db::open(&path).unwrap();
     }
 
     #[test]

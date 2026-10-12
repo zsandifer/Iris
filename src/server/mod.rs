@@ -560,10 +560,11 @@ mod tests {
         crate::persona::seed(&paths).unwrap();
         let db = crate::db::Db::open(&paths.db_file()).unwrap();
         let mut cfg = Config::default();
-        // Never touch real CLIs from tests.
+        // Never touch real CLIs (or the network) from tests.
         for h in cfg.harness.values_mut() {
             h.enabled = false;
         }
+        cfg.feed.enabled = false;
         let state = AppState::new(cfg, paths, db).unwrap();
         Harness {
             app: router(state.clone()),
@@ -2017,6 +2018,285 @@ esac
             let (s, _, _) = get_raw(&h.app, missing, None).await;
             assert_eq!(s, StatusCode::NOT_FOUND, "{missing}");
         }
+    }
+
+    #[tokio::test]
+    async fn feed_pipeline_routes() {
+        let h = setup();
+        let t = pair_as(&h, None).await;
+        let (_, feed) = send(&h.app, "GET", "/api/feed", Some(&t), None).await;
+        assert_eq!(feed["status"]["pipeline"], true);
+        assert_eq!(feed["status"]["enabled"], false, "config is off by default");
+        assert_eq!(feed["status"]["daily_size"], 10);
+        assert_eq!(feed["status"]["paused"], false);
+
+        // Activity drives the adaptive size and the pause.
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            "/api/feed/activity",
+            Some(&t),
+            Some(json!({"event": "nope"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        for ev in ["opened", "reached_end"] {
+            let (s, _) = send(
+                &h.app,
+                "POST",
+                "/api/feed/activity",
+                Some(&t),
+                Some(json!({"event": ev})),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK);
+        }
+        let owner = h.state.db.with(db::owner_user_id).unwrap().unwrap();
+        let st = h
+            .state
+            .db
+            .with(|c| crate::feed::store::get_state(c, &owner))
+            .unwrap();
+        assert!(st.last_open_at.is_some());
+
+        h.state
+            .db
+            .with(|c| {
+                crate::feed::store::update_state(c, &owner, |s| {
+                    s.last_batch_day = Some(crate::jobs::local_day(crate::util::now_ms()))
+                })
+            })
+            .unwrap();
+        // Pause by hand, then resume: the app overrides the disabled config.
+        let (_, p) = send(&h.app, "POST", "/api/feed/pause", Some(&t), None).await;
+        assert_eq!(
+            (
+                p["status"]["paused"].as_bool(),
+                p["status"]["paused_reason"].as_str()
+            ),
+            (Some(true), Some("user"))
+        );
+        assert_eq!(p["status"]["enabled"], false);
+        let (_, r) = send(&h.app, "POST", "/api/feed/resume", Some(&t), None).await;
+        assert_eq!(
+            (r["was_paused"].as_bool(), r["status"]["paused"].as_bool()),
+            (Some(true), Some(false))
+        );
+
+        assert_eq!(r["status"]["enabled"], true);
+        assert!(crate::feed::enabled(&h.state).await);
+        assert_eq!(
+            crate::jobs::status(&h.state)
+                .await
+                .iter()
+                .find(|j| j["name"] == "feed")
+                .unwrap()["enabled"],
+            true
+        );
+        // A restart retains the app's choice even though config defaults off.
+        let reloaded = AppState::new(
+            h.state.cfg.clone(),
+            h.state.paths.clone(),
+            crate::db::Db::open(&h.state.paths.db_file()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::feed::status_json(&reloaded, &owner).await["enabled"],
+            true
+        );
+        let (_, p) = send(&h.app, "POST", "/api/feed/pause", Some(&t), None).await;
+        assert_eq!(p["status"]["enabled"], false);
+        assert!(!crate::feed::enabled(&h.state).await);
+        let mut cfg = h.state.cfg.clone();
+        cfg.feed.enabled = true;
+        let reloaded = AppState::new(
+            cfg,
+            h.state.paths.clone(),
+            crate::db::Db::open(&h.state.paths.db_file()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::feed::status_json(&reloaded, &owner).await["enabled"],
+            false,
+            "app choice also overrides an enabled config"
+        );
+
+        // Sources.
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            "/api/feed/sources",
+            Some(&t),
+            Some(json!({"input": "r/space"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(
+            (b["source"]["kind"].as_str(), b["source"]["origin"].as_str()),
+            (Some("reddit"), Some("user"))
+        );
+        let id = b["source"]["id"].as_str().unwrap().to_string();
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            "/api/feed/sources",
+            Some(&t),
+            Some(json!({"input": "not a source"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (_, b) = send(
+            &h.app,
+            "PATCH",
+            &format!("/api/feed/sources/{id}"),
+            Some(&t),
+            Some(json!({"enabled": false})),
+        )
+        .await;
+        assert_eq!(b["source"]["enabled"], false);
+        let (_, list) = send(&h.app, "GET", "/api/feed/sources", Some(&t), None).await;
+        assert_eq!(list["sources"].as_array().unwrap().len(), 1);
+        assert!(
+            list["sources"][0].get("state").is_none(),
+            "internal state stays private"
+        );
+        let (s, _) = send(
+            &h.app,
+            "DELETE",
+            &format!("/api/feed/sources/{id}"),
+            Some(&t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        let name = "0123456789abcdef0123456789abcdef.png";
+        // A pipeline post shows its cached photo; liking a priced post
+        // watches it, and Talk about it carries the link.
+        let post = h
+            .state
+            .db
+            .with(|c| {
+                crate::entities::insert_pipeline_post(
+                    c,
+                    &owner,
+                    &crate::entities::PipelinePost {
+                        title: "Trail shoe".into(),
+                        body: "Light and grippy.".into(),
+                        source_url: "https://shop.example/shoe".into(),
+                        source_name: "Shop".into(),
+                        source_kind: "rss".into(),
+                        images: vec!["https://shop.example/shoe.jpg".into()],
+                        cached: [(
+                            "https://shop.example/shoe.jpg".to_string(),
+                            name.to_string(),
+                        )]
+                        .into(),
+                        facts: json!({"price": {"amount": 120.0, "currency": "USD"}}),
+                        why: Some("You run trails.".into()),
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(post.photos, vec![format!("/api/feed/images/{name}")]);
+        assert_eq!(post.images, vec!["https://shop.example/shoe.jpg"]);
+
+        // Cached images: only well-formed names, served with safe headers.
+        let dir = crate::feed::images::dir(&h.state.paths.data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let req = HttpRequest::builder()
+            .uri(format!("/api/feed/images/{name}"))
+            .header("authorization", format!("Bearer {t}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = h.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "image/png");
+        assert!(
+            res.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("sandbox")
+        );
+        let (s, _) = send(
+            &h.app,
+            "GET",
+            "/api/feed/images/..%2F..%2Firis.db",
+            Some(&t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _) = send(
+            &h.app,
+            "GET",
+            &format!("/api/feed/images/{name}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+        // Another person cannot read the owner's cached images.
+        let (_, u) = send(
+            &h.app,
+            "POST",
+            "/api/users",
+            Some(&t),
+            Some(json!({"display_name": "Sam"})),
+        )
+        .await;
+        let sam = pair_as(&h, u["user"]["id"].as_str()).await;
+        let (s, _) = send(
+            &h.app,
+            "GET",
+            &format!("/api/feed/images/{name}"),
+            Some(&sam),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/feed/{}/like", post.id),
+            Some(&t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let watched = h
+            .state
+            .db
+            .with(|c| crate::feed::store::due_watches(c, &owner, 10))
+            .unwrap();
+        assert_eq!(watched.len(), 1);
+        let (_, d) = send(
+            &h.app,
+            "POST",
+            &format!("/api/feed/{}/discuss", post.id),
+            Some(&t),
+            None,
+        )
+        .await;
+        let cid = d["conversation"]["id"].as_str().unwrap();
+        let (_, msgs) = send(
+            &h.app,
+            "GET",
+            &format!("/api/conversations/{cid}/messages"),
+            Some(&t),
+            None,
+        )
+        .await;
+        let ctx = msgs["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            ctx.contains("Link: https://shop.example/shoe")
+                && ctx.contains("Why it was picked: You run trails."),
+            "{ctx}"
+        );
     }
 
     #[tokio::test]
