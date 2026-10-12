@@ -157,7 +157,10 @@ pub async fn finish(state: &AppState, kind: &str, target: &str, outcome: &str, n
                         }
                         _ => false,
                     };
-                    if !matches || resolved(&card) {
+                    if !matches
+                        || resolved(&card)
+                        || db::conversation_member_ids(c, &m.conversation_id)? != [owner.clone()]
+                    {
                         continue;
                     }
                     card["state"] = outcome.clone().into();
@@ -166,9 +169,7 @@ pub async fn finish(state: &AppState, kind: &str, target: &str, outcome: &str, n
                         card[field] = Value::Null;
                     }
                     updates.push(db::update_message_card(c, &id, &card)?);
-                    if db::conversation_member_ids(c, &m.conversation_id)? == [owner.clone()] {
-                        conversations.insert(m.conversation_id);
-                    }
+                    conversations.insert(m.conversation_id);
                 }
                 let notes = conversations
                     .iter()
@@ -223,13 +224,32 @@ pub async fn request(
         if con.as_ref().is_some_and(|c| c.active()) {
             return Ok(json!({"outcome": "already connected"}));
         }
-        let card = if let Some(con) = con.filter(|c| c.auth_state != "ok") {
-            json!({"type": "connector_reconnect", "title": format!("Reconnect {}", catalog.label), "connector_id": con.id, "service": name,
-                "auth": if con.config.oauth.is_some() { "oauth" } else { "secrets" }, "state": "needs_reconnect", "owner_only": true})
+        if let Some(con) = con
+            .as_ref()
+            .filter(|c| !c.enabled || c.paused_reason.is_some())
+        {
+            let status = if !con.enabled { "disabled" } else { "paused" };
+            (
+                name,
+                json!({"type": "action", "title": format!("{} is {status}", catalog.label),
+                    "body": format!("I can't use {} because it is {status} by the owner. Review its settings and resume it when you're ready.", catalog.label),
+                    "connector_id": con.id, "service": con.service, "state": "pending", "owner_only": true,
+                    "action_label": "Resume", "action": {"method": "POST", "path": format!("/api/connectors/{}/resume", con.id)}}),
+                if !con.enabled {
+                    "connector disabled by owner"
+                } else {
+                    "connector paused by owner"
+                },
+            )
         } else {
-            json!({"type": "connect", "title": format!("Connect {}", catalog.label), "service": name, "state": "pending", "owner_only": true})
-        };
-        (name, card, "posted a connect card")
+            let card = if let Some(con) = con.filter(|c| c.auth_state != "ok") {
+                json!({"type": "connector_reconnect", "title": format!("Reconnect {}", catalog.label), "connector_id": con.id, "service": name,
+                "auth": if con.config.oauth.is_some() { "oauth" } else { "secrets" }, "state": "needs_reconnect", "owner_only": true})
+            } else {
+                json!({"type": "connect", "title": format!("Connect {}", catalog.label), "service": name, "state": "pending", "owner_only": true})
+            };
+            (name, card, "posted a connect card")
+        }
     } else {
         let name = args["engine"].as_str().unwrap_or("");
         let Some(entry) = state.harness(name) else {
@@ -273,6 +293,7 @@ pub async fn request(
         }
     };
     let (uid, conv, tool) = (owner.to_owned(), conv.to_owned(), tool.to_owned());
+    let login_state = state.clone();
     let (value, posted) = state
         .db
         .call(move |c| {
@@ -299,11 +320,11 @@ pub async fn request(
                     m.card.as_ref().is_some_and(|k| {
                         !resolved(k)
                             && k["type"] == card["type"]
-                            && (k["harness"] == target || k["service"] == target)
+                            && (k["harness"] == target || k["service"] == target || (card["connector_id"].is_string() && k["connector_id"] == card["connector_id"]))
                     })
                 }) {
                     return Ok((
-                        json!({"outcome": "card already posted", "card_id": m.id}),
+                        json!({"outcome": if card["type"] == "action" { happened } else { "card already posted" }, "card_id": m.id}),
                         None,
                     ));
                 }
@@ -321,6 +342,10 @@ pub async fn request(
                 times.push(now_ms());
                 db::set_setting(c, &key, &json!(times).to_string())?;
                 let mut card = card;
+                if card["type"] == "engine_signin"
+                    && let Some(login) = login_state.logins.status(&target).filter(|s| !s.finished()) {
+                    login.apply_to_card(&mut card);
+                }
                 card["requested_by"] = "system_request".into();
                 card["request_tool"] = tool.into();
                 let message = entities::insert_card(c, &conv, &card, "assistant")?;
@@ -579,6 +604,170 @@ mod tests {
                 .unwrap()
                 .contains("signed in ✓")
         );
+    }
+
+    #[tokio::test]
+    async fn completions_leave_shared_and_guest_cards_untouched() {
+        let (_tmp, state, owner, conv) = fixture();
+        let (shared, guest, cards) = state.db.with(|c| {
+            c.execute("INSERT INTO users (id, display_name, is_owner, created_at) VALUES ('guest', 'Guest', 0, 1)", [])?;
+            let shared = db::create_conversation(c, &owner, "side", "Shared", None)?;
+            c.execute("INSERT INTO conversation_members (conversation_id, user_id, role, joined_at) VALUES (?1, 'guest', 'member', 1)", [&shared.id])?;
+            let guest = db::create_conversation(c, "guest", "side", "Guest", None)?;
+            entities::insert_connector(c, "connector-id", "google", "", "http", &ConnectorConfig::default(), true)?;
+            entities::set_connector_state(c, "connector-id", &ConnectorState { service: Some("google"), ..Default::default() })?;
+            let mut cards = vec![];
+            for cid in [&conv, &shared.id, &guest.id] {
+                for card in [
+                    json!({"type": "engine_signin", "harness": "codex", "state": "needs_reconnect"}),
+                    json!({"type": "engine_setup", "harness": "codex", "state": "needs_setup"}),
+                    json!({"type": "connect", "service": "google", "state": "pending"}),
+                    json!({"type": "connector_reconnect", "connector_id": "connector-id", "state": "needs_reconnect"}),
+                ] {
+                    cards.push(entities::insert_card(c, cid, &card, "assistant")?);
+                }
+            }
+            Ok((shared, guest, cards))
+        }).unwrap();
+        let mut events = state.hub.subscribe();
+        for (kind, target) in [
+            ("signin", "codex"),
+            ("install", "codex"),
+            ("connector", "connector-id"),
+        ] {
+            finish(&state, kind, target, "done", "Connection outcome.").await;
+            // Completion is idempotent.
+            finish(&state, kind, target, "done", "Connection outcome.").await;
+        }
+        state
+            .db
+            .with(|c| {
+                for before in &cards {
+                    let after = db::get_message(c, &before.id)?.unwrap();
+                    if before.conversation_id == conv {
+                        assert_eq!(after.card.unwrap()["state"], "done");
+                    } else {
+                        assert_eq!(after.card, before.card);
+                    }
+                }
+                for cid in [&shared.id, &guest.id] {
+                    assert!(
+                        db::list_messages(c, cid, None, 100)?
+                            .iter()
+                            .all(|m| m.kind != "system_note")
+                    );
+                }
+                assert_eq!(
+                    db::list_messages(c, &conv, None, 100)?
+                        .iter()
+                        .filter(|m| m.kind == "system_note")
+                        .count(),
+                    3
+                );
+                Ok(())
+            })
+            .unwrap();
+        let mut count = 0;
+        while let Ok(event) = events.try_recv() {
+            assert!(!event.audience.includes("guest"));
+            let value: Value = serde_json::from_str(&event.json).unwrap();
+            assert_eq!(value["conversation_id"], conv);
+            count += 1;
+        }
+        assert_eq!(count, 7);
+    }
+
+    #[tokio::test]
+    async fn paused_and_disabled_connectors_offer_resume_without_claiming_connected() {
+        for disabled in [false, true] {
+            let (_tmp, state, owner, conv) = fixture();
+            state
+                .db
+                .with(|c| {
+                    entities::insert_connector(
+                        c,
+                        "connector-id",
+                        "google",
+                        "",
+                        "http",
+                        &ConnectorConfig::default(),
+                        !disabled,
+                    )?;
+                    entities::set_connector_state(
+                        c,
+                        "connector-id",
+                        &ConnectorState {
+                            service: Some("google"),
+                            auth_state: Some("ok"),
+                            paused: (!disabled).then_some(Some("owner paused it")),
+                            ..Default::default()
+                        },
+                    )?;
+                    entities::insert_card(
+                        c,
+                        &conv,
+                        &json!({"type": "connect", "service": "google", "state": "pending"}),
+                        "assistant",
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            let args = json!({"name": "google"});
+            let response = request(&state, &owner, &conv, "request_connector_setup", &args)
+                .await
+                .unwrap();
+            assert_eq!(
+                response["outcome"],
+                if disabled {
+                    "connector disabled by owner"
+                } else {
+                    "connector paused by owner"
+                }
+            );
+            let repeated = request(&state, &owner, &conv, "request_connector_setup", &args)
+                .await
+                .unwrap();
+            assert_eq!(response, repeated);
+            let card = state
+                .db
+                .with(|c| db::get_message(c, response["card_id"].as_str().unwrap()))
+                .unwrap()
+                .unwrap()
+                .card
+                .unwrap();
+            assert_eq!(card["type"], "action");
+            assert_eq!(card["action_label"], "Resume");
+            assert_eq!(card["action"]["method"], "POST");
+            assert_eq!(
+                card["action"]["path"],
+                "/api/connectors/connector-id/resume"
+            );
+            assert_eq!(card["owner_only"], true);
+            assert!(card["body"].as_str().unwrap().contains(if disabled {
+                "disabled by the owner"
+            } else {
+                "paused by the owner"
+            }));
+            crate::login::on_connector_updated(&state, "connector-id").await;
+            state
+                .db
+                .with(|c| {
+                    let messages = db::list_messages(c, &conv, None, 100)?;
+                    assert_eq!(messages.len(), 2);
+                    assert!(
+                        messages
+                            .iter()
+                            .all(|m| m.card.as_ref().unwrap()["state"] == "pending")
+                    );
+                    assert!(
+                        !entities::get_connector(c, "connector-id")?
+                            .unwrap()
+                            .active()
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
     }
 
     #[tokio::test]
