@@ -1645,14 +1645,14 @@ Creates (or updates) the connector named after the service. Response
 {
   "progress": {
     "step": 3, "total_steps": 6, "phase": "setup",
-    "summary": "Google setup: step 3 of 6", "error": null
+    "summary": "Google setup: step 3 of 6", "project_id": "example-project-123456", "error": null
   },
   "pages": {
     "project": "https://console.cloud.google.com/projectcreate",
-    "apis": "https://console.cloud.google.com/flows/enableapi?apiid=gmail.googleapis.com,calendar-json.googleapis.com,drive.googleapis.com,youtube.googleapis.com",
-    "branding": "https://console.cloud.google.com/auth/branding",
-    "audience": "https://console.cloud.google.com/auth/audience",
-    "client": "https://console.cloud.google.com/auth/clients/create"
+    "apis": "https://console.cloud.google.com/flows/enableapi?apiid=gmail.googleapis.com,calendar-json.googleapis.com,drive.googleapis.com,youtube.googleapis.com&project=example-project-123456",
+    "branding": "https://console.cloud.google.com/auth/branding?project=example-project-123456",
+    "audience": "https://console.cloud.google.com/auth/audience?project=example-project-123456",
+    "client": "https://console.cloud.google.com/auth/clients/create?project=example-project-123456"
   },
   "redirect_uri": "https://iris.example/api/oauth/callback"
 }
@@ -1660,11 +1660,20 @@ Creates (or updates) the connector named after the service. Response
 
 Steps 1–6 are project, APIs, branding/audience, login key, publish, paste.
 `phase` is `setup`, `sign_in` (after the key is saved), or `connected`.
-The Console URLs are defined together on the server. `redirect_uri` is null
+The Console URLs are defined together on the server. All later Console links,
+including the individual API fallbacks, are pinned with `project=<project_id>`
+when an ID is saved; otherwise they retain their unpinned URLs. `redirect_uri` is null
 until `public_url` is a valid HTTPS URL without credentials, query or fragment.
 The app links to its HTTPS setup help from step 4.
 
-`PUT /api/connectors/google/setup` accepts `{"step": 1..6, "sign_in"?: false}`.
+`PUT /api/connectors/google/setup` accepts `{"step": 1..6, "sign_in"?: false,
+"project_id"?: "..."}`. The optional non-secret project ID accepts a bare ID,
+a Console URL containing `project=<id>`, or copied text containing the ID.
+It must be 6–30 lowercase ASCII letters, digits or hyphens, start with a
+letter and not end with a hyphen. Invalid or ambiguous input returns a friendly
+400 without changing progress. The saved ID can be replaced at any step;
+omitting it preserves it through navigation, sign-in and errors. Older saved
+progress without an ID still loads (`project_id: null`).
 It saves progress in SQLite and clears the previous reported error. Passing
 `sign_in: true` requires step 6 and a saved Google client. Advancing beyond
 step 4 or returning to sign-in requires HTTPS `public_url`. Returns the same
@@ -3235,7 +3244,8 @@ Private system prompts include the same compact status projection. Shared and
 isolated turns receive only Iris's version and whether the current engine is usable.
 Status reads cached official CLI probe results and current DB/runtime state; it
 never runs a CLI probe or operation. `signed_in: null` means not yet known.
-Status includes `google_setup` (step, total_steps, phase, summary, and fixed
+Status includes `google_setup` (step, total_steps, phase, summary, non-secret
+project_id, and fixed
 error step/message only), engine names/install/sign-in/version, current engine and model,
 isolation, connector names/status/rules, saved login host names, wallet card count,
 agent name, feed/Pause/quiet hours/voice state, eight recent pending card summaries

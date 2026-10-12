@@ -378,6 +378,7 @@ pub async fn setup(
                         sign_in: true,
                         completed: !needs_sign_in,
                         issue: None,
+                        ..crate::google_setup::read(c)?
                     },
                 )?;
             }

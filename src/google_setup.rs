@@ -1,5 +1,5 @@
-//! Owner-only Google setup. Progress contains only fixed steps and protocol
-//! codes; pasted credentials go straight to the existing connector vault path.
+//! Owner-only Google setup. Progress includes the non-secret project ID;
+//! pasted credentials go straight to the existing connector vault path.
 use crate::{db, entities, state::AppState};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -39,13 +39,91 @@ const GOOGLE_PAGES: &[(&str, &str)] = &[
     ),
 ];
 
-pub fn pages() -> Value {
+pub fn pages(project_id: Option<&str>) -> Value {
     Value::Object(
         GOOGLE_PAGES
             .iter()
-            .map(|(key, url)| ((*key).into(), json!(url)))
+            .map(|(key, url)| {
+                let pinned = project_id
+                    .filter(|id| project_id_valid(id) && *key != "project")
+                    .map_or_else(|| (*url).to_string(), |id| pin_project(url, id));
+                ((*key).into(), json!(pinned))
+            })
             .collect(),
     )
+}
+
+fn pin_project(url: &str, id: &str) -> String {
+    let (base, fragment) = url.split_once('#').unwrap_or((url, ""));
+    let separator = if base.contains('?') { '&' } else { '?' };
+    let mut pinned = format!("{base}{separator}project={id}");
+    if url.contains('#') {
+        pinned.push('#');
+        pinned.push_str(fragment);
+    }
+    pinned
+}
+
+fn project_id_valid(id: &str) -> bool {
+    (6..=30).contains(&id.len())
+        && id.as_bytes()[0].is_ascii_lowercase()
+        && !id.ends_with('-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Accept a copied ID, Console address, or text around the ID. Never guess
+/// another ID when an explicit project= value is invalid or ambiguous.
+pub fn parse_project_id(paste: &str) -> Result<String, &'static str> {
+    const ERROR: &str = "I need the Project ID shown under your project name: 6–30 lowercase letters, numbers or hyphens, starting with a letter and not ending with a hyphen.";
+    if paste.len() > 65536 {
+        return Err(ERROR);
+    }
+    let text = paste.trim();
+    if project_id_valid(text) {
+        return Ok(text.to_string());
+    }
+    let explicit: Vec<_> = text
+        .split(|c: char| c.is_whitespace() || "?&#\"'<>(),;[]{}".contains(c))
+        .filter_map(|s| s.strip_prefix("project="))
+        .collect();
+    let has_explicit = !explicit.is_empty();
+    let tokens: Vec<_> = if !has_explicit {
+        text.split(|c: char| !c.is_alphanumeric() && !"-_.".contains(c))
+            .map(|id| id.trim_end_matches('.'))
+            .filter(|id| {
+                id.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                    && !id.eq_ignore_ascii_case("project")
+                    && !id.eq_ignore_ascii_case("id")
+            })
+            .collect()
+    } else {
+        explicit
+    };
+    // Auto-generated IDs contain hyphens/digits; prefer them over surrounding
+    // prose such as "project". Letter-only IDs still work, including bare IDs.
+    let distinctive = !has_explicit
+        && tokens
+            .iter()
+            .any(|id| id.contains(['-', '_']) || id.bytes().any(|b| b.is_ascii_digit()));
+    let mut ids = tokens.into_iter().filter(|id| {
+        if has_explicit {
+            true
+        } else if distinctive {
+            id.contains(['-', '_']) || id.bytes().any(|b| b.is_ascii_digit())
+        } else {
+            project_id_valid(id)
+        }
+    });
+    let id = ids.next().ok_or(ERROR)?;
+    if !project_id_valid(id) {
+        return Err(ERROR);
+    }
+    if ids.any(|other| other != id) {
+        return Err("I found more than one Project ID. Copy just the ID for your Iris project.");
+    }
+    Ok(id.to_string())
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -106,6 +184,8 @@ impl Issue {
 pub struct Progress {
     pub step: u8,
     #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
     pub sign_in: bool,
     #[serde(default)]
     pub completed: bool,
@@ -117,6 +197,7 @@ impl Default for Progress {
     fn default() -> Self {
         Self {
             step: 1,
+            project_id: None,
             sign_in: false,
             completed: false,
             issue: None,
@@ -182,6 +263,7 @@ pub fn status(c: &rusqlite::Connection) -> rusqlite::Result<Value> {
             sign_in: true,
             completed: true,
             issue: None,
+            ..Progress::default()
         }
     } else {
         Progress::default()
@@ -202,6 +284,7 @@ pub fn status(c: &rusqlite::Connection) -> rusqlite::Result<Value> {
     };
     Ok(json!({
         "step": p.step, "total_steps": STEPS, "phase": phase,
+        "project_id": p.project_id,
         "summary": if phase == "connected" { "Google connected".into() } else { format!("Google setup: step {} of {STEPS}", p.step) },
         "error": p.issue.map(|i| { let (step, message) = i.fix(); json!({"step": step, "message": message}) }),
     }))
@@ -225,6 +308,7 @@ pub async fn report_issue(
                     sign_in: matches!(issue, Issue::MissingPermissions),
                     completed: false,
                     issue: Some(issue),
+                    ..read(c)?
                 },
             )
         })
@@ -329,6 +413,105 @@ mod tests {
     const SECRET: &str = "GOCSPX-paste-canary_123";
 
     #[test]
+    fn extracts_and_validates_project_ids() {
+        const PROJECT: &str = "example-project-123456-a1";
+        assert_eq!(
+            parse_project_id("Copied Project ID: abcdef").unwrap(),
+            "abcdef"
+        );
+        for paste in [
+            PROJECT.to_string(),
+            format!("  {PROJECT}\n"),
+            format!("https://console.cloud.google.com/auth/branding?project={PROJECT}"),
+            format!(
+                "Open https://console.cloud.google.com/flows/enableapi?apiid=gmail.googleapis.com&project={PROJECT}&other=1#top"
+            ),
+            format!("Project ID: {PROJECT}"),
+            format!("Your project is {PROJECT}"),
+            format!("Your project is {PROJECT}."),
+            format!("project={PROJECT}"),
+            format!("{PROJECT}\n{PROJECT}"),
+        ] {
+            assert_eq!(parse_project_id(&paste).unwrap(), PROJECT, "{paste}");
+        }
+        for id in [
+            "abcdef",
+            "project",
+            "a12345",
+            "a23456789012345678901234567890",
+        ] {
+            assert_eq!(parse_project_id(id).unwrap(), id);
+        }
+        for paste in [
+            "",
+            "junk",
+            "abcde",
+            "Iris",
+            "Example-project-123456",
+            "example-project-",
+            "123example",
+            "-example",
+            "example_project",
+            "example.project",
+            "éxample-project",
+            "example-projéct",
+            "a234567890123456789012345678901",
+            "https://console.cloud.google.com/auth/branding?project=BAD-ID",
+            "project=abcde example-project-123456",
+            "Your project is Example-project-123456",
+            "Your project is example-project-",
+            "project ID: UPPERCASE",
+            "project=example-project-123456&project=another-project-123456",
+            "project=abcdef&project=another-project-123456",
+            "example-project-123456 another-project-123456",
+        ] {
+            assert!(parse_project_id(paste).is_err(), "{paste}");
+        }
+        assert!(parse_project_id(&"a".repeat(65537)).is_err());
+    }
+
+    #[test]
+    fn pins_all_later_console_pages_without_losing_queries_or_fragments() {
+        let id = "example-project-123456";
+        let unpinned = pages(None);
+        let pinned = pages(Some(id));
+        for (key, url) in GOOGLE_PAGES {
+            assert_eq!(unpinned[key], *url);
+            let expected = if *key == "project" {
+                url.to_string()
+            } else {
+                format!(
+                    "{url}{}project={id}",
+                    if url.contains('?') { '&' } else { '?' }
+                )
+            };
+            assert_eq!(pinned[key], expected);
+        }
+        assert_eq!(pages(Some("invalid&project=other")), unpinned);
+        assert_eq!(
+            pin_project("https://console.cloud.google.com/auth/audience#top", id),
+            format!("https://console.cloud.google.com/auth/audience?project={id}#top")
+        );
+        assert_eq!(
+            pin_project("https://console.cloud.google.com/auth/audience?x=1#top", id),
+            format!("https://console.cloud.google.com/auth/audience?x=1&project={id}#top")
+        );
+    }
+
+    #[test]
+    fn old_progress_without_a_project_id_still_resumes() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let progress = db
+            .with(|c| {
+                db::set_setting(c, SETTING, r#"{"step":3,"sign_in":false}"#)?;
+                read(c)
+            })
+            .unwrap();
+        assert_eq!(progress.step, 3);
+        assert_eq!(progress.project_id, None);
+    }
+
+    #[test]
     fn stale_sign_in_progress_resumes_at_the_paste_step_without_a_connector() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let st = db
@@ -340,6 +523,7 @@ mod tests {
                         sign_in: true,
                         completed: true,
                         issue: None,
+                        ..Progress::default()
                     },
                 )?;
                 status(c)

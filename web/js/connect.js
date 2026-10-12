@@ -190,6 +190,7 @@ function GoogleSetup({ entry, con }) {
   const [setup, setSetup] = useState(null);
   const [paste, setPaste] = useState('');
   const [email, setEmail] = useState('');
+  const [project, setProject] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const pending = useRef(false);
@@ -208,10 +209,15 @@ function GoogleSetup({ entry, con }) {
     return () => { window.removeEventListener('focus', visible); document.removeEventListener('visibilitychange', visible); };
   }, []);
   const p = setup?.progress;
+  useEffect(() => { setProject(p?.project_id || ''); }, [p?.project_id]);
   useEffect(() => { if (p?.step !== 6 || p?.phase !== 'setup') setPaste(''); }, [p?.step, p?.phase]);
-  const advance = async (step, sign_in = false) => {
+  const advance = async (step, sign_in = false, project_id) => {
     pending.current = true; revision.current++; setBusy(true); setError('');
-    try { setSetup(await put('/connectors/google/setup', { step, sign_in })); }
+    try {
+      const r = await put('/connectors/google/setup', { step, sign_in, project_id });
+      setSetup(r);
+      if (project_id !== undefined) setProject(r.progress.project_id || '');
+    }
     catch (e) { setError(e.message); }
     pending.current = false; setBusy(false);
   };
@@ -240,6 +246,11 @@ function GoogleSetup({ entry, con }) {
   const validation = paste ? googlePasteError(paste) : null;
   const pages = setup?.pages;
   const open = (key, label = 'Open') => html`<${ExternalLink} url=${pages[key]} cls="b1 wide">${label}<//>`;
+  const projectField = html`<label class="lbl" for="google-project">Project ID</label>
+    <input id="google-project" class="field mono" value=${project} placeholder="example-project-123456"
+      autocomplete="off" autocapitalize="off" spellcheck=${false} aria-describedby="google-project-help"
+      onInput=${(e) => { setProject(e.target.value); setError(''); }} />
+    <small id="google-project-help" class="mu">Paste the ID, or the Google Console page’s address.</small>`;
   return html`<${Page} title=${title} sub="One setup for Gmail, Calendar, Drive and YouTube read-only." onBack=${back}>
     ${error && html`<p class="err-line" role="alert">${error}</p>`}
     ${!p ? html`<${Spinner} />${error && html`<button class="b2 wide" onClick=${reload}>Try again</button>`}` : html`
@@ -259,10 +270,17 @@ function GoogleSetup({ entry, con }) {
           ${[['redirect_uri_mismatch', 'Callback address doesn’t match'], ['access_denied', 'Access denied'], ['invalid_client', 'Invalid login key'], ['unauthorized_client', 'Wrong kind of login key']].map(([code, label]) => html`<button class="b2 wide gap" disabled=${busy} onClick=${() => report(code)}>${label}</button>`)}
         </details>`
       : html`<div class="google-step" key=${p.step}>
-        ${p.step === 1 && html`<p>A project gives your private Iris app a home in Google.</p><p>Create a project named <b>Iris</b>. Select it in the project picker before each later step.</p>
-          <${Copy} text="Iris" />${open('project')}`}
+        ${p.step >= 2 && p.step <= 5 && p.project_id && html`<p>You should see <b class="mono">${p.project_id}</b> on Google’s page. If it shows a different project, tap the project picker at the top and choose it.</p>`}
+        ${p.step === 1 && html`<p>A project gives your private Iris app a home in Google.</p>
+          <p>The name field may say <b>My Project 12345</b>. Set it to <b>Iris</b> before tapping <b>Create</b>; either name works.</p>
+          <${Copy} text="Iris" />${open('project')}
+          <p>After tapping <b>Create</b>, copy the <b>Project ID</b> shown under the project name and paste it here.</p>
+          <p>Google uses this ID to choose your project, not the name.</p>
+          <form class="form" onSubmit=${(e) => { e.preventDefault(); advance(2, false, project); }}>
+            ${projectField}<button class="b1 wide gap" disabled=${busy || !project.trim()}>${busy ? 'Saving…' : 'Save Project ID and continue'}</button>
+          </form>`}
         ${p.step === 2 && html`<p>Turning these on lets Iris use your mail, calendar, files and YouTube subscriptions.</p>
-          <p>Check that your Iris project is selected, then turn on all four services together.</p>${open('apis')}
+          <p>Turn on all four services together.</p>${open('apis')}
           <details class="alt"><summary>Didn't turn on all four?</summary><p>Open each one and tap <b>Enable</b>:</p>
             ${[['api_gmail', 'Gmail'], ['api_calendar', 'Calendar'], ['api_drive', 'Drive'], ['api_youtube', 'YouTube']].map(([k, l]) => html`<${ExternalLink} url=${pages[k]} cls="b2 wide gap">${l}<//>`)}</details>`}
         ${p.step === 3 && html`<p>This tells Google what to show when you sign in to your own app.</p>
@@ -290,7 +308,11 @@ function GoogleSetup({ entry, con }) {
             <button class="b1 wide gap" disabled=${busy || !paste || !!validation}>${busy ? 'Saving…' : 'Done — save key'}</button>
           </form>
           ${con?.oauth?.client_configured && html`<button class="b2 wide gap" disabled=${busy} onClick=${() => advance(6, true)}>Use saved key</button>`}`}
-        ${p.step < 6 && html`<button class="b1 wide gap" disabled=${busy || (p.step === 4 && !setup.redirect_uri)} onClick=${() => advance(p.step + 1)}>${busy ? 'Saving…' : 'Done'}</button>`}
+        ${p.step > 1 && html`<details class="alt"><summary>${p.project_id ? 'Change Project ID' : 'Add Project ID to open the right project'}</summary>
+          <form class="form" onSubmit=${(e) => { e.preventDefault(); advance(p.step, false, project); }}>
+            ${projectField}<button class="b2 wide gap" disabled=${busy || !project.trim()}>${busy ? 'Saving…' : 'Save Project ID'}</button>
+          </form></details>`}
+        ${p.step > 1 && p.step < 6 && html`<button class="b1 wide gap" disabled=${busy || (p.step === 4 && !setup.redirect_uri)} onClick=${() => advance(p.step + 1)}>${busy ? 'Saving…' : 'Done'}</button>`}
       </div>`}
       <button class="b2 wide gap" onClick=${back}>Back</button>
       <small class="mu">Your place is saved. You can leave and come back anytime.</small>
