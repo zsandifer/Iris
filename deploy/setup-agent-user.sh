@@ -91,8 +91,8 @@ fi
 [ ! -L "$BASE/home" ] || { echo "Agent home cannot be a symlink" >&2; exit 1; }
 install -d -m 0700 -o "$AGENT_USER" -g "$AGENT_USER" "$BASE/home"
 install -d -m 0730 -o "$SERVICE_USER" -g "$AGENT_USER" "$BASE/workspace"
-install -d -m 0750 -o "$SERVICE_USER" -g "$AGENT_USER" "$BASE/turns"
-echo "Provisioned $BASE/home (0700), workspace parent (0730), turns (0750)."
+install -d -m 2750 -o "$SERVICE_USER" -g "$AGENT_USER" "$BASE/turns"
+echo "Provisioned $BASE/home (0700), workspace parent (0730), turns (2750, setgid so per-turn files carry the agent group)."
 usermod -a -G "$AGENT_USER" "$SERVICE_USER"
 echo "Added $SERVICE_USER to $AGENT_USER for per-turn file sharing; restart the user manager."
 # Do not follow symlinks; retain service ownership throughout private data.

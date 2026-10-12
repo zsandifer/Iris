@@ -338,7 +338,10 @@ pub fn turn_dir(cfg: &AgentConfig, paths: &Paths, turn: &str) -> Result<PathBuf>
         return Ok(paths.run_dir());
     };
     let dir = p.runtime.join(turn);
-    std::fs::create_dir(&dir)?;
+    // Create with the final mode: the runtime parent is setgid, so the new
+    // directory inherits the agent group and the setgid bit. A later chmod
+    // by a service user outside that group would strip setgid.
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o750).create(&dir)?;
     group_readable(&dir, p.gid, 0o750)?;
     Ok(dir)
 }
@@ -346,11 +349,21 @@ pub fn turn_dir(cfg: &AgentConfig, paths: &Paths, turn: &str) -> Result<PathBuf>
 fn group_readable(path: &Path, gid: u32, mode: u32) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    // The turns directory is setgid, so new files already carry the agent
+    // group and Iris needs no supplementary group. Only change it otherwise.
+    use std::os::unix::fs::MetadataExt;
+    let current = std::fs::symlink_metadata(path)?.gid();
     // SAFETY: valid C string; a service user may change its own file to its supplementary group.
-    if unsafe { libc::chown(c.as_ptr(), u32::MAX, gid) } != 0 {
+    if current != gid && unsafe { libc::chown(c.as_ptr(), u32::MAX, gid) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    // Keep an inherited setgid bit, and skip chmod when nothing changes:
+    // chmod by a non-member of the file's group clears setgid on directories.
+    let have = std::fs::symlink_metadata(path)?.mode() & 0o7777;
+    let want = mode | (have & 0o2000);
+    if have != want {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(want))?;
+    }
     Ok(())
 }
 
