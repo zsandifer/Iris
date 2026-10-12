@@ -15,7 +15,7 @@ import { Hub, Logins, Computer, Files, FileEditor, Folder } from './hub.js';
 import { Connections, AddService, ConnectorPage, ConnectorForm, TrustedPeople } from './connect.js';
 import { Settings, AiEngine, Devices, People, ActivityLog } from './settings.js';
 import { isIOS, standalone, syncPush, resetPush } from './push.js';
-import { trackViewport } from './viewport.js';
+import { trackViewport, blockZoom } from './viewport.js';
 
 const TABS = [
   ['chat', 'Chat', 'chat'],
@@ -347,5 +347,6 @@ if ('serviceWorker' in navigator) {
 
 const root = document.getElementById('app');
 trackViewport(root);
+blockZoom();
 render(html`<${App} />`, root);
 boot();

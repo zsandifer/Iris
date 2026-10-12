@@ -20,6 +20,13 @@
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { position: fixed; inset: 0; margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--ink); overscroll-behavior: none; }
+/* A fixed app frame: panning only, no pinch or double-tap zoom. */
+html { touch-action: pan-x pan-y; }
+/* iOS cannot lock orientation for web apps; on a sideways phone, ask to turn it back. */
+@media (orientation: landscape) and (max-height: 500px) {
+  body::after { content: "Turn your phone upright to use Iris"; position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center;
+    padding: 24px; text-align: center; font-size: 17px; font-weight: 600; background: var(--bg); color: var(--ink); }
+}
 body { font: 15px/1.45 -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", Roboto, sans-serif; -webkit-text-size-adjust: 100%; }
 button { font: inherit; color: inherit; cursor: pointer; }
 button:disabled { cursor: default; opacity: .5; }
