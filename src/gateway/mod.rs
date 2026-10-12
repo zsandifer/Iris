@@ -1304,7 +1304,12 @@ pub async fn call_tool(
         subject = subject.unverified();
     }
     let category = subject.category();
-    let recipients = policy::audience(action, args);
+    let mut recipients = policy::audience(action, args);
+    if con.service == "google" && google::hidden_audience(tool, args) {
+        // A saved forwarding destination the call does not show is never
+        // trusted.
+        recipients.push(policy::UNREADABLE_RECIPIENTS.to_string());
+    }
     let label = service_label(con);
     let preview = policy::preview(&label, tool, category, args);
     let trusted = state.trusted_recipients().await;

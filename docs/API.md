@@ -1489,7 +1489,11 @@ by their real arguments: `manage_event` with `action: "create"` is
 `send_updates` is `"none"` and no attendees are given (Google tells guests
 by default), and deleting also notifies guests unless `send_updates` is
 `"none"`; `update_drive_file` with `trashed: true` is "Move files to the
-trash" and with sharing settings "Share files"; Gmail labels that add
+trash", and with sharing settings or `add_parents` (moving into a folder
+gives its people access) also "Share files, change who has access, or put
+them in folders", as is creating, copying, or importing a file (Drive, Docs,
+Sheets) into a folder other than My Drive's root; populating a Docs tab
+replaces its content (a deletion) unless `replace_existing` is `false`; Gmail labels that add
 `TRASH` are "Move email to the trash" (other label changes in the same call
 are also "Label, archive and mark email"); filters with a `forward` or
 `TRASH` action also need "Filters that forward email to someone" or "Move
@@ -1501,7 +1505,9 @@ labels on existing mail; a one-action tool the server marks destructive
 the starting rules; comments on Docs, Sheets and Slides
 are their own "Comment on ..." actions. Arguments are read the way the
 server reads them (it accepts `addLabelIds` for `add_label_ids`, JSON
-strings for objects and lists, and strips and lowercases `action`). A call
+strings for objects and lists, and strips and lowercases `action`). A filter create or update without its action keeps a saved forwarding
+destination the call does not show, so it is never treated as going only
+to trusted people. A call
 that performs several actions needs every one of them allowed. A tool or argument value the table
 does not know (`action: "purge"`, a newer server's tool) is classified as
 above under its tool name, which asks for anything it cannot place. The

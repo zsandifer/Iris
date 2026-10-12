@@ -451,7 +451,7 @@ function OneTapSetup({ entry, con }) {
       <button class="b1 wide gap" onClick=${() => open(live)}>Done</button>`;
   }
   return html`<p>You'll approve access on ${entry.label}'s own page. Nothing to create or paste.</p>
-    <p class="mu">${agentName()} reads freely and asks you before changing, sending, or deleting anything. You can change that later.</p>
+    <p class="mu">${entry.group === 'money' ? `${agentName()} asks you before every action, even reading.` : `${agentName()} reads freely and asks you before changing, sending, or deleting anything.`} You can change that later.</p>
     ${live ? html`<${ServiceSignIn} con=${live} label=${entry.label} auto=${fresh}
         onDone=${() => { toast(`${entry.label} is connected`); open(live); }} />`
       : html`<button class="b1 wide" disabled=${busy} onClick=${connect}>${busy ? 'Connecting…' : 'Connect'}</button>`}`;
@@ -623,7 +623,7 @@ export function ConnectorPage({ id, part = null }) {
         sub=${(con.policy?.off || []).includes(p) ? 'Off' : null} onClick=${() => go(`iris/connections/${id}/${p}`)} />`)}<//>`}
 
     ${(svc || ready) && html`${!perms ? html`<${Group}><div class="r"><div class="rt mu">${svc ? 'Loading…' : `Starting ${label}…`}</div></div><//>`
-      : perms.error ? (google ? null : html`<${Group} label="Permissions"><div class="r"><div class="rt">${cap(perms.error)}${perms.detail && html`<small class="mono">${perms.detail}</small>`}</div></div><//>`)
+      : perms.error ? html`<${Group} label=${google && !svc ? 'Other actions' : 'Permissions'}><div class="r"><div class="rt">${google && !svc ? `I couldn't check Google for other actions: ${perms.error}` : cap(perms.error)}${perms.detail && html`<small class="mono">${perms.detail}</small>`}</div></div><//>`
       : html`${google && otherTools && html`<div class="gl">Other actions</div>`}
         <${PermissionSections} perms=${perms} con=${con} onSaved=${saved} disabled=${!serviceOn} />
         ${!perms.sections.length && !google && html`<${Group}><div class="r"><div class="rt mu">${label} didn't list any actions.</div></div><//>`}

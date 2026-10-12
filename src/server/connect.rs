@@ -3026,6 +3026,17 @@ mod tests {
             .unwrap();
         let (_, v) = call(&a, "GET", &perms("gmail"), None).await;
         assert_eq!(v["account"], "owner@example.com");
+        // A sign-in started before signing out can't finish afterwards.
+        let (s, flow) = call(
+            &a,
+            "POST",
+            &format!("/api/connectors/{id}/oauth/start"),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{flow}");
+        let q = crate::oauth::parse_query(flow["authorize_url"].as_str().unwrap());
+        assert_eq!(crate::oauth::pending_flows(&a.state, &id), 1);
         let (s, v) = call(
             &a,
             "POST",
@@ -3036,11 +3047,30 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{v}");
         let c = &v["connector"];
         assert_eq!(c["auth_state"], "needs_sign_in");
+        assert_eq!(crate::oauth::pending_flows(&a.state, &id), 0);
         assert_eq!(c["oauth"]["connected"], false);
         assert_eq!(c["oauth"]["account"], Value::Null);
         assert_eq!(c["oauth"]["client_configured"], true);
         assert_eq!(c["policy"]["off"], json!(["youtube"]));
         assert_eq!(c["policy"]["tools"]["calendar.events.create"], "allow");
+        let (s, html) = send(
+            &a.app,
+            "GET",
+            &format!("/api/oauth/callback?state={}&code=the-code", q["state"]),
+            "",
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(html.contains("didn"), "{html}");
+        let con = a
+            .state
+            .db
+            .with(|c| entities::get_connector(c, &id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(con.auth_state, "needs_sign_in");
+        assert!(con.config.oauth.unwrap().refresh_token.is_none());
         let (s, _) = call(&a, "POST", "/api/connectors/nope/oauth/sign-out", None).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
     }

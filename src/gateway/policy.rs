@@ -750,7 +750,7 @@ fn norm_key(k: &str) -> String {
 }
 
 /// An unparseable audience is never trusted or remembered after approval.
-const UNREADABLE_RECIPIENTS: &str = "recipients Iris cannot read unambiguously";
+pub const UNREADABLE_RECIPIENTS: &str = "recipients Iris cannot read unambiguously";
 
 fn atext(c: u8) -> bool {
     c.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&c)

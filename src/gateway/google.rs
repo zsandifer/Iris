@@ -129,7 +129,11 @@ pub const SERVICES: &[Service] = &[
             a("drive.create", "Create, upload and copy files", Write),
             a("drive.edit", "Edit, rename and move files", Write),
             a("drive.trash", "Move files to the trash", Delete),
-            a("drive.share", "Share files and change who has access", Send),
+            a(
+                "drive.share",
+                "Share files, change who has access, or put them in folders",
+                Send,
+            ),
         ],
     },
     Service {
@@ -161,7 +165,8 @@ pub const SERVICES: &[Service] = &[
         actions: &[
             a("slides.read", "Read presentations", Read),
             a("slides.create", "Create presentations", Write),
-            a("slides.edit", "Edit presentations", Write),
+            // Its tool is marked destructive (batch edits can delete).
+            a("slides.edit", "Edit presentations", Delete),
             a("slides.comments", "Comment on presentations", Send),
         ],
     },
@@ -173,7 +178,7 @@ pub const SERVICES: &[Service] = &[
             a("forms.read", "Read forms", Read),
             a("forms.responses", "Read responses", Read),
             a("forms.create", "Create forms", Write),
-            a("forms.edit", "Edit forms", Write),
+            a("forms.edit", "Edit forms", Delete),
             a(
                 "forms.publish",
                 "Publish forms and open or close responses",
@@ -302,12 +307,32 @@ const TOOLS: &[(&str, &str, &[&str])] = &[
     ),
     ("get_drive_shareable_link", "drive", &["drive.sharing.read"]),
     ("get_drive_file_download_url", "drive", &["drive.download"]),
-    ("create_drive_folder", "drive", &["drive.create"]),
-    ("create_drive_file", "drive", &["drive.create"]),
-    ("import_to_google_doc", "drive", &["drive.create"]),
-    ("import_to_google_slides", "drive", &["drive.create"]),
-    ("import_to_google_sheets", "drive", &["drive.create"]),
-    ("copy_drive_file", "drive", &["drive.create"]),
+    (
+        "create_drive_folder",
+        "drive",
+        &["drive.create", "drive.share"],
+    ),
+    (
+        "create_drive_file",
+        "drive",
+        &["drive.create", "drive.share"],
+    ),
+    (
+        "import_to_google_doc",
+        "drive",
+        &["drive.create", "drive.share"],
+    ),
+    (
+        "import_to_google_slides",
+        "drive",
+        &["drive.create", "drive.share"],
+    ),
+    (
+        "import_to_google_sheets",
+        "drive",
+        &["drive.create", "drive.share"],
+    ),
+    ("copy_drive_file", "drive", &["drive.create", "drive.share"]),
     (
         "update_drive_file",
         "drive",
@@ -323,8 +348,8 @@ const TOOLS: &[(&str, &str, &[&str])] = &[
     ("debug_docs_runtime_info", "docs", &["docs.read"]),
     ("debug_table_structure", "docs", &["docs.read"]),
     ("get_doc_as_markdown", "docs", &["docs.read"]),
-    ("create_doc", "docs", &["docs.create"]),
-    ("export_doc_to_pdf", "docs", &["docs.create"]),
+    ("create_doc", "docs", &["docs.create", "drive.share"]),
+    ("export_doc_to_pdf", "docs", &["docs.create", "drive.share"]),
     ("modify_doc_text", "docs", &["docs.edit"]),
     ("find_and_replace_doc", "docs", &["docs.edit"]),
     ("insert_doc_elements", "docs", &["docs.edit"]),
@@ -341,7 +366,11 @@ const TOOLS: &[(&str, &str, &[&str])] = &[
     ("get_spreadsheet_info", "sheets", &["sheets.read"]),
     ("read_sheet_values", "sheets", &["sheets.read"]),
     ("list_sheet_tables", "sheets", &["sheets.read"]),
-    ("create_spreadsheet", "sheets", &["sheets.create"]),
+    (
+        "create_spreadsheet",
+        "sheets",
+        &["sheets.create", "drive.share"],
+    ),
     ("modify_sheet_values", "sheets", &["sheets.edit"]),
     ("format_sheet_range", "sheets", &["sheets.edit"]),
     ("manage_conditional_formatting", "sheets", &["sheets.edit"]),
@@ -557,6 +586,35 @@ fn label_tokens(v: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
+/// A destination folder other than the owner's own My Drive root.
+fn into_folder(args: &Value, key: &str) -> bool {
+    given(args, key)
+        && args
+            .get(key)
+            .and_then(Value::as_str)
+            .is_none_or(|f| !f.trim().eq_ignore_ascii_case("root"))
+}
+
+fn with_folder(create: (&'static str, Category), folder: bool) -> Vec<(&'static str, Category)> {
+    let mut out = vec![create];
+    if folder {
+        out.push(("drive.share", Send));
+    }
+    out
+}
+
+/// A forwarding filter whose destination the call does not show (the
+/// server keeps the saved one): its audience is unknown.
+pub fn hidden_audience(name: &str, args: &Value) -> bool {
+    let args = &server_arguments(args);
+    name == "manage_gmail_filter"
+        && matches!(
+            selector(args, "action").as_deref(),
+            Some("create" | "update")
+        )
+        && !given(args, "filter_action")
+}
+
 /// Tools whose call is placed by its arguments (everything else performs
 /// its one action, and keeps the server's destructive hint).
 pub fn placed_by_arguments(name: &str) -> bool {
@@ -570,6 +628,15 @@ pub fn placed_by_arguments(name: &str) -> bool {
             | "manage_out_of_office"
             | "manage_focus_time"
             | "update_drive_file"
+            | "create_drive_folder"
+            | "copy_drive_file"
+            | "create_drive_file"
+            | "import_to_google_doc"
+            | "import_to_google_slides"
+            | "import_to_google_sheets"
+            | "create_doc"
+            | "export_doc_to_pdf"
+            | "create_spreadsheet"
             | "manage_drive_access"
             | "manage_document_comment"
             | "manage_spreadsheet_comment"
@@ -686,7 +753,11 @@ pub fn call_actions(name: &str, args: &Value) -> Option<Vec<(&'static str, Categ
             if set_true(args, "trashed") {
                 out.push(("drive.trash", Delete));
             }
-            if given(args, "writers_can_share") || given(args, "copy_requires_writer_permission") {
+            // Moving into a folder gives the folder's people access.
+            if given(args, "writers_can_share")
+                || given(args, "copy_requires_writer_permission")
+                || into_folder(args, "add_parents")
+            {
                 out.push(("drive.share", Send));
             }
             let other = args.as_object().is_some_and(|o| {
@@ -706,6 +777,26 @@ pub fn call_actions(name: &str, args: &Value) -> Option<Vec<(&'static str, Categ
             }
             Some(out)
         }
+        // Creating or copying into a folder gives its people access too.
+        "create_drive_folder" | "copy_drive_file" => Some(with_folder(
+            ("drive.create", Write),
+            into_folder(args, "parent_folder_id"),
+        )),
+        "create_drive_file"
+        | "import_to_google_doc"
+        | "import_to_google_slides"
+        | "import_to_google_sheets" => Some(with_folder(
+            ("drive.create", Write),
+            into_folder(args, "folder_id"),
+        )),
+        "create_doc" | "export_doc_to_pdf" => Some(with_folder(
+            ("docs.create", Write),
+            into_folder(args, "folder_id"),
+        )),
+        "create_spreadsheet" => Some(with_folder(
+            ("sheets.create", Write),
+            into_folder(args, "folder_id"),
+        )),
         "manage_drive_access" => match act()?.as_str() {
             "grant" | "grant_batch" | "update" | "transfer_owner" => one("drive.share", Send),
             "revoke" => one("drive.share", Delete),
@@ -719,6 +810,12 @@ pub fn call_actions(name: &str, args: &Value) -> Option<Vec<(&'static str, Categ
             _ => None,
         },
         "manage_doc_tab" => match act()?.as_str() {
+            // Replaces the tab's content unless told not to.
+            "populate_from_markdown"
+                if args.get("replace_existing") != Some(&Value::Bool(false)) =>
+            {
+                one("docs.edit", Delete)
+            }
             "create" | "rename" | "populate_from_markdown" => one("docs.edit", Write),
             "delete" => one("docs.edit", Delete),
             _ => None,
@@ -889,7 +986,12 @@ mod tests {
             for id in actions {
                 let a = action(id).unwrap_or_else(|| panic!("{t}: unknown action {id}"));
                 let owner = service(svc).unwrap();
-                assert!(owner.actions.iter().any(|x| x.id == a.id), "{t}: {id}");
+                // Putting a file in a folder is Drive sharing, whichever
+                // service creates it.
+                assert!(
+                    owner.actions.iter().any(|x| x.id == a.id) || a.id == "drive.share",
+                    "{t}: {id}"
+                );
             }
         }
         assert_eq!(TOOLS.len(), SERVER_TOOLS.len());
@@ -1275,6 +1377,56 @@ mod tests {
             ),
             Some(vec![("calendar.events.delete", Delete)])
         );
+        // Putting files in a folder shares them with its people.
+        assert_eq!(
+            c(
+                "update_drive_file",
+                json!({"file_id": "f", "add_parents": "folder1"})
+            ),
+            Some(vec![("drive.share", Send), ("drive.edit", Write)])
+        );
+        assert_eq!(
+            c("create_doc", json!({"title": "t", "folder_id": "folder1"})),
+            Some(vec![("docs.create", Write), ("drive.share", Send)])
+        );
+        assert_eq!(
+            c("create_doc", json!({"title": "t", "folder_id": "root"})),
+            Some(vec![("docs.create", Write)])
+        );
+        assert_eq!(
+            c("copy_drive_file", json!({"file_id": "f"})),
+            Some(vec![("drive.create", Write)])
+        );
+        assert_eq!(
+            c(
+                "copy_drive_file",
+                json!({"fileId": "f", "parentFolderId": "folder1"})
+            ),
+            Some(vec![("drive.create", Write), ("drive.share", Send)])
+        );
+        // Populating a tab replaces its content unless told not to.
+        assert_eq!(
+            c(
+                "manage_doc_tab",
+                json!({"action": "populate_from_markdown", "document_id": "d"})
+            ),
+            Some(vec![("docs.edit", Delete)])
+        );
+        assert_eq!(
+            c(
+                "manage_doc_tab",
+                json!({"action": "populate_from_markdown", "replace_existing": false})
+            ),
+            Some(vec![("docs.edit", Write)])
+        );
+        assert!(hidden_audience(
+            "manage_gmail_filter",
+            &json!({"action": "update", "criteria": {"to": "me@example.com"}})
+        ));
+        assert!(!hidden_audience(
+            "manage_gmail_filter",
+            &json!({"action": "create", "filter_action": {"forward": "x@example.com"}})
+        ));
         // Lists inside multi-purpose tools are reads.
         assert_eq!(
             c("manage_out_of_office", json!({"action": "list"})),

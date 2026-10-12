@@ -911,6 +911,19 @@ pub async fn invalidate(state: &AppState, connector_id: &str, rejected: Option<&
     let _ = save(state, connector_id, o).await;
 }
 
+/// Sign-ins in progress for a connector (tests).
+#[cfg(test)]
+pub fn pending_flows(state: &AppState, connector_id: &str) -> usize {
+    state
+        .oauth
+        .flows
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .values()
+        .filter(|f| f.connector_id == connector_id)
+        .count()
+}
+
 /// Drop sign-ins in progress for a connector (or all): a connection that
 /// was turned off or removed is not signed in by an old browser tab.
 pub fn forget_flows(state: &AppState, connector_id: Option<&str>) {

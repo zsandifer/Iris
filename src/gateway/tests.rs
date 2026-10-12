@@ -2389,3 +2389,52 @@ async fn an_older_google_connection_keeps_its_rules_as_actions() {
     assert_eq!(up.mode, policy::Mode::Standard);
     assert_eq!(up.tools, other.tools);
 }
+
+#[tokio::test]
+async fn a_saved_forwarding_destination_is_never_trusted() {
+    let t = setup(|_| {});
+    t.state
+        .db
+        .with(|c| db::set_setting(c, "safety.trusted_recipients", r#"["me@example.com"]"#))
+        .unwrap();
+    let mut p = policy::Policy::new(policy::Mode::Careful);
+    p.tools
+        .insert("gmail.filters".into(), policy::ToolRule::Allow);
+    p.tools
+        .insert("gmail.trash".into(), policy::ToolRule::Allow);
+    // The fake server's send_message stands in for the filter tool.
+    let script = FAKE_SERVER.replace(
+        r#""name":"send_message""#,
+        r#""name":"manage_gmail_filter""#,
+    );
+    as_google(&t, &p);
+    let id = t.connector_id.clone();
+    t.state
+        .db
+        .with(move |c| {
+            let mut cfg = entities::get_connector(c, &id)?.unwrap().config;
+            cfg.args = vec!["-c".into(), script];
+            entities::update_connector(c, &id, None, Some(&cfg), None)?;
+            Ok(())
+        })
+        .unwrap();
+    let (token, _guard, _) = t.grant().await;
+    // Only the trusted owner appears in the call; the saved filter forwards
+    // to someone the call does not show, so it asks.
+    let (state, tok) = (t.state.clone(), token.clone());
+    let held = tokio::spawn(async move {
+        handle(
+            &state,
+            &json!({"token": tok, "connector": "chat", "request": {
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "manage_gmail_filter", "arguments": {
+                    "action": "update", "filter_id": "f1",
+                    "criteria": {"to": "me@example.com"}}}}}),
+        )
+        .await
+    });
+    let card = t.pending_card().await;
+    t.decide(&card.id, false);
+    assert_eq!(held.await.unwrap()["result"]["isError"], true);
+    assert!(!t.calls_log().contains("manage_gmail_filter"));
+}
