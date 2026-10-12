@@ -706,6 +706,20 @@ async fn run_tool(
             let events = cdp.subscribe();
             press_key(cdp, s, "Enter", &|| b.check_agent(ctx)).await?;
             settle(events, &page, Duration::from_millis(1500)).await;
+            // Scripted sign-ins often check the password with the server
+            // before moving on: give a late navigation a few seconds.
+            for _ in 0..20 {
+                if run.page().target_id != page.target_id {
+                    break;
+                }
+                // Mid-navigation the page cannot answer: keep waiting.
+                if let Ok(now) = eval(run, "navigationState()").await
+                    && now["doc"] != before["doc"]
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
             release_after_action(run, &page, &before).await?;
             let mut out = snapshot_after(run).await?;
             out.text = format!("filled and submitted.\n\n{}", out.text);
@@ -1075,7 +1089,7 @@ async fn eval_page(
 pub(crate) const STILL_SIGNING_IN: &str = "Done. The page still has the user's sign-in details in it, so it \
     cannot be read until the sign-in moves to a new page. If it now asks for the password, call \
     fill_login again with submit; if it asks for a code or a check, ask the user to take over \
-    the browser. Use `wait` for a few seconds and try `snapshot` again if it may still be loading.";
+    the browser.";
 
 /// The snapshot after an action. A page that is still locked by a fill is
 /// not a failure of the action.
@@ -1172,8 +1186,15 @@ async fn drag(
     )
     .await?;
     guard()?;
-    cdp.call("Input.dispatchMouseEvent", ev("mousePressed", x, y), s)
-        .await?;
+    // The whole call is dropped on takeover or turn end: the release is
+    // queued on drop, so the button is never left held.
+    let mut held = Held {
+        cdp,
+        session: s.map(String::from),
+        at: (x, y),
+        armed: true,
+    };
+    cdp.send("Input.dispatchMouseEvent", ev("mousePressed", x, y), s);
     let mut moved = Ok(());
     const STEPS: u32 = 12;
     for i in 1..=STEPS {
@@ -1186,12 +1207,36 @@ async fn drag(
         let _ = cdp
             .call("Input.dispatchMouseEvent", ev("mouseMoved", mx, my), s)
             .await;
+        held.at = (mx, my);
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
-    let (rx, ry) = if moved.is_ok() { (tx, ty) } else { (x, y) };
+    let (rx, ry) = if moved.is_ok() { (tx, ty) } else { held.at };
+    held.armed = false;
     cdp.call("Input.dispatchMouseEvent", ev("mouseReleased", rx, ry), s)
         .await?;
     moved
+}
+
+/// A pressed mouse button, released when dropped unless disarmed.
+struct Held<'a> {
+    cdp: &'a Cdp,
+    session: Option<String>,
+    at: (f64, f64),
+    armed: bool,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let (x, y) = self.at;
+            self.cdp.send(
+                "Input.dispatchMouseEvent",
+                json!({"type": "mouseReleased", "x": x, "y": y, "button": "left",
+                       "buttons": 0, "clickCount": 1}),
+                self.session.as_deref(),
+            );
+        }
+    }
 }
 
 /// (key, code, Windows virtual key code, text) for named keys.

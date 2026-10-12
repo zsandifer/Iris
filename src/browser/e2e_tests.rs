@@ -130,7 +130,10 @@ h.onpointerup = () => {
   if (start === null) return;
   start = null;
   // A jump straight to the end is a robot: a person moves on the way.
-  parent.postMessage(h.offsetLeft >= 260 && moves > 3 ? 'slider-passed' : 'slider-failed', '*');
+  const ok = h.offsetLeft >= 260 && moves > 3;
+  parent.postMessage(ok ? 'slider-passed' : 'slider-failed', '*');
+  // A failed try snaps back, like real sliders.
+  if (!ok) { h.style.left = '10px'; moves = 0; }
 };
 parent.postMessage('ready-slider', '*');
 </script></body>"##;
@@ -1393,18 +1396,40 @@ async fn does_the_web_basics_and_solves_captchas() {
     call("click_at", verify).await;
     assert!(status().await.contains("grid-passed"), "{}", status().await);
 
-    // Slider CAPTCHA: drag the handle all the way, moving on the way.
+    // Taking over mid-drag lets go of the button (the page sees pointerup).
     let (sx, sy) = frame_at(&snap, "Slider check");
+    let (st, tk) = (state.clone(), guard.token().to_string());
+    let dragging = tokio::spawn(async move {
+        tools::call(
+            &st,
+            &tk,
+            "drag",
+            &json!({"from_x": sx + 30.0, "from_y": sy + 30.0, "to_x": sx + 305.0, "to_y": sy + 30.0}),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    state.browser.take_over(&owner, "phone").await.unwrap();
+    let _ = dragging.await;
+    let mut released = false;
+    for _ in 0..20 {
+        if status().await.contains("slider-failed") {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(released, "the button stayed held: {}", status().await);
+    state.browser.hand_back();
+
+    // Slider CAPTCHA: drag the handle all the way, moving on the way.
     call(
         "drag",
         json!({"from_x": sx + 30.0, "from_y": sy + 30.0, "to_x": sx + 305.0, "to_y": sy + 30.0}),
     )
     .await;
     let st = status().await;
-    assert!(
-        st.contains("slider-passed") && !st.contains("slider-failed"),
-        "{st}"
-    );
+    assert!(st.contains("slider-passed"), "{st}");
 
     // Off-screen points are refused, not clicked somewhere else.
     let out = tools::call(
