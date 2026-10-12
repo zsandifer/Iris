@@ -1489,7 +1489,9 @@ by their real arguments: `manage_event` with `action: "create"` is
 `send_updates` is `"none"` and no attendees are given (Google tells guests
 by default), and deleting also notifies guests unless `send_updates` is
 `"none"`; `update_drive_file` with `trashed: true` is "Move files to the
-trash", and with sharing settings or `add_parents` (moving into a folder
+trash", with new `content`/`file_url`/`file_path` (unless `mode` is
+`append` or `prepend`) it replaces the file (a deletion for the starting
+rules), and with sharing settings or `add_parents` (moving into a folder
 gives its people access) also "Share files, change who has access, or put
 them in folders", as is creating, copying, or importing a file (Drive, Docs,
 Sheets) into a folder other than My Drive's root; populating a Docs tab

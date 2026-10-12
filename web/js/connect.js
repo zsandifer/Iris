@@ -494,7 +494,7 @@ function ModeSheet({ con, onSaved }) {
 /** Allow / Ask / Off for one action (a native picker, styled quietly). */
 function PermissionRow({ a, onChoose, disabled }) {
   return html`<div class="r perm">
-    <div class="rt">${a.label}${a.note && html`<small>${a.note}</small>`}</div>
+    <div class="rt">${a.label}${(a.note || a.description) && html`<small>${a.note || brief(a.description)}</small>`}</div>
     <label class="perm-pick">
       <span>${CHOICE_LABEL[a.value] || a.value}</span>
       <svg class="ic" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"
@@ -520,6 +520,11 @@ function PermissionSections({ perms, con, onSaved, disabled }) {
 }
 
 const cap = (t) => (t ? t[0].toUpperCase() + t.slice(1) : t);
+/** The first sentence of a server's tool description, kept short. */
+const brief = (d) => {
+  const first = String(d || '').split(/(?<=\.)\s|\n/)[0].trim();
+  return first.length > 110 ? `${first.slice(0, 107)}…` : first;
+};
 
 function Hero({ c, title, sub }) {
   return html`<div class="svc-hero"><${ServiceTile} c=${c} size=${64} /><h1 class="ttl">${title}</h1>${sub && html`<div class="sub">${sub}</div>`}</div>`;

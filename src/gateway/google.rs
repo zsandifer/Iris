@@ -772,7 +772,17 @@ pub fn call_actions(name: &str, args: &Value) -> Option<Vec<(&'static str, Categ
                     .contains(&k.as_str())
                 })
             });
-            if out.is_empty() || other {
+            // New content replaces the file unless appended or prepended.
+            let replaces = ["content", "file_path", "file_url"]
+                .iter()
+                .any(|k| given(args, k))
+                && !matches!(
+                    selector(args, "mode").as_deref(),
+                    Some("append" | "prepend")
+                );
+            if replaces {
+                out.push(("drive.edit", Delete));
+            } else if out.is_empty() || other {
                 out.push(("drive.edit", Write));
             }
             Some(out)
@@ -1376,6 +1386,21 @@ mod tests {
                 json!({"action": "\u{1c}DELETE\u{3000}", "send_updates": "none"})
             ),
             Some(vec![("calendar.events.delete", Delete)])
+        );
+        // Replacing a file's content is destructive; appending is an edit.
+        assert_eq!(
+            c(
+                "update_drive_file",
+                json!({"file_id": "f", "content": "new"})
+            ),
+            Some(vec![("drive.edit", Delete)])
+        );
+        assert_eq!(
+            c(
+                "update_drive_file",
+                json!({"file_id": "f", "content": "more", "mode": "append"})
+            ),
+            Some(vec![("drive.edit", Write)])
         );
         // Putting files in a folder shares them with its people.
         assert_eq!(

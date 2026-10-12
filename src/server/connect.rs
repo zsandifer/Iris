@@ -3005,6 +3005,11 @@ mod tests {
             .vault
             .seal_str("tok", &format!("connector:{id}:oauth:refresh_token"))
             .unwrap();
+        let access = a
+            .state
+            .vault
+            .seal_str("atok", &format!("connector:{id}:oauth:access_token"))
+            .unwrap();
         let cid = id.clone();
         a.state
             .db
@@ -3012,6 +3017,8 @@ mod tests {
                 let mut cfg = entities::get_connector(c, &cid)?.unwrap().config;
                 let o = cfg.oauth.as_mut().unwrap();
                 o.refresh_token = Some(sealed);
+                o.access_token = Some(access);
+                o.expires_at = Some(crate::util::now_ms() + 3_600_000);
                 o.account = Some("owner@example.com".into());
                 entities::update_connector(c, &cid, None, Some(&cfg), None)?;
                 entities::set_connector_state(
@@ -3070,7 +3077,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(con.auth_state, "needs_sign_in");
-        assert!(con.config.oauth.unwrap().refresh_token.is_none());
+        let o = con.config.oauth.unwrap();
+        assert!(o.refresh_token.is_none() && o.access_token.is_none() && o.expires_at.is_none());
         let (s, _) = call(&a, "POST", "/api/connectors/nope/oauth/sign-out", None).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
