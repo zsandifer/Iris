@@ -34,6 +34,8 @@ UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY CODEX_API
 # Light hardening that still lets the CLIs work in your home directory.
 # deploy/setup-engines.sh relaxes NoNewPrivileges with a drop-in when you
 # enable the engine-install privilege split (it uses sudo).
+# deploy/setup-agent-user.sh also installs a drop-in for the fixed agent
+# launcher. Restart the user manager after setup to load its new group.
 NoNewPrivileges=yes
 UMask=0077
 

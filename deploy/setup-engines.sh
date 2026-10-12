@@ -12,7 +12,9 @@
 # engines into its own data directory as the agent user.
 #
 # Usage (as root):
-#   sh deploy/setup-engines.sh <agent-user> [iris-binary] [engines-dir]
+#   sh deploy/setup-engines.sh <service-user> [iris-binary] [engines-dir] [agent-user] [data-dir] [config-file]
+# With agent-user, also calls setup-agent-user.sh to isolate CLI turns.
+# The historical AGENT_USER variable below names the service account.
 # Defaults: iris-binary=/usr/local/bin/iris, engines-dir=/opt/iris/engines
 #
 # Then add to the agent user's ~/.config/iris/config.toml:
@@ -154,3 +156,9 @@ echo "  helper = [\"sudo\", \"-n\", \"-u\", \"$ADMIN_USER\", \"$IRIS_BIN\", \"en
 echo ""
 echo "Then, as $AGENT_USER: systemctl --user daemon-reload && systemctl --user restart iris"
 echo "Engines need Node.js (npm) on the server for Codex, Gemini CLI, and OpenCode."
+
+# Optional second split: CLI turns as a dedicated account, data private to
+# the service account (the historical first argument names that account).
+if [ -n "${4:-}" ]; then
+    sh "$(dirname "$0")/setup-agent-user.sh" "$AGENT_USER" "$4" "$IRIS_BIN" "${5:-$AGENT_HOME/.local/share/iris}" "${6:-$AGENT_HOME/.config/iris/config.toml}" "$ENGINES_DIR"
+fi

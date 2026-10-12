@@ -474,6 +474,9 @@ async fn run_locked(
         let prompt = render_prompt(&ctx, &agent_name, &replay, &input.user_message);
         let mut notices = state.harness_notices(&harness_name);
         let caps = entry.harness.capabilities();
+        if !caps.mcp {
+            notices.push("App actions, memory updates and connected services are unavailable to this engine right now. Explain that briefly if the user asks for one; do not claim an action was saved or sent.".into());
+        }
         let sees_images =
             caps.images && catalog.get(&d.model).and_then(|m| m.images).unwrap_or(true);
         let mut images = load_images(state, &input.user_message).await;
@@ -535,6 +538,24 @@ async fn run_locked(
             .await
             .unwrap_or_default()
         };
+        let prepared = (|| -> crate::util::Result<_> {
+            Ok((
+                crate::agent::workdir(&state.cfg.agent, &state.paths, conv_id)?,
+                state.protected_paths()?,
+                crate::agent::turn_dir(&state.cfg.agent, &state.paths, &new_id())?,
+            ))
+        })();
+        let (cwd, protected_paths, run_dir) = match prepared {
+            Ok(p) => p,
+            Err(e) => {
+                outcome = Outcome::Failed {
+                    kind: "internal",
+                    detail: format!("could not prepare isolated turn: {e}"),
+                };
+                break;
+            }
+        };
+        let _turn_files = crate::agent::TurnFiles::new(&state.cfg.agent, conv_id, &run_dir);
         let mut spec = TurnSpec {
             turn_id: new_id(),
             prompt,
@@ -544,20 +565,18 @@ async fn run_locked(
             effort: d.effort.clone(),
             resume: session.as_ref().map(|s| s.session_id.clone()),
             mcp_servers,
-            cwd: state.paths.workspace_dir(),
-            // The owner's memory is only writable in the owner's own chats.
-            writable_dirs: if scope == Scope::Private {
-                vec![state.paths.memory_dir()]
-            } else {
-                Vec::new()
-            },
-            run_dir: state.paths.run_dir(),
+            cwd,
+            writable_dirs: Vec::new(),
+            run_dir,
             scope: conv_id.to_string(),
             key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
             isolated: scope != Scope::Private,
             own_mcp_servers: Vec::new(),
+            protected_paths,
+            split: !state.cfg.agent.user.is_empty(),
         };
         if spec.isolated
+            && !spec.split
             && let Err(why) = entry.harness.can_isolate()
         {
             crate::warn!("turn {msg_id}: {harness_name} cannot be isolated: {why}");
@@ -579,6 +598,22 @@ async fn run_locked(
                 continue;
             }
         }
+        let _relays = match crate::agent::relay_servers(
+            &state.cfg.agent,
+            &spec.run_dir,
+            &mut spec.mcp_servers,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                outcome = Outcome::Failed {
+                    kind: "internal",
+                    detail: format!("could not prepare app bridge: {e}"),
+                };
+                break;
+            }
+        };
         let invocation = match build_invocation(state, &harness_name, &spec).await {
             Ok(mut i) => {
                 if harness_name == "claude" && crate::harness::is_managed(&program) {
@@ -589,6 +624,15 @@ async fn run_locked(
                 // API keys the owner added in the app (after inherited
                 // ones were stripped).
                 i.env.extend(keys);
+                if let Err(e) = crate::agent::expose_files(&state.cfg.agent, &i).and_then(|_| {
+                    crate::agent::wrap(&state.cfg.agent, &harness_name, &spec.scope, &mut i)
+                }) {
+                    outcome = Outcome::Failed {
+                        kind: "internal",
+                        detail: format!("could not isolate CLI: {e}"),
+                    };
+                    break;
+                }
                 i
             }
             Err(e) => {
@@ -647,6 +691,7 @@ async fn run_locked(
         );
         let consume_fut = consume(state, &mut audience, conv_id, msg_id, rx);
         let (run_res, attempt) = tokio::join!(run_fut, consume_fut);
+
         for f in &invocation.temp_files {
             let _ = std::fs::remove_file(f);
         }
@@ -837,7 +882,9 @@ async fn refine_with_model(
     let entry = state.harness(&m.harness)?;
     let program = entry.program()?;
     // The classifier always runs isolated (it needs nothing of the CLI's).
-    entry.harness.can_isolate().ok()?;
+    if state.cfg.agent.user.is_empty() {
+        entry.harness.can_isolate().ok()?;
+    }
     let effort = pin
         .and_then(|p| p.effort)
         .or_else(|| crate::ranking::default_effort(m));
@@ -851,17 +898,22 @@ async fn refine_with_model(
         effort,
         resume: None,
         mcp_servers: Vec::new(),
-        cwd: state.paths.workspace_dir(),
+        cwd: crate::agent::workdir(&state.cfg.agent, &state.paths, "classifier").ok()?,
         writable_dirs: Vec::new(),
-        run_dir: state.paths.run_dir(),
+        run_dir: crate::agent::turn_dir(&state.cfg.agent, &state.paths, &new_id()).ok()?,
         scope: "classifier".into(),
         key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
         // A one-word answer needs none of the CLI's own tools or memory.
         isolated: true,
         own_mcp_servers: own_mcp_servers(state, entry, &program).await?,
+        protected_paths: state.protected_paths().ok()?,
+        split: !state.cfg.agent.user.is_empty(),
     };
+    let _turn_files = crate::agent::TurnFiles::new(&state.cfg.agent, "classifier", &spec.run_dir);
     let mut invocation = build_invocation(state, &m.harness, &spec).await.ok()?;
     invocation.env.extend(keys);
+    crate::agent::expose_files(&state.cfg.agent, &invocation).ok()?;
+    crate::agent::wrap(&state.cfg.agent, &m.harness, "classifier", &mut invocation).ok()?;
     let strip = state.strip_env(entry);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let run = runner::run(
@@ -877,6 +929,10 @@ async fn refine_with_model(
         tx,
     )
     .await;
+
+    if spec.split {
+        let _ = std::fs::remove_dir_all(&spec.run_dir);
+    }
     for f in &invocation.temp_files {
         let _ = std::fs::remove_file(f);
     }
@@ -897,9 +953,14 @@ async fn build_invocation(
     harness: &str,
     spec: &TurnSpec,
 ) -> crate::util::Result<crate::harness::Invocation> {
-    let (st, name, spec) = (state.clone(), harness.to_string(), spec.clone());
+    let (st, name, mut spec) = (state.clone(), harness.to_string(), spec.clone());
     tokio::task::spawn_blocking(move || match st.harness(&name) {
-        Some(e) => e.harness.build(&spec),
+        Some(e) => {
+            let images = crate::agent::copy_images(&mut spec)?;
+            let mut inv = e.harness.build(&spec)?;
+            inv.temp_files.extend(images);
+            Ok(inv)
+        }
         None => Err(format!("unknown harness {name}").into()),
     })
     .await
@@ -917,7 +978,7 @@ pub(crate) async fn own_mcp_servers(
         return Some(Vec::new());
     };
     let strip = state.strip_env(entry);
-    match runner::probe(program, &args, &state.paths.workspace_dir(), &strip, &[]).await {
+    match state.agent_probe(entry, program, &args, &strip, &[]).await {
         Ok((true, out, _)) => entry.harness.parse_own_mcp_servers(&out),
         _ => None,
     }
@@ -1408,11 +1469,19 @@ async fn mcp_servers(
         "mcp".into(),
         "--data-dir".into(),
         state.paths.data_dir.to_string_lossy().into_owned(),
+        "--config".into(),
+        state.paths.config_file.to_string_lossy().into_owned(),
         "--user".into(),
         user_id.into(),
         "--conversation".into(),
         conv_id.into(),
     ];
+    args.extend([
+        "--workdir".into(),
+        crate::agent::workdir(&state.cfg.agent, &state.paths, conv_id)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    ]);
     if shared {
         args.push("--shared".into());
     }

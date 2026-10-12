@@ -259,7 +259,10 @@ pub async fn verify(
         // OpenCode lists a provider's models once its key is present: a
         // model of the provider this key is for.
         let args = entry.harness.models_probe_args().unwrap_or_default();
-        match runner::probe(&program, &args, &state.paths.workspace_dir(), &strip, &keys).await {
+        match state
+            .agent_probe(entry, &program, &args, &strip, &keys)
+            .await
+        {
             Ok((true, out, _)) => entry
                 .harness
                 .parse_models(&out)
@@ -281,22 +284,44 @@ pub async fn verify(
         effort: None,
         resume: None,
         mcp_servers: Vec::new(),
-        cwd: state.paths.workspace_dir(),
+        cwd: match crate::agent::workdir(&state.cfg.agent, &state.paths, "keycheck") {
+            Ok(p) => p,
+            Err(_) => return AuthState::Unknown,
+        },
         writable_dirs: Vec::new(),
-        run_dir: state.paths.run_dir(),
+        run_dir: match crate::agent::turn_dir(
+            &state.cfg.agent,
+            &state.paths,
+            &crate::util::new_id(),
+        ) {
+            Ok(p) => p,
+            Err(_) => return AuthState::Unknown,
+        },
         scope: "keycheck".into(),
         key_env: keys.iter().map(|(k, _)| k.clone()).collect(),
         // A one-word check needs none of the CLI's own tools or memory.
         isolated: true,
+        protected_paths: match state.protected_paths() {
+            Ok(p) => p,
+            Err(_) => return AuthState::Unknown,
+        },
+        split: !state.cfg.agent.user.is_empty(),
         own_mcp_servers: match crate::turn::own_mcp_servers(state, entry, &program).await {
             Some(names) => names,
             None => return AuthState::Unknown,
         },
     };
+    let _turn_files = crate::agent::TurnFiles::new(&state.cfg.agent, "keycheck", &spec.run_dir);
     let Ok(mut invocation) = entry.harness.build(&spec) else {
         return AuthState::Unknown;
     };
     invocation.env.extend(keys);
+    if crate::agent::expose_files(&state.cfg.agent, &invocation)
+        .and_then(|_| crate::agent::wrap(&state.cfg.agent, harness, "keycheck", &mut invocation))
+        .is_err()
+    {
+        return AuthState::Unknown;
+    }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let run = runner::run(
@@ -312,6 +337,10 @@ pub async fn verify(
         tx,
     )
     .await;
+
+    if spec.split {
+        let _ = std::fs::remove_dir_all(&spec.run_dir);
+    }
     for f in &invocation.temp_files {
         let _ = std::fs::remove_file(f);
     }

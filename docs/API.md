@@ -1729,6 +1729,7 @@ anything.
     "installed": true, "managed": true, "external": false,
     "version": "2.1.296 (Claude Code)", "managed_version": "2.1.296",
     "auth": "ok", "requires": null,
+    "isolation": "split", "agent_user": "iris-agent", "signed_in_as_agent": true,
     "operation": {"op": "update", "state": "done", "error": null, "version": "2.1.296",
                   "started_at": 1760000000000, "finished_at": 1760000017000}
   }],
@@ -1742,6 +1743,13 @@ anything.
 `requires`: `"nodejs"` when the engine needs npm and it is missing.
 `operation`: the last install/update/uninstall (`state` `running`, `done`,
 or `failed` with `error`), or `null`.
+
+Each engine reports `isolation` (`single_user` or `split`), `agent_user`
+(the dedicated account or null), and `signed_in_as_agent` (true/false when
+its sign-in is known in split mode; null in single-user mode or when unknown).
+Version, model and auth probes and app-driven sign-in use the configured
+account. Gemini's `mcp` capability is false while project context is disabled
+through restricted mode.
 
 #### `POST /api/engines/{name}/install`, `POST /api/engines/{name}/update`
 
@@ -2524,6 +2532,8 @@ Metadata only; the encrypted secret is never returned.
 | `auth` | string | `ok`, `auth_required`, or `unknown` (Gemini CLI has no status command: `unknown` until a turn shows otherwise; `unknown` counts as usable). |
 | `auth_message` | string or null | Short reason when `auth_required`; never contains account data. |
 | `checked_at` | int or null | Last probe. |
+| `isolation` | string | `single_user` or `split`. |
+| `agent_user` | string or null | Dedicated OS account in split mode; `auth` refers to that account's CLI sign-in. |
 
 ### ModelEntry
 
@@ -2790,13 +2800,15 @@ for the proxies so a call can wait for the owner's approval (Claude Code
   returns `isError: true` with `Error: <tool> is not available in shared
   conversations`. This keeps other members from reading or changing the
   creator's goals, ideas, feed, library, or connector list through the agent.
-- `--workdir` is the CLI's working folder when it is not the workspace
-  itself (Gemini runs in `workspace/gemini/<conversation>`); relative
-  `save_to_library` paths resolve against it. It is ignored unless it lies
-  inside the workspace.
-- `list_connectors` returns an empty list, and `save_to_library` cannot read
-  the memory folder, unless `--user` is the Iris owner and the conversation
-  is not shared: connectors and memory are the owner's.
+- `--workdir` is always the current conversation's directory. Relative
+  `save_to_library` paths resolve there; a different directory is refused.
+  Neither another conversation nor the memory tree is a library file root.
+- `list_connectors` returns an empty list unless this is the owner's private
+  context. `read_memory` / `write_memory` are also owner-only and unavailable
+  in shared chats; paths must be relative Markdown paths inside Iris memory.
+- In split mode the CLI starts `iris mcp-relay SOCKET` with an expiring token
+  supplied through per-turn config/environment. Iris runs the real bridge
+  as its service user; the agent never opens its database.
 - The command refuses to start if there is no Iris database in `DATA_DIR`.
 
 Claude Code receives it through `--mcp-config` (and `mcp__iris` is
@@ -2862,6 +2874,8 @@ All tools are available in normal mode; only `create_card` in shared mode.
 | `create_idea` | `title` (required, max 300), `description?` (max 2,000), `prompt?` (max 4,000; sent when the user taps the idea) | `{"idea": Idea}` (status `open`) |
 | `list_feed_posts` | `limit?: int` (1 to 50, default 10) | `{"posts": [FeedPost]}` |
 | `create_feed_post` | `title` (required, max 300), `body` (required, Markdown, max 50,000), `topic?` (max 100), `source_url?`, `source_name?` (max 100), `image_url?` (http(s), max 2,000), `images?: string[]` (the page's original photos, http(s), max 10), `why?` (max 300) | `{"post": FeedPost}` |
+| `read_memory` | `path` (required, relative `.md` path, owner private context only) | `{"content": string}` |
+| `write_memory` | `path`, `content` (required, Markdown, owner private context only) | `{"written": true}` |
 | `save_to_library` | `title` (required, max 300), exactly one of `content` or `path`, `mime?`, `kind?: "artifact" \| "media"`, `description?` (max 2,000) | `{"item": LibraryItem}` |
 | `list_library` | `kind?: "artifact" \| "media"` | `{"items": [LibraryItem]}` (max 500) |
 | `create_card` | `type` (required, one of the [card types](#card)), `title` (required), `body?`, `url?`, `image_url?`, `action_label?`, `service?`, `ref_id?` (id of a related goal, idea, or feed post) | `{"card_message_id": "...", "shown": true}` |
@@ -2997,17 +3011,14 @@ never used in jobs (nobody could approve).
 - **`content`** (text, up to 1,000,000 characters): `mime` defaults to
   `text/markdown` and must be `text/*` or `application/json`. The file
   extension is `md`, `html`, `csv`, `json`, or `txt` based on `mime`.
-- **`path`**: a relative path (resolved against the CLI's working folder:
-  `--workdir`, else the workspace) or an absolute path. After resolving
-  symlinks, the file must be inside the **workspace** folder (or, in the
-  owner's own conversations, the **memory** folder), must not itself be a
-  symlink, must be a regular file, and must be at most 20 MiB. Otherwise:
-  `only regular files in the working folder or memory folder can be saved`
-  (or `file not
-  found`, `file is larger than 20 MB`). `mime` defaults from the extension
-  (`md`, `txt`, `csv`, `json`, `html`, `pdf`, `png`, `jpg`/`jpeg`, `gif`,
-  `webp`, `svg`, `mp3`, `wav`, `mp4`; otherwise
-  `application/octet-stream`).
+- **`path`**: a relative or absolute path inside the **current conversation's
+  working directory**, naming a regular file up to 20 MiB. Every path
+  component is opened relative to a directory descriptor without following
+  symlinks; traversal, symlinked directories, other conversations and memory
+  files are refused. In split mode the fixed launcher reads the file as the
+  agent user. `mime` defaults from the extension (`md`, `txt`, `csv`, `json`,
+  `html`, `pdf`, `png`, `jpg`/`jpeg`, `gif`, `webp`, `svg`, `mp3`, `wav`, `mp4`;
+  otherwise `application/octet-stream`).
 - `kind` defaults to `media` for `image/*`, `audio/*`, `video/*`, else
   `artifact`.
 - The file is copied into the Library folder; the item is linked to the

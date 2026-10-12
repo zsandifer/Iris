@@ -100,6 +100,9 @@ pub fn engines_json(state: &AppState) -> Vec<Value> {
                 "version": status.as_ref().and_then(|s| s.version.clone()),
                 "managed_version": engines::installed_version(&root, e.name),
                 "auth": status.as_ref().map(|s| s.auth),
+                "isolation": if state.cfg.agent.user.is_empty() { "single_user" } else { "split" },
+                "agent_user": status.as_ref().and_then(|s| s.agent_user.clone()),
+                "signed_in_as_agent": if state.cfg.agent.user.is_empty() { None } else { status.as_ref().and_then(|s| match s.auth { AuthState::Unknown => None, other => Some(other == AuthState::Ok) }) },
                 "requires": needs,
                 "operation": state.engine_ops.get(e.name),
             })
