@@ -1,10 +1,11 @@
 // Iris's computer: the live view of Iris's browser (chat peek, the
 // computer screen, full-screen Watch), Take over / Hand back with taps,
-// scrolling and typing forwarded to the page, browser setup, and Pause.
+// scrolling and typing forwarded to the page, filling saved logins and
+// cards while in control, browser setup, and Pause.
 import { html, useEffect, useRef, useState } from './h.js';
 import { get, post, put, wsSend } from './api.js';
 import { S, set, useStore, go, back, toast, frames, loadBrowser } from './store.js';
-import { Icon, Row, Group, Page, Spinner, Toggle, agentName, confirmSheet, stamp, hostOf } from './ui.js';
+import { Icon, Row, Group, Page, Spinner, Toggle, agentName, confirmSheet, openSheet, closeSheet, stamp, hostOf } from './ui.js';
 import { activityTitle, placeLabel } from './hub.js';
 
 // ---------------------------------------------------------------- watching
@@ -76,6 +77,38 @@ const SPECIAL = new Set(['Enter', 'Backspace', 'Tab', 'Escape', 'Delete', 'Arrow
 const PAD = '  ';
 
 function input(ev) { wsSend({ type: 'browser.input', ...ev }); }
+
+const LOGIN_FIELDS = [['username', 'Username'], ['password', 'Password']];
+const CARD_FIELDS = [['number', 'Number'], ['exp', 'Expiry'], ['cvc', 'CVC'], ['name', 'Name']];
+
+/** The site a saved login is for, as a host (matches the page's). */
+function siteHost(site) {
+  if (!site) return '';
+  return hostOf(site.includes('://') ? site : `https://${site}`);
+}
+
+/** Saved logins and cards to fill into the field the owner tapped. The
+ * server types them into the page; they never come back to the app. */
+async function fillSheet(host) {
+  let list;
+  try { list = (await get('/credentials')).credentials || []; } catch (e) { toast(e.message); return; }
+  const logins = list.filter((c) => c.kind === 'login')
+    .sort((a, b) => (siteHost(b.metadata.site) === host) - (siteHost(a.metadata.site) === host));
+  const cards = list.filter((c) => c.kind === 'card');
+  const pick = (c, field) => { closeSheet(); input({ kind: 'fill', credential_id: c.id, field }); };
+  const item = (c, title, sub, fields) => html`<div class="fill-item">
+    <b>${title}</b>${sub && html`<small class="mu">${sub}</small>`}
+    <div class="row-btns">${fields.map(([f, label]) => html`<button class="b2" onClick=${() => pick(c, f)}>${label}</button>`)}</div>
+  </div>`;
+  openSheet(() => html`<div class="sheet-body">
+    <h3>Fill from Logins & wallet</h3>
+    <p class="mu">Tap the field on the page first, then what goes in it. It's typed straight into the site; ${agentName()} never sees it.</p>
+    ${!logins.length && !cards.length && html`<p class="mu">Nothing saved yet. Add logins and cards in Logins & wallet.</p>`}
+    ${logins.map((c) => item(c, c.label, [c.metadata.site, c.metadata.username].filter(Boolean).join(' · '), LOGIN_FIELDS))}
+    ${cards.map((c) => item(c, `${(c.metadata.brand || 'Card').replace(/^./, (x) => x.toUpperCase())} ••${c.metadata.last4 || ''}`, c.label, CARD_FIELDS))}
+    <div class="btns"><button class="b2" onClick=${closeSheet}>Cancel</button></div>
+  </div>`);
+}
 
 /** Full screen: Watch, or (in control) forward taps, drags and typing. */
 function Viewer({ control }) {
@@ -210,6 +243,7 @@ function Viewer({ control }) {
       <button class="vw-btn" aria-label="Back" onClick=${() => input({ kind: 'back' })}><${Icon} name="back" size=${18} /></button>
       <form class="vw-url" onSubmit=${go2}><input type="text" inputmode="url" autocapitalize="off" autocomplete="off" spellcheck=${false}
         placeholder="Go to a website" value=${url} onInput=${(e) => setUrl(e.target.value)} aria-label="Web address" /></form>
+      <button class="vw-btn" aria-label="Fill a saved login or card" onClick=${() => fillSheet(host)}><${Icon} name="key" size=${19} /></button>
       <button class="vw-btn" aria-label="Type" onClick=${keyboard}><${Icon} name="keyboard" size=${20} /></button>
       <input ref=${kb} class="vw-kb" aria-label="Type into the page" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck=${false}
         onKeyDown=${onKeyDown} onBeforeInput=${onBeforeInput} onCompositionEnd=${onComposition}
@@ -294,14 +328,14 @@ function Setup({ b }) {
   const op = b.install;
   if (op?.state === 'running') {
     return html`<div class="screen"><${Spinner} /><b>Setting up ${agentName()}'s browser…</b>
-      <small>Downloading Chromium from its official source. This takes a minute or two.</small></div>`;
+      <small>Downloading Playwright and Chromium from their official sources. This takes a minute or two.</small></div>`;
   }
   return html`<div class="screen">
     <${Icon} name="globe" size=${30} />
     <b>${agentName()} doesn't have a browser yet</b>
     ${b.requires === 'nodejs'
-      ? html`<small>Setting it up needs Node.js on your server. Install Node.js there (or Chromium itself), then come back here.</small>`
-      : html`<small>${agentName()} can browse, sign in, and fill forms for you in its own browser, and you can watch or take over any time.</small>
+      ? html`<small>Setting it up needs Node.js on your server. Install Node.js there, then come back here.</small>`
+      : html`<small>${agentName()} can browse and fill in forms for you in its own browser. You can watch or take over any time, for example to sign in to a site.</small>
         <button class="b1" onClick=${install}>Set up the browser</button>`}
     ${op?.state === 'failed' && html`<small class="err-line">That didn't work: ${op.error}</small>`}
   </div>`;
@@ -374,7 +408,7 @@ export function Computer() {
     ${usable && html`<div class="big2">
       <button onClick=${watch}><${Icon} name="eye" size=${16} /> Watch</button>
       <button class="p" onClick=${takeOver}><${Icon} name="hand" size=${16} /> Take over</button></div>`}
-    ${usable && html`<div class="gnote">Take over to sign in to a site yourself or help ${agentName()} past a tricky step. ${agentName()} waits while you're in control. Sign-ins stay in its browser.</div>`}
+    ${usable && html`<div class="gnote">Take over to sign in to a site yourself (the key fills your saved logins) or help ${agentName()} past a tricky step. ${agentName()} waits while you're in control, and can't read a page where you typed a password until it moves on. Sign-ins stay in its browser.</div>`}
     <${Group} label="Recently">
       ${!act ? html`<${Spinner} />` : act.items.length ? act.items.map((it) => html`<${Row} title=${activityTitle(it)} sub=${placeLabel(it)}
         value=${stamp(it.created_at)} chevron=${false} onClick=${it.conversation_kind === 'job' ? undefined : () => go(`chat/${it.conversation_id}`)} />`)

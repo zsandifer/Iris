@@ -406,6 +406,10 @@ span.fav { display: inline-block; overflow: hidden; }
 .sheet-body p { margin: 0 0 12px; font-size: 14px; }
 .sheet-body .grp { margin-top: 8px; }
 .sheet-body.flush { margin: 0 -2px; }
+.fill-item { padding: 10px 0; border-top: 1px solid var(--ln); }
+.fill-item b, .fill-item small { display: block; }
+.fill-item .row-btns { justify-content: flex-start; margin: 8px 0 0; }
+.fill-item .b2 { padding: 7px 12px; font-size: 13px; }
 .sheet-body.flush .post { margin: 4px -14px 4px; }
 .btns { display: flex; gap: 8px; margin-top: 16px; }
 .btns > * { flex: 1; }
