@@ -32,12 +32,12 @@
 import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const opts = parseArgs(process.argv.slice(2));
-const DIR = opts.dir || process.env.IRIS_TEST_DIR || join(homedir(), '.local/share/iris-test');
+const DIR = resolve(opts.dir || process.env.IRIS_TEST_DIR || join(homedir(), '.local/share/iris-test'));
 const OFFLINE = opts['self-test'] || opts.rejudge;
 const BASE = OFFLINE ? '' : readFileSync(join(DIR, 'url'), 'utf8').trim();
 const TOKEN = OFFLINE ? '' : readFileSync(join(DIR, 'token'), 'utf8').trim();
@@ -317,6 +317,12 @@ Also set "root_cause" for anything but a pass: "site_blocking" (the site refused
 
 Attached pictures (when present) are the browser's live view at the end of each turn, in order: what the page really showed. Use them to check the reply (values, selected options, form state, messages). A reply that contradicts the picture fails. The picture may lag a moment behind the last action, and a page the agent left is not shown.`;
 
+/** End-of-turn pictures for the judge, as absolute paths (it runs in a
+ * temporary directory). Pictures of real accounts' pages stay here. */
+function judgeImages(s, turns) {
+  return s.suite === 'real' ? [] : turns.map((t) => t.final_frame).filter(Boolean).map((f) => resolve(f));
+}
+
 async function judge(s, turns, mech) {
   if (JUDGE === 'none') return { verdict: mech.ok ? 'pass' : 'fail', reason: mech.fails.join('; ') || 'checks passed', root_cause: mech.ok ? 'none' : 'unknown', nudge: '' };
   const convo = turns.map((t) => [
@@ -333,9 +339,10 @@ async function judge(s, turns, mech) {
   const prompt = `## Test ${s.id}\nTask: ${s.task}\nSuccess criteria: ${s.success}\nMechanical checks: ${mech.ok ? 'all passed' : mech.fails.join('; ')}\nNudges left: ${turns.length < MAX_TURNS && turns.length - 1 < MAX_NUDGES ? 'yes' : 'no (do not answer "nudge")'}\n\n## Conversation\n${convo}\n\nAnswer with the JSON verdict.`;
   const [engine, model] = JUDGE.split(':');
   // Pictures of real accounts' pages stay on this machine.
-  const images = s.suite === 'real' ? [] : turns.map((t) => t.final_frame).filter(Boolean);
+  const images = judgeImages(s, turns);
   const promptWithPics = `${prompt}\n\n${images.length ? `${images.length} picture(s) attached: the end of turn(s) ${turns.filter((t) => t.final_frame).map((t) => t.n).join(', ')}.` : 'No pictures attached.'}`;
   const work = mkdtempSync(join(tmpdir(), 'iris-judge-'));
+  judgeDirs.add(work);
   try {
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
@@ -349,20 +356,33 @@ async function judge(s, turns, mech) {
     }
   } finally {
     rmSync(work, { recursive: true, force: true });
+    judgeDirs.delete(work);
   }
 }
 
-function run(cmd, args, input, cwd, timeoutMs = 300000) {
+// Judges still running, so an interrupted suite can stop them too.
+const children = new Set();
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    for (const pid of children) try { process.kill(-pid, 'SIGKILL'); } catch {}
+    for (const dir of judgeDirs) rmSync(dir, { recursive: true, force: true });
+    process.exit(130);
+  });
+}
+const judgeDirs = new Set();
+
+function run(cmd, args, input, cwd, timeoutMs = 300000, extraEnv = {}) {
   return new Promise((resolve, reject) => {
-    const env = { ...process.env };
+    const env = { ...process.env, ...extraEnv };
     for (const k of ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'CODEX_API_KEY']) delete env[k];
     // Its own process group: the npm launchers start the real CLI as a
     // child, which a timeout must stop too.
     const p = spawn(cmd, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    children.add(p.pid);
     let out = '';
     let err = '';
     let settled = false;
-    const done = (fn, v) => { if (!settled) { settled = true; clearTimeout(t); fn(v); } };
+    const done = (fn, v) => { if (!settled) { settled = true; clearTimeout(t); children.delete(p.pid); fn(v); } };
     const t = setTimeout(() => {
       try { process.kill(-p.pid, 'SIGKILL'); } catch {}
       done(reject, new Error(`${cmd} timed out after ${timeoutMs / 1000}s`));
@@ -401,7 +421,9 @@ async function judgeClaude(work, model, prompt, images) {
   const input = JSON.stringify({ type: 'user', message: { role: 'user', content } }) + '\n';
   const out = await run('claude', ['-p', '--model', model, '--tools', '', '--strict-mcp-config', '--setting-sources', '',
     '--no-session-persistence', '--disable-slash-commands', '--input-format', 'stream-json', '--output-format', 'stream-json',
-    '--verbose', '--json-schema', JSON.stringify(JUDGE_SCHEMA), '--system-prompt', JUDGE_SYSTEM], input, work);
+    '--verbose', '--json-schema', JSON.stringify(JUDGE_SCHEMA), '--system-prompt', JUDGE_SYSTEM], input, work, 300000,
+    // No CLAUDE.md files or auto memory either (as src/harness/claude.rs).
+    { CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' });
   const r = out.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return {}; } }).find((m) => m.type === 'result');
   if (!r || r.is_error) throw new Error(r?.result || 'no result');
   return r.structured_output;
@@ -533,7 +555,7 @@ async function main() {
   const creds = await syncCredentials(credentials);
   const slots = (await api('GET', '/models/slots')).slots;
   const model = slots.find((x) => x.slot === 'chat')?.effective;
-  const outDir = opts.out || join(DIR, 'runs', stamp());
+  const outDir = resolve(opts.out || join(DIR, 'runs', stamp()));
   mkdirSync(outDir, { recursive: true });
   const report = { started: new Date().toISOString(), iris: { version: health.version, build_id: health.build_id }, model, judge: JUDGE, scenario_file: SCEN_FILE, options: { MAX_TURNS, MAX_NUDGES, TIMEOUT, HOST_GAP }, runs: [] };
   console.log(`${scenarios.length} scenarios x ${opts.repeat || 1}; model ${model}; judge ${JUDGE}; report ${outDir}`);
@@ -590,14 +612,19 @@ function selfTest() {
   }
   const rx = mechanical({ checks: { reply_regex: '\\d+\\s*%' } }, [turn({ reply: 'Chrome uses **12.5 %**' })]).ok;
   console.log(`${rx ? 'ok  ' : 'FAIL'} a regex across markdown`);
-  if (bad || !rx) process.exit(1);
+  const pics = judgeImages({ suite: 'public' }, [turn({ final_frame: 'runs/run1/t/frames/t1-final.jpg' })]);
+  const abs = pics.length === 1 && pics[0].startsWith('/');
+  console.log(`${abs ? 'ok  ' : 'FAIL'} relative frame paths reach the judge as absolute paths`);
+  const local = judgeImages({ suite: 'real' }, [turn({ final_frame: '/x/t1-final.jpg' })]).length === 0;
+  console.log(`${local ? 'ok  ' : 'FAIL'} real-account pictures stay local`);
+  if (bad || !rx || !abs || !local) process.exit(1);
 }
 
 async function rejudge(file) {
   const { scenario, result } = JSON.parse(readFileSync(file, 'utf8'));
   const turns = result.turns.filter((t) => t.reply !== undefined);
   for (const t of turns) {
-    const f = join(dirname(file), 'frames', `t${t.n}-final.jpg`);
+    const f = join(dirname(resolve(file)), 'frames', `t${t.n}-final.jpg`);
     if (!t.final_frame && existsSync(f)) t.final_frame = f;
   }
   const mech = mechanical(scenario, turns);

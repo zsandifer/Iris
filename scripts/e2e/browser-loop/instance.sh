@@ -16,7 +16,7 @@
 #   IRIS_TEST_PUBLIC_URL  URL `iris pair` prints (for example a tailnet name)
 #   IRIS_TEST_MODEL chat model to pin (default claude:haiku)
 #   IRIS_TEST_ENGINES  engines dir to use read-only (default /opt/iris/engines
-#                   when it exists, else Iris's own default)
+#                   when it exists, else ~/.local/share/iris/engines)
 #   IRIS_BIN        iris binary to run (default target/release/iris, else
 #                   target/debug/iris of this checkout)
 #
@@ -29,8 +29,14 @@ ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 DIR=${IRIS_TEST_DIR:-$HOME/.local/share/iris-test}
 BIND=${IRIS_TEST_BIND:-127.0.0.1:7999}
 MODEL=${IRIS_TEST_MODEL:-claude:haiku}
+# Engines (the CLIs and the browser) are used where an existing Iris keeps
+# them: the privilege-split directory, else a single-user install's.
 ENGINES=${IRIS_TEST_ENGINES:-}
-[ -n "$ENGINES" ] || { [ -d /opt/iris/engines ] && ENGINES=/opt/iris/engines; } || true
+if [ -z "$ENGINES" ]; then
+  for d in /opt/iris/engines "${XDG_DATA_HOME:-$HOME/.local/share}/iris/engines"; do
+    [ -d "$d" ] && { ENGINES=$d; break; }
+  done
+fi
 CFG=(--config "$DIR/config.toml" --data-dir "$DIR/data")
 BIN="$DIR/bin/iris"
 BASE="http://$BIND"
@@ -111,6 +117,9 @@ up() {
   [ -f "$DIR/config.toml" ] || "$BIN" init "${CFG[@]}" >/dev/null
   configure
   check_safe
+  if [ -z "$ENGINES" ] && ! command -v playwright-mcp >/dev/null; then
+    die "no engines directory found and no playwright-mcp on PATH: set IRIS_TEST_ENGINES to the engines directory of an Iris that has its browser installed"
+  fi
   # Keys that would bill API usage instead of the signed-in subscriptions.
   env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u CODEX_API_KEY \
     setsid nohup "$BIN" serve "${CFG[@]}" >>"$DIR/serve.log" 2>&1 </dev/null &
