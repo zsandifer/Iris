@@ -93,7 +93,9 @@ while IFS= read -r line; do
               t=$(cat pagetext 2>/dev/null)
               reply "### Result\\n\\\"$t\\\"" '' '' ;;
             *captureScreenshot*)
-              reply '### Result\n\"QUJD\"' '' '' ;;
+              # `hangcast`: the first picture is never answered.
+              if [ -f hangcast ]; then rm -f hangcast
+              else reply '### Result\n\"QUJD\"' '' ''; fi ;;
             *insertText*)
               reply "### Page\\n- Page URL: $url" '' '' ;;
             *activeElement*)
@@ -1368,6 +1370,32 @@ fn frames(f: &Fake) -> usize {
             t == "browser_run_code_unsafe" && a["code"].to_string().contains("captureScreenshot")
         })
         .count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_picture_that_never_comes_holds_the_live_view_only_briefly() {
+    let f = Fake::new();
+    let b = f.browser();
+    f.set("hangcast", "");
+    b.ensure().await.unwrap();
+    let (_guard, mut rx) = b.watch(Mode::Full, None);
+    // The stuck picture is given up after FRAME_TIMEOUT (not the 20 s of
+    // other quick calls) and the next one shows.
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(12), rx.wait_for(Option::is_some))
+        .await
+        .expect("a picture after the stuck one")
+        .unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_secs(7),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(frames(&f) >= 2);
+    // Each step of a picture has its own limit inside the page's code, and
+    // a DevTools session that stops answering is let go.
+    let code = frame_code(500, 55);
+    assert!(code.contains("did not answer in time") && code.contains("s.detach()"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -125,23 +125,35 @@ const FRAME_MIN_W: u32 = 120;
 
 /// One live-view picture of the visible page at `width` device pixels,
 /// through Chrome's own capture (any size, set quality, nothing written to
-/// disk). The DevTools session is kept on the page for the next frame.
+/// disk). The DevTools session is kept on the page for the next frame; one
+/// that stops answering (seen on some sites after they load) is dropped
+/// after a few seconds, so the next picture uses a new one.
 fn frame_code(width: u32, quality: u32) -> String {
     format!(
         "async (page) => {{
+  const within = (p) => Promise.race([p, new Promise((_, no) =>
+    setTimeout(() => no(new Error('the page did not answer in time')), {FRAME_STEP_MS}))]);
+  let s;
   try {{
-    const s = page.__irisCast || (page.__irisCast = await page.context().newCDPSession(page));
-    const {{ cssVisualViewport: v }} = await s.send('Page.getLayoutMetrics');
-    const r = await s.send('Page.captureScreenshot', {{ format: 'jpeg', quality: {quality},
-      clip: {{ x: v.pageX, y: v.pageY, width: v.clientWidth, height: v.clientHeight, scale: {width} / v.clientWidth }} }});
+    s = page.__irisCast || (page.__irisCast = await within(page.context().newCDPSession(page)));
+    const {{ cssVisualViewport: v }} = await within(s.send('Page.getLayoutMetrics'));
+    const r = await within(s.send('Page.captureScreenshot', {{ format: 'jpeg', quality: {quality},
+      clip: {{ x: v.pageX, y: v.pageY, width: v.clientWidth, height: v.clientHeight, scale: {width} / v.clientWidth }} }}));
     return r.data;
   }} catch (e) {{
     page.__irisCast = undefined;
+    if (s) s.detach().catch(() => {{}});
     throw e;
   }}
 }}"
     )
 }
+
+/// Longest wait for each step of a live-view picture, and for the whole
+/// call: a stuck capture holds the live view only this long, not the
+/// 20 seconds other quick calls get.
+const FRAME_STEP_MS: u64 = 3000;
+const FRAME_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// One encoded frame, serialized once for every watcher.
 pub struct Frame {
@@ -1246,12 +1258,16 @@ impl Browser {
     /// Run Iris's own fixed Playwright code (never the agent's) and read
     /// its JSON result.
     pub(crate) async fn run_code(&self, run: &Running, code: &str) -> Result<Value> {
+        self.run_code_within(run, code, QUICK).await
+    }
+
+    async fn run_code_within(&self, run: &Running, code: &str, timeout: Duration) -> Result<Value> {
         let r = self
             .tool(
                 run,
                 "browser_run_code_unsafe",
                 &json!({"code": code}),
-                QUICK,
+                timeout,
             )
             .await?;
         let text = ok_text(&r)?;
@@ -1493,6 +1509,7 @@ impl Browser {
         use std::hash::{Hash, Hasher};
         let mut last: Option<(Mode, u32, u64)> = None;
         let mut header_at: Option<tokio::time::Instant> = None;
+        let mut failed = 0u32;
         loop {
             let (mode, width) = {
                 let w = lock(&self.watchers);
@@ -1519,7 +1536,27 @@ impl Browser {
                     let _ = self.follow_new_tab(run).await;
                 }
             }
-            let shot = self.run_code(run, &frame_code(width, mode.quality())).await;
+            let shot = self
+                .run_code_within(run, &frame_code(width, mode.quality()), FRAME_TIMEOUT)
+                .await;
+            // Failures are logged (the first, then every 50th; no page
+            // content), so a live view that stays blank can be explained.
+            match &shot {
+                Err(e) if self.is_current(run) => {
+                    failed += 1;
+                    if failed % 50 == 1 {
+                        crate::warn!(
+                            "browser: live view picture failed ({failed} in a row): {}",
+                            crate::util::truncate_chars(&e.to_string(), 200)
+                        );
+                    }
+                }
+                Ok(_) if failed > 0 => {
+                    crate::info!("browser: live view pictures back after {failed} failures");
+                    failed = 0;
+                }
+                _ => {}
+            }
             if let Ok(Value::String(data)) = shot {
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 data.hash(&mut h);
