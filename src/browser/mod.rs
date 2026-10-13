@@ -575,7 +575,8 @@ pub(crate) fn hide_secrets(text: &str, secrets: &[String]) -> String {
     out
 }
 
-/// Replace `code` where no other digit touches it.
+/// Replace `code` where no other letter or digit touches it (so neither a
+/// longer number nor a snapshot ref like `e737` is cut).
 fn hide_standalone(text: &str, code: &str) -> String {
     let b = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -584,8 +585,8 @@ fn hide_standalone(text: &str, code: &str) -> String {
     while let Some(pos) = text[i..].find(code) {
         let start = i + pos;
         let end = start + code.len();
-        let before = start > 0 && b[start - 1].is_ascii_digit();
-        let after = end < b.len() && b[end].is_ascii_digit();
+        let before = start > 0 && b[start - 1].is_ascii_alphanumeric();
+        let after = end < b.len() && b[end].is_ascii_alphanumeric();
         if !before && !after {
             out.push_str(&text[last..start]);
             out.push_str("[hidden]");
@@ -1976,6 +1977,11 @@ mod tests {
         );
         assert!(!t.contains("Pw-secret") && !t.contains("4111"));
         assert!(t.contains("flight 7370"));
+        let refs = hide_secrets("- textbox [ref=e737]\n- button [ref=f2e737]: 737", &secrets);
+        assert_eq!(
+            refs,
+            "- textbox [ref=e737]\n- button [ref=f2e737]: [hidden]"
+        );
         assert!(t.contains("cvc [hidden]") && t.contains("Boeing [hidden]"));
         // Short passwords as forms send them, and as snapshots quote them.
         let short = [
