@@ -98,7 +98,7 @@ export function Logins() {
     <${Group} label="Logins">
       ${logins.map((c) => html`<${Row} icon=${html`<${LetterTile} name=${c.metadata.site || c.label} />`} title=${c.label}
         sub=${[c.metadata.site, c.metadata.username].filter(Boolean).join(' · ')} value=${c.last_used_at ? `used ${since(c.last_used_at)}` : ''}
-        value="always asks" chevron=${false} right=${html`<button class="icon-btn" aria-label="Delete" onClick=${() => remove(c)}><${Icon} name="trash" size=${16} /></button>`} />`)}
+        chevron=${false} right=${html`<button class="icon-btn" aria-label="Delete" onClick=${() => remove(c)}><${Icon} name="trash" size=${16} /></button>`} />`)}
       <${Row} title="Add login" accent icon="plus" onClick=${() => setAdding('login')} chevron=${false} />
     <//>
     <${Group} label="Wallet">

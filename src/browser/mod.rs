@@ -250,6 +250,10 @@ struct Private {
     pages: Vec<String>,
     /// Tabs open when last counted (new ones during take over are followed).
     tabs: usize,
+    /// Saved secrets Iris filled this session: hidden from everything the
+    /// agent gets back (a page may echo them into its address, title, a
+    /// dialog, or its text).
+    secrets: Vec<String>,
 }
 
 /// Most private addresses remembered (the oldest are forgotten first; the
@@ -464,6 +468,7 @@ pub(crate) struct Field {
     pub url: String,
     pub private: bool,
     /// In another site's frame.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub frame: bool,
 }
 
@@ -1371,7 +1376,7 @@ impl Browser {
 
     /// Run the owner's input on the page: in control from `device_id`,
     /// one input at a time.
-    async fn owner_input<'a>(
+    pub(crate) async fn owner_input<'a>(
         &'a self,
         device_id: &str,
     ) -> Result<(Arc<Running>, tokio::sync::MutexGuard<'a, ()>)> {
@@ -1506,7 +1511,7 @@ impl Browser {
                 if text.chars().count() > 2000 {
                     return Err("text is too long".into());
                 }
-                self.type_text(&run, device_id, text, false).await?;
+                self.type_text(&run, device_id, text).await?;
             }
             "key" => {
                 let key = ev["key"].as_str().unwrap_or("");
@@ -1531,22 +1536,15 @@ impl Browser {
     }
 
     /// Type for the owner into the focused field. When that field is
-    /// private (or `private`: a saved secret), the page is closed to the
-    /// agent first; this is checked for every piece of text, as the page
+    /// private, the page is closed to the agent first; this is checked for every piece of text, as the page
     /// may move focus by itself. Printable ASCII goes through the keyboard
     /// key by key; anything else is inserted as text, into whichever frame
     /// has focus.
-    pub(crate) async fn type_text(
-        &self,
-        run: &Running,
-        device_id: &str,
-        text: &str,
-        private: bool,
-    ) -> Result<()> {
+    pub(crate) async fn type_text(&self, run: &Running, device_id: &str, text: &str) -> Result<()> {
         if text.is_empty() {
             return Ok(());
         }
-        self.focused_field(run, true, private).await?;
+        self.focused_field(run, true, false).await?;
         let mut other = String::new();
         for c in text.chars().chain(std::iter::once('\0')) {
             let key = (' '..='~').contains(&c);
@@ -1571,19 +1569,17 @@ impl Browser {
         Ok(())
     }
 
-    /// Fill a saved value for the owner (`fill.rs`): `check` sees the
-    /// focused field and the page's real address first and may refuse.
-    pub(crate) async fn fill_for_owner(
-        &self,
-        device_id: &str,
-        check: impl FnOnce(&Field) -> Result<()>,
-        value: &str,
-        private: bool,
-    ) -> Result<()> {
-        let (run, _op) = self.owner_input(device_id).await?;
-        let field = self.focused_field(&run, false, false).await?;
-        check(&field)?;
-        self.type_text(&run, device_id, value, private).await
+    /// Hide a saved secret Iris filled from what the agent gets back.
+    pub(crate) fn remember_secret(&self, secret: &str) {
+        let mut p = lock(&self.private);
+        if !p.secrets.iter().any(|s| s == secret) {
+            p.secrets.push(secret.to_string());
+        }
+    }
+
+    /// The saved secrets Iris filled this session.
+    pub(crate) fn filled_secrets(&self) -> Vec<String> {
+        lock(&self.private).secrets.clone()
     }
 
     /// Whether the agent must keep off the current page: the owner typed

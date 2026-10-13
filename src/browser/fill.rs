@@ -192,38 +192,34 @@ pub async fn fill(
     let (cred, secret) = load(state, &user_id, credential_id).await?;
     let (value, private) = value_of(&cred, &secret, field)?;
     let site = cred.metadata["site"].as_str().unwrap_or("");
-    state
-        .browser
-        .fill_for_owner(
-            device_id,
-            |field| {
-                let url = field.url.as_str();
-                let (scheme, host) = origin_of(url).ok_or("Open the site's page first.")?;
-                if !secure_enough(&scheme, &host) {
-                    return Err("I only fill saved details into secure (https) pages.".into());
-                }
-                if cred.kind == "login" {
-                    if !credential_matches(url, &cred) {
-                        return Err(
-                            format!("This login is saved for {site}, not this page.").into()
-                        );
-                    }
-                    // The page's address says nothing about a frame from
-                    // another site (an ad, a widget) that has focus.
-                    if field.frame {
-                        return Err(format!(
-                            "That field belongs to another site inside this page, so I won't \
-                             fill your {site} login there."
-                        )
-                        .into());
-                    }
-                }
-                Ok(())
-            },
-            &value,
-            private,
-        )
-        .await?;
+    let (run, _op) = state.browser.owner_input(device_id).await?;
+    // The focused element itself is filled (whatever it held is replaced),
+    // in the frame it was checked in: focus moving meanwhile stops it.
+    let Some(at) = locate(state, &run, Find::Focused).await? else {
+        return Err("Tap the field to fill first.".into());
+    };
+    if !secure_url(&at.top) || !secure_url(&at.frame) {
+        return Err("I only fill saved details into secure (https) pages.".into());
+    }
+    if cred.kind == "login" {
+        if !credential_matches(&at.top, &cred) {
+            return Err(format!("This login is saved for {site}, not this page.").into());
+        }
+        // The page's address says nothing about a frame from another site
+        // (an ad, a widget) that has focus.
+        if !credential_matches(&at.frame, &cred) {
+            return Err(format!(
+                "That field belongs to another site inside this page, so I won't fill your \
+                 {site} login there."
+            )
+            .into());
+        }
+    }
+    state.browser.controller(device_id)?;
+    if !put(state, &run, Find::Focused, &at, &[value], private, false).await? {
+        return Err("That field can't be filled.".into());
+    }
+    drop(secret);
     let (uid, cid) = (user_id, cred.id.clone());
     let _ = state
         .db
@@ -342,26 +338,61 @@ fn card_name(c: &Credential) -> String {
 struct Target {
     top: String,
     frame: String,
+    /// `input`, `textarea`, `select`, or `editable`.
     tag: String,
+    /// An input's type (`password`, `text`, `email`, ...).
+    kind: String,
 }
 
-/// Iris's fixed Playwright code for one field: find it by ref; with
-/// `value` (candidates, the first that fits), check it is still where it
-/// was (`expect`), mark the page private (`mark`), fill it, and press
-/// Enter (`submit`). The values travel to Playwright only, inside this
-/// code; the result never contains them.
+/// Which field: by the agent's element ref, or the one the owner focused.
+#[derive(Clone, Copy)]
+enum Find<'a> {
+    Ref(&'a str),
+    Focused,
+}
+
+/// A secret too short to hide reliably from what the agent reads.
+const MIN_HIDDEN: usize = 4;
+
+/// Iris's fixed Playwright code for one field: find it; with `fill`
+/// (candidate values: the first that fits the field), check it is still
+/// exactly where it was checked (`Target`), mark the page private, fill
+/// the element itself (replacing what it held), and press Enter. The
+/// values travel to Playwright only, inside this code; the result never
+/// contains them.
 fn field_code(
-    target: &str,
+    find: Find,
     fill: Option<(&Target, &[String], bool, bool)>,
 ) -> std::result::Result<String, serde_json::Error> {
-    let sel = serde_json::to_string(&format!("aria-ref={target}"))?;
-    let find = format!(
-        "const h = await page.locator({sel}).elementHandle({{ timeout: 3000 }}).catch(() => null);
+    let locate = match find {
+        Find::Ref(r) => format!(
+            "const h = await page.locator({}).elementHandle({{ timeout: 3000 }}).catch(() => null);
   if (!h) return {{ found: false }};
-  const frame = await h.ownerFrame();
+  const frame = await h.ownerFrame();",
+            serde_json::to_string(&format!("aria-ref={r}"))?
+        ),
+        // The deepest frame whose document has focus on a field (frames of
+        // other sites included: Playwright reaches them from Node).
+        Find::Focused => "let h = null, frame = null;
+  for (const f of page.frames()) {
+    const c = await f.evaluateHandle(() => {
+      let e = document.hasFocus() ? document.activeElement : null;
+      while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
+      return e && !['IFRAME', 'FRAME', 'BODY', 'HTML'].includes(e.tagName) ? e : null;
+    }).catch(() => null);
+    const el = c && c.asElement();
+    if (el) { h = el; frame = f; }
+  }
+  if (!h) return { found: false };"
+            .to_string(),
+    };
+    let find = format!(
+        "{locate}
   const info = {{ found: true, top: page.url(), frame: frame ? frame.url() : '',
-    tag: await h.evaluate((e) => e.isContentEditable ? 'editable' : e.tagName.toLowerCase()),
-    max: await h.evaluate((e) => e.maxLength > 0 ? e.maxLength : null) }};"
+    ...(await h.evaluate((e) => ({{
+      tag: e.isContentEditable ? 'editable' : e.tagName.toLowerCase(),
+      kind: (e.type || '').toLowerCase(),
+    }}))) }};"
     );
     let Some((at, values, mark, submit)) = fill else {
         return Ok(format!("async (page) => {{\n  {find}\n  return info;\n}}"));
@@ -369,7 +400,7 @@ fn field_code(
     Ok(format!(
         "async (page) => {{
   {find}
-  if (info.top !== {top} || info.frame !== {frame} || info.tag !== {tag}) return {{ moved: true }};
+  if (info.top !== {top} || info.frame !== {frame} || info.tag !== {tag} || info.kind !== {kind}) return {{ moved: true }};
   if ({mark}) await page.evaluate({mark_js});
   const values = {values};
   let filled = false;
@@ -379,7 +410,14 @@ fn field_code(
       if (await h.selectOption({{ label: v }}).then(() => true, () => false)) {{ filled = true; break; }}
     }}
   }} else {{
-    const v = values.find((v) => !info.max || v.length <= info.max) ?? values[0];
+    // Several forms (a year as 2031 or 31): what the field says it takes.
+    const hint = await h.evaluate((e) => [e.placeholder, e.getAttribute('aria-label'), e.name, e.id,
+      e.pattern, ...Array.from(e.labels || [], (l) => l.textContent)].filter(Boolean).join(' ').toLowerCase());
+    const max = await h.evaluate((e) => (e.maxLength > 0 ? e.maxLength : 0));
+    const short = !/yyyy|\\{{4\\}}/.test(hint) && /yy|\\{{2\\}}/.test(hint);
+    const fits = values.filter((v) => !max || v.length <= max);
+    const pick = fits.length ? fits : values;
+    const v = short ? pick.reduce((a, b) => (b.length < a.length ? b : a)) : pick[0];
     filled = await h.fill(v).then(() => true, () => false);
   }}
   if (filled && {submit}) await h.press('Enter').catch(() => {{}});
@@ -388,18 +426,21 @@ fn field_code(
         top = serde_json::to_string(&at.top)?,
         frame = serde_json::to_string(&at.frame)?,
         tag = serde_json::to_string(&at.tag)?,
+        kind = serde_json::to_string(&at.kind)?,
         mark_js = serde_json::to_string(super::MARK_JS)?,
         values = serde_json::to_string(values)?,
     ))
 }
 
-async fn locate(state: &AppState, run: &Running, target: &str) -> Result<Option<Target>> {
-    if !valid_ref(target) {
+async fn locate(state: &AppState, run: &Running, find: Find<'_>) -> Result<Option<Target>> {
+    if let Find::Ref(r) = find
+        && !valid_ref(r)
+    {
         return Ok(None);
     }
     let v = state
         .browser
-        .run_code(run, &field_code(target, None)?)
+        .run_code(run, &field_code(find, None)?)
         .await?;
     if v["found"] != true {
         return Ok(None);
@@ -412,29 +453,62 @@ async fn locate(state: &AppState, run: &Running, target: &str) -> Result<Option<
         top: v["top"].as_str().unwrap_or("").into(),
         frame: v["frame"].as_str().unwrap_or("").into(),
         tag,
+        kind: v["kind"].as_str().unwrap_or("").into(),
     }))
 }
 
-/// Type `values` (candidates) into a located field. Whether it was filled.
+/// Fill `values` (candidates) into a located field. Whether it was filled.
+/// A private value closes the page to the agent first and is hidden from
+/// everything the agent reads afterwards.
 async fn put(
     state: &AppState,
     run: &Running,
-    target: &str,
+    find: Find<'_>,
     at: &Target,
     values: &[String],
     private: bool,
     submit: bool,
 ) -> Result<bool> {
     if private {
-        // Closed to the agent before anything is typed.
         state.browser.remember_private(&at.top);
+        for v in values {
+            state.browser.remember_secret(v);
+        }
     }
-    let code = field_code(target, Some((at, values, private, submit)))?;
+    let code = field_code(find, Some((at, values, private, submit)))?;
     let v = state.browser.run_code(run, &code).await?;
     if v["moved"] == true {
         return Err(PAGE_CHANGED.into());
     }
     Ok(v["filled"] == true)
+}
+
+/// `scheme://host:port` of a web address (port always written).
+fn full_origin(url: &str) -> Option<String> {
+    if !url.contains("://") {
+        return None;
+    }
+    let (scheme, host, port) = login_origin(url)?;
+    Some(format!("{scheme}://{host}:{port}"))
+}
+
+fn secure_url(url: &str) -> bool {
+    origin_of(url).is_some_and(|(s, h)| secure_enough(&s, &h))
+}
+
+/// Where a saved login may go: the field's own frame and the page are the
+/// saved site, over HTTPS (HTTP only on this machine), and a password only
+/// into a password field (a page could echo any other field into its
+/// address).
+fn login_target_ok(cred: &Credential, field: &str, at: &Target) -> bool {
+    let kind_ok = match field {
+        "password" => at.tag == "input" && at.kind == "password",
+        _ => matches!(at.tag.as_str(), "input" | "editable") && at.kind != "password",
+    };
+    kind_ok
+        && secure_url(&at.frame)
+        && credential_matches(&at.frame, cred)
+        && credential_matches(&at.top, cred)
 }
 
 const PAGE_CHANGED: &str = "the page changed while filling, so I stopped";
@@ -468,7 +542,7 @@ async fn login_inner(
     // the saved site's.
     let mut targets = Vec::new();
     for (field, r) in &refs {
-        let Some(at) = locate(state, run, r).await? else {
+        let Some(at) = locate(state, run, Find::Ref(r)).await? else {
             return Ok(text(format!(
                 "not found (no field for ref {r}; take a new browser_snapshot)"
             )));
@@ -504,23 +578,48 @@ async fn login_inner(
             )));
         }
     };
-    for (_, r, at) in &targets {
-        let secure = origin_of(&at.frame).is_some_and(|(s, h)| secure_enough(&s, &h));
-        if !secure || !credential_matches(&at.frame, &cred) || !credential_matches(&at.top, &cred) {
+    for (field, r, at) in &targets {
+        if !login_target_ok(&cred, field, at) {
             return Ok(text(format!(
-                "not found (the field {r} is not on {} over a secure connection, so I won't \
-                 fill the login there)",
+                "not filled (ref {r} is not a {} field on {} over a secure connection, so I \
+                 won't fill the login there)",
+                if *field == "password" {
+                    "password"
+                } else {
+                    "username"
+                },
                 cred.metadata["site"].as_str().unwrap_or("the saved site")
             )));
         }
     }
     let (cred, secret) = load(state, &ctx.user_id, &cred.id).await?;
+    if targets.iter().any(|(f, _, _)| *f == "password")
+        && secret
+            .get("password")
+            .and_then(Value::as_str)
+            .is_some_and(|p| p.chars().count() < MIN_HIDDEN)
+    {
+        return Ok(text(
+            "not filled (this saved password is too short to keep out of what I read; ask the \
+             user to take over and fill it)",
+        ));
+    }
     let submit = args["submit"] == true;
     let last = targets.len() - 1;
     for (i, (field, r, at)) in targets.iter().enumerate() {
         b.check_agent(ctx)?;
         let (value, private) = value_of(&cred, &secret, field)?;
-        if !put(state, run, r, at, &[value], private, submit && i == last).await? {
+        if !put(
+            state,
+            run,
+            Find::Ref(r),
+            at,
+            &[value],
+            private,
+            submit && i == last,
+        )
+        .await?
+        {
             return Ok(text(format!(
                 "not filled (the {field} field {r} could not be filled)"
             )));
@@ -540,11 +639,60 @@ async fn login_inner(
     }))
 }
 
-/// A card the owner approved for this page.
+/// A card the owner approved for this page and these receiving frames.
 pub struct Approved {
     card: Credential,
     message_id: String,
-    origin: (String, String),
+    /// The page's origin (`scheme://host:port`).
+    page: String,
+    /// Origins of the frames holding the fields, as shown on the approval.
+    frames: Vec<String>,
+}
+
+/// The card fields `fill_saved_card` may name, with their argument.
+const CARD_FIELDS: &[(&str, &str)] = &[
+    ("number", "number_ref"),
+    ("exp", "exp_ref"),
+    ("exp_month", "exp_month_ref"),
+    ("exp_year", "exp_year_ref"),
+    ("cvc", "cvc_ref"),
+    ("name", "name_ref"),
+];
+
+/// The fields the agent named: located, all over HTTPS. A tool result
+/// instead when one is missing or not secure.
+async fn card_targets<'a>(
+    state: &AppState,
+    run: &Running,
+    args: &'a Value,
+) -> std::result::Result<Vec<(&'static str, &'a str, Target)>, Value> {
+    let mut targets = Vec::new();
+    for (field, key) in CARD_FIELDS {
+        let Some(r) = args[*key].as_str().map(str::trim).filter(|r| !r.is_empty()) else {
+            continue;
+        };
+        let at = match locate(state, run, Find::Ref(r)).await {
+            Ok(Some(at)) => at,
+            Ok(None) => {
+                return Err(text(format!(
+                    "not found (no field for ref {r}; take a new browser_snapshot and call \
+                     fill_saved_card again)"
+                )));
+            }
+            Err(e) => return Err(error(format!("not filled ({e})"))),
+        };
+        if !secure_url(&at.top) || !secure_url(&at.frame) {
+            return Err(text(
+                "not found (this page or one of its fields is not secure, so cards are not \
+                 filled here)",
+            ));
+        }
+        targets.push((*field, r, at));
+    }
+    if !targets.iter().any(|(f, _, _)| *f == "number") {
+        return Err(error("Give number_ref (from browser_snapshot)."));
+    }
+    Ok(targets)
 }
 
 /// Whether an earlier approval card still answers this request: same card
@@ -581,12 +729,20 @@ pub async fn approve_card(
         .ensure()
         .await
         .map_err(|e| error(format!("The browser could not start: {e}")))?;
-    let (page, _) = b.page_info(&run).await.map_err(|e| error(e.to_string()))?;
-    let Some(origin) = origin_of(&page).filter(|(s, h)| secure_enough(s, h)) else {
-        return Err(text(
-            "not found (this page is not secure, so cards are not filled here)",
-        ));
-    };
+    // The fields first: the owner approves the page and every site that
+    // would receive the card.
+    let targets = card_targets(state, &run, args).await?;
+    let top = targets[0].2.top.clone();
+    let page = full_origin(&top).ok_or_else(|| text("not found (this page has no address)"))?;
+    let mut frames: Vec<String> = targets
+        .iter()
+        .filter_map(|(_, _, at)| full_origin(&at.frame))
+        .collect();
+    frames.sort();
+    frames.dedup();
+    if targets.iter().any(|(_, _, at)| at.top != top) || frames.is_empty() {
+        return Err(text("not filled (the page changed; try again)"));
+    }
     let cards = credentials(state, &ctx.user_id, "card").await;
     let card = match choose(&cards, args["card"].as_str(), |c, h| {
         let digits: String = h.chars().filter(char::is_ascii_digit).collect();
@@ -609,7 +765,7 @@ pub async fn approve_card(
             )));
         }
     };
-    let (answer, msg) = ask_approval(state, ctx, &card, &page, &origin).await;
+    let (answer, msg) = ask_approval(state, ctx, &card, &top, &page, &frames).await;
     match answer {
         crate::gateway::Answer::Approved => {}
         crate::gateway::Answer::Denied => {
@@ -629,7 +785,8 @@ pub async fn approve_card(
     Ok(Approved {
         card,
         message_id: msg.id,
-        origin,
+        page,
+        frames,
     })
 }
 
@@ -640,10 +797,23 @@ async fn ask_approval(
     ctx: &TurnCtx,
     card: &Credential,
     url: &str,
-    origin: &(String, String),
+    page: &str,
+    frames: &[String],
 ) -> (crate::gateway::Answer, Option<db::Message>) {
-    let host = &origin.1;
     use crate::gateway::policy::reveal_hidden;
+    let host = origin_of(url).map(|(_, h)| h).unwrap_or_default();
+    // Fields inside another site's frame (a payment provider) are named:
+    // that site receives the card.
+    let others: Vec<&str> = frames
+        .iter()
+        .filter(|f| *f != page)
+        .map(|f| f.split("://").nth(1).unwrap_or(f))
+        .collect();
+    let receivers = if others.is_empty() {
+        String::new()
+    } else {
+        format!("\nThe card fields are on: {}", others.join(", "))
+    };
     let name = reveal_hidden(&card_name(card));
     let exp = match (
         card.metadata["exp_month"].as_u64(),
@@ -653,11 +823,12 @@ async fn ask_approval(
         _ => String::new(),
     };
     let url = reveal_hidden(url);
-    let host = reveal_hidden(host);
+    let host = reveal_hidden(&host);
     let preview = format!(
-        "Fill your {name}{exp} (\"{}\") into the payment form on this page:\n{url}\n\n\
+        "Fill your {name}{exp} (\"{}\") into the payment form on this page:\n{url}{}\n\n\
          Approving lets me fill it in this once, to finish what you asked for.",
         reveal_hidden(&card.label),
+        reveal_hidden(&receivers),
     );
     let title_text = format!("Use your {name} on {host}");
     let mut value = entities::approval_card(&entities::ApprovalRequest {
@@ -669,7 +840,7 @@ async fn ask_approval(
         action_label: "Fill card",
         approver_user_id: &ctx.user_id,
     });
-    value["wallet"] = json!({"credential_id": card.id, "origin": format!("{}://{host}", origin.0),
+    value["wallet"] = json!({"credential_id": card.id, "origin": page, "frames": frames,
                              "revision": card.updated_at, "used_at": null});
     crate::gateway::approve_browser_card(state, ctx, value).await
 }
@@ -697,37 +868,19 @@ async fn card_inner(
     approved: Approved,
 ) -> Result<Value> {
     let b = &state.browser;
-    const FIELDS: &[(&str, &str)] = &[
-        ("number", "number_ref"),
-        ("exp", "exp_ref"),
-        ("exp_month", "exp_month_ref"),
-        ("exp_year", "exp_year_ref"),
-        ("cvc", "cvc_ref"),
-        ("name", "name_ref"),
-    ];
-    let mut targets = Vec::new();
-    for (field, key) in FIELDS {
-        let Some(r) = args[*key].as_str().map(str::trim).filter(|r| !r.is_empty()) else {
-            continue;
-        };
-        let Some(at) = locate(state, run, r).await? else {
-            return Ok(text(format!(
-                "not filled (no field for ref {r}; take a new browser_snapshot and call \
-                 fill_saved_card again)"
-            )));
-        };
-        // The page the owner approved, and every field over HTTPS.
-        let field_secure = origin_of(&at.frame).is_some_and(|(s, h)| secure_enough(&s, &h));
-        if origin_of(&at.top).as_ref() != Some(&approved.origin) || !field_secure {
+    let targets = match card_targets(state, run, args).await {
+        Ok(t) => t,
+        Err(out) => return Ok(out),
+    };
+    // Still the page and the receiving sites the owner approved.
+    for (_, _, at) in &targets {
+        let frame_ok = full_origin(&at.frame).is_some_and(|o| approved.frames.contains(&o));
+        if full_origin(&at.top).as_deref() != Some(approved.page.as_str()) || !frame_ok {
             return Ok(text(
-                "not filled (the page is not the one the user approved, or a field is not \
-                 secure)",
+                "not filled (the page or a field is not the one the user approved; call \
+                 fill_saved_card again to ask)",
             ));
         }
-        targets.push((*field, r, at));
-    }
-    if !targets.iter().any(|(f, _, _)| *f == "number") {
-        return Ok(error("Give number_ref (from browser_snapshot)."));
     }
     b.check_agent(ctx)?;
     let revision = approved.card.updated_at;
@@ -786,7 +939,17 @@ async fn card_inner(
         }
         // Everything but the name closes the page to the agent.
         let private = *field != "name";
-        if !put(state, run, r, at, &values, private, submit && i == last).await? {
+        if !put(
+            state,
+            run,
+            Find::Ref(r),
+            at,
+            &values,
+            private,
+            submit && i == last,
+        )
+        .await?
+        {
             if *field == "number" {
                 return Ok(text(
                     "not filled (the card number field could not be filled)",

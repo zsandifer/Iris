@@ -53,9 +53,29 @@ pub const ALLOWED: &[&str] = &[
     "browser_mouse_wheel",
 ];
 
-/// Tools that only change which page is open, so they stay usable while
-/// the current page holds the owner's private details.
-const NAVIGATION: &[&str] = &["browser_navigate", "browser_navigate_back", "browser_tabs"];
+/// Tools that only change which page is open (or answer a dialog), so
+/// they stay usable while the current page holds the owner's private
+/// details.
+const NAVIGATION: &[&str] = &[
+    "browser_navigate",
+    "browser_navigate_back",
+    "browser_tabs",
+    "browser_handle_dialog",
+];
+
+/// Everything of the page's text and field values (all frames), to check
+/// for saved secrets Iris filled before a picture of it is taken.
+const PAGE_TEXT_CODE: &str = "async (page) => {
+  const out = [];
+  for (const f of page.frames()) {
+    out.push(await f.locator('body').innerText({ timeout: 2000 }).catch(() => ''));
+    out.push(...(await f.locator('input, textarea').evaluateAll((els) => els.map((e) => e.value)).catch(() => [])));
+  }
+  return out.join('\\n').slice(0, 4000000);
+}";
+
+const SHOWS_SECRET: &str = "No screenshot right now: this page shows saved sign-in or card \
+    details. Use browser_snapshot instead.";
 
 /// Tools that only read the page. Everything else acts on it, and Playwright
 /// keeps going with an action (waiting for its target) even when its answer
@@ -298,6 +318,18 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
             Err(e) => return error(e.to_string()),
         }
     }
+    // Saved secrets Iris filled may show on later pages (echoed into the
+    // text or a field): no pictures of those.
+    let secrets = b.filled_secrets();
+    if name == "browser_take_screenshot" && !secrets.is_empty() {
+        let shown = match b.run_code(&run, PAGE_TEXT_CODE).await {
+            Ok(v) => v.as_str().unwrap_or("").to_string(),
+            Err(e) => return error(e.to_string()),
+        };
+        if crate::gateway::redact(&shown, &secrets) != shown {
+            return error(SHOWS_SECRET);
+        }
+    }
     b.set_busy(true);
     let started = std::time::Instant::now();
     let drain = if READS.contains(&name) {
@@ -326,6 +358,19 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     {
         parts.push(json!({"type": "text",
             "text": "(Iris closed the file picker: uploading files is not available.)"}));
+    }
+    // Anything else that could carry them (addresses, titles, dialogs,
+    // page text) has them hidden.
+    let secrets = b.filled_secrets();
+    if !secrets.is_empty()
+        && let Some(parts) = out["content"].as_array_mut()
+    {
+        for p in parts.iter_mut() {
+            if let Some(t) = p["text"].as_str() {
+                let hidden = crate::gateway::redact(t, &secrets);
+                p["text"] = hidden.into();
+            }
+        }
     }
     crate::info!(
         "browser: {name} {} in {}ms",

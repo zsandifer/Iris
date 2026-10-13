@@ -391,7 +391,7 @@ fn output_with_timeout(
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .process_group(0);
-    let mut child = cmd.spawn()?;
+    let mut child = crate::util::spawn_retrying(|| cmd.spawn())?;
     let drain = |r: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -613,12 +613,18 @@ pub fn chromium_major(root: &Path) -> Option<String> {
         .then(|| major.to_string())
 }
 
-/// The Chromium build the installed `playwright-core` pins
+/// The Chromium build the `playwright-core` that Playwright MCP loads pins
 /// (`browsers.json`): its revision, and its version when given, so an
-/// unchanged build is not downloaded again.
+/// unchanged build is not downloaded again. Node resolves MCP's own copy
+/// first (npm nests it there when an older install left a different
+/// `playwright-core` at the top), then the top-level one.
 fn pinned_chromium(prefix: &Path) -> Option<(String, Option<String>)> {
-    let text =
-        std::fs::read_to_string(prefix.join("node_modules/playwright-core/browsers.json")).ok()?;
+    let text = [
+        "node_modules/@playwright/mcp/node_modules/playwright-core/browsers.json",
+        "node_modules/playwright-core/browsers.json",
+    ]
+    .iter()
+    .find_map(|f| std::fs::read_to_string(prefix.join(f)).ok())?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     let entry = v["browsers"]
         .as_array()?
@@ -1250,6 +1256,16 @@ touch "$PLAYWRIGHT_BROWSERS_PATH/chromium-$r/INSTALLATION_COMPLETE"
         )
         .unwrap();
         assert_eq!(pinned_chromium(prefix), Some(("1".into(), None)));
+        // MCP's own nested copy wins over one an older install left at the
+        // top (that is the one its install-browser uses).
+        let nested = prefix.join("node_modules/@playwright/mcp/node_modules/playwright-core");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("browsers.json"),
+            r#"{"browsers": [{"name": "chromium", "revision": "1247"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(pinned_chromium(prefix), Some(("1247".into(), None)));
         std::fs::create_dir_all(prefix.join("e/chromium")).unwrap();
         std::fs::write(prefix.join("e/chromium/CHROMIUM_VERSION"), "x.1").unwrap();
         assert_eq!(chromium_major(&prefix.join("e")), None);

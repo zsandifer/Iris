@@ -859,8 +859,9 @@ dropping them; when they end you get one summary notification.
   only through `iris mcp --browser`, which forwards over a Unix socket in
   the private run directory, accepted only for a running turn, and only
   for reviewed tools (no code execution in the server, no page scripts, no
-  file access, no request headers). Saved secrets are filled only when you
-  ask while in control, from the vault straight into the page; a page
+  file access, no request headers). Saved secrets go from the vault straight
+  into the page, typed by Iris (the agent names the fields and never sees
+  the values; cards need your OK each time); a page
   where you typed or filled private details is closed to the agent until
   it moves on. Only `http`/`https` pages can be opened. When a turn ends or
   you take over, its pending browser reads stop, and an action already

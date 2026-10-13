@@ -1967,11 +1967,14 @@ Saved logins and payment cards. All routes are **owner-only** and scoped to
 the caller. Secrets (password, notes, card number, CVC) are encrypted at rest
 and **never returned**; responses only contain non-secret metadata.
 
-The agent never uses them. While the owner has taken over Iris's browser,
-the app fills one field at a time into the page (`browser.input` with
-`kind: "fill"`, see [the WebSocket](#4-websocket-get-apiws)): Iris types the
-saved value into the focused element itself, and it never reaches a tool
-result, a message, a client, or a log. A login is filled only into the site
+The agent uses them without seeing them: its `fill_saved_login` and
+`fill_saved_card` tools (see [the browser tools](#the-browser-tools)) name the
+fields, and Iris types the saved values in itself; every card use needs the
+owner's OK on an approval card. While the owner has taken over Iris's
+browser, the app can also fill one field at a time into the page
+(`browser.input` with `kind: "fill"`, see [the
+WebSocket](#4-websocket-get-apiws)). Either way the value never reaches a
+tool result, a message, a client, or a log. A login is filled only into the site
 it was saved for (scheme, host, and port must match the saved `site`;
 subdomains require `allow_subdomains: true`), and anything only over HTTPS
 (plain HTTP only on this machine). `last_used_at` records the last fill.
@@ -2527,15 +2530,15 @@ image:
 | `key` | `key` | `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, arrows, `Home`, `End`, `PageUp`, `PageDown`. |
 | `back` | none | History back. |
 | `navigate` | `url` | Open an http(s) page (as `POST /api/browser/navigate`). |
-| `fill` | `credential_id`, `field` | Type one field of a saved [credential](#313-credentials) into the focused element: `username` or `password` for a login, `number`, `exp` (MM/YY), `cvc`, or `name` for a card. A login only on the site it was saved for; everything only over HTTPS (plain HTTP only on this machine). The value never comes back to any client. |
+| `fill` | `credential_id`, `field` | Fill one field of a saved [credential](#313-credentials) into the focused element (its contents are replaced; the element is checked and filled in one step, in its own frame): `username` or `password` for a login, `number`, `exp` (MM/YY), `cvc`, or `name` for a card. A login only on the site it was saved for; everything only over HTTPS (plain HTTP only on this machine). The value never comes back to any client. |
 
 Typing into a private field (a password, card, or one-time-code field, by
 its type, autocomplete, name, or label, or a field in another site's
 frame; checked for every `text` input), and filling a `password`,
 `number`, `exp`, or `cvc`, closes that page to the agent before anything is
 typed: its browser tools other than `browser_navigate`,
-`browser_navigate_back`, and `browser_tabs` answer that the owner typed
-private details there. Both the document (in whichever tab, also after its
+`browser_navigate_back`, `browser_tabs`, `browser_handle_dialog`, and the
+fill tools answer that the owner typed private details there. Both the document (in whichever tab, also after its
 address changes within it) and its address (ignoring the fragment; a page
 brought back from history may still hold what was typed) stay closed until
 the browser closes. Pages and addresses are read from the browser itself,
@@ -3581,12 +3584,15 @@ Iris adds two tools of its own, after Playwright's:
   `submit`): types the owner's saved login for the current site into the
   fields with those element refs (from `browser_snapshot`). Each field's own
   frame and the page must be the site the login was saved for, over HTTPS
-  (plain HTTP only on this machine). `submit` presses Enter in the last field.
+  (plain HTTP only on this machine), and the password goes only into a
+  password field. `submit` presses Enter in the last field.
 - `fill_saved_card` (`number_ref`, optional `exp_ref`, `exp_month_ref`,
   `exp_year_ref`, `cvc_ref`, `name_ref`, `card`, `submit`): only after the
   owner approves an approval card in the chat (service `wallet`; the same
-  pending map, expiry, and cancellation as connector approvals), and only on
-  the page approved (same scheme and host), with every field over HTTPS. One
+  pending map, expiry, and cancellation as connector approvals). The fields
+  are found first, and the card names the page and any other site whose
+  frame holds a field (a payment provider); the fill goes only to that page
+  and those origins (scheme, host, port), every field over HTTPS. One
   approval fills once; a card edited since needs a new one.
 
 Iris locates each field and types its value through Playwright's own
@@ -3595,14 +3601,19 @@ values never appear in a tool result, message, log, or command line. The
 answers are `filled`, `filled and submitted`, `denied`, `not filled (...)`,
 or `not found (...)`. Filling a password, card number, expiry, or CVC closes
 the page to the agent as if the owner had typed it (see below); the fill
-tools themselves stay usable there.
+tools themselves stay usable there. For the rest of the browser session,
+saved secrets Iris filled (and their common encodings) are replaced with
+`[hidden]` in every result the agent gets (addresses, titles, dialogs, page
+text), and a screenshot is refused while the page's text or fields show
+one.
 - Addresses that are not web pages in `browser_navigate` and
   `browser_tabs` (`url`): only `http`, `https`, a bare domain without a
   port, or `about:blank`; anything with whitespace or control characters
   (browsers drop them while parsing) is refused.
-- Anything but `browser_navigate`, `browser_navigate_back`, and
-  `browser_tabs` while the current page holds private details the owner
-  typed or filled (see [Input while in control](#4-websocket-get-apiws)).
+- Anything but `browser_navigate`, `browser_navigate_back`, `browser_tabs`,
+  `browser_handle_dialog`, and the fill tools while the current page holds
+  private details the owner typed or filled (see [Input while in
+  control](#4-websocket-get-apiws)).
 
 Each call waits while the owner has taken over (up to about 50 seconds,
 then tells the agent the user is still using it), and checks again once it

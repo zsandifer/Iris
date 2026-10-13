@@ -57,10 +57,16 @@ while IFS= read -r line; do
           reply "### Page\\n- Page URL: $to\\n- Page Title: Sign in\\n### Snapshot\\n- [Snapshot](out/page-2.yml)" '' '' ;;
         browser_run_code_unsafe)
           case "$line" in
-            *aria-ref=*)
-              # Iris's agent fills: `fieldframe` is the field's frame
-              # address (default: the page's), `noref` hides the field.
+            *aria-ref=*|*hasFocus*)
+              # Iris's fills: `fieldframe` is the field's frame address
+              # (default: the page's), `noref` hides the field, `kinds`
+              # lists input types by ref (`e4 password`; the owner's
+              # focused field is `focused`; default text).
               ff=$(cat fieldframe 2>/dev/null || echo "$url")
+              r=$(printf '%s' "$line" | sed -n 's/.*aria-ref=\([a-z0-9]*\).*/\1/p')
+              [ -n "$r" ] || r=focused
+              k=$(grep "^$r " kinds 2>/dev/null | cut -d' ' -f2)
+              [ -n "$k" ] || k=text
               if [ -f noref ]; then
                 reply "### Result\\n{\\\"found\\\":false}" '' ''
               else
@@ -69,9 +75,12 @@ while IFS= read -r line; do
                     case "$line" in *'if (true) await page.evaluate'*) : > marked ;; esac
                     reply "### Result\\n{\\\"filled\\\":true}" '' '' ;;
                   *)
-                    reply "### Result\\n{\\\"found\\\":true,\\\"top\\\":\\\"$url\\\",\\\"frame\\\":\\\"$ff\\\",\\\"tag\\\":\\\"input\\\"}" '' '' ;;
+                    reply "### Result\\n{\\\"found\\\":true,\\\"top\\\":\\\"$url\\\",\\\"frame\\\":\\\"$ff\\\",\\\"tag\\\":\\\"input\\\",\\\"kind\\\":\\\"$k\\\"}" '' '' ;;
                 esac
               fi ;;
+            *innerText*)
+              t=$(cat pagetext 2>/dev/null)
+              reply "### Result\\n\\\"$t\\\"" '' '' ;;
             *captureScreenshot*)
               reply '### Result\n\"QUJD\"' '' '' ;;
             *insertText*)
@@ -418,23 +427,21 @@ async fn owner_fills_saved_logins_only_on_their_site() {
     assert_eq!(f.called("browser_press_key"), 0);
     // Its own site, but the focused field is in another site's frame.
     f.set("url", "https://site.test/login");
-    f.set("frame", "true");
+    f.set("fieldframe", "https://ads.test/frame");
     let err = fill::fill(&f.state, "dev", &id, "password")
         .await
         .unwrap_err();
     assert!(err.to_string().contains("another site"), "{err}");
-    assert_eq!(f.called("browser_press_key"), 0);
-    // Its own site: typed key by key, and the page closes to the agent.
-    f.set("frame", "false");
-    f.set("field", "false");
+    assert!(fills(&f).is_empty());
+    // Its own site: the focused element itself is filled (replacing what
+    // it held), never typed key by key, and the page closes to the agent.
+    std::fs::remove_file(f.file("fieldframe")).unwrap();
     fill::fill(&f.state, "dev", &id, "password").await.unwrap();
-    let keys: String = f
-        .calls()
-        .iter()
-        .filter(|(t, _)| t == "browser_press_key")
-        .map(|(_, a)| a["key"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(keys, "Pw-1234");
+    let done = fills(&f);
+    assert_eq!(done.len(), 1);
+    assert!(done[0].0.contains("hasFocus") && done[0].0.contains("Pw-1234"));
+    assert!(done[0].0.contains("h.fill(v)"));
+    assert_eq!(f.called("browser_press_key"), 0);
     b.hand_back();
     let g = b.begin_turn(&f.owner, &f.conv, "m", &[]);
     let r = f.agent(g.token(), "browser_snapshot", json!({})).await;
@@ -499,6 +506,7 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
             .any(|t| t["name"] == "fill_saved_login")
     );
     let login = json!({"username_ref": "e3", "password_ref": "e4", "submit": true});
+    f.set("kinds", "e4 password\n");
 
     // Another site, a field in another site's frame, a plain-HTTP page, a
     // bad ref: nothing is typed.
@@ -536,6 +544,18 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
     .await;
     let r = f.agent(&token, "fill_saved_login", login.clone()).await;
     assert!(text(&r).starts_with("not found"), "{r}");
+    // A password only goes into a password field (a search box could put
+    // it in the address).
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://site.test/login"}),
+    )
+    .await;
+    let r = f
+        .agent(&token, "fill_saved_login", json!({"password_ref": "e3"}))
+        .await;
+    assert!(text(&r).contains("is not a password field"), "{r}");
     assert!(fills(&f).is_empty());
 
     // Its site: both fields filled by Iris, Enter only in the last; the
@@ -562,6 +582,31 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
         .agent(&token, "fill_saved_login", json!({"password_ref": "e4"}))
         .await;
     assert_eq!(text(&r), "filled", "{r}");
+    // The password echoed anywhere later (an address, a title, a dialog)
+    // is hidden from the agent; a page showing it gets no screenshot.
+    f.load("https://site.test/search?q=Pw-5678");
+    let r = f
+        .agent(&token, "browser_tabs", json!({"action": "list"}))
+        .await;
+    assert!(
+        text(&r).contains("q=[hidden]") && !r.to_string().contains("Pw-5678"),
+        "{r}"
+    );
+    f.set("pagetext", "You searched for Pw-5678");
+    let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    assert!(text(&r).starts_with("No screenshot right now"), "{r}");
+    f.set("pagetext", "Welcome back");
+    let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    // A dialog can still be answered after a fill (even on a closed page).
+    f.set(
+        "modal",
+        r#"- [\"alert\" dialog with message \"Hi\"]: can be handled by browser_handle_dialog"#,
+    );
+    let r = f
+        .agent(&token, "browser_handle_dialog", json!({"accept": true}))
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
     drop(g);
     b.close().await;
 }
@@ -604,6 +649,8 @@ async fn the_agent_fills_a_card_only_after_the_owner_approves() {
         json!({"url": "https://shop.test/pay"}),
     )
     .await;
+    // The fields are in a payment provider's frame: the owner sees it.
+    f.set("fieldframe", "https://pay.test/card");
     let args = json!({"number_ref": "e5", "exp_month_ref": "e6", "exp_year_ref": "e7",
                       "cvc_ref": "e8", "name_ref": "e9"});
     let pending = || async {
@@ -648,6 +695,14 @@ async fn the_agent_fills_a_card_only_after_the_owner_approves() {
             .unwrap()
             .contains("Visa ending 1111 on shop.test")
     );
+    assert!(
+        card["preview"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("The card fields are on: pay.test:443"),
+        "{card}"
+    );
+    assert_eq!(card["wallet"]["frames"], json!(["https://pay.test:443"]));
     assert!(!card.to_string().contains("4111111111111111"));
     decide(m, false);
     let r = call.await.unwrap();
@@ -872,6 +927,27 @@ async fn dialogs_file_pickers_and_new_windows_during_take_over() {
     b.close().await;
 }
 
+/// A JPEG's width and height (its start-of-frame header).
+fn jpeg_size(b64: &str) -> (u32, u32) {
+    use base64::Engine as _;
+    let b = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .unwrap();
+    let mut i = 2;
+    while i + 9 < b.len() {
+        assert_eq!(b[i], 0xFF, "JPEG marker");
+        let marker = b[i + 1];
+        let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+        if matches!(marker, 0xC0..=0xC2) {
+            let h = u16::from_be_bytes([b[i + 5], b[i + 6]]) as u32;
+            let w = u16::from_be_bytes([b[i + 7], b[i + 8]]) as u32;
+            return (w, h);
+        }
+        i += 2 + len;
+    }
+    panic!("no JPEG frame header");
+}
+
 /// End to end with the real Playwright MCP and Chromium, installed by
 /// Iris: `iris engines install browser --dir DIR`, then
 /// `IRIS_REAL_BROWSER=DIR cargo test real_playwright -- --ignored`.
@@ -911,6 +987,20 @@ async fn real_playwright() {
                  <form method=post action=/home><input name=user aria-label=Username>\
                  <input name=pw type=password aria-label=Password><button>Sign in</button></form></body></html>"
                     .to_string()
+            } else if req.starts_with("GET /pay") {
+                // A checkout: number, month list (values without leading
+                // zeros), a two-digit year known only by its placeholder,
+                // and a CVC.
+                let months: String = (1..=12)
+                    .map(|m| format!("<option value={m}>{m:02}</option>"))
+                    .collect();
+                format!(
+                    "<html><head><title>Iris smoke checkout</title></head><body><form>\
+                     <input name=n aria-label='Card number' autocomplete=cc-number>\
+                     <select name=m aria-label='Expiry month'><option value=''>MM</option>{months}</select>\
+                     <input name=y aria-label='Expiry year' placeholder=YY>\
+                     <input name=c aria-label='Security code' autocomplete=cc-csc></form></body></html>"
+                )
             } else if req.starts_with("GET /field") {
                 "<html><body style='margin:0'><input name=q style='width:500px;height:200px'></body></html>"
                     .to_string()
@@ -998,19 +1088,38 @@ async fn real_playwright() {
         .unwrap();
     assert!(!text_of(&ua).contains("HeadlessChrome"), "{ua}");
 
-    // Live view.
-    let (watching, mut rx) = b.watch(Mode::Full, None);
-    let frame = tokio::time::timeout(Duration::from_secs(10), rx.wait_for(Option::is_some))
-        .await
-        .unwrap()
-        .unwrap()
-        .clone()
-        .unwrap();
+    // Live view: pictures as wide as the viewer asked (a thumbnail), up to
+    // the page's own device pixels (full screen).
+    let next_frame = |rx: &mut tokio::sync::watch::Receiver<Option<Arc<Frame>>>| {
+        let mut rx = rx.clone();
+        async move {
+            rx.mark_unchanged();
+            tokio::time::timeout(Duration::from_secs(10), rx.wait_for(Option::is_some))
+                .await
+                .unwrap()
+                .unwrap()
+                .clone()
+                .unwrap()
+        }
+    };
+    let (peek, mut rx) = b.watch(Mode::Peek, Some(216));
+    let frame = next_frame(&mut rx).await;
     let v: Value = serde_json::from_str(&frame.json).unwrap();
-    assert!(v["data"].as_str().unwrap().starts_with("/9j/"), "a JPEG");
+    assert_eq!(jpeg_size(v["data"].as_str().unwrap()), (216, 432));
+    drop(peek);
+    b.frames.send_replace(None);
+    let (watching, mut rx) = b.watch(Mode::Full, None);
+    let frame = loop {
+        let frame = next_frame(&mut rx).await;
+        let v: Value = serde_json::from_str(&frame.json).unwrap();
+        if v["mode"] == "full" {
+            break v;
+        }
+    };
+    assert_eq!(jpeg_size(frame["data"].as_str().unwrap()), (1000, 2000));
     eprintln!(
         "full frame: {} base64 bytes",
-        v["data"].as_str().unwrap().len()
+        frame["data"].as_str().unwrap().len()
     );
 
     // The owner signs in: tap the password field, type.
@@ -1175,6 +1284,99 @@ async fn real_playwright() {
         home_now.contains("Welcome home") && !home_now.contains("Real-Pw-42"),
         "{home_now}"
     );
+
+    // The agent fills a saved card after the owner approves, never seeing
+    // it.
+    let card_id = "real-card".to_string();
+    let secret = f
+        .state
+        .vault
+        .encrypt(
+            json!({"number": "4111111111111111", "cvc": "737"})
+                .to_string()
+                .as_bytes(),
+            &card_id,
+        )
+        .unwrap();
+    f.state
+        .db
+        .with(|c| {
+            crate::entities::insert_credential(
+                c,
+                &card_id,
+                &f.owner,
+                "card",
+                "Everyday",
+                &json!({"last4": "1111", "brand": "visa", "exp_month": 4, "exp_year": 2031}),
+                &secret,
+            )
+        })
+        .unwrap();
+    let chat = b.begin_turn(&f.owner, &f.conv, "m2", std::slice::from_ref(&f.owner));
+    let chat_token = chat.token().to_string();
+    f.agent(
+        &chat_token,
+        "browser_navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/pay")}),
+    )
+    .await;
+    let snap = text(&f.agent(&chat_token, "browser_snapshot", json!({})).await);
+    let ref_named = |label: &str| {
+        let line = snap
+            .lines()
+            .find(|l| l.contains(&format!("\"{label}\"")))
+            .unwrap_or_else(|| panic!("{label} in {snap}"));
+        let at = line.find("[ref=").unwrap() + 5;
+        line[at..line[at..].find(']').unwrap() + at].to_string()
+    };
+    let args = json!({"number_ref": ref_named("Card number"), "exp_month_ref": ref_named("Expiry month"),
+        "exp_year_ref": ref_named("Expiry year"), "cvc_ref": ref_named("Security code")});
+    let call = {
+        let (st, tk) = (f.state.clone(), chat_token.clone());
+        tokio::spawn(async move { tools::call(&st, &tk, "fill_saved_card", &args).await })
+    };
+    let approval = loop {
+        let msgs = f
+            .state
+            .db
+            .with(|c| crate::db::list_messages(c, &f.conv, None, 50))
+            .unwrap();
+        if let Some(m) = msgs.into_iter().find(|m| {
+            m.card
+                .as_ref()
+                .is_some_and(|c| c["service"] == "wallet" && c["state"] == "pending")
+        }) {
+            break m;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let mut card = approval.card.clone().unwrap();
+    card["state"] = "approved".into();
+    card["decided_at"] = crate::util::now_ms().into();
+    f.state
+        .db
+        .with(|c| crate::db::update_message_card(c, &approval.id, &card))
+        .unwrap();
+    crate::gateway::decided(&f.state, &approval.id, true);
+    let r = call.await.unwrap();
+    assert_eq!(text(&r), "filled", "{r}");
+    let values = b
+        .tool(
+            &run,
+            "browser_evaluate",
+            &json!({"function": "() => [...document.querySelectorAll('input, select')].map((i) => i.value)"}),
+            QUICK,
+        )
+        .await
+        .unwrap();
+    let values = text_of(&values).replace([' ', '\n'], "");
+    assert!(
+        values.contains(r#"["4111111111111111","4","31","737"]"#),
+        "{values}"
+    );
+    let r = f.agent(&chat_token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE);
+    drop(chat);
 
     // The owner again: a code field known only by its label is private,
     // and a field in another site's frame says so.
