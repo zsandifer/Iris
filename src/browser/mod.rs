@@ -986,13 +986,10 @@ impl Browser {
 
     async fn idle_loop(&self, run: Arc<Running>) {
         let idle_ms = (self.cfg.idle_mins as i64) * 60_000;
+        // Once a minute (a server that died is already skipped by
+        // `running()`; this only tidies up after it).
         loop {
-            for _ in 0..60 {
-                if !run.alive() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
             if !run.alive() {
                 break;
             }
