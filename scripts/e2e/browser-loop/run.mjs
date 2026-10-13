@@ -30,7 +30,7 @@
 // the scenario file go into the TEST vault, through the credentials API, and
 // their passwords are never printed or written to the report.
 import { spawn } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, openSync, readSync, closeSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -179,6 +179,44 @@ function hasLoginFor(creds, host) {
 
 // ---------------------------------------------------------------- one turn
 
+/**
+ * The turn's tool calls and results as Claude Code recorded them (the
+ * TEST instance runs it as this account): Iris itself keeps no tool
+ * results. Returns the errors (for the judge and the report) and writes
+ * the whole log beside the result (page text included; it stays here).
+ */
+function claudeToolLog(conv, since, file) {
+  const root = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'projects');
+  let dirs = [];
+  try { dirs = readdirSync(root).filter((d) => d.endsWith(`-${conv}`)); } catch { return []; }
+  const calls = new Map();
+  const lines = [];
+  const errors = [];
+  for (const d of dirs) {
+    for (const f of readdirSync(join(root, d)).filter((x) => x.endsWith('.jsonl'))) {
+      for (const line of readFileSync(join(root, d, f), 'utf8').split('\n')) {
+        let m;
+        try { m = JSON.parse(line); } catch { continue; }
+        if (!m.timestamp || Date.parse(m.timestamp) < since || !Array.isArray(m.message?.content)) continue;
+        for (const c of m.message.content) {
+          if (c.type === 'tool_use') {
+            const name = c.name.replace(/^mcp__(iris_)?browser__/, '');
+            calls.set(c.id, { name, args: JSON.stringify(c.input ?? {}).slice(0, 300) });
+            lines.push(`>> ${name} ${calls.get(c.id).args}`);
+          } else if (c.type === 'tool_result') {
+            const text = Array.isArray(c.content) ? c.content.filter((x) => x.type === 'text').map((x) => x.text).join('\n') : String(c.content ?? '');
+            const call = calls.get(c.tool_use_id) || { name: '?', args: '' };
+            lines.push(`${c.is_error ? '!!' : '<<'} ${text.slice(0, 4000)}`);
+            if (c.is_error) errors.push({ tool: call.name, args: call.args, error: text.replace(/\s+/g, ' ').slice(0, 300) });
+          }
+        }
+      }
+    }
+  }
+  if (lines.length) writeFileSync(file, lines.join('\n') + '\n');
+  return errors;
+}
+
 function logSize() { try { return statSync(LOG).size; } catch { return 0; } }
 
 function logSlice(from, to) {
@@ -280,6 +318,7 @@ async function turn(events, conv, text, dir, n) {
   const browser = (await api('GET', '/browser')).browser;
   const logText = logSlice(logFrom, logSize());
   writeFileSync(join(dir, `iris-t${n}.log`), logText);
+  const toolErrors = msg.harness === 'claude' ? claudeToolLog(conv, started - 1000, join(dir, `tools-t${n}.log`)) : [];
   return {
     n,
     sent: text,
@@ -297,6 +336,7 @@ async function turn(events, conv, text, dir, n) {
     browser: { url: browser.url, title: browser.title, running: browser.running, error: browser.error },
     final_frame: finalFrame,
     log_warnings: logText.split('\n').filter((l) => /WARN|ERROR/.test(l)).slice(-30),
+    tool_errors: toolErrors,
   };
 }
 
@@ -368,6 +408,7 @@ async function judge(s, turns, mech) {
     `USER: ${t.sent}`,
     `TOOLS (in order): ${t.activity.map((a) => `${a.name}${a.status === 'failed' ? ' [FAILED]' : ''}${a.summary ? ` (${a.summary.slice(0, 80)})` : ''}`).join(' | ') || '(none)'}`,
     t.cards.length ? `CARDS POSTED: ${JSON.stringify(t.cards)}` : '',
+    t.tool_errors?.length ? `TOOL ERRORS (what the tools answered):\n${t.tool_errors.slice(-12).map((e) => `- ${e.tool} ${e.args.slice(0, 120)} => ${e.error}`).join('\n')}` : '',
     t.error ? `IRIS ERROR: ${JSON.stringify(t.error)}` : '',
     t.stopped ? `HARNESS STOPPED THE TURN: ${t.stopped}` : '',
     `AGENT REPLY (status ${t.status}, ${t.seconds}s):\n${t.reply.slice(0, 6000)}`,
