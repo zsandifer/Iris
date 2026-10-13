@@ -57,6 +57,21 @@ while IFS= read -r line; do
           reply "### Page\\n- Page URL: $to\\n- Page Title: Sign in\\n### Snapshot\\n- [Snapshot](out/page-2.yml)" '' '' ;;
         browser_run_code_unsafe)
           case "$line" in
+            *aria-ref=*)
+              # Iris's agent fills: `fieldframe` is the field's frame
+              # address (default: the page's), `noref` hides the field.
+              ff=$(cat fieldframe 2>/dev/null || echo "$url")
+              if [ -f noref ]; then
+                reply "### Result\\n{\\\"found\\\":false}" '' ''
+              else
+                case "$line" in
+                  *'const values'*)
+                    case "$line" in *'if (true) await page.evaluate'*) : > marked ;; esac
+                    reply "### Result\\n{\\\"filled\\\":true}" '' '' ;;
+                  *)
+                    reply "### Result\\n{\\\"found\\\":true,\\\"top\\\":\\\"$url\\\",\\\"frame\\\":\\\"$ff\\\",\\\"tag\\\":\\\"input\\\"}" '' '' ;;
+                esac
+              fi ;;
             *insertText*)
               reply "### Page\\n- Page URL: $url" '' '' ;;
             *activeElement*)
@@ -429,6 +444,243 @@ async fn owner_fills_saved_logins_only_on_their_site() {
     b.close().await;
 }
 
+/// The `run_code` calls that filled a field, and whether each pressed Enter.
+fn fills(f: &Fake) -> Vec<(String, bool)> {
+    f.calls()
+        .into_iter()
+        .filter(|(t, a)| {
+            t == "browser_run_code_unsafe" && a["code"].as_str().unwrap().contains("const values")
+        })
+        .map(|(_, a)| {
+            let code = a["code"].as_str().unwrap().to_string();
+            let enter = code.contains("if (filled && true)");
+            (code, enter)
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_agent_fills_saved_logins_without_seeing_them() {
+    let f = Fake::new();
+    let b = f.browser();
+    let id = "login-1".to_string();
+    let secret = f
+        .state
+        .vault
+        .encrypt(json!({"password": "Pw-5678"}).to_string().as_bytes(), &id)
+        .unwrap();
+    f.state
+        .db
+        .with(|c| {
+            crate::entities::insert_credential(
+                c,
+                &id,
+                &f.owner,
+                "login",
+                "Site",
+                &json!({"site": "site.test", "username": "sam"}),
+                &secret,
+            )
+        })
+        .unwrap();
+    let g = b.begin_turn(&f.owner, &f.conv, "m", std::slice::from_ref(&f.owner));
+    let token = g.token().to_string();
+    let listed = tools::list(&f.state, &token).await;
+    assert!(
+        listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "fill_saved_login")
+    );
+    let login = json!({"username_ref": "e3", "password_ref": "e4", "submit": true});
+
+    // Another site, a field in another site's frame, a plain-HTTP page, a
+    // bad ref: nothing is typed.
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://evil.test/login"}),
+    )
+    .await;
+    let r = f.agent(&token, "fill_saved_login", login.clone()).await;
+    assert!(text(&r).starts_with("not found (no saved login"), "{r}");
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://site.test/login"}),
+    )
+    .await;
+    f.set("fieldframe", "https://ads.test/frame");
+    let r = f.agent(&token, "fill_saved_login", login.clone()).await;
+    assert!(text(&r).contains("won't fill"), "{r}");
+    std::fs::remove_file(f.file("fieldframe")).unwrap();
+    let r = f
+        .agent(
+            &token,
+            "fill_saved_login",
+            json!({"password_ref": "x\"); evil(\""}),
+        )
+        .await;
+    assert!(text(&r).contains("no field for ref"), "{r}");
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "http://site.test/login"}),
+    )
+    .await;
+    let r = f.agent(&token, "fill_saved_login", login.clone()).await;
+    assert!(text(&r).starts_with("not found"), "{r}");
+    assert!(fills(&f).is_empty());
+
+    // Its site: both fields filled by Iris, Enter only in the last; the
+    // answer never carries the values, and the page closes to the agent.
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://site.test/login"}),
+    )
+    .await;
+    let r = f.agent(&token, "fill_saved_login", login.clone()).await;
+    assert_eq!(text(&r), "filled and submitted", "{r}");
+    assert!(!r.to_string().contains("Pw-5678") && !r.to_string().contains("sam"));
+    let done = fills(&f);
+    assert_eq!(done.len(), 2);
+    assert!(done[0].0.contains("aria-ref=e3") && done[0].0.contains(r#"["sam"]"#));
+    assert!(!done[0].1);
+    assert!(done[1].0.contains("aria-ref=e4") && done[1].0.contains("Pw-5678"));
+    assert!(done[1].1);
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE);
+    // Filling still works there (the password step of a two-step form).
+    let r = f
+        .agent(&token, "fill_saved_login", json!({"password_ref": "e4"}))
+        .await;
+    assert_eq!(text(&r), "filled", "{r}");
+    drop(g);
+    b.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_agent_fills_a_card_only_after_the_owner_approves() {
+    let f = Fake::new();
+    let b = f.browser();
+    let id = "card-1".to_string();
+    let secret = f
+        .state
+        .vault
+        .encrypt(
+            json!({"number": "4111111111111111", "cvc": "737"})
+                .to_string()
+                .as_bytes(),
+            &id,
+        )
+        .unwrap();
+    f.state
+        .db
+        .with(|c| {
+            crate::entities::insert_credential(
+                c,
+                &id,
+                &f.owner,
+                "card",
+                "Everyday",
+                &json!({"last4": "1111", "brand": "visa", "exp_month": 4, "exp_year": 2031,
+                        "cardholder": "S Doe"}),
+                &secret,
+            )
+        })
+        .unwrap();
+    let g = b.begin_turn(&f.owner, &f.conv, "m", std::slice::from_ref(&f.owner));
+    let token = g.token().to_string();
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://shop.test/pay"}),
+    )
+    .await;
+    let args = json!({"number_ref": "e5", "exp_month_ref": "e6", "exp_year_ref": "e7",
+                      "cvc_ref": "e8", "name_ref": "e9"});
+    let pending = || async {
+        for _ in 0..200 {
+            let msgs = f
+                .state
+                .db
+                .with(|c| crate::db::list_messages(c, &f.conv, None, 50))
+                .unwrap();
+            if let Some(m) = msgs.into_iter().find(|m| {
+                m.card
+                    .as_ref()
+                    .is_some_and(|c| c["service"] == "wallet" && c["state"] == "pending")
+            }) {
+                return m;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("no approval card");
+    };
+    let decide = |m: crate::db::Message, approve: bool| {
+        let mut card = m.card.clone().unwrap();
+        card["state"] = if approve { "approved" } else { "denied" }.into();
+        card["decided_at"] = crate::util::now_ms().into();
+        f.state
+            .db
+            .with(|c| crate::db::update_message_card(c, &m.id, &card))
+            .unwrap();
+        crate::gateway::decided(&f.state, &m.id, approve);
+    };
+
+    // The owner says no: nothing is typed.
+    let call = {
+        let (st, tk, a) = (f.state.clone(), token.clone(), args.clone());
+        tokio::spawn(async move { tools::call(&st, &tk, "fill_saved_card", &a).await })
+    };
+    let m = pending().await;
+    let card = m.card.as_ref().unwrap();
+    assert!(
+        card["title"]
+            .as_str()
+            .unwrap()
+            .contains("Visa ending 1111 on shop.test")
+    );
+    assert!(!card.to_string().contains("4111111111111111"));
+    decide(m, false);
+    let r = call.await.unwrap();
+    assert!(text(&r).starts_with("denied"), "{r}");
+    assert!(fills(&f).is_empty());
+
+    // Approved: every field filled by Iris, and the page closes.
+    let call = {
+        let (st, tk, a) = (f.state.clone(), token.clone(), args.clone());
+        tokio::spawn(async move { tools::call(&st, &tk, "fill_saved_card", &a).await })
+    };
+    decide(pending().await, true);
+    let r = call.await.unwrap();
+    assert_eq!(text(&r), "filled", "{r}");
+    assert!(!r.to_string().contains("4111"));
+    let done = fills(&f);
+    assert_eq!(done.len(), 5);
+    assert!(done[0].0.contains("4111111111111111"));
+    assert!(done[1].0.contains(r#"["04","4"]"#), "{}", done[1].0);
+    assert!(done[2].0.contains(r#"["2031","31"]"#));
+    assert!(done[3].0.contains("737"));
+    assert!(done[4].0.contains("S Doe"));
+    let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE);
+    // That OK was for one fill.
+    let used = f
+        .state
+        .db
+        .with(|c| crate::db::list_messages(c, &f.conv, None, 50))
+        .unwrap()
+        .into_iter()
+        .find_map(|m| m.card.filter(|c| c["state"] == "approved"))
+        .unwrap();
+    assert!(used["wallet"]["used_at"].is_i64());
+    drop(g);
+    b.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_sandbox_stays_on_without_the_owners_consent() {
     let f = Fake::new();
@@ -630,6 +882,11 @@ async fn real_playwright() {
                      <input id=c name=code style='{big};top:100px'>\
                      <iframe src='http://127.0.0.1:{other_port}/field' style='{big};top:400px;border:0'></iframe></body></html>"
                 )
+            } else if req.starts_with("GET /signin") {
+                "<html><head><title>Iris smoke sign in form</title></head><body>\
+                 <form method=post action=/home><input name=user aria-label=Username>\
+                 <input name=pw type=password aria-label=Password><button>Sign in</button></form></body></html>"
+                    .to_string()
             } else if req.starts_with("GET /field") {
                 "<html><body style='margin:0'><input name=q style='width:500px;height:200px'></body></html>"
                     .to_string()
@@ -812,6 +1069,87 @@ async fn real_playwright() {
             .iter()
             .any(|p| p["type"] == "image"),
         "{r}"
+    );
+
+    // The agent signs in with a saved login it never sees.
+    let id = "real-login".to_string();
+    let secret = f
+        .state
+        .vault
+        .encrypt(
+            json!({"password": "Real-Pw-42"}).to_string().as_bytes(),
+            &id,
+        )
+        .unwrap();
+    f.state
+        .db
+        .with(|c| {
+            crate::entities::insert_credential(
+                c,
+                &id,
+                &f.owner,
+                "login",
+                "Smoke",
+                &json!({"site": format!("http://127.0.0.1:{port}"), "username": "sam"}),
+                &secret,
+            )
+        })
+        .unwrap();
+    let signin = format!("http://127.0.0.1:{port}/signin");
+    f.agent(&token, "browser_navigate", json!({"url": signin}))
+        .await;
+    let snap = text(&f.agent(&token, "browser_snapshot", json!({})).await);
+    let ref_of = |label: &str| {
+        let line = snap
+            .lines()
+            .find(|l| l.contains(&format!("textbox \"{label}\"")))
+            .unwrap_or_else(|| panic!("{label} in {snap}"));
+        let at = line.find("[ref=").unwrap() + 5;
+        line[at..line[at..].find(']').unwrap() + at].to_string()
+    };
+    let (user_ref, pw_ref) = (ref_of("Username"), ref_of("Password"));
+    let r = f
+        .agent(
+            &token,
+            "fill_saved_login",
+            json!({"username_ref": user_ref, "password_ref": pw_ref}),
+        )
+        .await;
+    assert_eq!(text(&r), "filled", "{r}");
+    let typed = b
+        .tool(
+            &run,
+            "browser_evaluate",
+            &json!({"function": "() => [...document.querySelectorAll('input')].map((i) => i.value)"}),
+            QUICK,
+        )
+        .await
+        .unwrap();
+    assert!(
+        text_of(&typed).contains("Real-Pw-42") && text_of(&typed).contains("sam"),
+        "{typed}"
+    );
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE);
+    let r = f
+        .agent(
+            &token,
+            "fill_saved_login",
+            json!({"password_ref": pw_ref, "submit": true}),
+        )
+        .await;
+    assert_eq!(text(&r), "filled and submitted", "{r}");
+    let mut home_now = String::new();
+    for _ in 0..20 {
+        home_now = text(&f.agent(&token, "browser_snapshot", json!({})).await);
+        if home_now.contains("Welcome home") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        home_now.contains("Welcome home") && !home_now.contains("Real-Pw-42"),
+        "{home_now}"
     );
 
     // The owner again: a code field known only by its label is private,

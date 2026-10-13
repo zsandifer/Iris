@@ -130,6 +130,11 @@ impl TurnCtx {
         *self.ended.borrow()
     }
 
+    /// Ends with the turn (approvals held for it are cancelled).
+    pub(crate) fn cancellation(&self) -> watch::Sender<bool> {
+        self.ended.clone()
+    }
+
     /// Resolves when the turn ends.
     pub async fn wait_ended(&self) {
         let mut rx = self.ended.subscribe();
@@ -405,6 +410,9 @@ const FIELD_FN: &str = r#"() => {
   }
   return { private: priv, frame };
 }"#;
+
+/// Marks the current document private (see `private_page`).
+pub(crate) const MARK_JS: &str = "(() => { try { Object.defineProperty(window, '__irisPrivate', { value: true }); } catch (_) {} })()";
 
 /// Run `FIELD_FN` from Playwright's Node side, with the real address.
 fn field_code(mark: bool, force: bool) -> String {
@@ -954,7 +962,7 @@ impl Browser {
 
     /// Run Iris's own fixed Playwright code (never the agent's) and read
     /// its JSON result.
-    async fn run_code(&self, run: &Running, code: &str) -> Result<Value> {
+    pub(crate) async fn run_code(&self, run: &Running, code: &str) -> Result<Value> {
         let r = self
             .tool(
                 run,
@@ -971,7 +979,7 @@ impl Browser {
     /// The current tab: its address and title (from the browser, not from
     /// anything the page wrote) and whether the owner typed private
     /// details into this document.
-    async fn page_info(&self, run: &Running) -> Result<(String, bool)> {
+    pub(crate) async fn page_info(&self, run: &Running) -> Result<(String, bool)> {
         let v = self.run_code(run, PAGE_CODE).await?;
         let url = v["url"].as_str().ok_or("the browser has no open page")?;
         self.set_page_info(Some(url), v["title"].as_str());
@@ -1001,16 +1009,21 @@ impl Browser {
             frame: v["frame"] != false,
         };
         if mark && field.private {
-            let mut p = lock(&self.private);
-            let key = page_key(&field.url).to_string();
-            if !p.pages.contains(&key) {
-                if p.pages.len() >= PRIVATE_PAGES_MAX {
-                    p.pages.remove(0);
-                }
-                p.pages.push(key);
-            }
+            self.remember_private(&field.url);
         }
         Ok(field)
+    }
+
+    /// Keep the agent off this address (see `private_page`).
+    pub(crate) fn remember_private(&self, url: &str) {
+        let mut p = lock(&self.private);
+        let key = page_key(url).to_string();
+        if !p.pages.contains(&key) {
+            if p.pages.len() >= PRIVATE_PAGES_MAX {
+                p.pages.remove(0);
+            }
+            p.pages.push(key);
+        }
     }
 
     /// The server's tools the agent may use. Asked once per install (a

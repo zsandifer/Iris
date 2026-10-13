@@ -57,7 +57,8 @@ impl BrowserBridge {
                 req,
                 "browser",
                 "Iris's own web browser (Playwright), which the user can watch and take over \
-                 from their phone. Signing in and paying are theirs: ask them to take over.",
+                 from their phone. Saved logins and cards are filled in by Iris; you never see \
+                 them.",
             ),
             "ping" => json!({}),
             "tools/list" => {

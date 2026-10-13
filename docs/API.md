@@ -3568,6 +3568,28 @@ results link snapshot files the agent cannot open, so the agent calls
   tool a newer version adds.
 - Writing results to files: the `filename` option is removed from the
   definitions and refused.
+
+Iris adds two tools of its own, after Playwright's:
+
+- `fill_saved_login` (`username_ref`, `password_ref`, optional `login`,
+  `submit`): types the owner's saved login for the current site into the
+  fields with those element refs (from `browser_snapshot`). Each field's own
+  frame and the page must be the site the login was saved for, over HTTPS
+  (plain HTTP only on this machine). `submit` presses Enter in the last field.
+- `fill_saved_card` (`number_ref`, optional `exp_ref`, `exp_month_ref`,
+  `exp_year_ref`, `cvc_ref`, `name_ref`, `card`, `submit`): only after the
+  owner approves an approval card in the chat (service `wallet`; the same
+  pending map, expiry, and cancellation as connector approvals), and only on
+  the page approved (same scheme and host), with every field over HTTPS. One
+  approval fills once; a card edited since needs a new one.
+
+Iris locates each field and types its value through Playwright's own
+`browser_run_code_unsafe` on Iris's side (never offered to the agent); the
+values never appear in a tool result, message, log, or command line. The
+answers are `filled`, `filled and submitted`, `denied`, `not filled (...)`,
+or `not found (...)`. Filling a password, card number, expiry, or CVC closes
+the page to the agent as if the owner had typed it (see below); the fill
+tools themselves stay usable there.
 - Addresses that are not web pages in `browser_navigate` and
   `browser_tabs` (`url`): only `http`, `https`, a bare domain without a
   port, or `about:blank`; anything with whitespace or control characters

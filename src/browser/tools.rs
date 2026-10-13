@@ -1,9 +1,10 @@
 //! The browser tools the agent gets: Playwright MCP's own, served by `iris
 //! mcp --browser` (started by the harness CLI) and forwarded over the
-//! private socket to the server that runs the browser.
+//! private socket to the server that runs the browser, plus Iris's own
+//! `fill_saved_login` / `fill_saved_card` (`fill.rs`).
 //!
-//! Iris passes calls through unchanged or refuses them; it never decides
-//! what to call. Refused: tools outside [`ALLOWED`], calls that would read
+//! Iris passes Playwright calls through unchanged or refuses them; it never
+//! decides what to call. Refused: tools outside [`ALLOWED`], calls that would read
 //! or write files on the server, addresses that are not web pages, and any
 //! use of a page where the owner just typed private details.
 
@@ -179,15 +180,20 @@ are fine.
   sites, maps, canvases), click or drag by position with
   `browser_mouse_click_xy` / `browser_mouse_drag_xy` (CSS pixels of the
   screenshot), then screenshot again to check.
-- Signing in, paying, and verification codes are the user's: never type a
-  password, card number, or code, and never ask for one in chat. Ask the user
-  to take over the browser in the app and do that step themselves (they can
-  fill their saved logins and cards from there), then wait. Sign-ins stay in
-  the browser, so this is usually needed once per site. Sites that fight
-  automated browsers (for example X) always need the user to sign in.
+- Signing in: never type a password, card number, or code yourself, and
+  never ask for one in chat. Call `fill_saved_login` with the refs of the
+  username and password fields and `submit: true`; Iris fills the user's
+  saved login and you never see it (for two-step forms, call it again on the
+  password step). If it answers `not found`, or the site asks for a code or a
+  check, or fights automated browsers (for example X), ask the user to take
+  over the browser in the app and sign in themselves, then wait. Sign-ins
+  stay in the browser, so this is usually needed once per site.
+- Paying: call `fill_saved_card` with the refs of the payment fields. The user
+  approves every use in the chat; tell them you are waiting for their OK.
 - While the user has control, tools answer that they are waiting; tell the
-  user you are waiting for them to hand it back. A page where they typed
-  private details stays closed to you until it moves on.
+  user you are waiting for them to hand it back. A page where a password or
+  card was filled or typed stays closed to you until it moves on (you can
+  still fill saved details there, or open another page).
 - CAPTCHAs: you may solve them. Click the \"I'm not a robot\" box; for picture
   puzzles pick the tiles, then the verify button; drag sliders. If a new
   puzzle keeps coming after two or three tries, ask the user to take over.
@@ -200,7 +206,10 @@ pub async fn list(state: &AppState, token: &str) -> Value {
         return json!({"tools": []});
     }
     match state.browser.tool_list().await {
-        Ok(tools) => json!({"tools": tools}),
+        Ok(mut tools) => {
+            tools.extend(super::fill::definitions());
+            json!({"tools": tools})
+        }
         Err(e) => {
             crate::warn!("browser: tools unavailable: {e}");
             json!({"tools": []})
@@ -215,7 +224,8 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     let Some(ctx) = b.turn(token) else {
         return error(super::TURN_ENDED);
     };
-    if !ALLOWED.contains(&name) {
+    let fill = super::fill::TOOLS.contains(&name);
+    if !ALLOWED.contains(&name) && !fill {
         return error(format!("unknown tool {name}"));
     }
     let args = if args.is_null() {
@@ -236,6 +246,14 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
         return error(super::TURN_ENDED);
     }
     b.mark_used(&ctx);
+    // A card needs the owner's OK first, asked without holding the page.
+    let mut approved = None;
+    if name == "fill_saved_card" {
+        match super::fill::approve_card(state, &ctx, &args).await {
+            Ok(a) => approved = Some(a),
+            Err(out) => return out,
+        }
+    }
     // Wait while the owner has control, then hold the page; control is
     // checked again once the page is ours, so a call queued behind another
     // never runs after a take-over.
@@ -271,7 +289,9 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     if let Err(e) = b.check_agent(&ctx) {
         return error(e.to_string());
     }
-    if !NAVIGATION.contains(&name) {
+    // Filling saved details reads nothing, so it may go on on a page that
+    // already holds some (the password step after the username).
+    if !NAVIGATION.contains(&name) && !fill {
         match b.private_page(&run).await {
             Ok(false) => {}
             Ok(true) => return error(super::PRIVATE_PAGE),
@@ -285,13 +305,16 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     } else {
         ACTION_DRAIN
     };
-    let result = while_agent(
-        b,
-        &ctx,
-        drain,
-        b.tool(&run, name, &args, super::CALL_TIMEOUT),
-    )
-    .await;
+    let work = async {
+        match (name, approved) {
+            ("fill_saved_login", _) => Ok(super::fill::agent_login(state, &ctx, &run, &args).await),
+            ("fill_saved_card", Some(a)) => {
+                Ok(super::fill::agent_card(state, &ctx, &run, &args, a).await)
+            }
+            _ => b.tool(&run, name, &args, super::CALL_TIMEOUT).await,
+        }
+    };
+    let result = while_agent(b, &ctx, drain, work).await;
     b.set_busy(false);
     let mut out = result.unwrap_or_else(|e| error(e.to_string()));
     // A file picker would block every tool, and the agent may not upload

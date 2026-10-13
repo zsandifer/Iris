@@ -25,8 +25,11 @@ All notable changes to Iris are documented here, following
   cards there yourself. The browser is Microsoft’s Playwright MCP server,
   installed and updated from the app; Iris only wraps it (reviewed tools,
   live view, take over) instead of automating Chromium itself. Sign-ins are
-  the owner’s: the agent asks you to take over, and cannot read a page where
-  you typed a password until it moves on (in any tab, or back in history).
+  filled by Iris without the agent seeing them (`fill_saved_login`,
+  `fill_saved_card` with element refs; cards ask you every time); the agent
+  cannot read a page where a password was filled or typed until it moves on
+  (in any tab, or back in history). Sites that fight automation (like X):
+  take over and sign in yourself.
 - Iris’s own browser lives at one fixed path that `deploy/setup-engines.sh`
   approves for Chrome’s sandbox where AppArmor restricts user namespaces
   (Ubuntu 23.10+); when the sandbox cannot start, the app shows the exact

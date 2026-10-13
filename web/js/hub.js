@@ -92,19 +92,19 @@ export function Logins() {
   }
   const logins = list.filter((c) => c.kind === 'login');
   const cards = list.filter((c) => c.kind === 'card');
-  return html`<${Page} title="Logins & wallet" sub=${`For you to fill in; ${agentName()} never sees them`}>
-    <div class="lock"><${Icon} name="lock" size=${15} /> Stored encrypted on your server, separate from ${agentName()}. When you take over ${agentName()}'s browser, tap the key to fill one into the page: it's typed into the site directly and never enters ${agentName()}'s chat or memory.</div>
+  return html`<${Page} title="Logins & wallet" sub=${`${agentName()} can use these but never sees them`}>
+    <div class="lock"><${Icon} name="lock" size=${15} /> Stored encrypted on your server, separate from ${agentName()}. ${agentName()} signs in for you in its own browser: the password is typed into the site directly and never enters its chat or memory. Cards always ask you first, every time. When you take over the browser, tap the key to fill one yourself.</div>
     ${!data ? html`<${Spinner} />` : html`
     <${Group} label="Logins">
       ${logins.map((c) => html`<${Row} icon=${html`<${LetterTile} name=${c.metadata.site || c.label} />`} title=${c.label}
         sub=${[c.metadata.site, c.metadata.username].filter(Boolean).join(' · ')} value=${c.last_used_at ? `used ${since(c.last_used_at)}` : ''}
-        chevron=${false} right=${html`<button class="icon-btn" aria-label="Delete" onClick=${() => remove(c)}><${Icon} name="trash" size=${16} /></button>`} />`)}
+        value="always asks" chevron=${false} right=${html`<button class="icon-btn" aria-label="Delete" onClick=${() => remove(c)}><${Icon} name="trash" size=${16} /></button>`} />`)}
       <${Row} title="Add login" accent icon="plus" onClick=${() => setAdding('login')} chevron=${false} />
     <//>
     <${Group} label="Wallet">
       ${cards.map((c) => html`<${Row} icon="card" title=${`${(c.metadata.brand || 'Card').replace(/^./, (x) => x.toUpperCase())} ••${c.metadata.last4 || ''}`}
         sub=${[c.label, c.metadata.exp_month && `exp ${String(c.metadata.exp_month).padStart(2, '0')}/${String(c.metadata.exp_year || '').slice(-2)}`].filter(Boolean).join(' · ')}
-        chevron=${false} right=${html`<button class="icon-btn" aria-label="Delete" onClick=${() => remove(c)}><${Icon} name="trash" size=${16} /></button>`} />`)}
+        value="always asks" chevron=${false} right=${html`<button class="icon-btn" aria-label="Delete" onClick=${() => remove(c)}><${Icon} name="trash" size=${16} /></button>`} />`)}
       <${Row} title="Add card" accent icon="plus" onClick=${() => setAdding('card')} chevron=${false} />
     <//>`}
   <//>`;

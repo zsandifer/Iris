@@ -514,11 +514,15 @@ computer).
   waits for a slow page, the picture waits too. Take over forwards your
   taps, scrolling, and typing to the same page; the agent's browser tools
   wait until you hand back.
-- **Signing in is yours.** The agent never types passwords, card numbers,
-  or codes. When a site needs one (and always for sites that fight
-  automated browsers, such as X), it asks you to take over and sign in
+- **Saved logins and cards.** The agent never sees or types passwords,
+  card numbers, or codes. It calls `fill_saved_login` / `fill_saved_card`
+  with the fields' element refs, and Iris types the saved values into them
+  through Playwright on its own side; a card needs your OK on an approval
+  card in the chat every time. For codes, checks, or sites that fight
+  automated browsers (such as X), it asks you to take over and sign in
   yourself. The key button in the take-over bar fills a field you tapped
-  from Logins & wallet: logins only on the site they were saved for, and
+  from Logins & wallet. Logins only go into fields on the site they were
+  saved for, and
   everything only over HTTPS (plain HTTP only on this machine), and never
   into another site's frame inside the page. When you type into a
   password, card, or code field, or fill a saved secret, the agent cannot
