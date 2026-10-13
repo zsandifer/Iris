@@ -26,7 +26,7 @@ All notable changes to Iris are documented here, following
   installed and updated from the app; Iris only wraps it (reviewed tools,
   live view, take over) instead of automating Chromium itself. Sign-ins are
   the owner’s: the agent asks you to take over, and cannot read a page where
-  you typed a password until it moves on.
+  you typed a password until it moves on (in any tab, or back in history).
 - Iris’s own browser lives at one fixed path that `deploy/setup-engines.sh`
   approves for Chrome’s sandbox where AppArmor restricts user namespaces
   (Ubuntu 23.10+); when the sandbox cannot start, the app shows the exact

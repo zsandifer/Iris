@@ -519,11 +519,16 @@ computer).
   automated browsers, such as X), it asks you to take over and sign in
   yourself. The key button in the take-over bar fills a field you tapped
   from Logins & wallet: logins only on the site they were saved for, and
-  everything only over HTTPS (plain HTTP only on this machine). When you
-  type into a password, card, or code field, or fill a saved secret, the
-  agent cannot use that page at all until it moves on (a new address, for
-  example after the sign-in); it can still open another page. The agent
-  never gets your saved logins or cards.
+  everything only over HTTPS (plain HTTP only on this machine), and never
+  into another site's frame inside the page. When you type into a
+  password, card, or code field, or fill a saved secret, the agent cannot
+  use that page at all (in any tab) until it moves on to a new page, for
+  example after the sign-in; it can still open another page, but not that
+  address again until the browser closes. The agent never gets your saved
+  logins or cards. While you are in control, dialogs the page shows are
+  answered for you (alerts and confirmations accepted, prompts dismissed),
+  file pickers are cancelled, and a window the page opens (a sign-in
+  popup) becomes the one you see.
 - **Who gets it.** Only the owner's own conversations and jobs (the profile
   holds the owner's sign-ins); never shared chats.
 - **Sandbox.** Iris always starts Chrome with its sandbox. Ubuntu 23.10
@@ -852,7 +857,8 @@ dropping them; when they end you get one summary notification.
   ask while in control, from the vault straight into the page; a page
   where you typed or filled private details is closed to the agent until
   it moves on. Only `http`/`https` pages can be opened. When a turn ends or
-  you take over, its pending browser actions stop.
+  you take over, its pending browser reads stop, and an action already
+  sent gets a few seconds to finish before you get the page.
 - "Pause Iris" in Iris's computer stops running turns, closes the browser,
   and holds chats and jobs until you turn it back on.
 

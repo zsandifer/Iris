@@ -2515,7 +2515,7 @@ image:
 
 | `kind` | Fields | Effect |
 |---|---|---|
-| `tap` | `x`, `y` | A left click at that point. |
+| `tap` | `x`, `y` | A left click at that point. A window the page opens (a sign-in popup) becomes the current tab. |
 | `scroll` | `x`, `y` (optional), `dx`, `dy` | Mouse wheel; deltas in CSS pixels (max 4,000). |
 | `text` | `text` (max 2,000 characters) | Typed into the focused element. |
 | `key` | `key` | `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, arrows, `Home`, `End`, `PageUp`, `PageDown`. |
@@ -2523,12 +2523,23 @@ image:
 | `navigate` | `url` | Open an http(s) page (as `POST /api/browser/navigate`). |
 | `fill` | `credential_id`, `field` | Type one field of a saved [credential](#313-credentials) into the focused element: `username` or `password` for a login, `number`, `exp` (MM/YY), `cvc`, or `name` for a card. A login only on the site it was saved for; everything only over HTTPS (plain HTTP only on this machine). The value never comes back to any client. |
 
-Typing into a private field (a password, card, or one-time-code field, or
-one inside a frame), and filling a `password`, `number`, `exp`, or `cvc`,
-closes the current page to the agent: its browser tools other than
-`browser_navigate`, `browser_navigate_back`, and `browser_tabs` answer that
-the owner typed private details there, until the page's address (ignoring
-the fragment) changes or the agent opens a page.
+Typing into a private field (a password, card, or one-time-code field, by
+its type, autocomplete, name, or label, or a field in another site's
+frame; checked for every `text` input), and filling a `password`,
+`number`, `exp`, or `cvc`, closes that page to the agent before anything is
+typed: its browser tools other than `browser_navigate`,
+`browser_navigate_back`, and `browser_tabs` answer that the owner typed
+private details there. Both the document (in whichever tab, also after its
+address changes within it) and its address (ignoring the fragment; a page
+brought back from history may still hold what was typed) stay closed until
+the browser closes. Pages and addresses are read from the browser itself,
+never from page-controlled text. A login is filled only when its site
+matches that real address and the focused field is not in another site's
+frame.
+
+While the owner is in control, a dialog the page opens is answered for
+them (alerts and confirmations accepted, prompts dismissed) and a file
+picker is cancelled; the input is then carried out.
 
 Input from a device that does not have control, or a failed input, gets
 `{"type": "browser.input_error", "message": "..."}`. Input is carried out in
@@ -3558,8 +3569,9 @@ results link snapshot files the agent cannot open, so the agent calls
 - Writing results to files: the `filename` option is removed from the
   definitions and refused.
 - Addresses that are not web pages in `browser_navigate` and
-  `browser_tabs` (`url`): only `http`, `https`, a bare domain, or
-  `about:blank`.
+  `browser_tabs` (`url`): only `http`, `https`, a bare domain without a
+  port, or `about:blank`; anything with whitespace or control characters
+  (browsers drop them while parsing) is refused.
 - Anything but `browser_navigate`, `browser_navigate_back`, and
   `browser_tabs` while the current page holds private details the owner
   typed or filled (see [Input while in control](#4-websocket-get-apiws)).
@@ -3570,7 +3582,12 @@ holds the page, so a queued call never acts under the owner's control.
 Takeover also discards the result of a call already under way, even if
 control is immediately handed back. When the turn ends (finished,
 cancelled, or failed), its calls stop at once, even in the middle of a
-wait. Every harness gets a per-server timeout of the effective approval
+wait. Reads (`browser_snapshot`, `browser_find`, `browser_take_screenshot`,
+`browser_wait_for`) are dropped at once; an action already sent to the
+browser keeps the page for up to 8 seconds while it finishes, so it never
+lands under the owner's hands. A file picker the agent's action opens is
+cancelled (the result says so); the agent answers its own dialogs with
+`browser_handle_dialog`. Every harness gets a per-server timeout of the effective approval
 window plus 300 seconds, using the standard per-server MCP timeout fields.
 
 The agent never handles passwords, card numbers, or codes: its instructions
