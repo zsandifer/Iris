@@ -4,8 +4,8 @@
 //! a tool process of a running turn can drive the browser.
 //!
 //! Protocol: one JSON line per connection,
-//! `{"token": "...", "name": "<tool>", "arguments": {...}}`, answered with
-//! one JSON line holding the MCP `tools/call` result.
+//! `{"token": "...", "method": "tools/list" | "tools/call", "params": {...}}`,
+//! answered with one JSON line holding the MCP result.
 
 use crate::config::Paths;
 use crate::state::AppState;
@@ -77,14 +77,24 @@ async fn handle(state: AppState, stream: tokio::net::UnixStream) -> Result<()> {
     let mut line = String::new();
     reader.read_line(&mut line).await?;
     let req: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
-    let out = super::tools::call(
-        &state,
-        req["token"].as_str().unwrap_or(""),
-        req["name"].as_str().unwrap_or(""),
-        &req.get("arguments").cloned().unwrap_or_else(|| json!({})),
-    )
-    .await;
-    let mut body = out.to_mcp().to_string();
+    let token = req["token"].as_str().unwrap_or("");
+    let params = &req["params"];
+    let out = match req["method"].as_str().unwrap_or("") {
+        "tools/list" => super::tools::list(&state, token).await,
+        _ => {
+            super::tools::call(
+                &state,
+                token,
+                params["name"].as_str().unwrap_or(""),
+                &params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            )
+            .await
+        }
+    };
+    let mut body = out.to_string();
     body.push('\n');
     w.write_all(body.as_bytes()).await?;
     w.shutdown().await?;
@@ -100,8 +110,9 @@ fn owned_by_us(dir: &Path) -> bool {
         .is_ok_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0)
 }
 
-/// Client side (inside `iris mcp --browser`): forward one call.
-pub fn forward(socket: &Path, token: &str, name: &str, arguments: &Value) -> Value {
+/// Client side (inside `iris mcp --browser`): forward one request
+/// (`tools/list` or `tools/call` with its params).
+pub fn forward(socket: &Path, token: &str, method: &str, params: &Value) -> Value {
     let fail = |msg: &str| json!({"content": [{"type": "text", "text": msg}], "isError": true});
     if !socket.parent().is_some_and(owned_by_us) {
         return fail("The browser is not available right now (Iris is not running).");
@@ -111,7 +122,7 @@ pub fn forward(socket: &Path, token: &str, name: &str, arguments: &Value) -> Val
         Err(_) => return fail("The browser is not available right now (Iris is not running)."),
     };
     // The harness enforces the per-server timeout (approval window plus execution).
-    let mut req = json!({"token": token, "name": name, "arguments": arguments}).to_string();
+    let mut req = json!({"token": token, "method": method, "params": params}).to_string();
     req.push('\n');
     if stream.write_all(req.as_bytes()).is_err() {
         return fail("The browser is not available right now.");
@@ -162,7 +173,14 @@ mod tests {
         // The tool process side is blocking I/O.
         let ask = move |token: String, name: &'static str| {
             let s = s2.clone();
-            tokio::task::spawn_blocking(move || forward(&s, &token, name, &json!({"x": 1})))
+            tokio::task::spawn_blocking(move || {
+                forward(
+                    &s,
+                    &token,
+                    "tools/call",
+                    &json!({"name": name, "arguments": {"x": 1}}),
+                )
+            })
         };
         // A live token reaches the tools (an unknown tool name is refused
         // by them, proving the call arrived with its name and token).
@@ -170,17 +188,23 @@ mod tests {
         assert_eq!(r["isError"], true);
         assert_eq!(r["content"][0]["text"], "unknown tool no_such_tool");
         // A wrong or expired token is refused before anything runs.
-        let r = ask("bogus".into(), "snapshot").await.unwrap();
+        let r = ask("bogus".into(), "browser_snapshot").await.unwrap();
         assert_eq!(r["content"][0]["text"], crate::browser::TURN_ENDED);
+        let s3 = sock.clone();
+        let listed =
+            tokio::task::spawn_blocking(move || forward(&s3, "bogus", "tools/list", &json!({})))
+                .await
+                .unwrap();
+        assert_eq!(listed, json!({"tools": []}));
         drop(g);
-        let r = ask(token, "snapshot").await.unwrap();
+        let r = ask(token, "browser_snapshot").await.unwrap();
         assert_eq!(r["content"][0]["text"], crate::browser::TURN_ENDED);
     }
 
     #[test]
     fn forward_reports_a_missing_server() {
         let tmp = tempfile::tempdir().unwrap();
-        let v = forward(&tmp.path().join("none.sock"), "t", "snapshot", &json!({}));
+        let v = forward(&tmp.path().join("none.sock"), "t", "tools/call", &json!({}));
         assert_eq!(v["isError"], true);
     }
 }

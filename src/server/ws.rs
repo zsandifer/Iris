@@ -8,7 +8,8 @@
 //! The owner's app can also watch Iris's browser on the same socket:
 //! `{"type":"browser.watch","mode":"peek"|"full"|"off"}` starts or stops
 //! `browser.frame` events, and while the owner has taken over,
-//! `{"type":"browser.input",...}` sends taps, scrolls, keys, and text.
+//! `{"type":"browser.input",...}` sends taps, scrolls, keys, text, and
+//! fills of saved logins and cards.
 
 use super::{AuthUser, auth_from_token};
 use crate::auth;
@@ -138,6 +139,15 @@ pub(super) async fn event_visible(state: &AppState, uid: &str, raw: &str) -> boo
 async fn browser_input(state: &AppState, device_id: &str, ev: &Value) -> crate::util::Result<()> {
     if !device_active(state, device_id).await {
         return Err("device revoked".into());
+    }
+    if ev["kind"] == "fill" {
+        return crate::browser::fill::fill(
+            state,
+            device_id,
+            ev["credential_id"].as_str().unwrap_or(""),
+            ev["field"].as_str().unwrap_or(""),
+        )
+        .await;
     }
     state.browser.user_input(device_id, ev).await
 }
@@ -437,7 +447,7 @@ mod tests {
             .db
             .with(|c| crate::db::revoke_device(c, &device.user_id, &device.id))
             .unwrap();
-        for kind in ["navigate", "tap", "text", "key", "scroll"] {
+        for kind in ["navigate", "tap", "text", "key", "scroll", "fill"] {
             assert_eq!(
                 browser_input(&state, &device.id, &json!({"kind":kind}))
                     .await

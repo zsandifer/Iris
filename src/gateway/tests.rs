@@ -690,11 +690,24 @@ async fn pause_and_disconnect_everything() {
         .db
         .with(|c| db::delete_setting(c, "paused"))
         .unwrap();
+    let browser_turn = t.state.browser.begin_turn(&t.owner, &t.main, "m", &[]);
     assert_eq!(disconnect_all(&t.state).await.unwrap(), 1);
     assert!(!t.connector().enabled);
     let r = t.call(&token, "search_messages", json!({})).await;
     assert!(text(&r).contains("cancelled"), "{r}");
     assert!(t.calls_log().is_empty());
+    // The browser goes with it until the owner reopens it.
+    assert!(!t.state.browser.enabled());
+    assert!(t.state.browser.running().is_none());
+    assert!(
+        t.state
+            .browser
+            .turn(browser_turn.token())
+            .unwrap()
+            .is_ended()
+    );
+    assert!(t.state.setting("browser.disconnected").await.is_some());
+    assert!(t.state.browser.ensure().await.is_err());
 }
 
 #[tokio::test]
@@ -1786,146 +1799,6 @@ async fn security_regression_long_upstream_secrets_are_scrubbed_before_truncatio
     server.abort();
 }
 
-/// Browser wallet calls use the same pending map, decision route, expiry,
-/// and cancellation handling as connector approvals.
-#[tokio::test]
-async fn wallet_approvals_use_the_gateway_and_never_resume_ended_turns() {
-    for action in [
-        "approve",
-        "deny",
-        "expire",
-        "stop",
-        "pause",
-        "settings_pause",
-        "disconnect",
-        "join",
-        "abort",
-    ] {
-        let t = setup(|c| c.safety.approval_timeout_secs = 1);
-        let guard = t.state.browser.begin_turn(
-            &t.owner,
-            &t.main,
-            "wallet-turn",
-            std::slice::from_ref(&t.owner),
-        );
-        let ctx = t.state.browser.turn(guard.token()).unwrap();
-        let st = t.state.clone();
-        let card = entities::approval_card(&entities::ApprovalRequest {
-            title: "Fill card at shop.example",
-            service: "wallet",
-            approver_user_id: &t.owner,
-            ..Default::default()
-        });
-        let held = tokio::spawn(async move { approve_browser_card(&st, &ctx, card).await });
-        let msg = t.pending_card().await;
-        assert_eq!(msg.card.as_ref().unwrap()["turn_message_id"], "wallet-turn");
-        assert!(msg.card.as_ref().unwrap()["expires_at"].as_i64().unwrap() > msg.created_at);
-        // The socket receives the same release as a connector call.
-        match action {
-            "approve" | "deny" => {
-                owner_request(
-                    &t,
-                    "POST",
-                    &format!("/api/messages/{}/decision", msg.id),
-                    json!({"approve": action == "approve"}),
-                )
-                .await;
-            }
-            "stop" => {
-                crate::turn::cancel(&t.state, &t.main);
-            }
-            "pause" => {
-                owner_request(&t, "PUT", "/api/safety", json!({"paused": true})).await;
-            }
-            "settings_pause" => {
-                owner_request(&t, "PUT", "/api/settings", json!({"paused": true})).await;
-            }
-            "disconnect" => {
-                owner_request(&t, "POST", "/api/safety/disconnect-all", Value::Null).await;
-            }
-            "join" => {
-                t.state.db.with(|c| {
-                    let u = add_guest(c)?;
-                    c.execute("INSERT INTO conversation_members (conversation_id, user_id, role, joined_at)
-                        VALUES (?1, ?2, 'member', 1)", rusqlite::params![t.main, u.id])?;
-                    Ok(())
-                }).unwrap();
-                cancel_conversation_grants(&t.state, &t.main);
-            }
-            "abort" => {
-                held.abort();
-                t.state.browser.end_turns(Some(&t.main));
-            }
-            _ => {}
-        }
-        if action != "abort" {
-            let (answer, _) = tokio::time::timeout(Duration::from_secs(3), held)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(
-                match action {
-                    "approve" => matches!(answer, Answer::Approved),
-                    "deny" => matches!(answer, Answer::Denied),
-                    "expire" => matches!(answer, Answer::Expired),
-                    _ => matches!(answer, Answer::Cancelled),
-                },
-                "{action}"
-            );
-        }
-        // Detached wallet waiter closes its card even if the MCP request
-        // was dropped while waiting (Stop, disconnect, or CLI exit).
-        for _ in 0..100 {
-            let closed = t
-                .state
-                .db
-                .with(|c| db::get_message(c, &msg.id))
-                .unwrap()
-                .unwrap()
-                .card
-                .as_ref()
-                .is_some_and(|c| c["state"] != "pending");
-            if closed && t.state.gateway.pending_count() == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let card = t
-            .state
-            .db
-            .with(|c| db::get_message(c, &msg.id))
-            .unwrap()
-            .unwrap()
-            .card
-            .unwrap();
-        let expected = match action {
-            "approve" => "approved",
-            "deny" => "denied",
-            "expire" => "expired",
-            _ => "cancelled",
-        };
-        assert_eq!(card["state"], expected, "{action}");
-        assert_eq!(t.state.gateway.pending_count(), 0);
-        if action == "disconnect" {
-            assert!(!t.state.browser.enabled());
-            assert!(t.state.browser.running().is_none());
-            assert!(t.state.setting("browser.disconnected").await.is_some());
-            assert!(t.state.browser.ensure().await.is_err());
-        }
-        let messages = t
-            .state
-            .db
-            .with(|c| db::list_messages(c, &t.main, None, 50))
-            .unwrap();
-        assert_eq!(messages.iter().filter(|m| m.kind == "card").count(), 1);
-        assert_eq!(
-            messages.iter().filter(|m| m.kind == "system_note").count(),
-            usize::from(matches!(action, "approve" | "deny"))
-        );
-        drop(guard);
-    }
-}
-
 #[tokio::test]
 async fn browser_access_is_owner_only_private_and_revoked_on_membership_change() {
     let t = setup(|_| {});
@@ -1957,51 +1830,6 @@ async fn browser_access_is_owner_only_private_and_revoked_on_membership_change()
 fn add_guest(c: &rusqlite::Connection) -> rusqlite::Result<db::User> {
     c.execute("INSERT INTO users (id, display_name, is_owner, created_at) VALUES ('guest', 'Guest', 0, 1)", [])?;
     Ok(db::get_user(c, "guest")?.unwrap())
-}
-
-async fn owner_request(t: &T, method: &str, path: &str, body: Value) {
-    use axum::body::Body;
-    use tower::ServiceExt;
-    let app = crate::server::router(t.state.clone());
-    let code = t
-        .state
-        .db
-        .with(|c| Ok(crate::auth::create_pairing_code(c, &t.owner)))
-        .unwrap()
-        .unwrap()
-        .0;
-    let response = app
-        .clone()
-        .oneshot(
-            axum::http::Request::post("/api/pair")
-                .header("content-type", "application/json")
-                .body(Body::from(json!({"code": code}).to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-        .await
-        .unwrap();
-    let paired: Value = serde_json::from_slice(&bytes).unwrap();
-    let token = paired["token"].as_str().unwrap();
-    let response = app
-        .oneshot(
-            axum::http::Request::builder()
-                .method(method)
-                .uri(path)
-                .header("authorization", format!("Bearer {token}"))
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert!(
-        response.status().is_success(),
-        "{method} {path}: {}",
-        response.status()
-    );
 }
 
 #[test]

@@ -233,16 +233,6 @@ impl AppState {
             db.with(|c| db::get_setting(c, "browser.disconnected"))?
                 .is_some(),
         );
-        {
-            let (db, vault, history) = (
-                db.clone(),
-                vault.clone(),
-                crate::browser::fill::history_path(&paths),
-            );
-            browser.set_secret_source(Arc::new(move || {
-                crate::browser::fill::load_secrets_blocking(&db, &vault, &history)
-            }));
-        }
         Ok(Self(Arc::new(Inner {
             rankings,
             browser,

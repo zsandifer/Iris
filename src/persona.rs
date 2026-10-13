@@ -533,7 +533,9 @@ mod tests {
         assert!(!prompt.contains("## Your browser"));
         let mut b = ctx("Nova");
         b.browser = Some("browser");
-        assert!(assemble(&p, &b).contains("fill_login"));
+        let with_browser = assemble(&p, &b);
+        assert!(with_browser.contains("`browser_snapshot`"));
+        assert!(with_browser.contains("take over"));
         b.scope = Scope::Shared;
         assert!(!assemble(&p, &b).contains("## Your browser"));
     }

@@ -510,8 +510,7 @@ pub fn redact(text: &str, secrets: &[String]) -> String {
     out
 }
 
-/// Common reversible encodings of a secret, shared with browser redaction.
-/// Callers cache these forms when remembering a filled value.
+/// Common reversible encodings of a secret.
 pub(crate) fn encoded_secret_forms(secret: &str) -> Vec<String> {
     use base64::{
         Engine as _,
@@ -1972,33 +1971,6 @@ async fn hold_approval(
             .await;
     }
     (decision, Some(msg))
-}
-
-/// Hold a wallet fill through the gateway's ordinary approval mechanism.
-pub(crate) async fn approve_browser_card(
-    state: &AppState,
-    ctx: &crate::browser::TurnCtx,
-    mut card: Value,
-) -> (Answer, Option<db::Message>) {
-    const SOURCE: &str = "iris-browser-wallet";
-    card["expires_at"] = (now_ms() + state.cfg.approval_timeout_secs() as i64 * 1000).into();
-    card["turn_message_id"] = ctx.message_id.clone().into();
-    card["category"] = "purchase".into();
-    card["tool"] = "fill_card".into();
-    let grant = Grant {
-        owner_user_id: ctx.user_id.clone(),
-        conversation_id: ctx.conversation_id.clone(),
-        card_conversation_id: ctx.conversation_id.clone(),
-        message_id: ctx.message_id.clone(),
-        private_conversation: Some(ctx.conversation_id.clone()),
-        connectors: Vec::new(),
-        cancel: ctx.cancellation(),
-        current_turn: Mutex::default(),
-    };
-    let st = state.clone();
-    tokio::spawn(async move { hold_approval(&st, &grant, SOURCE, card, None).await })
-        .await
-        .unwrap_or((Answer::Cancelled, None))
 }
 
 /// Move a still-pending card to `to`; returns the card's final state.
