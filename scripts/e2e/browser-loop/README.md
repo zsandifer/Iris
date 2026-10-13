@@ -111,6 +111,9 @@ checks the pass/fail rules on synthetic turns.
 
 `<test dir>/runs/<timestamp>/`: `report.md` (table per run), `report.json`
 (everything), and per scenario `result.json` (the transcript, tools,
-judge verdicts), `iris-t<n>.log` (the server log during that turn), and
+judge verdicts), `iris-t<n>.log` (the server log during that turn),
+`tools-t<n>.log` (with a Claude chat model: every tool call and what it
+answered, from Claude Code's own session file; tool errors also go to the
+judge), and
 `frames/` (live-view pictures every few seconds and at the end). One line per
 run is appended to `<test dir>/runs/index.tsv`.
