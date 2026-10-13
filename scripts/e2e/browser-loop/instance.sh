@@ -101,8 +101,16 @@ if d and os.access(d, os.W_OK):
 if e.get("auto_update", True): bad.append("engines.auto_update is not false")
 if e.get("helper"): bad.append("engines.helper is set")
 if c.get("agent", {}).get("user"): bad.append("agent.user is set (split mode)")
-host = c.get("bind", "").rsplit(":", 1)[0]
-if host in ("0.0.0.0", "::", "[::]", ""): bad.append(f"bind {c.get('bind')!r} is public")
+# Loopback, private ranges, and Tailscale's (100.64.0.0/10, fd7a:115c:a1e0::/48) only.
+import ipaddress
+host = c.get("bind", "").rsplit(":", 1)[0].strip("[]")
+try:
+    ip = ipaddress.ip_address("127.0.0.1" if host == "localhost" else host)
+    ok = not ip.is_unspecified and (ip.is_loopback or ip.is_private
+        or ip in ipaddress.ip_network("100.64.0.0/10"))
+except ValueError:
+    ok = False
+if not ok: bad.append(f"bind {c.get('bind')!r} is not a loopback or private address")
 if bad: sys.exit("unsafe test config: " + "; ".join(bad))
 PY
 }

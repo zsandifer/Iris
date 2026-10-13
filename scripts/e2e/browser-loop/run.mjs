@@ -102,6 +102,19 @@ class Events {
     this.ws.onerror = () => {};
   }
   on(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
+  /** The page as it is now: Iris sends frames only when the picture
+   * changes, but a new watcher gets the current one at once. */
+  async fresh(timeoutMs = 8000) {
+    if (opts['no-watch'] || this.ws.readyState !== WebSocket.OPEN) return null;
+    const asked = Date.now();
+    this.ws.send(JSON.stringify({ type: 'browser.watch', mode: 'off' }));
+    this.ws.send(JSON.stringify({ type: 'browser.watch', mode: 'full', width: 500 }));
+    while (Date.now() - asked < timeoutMs) {
+      if (this.frame?.at >= asked) return this.frame;
+      await sleep(200);
+    }
+    return null;
+  }
   close() { this.closed = true; try { this.ws.close(); } catch {} }
 }
 
@@ -237,11 +250,12 @@ async function turn(events, conv, text, dir, n) {
   }
   off();
   activeConversation = null;
-  await sleep(1500); // the last frame
+  await sleep(1000); // let the page settle after the last action
   let finalFrame = null;
-  if (events.frame?.at >= started) {
+  const last = await events.fresh();
+  if (last) {
     finalFrame = join(frames, `t${n}-final.jpg`);
-    writeFileSync(finalFrame, Buffer.from(events.frame.data, 'base64'));
+    writeFileSync(finalFrame, Buffer.from(last.data, 'base64'));
   }
   const { messages } = await api('GET', `/conversations/${conv}/messages?limit=50`);
   const msg = messages.find((x) => x.id === asstId) || done || {};
