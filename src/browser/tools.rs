@@ -147,11 +147,15 @@ pub fn allowed_definitions(all: Vec<Value>) -> Vec<Value> {
     all.into_iter()
         .filter(|t| t["name"].as_str().is_some_and(|n| ALLOWED.contains(&n)))
         .map(|mut t| {
-            if let Some(props) = t["inputSchema"]["properties"].as_object_mut() {
-                props.remove("filename");
-            }
-            if let Some(req) = t["inputSchema"]["required"].as_array_mut() {
-                req.retain(|r| r != "filename");
+            // `get_mut`, not `t[..]`: indexing a Value mutably inserts null
+            // for a missing key, and MCP clients reject `"required": null`.
+            if let Some(schema) = t.get_mut("inputSchema").and_then(Value::as_object_mut) {
+                if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+                    props.remove("filename");
+                }
+                if let Some(req) = schema.get_mut("required").and_then(Value::as_array_mut) {
+                    req.retain(|r| r != "filename");
+                }
             }
             t
         })
@@ -423,7 +427,7 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     let text = super::text_of(&out);
     if text.contains("can be handled by browser_file_upload")
         && b.answer_modal(&run, &text, false).await
-        && let Some(parts) = out["content"].as_array_mut()
+        && let Some(parts) = out.get_mut("content").and_then(Value::as_array_mut)
     {
         parts.push(json!({"type": "text",
             "text": "(Iris closed the file picker: uploading files is not available.)"}));
@@ -454,7 +458,7 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     // page text) has them hidden.
     let secrets = b.filled_secrets();
     if !secrets.is_empty()
-        && let Some(parts) = out["content"].as_array_mut()
+        && let Some(parts) = out.get_mut("content").and_then(Value::as_array_mut)
     {
         for p in parts.iter_mut() {
             if let Some(t) = p["text"].as_str() {
@@ -579,6 +583,13 @@ pub(crate) mod tests {
         );
         assert!(shown[1]["inputSchema"]["properties"].get("type").is_some());
         assert_eq!(shown[1]["inputSchema"]["required"], json!([]));
+        // A schema without `required` (or without a schema) stays that way.
+        let bare = allowed_definitions(vec![
+            json!({"name": "browser_navigate", "inputSchema": {"type": "object", "properties": {}}}),
+            json!({"name": "browser_snapshot"}),
+        ]);
+        assert!(bare[0]["inputSchema"].get("required").is_none());
+        assert!(bare[1].get("inputSchema").is_none());
         for unsafe_tool in [
             "browser_run_code_unsafe",
             "browser_evaluate",
