@@ -508,11 +508,15 @@ computer).
   close.
 - **Memory.** The browser starts on first use and closes after
   `browser.idle_mins` (default 10) without use, so it costs nothing while
-  idle. A running browser with one tab takes a few hundred MB (the
+  idle. When it gets stuck, the agent can restart it (`restart_browser`:
+  closed gracefully and opened again, sign-ins kept). A running browser with one tab takes a few hundred MB (the
   Node.js server plus Chromium).
 - **Live view and take over.** While you watch, Iris takes screenshots
   through the server (about 1 per second for the small peek in chat, about
-  3 full screen) and sends only pictures that changed. While the agent
+  3 full screen) and sends only pictures that changed. The peek in chat is
+  only the picture; tap it for the full view and Take over. It stays after
+  the agent's turn ends (which is often when it asks you to take over) for
+  at least a minute and until you write again or take over. While the agent
   waits for a slow page, the picture waits too. Take over forwards your
   taps, scrolling, and typing to the same page; the agent's browser tools
   wait until you hand back.
@@ -520,17 +524,23 @@ computer).
   card numbers, or codes. It calls `fill_saved_login` / `fill_saved_card`
   with the fields' element refs, and Iris types the saved values into them
   through Playwright on its own side; a card needs your OK on an approval
-  card in the chat every time. For codes, checks, or sites that fight
-  automated browsers (such as X), it asks you to take over and sign in
-  yourself. The key button in the take-over bar fills a field you tapped
+  card in the chat every time. If no login is saved for the site, it can
+  post a card in the chat where you type one in (it goes straight to Logins
+  & wallet). For codes, checks, or sites that fight automated browsers, it
+  asks you to take over and sign in yourself; for X it asks right away
+  (X's sign-in tends to stall for automated browsers after the username,
+  and no browser setting we tried changes that). The key button in the take-over bar fills a field you tapped
   from Logins & wallet. Logins only go into fields on the site they were
   saved for, and
   everything only over HTTPS (plain HTTP only on this machine), and never
   into another site's frame inside the page. When you type into a
-  password, card, or code field, or fill a saved secret, the agent cannot
-  use that page at all (in any tab) until it moves on to a new page, for
-  example after the sign-in; it can still open another page, but not that
-  address again until the browser closes. The agent never gets your saved
+  password, card, or code field, the agent cannot use that page at all (in
+  any tab) until it moves on to a new page, for example after the sign-in;
+  it can still open another page, but not that address again until the
+  browser closes. A saved password or card Iris filled closes the page only
+  while it is still on it, in a field or its text (sent or cleared forms
+  open it again, even when the address stays the same); meanwhile the agent can still read the
+  page, with the secret hidden, to see whether the sign-in worked. The agent never gets your saved
   logins or cards. While you are in control, dialogs the page shows are
   answered for you (alerts and confirmations accepted, prompts dismissed),
   file pickers are cancelled, and a window the page opens (a sign-in

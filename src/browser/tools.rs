@@ -1,14 +1,15 @@
 //! The browser tools the agent gets: Playwright MCP's own, served by `iris
 //! mcp --browser` (started by the harness CLI) and forwarded over the
 //! private socket to the server that runs the browser, plus Iris's own
-//! `fill_saved_login` / `fill_saved_card` (`fill.rs`).
+//! `fill_saved_login` / `fill_saved_card` (`fill.rs`), `restart_browser`
+//! and `ask_to_save_login` (`own.rs`).
 //!
 //! Iris passes Playwright calls through unchanged or refuses them; it never
 //! decides what to call. Refused: tools outside [`ALLOWED`], calls that would read
 //! or write files on the server, addresses that are not web pages, and any
 //! use of a page where the owner just typed private details.
 
-use super::{Browser, Control, TurnCtx};
+use super::{Access, Browser, Control, TurnCtx};
 use crate::state::AppState;
 use crate::util::Result;
 use serde_json::{Value, json};
@@ -132,7 +133,7 @@ const READS: &[&str] = &[
 /// for a while, since a slow page finishing its load under the owner's
 /// hands changes nothing they typed.
 fn drain_for(name: &str) -> Duration {
-    if READS.contains(&name) {
+    if READS.contains(&name) || name == super::own::SAVE_LOGIN {
         Duration::ZERO
     } else if matches!(name, "browser_navigate" | "browser_navigate_back") {
         Duration::from_secs(8)
@@ -263,18 +264,29 @@ are fine.
   username and password fields and `submit: true` (or `submit_ref`, the
   sign-in button's ref, when Enter does not sign in); Iris fills the user's
   saved login and you never see it (for two-step forms, call it again on the
-  password step). If it answers `not found`, or the site asks for a code or a
-  check, or fights automated browsers (for example X), ask the user to take
+  password step). Its answer says whether the password left the page; then
+  take a `browser_snapshot` to see whether you are signed in. If it answers
+  `not found`, offer to save one: `ask_to_save_login` posts a card where the
+  user types it in (you never see it), then wait for them. If the site asks
+  for a code or a check, or fights automated browsers, ask the user to take
   over the browser in the app and sign in themselves, then wait (if the
-  sign-in opened in a new tab or window, select it with `browser_tabs`
-  first: the user sees the tab you are on). Sign-ins
-  stay in the browser, so this is usually needed once per site.
+  sign-in opened in a new tab or window, select it with `browser_tabs` first:
+  the user sees the tab you are on). Sign-ins stay in the browser, so this is
+  usually needed once per site.
+- X (x.com, twitter.com): its sign-in stalls in your browser (checks you
+  cannot pass). Do not try to sign in there yourself, not even the username:
+  ask the user right away to take over and sign in, then wait.
 - Paying: call `fill_saved_card` with the refs of the payment fields. The user
   approves every use in the chat; tell them you are waiting for their OK.
 - While the user has control, tools answer that they are waiting; tell the
-  user you are waiting for them to hand it back. A page where a password or
-  card was filled or typed stays closed to you until it moves on (you can
-  still fill saved details there, or open another page).
+  user you are waiting for them to hand it back. A page where the user typed
+  a password or card stays closed to you until it moves on (you can still
+  fill saved details there, or open another page). A page where Iris filled
+  a saved password or card is closed only while it is still on the page:
+  meanwhile `browser_snapshot` works, with saved details shown as [hidden].
+- If the browser is stuck or crashed (pages never load, tools keep timing
+  out), call `restart_browser`: it closes and reopens it, sign-ins kept. Then
+  open the page again.
 - CAPTCHAs: you may solve them. Click the \"I'm not a robot\" box; for picture
   puzzles pick the tiles, then the verify button; drag sliders. If a new
   puzzle keeps coming after two or three tries, ask the user to take over.
@@ -289,6 +301,7 @@ pub async fn list(state: &AppState, token: &str) -> Value {
     match state.browser.tool_list().await {
         Ok(mut tools) => {
             tools.extend(super::fill::definitions());
+            tools.extend(super::own::definitions());
             json!({"tools": tools})
         }
         Err(e) => {
@@ -306,7 +319,8 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
         return error(super::TURN_ENDED);
     };
     let fill = super::fill::TOOLS.contains(&name);
-    if !ALLOWED.contains(&name) && !fill {
+    let own = super::own::TOOLS.contains(&name);
+    if !ALLOWED.contains(&name) && !fill && !own {
         return error(format!("unknown tool {name}"));
     }
     let args = if args.is_null() {
@@ -357,6 +371,21 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     if let Err(e) = b.check_agent(&ctx) {
         return error(e.to_string());
     }
+    // Closing and reopening is run to the end (a start cut short could
+    // leave a half-started browser); the page is held meanwhile.
+    if name == super::own::RESTART {
+        b.set_busy(true);
+        let restarted = b.restart().await;
+        b.set_busy(false);
+        if let Err(e) = restarted {
+            return error(format!("The browser could not restart: {e}"));
+        }
+        if let Err(e) = b.check_agent(&ctx) {
+            return error(e.to_string());
+        }
+        return json!({"content": [{"type": "text", "text": "restarted (one blank tab; sign-ins \
+            are kept: open the page again with browser_navigate)"}]});
+    }
     // Starting is cancelled too if the turn ends meanwhile.
     let started = tokio::select! {
         r = b.ensure() => r,
@@ -371,11 +400,20 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
         return error(e.to_string());
     }
     // Filling saved details reads nothing, so it may go on on a page that
-    // already holds some (the password step after the username).
-    if !NAVIGATION.contains(&name) && !fill {
-        match b.private_page(&run).await {
-            Ok(false) => {}
-            Ok(true) => return error(super::PRIVATE_PAGE),
+    // already holds some (the password step after the username); asking
+    // to save a login reads only the page's address. A saved secret Iris
+    // filled is hidden from snapshots, so the page can still be read while
+    // it is there (to see whether a sign-in went through).
+    if !NAVIGATION.contains(&name) && !fill && !own {
+        match b.page_access(&run).await {
+            Ok(Access::Open) => {}
+            Ok(Access::Filled) => match name {
+                "browser_snapshot" => {}
+                "browser_take_screenshot" => return error(SHOWS_SECRET),
+                _ if probes_page(name, &args) => return error(SEARCH_SECRET),
+                _ => return error(super::FILLED_PAGE),
+            },
+            Ok(Access::Typed) => return error(super::PRIVATE_PAGE),
             Err(e) => return error(e.to_string()),
         }
     }
@@ -404,6 +442,9 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
             ("fill_saved_login", _) => Ok(super::fill::agent_login(state, &ctx, &run, &args).await),
             ("fill_saved_card", Some(a)) => {
                 Ok(super::fill::agent_card(state, &ctx, &run, &args, a).await)
+            }
+            (super::own::SAVE_LOGIN, _) => {
+                Ok(super::own::ask_to_save_login(state, &ctx, &run, &args).await)
             }
             _ => b.tool(&run, name, &args, super::CALL_TIMEOUT).await,
         }
@@ -436,8 +477,10 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     // saved secret, or become private, while it was being taken (text is
     // redacted below; pixels cannot be).
     if name == "browser_take_screenshot" && out["isError"] != true {
-        let private = b.private_page(&run).await.unwrap_or(true);
-        let shown = if secrets.is_empty() {
+        let access = b.page_access(&run).await.unwrap_or(Access::Typed);
+        let shown = if access == Access::Filled {
+            Some(true)
+        } else if secrets.is_empty() {
             Some(false)
         } else {
             b.run_code(&run, PAGE_TEXT_CODE).await.ok().map(|v| {
@@ -445,7 +488,7 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
                 super::hide_secrets(t, &secrets) != t
             })
         };
-        if private {
+        if access == Access::Typed {
             out = error(super::PRIVATE_PAGE);
         } else if shown != Some(false) {
             out = error(SHOWS_SECRET);

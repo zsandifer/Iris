@@ -13,7 +13,8 @@ use crate::state::AppState;
 /// field is private (default true), `frame` whether it is in another
 /// site's frame, `tabs` how many tabs are open, `modal` a pending dialog
 /// or file picker line, `nosandbox` makes a sandboxed start fail,
-/// `calls.log` records calls.
+/// `pagetext` the page's text, `fields` what its fields hold (snapshots
+/// show it), `calls.log` records calls.
 const FAKE: &str = r####"#!/bin/sh
 cfg="$2"
 reply() { printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}%s]%s}}\n' "$id" "$1" "$2" "$3"; }
@@ -84,6 +85,10 @@ while IFS= read -r line; do
                     reply "### Result\\n{\\\"found\\\":true,\\\"top\\\":\\\"$url\\\",\\\"frame\\\":\\\"$ff\\\",\\\"tag\\\":\\\"input\\\",\\\"kind\\\":\\\"$k\\\"}" '' '' ;;
                 esac
               fi ;;
+            *'walk(document)'*)
+              t="$(cat fields 2>/dev/null) $(cat pagetext 2>/dev/null)"
+              if [ -f fieldsfail ]; then reply "### Result\\nnull" '' ''
+              else reply "### Result\\n\\\"$t\\\"" '' ''; fi ;;
             *innerText*)
               t=$(cat pagetext 2>/dev/null)
               reply "### Result\\n\\\"$t\\\"" '' '' ;;
@@ -101,6 +106,9 @@ while IFS= read -r line; do
               m=false; [ -f marked ] && m=true
               reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"title\\\":\\\"Sign in\\\",\\\"private\\\":$m}" '' '' ;;
           esac ;;
+        browser_snapshot)
+          t=$(cat fields 2>/dev/null)
+          reply "### Page\\n- Page URL: $url\\n- Page Title: Sign in\\n### Snapshot\\n- textbox \\\"Password\\\" [ref=e4]: $t" '' '' ;;
         browser_take_screenshot)
           [ -f slowshot ] && sleep 1
           [ -f pagetext_after ] && mv pagetext_after pagetext
@@ -220,7 +228,9 @@ async fn agent_calls_pass_through_and_private_pages_stay_closed() {
             "browser_take_screenshot",
             "browser_tabs",
             "fill_saved_login",
-            "fill_saved_card"
+            "fill_saved_card",
+            "restart_browser",
+            "ask_to_save_login"
         ]
     );
     assert!(
@@ -468,18 +478,88 @@ async fn owner_fills_saved_logins_only_on_their_site() {
     assert!(err.to_string().contains("another site"), "{err}");
     assert!(fills(&f).is_empty());
     // Its own site: the focused element itself is filled (replacing what
-    // it held), never typed key by key, and the page closes to the agent.
+    // it held), never typed key by key, and the page closes to the agent
+    // while the password is in its field.
     std::fs::remove_file(f.file("fieldframe")).unwrap();
     fill::fill(&f.state, "dev", &id, "password").await.unwrap();
+    f.set("fields", "sam Pw-1234");
     let done = fills(&f);
     assert_eq!(done.len(), 1);
     assert!(done[0].0.contains("hasFocus") && done[0].0.contains("Pw-1234"));
     assert!(done[0].0.contains("h.fill(v, "));
     assert_eq!(f.called("browser_press_key"), 0);
+    // Iris knows the value, so the document is not marked for good.
+    assert!(!f.file("marked").exists());
     b.hand_back();
     let g = b.begin_turn(&f.owner, &f.conv, "m", &[]);
-    let r = f.agent(g.token(), "browser_snapshot", json!({})).await;
+    let token = g.token().to_string();
+    let clicks = f.called("browser_click");
+    for (tool, args) in [
+        ("browser_click", json!({"target": "e3"})),
+        ("browser_type", json!({"target": "e4", "text": "x"})),
+        ("browser_press_key", json!({"key": "Enter"})),
+    ] {
+        let r = f.agent(&token, tool, args).await;
+        assert_eq!(text(&r), FILLED_PAGE, "{tool}");
+    }
+    assert_eq!(f.called("browser_click"), clicks);
+    let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(!r.to_string().contains("QUJD"));
+    // Reading it works, with the password hidden.
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(
+        text(&r).contains("[hidden]") && !r.to_string().contains("Pw-1234"),
+        "{r}"
+    );
+    // Once the field no longer holds it (the form was sent or cleared, on
+    // the same address), the page is the agent's again.
+    f.set("fields", "sam");
+    let r = f
+        .agent(&token, "browser_click", json!({"target": "e3"}))
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert_eq!(f.called("browser_click"), clicks + 1);
+    // A frame that could not be read counts as still holding it.
+    f.set("fieldsfail", "");
+    let r = f
+        .agent(&token, "browser_click", json!({"target": "e3"}))
+        .await;
+    assert_eq!(text(&r), FILLED_PAGE);
+    std::fs::remove_file(f.file("fieldsfail")).unwrap();
+
+    // A saved password too short to look for closes the page until it
+    // moves on, as if the owner typed it.
+    let short = "login-2".to_string();
+    let secret = f
+        .state
+        .vault
+        .encrypt(json!({"password": "a1!"}).to_string().as_bytes(), &short)
+        .unwrap();
+    f.state
+        .db
+        .with(|c| {
+            crate::entities::insert_credential(
+                c,
+                &short,
+                &f.owner,
+                "login",
+                "Short",
+                &json!({"site": "site.test", "username": "sam"}),
+                &secret,
+            )
+        })
+        .unwrap();
+    b.take_over(&f.owner, "dev").await.unwrap();
+    fill::fill(&f.state, "dev", &short, "password")
+        .await
+        .unwrap();
+    b.hand_back();
+    assert!(f.file("marked").exists());
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_eq!(text(&r), PRIVATE_PAGE);
+    drop(g);
     let used = f
         .state
         .db
@@ -593,7 +673,7 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
     assert!(fills(&f).is_empty());
 
     // Its site: both fields filled by Iris, Enter only in the last; the
-    // answer never carries the values, and the page closes to the agent.
+    // answer never carries the values, and says the password left the page.
     f.agent(
         &token,
         "browser_navigate",
@@ -601,7 +681,7 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
     )
     .await;
     let r = f.agent(&token, "fill_saved_login", login.clone()).await;
-    assert_eq!(text(&r), "filled and submitted", "{r}");
+    assert_eq!(text(&r), fill::SUBMITTED, "{r}");
     assert!(!r.to_string().contains("Pw-5678") && !r.to_string().contains("sam"));
     let done = fills(&f);
     assert_eq!(done.len(), 2);
@@ -629,6 +709,10 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
     assert!(text(&r).contains("not on the same site"), "{r}");
     assert_eq!(clicks(&f), 0);
     f.set("frames", "");
+    // This time the sign-in does not take the password off the page (the
+    // address does not change either): the answer says so after a while.
+    f.set("fields", "sam Pw-5678");
+    let started = std::time::Instant::now();
     let r = f
         .agent(
             &token,
@@ -636,16 +720,33 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
             json!({"password_ref": "e4", "submit_ref": "e9"}),
         )
         .await;
-    assert_eq!(text(&r), "filled and submitted", "{r}");
+    assert_eq!(text(&r), fill::STILL_THERE, "{r}");
+    assert!(started.elapsed() >= Duration::from_secs(4));
     assert_eq!(clicks(&f), 1);
     assert!(!fills(&f).last().unwrap().1, "no Enter with a button");
+    // The agent can read the page to see what happened, without the
+    // password, but not act on it while the password is there.
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
-    assert_eq!(text(&r), PRIVATE_PAGE);
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(
+        text(&r).contains("[hidden]") && !r.to_string().contains("Pw-5678"),
+        "{r}"
+    );
+    let r = f
+        .agent(&token, "browser_click", json!({"target": "e3"}))
+        .await;
+    assert_eq!(text(&r), FILLED_PAGE);
     // Filling still works there (the password step of a two-step form).
     let r = f
         .agent(&token, "fill_saved_login", json!({"password_ref": "e4"}))
         .await;
     assert_eq!(text(&r), "filled", "{r}");
+    // The form takes it: the page is open again.
+    f.set("fields", "sam");
+    let r = f
+        .agent(&token, "browser_click", json!({"target": "e3"}))
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
     // The password echoed anywhere later (an address, a title, a dialog)
     // is hidden from the agent; a page showing it gets no screenshot.
     f.load("https://site.test/search?q=Pw-5678");
@@ -660,7 +761,8 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
     assert!(text(&r).starts_with("No screenshot right now"), "{r}");
     // Nor searching it (a match or not would tell what is hidden), or
-    // naming elements by text; snapshot refs still work.
+    // naming elements by text; and while the page shows it, nothing else
+    // but reading it, redacted.
     for (tool, args) in [
         ("browser_find", json!({"text": "p=P"})),
         ("browser_wait_for", json!({"text": "Pw-5"})),
@@ -669,15 +771,15 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
         let r = f.agent(&token, tool, args).await;
         assert!(text(&r).contains("searching it"), "{tool}: {r}");
     }
-    let r = f
-        .agent(
-            &token,
-            "browser_click",
-            json!({"target": "e3", "element": "Search"}),
-        )
-        .await;
+    let click = json!({"target": "e3", "element": "Search"});
+    let r = f.agent(&token, "browser_click", click.clone()).await;
+    assert_eq!(text(&r), FILLED_PAGE);
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
+    // Once it is gone, the page is the agent's again.
     f.set("pagetext", "Welcome back");
+    let r = f.agent(&token, "browser_click", click).await;
+    assert_ne!(r["isError"], true, "{r}");
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     // A secret that shows up while the picture is taken: checked again
@@ -921,8 +1023,29 @@ async fn the_agent_fills_a_card_only_after_the_owner_approves() {
     assert!(done[2].0.contains(r#"["2031","31"]"#));
     assert!(done[3].0.contains("737"));
     assert!(done[4].0.contains("S Doe"));
+    // The expiry did not lock the document for good: while the number and
+    // code are in their fields the page can only be read (without them),
+    // and once the form clears them it is open again, on the same page.
+    assert!(!f.file("marked").exists());
+    f.set("fields", "4111111111111111 04 2031 737 S Doe");
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
-    assert_eq!(text(&r), PRIVATE_PAGE);
+    assert!(text(&r).starts_with("No screenshot right now"), "{r}");
+    let r = f
+        .agent(&token, "browser_click", json!({"target": "e9"}))
+        .await;
+    assert_eq!(text(&r), FILLED_PAGE);
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(
+        !r.to_string().contains("4111") && !text(&r).contains(" 737"),
+        "{r}"
+    );
+    f.set("fields", "S Doe");
+    let r = f
+        .agent(&token, "browser_click", json!({"target": "e9"}))
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    f.set("fields", "");
     // The number and code are hidden from now on; the expiry and name are
     // not (ordinary pages show years and months).
     let hidden = b.filled_secrets();
@@ -1014,6 +1137,193 @@ async fn the_agent_fills_a_card_only_after_the_owner_approves() {
     }
     drop(g);
     b.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_agent_restarts_the_browser_keeping_its_profile() {
+    let f = Fake::new();
+    let b = f.browser();
+    let g = b.begin_turn(&f.owner, &f.conv, "m", std::slice::from_ref(&f.owner));
+    let token = g.token().to_string();
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://site.test/login"}),
+    )
+    .await;
+    let first = b.running().unwrap();
+    std::fs::write(b.profile_dir.join("Cookies"), "kept").unwrap();
+    // A page the owner typed a password into, before the restart.
+    b.remember_private("https://site.test/login");
+    let r = f.agent(&token, "restart_browser", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(text(&r).starts_with("restarted"), "{r}");
+    // Closed gracefully (so the profile is saved), then a new browser.
+    assert_eq!(f.called("browser_close"), 1);
+    let second = b.running().unwrap();
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(
+        std::fs::read_to_string(b.profile_dir.join("Cookies")).unwrap(),
+        "kept"
+    );
+    // Its tabs are gone, and with them what was typed.
+    assert!(lock(&b.private).pages.is_empty());
+    assert_eq!(b.state_json()["url"], "about:blank");
+    // Without a running browser it just opens one.
+    b.close().await;
+    let r = f.agent(&token, "restart_browser", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(b.running().is_some());
+    // Playwright's own close is still never offered.
+    let r = f.agent(&token, "browser_close", json!({})).await;
+    assert_eq!(text(&r), "unknown tool browser_close");
+    drop(g);
+    b.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_agent_asks_the_owner_to_save_a_login_for_the_open_site() {
+    let f = Fake::new();
+    let b = f.browser();
+    let mut rx = f.state.hub.subscribe();
+    let g = b.begin_turn(&f.owner, &f.conv, "m", std::slice::from_ref(&f.owner));
+    let token = g.token().to_string();
+    let cards = |f: &Fake| {
+        f.state
+            .db
+            .with(|c| crate::db::list_messages(c, &f.conv, None, 100))
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.kind == "card")
+            .collect::<Vec<_>>()
+    };
+    // No page yet, or one that is not secure: nothing is posted.
+    let r = f.agent(&token, "ask_to_save_login", json!({})).await;
+    assert!(text(&r).starts_with("not posted (open the site"), "{r}");
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "http://shop.test/login"}),
+    )
+    .await;
+    let r = f.agent(&token, "ask_to_save_login", json!({})).await;
+    assert!(
+        text(&r).starts_with("not posted (this page is not secure"),
+        "{r}"
+    );
+    assert!(cards(&f).is_empty());
+    // The site comes from the page itself (its port kept, its path not);
+    // the agent may only suggest a name and username.
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://Shop.test:8443/account/login?next=/cart"}),
+    )
+    .await;
+    let r = f
+        .agent(
+            &token,
+            "ask_to_save_login",
+            json!({"label": "Shop", "username": "sam@example.test", "site": "https://evil.test"}),
+        )
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(text(&r).starts_with("posted"), "{r}");
+    let posted = cards(&f);
+    assert_eq!(posted.len(), 1);
+    let card = posted[0].card.clone().unwrap();
+    assert_eq!(card["type"], "save_login");
+    assert_eq!(card["site"], "https://shop.test:8443");
+    assert_eq!(card["host"], "shop.test");
+    assert_eq!(card["label"], "Shop");
+    assert_eq!(card["username"], "sam@example.test");
+    assert_eq!(card["state"], "pending");
+    assert_eq!(posted[0].status, "complete");
+    // The chat gets it right away.
+    let mut created = false;
+    while let Ok(e) = rx.try_recv() {
+        let v: Value = serde_json::from_str(&e.json).unwrap();
+        created |= v["type"] == "message.created" && v["message"]["id"] == posted[0].id;
+    }
+    assert!(created);
+    // Bad suggestions are refused.
+    let r = f
+        .agent(&token, "ask_to_save_login", json!({"username": "a\nb"}))
+        .await;
+    assert_eq!(r["isError"], true, "{r}");
+    // Not in a job (nobody would see the card).
+    let job = b.begin_turn(&f.owner, &f.conv, "j", &[]);
+    let r = f.agent(job.token(), "ask_to_save_login", json!({})).await;
+    assert!(text(&r).starts_with("not posted (only in a chat"), "{r}");
+    assert_eq!(cards(&f).len(), 1);
+    drop(job);
+    drop(g);
+    b.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_turns_peek_stays_until_the_owner_takes_over() {
+    let f = Fake::new();
+    let b = f.browser();
+    let mut rx = f.state.hub.subscribe();
+    let active = |b: &Browser| b.state_json()["active"].as_array().unwrap().clone();
+    let g = b.begin_turn(&f.owner, &f.conv, "m1", std::slice::from_ref(&f.owner));
+    f.agent(
+        g.token(),
+        "browser_navigate",
+        json!({"url": "https://site.test/"}),
+    )
+    .await;
+    assert_eq!(
+        active(b),
+        [json!({"conversation_id": f.conv, "message_id": "m1"})]
+    );
+    drop(g);
+    // The turn ended (asking the owner to take over): its peek stays.
+    let done = loop {
+        let v: Value = serde_json::from_str(&rx.recv().await.unwrap().json).unwrap();
+        if v["type"] == "browser.done" {
+            break v;
+        }
+    };
+    assert_eq!(done["message_id"], "m1");
+    assert_eq!(done["linger_ms"], LINGER_MS);
+    let a = active(b);
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0]["message_id"], "m1");
+    assert!(a[0]["ended_at"].as_i64().unwrap() > 0);
+    assert!(a[0]["linger_ms"].as_i64().unwrap() > LINGER_MS - 5000);
+    // A later browsing turn in the chat takes its place.
+    let g = b.begin_turn(&f.owner, &f.conv, "m2", std::slice::from_ref(&f.owner));
+    f.agent(g.token(), "browser_snapshot", json!({})).await;
+    assert_eq!(
+        active(b),
+        [json!({"conversation_id": f.conv, "message_id": "m2"})]
+    );
+    drop(g);
+    assert_eq!(active(b)[0]["message_id"], "m2");
+    // The owner takes over: it has done its job.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    assert!(active(b).is_empty());
+    // A turn that ends while the owner is in control leaves none.
+    let g = b.begin_turn(&f.owner, &f.conv, "m3", std::slice::from_ref(&f.owner));
+    let ctx = b.turn(g.token()).unwrap();
+    b.mark_used(&ctx);
+    drop(g);
+    assert!(active(b).is_empty());
+    b.hand_back();
+    // Nor does one whose browser closed, and closing drops what is left.
+    let g = b.begin_turn(&f.owner, &f.conv, "m4", std::slice::from_ref(&f.owner));
+    f.agent(g.token(), "browser_snapshot", json!({})).await;
+    drop(g);
+    assert_eq!(active(b).len(), 1);
+    b.close().await;
+    assert!(active(b).is_empty());
+    let g = b.begin_turn(&f.owner, &f.conv, "m5", std::slice::from_ref(&f.owner));
+    let ctx = b.turn(g.token()).unwrap();
+    b.mark_used(&ctx);
+    drop(g);
+    assert!(active(b).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1271,7 +1581,26 @@ async fn real_playwright() {
             let n = stream.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]);
             let big = "position:absolute;left:0;width:500px;height:200px";
-            let body = if req.starts_with("GET /login") {
+            // A sign-in kept in a cookie that outlives the browser.
+            let mut extra = String::new();
+            let body = if req.starts_with("GET /remember") {
+                extra = "Set-Cookie: iris_smoke=1; Max-Age=86400; Path=/\r\n".into();
+                "<html><body><p>Remembered</p></body></html>".to_string()
+            } else if req.starts_with("GET /me") {
+                let signed = req.lines().any(|l| {
+                    l.to_ascii_lowercase().starts_with("cookie:") && l.contains("iris_smoke=1")
+                });
+                format!(
+                    "<html><body><p>{}</p></body></html>",
+                    if signed { "Signed in" } else { "Signed out" }
+                )
+            } else if req.starts_with("GET /textonly") {
+                // A sign-in form whose page later keeps the password only
+                // in its text (Iris moves it there below).
+                "<html><body><input type=password aria-label=Password>\
+                 <button>Go</button><p id=out></p></body></html>"
+                    .to_string()
+            } else if req.starts_with("GET /login") {
                 "<html><head><title>Iris smoke sign in</title></head><body style='margin:0'>\
                  <input type=password aria-label=Password style='position:absolute;top:100px;left:0;width:500px;height:100px'>\
                  <p style='margin-top:250px'>Sign in to continue</p></body></html>"
@@ -1370,7 +1699,7 @@ async fn real_playwright() {
             };
             let _ = write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
         }
@@ -1663,8 +1992,18 @@ async fn real_playwright() {
         text_of(&typed).contains("Real-Pw-42") && text_of(&typed).contains("sam"),
         "{typed}"
     );
+    // While the password is in its field the agent may only read the page
+    // (without it).
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
-    assert_eq!(text(&r), PRIVATE_PAGE);
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(
+        !r.to_string().contains("Real-Pw-42"),
+        "the password reached the agent"
+    );
+    let r = f
+        .agent(&token, "browser_click", json!({"target": user_ref}))
+        .await;
+    assert_eq!(text(&r), FILLED_PAGE);
     let r = f
         .agent(
             &token,
@@ -1672,7 +2011,7 @@ async fn real_playwright() {
             json!({"password_ref": pw_ref, "submit_ref": button_ref}),
         )
         .await;
-    assert_eq!(text(&r), "filled and submitted", "{r}");
+    assert_eq!(text(&r), fill::SUBMITTED, "{r}");
     let mut home_now = String::new();
     for _ in 0..20 {
         home_now = text(&f.agent(&token, "browser_snapshot", json!({})).await);
@@ -1715,7 +2054,8 @@ async fn real_playwright() {
             json!({"username_ref": ref_in("Username"), "password_ref": ref_in("Password"), "submit": true}),
         )
         .await;
-    assert_eq!(text(&r), "filled and submitted", "{r}");
+    // The next page holds it in a frame's field: the answer says so.
+    assert_eq!(text(&r), fill::STILL_THERE, "{r}");
     let mut on_echo = false;
     for _ in 0..40 {
         let url = b.current_url(&run).await.unwrap();
@@ -1806,6 +2146,59 @@ async fn real_playwright() {
         text(&shot).starts_with("No screenshot right now"),
         "screenshot taken"
     );
+
+    // A page that takes the password out of its field but keeps it in its
+    // text, on the same document: still closed to actions (only redacted
+    // reads), until the text goes too.
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/textonly")}),
+    )
+    .await;
+    let snap = text(&f.agent(&token, "browser_snapshot", json!({})).await);
+    let ref_named = |what: &str| {
+        let line = snap
+            .lines()
+            .find(|l| l.contains(what))
+            .unwrap_or_else(|| panic!("{what} in {snap}"));
+        let at = line.find("[ref=").unwrap() + 5;
+        line[at..line[at..].find(']').unwrap() + at].to_string()
+    };
+    let (pw, go) = (
+        ref_named("textbox \"Password\""),
+        ref_named("button \"Go\""),
+    );
+    let r = f
+        .agent(&token, "fill_saved_login", json!({"password_ref": pw}))
+        .await;
+    assert_eq!(text(&r), "filled", "{r}");
+    b.run_code(
+        &run,
+        "async (page) => { await page.evaluate(() => { const i = document.querySelector('input'); \
+         document.getElementById('out').textContent = 'You typed ' + i.value; i.value = ''; }); return true; }",
+    )
+    .await
+    .unwrap();
+    let r = f
+        .agent(&token, "browser_click", json!({"target": go}))
+        .await;
+    assert_eq!(text(&r), FILLED_PAGE);
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert!(
+        text(&r).contains("You typed") && !r.to_string().contains("Real-Pw-42"),
+        "the password reached the agent"
+    );
+    b.run_code(
+        &run,
+        "async (page) => { await page.evaluate(() => { document.getElementById('out').textContent = 'Done'; }); return true; }",
+    )
+    .await
+    .unwrap();
+    let r = f
+        .agent(&token, "browser_click", json!({"target": go}))
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
 
     // The agent fills a saved card after the owner approves, never seeing
     // it.
@@ -1900,8 +2293,18 @@ async fn real_playwright() {
         values.contains(r#"["4111111111111111","3","31","737"]"#),
         "the card fields hold something else"
     );
+    // The expiry does not lock the page for good: it can be read without
+    // the number and code while they are in their fields.
     let r = f.agent(&chat_token, "browser_snapshot", json!({})).await;
-    assert_eq!(text(&r), PRIVATE_PAGE);
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(
+        !r.to_string().contains("4111"),
+        "the card number reached the agent"
+    );
+    let r = f
+        .agent(&chat_token, "browser_press_key", json!({"key": "Tab"}))
+        .await;
+    assert_eq!(text(&r), FILLED_PAGE);
     // Going away and back to the filled form writes nothing of it to disk.
     let r = f
         .agent(
@@ -2008,8 +2411,22 @@ async fn real_playwright() {
         json!(["4111111111111111", "737"]),
         "the frame's fields hold something else"
     );
+    // The number and code are found in the other site's frame: the page
+    // can be read without them, and nothing else until they are gone.
     let r = f.agent(&chat_token, "browser_snapshot", json!({})).await;
-    assert_eq!(text(&r), PRIVATE_PAGE);
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(
+        !r.to_string().contains("4111"),
+        "the card number reached the agent"
+    );
+    let r = f
+        .agent(
+            &chat_token,
+            "browser_click",
+            json!({"target": ref_in_box("Provider code")}),
+        )
+        .await;
+    assert_eq!(text(&r), FILLED_PAGE);
 
     drop(chat);
 
@@ -2059,6 +2476,35 @@ async fn real_playwright() {
     }
     assert!(url.ends_with("/home"), "{url}");
     b.hand_back();
+
+    // The agent asks the owner to save a login for the open site, and
+    // restarts the browser: a new one, its sign-ins kept.
+    let chat = b.begin_turn(&f.owner, &f.conv, "m3", std::slice::from_ref(&f.owner));
+    let token = chat.token().to_string();
+    let page = |p: &str| json!({"url": format!("http://127.0.0.1:{port}/{p}")});
+    let me = async |f: &Fake, token: &str| {
+        f.agent(token, "browser_navigate", page("me")).await;
+        text(&f.agent(token, "browser_snapshot", json!({})).await)
+    };
+    assert!(me(&f, &token).await.contains("Signed out"));
+    f.agent(&token, "browser_navigate", page("remember")).await;
+    assert!(me(&f, &token).await.contains("Signed in"));
+    let r = f.agent(&token, "ask_to_save_login", json!({})).await;
+    assert!(text(&r).starts_with("posted"), "{r}");
+    let r = f.agent(&token, "restart_browser", json!({})).await;
+    assert!(text(&r).starts_with("restarted"), "{r}");
+    let again = b.running().unwrap();
+    assert!(!Arc::ptr_eq(&run, &again));
+    assert!(
+        me(&f, &token).await.contains("Signed in"),
+        "the sign-in did not survive the restart"
+    );
+    let r = f
+        .agent(&token, "browser_navigate", json!({"url": home.clone()}))
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(text(&f.agent(&token, "browser_snapshot", json!({})).await).contains("Welcome home"));
+    drop(chat);
 
     drop(watching);
     drop(g);

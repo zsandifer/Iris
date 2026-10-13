@@ -1,7 +1,7 @@
 // Chat: messages, live status phrases, receipts, cards, and the composer.
 import { html, useEffect, useLayoutEffect, useRef, useState } from './h.js';
 import { post, put, api, seg, isId } from './api.js';
-import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId, isOwner, convFor, lookUpConv } from './store.js';
+import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId, isOwner, convFor, lookUpConv, peekShown } from './store.js';
 import { Icon, Img, Avatar, agentName, stamp, Spinner } from './ui.js';
 import { openPhoto } from './photo.js';
 import { md } from './md.js';
@@ -47,13 +47,32 @@ function retryFor(list, m) {
   return null;
 }
 
+/** The live browser peek under an assistant message (`peekShown`). A
+ * finished turn often ends by asking the owner to take over, so its peek
+ * stays a while; this re-renders when that minimum time is up (the server
+ * drops it when they take over or the browser closes). */
+function Peek({ m, list }) {
+  const [, tick] = useState(0);
+  const until = S.browsing[m.id]?.until;
+  const left = until == null ? 0 : until - Date.now();
+  useEffect(() => {
+    if (left <= 0) return undefined;
+    const t = setTimeout(() => tick((x) => x + 1), left + 50);
+    return () => clearTimeout(t);
+  }, [until]);
+  return peekShown(m.id, list) ? html`<${BrowserPeek} />` : null;
+}
+
+function peekFor(m, list) {
+  return S.browsing[m.id] ? html`<${Peek} m=${m} list=${list} />` : null;
+}
+
 function Assistant({ m, list }) {
   const live = S.live[m.id];
+  const peek = peekFor(m, list);
   if (m.status === 'streaming') {
     const text = live?.text || '';
     const running = (live?.acts || []).some((a) => a.status === 'started');
-    // Only while Iris is browsing in this turn: a live thumbnail.
-    const peek = S.browsing[m.id] && html`<${BrowserPeek} />`;
     const waiting = list.some((x) => x.card?.type === 'approval' && x.card.turn_message_id === m.id && x.card.state === 'pending');
     if (waiting) return html`${text && html`<div class="b" dangerouslySetInnerHTML=${{ __html: md(text) }} />`}<div class="status shimmer" aria-live="polite">Waiting for your OK…</div>${peek}`;
     if (!text) return html`<${StatusLine} live=${live} />${peek}`;
@@ -71,6 +90,7 @@ function Assistant({ m, list }) {
   return html`<${Receipt} meta=${m.meta} />
     ${content ? html`<div class=${'b' + (failed ? ' b-err' : '')} dangerouslySetInnerHTML=${{ __html: md(content) }} />`
       : m.status === 'cancelled' ? html`<div class="note">Stopped.</div>` : null}
+    ${peek}
     ${failed && m.meta?.error?.kind !== 'paused' && retryFor(list, m) && html`<button class="retry" onClick=${retry}><${Icon} name="refresh" size=${15} /> Try again</button>`}`;
 }
 

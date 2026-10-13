@@ -6,7 +6,7 @@
 //! it into the focused field through the browser server. The agent never
 //! gets it: secrets travel from the vault to the page only, never into a
 //! tool result, a message, or a log, and the page is closed to the agent
-//! until it moves on. Logins are only filled into the site they were saved
+//! while they are on it. Logins are only filled into the site they were saved
 //! for (the page's real address, and never into another site's frame on
 //! it), cards and secrets only over HTTPS (plain HTTP only on this
 //! machine).
@@ -17,8 +17,9 @@
 //! through Playwright on Iris's side. Logins go only into fields whose own
 //! frame is the saved site; cards only over HTTPS and only after the owner
 //! approves that use on a card in the chat. Filling a password or card
-//! details closes the page to the agent (see `private_page`) until it moves
-//! on; `submit` presses Enter in the last field so a sign-in can.
+//! details closes the page to the agent (see `page_access`) while a saved
+//! secret is still on it; `submit` presses Enter in the last field so a
+//! sign-in can.
 
 use super::{Running, TurnCtx};
 use crate::db;
@@ -571,11 +572,20 @@ async fn locate_any(state: &AppState, run: &Running, find: Find<'_>) -> Result<O
     }))
 }
 
+/// Whether Iris can tell a filled secret is still on a page (and hide it):
+/// long enough, or a short code of digits, which is matched where it
+/// stands alone.
+fn watchable(v: &str) -> bool {
+    v.chars().count() >= MIN_HIDDEN || (v.len() == 3 && v.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Fill `values` (candidates) into a located field of the saved item's
-/// `field`. Whether it was filled. A private value closes the page to the
-/// agent first; a secret one (a password, card number, or code; not an
-/// expiry, which ordinary pages show) is also hidden from everything the
-/// agent reads afterwards.
+/// `field`. Whether it was filled. A secret value (a password, card number,
+/// or code) is hidden from everything the agent reads afterwards, and the
+/// page is closed to the agent while one is still on it. An expiry (shown
+/// on ordinary pages, never filled without the number it goes with) is
+/// left to that rule too. A secret too short to look for closes the page
+/// until it moves on, as if the owner typed it.
 #[allow(clippy::too_many_arguments)]
 async fn put(
     state: &AppState,
@@ -587,15 +597,21 @@ async fn put(
     private: bool,
     submit: bool,
 ) -> Result<bool> {
-    if private {
+    let secret = matches!(field, "password" | "number" | "cvc");
+    let watched = private && (!secret || values.iter().all(|v| watchable(v)));
+    let mark = private && !watched;
+    if mark {
         state.browser.remember_private(&at.top);
     }
-    if matches!(field, "password" | "number" | "cvc") {
+    if secret {
         for v in values {
             state.browser.remember_secret(v);
         }
     }
-    let code = field_code(find, Some((at, values, private, submit)))?;
+    if watched {
+        state.browser.note_filled();
+    }
+    let code = field_code(find, Some((at, values, mark, submit)))?;
     let v = state.browser.run_code(run, &code).await?;
     if v["moved"] == true {
         return Err(PAGE_CHANGED.into());
@@ -673,8 +689,29 @@ fn full_origin(url: &str) -> Option<String> {
     Some(format!("{scheme}://{host}:{port}"))
 }
 
-fn secure_url(url: &str) -> bool {
+pub(crate) fn secure_url(url: &str) -> bool {
     origin_of(url).is_some_and(|(s, h)| secure_enough(&s, &h))
+}
+
+/// The site a login for this page is saved under (`https://host`, with
+/// the port only when it is not the default), and its host.
+pub fn site_of(url: &str) -> Option<(String, String)> {
+    if !url.contains("://") {
+        return None;
+    }
+    let (scheme, host, port) = login_origin(url)?;
+    let default = if scheme == "https" { 443 } else { 80 };
+    let shown = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.clone()
+    };
+    let site = if port == default {
+        format!("{scheme}://{shown}")
+    } else {
+        format!("{scheme}://{shown}:{port}")
+    };
+    Some((site, host))
 }
 
 /// Where a saved login may go: the field's own frame and the page are the
@@ -830,11 +867,44 @@ async fn login_inner(
         .call(move |c| entities::mark_credential_used(c, &uid, &cid))
         .await;
     crate::info!("browser: filled saved login {} for the agent", cred.id);
-    Ok(text(if submit || button.is_some() {
-        "filled and submitted"
-    } else {
-        "filled"
-    }))
+    if !(submit || button.is_some()) {
+        return Ok(text("filled"));
+    }
+    // The page is closed to the agent while the password is on it: say
+    // whether the form took it, so the agent knows what it can do next.
+    let password = targets.iter().any(|(f, _, _)| *f == "password");
+    if password && !settled(state, ctx, run).await {
+        return Ok(text(STILL_THERE));
+    }
+    Ok(text(SUBMITTED))
+}
+
+pub(crate) const SUBMITTED: &str = "filled and submitted (the password is no longer on the page: \
+    take a browser_snapshot to see whether the sign-in worked)";
+pub(crate) const STILL_THERE: &str = "filled and submitted, but the password is still in its field \
+    (the page may still be working, or the sign-in did not go through). Read the page with \
+    browser_snapshot to check (saved details show as [hidden]); other actions wait until the \
+    password leaves the page. If it stays stuck, ask the user to take over.";
+
+/// How long a submitted sign-in may take to clear the password from the
+/// page before the answer says it is still there.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wait (up to `SETTLE`) until no saved secret is on the page.
+async fn settled(state: &AppState, ctx: &TurnCtx, run: &Running) -> bool {
+    let until = tokio::time::Instant::now() + SETTLE;
+    loop {
+        if state.browser.check_agent(ctx).is_err() {
+            return false;
+        }
+        if let Ok(false) = state.browser.shows_secret(run).await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= until {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 /// A card the owner approved for this page and these receiving frames.

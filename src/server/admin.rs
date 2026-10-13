@@ -782,6 +782,9 @@ struct CredentialBody {
     exp_year: Option<u16>,
     cvc: Option<String>,
     brand: Option<String>,
+    /// Saved from the agent's "save a login" card (`save_login`): that card
+    /// is marked saved in the same write.
+    message_id: Option<String>,
 }
 
 fn card_brand(number: &str) -> &'static str {
@@ -924,11 +927,81 @@ async fn create_credential(
         .vault
         .encrypt(Value::Object(secret).to_string().as_bytes(), &id)?;
     let uid = user.id().to_string();
-    let cred = state
+    let Some(card_id) = body.message_id.clone() else {
+        let cred = state
+            .db
+            .call(move |c| {
+                entities::insert_credential(c, &id, &uid, &kind, label.trim(), &meta, &ct)
+            })
+            .await?;
+        return ok(json!({"credential": cred}));
+    };
+    if kind != "login" {
+        return Err(ApiError::bad_request(
+            "only a login can be saved from that card",
+        ));
+    }
+    let host = meta["site"]
+        .as_str()
+        .and_then(|s| {
+            crate::browser::fill::origin_of(&if s.contains("://") {
+                s.to_string()
+            } else {
+                format!("https://{s}")
+            })
+        })
+        .map(|(_, h)| h)
+        .unwrap_or_default();
+    // Checked and written under one lock: one card saves one login.
+    let saved = state
         .db
-        .call(move |c| entities::insert_credential(c, &id, &uid, &kind, label.trim(), &meta, &ct))
+        .call(move |c| {
+            let Some(m) = db::get_message(c, &card_id)? else {
+                return Ok(None);
+            };
+            let mut card = m.card.clone().unwrap_or_default();
+            if card["type"] != "save_login"
+                || !db::conversation_member_ids(c, &m.conversation_id)?.contains(&uid)
+            {
+                return Ok(None);
+            }
+            if card["state"] != "pending" {
+                return Ok(Some(Err(())));
+            }
+            db::write_tx(c, |c| {
+                let cred =
+                    entities::insert_credential(c, &id, &uid, &kind, label.trim(), &meta, &ct)?;
+                card["state"] = "saved".into();
+                card["credential_id"] = cred.id.clone().into();
+                card["saved_at"] = now_ms().into();
+                let updated = db::update_message_card(c, &card_id, &card)?;
+                let note = crate::awareness::insert_note(
+                    c,
+                    &updated.conversation_id,
+                    &if host.is_empty() {
+                        "You saved a login.".to_string()
+                    } else {
+                        format!("You saved a login for {host}.")
+                    },
+                )?;
+                Ok(Some(Ok((cred, updated, note))))
+            })
+        })
         .await?;
-    ok(json!({"credential": cred}))
+    let (cred, updated, note) = match saved {
+        Some(Ok(v)) => v,
+        Some(Err(())) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "conflict",
+                "this login was already saved",
+            ));
+        }
+        None => return Err(ApiError::not_found("message")),
+    };
+    crate::login::broadcast_updated(&state, &updated).await;
+    crate::awareness::broadcast_created(&state, &note).await;
+    ok(json!({"credential": cred, "message": updated}))
 }
 
 async fn update_credential(
