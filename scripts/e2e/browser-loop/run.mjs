@@ -412,7 +412,7 @@ async function judge(s, turns, mech) {
     t.error ? `IRIS ERROR: ${JSON.stringify(t.error)}` : '',
     t.stopped ? `HARNESS STOPPED THE TURN: ${t.stopped}` : '',
     `AGENT REPLY (status ${t.status}, ${t.seconds}s):\n${t.reply.slice(0, 6000)}`,
-    `BROWSER AFTER TURN: ${t.browser.url || '(closed)'} "${t.browser.title || ''}"${t.browser.error ? ` error: ${t.browser.error}` : ''}`,
+    `BROWSER AFTER TURN (address, then the tab title, which is not necessarily the page's headline): ${t.browser.url || '(closed)'} "${t.browser.title || ''}"${t.browser.error ? ` error: ${t.browser.error}` : ''}`,
     t.log_warnings.length ? `IRIS LOG WARNINGS:\n${t.log_warnings.join('\n').slice(0, 3000)}` : '',
   ].filter(Boolean).join('\n')).join('\n\n');
   const prompt = `## Test ${s.id}\nTask: ${s.task}\nSuccess criteria: ${s.success}\nMechanical checks: ${mech.ok ? 'all passed' : mech.fails.join('; ')}\nNudges left: ${turns.length < MAX_TURNS && turns.length - 1 < MAX_NUDGES ? 'yes' : 'no (do not answer "nudge")'}\n\n## Conversation\n${convo}\n\nAnswer with the JSON verdict.`;
