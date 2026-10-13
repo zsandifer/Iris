@@ -366,7 +366,7 @@ export function StoryViewer() {
 
   const img = photos(p)[0];
   const slide = dir.current > 0 ? ' from-r' : dir.current < 0 ? ' from-l' : '';
-  return html`<div class=${'viewer story-viewer' + (leaving ? ' leaving' : '')} onPointerDown=${down} onPointerUp=${up} onPointerCancel=${() => { touch.current = null; setPaused(false); }}
+  return html`<div class=${'story-viewer' + (leaving ? ' leaving' : '')} onPointerDown=${down} onPointerUp=${up} onPointerCancel=${() => { touch.current = null; setPaused(false); }}
       onContextMenu=${(e) => e.preventDefault()}>
     <div class=${'viewer-topic' + slide} key=${`t${st.t}`}>
     <div class="viewer-story" key=${`s${st.s}`}>

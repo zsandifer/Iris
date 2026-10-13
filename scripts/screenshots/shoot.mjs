@@ -93,7 +93,7 @@ shots.feed = await capture('feed', 'light', async (page) => {
 shots.story = await capture('story', 'light', async (page) => {
   await go(page, '#/foryou');
   await page.click('.stile >> nth=0');
-  await page.waitForSelector('.viewer img');
+  await page.waitForSelector('.story-viewer img');
   await page.waitForTimeout(1400);
 });
 shots.approval = await capture('approval', 'light', async (page, inject, store) => {

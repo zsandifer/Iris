@@ -258,9 +258,9 @@ span.fav { display: inline-block; overflow: hidden; }
 .pills.static button { cursor: default; color: var(--ink); opacity: 1; }
 .end .b2 { margin-top: 10px; }
 
-.viewer { position: absolute; inset: 0; z-index: 20; background: #000; color: #fff; touch-action: none; user-select: none; -webkit-user-select: none; }
-.viewer-im, .viewer .img-ph { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-.viewer { animation: viewer-in .26s cubic-bezier(.2,.8,.2,1); }
+.story-viewer { position: absolute; inset: 0; z-index: 20; background: #000; color: #fff; touch-action: none; user-select: none; -webkit-user-select: none; }
+.viewer-im, .story-viewer .img-ph { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.story-viewer { animation: viewer-in .26s cubic-bezier(.2,.8,.2,1); }
 @keyframes viewer-in { from { opacity: 0; transform: scale(.96); } }
 .viewer-topic, .viewer-story { position: absolute; inset: 0; }
 .viewer-topic.from-r { animation: topic-r .32s cubic-bezier(.2,.8,.2,1); }
@@ -273,7 +273,7 @@ span.fav { display: inline-block; overflow: hidden; }
 .viewer-heart { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; color: #fff;
   filter: drop-shadow(0 4px 18px rgba(0,0,0,.4)); animation: heart-pop .8s ease-out forwards; }
 @keyframes heart-pop { 0% { opacity: 0; transform: scale(.4); } 25% { opacity: 1; transform: scale(1.1); } 45% { transform: scale(1); } 100% { opacity: 0; transform: scale(1); } }
-@media (prefers-reduced-motion: reduce) { .viewer, .viewer-topic, .viewer-story, .viewer-tx { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .story-viewer, .viewer-topic, .viewer-story, .viewer-tx { animation: none; } }
 .viewer-blank { background: linear-gradient(160deg, #6d5bd0, #1d1925); }
 .viewer-shade { position: absolute; inset: 0; pointer-events: none; background: linear-gradient(rgba(0,0,0,.45), transparent 22%, transparent 45%, rgba(0,0,0,.8)); }
 .bars { position: absolute; top: calc(var(--sat) + 10px); left: 12px; right: 12px; display: flex; gap: 4px; }
@@ -285,7 +285,7 @@ span.fav { display: inline-block; overflow: hidden; }
 .viewer-top { position: absolute; top: calc(var(--sat) + 22px); left: 12px; right: 10px; display: flex; align-items: center; gap: 9px; }
 .viewer-top b { display: block; font-size: 14px; } .viewer-top small { display: block; font-size: 12px; opacity: .85; }
 .viewer-top .tile, .viewer-top .fav { border: 2px solid rgba(255,255,255,.8); }
-.viewer .x { margin-left: auto; background: none; border: 0; color: #fff; padding: 6px; }
+.story-viewer .x { margin-left: auto; background: none; border: 0; color: #fff; padding: 6px; }
 .viewer-tx { position: absolute; left: 18px; right: 18px; bottom: calc(var(--sab) + 26px); }
 .viewer-tx > b { display: block; font: 600 25px/1.2 var(--serif); margin-bottom: 6px; text-shadow: 0 1px 8px rgba(0,0,0,.4); }
 .viewer-tx p { font-size: 14.5px; opacity: .93; margin: 0 0 8px; }
@@ -592,7 +592,7 @@ details.alt p { margin: 8px 0; }
 @keyframes sink { to { transform: translateY(100%); } }
 @keyframes fade-out { to { opacity: 0; } }
 .toast.leaving { animation: fade-out .2s ease forwards; }
-.viewer.leaving { animation: viewer-out .22s ease forwards; pointer-events: none; }
+.story-viewer.leaving { animation: viewer-out .22s ease forwards; pointer-events: none; }
 @keyframes viewer-out { to { opacity: 0; transform: scale(.96); } }
 /* things that appear inside a screen ease in instead of popping */
 .warn, .warn-box, .feed-note, .feed-run, .rail, .empty, .rcpt-steps, .peek, .retry, .notify-card, .paused-bar,
@@ -603,7 +603,10 @@ details.alt p { margin: 8px 0; }
 details.alt::details-content { opacity: 0; transition: opacity .22s, content-visibility .22s allow-discrete; }
 details.alt[open]::details-content { opacity: 1; }
 @media (prefers-reduced-motion: reduce) {
-  .route, .sheet-wrap, .sheet, .toast, .viewer, .warn, .warn-box, .feed-note, .feed-run, .rail, .empty, .rcpt-steps, .peek, .retry,
+  .route, .sheet-wrap, .sheet, .toast, .story-viewer, .warn, .warn-box, .feed-note, .feed-run, .rail, .empty, .rcpt-steps, .peek, .retry,
   .notify-card, .paused-bar, .att, .note, .ap-raw, .effort, .vw-bar, .live-line, .photo-error, .screen, .status, .gnote, .post-b, .md, .photo-layer img {
     animation: none !important; }
 }
+/* the computer view is fixed to the window: a sliding parent would move it */
+.route:has(.viewer) { animation-name: fade; }
+.viewer { animation: fade .22s ease-out; }
