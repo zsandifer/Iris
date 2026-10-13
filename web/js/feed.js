@@ -276,42 +276,48 @@ export function FeedScreen() {
 
 export function StoryViewer() {
   useStore();
-  const st = S.story;
+  // The closed story stays on screen while it fades away.
+  const [ghost, setGhost] = useState(S.story);
+  useEffect(() => {
+    if (S.story) { setGhost(S.story); return undefined; }
+    const id = setTimeout(() => setGhost(null), 220);
+    return () => clearTimeout(id);
+  }, [S.story]);
+  const leaving = !S.story;
+  const st = S.story || ghost;
   const tps = S.feed ? topics(S.feed.posts) : [];
   const touch = useRef(null);
+  const tap = useRef(null); // { at, timer } of the last short tap, for double tap
+  const dir = useRef(0); // last topic change: 1 forward, -1 back (slide direction)
   const [paused, setPaused] = useState(false);
-  const [photoOpen, setPhotoOpen] = useState(photoIsOpen);
-  useEffect(() => {
-    const change = () => setPhotoOpen(photoIsOpen());
-    document.addEventListener('iris-photo-change', change);
-    change();
-    return () => document.removeEventListener('iris-photo-change', change);
-  }, []);
+  const [heart, setHeart] = useState(0);
   const topic = st && tps[st.t];
   const p = topic?.stories[st.s];
 
   const close = () => set({ story: null });
+  // Taps move within a topic; past its last story goes on to the next topic.
   const step = (d) => {
     if (!topic) return close();
     const s = st.s + d;
-    if (s >= topic.stories.length) return st.t + 1 < tps.length ? set({ story: { t: st.t + 1, s: 0 } }) : close();
-    if (s < 0) return st.t > 0 ? set({ story: { t: st.t - 1, s: tps[st.t - 1].stories.length - 1 } }) : set({ story: { ...st, s: 0 } });
-    set({ story: { ...st, s } });
+    if (s >= topic.stories.length) return topicStep(1);
+    set({ story: { ...st, s: Math.max(0, s) } });
   };
   const topicStep = (d) => {
     const t = st.t + d;
-    if (t < 0 || t >= tps.length) return d > 0 ? close() : null;
+    if (t < 0) return null;
+    if (t >= tps.length) return close();
+    dir.current = d;
     set({ story: { t, s: 0 } });
   };
 
   useEffect(() => {
-    if (!p || paused || photoOpen) return undefined;
+    if (!p || paused || leaving) return undefined;
     const id = setTimeout(() => step(1), STORY_MS);
     return () => clearTimeout(id);
-  }, [st?.t, st?.s, paused, photoOpen, !!p]);
+  }, [st?.t, st?.s, paused, leaving, !!p]);
 
   useEffect(() => {
-    if (!st) return undefined;
+    if (!st || leaving) return undefined;
     const key = (e) => {
       if (photoIsOpen()) return;
       if (e.key === 'Escape') close();
@@ -321,34 +327,58 @@ export function StoryViewer() {
     addEventListener('keydown', key);
     return () => removeEventListener('keydown', key);
   });
+  useEffect(() => () => clearTimeout(tap.current?.timer), []);
 
   if (!st || !p) return null;
 
-  const down = (e) => { touch.current = { x: e.clientX, y: e.clientY, t: Date.now() }; setPaused(true); };
+  // Hold anywhere pauses; a short tap on the outer quarters steps; a double
+  // tap likes; a horizontal swipe changes topic; vertical talks or closes.
+  const down = (e) => {
+    if (e.target.closest('button')) return;
+    touch.current = { x: e.clientX, y: e.clientY, t: Date.now() };
+    setPaused(true);
+  };
   const up = (e) => {
     setPaused(false);
     const t0 = touch.current;
     touch.current = null;
-    if (!t0 || e.target.closest('button')) return;
+    if (!t0) return undefined;
     const dx = e.clientX - t0.x;
     const dy = e.clientY - t0.y;
     if (Math.abs(dy) > 70 && Math.abs(dy) > Math.abs(dx)) return dy < 0 ? discuss(p) : close();
     if (Math.abs(dx) > 60) return topicStep(dx < 0 ? 1 : -1);
-    if (Date.now() - t0.t > 500) return undefined;
-    if (e.target.closest('.viewer-im')) return; // its click opens the photo
-    const w = e.currentTarget.clientWidth;
-    step(e.clientX - e.currentTarget.getBoundingClientRect().left < w * 0.3 ? -1 : 1);
+    if (Date.now() - t0.t > 300 || Math.hypot(dx, dy) > 12) return undefined; // a hold
+    const prev = tap.current;
+    if (prev && Date.now() - prev.at < 300) {
+      clearTimeout(prev.timer);
+      tap.current = null;
+      if (!p.liked) like(p);
+      setHeart((n) => n + 1);
+      return undefined;
+    }
+    const r = e.currentTarget.getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width;
+    const d = x < 0.25 ? -1 : x > 0.75 ? 1 : 0;
+    // Wait out a possible second tap before stepping.
+    tap.current = { at: Date.now(), timer: d ? setTimeout(() => { tap.current = null; step(d); }, 300) : null };
+    return undefined;
   };
 
   const img = photos(p)[0];
-  return html`<div class="viewer" onPointerDown=${down} onPointerUp=${up} onPointerCancel=${() => setPaused(false)}>
-    ${img ? html`<${Img} src=${img} alt=${p.title} cls="viewer-im" />` : html`<div class="viewer-im viewer-blank" />`}
+  const slide = dir.current > 0 ? ' from-r' : dir.current < 0 ? ' from-l' : '';
+  return html`<div class=${'viewer story-viewer' + (leaving ? ' leaving' : '')} onPointerDown=${down} onPointerUp=${up} onPointerCancel=${() => { touch.current = null; setPaused(false); }}
+      onContextMenu=${(e) => e.preventDefault()}>
+    <div class=${'viewer-topic' + slide} key=${`t${st.t}`}>
+    <div class="viewer-story" key=${`s${st.s}`}>
+      ${img ? html`<${Img} src=${img} alt=${p.title} cls="viewer-im" photo=${false} draggable="false" />` : html`<div class="viewer-im viewer-blank" />`}
+    </div>
     <div class="viewer-shade" />
+    ${heart > 0 && html`<div class="viewer-heart" key=${heart}><${Icon} name="heart" size=${96} fill=${true} /></div>`}
     <div class="bars">${topic.stories.map((_, i) => html`<i class=${i < st.s ? 'f' : ''}>
-      ${i === st.s && html`<b class=${'run' + (paused || photoOpen ? ' paused' : '')} style=${`animation-duration:${STORY_MS}ms`} key=${`${st.t}-${st.s}`} />`}</i>`)}</div>
+      ${i === st.s && html`<b class=${'run' + (paused ? ' paused' : '')} style=${`animation-duration:${STORY_MS}ms`} key=${`${st.t}-${st.s}`} />`}</i>`)}</div>
     <div class="viewer-top"><${Favicon} p=${p} size=${28} /><div><b>${topic.name}</b><small>${sourceName(p)} · ${ago(p.created_at)}</small></div>
       <button class="x" aria-label="Close" onClick=${close}><${Icon} name="x" size=${24} /></button></div>
-    <div class="viewer-tx">
+    <div class="viewer-tx" key=${`x${st.s}`}>
       <b>${p.hook || p.title}</b>
       ${p.hook && html`<div class="viewer-sub">${p.title}</div>`}
       <p>${plain(p.body, 200)}</p>
@@ -358,7 +388,7 @@ export function StoryViewer() {
         <button onClick=${() => discuss(p)}>Talk about it</button>
         ${p.source_url && html`<button onClick=${() => visit(p)}>Visit ›</button>`}
       </div>
-      <div class="sw">tap for next · swipe up to talk · swipe down to close</div>
+    </div>
     </div>
   </div>`;
 }

@@ -113,7 +113,8 @@ function Drawer() {
         }}><${LetterTile} name=${u.display_name} radius=${15} /><div class="rt">${u.display_name}</div></div>`)}</div></div>`);
     } catch (e) { toast(e.message); }
   };
-  const Item = ({ c, icon }) => html`<button class=${'it' + (c.id === cid && S.route.tab === 'chat' ? ' on' : '')} onClick=${() => go(`chat/${c.id}`)}>
+  const Item = ({ c, icon }) => html`<button class=${'it' + (c.id === cid && S.route.tab === 'chat' ? ' on' : '')} onClick=${() => go(`chat/${c.id}`)}
+    ...${c.kind === 'main' ? {} : longPress(() => chatMenu(c))}>
     <${Icon} name=${icon} size=${18} /><span>${title(c)}</span></button>`;
   return html`<div class=${'scrim' + (S.drawer ? ' on' : '')} onClick=${() => set({ drawer: false })} />
     <nav class=${'drw' + (S.drawer ? ' on' : '')} aria-hidden=${S.drawer ? 'false' : 'true'} inert=${!S.drawer}>
@@ -162,6 +163,28 @@ const okSeg = (s) => !!s && s !== '.' && s !== '..';
 
 // ------------------------------------------------------------------ top bar
 
+/** Press and hold (or right click) runs `fn` instead of the click. */
+function longPress(fn) {
+  let timer = null;
+  let fired = false;
+  let at = null;
+  const cancel = () => { clearTimeout(timer); timer = null; };
+  return {
+    onPointerDown: (e) => {
+      fired = false;
+      at = { x: e.clientX, y: e.clientY };
+      cancel();
+      timer = setTimeout(() => { fired = true; navigator.vibrate?.(10); fn(); }, 480);
+    },
+    onPointerMove: (e) => { if (at && Math.hypot(e.clientX - at.x, e.clientY - at.y) > 10) cancel(); },
+    onPointerUp: cancel,
+    onPointerLeave: cancel,
+    onPointerCancel: cancel,
+    onContextMenu: (e) => { e.preventDefault(); if (!fired) { cancel(); fired = true; fn(); } },
+    onClickCapture: (e) => { if (fired) { e.stopPropagation(); e.preventDefault(); fired = false; } },
+  };
+}
+
 function chatMenu(c) {
   const rename = async () => {
     closeSheet();
@@ -175,7 +198,7 @@ function chatMenu(c) {
   };
   const archive = async () => {
     closeSheet();
-    try { await setArchived(c, true); go('chat'); } catch (e) { toast(e.message); }
+    try { await setArchived(c, true); if (currentChat() === c.id) go('chat'); } catch (e) { toast(e.message); }
   };
   const unarchive = async () => {
     closeSheet();
@@ -187,8 +210,9 @@ function chatMenu(c) {
     try {
       await del(`/conversations/${seg(c.id)}`);
       if (S.archived) set({ archived: S.archived.filter((x) => x.id !== c.id) });
+      const open = currentChat() === c.id;
       await loadConvs();
-      go('chat');
+      if (open) go('chat');
     } catch (e) { toast(e.message); }
   };
   openSheet(() => html`<div class="sheet-body"><h3>${title(c)}</h3><div class="grp">
@@ -274,6 +298,35 @@ function Screen() {
   }
 }
 
+// Each screen slides in: deeper from the right, back up from the left,
+// and a tab switch fades.
+const routeKey = () => (S.route.tab === 'chat' ? `chat/${currentChat()}` : S.route.parts.join('/') + (S.route.query.get('edit') ? '?edit' : ''));
+let lastRoute = null;
+let lastMotion = '';
+function routeMotion() {
+  const key = routeKey();
+  if (key === lastRoute) return lastMotion;
+  const prev = lastRoute;
+  lastRoute = key;
+  const depth = (k) => k.split('/').length;
+  if (prev == null) lastMotion = '';
+  else if (prev.split('/')[0] !== key.split('/')[0]) lastMotion = ' r-fade';
+  else lastMotion = depth(key) >= depth(prev) ? ' r-in' : ' r-back';
+  return lastMotion;
+}
+
+// The toast fades out instead of vanishing.
+function Toast() {
+  const [shown, setShown] = useState(S.toast);
+  useEffect(() => {
+    if (S.toast) { setShown(S.toast); return undefined; }
+    const id = setTimeout(() => setShown(null), 200);
+    return () => clearTimeout(id);
+  }, [S.toast]);
+  if (!shown) return null;
+  return html`<div class=${'toast' + (S.toast ? '' : ' leaving')} role="status">${shown}</div>`;
+}
+
 function App() {
   useStore();
   if (!S.me) {
@@ -285,12 +338,12 @@ function App() {
   const tabbed = TABS.some(([k]) => k === S.route.tab);
   return html`<div class=${'app' + (tabbed ? ' tabbed' : ' paged') + (S.route.tab === 'chat' ? ' is-chat' : '')}>
     ${tabbed && html`<${TopBar} />`}
-    <main class="main" inert=${!!(S.drawer || S.sheet || S.story)}><${Screen} /></main>
+    <main class="main" inert=${!!(S.drawer || S.sheet || S.story)}><div class=${'route' + routeMotion()} key=${routeKey()}><${Screen} /></div></main>
     ${tabbed && html`<${Tabs} />`}
     <${Drawer} />
     <${StoryViewer} />
     <${Sheet} />
-    ${S.toast && html`<div class="toast" role="status">${S.toast}</div>`}
+    <${Toast} />
   </div>`;
 }
 
