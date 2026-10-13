@@ -192,6 +192,7 @@ function logSlice(from, to) {
 
 /** Send one message and wait for its reply. */
 async function turn(events, conv, text, dir, n) {
+  if (shuttingDown) throw new Error('interrupted');
   const frames = join(dir, 'frames');
   mkdirSync(frames, { recursive: true });
   const logFrom = logSize();
@@ -216,40 +217,57 @@ async function turn(events, conv, text, dir, n) {
     }
     if (m.type === 'message.completed' && m.message?.id === asstId) done = m.message;
   });
-  if (shuttingDown) throw new Error('interrupted');
   activeConversation = conv;
-  const { assistant_message } = await api('POST', `/conversations/${conv}/messages`, { text });
-  asstId = assistant_message.id;
+  const seenCards = new Set();
   let lastSaved = 0;
   let lastSeq = -1;
   let stopped = null;
-  while (!done) {
-    await sleep(1000);
-    const f = events.frame;
-    if (f && f.at >= started && f.seq !== lastSeq && Date.now() - lastSaved > 6000) {
-      writeFileSync(join(frames, `t${n}-${String(Math.round((f.at - started) / 1000)).padStart(4, '0')}s.jpg`), Buffer.from(f.data, 'base64'));
-      lastSaved = Date.now();
-      lastSeq = f.seq;
+  let posted = false;
+  try {
+    const { assistant_message } = await api('POST', `/conversations/${conv}/messages`, { text });
+    posted = true;
+    asstId = assistant_message.id;
+    while (!done) {
+      await sleep(1000);
+      const f = events.frame;
+      if (f && f.at >= started && f.seq !== lastSeq && Date.now() - lastSaved > 6000) {
+        writeFileSync(join(frames, `t${n}-${String(Math.round((f.at - started) / 1000)).padStart(4, '0')}s.jpg`), Buffer.from(f.data, 'base64'));
+        lastSaved = Date.now();
+        lastSeq = f.seq;
+      }
+      if (approvals.length && !stopped) {
+        stopped = 'approval card';
+        for (const a of approvals) await api('POST', `/messages/${a.id}/decision`, { approve: false }).catch(() => {});
+        await api('POST', `/conversations/${conv}/cancel`).catch(() => {});
+      }
+      if (Date.now() - started > TIMEOUT && !stopped) {
+        stopped = 'harness timeout';
+        await api('POST', `/conversations/${conv}/cancel`).catch(() => {});
+      }
+      if (Date.now() - started > TIMEOUT + 60000) break;
+      // Fallback in case events were missed (socket reconnect): the reply,
+      // and approval cards to deny.
+      if (!done && (Date.now() - started) % 15000 < 1000) {
+        const { messages } = await api('GET', `/conversations/${conv}/messages?limit=20`);
+        const m = messages.find((x) => x.id === asstId);
+        if (m && m.status !== 'streaming') done = m;
+        for (const c of messages) {
+          if (c.card?.type === 'approval' && c.card.state === 'pending' && !approvals.some((a) => a.id === c.id) && !seenCards.has(c.id)) {
+            seenCards.add(c.id);
+            cards.push({ type: 'approval', title: c.card.title, state: c.card.state });
+            approvals.push(c);
+          }
+        }
+      }
     }
-    if (approvals.length && !stopped) {
-      stopped = 'approval card';
-      for (const a of approvals) await api('POST', `/messages/${a.id}/decision`, { approve: false }).catch(() => {});
-      await api('POST', `/conversations/${conv}/cancel`).catch(() => {});
-    }
-    if (Date.now() - started > TIMEOUT && !stopped) {
-      stopped = 'harness timeout';
-      await api('POST', `/conversations/${conv}/cancel`).catch(() => {});
-    }
-    if (Date.now() - started > TIMEOUT + 60000) break;
-    // Fallback in case an event was missed (socket reconnect).
-    if (!done && (Date.now() - started) % 15000 < 1000) {
-      const { messages } = await api('GET', `/conversations/${conv}/messages?limit=20`);
-      const m = messages.find((x) => x.id === asstId);
-      if (m && m.status !== 'streaming') done = m;
-    }
+  } catch (e) {
+    // Never leave a turn running in Iris behind a harness error.
+    if (posted) await Promise.race([api('POST', `/conversations/${conv}/cancel`).catch(() => {}), sleep(5000)]);
+    throw e;
+  } finally {
+    off();
+    activeConversation = null;
   }
-  off();
-  activeConversation = null;
   await sleep(1000); // let the page settle after the last action
   let finalFrame = null;
   const last = await events.fresh();
@@ -425,7 +443,10 @@ function run(cmd, args, input, cwd, timeoutMs = 300000, extraEnv = {}) {
     p.stderr.on('data', (d) => (err += d));
     p.on('error', (e) => done(reject, e));
     // A judge that exits before reading its input must not crash the suite.
-    p.stdin.on('error', (e) => done(reject, e));
+    p.stdin.on('error', (e) => {
+      try { process.kill(-p.pid, 'SIGKILL'); } catch {}
+      done(reject, e);
+    });
     p.on('close', (code) => {
       code === 0 ? done(resolve, out) : done(reject, new Error(`${cmd} exited ${code}: ${(err || out).slice(-300)}`));
     });
