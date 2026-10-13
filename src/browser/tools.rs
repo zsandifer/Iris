@@ -11,6 +11,7 @@ use super::{Browser, Control, TurnCtx};
 use crate::state::AppState;
 use crate::util::Result;
 use serde_json::{Value, json};
+use std::time::Duration;
 
 /// MCP server name (tool prefix `mcp__browser__`).
 pub const SERVER: &str = "browser";
@@ -54,6 +55,21 @@ pub const ALLOWED: &[&str] = &[
 /// Tools that only change which page is open, so they stay usable while
 /// the current page holds the owner's private details.
 const NAVIGATION: &[&str] = &["browser_navigate", "browser_navigate_back", "browser_tabs"];
+
+/// Tools that only read the page. Everything else acts on it, and Playwright
+/// keeps going with an action (waiting for its target) even when its answer
+/// is no longer wanted.
+const READS: &[&str] = &[
+    "browser_snapshot",
+    "browser_find",
+    "browser_take_screenshot",
+    "browser_wait_for",
+];
+
+/// How long a take-over or Stop waits for an action already sent to the
+/// browser to finish before the page is handed on (Playwright gives up on
+/// an element that does not become ready after 5 seconds).
+const ACTION_DRAIN: Duration = Duration::from_secs(8);
 
 /// The definitions the agent sees: the allowed ones, without their
 /// `filename` option (results are never written to files for the agent).
@@ -264,11 +280,29 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     }
     b.set_busy(true);
     let started = std::time::Instant::now();
-    let result = while_agent(b, &ctx, b.tool(&run, name, &args, super::CALL_TIMEOUT)).await;
+    let drain = if READS.contains(&name) {
+        Duration::ZERO
+    } else {
+        ACTION_DRAIN
+    };
+    let result = while_agent(
+        b,
+        &ctx,
+        drain,
+        b.tool(&run, name, &args, super::CALL_TIMEOUT),
+    )
+    .await;
     b.set_busy(false);
-    let out = result.unwrap_or_else(|e| error(e.to_string()));
-    if name == "browser_navigate" && out["isError"] != true {
-        b.left_private_page();
+    let mut out = result.unwrap_or_else(|e| error(e.to_string()));
+    // A file picker would block every tool, and the agent may not upload
+    // files: Iris cancels it.
+    let text = super::text_of(&out);
+    if text.contains("can be handled by browser_file_upload")
+        && b.answer_modal(&run, &text, false).await
+        && let Some(parts) = out["content"].as_array_mut()
+    {
+        parts.push(json!({"type": "text",
+            "text": "(Iris closed the file picker: uploading files is not available.)"}));
     }
     crate::info!(
         "browser: {name} {} in {}ms",
@@ -282,20 +316,34 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     out
 }
 
-/// Cancel an admitted call on a control change and check once more
-/// immediately before releasing its result, even if it completed first.
+/// Give up on an admitted call on a control change or when the turn ends,
+/// and check once more immediately before releasing its result, even if
+/// it completed first. An action already sent keeps the page (the caller
+/// holds it) for up to `drain` while it finishes, so it cannot take effect
+/// under the owner's hands; reads are dropped at once.
 async fn while_agent<T>(
     b: &Browser,
     ctx: &TurnCtx,
+    drain: Duration,
     work: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     let mut control = b.control.subscribe();
     b.check_agent(ctx)?;
-    let result = tokio::select! {
+    tokio::pin!(work);
+    let stopped = tokio::select! {
         biased;
-        _ = ctx.wait_ended() => Err(super::TURN_ENDED.into()),
-        _ = control.changed() => Err(super::TAKEN_OVER.into()),
-        r = work => r,
+        _ = ctx.wait_ended() => Err(super::TURN_ENDED),
+        _ = control.changed() => Err(super::TAKEN_OVER),
+        r = &mut work => Ok(r),
+    };
+    let result = match stopped {
+        Ok(r) => r,
+        Err(why) => {
+            if !drain.is_zero() {
+                let _ = tokio::time::timeout(drain, &mut work).await;
+            }
+            return Err(why.into());
+        }
     };
     b.check_agent(ctx)?;
     if control.has_changed().unwrap_or(true) {
@@ -441,6 +489,140 @@ pub(crate) mod tests {
             .is_err()
         );
         assert!(check_args("browser_snapshot", &json!([])).is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_calls_respect_take_over_and_turn_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let b = state.browser.clone();
+        let (owner, conv) = state
+            .db
+            .with(|c| {
+                let owner = crate::db::owner_user_id(c)?.unwrap();
+                let conv = crate::db::ensure_main_conversation(c, &owner)?;
+                Ok((owner, conv))
+            })
+            .unwrap();
+        let g = b.begin_turn(&owner, &conv, "m", &[]);
+        let token = g.token().to_string();
+        // Another call holds the page.
+        let held = b.op_lock.lock().await;
+        let (st, tk) = (state.clone(), token.clone());
+        let queued = tokio::spawn(async move {
+            call(
+                &st,
+                &tk,
+                "browser_navigate",
+                &json!({"url": "https://a.test"}),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The owner takes over while the call waits for the page.
+        b.control.send_replace(super::super::Control::User {
+            user_id: "u".into(),
+            device_id: "d".into(),
+        });
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // It went back to waiting instead of running under the owner.
+        assert!(!queued.is_finished());
+        // The turn ends: the call gives up at once, having done nothing.
+        drop(g);
+        let out = tokio::time::timeout(Duration::from_secs(2), queued)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out["isError"], true);
+        assert_eq!(
+            out["content"][0]["text"].as_str(),
+            Some(super::super::TURN_ENDED)
+        );
+        assert!(b.running().is_none());
+        // Unknown and expired tokens are refused.
+        assert_eq!(
+            call(&state, &token, "browser_snapshot", &json!({})).await["isError"],
+            true
+        );
+        assert_eq!(
+            call(&state, "", "browser_snapshot", &json!({})).await["isError"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_calls_stop_on_take_over_and_actions_finish_first() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let b = &state.browser;
+        let turn = b.begin_turn("owner", "conv", "m", &[]);
+        let ctx = b.turn(turn.token()).unwrap();
+        let take_over = || {
+            b.control.send_replace(super::super::Control::User {
+                user_id: "owner".into(),
+                device_id: "phone".into(),
+            });
+        };
+
+        // A screenshot completes in the same poll as a take over and an
+        // immediate hand back. Checking only the current state leaks it.
+        let result = while_agent(b, &ctx, Duration::ZERO, async {
+            take_over();
+            b.hand_back();
+            Ok(json!({"content": [{"type": "image", "data": "private pixels"}]}))
+        })
+        .await;
+        assert_eq!(result.unwrap_err().to_string(), super::super::TAKEN_OVER);
+
+        // A read stops without waiting for its deadline.
+        b.hand_back();
+        let read = while_agent(b, &ctx, Duration::ZERO, async {
+            take_over();
+            std::future::pending::<Result<Value>>().await
+        });
+        let result = tokio::time::timeout(Duration::from_millis(200), read)
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap_err().to_string(), super::super::TAKEN_OVER);
+
+        // An action already sent finishes before the page is handed on
+        // (its caller holds the page meanwhile), and its result is
+        // still not released.
+        b.hand_back();
+        let done = AtomicBool::new(false);
+        let result = while_agent(b, &ctx, Duration::from_secs(5), async {
+            take_over();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            done.store(true, Ordering::SeqCst);
+            Ok(json!({}))
+        })
+        .await;
+        assert_eq!(result.unwrap_err().to_string(), super::super::TAKEN_OVER);
+        assert!(done.load(Ordering::SeqCst));
+        // One that never finishes is given up after the drain time.
+        b.hand_back();
+        let action = while_agent(b, &ctx, Duration::from_millis(100), async {
+            take_over();
+            std::future::pending::<Result<Value>>().await
+        });
+        let result = tokio::time::timeout(Duration::from_secs(2), action)
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap_err().to_string(), super::super::TAKEN_OVER);
+        // The turn ending stops it the same way.
+        b.hand_back();
+        let done = AtomicBool::new(false);
+        let result = while_agent(b, &ctx, Duration::from_secs(5), async {
+            ctx.ended.send_replace(true);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            done.store(true, Ordering::SeqCst);
+            Ok(json!({}))
+        })
+        .await;
+        assert_eq!(result.unwrap_err().to_string(), super::super::TURN_ENDED);
+        assert!(done.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

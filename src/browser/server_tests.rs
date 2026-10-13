@@ -8,8 +8,12 @@ use crate::state::AppState;
 
 /// Answers like Playwright MCP (synthetic results modeled on its markdown).
 /// Works in its working directory: `url` holds the current address,
-/// `field` whether the focused field is private (default true),
-/// `nosandbox` makes a sandboxed start fail, `calls.log` records calls.
+/// `marked` exists while the current document is marked private (a new
+/// page from `browser_navigate` drops it), `field` whether the focused
+/// field is private (default true), `frame` whether it is in another
+/// site's frame, `tabs` how many tabs are open, `modal` a pending dialog
+/// or file picker line, `nosandbox` makes a sandboxed start fail,
+/// `calls.log` records calls.
 const FAKE: &str = r####"#!/bin/sh
 cfg="$2"
 reply() { printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}%s]%s}}\n' "$id" "$1" "$2" "$3"; }
@@ -25,19 +29,46 @@ while IFS= read -r line; do
     *'"method":"tools/call"'*)
       printf '%s\n' "$line" >> calls.log
       tool=$(printf '%s' "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+      if [ -f modal ] && [ "$tool" != browser_tabs ]; then
+        m=$(cat modal)
+        case "$tool:$m" in
+          browser_handle_dialog:*dialog*|browser_file_upload:*file_upload*)
+            rm -f modal
+            reply "### Page\\n- Page URL: $url" '' '' ;;
+          *)
+            reply "### Error\\nError: Tool \\\"$tool\\\" does not handle the modal state.\\n### Modal state\\n$m" '' ',"isError":true' ;;
+        esac
+        continue
+      fi
       case "$tool" in
         browser_tabs)
+          n=$(cat tabs 2>/dev/null || echo 1)
           if [ -f nosandbox ] && grep -q '"chromiumSandbox":true' "$cfg"; then
             reply '### Error\nError: browserBackend.callTool: Target page, context or browser has been closed\nBrowser logs:\nChromium sandboxing failed!\n[pid=1][err] [1:1:FATAL:zygote_host_impl_linux.cc(130)] No usable sandbox!' '' ',"isError":true'
           else
-            reply "### Result\\n- 0: (current) [Sign in]($url)" '' ''
+            list="### Result"; i=0
+            while [ "$i" -lt "$n" ]; do list="$list\\n- $i: [Sign in]($url)"; i=$((i+1)); done
+            reply "$list" '' ''
           fi ;;
         browser_navigate)
           to=$(printf '%s' "$line" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')
           printf '%s' "$to" > url
+          rm -f marked
           reply "### Page\\n- Page URL: $to\\n- Page Title: Sign in\\n### Snapshot\\n- [Snapshot](out/page-2.yml)" '' '' ;;
-        browser_evaluate)
-          reply "### Result\\n$(cat field 2>/dev/null || echo true)" '' '' ;;
+        browser_run_code_unsafe)
+          case "$line" in
+            *insertText*)
+              reply "### Page\\n- Page URL: $url" '' '' ;;
+            *activeElement*)
+              p=$(cat field 2>/dev/null || echo true)
+              fr=$(cat frame 2>/dev/null || echo false)
+              case "$line" in *'priv = true ||'*) p=true ;; esac
+              case "$line" in *'if (true && priv)'*) [ "$p" = true ] && : > marked ;; esac
+              reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"private\\\":$p,\\\"frame\\\":$fr}" '' '' ;;
+            *)
+              m=false; [ -f marked ] && m=true
+              reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"title\\\":\\\"Sign in\\\",\\\"private\\\":$m}" '' '' ;;
+          esac ;;
         browser_take_screenshot)
           mkdir -p out && echo x > out/page-1.jpeg
           reply '### Result\n- [Screenshot of viewport](out/page-1.jpeg)' ',{"type":"image","data":"QUJD","mimeType":"image/jpeg"}' '' ;;
@@ -95,6 +126,12 @@ impl Fake {
 
     fn set(&self, name: &str, value: &str) {
         std::fs::write(self.file(name), value).unwrap();
+    }
+
+    /// A new document at `url` (nothing marked on it).
+    fn load(&self, url: &str) {
+        self.set("url", url);
+        let _ = std::fs::remove_file(self.file("marked"));
     }
 
     /// Every call the server got: (tool, arguments).
@@ -197,11 +234,9 @@ async fn agent_calls_pass_through_and_private_pages_stay_closed() {
     let calls = f.calls();
     let i = calls
         .iter()
-        .position(|(t, _)| t == "browser_mouse_move_xy")
+        .position(|(t, _)| t == "browser_mouse_click_xy")
         .unwrap();
     assert_eq!(calls[i].1, json!({"x": 250.0, "y": 250.0}));
-    assert_eq!(calls[i + 1].0, "browser_mouse_down");
-    assert_eq!(calls[i + 2].0, "browser_mouse_up");
     let keys: Vec<_> = calls
         .iter()
         .filter(|(t, _)| t == "browser_press_key")
@@ -209,31 +244,60 @@ async fn agent_calls_pass_through_and_private_pages_stay_closed() {
         .collect();
     assert_eq!(keys, ["p", "Backspace"]);
     assert!(calls.iter().any(|(t, a)| {
-        t == "browser_evaluate"
-            && a["function"]
+        t == "browser_run_code_unsafe"
+            && a["code"]
                 .as_str()
                 .unwrap()
-                .contains("insertText', false, \"ä\"")
+                .contains("keyboard.insertText(\"ä\")")
     }));
+    // The field was checked (and the page marked) before anything typed.
+    let checked = calls
+        .iter()
+        .position(|(t, a)| {
+            t == "browser_run_code_unsafe" && a["code"].to_string().contains("activeElement")
+        })
+        .unwrap();
+    let typed = calls
+        .iter()
+        .position(|(t, _)| t == "browser_press_key")
+        .unwrap();
+    assert!(checked < typed);
     b.hand_back();
 
-    // That page is closed to the agent, also for screenshots; nothing
-    // reaches the server.
+    // That page is closed to the agent, also for screenshots; only Iris's
+    // own look at the page reaches the server.
     let before = f.calls().len();
     for tool in ["browser_snapshot", "browser_take_screenshot"] {
         let r = f.agent(&token, tool, json!({})).await;
         assert_eq!(r["isError"], true);
         assert_eq!(text(&r), PRIVATE_PAGE);
     }
-    assert!(f.calls()[before..].iter().all(|(t, _)| t == "browser_tabs"));
-    // A fragment is the same page; the page moving on opens it again.
+    assert!(
+        f.calls()[before..]
+            .iter()
+            .all(|(t, a)| t == "browser_run_code_unsafe" && a["code"].as_str() == Some(PAGE_CODE))
+    );
+    // A fragment, or another address in the same document, is the same
+    // page.
     f.set("url", "https://site.test/login#password");
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_eq!(text(&r), PRIVATE_PAGE);
-    f.set("url", "https://site.test/home");
+    f.set("url", "https://site.test/login/step-2");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE);
+    // Another tab, or the page moving on, is open to the agent; coming
+    // back to the address (another tab, or history that may restore what
+    // was typed) is not.
+    f.load("https://site.test/home");
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
-    assert_eq!(f.called("browser_snapshot"), 1);
+    f.load("https://site.test/login");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE);
+    f.load("https://site.test/home");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert_eq!(f.called("browser_snapshot"), 2);
 
     // Typing into an ordinary field keeps the page open.
     b.take_over(&f.owner, "dev").await.unwrap();
@@ -248,23 +312,36 @@ async fn agent_calls_pass_through_and_private_pages_stay_closed() {
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
 
-    // Navigating away from a private page is always allowed and opens it.
+    // The page may move focus to a private field by itself: every piece
+    // of text is checked.
     b.take_over(&f.owner, "dev").await.unwrap();
-    f.set("field", "true");
-    b.user_input("dev", &json!({"kind": "tap", "x": 0.1, "y": 0.1}))
+    b.user_input("dev", &json!({"kind": "text", "text": "a"}))
         .await
         .unwrap();
+    f.set("field", "true");
     b.user_input("dev", &json!({"kind": "text", "text": "123456"}))
         .await
         .unwrap();
     b.hand_back();
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_eq!(text(&r), PRIVATE_PAGE);
+    // Navigating away from a private page is always allowed and opens it;
+    // reloading its address does not.
     let r = f
         .agent(
             &token,
             "browser_navigate",
             json!({"url": "https://site.test/home"}),
+        )
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE);
+    let r = f
+        .agent(
+            &token,
+            "browser_navigate",
+            json!({"url": "https://site.test/next"}),
         )
         .await;
     assert_ne!(r["isError"], true, "{r}");
@@ -319,8 +396,16 @@ async fn owner_fills_saved_logins_only_on_their_site() {
     f.set("url", "http://site.test/login");
     assert!(fill::fill(&f.state, "dev", &id, "password").await.is_err());
     assert_eq!(f.called("browser_press_key"), 0);
-    // Its own site: typed key by key, and the page closes to the agent.
+    // Its own site, but the focused field is in another site's frame.
     f.set("url", "https://site.test/login");
+    f.set("frame", "true");
+    let err = fill::fill(&f.state, "dev", &id, "password")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("another site"), "{err}");
+    assert_eq!(f.called("browser_press_key"), 0);
+    // Its own site: typed key by key, and the page closes to the agent.
+    f.set("frame", "false");
     f.set("field", "false");
     fill::fill(&f.state, "dev", &id, "password").await.unwrap();
     let keys: String = f
@@ -404,6 +489,113 @@ async fn live_view_sends_new_pictures_and_removes_its_files() {
     b.close().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dialogs_file_pickers_and_new_windows_during_take_over() {
+    let f = Fake::new();
+    let b = f.browser();
+    b.ensure().await.unwrap();
+    b.take_over(&f.owner, "dev").await.unwrap();
+    let tap = json!({"kind": "tap", "x": 0.5, "y": 0.5});
+
+    // A confirmation the owner cannot see is accepted, and the tap goes
+    // through after it.
+    f.set(
+        "modal",
+        r#"- [\"confirm\" dialog with message \"Leave site?\"]: can be handled by browser_handle_dialog"#,
+    );
+    b.user_input("dev", &tap).await.unwrap();
+    let dialogs: Vec<_> = f
+        .calls()
+        .into_iter()
+        .filter(|(t, _)| t == "browser_handle_dialog")
+        .collect();
+    assert_eq!(
+        dialogs,
+        [("browser_handle_dialog".into(), json!({"accept": true}))]
+    );
+    // Refused once because of it, then tried again.
+    assert_eq!(f.called("browser_mouse_click_xy"), 2);
+    // A prompt would need text: dismissed.
+    f.set(
+        "modal",
+        r#"- [\"prompt\" dialog with message \"Name?\"]: can be handled by browser_handle_dialog"#,
+    );
+    b.user_input("dev", &tap).await.unwrap();
+    assert_eq!(
+        f.calls()
+            .iter()
+            .rfind(|(t, _)| t == "browser_handle_dialog")
+            .unwrap()
+            .1,
+        json!({"accept": false})
+    );
+    // A file picker is cancelled, never given files.
+    f.set(
+        "modal",
+        r#"- [File chooser]: can be handled by browser_file_upload"#,
+    );
+    b.user_input("dev", &tap).await.unwrap();
+    assert_eq!(
+        f.calls()
+            .iter()
+            .rfind(|(t, _)| t == "browser_file_upload")
+            .unwrap()
+            .1,
+        json!({})
+    );
+
+    // A window the tap opened (a sign-in popup) is what the owner sees
+    // and uses next.
+    f.set("tabs", "2");
+    b.user_input("dev", &tap).await.unwrap();
+    let selects: Vec<_> = f
+        .calls()
+        .into_iter()
+        .filter(|(t, a)| t == "browser_tabs" && a["action"] == "select")
+        .collect();
+    assert_eq!(selects.len(), 1);
+    assert_eq!(selects[0].1["index"], 1);
+    // Only once.
+    b.user_input("dev", &tap).await.unwrap();
+    assert_eq!(
+        f.calls()
+            .iter()
+            .filter(|(t, a)| t == "browser_tabs" && a["action"] == "select")
+            .count(),
+        1
+    );
+    b.hand_back();
+
+    // The agent answers its own dialogs, but a file picker (it may not
+    // upload) is cancelled for it so the browser is not stuck.
+    let g = b.begin_turn(&f.owner, &f.conv, "m", &[]);
+    f.set(
+        "modal",
+        r#"- [File chooser]: can be handled by browser_file_upload"#,
+    );
+    let r = f
+        .agent(g.token(), "browser_click", json!({"ref": "e1"}))
+        .await;
+    assert!(text_of(&r).contains("closed the file picker"), "{r}");
+    assert!(!f.file("modal").exists());
+    f.set(
+        "modal",
+        r#"- [\"alert\" dialog with message \"Hi\"]: can be handled by browser_handle_dialog"#,
+    );
+    let before = f.called("browser_handle_dialog");
+    let r = f
+        .agent(g.token(), "browser_click", json!({"ref": "e1"}))
+        .await;
+    assert_eq!(r["isError"], true);
+    assert_eq!(f.called("browser_handle_dialog"), before);
+    let r = f
+        .agent(g.token(), "browser_handle_dialog", json!({"accept": true}))
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    drop(g);
+    b.close().await;
+}
+
 /// End to end with the real Playwright MCP and Chromium, installed by
 /// Iris: `iris engines install browser --dir DIR`, then
 /// `IRIS_REAL_BROWSER=DIR cargo test real_playwright -- --ignored`.
@@ -413,20 +605,43 @@ async fn real_playwright() {
     use std::io::{Read, Write};
     let root = PathBuf::from(std::env::var("IRIS_REAL_BROWSER").expect("IRIS_REAL_BROWSER"));
     // A local site: a sign-in page with a big password field at the top.
+    // Two origins: the site, and another one (its own port) for a frame.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
+    let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let other_port = other.local_addr().unwrap().port();
+    let serve = move |listener: std::net::TcpListener| {
         for stream in listener.incoming().flatten() {
             let mut stream = stream;
             let mut buf = [0u8; 4096];
             let n = stream.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]);
+            let big = "position:absolute;left:0;width:500px;height:200px";
             let body = if req.starts_with("GET /login") {
                 "<html><head><title>Iris smoke sign in</title></head><body style='margin:0'>\
                  <input type=password aria-label=Password style='position:absolute;top:100px;left:0;width:500px;height:100px'>\
                  <p style='margin-top:250px'>Sign in to continue</p></body></html>"
+                    .to_string()
+            } else if req.starts_with("GET /code") {
+                // A one-time code field named only `code`, labelled apart,
+                // and a field in another site's frame.
+                format!(
+                    "<html><body style='margin:0'><label for=c>Authentication code</label>\
+                     <input id=c name=code style='{big};top:100px'>\
+                     <iframe src='http://127.0.0.1:{other_port}/field' style='{big};top:400px;border:0'></iframe></body></html>"
+                )
+            } else if req.starts_with("GET /field") {
+                "<html><body style='margin:0'><input name=q style='width:500px;height:200px'></body></html>"
+                    .to_string()
+            } else if req.starts_with("GET /dialog") {
+                format!(
+                    "<html><body style='margin:0'><button onclick=\"window.answer = confirm('Sure?')\" \
+                     style='{big};top:0'>Go</button>\
+                     <button onclick=\"window.open('/home')\" style='{big};top:400px'>Open</button></body></html>"
+                )
             } else {
                 "<html><head><title>Iris smoke home</title></head><body><h1>Welcome home</h1></body></html>"
+                    .to_string()
             };
             let _ = write!(
                 stream,
@@ -434,7 +649,9 @@ async fn real_playwright() {
                 body.len()
             );
         }
-    });
+    };
+    std::thread::spawn(move || serve(listener));
+    std::thread::spawn(move || serve(other));
     let f = Fake::new();
     let b = f.browser();
     let server = launch::find_in("", Some(&root), &crate::harness::resolve_command).unwrap();
@@ -468,6 +685,16 @@ async fn real_playwright() {
             b.set_allow_no_sandbox(true).await;
         }
     }
+
+    // Script addresses never reach the browser.
+    let r = f
+        .agent(
+            &token,
+            "browser_navigate",
+            json!({"url": "javascript:0;alert(1)"}),
+        )
+        .await;
+    assert!(text(&r).contains("Only web pages"), "{r}");
 
     let login = format!("http://127.0.0.1:{port}/login");
     let r = f
@@ -528,8 +755,46 @@ async fn real_playwright() {
         let r = f.agent(&token, tool, json!({})).await;
         assert_eq!(text(&r), PRIVATE_PAGE, "{tool}");
     }
-    // Moving on opens the browser to the agent again.
+    // Another tab is open to the agent; coming back to the first is not.
     let home = format!("http://127.0.0.1:{port}/home");
+    let r = f
+        .agent(
+            &token,
+            "browser_tabs",
+            json!({"action": "new", "url": home}),
+        )
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert!(text(&r).contains("Welcome home"), "{r}");
+    let r = f
+        .agent(
+            &token,
+            "browser_tabs",
+            json!({"action": "select", "index": 0}),
+        )
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE);
+    let r = f
+        .agent(
+            &token,
+            "browser_tabs",
+            json!({"action": "close", "index": 1}),
+        )
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    // Moving on opens the browser to the agent again; going back to the
+    // page (history may restore what was typed) does not.
+    let r = f
+        .agent(&token, "browser_navigate", json!({"url": home}))
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    let r = f.agent(&token, "browser_navigate_back", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE);
     let r = f
         .agent(&token, "browser_navigate", json!({"url": home}))
         .await;
@@ -548,6 +813,53 @@ async fn real_playwright() {
             .any(|p| p["type"] == "image"),
         "{r}"
     );
+
+    // The owner again: a code field known only by its label is private,
+    // and a field in another site's frame says so.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    let input = |ev: Value| {
+        let b = b.clone();
+        async move { b.user_input("dev", &ev).await.unwrap() }
+    };
+    input(json!({"kind": "navigate", "url": format!("http://127.0.0.1:{port}/code")})).await;
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.2})).await;
+    let field = b.focused_field(&run, false, false).await.unwrap();
+    assert!(field.private && !field.frame, "{field:?}");
+    // (The frame loads on its own.)
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.5})).await;
+    let field = b.focused_field(&run, false, false).await.unwrap();
+    assert!(field.private && field.frame, "{field:?}");
+    assert_eq!(field.url, format!("http://127.0.0.1:{port}/code"));
+
+    // A confirmation the owner cannot see is answered; a window the page
+    // opens becomes the one they use.
+    input(json!({"kind": "navigate", "url": format!("http://127.0.0.1:{port}/dialog")})).await;
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.1})).await;
+    let answer = b
+        .tool(
+            &run,
+            "browser_evaluate",
+            &json!({"function": "() => window.answer"}),
+            QUICK,
+        )
+        .await
+        .unwrap();
+    assert!(text_of(&answer).contains("true"), "{answer}");
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.5})).await;
+    let mut url = String::new();
+    for _ in 0..20 {
+        let _op = b.op_lock.lock().await;
+        let _ = b.follow_new_tab(&run).await;
+        url = b.current_url(&run).await.unwrap();
+        if url.ends_with("/home") {
+            break;
+        }
+        drop(_op);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(url.ends_with("/home"), "{url}");
+    b.hand_back();
 
     drop(watching);
     drop(g);

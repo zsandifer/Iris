@@ -7,7 +7,8 @@
 //! gets it: secrets travel from the vault to the page only, never into a
 //! tool result, a message, or a log, and the page is closed to the agent
 //! until it moves on. Logins are only filled into the site they were saved
-//! for, cards and secrets only over HTTPS (plain HTTP only on this
+//! for (the page's real address, and never into another site's frame on
+//! it), cards and secrets only over HTTPS (plain HTTP only on this
 //! machine).
 //!
 //! The agent cannot fill anything itself: it asks the owner to take over.
@@ -183,13 +184,27 @@ pub async fn fill(
         .browser
         .fill_for_owner(
             device_id,
-            |url| {
+            |field| {
+                let url = field.url.as_str();
                 let (scheme, host) = origin_of(url).ok_or("Open the site's page first.")?;
                 if !secure_enough(&scheme, &host) {
                     return Err("I only fill saved details into secure (https) pages.".into());
                 }
-                if cred.kind == "login" && !credential_matches(url, &cred) {
-                    return Err(format!("This login is saved for {site}, not this page.").into());
+                if cred.kind == "login" {
+                    if !credential_matches(url, &cred) {
+                        return Err(
+                            format!("This login is saved for {site}, not this page.").into()
+                        );
+                    }
+                    // The page's address says nothing about a frame from
+                    // another site (an ad, a widget) that has focus.
+                    if field.frame {
+                        return Err(format!(
+                            "That field belongs to another site inside this page, so I won't \
+                             fill your {site} login there."
+                        )
+                        .into());
+                    }
                 }
                 Ok(())
             },

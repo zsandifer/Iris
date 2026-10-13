@@ -22,7 +22,10 @@
 //!
 //! When the owner types into a private field (a password, card details, a
 //! one-time code) or fills a saved secret, that page is closed to the
-//! agent until it moves on, so the agent never reads what was typed.
+//! agent, so the agent never reads what was typed: the document itself is
+//! marked (it stays closed in any tab, and after the address changes
+//! within it), and so is its address (a page brought back from history may
+//! still hold what was typed), until the browser closes.
 
 pub mod apparmor;
 pub mod fill;
@@ -202,16 +205,19 @@ struct View {
     sandbox_unavailable: bool,
 }
 
-/// What the owner typed that the agent must not read.
+/// Where the owner typed what the agent must not read.
 #[derive(Debug, Default)]
 struct Private {
-    /// Whether the field the owner types into is private (None: not
-    /// checked since focus may have moved).
-    field: Option<bool>,
-    /// The page (address, without its fragment) where the owner typed or
-    /// filled private details.
-    page: Option<String>,
+    /// Addresses (without fragments) of pages where the owner typed or
+    /// filled private details, kept until the browser closes.
+    pages: Vec<String>,
+    /// Tabs open when last counted (new ones during take over are followed).
+    tabs: usize,
 }
+
+/// Most private addresses remembered (the oldest are forgotten first; the
+/// documents themselves stay marked).
+const PRIVATE_PAGES_MAX: usize = 64;
 
 /// Shared browser state (cheap to clone through `Arc`).
 pub struct Shared {
@@ -317,14 +323,27 @@ fn line_value<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
-/// The current tab from `browser_tabs` (`- 0: (current) [Title](url)`):
-/// (title, url).
-fn current_tab(text: &str) -> Option<(String, String)> {
-    let line = text.lines().find(|l| l.contains("(current)"))?;
-    let rest = &line[line.find("(current)")? + "(current)".len()..];
-    let rest = rest.trim().strip_prefix('[')?.strip_suffix(')')?;
-    let split = rest.rfind("](")?;
-    Some((rest[..split].to_string(), rest[split + 2..].to_string()))
+/// How many tabs a `browser_tabs` result lists (`- 0: [Title](url)`).
+fn tab_count(text: &str) -> usize {
+    text.lines()
+        .filter(|l| {
+            l.strip_prefix("- ")
+                .and_then(|r| r.split_once(':'))
+                .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        })
+        .count()
+}
+
+/// The `### Page` section of a result (Playwright's page header), which
+/// comes before anything the page wrote itself.
+fn page_section(text: &str) -> Option<&str> {
+    let start = if text.starts_with("### Page\n") {
+        0
+    } else {
+        text.find("\n### Page\n")? + 1
+    };
+    let body = &text[start + "### Page\n".len()..];
+    Some(&body[..body.find("\n###").unwrap_or(body.len())])
 }
 
 /// The first JSON value after `### Result` (Iris's own page checks).
@@ -339,18 +358,73 @@ fn page_key(url: &str) -> &str {
     url.split('#').next().unwrap_or(url)
 }
 
-/// Whether the focused field takes private details: passwords, card
-/// fields, one-time codes. Fields inside frames cannot be inspected from
-/// the page, so they count as private (payment forms often live there).
-const PRIVATE_FIELD_JS: &str = r#"() => {
+/// Iris's own look at the page, run by Playwright's Node side (not
+/// through the page's scripts): the real address and title, and whether
+/// this document was marked private. `PAGE_FN` is evaluated in the page.
+const PAGE_CODE: &str = r#"async (page) => ({
+  url: page.url(),
+  title: await page.title(),
+  private: await page.evaluate("window.__irisPrivate === true"),
+})"#;
+
+/// The focused field, followed into shadow roots and same-origin frames:
+/// whether it takes private details (passwords, card fields, one-time
+/// codes; a field in another site's frame cannot be inspected and counts
+/// as private) and whether it is in another site's frame. With `MARK`, a
+/// private field marks the document private before anything is typed;
+/// with `FORCE` it counts as private whatever it is.
+const FIELD_FN: &str = r#"() => {
+  const sensitive = (e) => {
+    const doc = e.ownerDocument;
+    const named = (e.getAttribute('aria-labelledby') || '').split(/\s+/)
+      .map((id) => id && doc.getElementById(id)).filter(Boolean).map((l) => l.textContent);
+    const a = [e.type, e.autocomplete, e.name, e.id, e.getAttribute('aria-label'), e.placeholder,
+      ...Array.from(e.labels || [], (l) => l.textContent), ...named]
+      .filter(Boolean).join(' ').toLowerCase();
+    if (/password|passcode|cc-|card|cvc|cvv|csc|security code|expir|one-time|otp|\bpin\b|verification|2fa|mfa|totp|authenticat/.test(a)) return true;
+    return /\bcode\b/.test(a) && !/postal|zip|promo|coupon|discount|gift|voucher|referral|country|area code|dial/.test(a);
+  };
   let e = document.activeElement;
-  while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
-  if (!e || e === document.body || e === document.documentElement) return false;
-  if (e.tagName === 'IFRAME' || e.tagName === 'FRAME') return true;
-  const a = [e.type, e.autocomplete, e.name, e.id, e.getAttribute('aria-label'), e.placeholder]
-    .filter(Boolean).join(' ').toLowerCase();
-  return /password|passcode|cc-|card|cvc|cvv|csc|security code|expir|one-time-code|otp|\bpin\b|verification/.test(a);
+  let frame = false;
+  let inner = false;
+  for (;;) {
+    while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
+    if (!e || (e.tagName !== 'IFRAME' && e.tagName !== 'FRAME')) break;
+    let d = null;
+    try { d = e.contentDocument; } catch (_) {}
+    if (!d) { frame = true; break; }
+    e = d.activeElement;
+    inner = true;
+  }
+  const field = !!e && e !== e.ownerDocument.body && e !== e.ownerDocument.documentElement;
+  // Focus inside a frame but on no field of it: where typing goes is unclear.
+  if (inner && !field) frame = true;
+  const priv = FORCE || frame || (field && sensitive(e));
+  if (MARK && priv) {
+    try { Object.defineProperty(window, '__irisPrivate', { value: true }); } catch (_) {}
+  }
+  return { private: priv, frame };
 }"#;
+
+/// Run `FIELD_FN` from Playwright's Node side, with the real address.
+fn field_code(mark: bool, force: bool) -> String {
+    let f = FIELD_FN
+        .replace("FORCE", if force { "true" } else { "false" })
+        .replace("MARK", if mark { "true" } else { "false" });
+    format!(
+        "async (page) => ({{ url: page.url(), ...(await page.evaluate({})) }})",
+        serde_json::to_string(&format!("({f})()")).unwrap_or_default()
+    )
+}
+
+/// The focused field, as `FIELD_FN` sees it, and the page's real address.
+#[derive(Debug)]
+pub(crate) struct Field {
+    pub url: String,
+    pub private: bool,
+    /// In another site's frame.
+    pub frame: bool,
+}
 
 /// Keys the owner can press while in control (names as in the DOM).
 const KEYS: &[&str] = &[
@@ -692,18 +766,17 @@ impl Browser {
         }
     }
 
-    /// Keep the app's address bar current from a tool result.
+    /// Keep the app's address bar current from a tool result's page
+    /// header (`current_url` corrects it from the browser itself).
     fn note_page(&self, result: &Value) {
         let text = text_of(result);
-        let (url, title) = match current_tab(&text) {
-            Some((t, u)) => (Some(u), Some(t)),
-            None => (
-                line_value(&text, "- Page URL:").map(String::from),
-                line_value(&text, "- Page Title:").map(String::from),
-            ),
+        let Some(page) = page_section(&text) else {
+            return;
         };
+        let url = line_value(page, "- Page URL:");
+        let title = line_value(page, "- Page Title:");
         if url.is_some() || title.is_some() {
-            self.set_page_info(url.as_deref(), title.as_deref());
+            self.set_page_info(url, title);
         }
     }
 
@@ -879,14 +952,65 @@ impl Browser {
         Ok(r)
     }
 
+    /// Run Iris's own fixed Playwright code (never the agent's) and read
+    /// its JSON result.
+    async fn run_code(&self, run: &Running, code: &str) -> Result<Value> {
+        let r = self
+            .tool(
+                run,
+                "browser_run_code_unsafe",
+                &json!({"code": code}),
+                QUICK,
+            )
+            .await?;
+        let text = ok_text(&r)?;
+        self.remove_output(&text);
+        result_value(&text).ok_or_else(|| "the browser gave no answer".into())
+    }
+
+    /// The current tab: its address and title (from the browser, not from
+    /// anything the page wrote) and whether the owner typed private
+    /// details into this document.
+    async fn page_info(&self, run: &Running) -> Result<(String, bool)> {
+        let v = self.run_code(run, PAGE_CODE).await?;
+        let url = v["url"].as_str().ok_or("the browser has no open page")?;
+        self.set_page_info(Some(url), v["title"].as_str());
+        Ok((url.to_string(), v["private"] == true))
+    }
+
     /// The current tab's address.
     pub(crate) async fn current_url(&self, run: &Running) -> Result<String> {
-        let r = self
-            .tool(run, "browser_tabs", &json!({"action": "list"}), QUICK)
-            .await?;
-        current_tab(&ok_text(&r)?)
-            .map(|(_, url)| url)
-            .ok_or_else(|| "the browser has no open page".into())
+        Ok(self.page_info(run).await?.0)
+    }
+
+    /// The focused field (`FIELD_FN`); with `mark`, a private one closes
+    /// the page to the agent before anything is typed.
+    pub(crate) async fn focused_field(
+        &self,
+        run: &Running,
+        mark: bool,
+        force: bool,
+    ) -> Result<Field> {
+        let v = self.run_code(run, &field_code(mark, force)).await?;
+        let field = Field {
+            url: v["url"]
+                .as_str()
+                .ok_or("the browser has no open page")?
+                .into(),
+            private: v["private"] != false,
+            frame: v["frame"] != false,
+        };
+        if mark && field.private {
+            let mut p = lock(&self.private);
+            let key = page_key(&field.url).to_string();
+            if !p.pages.contains(&key) {
+                if p.pages.len() >= PRIVATE_PAGES_MAX {
+                    p.pages.remove(0);
+                }
+                p.pages.push(key);
+            }
+        }
+        Ok(field)
     }
 
     /// The server's tools the agent may use. Asked once per install (a
@@ -1073,6 +1197,13 @@ impl Browser {
             if header_at.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
                 header_at = Some(started);
                 let _ = self.current_url(run).await;
+                // A sign-in window the page opened while the owner is in
+                // control: show it to them (if no input is running).
+                if matches!(self.control(), Control::User { .. })
+                    && let Ok(_op) = self.op_lock.try_lock()
+                {
+                    let _ = self.follow_new_tab(run).await;
+                }
             }
             let shot = self
                 .tool(
@@ -1150,9 +1281,12 @@ impl Browser {
     // ----------------------------------------------------------- take over
 
     pub async fn take_over(&self, user_id: &str, device_id: &str) -> Result<()> {
-        self.ensure().await?;
+        let run = self.ensure().await?;
         self.last_input.store(now_ms(), Ordering::SeqCst);
-        lock(&self.private).field = None;
+        // Tabs open now are not new to the owner.
+        if let Ok(n) = self.count_tabs(&run).await {
+            lock(&self.private).tabs = n;
+        }
         self.control.send_replace(Control::User {
             user_id: user_id.into(),
             device_id: device_id.into(),
@@ -1203,10 +1337,83 @@ impl Browser {
     }
 
     /// One of Iris's own calls for the owner; its result only matters as
-    /// success or a short error.
+    /// success or a short error. A dialog or file picker the page opened
+    /// is answered first (the owner cannot see either in the live view),
+    /// and the call is tried again if it was refused because of it.
     async fn act(&self, run: &Running, name: &str, args: Value) -> Result<()> {
-        let r = self.tool(run, name, &args, CALL_TIMEOUT).await?;
+        let mut r = self.tool(run, name, &args, CALL_TIMEOUT).await?;
+        self.remove_output(&text_of(&r));
+        if self.answer_modal(run, &text_of(&r), true).await && is_error(&r) {
+            r = self.tool(run, name, &args, CALL_TIMEOUT).await?;
+            self.remove_output(&text_of(&r));
+            self.answer_modal(run, &text_of(&r), true).await;
+        }
         ok_text(&r).map(|_| ())
+    }
+
+    /// Answer what blocks the page, as Iris always has: alerts and
+    /// confirmations are accepted (they follow from what was just tapped),
+    /// prompts dismissed (they would need text), and file pickers
+    /// cancelled (files on the server are never uploaded). Whether
+    /// anything was answered. Dialogs only with `dialogs` (the agent
+    /// answers its own).
+    pub(crate) async fn answer_modal(&self, run: &Running, text: &str, dialogs: bool) -> bool {
+        let Some(modal) = text.find("### Modal state").map(|i| &text[i..]) else {
+            return false;
+        };
+        let mut answered = false;
+        if modal.contains("can be handled by browser_file_upload") {
+            let r = self
+                .tool(run, "browser_file_upload", &json!({}), QUICK)
+                .await;
+            if let Ok(r) = &r {
+                self.remove_output(&text_of(r));
+            }
+            answered |= r.is_ok_and(|r| !is_error(&r));
+        }
+        if let Some(line) = modal
+            .lines()
+            .find(|l| dialogs && l.contains("can be handled by browser_handle_dialog"))
+        {
+            let accept = !line.trim_start().starts_with("- [\"prompt\"");
+            let r = self
+                .tool(
+                    run,
+                    "browser_handle_dialog",
+                    &json!({"accept": accept}),
+                    QUICK,
+                )
+                .await;
+            if let Ok(r) = &r {
+                self.remove_output(&text_of(r));
+            }
+            answered |= r.is_ok_and(|r| !is_error(&r));
+        }
+        answered
+    }
+
+    async fn count_tabs(&self, run: &Running) -> Result<usize> {
+        let r = self
+            .tool(run, "browser_tabs", &json!({"action": "list"}), QUICK)
+            .await?;
+        Ok(tab_count(&ok_text(&r)?))
+    }
+
+    /// While the owner is in control, a tab the page opened (a sign-in or
+    /// payment window) becomes the one they see and use. Call with the
+    /// page held (`op_lock`).
+    async fn follow_new_tab(&self, run: &Running) -> Result<()> {
+        let n = self.count_tabs(run).await?;
+        let seen = std::mem::replace(&mut lock(&self.private).tabs, n);
+        if n > seen && n > 1 && matches!(self.control(), Control::User { .. }) {
+            self.act(
+                run,
+                "browser_tabs",
+                json!({"action": "select", "index": n - 1}),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Input from the owner's phone while they have control. Coordinates
@@ -1224,13 +1431,13 @@ impl Browser {
             "tap" => {
                 let x = frac("x").ok_or("x is required")? * VIEW_W as f64;
                 let y = frac("y").ok_or("y is required")? * VIEW_H as f64;
-                // Focus may move to another field.
-                lock(&self.private).field = None;
-                self.act(&run, "browser_mouse_move_xy", json!({"x": x, "y": y}))
+                // One click (not down and up): Playwright stops waiting for
+                // it when the page opens a dialog.
+                self.act(&run, "browser_mouse_click_xy", json!({"x": x, "y": y}))
                     .await?;
-                still()?;
-                self.act(&run, "browser_mouse_down", json!({})).await?;
-                self.act(&run, "browser_mouse_up", json!({})).await?;
+                // The tap may have opened a window (followed later too, by
+                // the live view, if it opens slowly).
+                let _ = self.follow_new_tab(&run).await;
             }
             "scroll" => {
                 let x = frac("x").unwrap_or(0.5) * VIEW_W as f64;
@@ -1259,33 +1466,28 @@ impl Browser {
                     .iter()
                     .find(|k| **k == key)
                     .ok_or("that key is not supported")?;
-                if matches!(*key, "Tab" | "Enter") {
-                    lock(&self.private).field = None;
-                }
                 self.act(&run, "browser_press_key", json!({"key": key}))
                     .await?;
             }
             "back" => {
-                lock(&self.private).field = None;
                 self.act(&run, "browser_navigate_back", json!({})).await?;
             }
             "navigate" => {
                 let url = normalize_url(ev["url"].as_str().unwrap_or(""))?;
-                lock(&self.private).field = None;
                 self.act(&run, "browser_navigate", json!({"url": url}))
                     .await?;
-                // A new page: nothing typed on the old one is on it.
-                lock(&self.private).page = None;
             }
             _ => return Err("unknown input kind".into()),
         }
         Ok(())
     }
 
-    /// Type for the owner into the focused field. Text for a private field
-    /// (or `private`: a saved secret) closes the page to the agent first.
-    /// Printable ASCII goes through the keyboard key by key; anything else
-    /// is inserted as text.
+    /// Type for the owner into the focused field. When that field is
+    /// private (or `private`: a saved secret), the page is closed to the
+    /// agent first; this is checked for every piece of text, as the page
+    /// may move focus by itself. Printable ASCII goes through the keyboard
+    /// key by key; anything else is inserted as text, into whichever frame
+    /// has focus.
     pub(crate) async fn type_text(
         &self,
         run: &Running,
@@ -1296,20 +1498,17 @@ impl Browser {
         if text.is_empty() {
             return Ok(());
         }
-        if private || self.field_is_private(run).await {
-            let url = self.current_url(run).await?;
-            lock(&self.private).page = Some(page_key(&url).to_string());
-        }
+        self.focused_field(run, true, private).await?;
         let mut other = String::new();
         for c in text.chars().chain(std::iter::once('\0')) {
             let key = (' '..='~').contains(&c);
             if (key || c == '\0') && !other.is_empty() {
                 self.controller(device_id)?;
-                let insert = format!(
-                    "() => document.execCommand('insertText', false, {})",
+                let code = format!(
+                    "async (page) => {{ await page.keyboard.insertText({}); }}",
                     serde_json::to_string(&other)?
                 );
-                self.act(run, "browser_evaluate", json!({"function": insert}))
+                self.act(run, "browser_run_code_unsafe", json!({"code": code}))
                     .await?;
                 other.clear();
             }
@@ -1324,65 +1523,33 @@ impl Browser {
         Ok(())
     }
 
-    /// Whether the focused field takes private details (checked once per
-    /// field; anything unclear counts as private).
-    async fn field_is_private(&self, run: &Running) -> bool {
-        if let Some(p) = lock(&self.private).field {
-            return p;
-        }
-        let checked = self
-            .tool(
-                run,
-                "browser_evaluate",
-                &json!({"function": PRIVATE_FIELD_JS}),
-                QUICK,
-            )
-            .await;
-        let private = !matches!(
-            checked
-                .as_ref()
-                .map(|r| (is_error(r), result_value(&text_of(r)))),
-            Ok((false, Some(Value::Bool(false))))
-        );
-        lock(&self.private).field = Some(private);
-        private
-    }
-
     /// Fill a saved value for the owner (`fill.rs`): `check` sees the
-    /// current page's address first and may refuse.
+    /// focused field and the page's real address first and may refuse.
     pub(crate) async fn fill_for_owner(
         &self,
         device_id: &str,
-        check: impl FnOnce(&str) -> Result<()>,
+        check: impl FnOnce(&Field) -> Result<()>,
         value: &str,
         private: bool,
     ) -> Result<()> {
         let (run, _op) = self.owner_input(device_id).await?;
-        let url = self.current_url(&run).await?;
-        check(&url)?;
+        let field = self.focused_field(&run, false, false).await?;
+        check(&field)?;
         self.type_text(&run, device_id, value, private).await
     }
 
     /// Whether the agent must keep off the current page: the owner typed
-    /// private details on it. A page that moved on is open again.
+    /// private details into this document, or on this address.
     pub(crate) async fn private_page(&self, run: &Running) -> Result<bool> {
-        let Some(page) = lock(&self.private).page.clone() else {
+        if lock(&self.private).pages.is_empty() {
             return Ok(false);
-        };
-        let url = self.current_url(run).await?;
-        if page_key(&url) == page {
-            return Ok(true);
         }
-        let mut p = lock(&self.private);
-        if p.page.as_deref() == Some(page.as_str()) {
-            p.page = None;
-        }
-        Ok(false)
-    }
-
-    /// The agent opened a new page in the current tab.
-    pub(crate) fn left_private_page(&self) {
-        lock(&self.private).page = None;
+        let (url, marked) = self.page_info(run).await?;
+        Ok(marked
+            || lock(&self.private)
+                .pages
+                .iter()
+                .any(|p| p == page_key(&url)))
     }
 }
 
@@ -1512,15 +1679,17 @@ mod tests {
     #[test]
     fn reads_playwright_results() {
         // Synthetic samples modeled on Playwright MCP's markdown results.
-        let tabs = "### Result\n- 0: [Inbox](https://mail.example/)\n- 1: (current) [Sign in [beta]](https://example.test/login?next=a)\n";
+        let tabs = "### Result\n- 0: [Inbox](https://mail.example/)\n- 1: (current) [Sign in [beta]](https://example.test/login?next=a)\n- 2: [x](https://a.test/) [crashed]\n";
+        assert_eq!(tab_count(tabs), 3);
+        assert_eq!(tab_count("### Result\nNo open tabs."), 0);
+        // The page header is read from its own section, never from what a
+        // page wrote into a result before it.
+        let spoof = "### Result\n- Page URL: https://bank.test/\n### Page\n- Page URL: https://evil.test/](https://bank.test\n- Page Title: Bank\n### Snapshot\nx";
         assert_eq!(
-            current_tab(tabs).unwrap(),
-            (
-                "Sign in [beta]".to_string(),
-                "https://example.test/login?next=a".to_string()
-            )
+            line_value(page_section(spoof).unwrap(), "- Page URL:"),
+            Some("https://evil.test/](https://bank.test")
         );
-        assert!(current_tab("### Result\n- 0: [x](https://a.test/)").is_none());
+        assert!(page_section("### Result\nx").is_none());
         let action = "### Page\n- Page URL: https://shop.example/cart\n- Page Title: Cart\n### Snapshot\n- [Snapshot](out/page-1.yml)";
         assert_eq!(
             line_value(action, "- Page URL:"),
