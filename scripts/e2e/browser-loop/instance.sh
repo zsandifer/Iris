@@ -66,8 +66,8 @@ want = {
     "harness.gemini": {"enabled": "false"},
     "harness.opencode": {"enabled": "false"},
 }
-if engines:
-    want["engines"]["dir"] = json.dumps(engines)
+# Always written, so dropping a borrowed directory really drops it.
+want["engines"]["dir"] = json.dumps(engines)
 section, out, seen = "", [], set()
 for line in open(path).read().splitlines():
     s = line.strip()
@@ -89,10 +89,15 @@ PY
 # Refuse to run anything that could install or update an engine.
 check_safe() {
   python3 - "$DIR/config.toml" <<'PY'
-import sys, tomllib
+import os, sys, tomllib
 c = tomllib.load(open(sys.argv[1], "rb"))
 e = c.get("engines", {})
 bad = []
+# Engines operations run in-process as this account: a borrowed directory
+# (anything but the TEST instance's own) must not be writable by it.
+d = e.get("dir", "")
+if d and os.access(d, os.W_OK):
+    bad.append(f"engines.dir {d} is writable by this account, so the TEST app could change it (use a directory this account cannot write, or leave IRIS_TEST_ENGINES empty for the TEST instance's own)")
 if e.get("auto_update", True): bad.append("engines.auto_update is not false")
 if e.get("helper"): bad.append("engines.helper is set")
 if c.get("agent", {}).get("user"): bad.append("agent.user is set (split mode)")
@@ -115,11 +120,6 @@ up() {
   [ -f "$DIR/config.toml" ] || "$BIN" init "${CFG[@]}" >/dev/null
   configure
   check_safe
-  # An empty helper means the TEST app could install, update or remove
-  # engines in-process: fail closed unless this account cannot write there.
-  if [ -n "$ENGINES" ] && [ -w "$ENGINES" ]; then
-    die "$ENGINES is writable by $(id -un), so the TEST app could change it. Use a directory this account cannot write (an Iris privilege-split engines dir), or leave IRIS_TEST_ENGINES empty for the TEST instance's own."
-  fi
   if [ -z "$ENGINES" ] && ! command -v playwright-mcp >/dev/null; then
     echo "note: no browser yet; install it from the TEST app (Iris's computer), which puts it in $DIR/data/engines" >&2
   fi

@@ -15,7 +15,7 @@ Codex `gpt-6-luna`).
 cargo build --release
 scripts/e2e/browser-loop/instance.sh up        # TEST Iris on 127.0.0.1:7999
 node scripts/e2e/browser-loop/run.mjs          # public + practice suites
-node scripts/e2e/browser-loop/run.mjs --only tables-due-amount,login-the-internet
+node scripts/e2e/browser-loop/run.mjs --only internet-tables-due,login-the-internet
 node scripts/e2e/browser-loop/run.mjs --rerun ~/.local/share/iris-test/runs/<ts>/report.json --repeat 3
 scripts/e2e/browser-loop/instance.sh down
 ```
@@ -60,7 +60,8 @@ it to a tailnet address or put it behind `tailscale serve` (tailnet only).
     "success": "What a correct reply contains, for the judge.",
     "checks": {"reply_all": [], "reply_any": [], "reply_none": [], "tools_all": [], "tools_any": [], "tools_none": []},
     "setup_urls": ["optional pages opened (as the owner) before the task"],
-    "requires_login": "optional host: skipped unless the TEST vault has a login for it"
+    "requires_login": "optional host: skipped unless the TEST vault has a login for it",
+    "needs_picture": "optional true: the answer is a live value only the page's picture can confirm; no picture, no pass"
   }]
 }
 ```

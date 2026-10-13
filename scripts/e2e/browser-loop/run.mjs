@@ -203,6 +203,7 @@ async function turn(events, conv, text, dir, n) {
     }
     if (m.type === 'message.completed' && m.message?.id === asstId) done = m.message;
   });
+  if (shuttingDown) throw new Error('interrupted');
   activeConversation = conv;
   const { assistant_message } = await api('POST', `/conversations/${conv}/messages`, { text });
   asstId = assistant_message.id;
@@ -289,6 +290,9 @@ function mechanical(s, turns) {
   for (const x of c.tools_none || []) if (tried.some((t) => t.includes(String(x).toLowerCase()))) fails.push(`tool ${x} used`);
   if (!tools.some((t) => t.includes('browser_'))) fails.push('the browser was not used successfully');
   const last = turns.at(-1);
+  // Answers only the page itself can confirm (random values, live lists)
+  // need its picture; without one the judge could not tell a made-up one.
+  if (s.needs_picture && !last?.final_frame) fails.push('no picture of the page to check the answer against');
   if (last && last.status !== 'complete') fails.push(`the last reply ended as ${last.status}`);
   if (last?.stopped) fails.push(`the harness stopped the last turn (${last.stopped})`);
   return { ok: fails.length === 0, fails };
@@ -368,21 +372,27 @@ async function judge(s, turns, mech) {
 const children = new Set();
 const judgeDirs = new Set();
 let activeConversation = null;
+let shuttingDown = false;
+const killJudges = () => { for (const pid of children) try { process.kill(-pid, 'SIGKILL'); } catch {} };
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, async () => {
-    for (const pid of children) try { process.kill(-pid, 'SIGKILL'); } catch {}
+    // Set at once: no new turn or judge starts while cleaning up.
+    shuttingDown = true;
+    killJudges();
     for (const dir of judgeDirs) rmSync(dir, { recursive: true, force: true });
     if (!OFFLINE) {
       const bounded = (p) => Promise.race([p.catch(() => {}), sleep(5000)]);
       if (activeConversation) await bounded(api('POST', `/conversations/${activeConversation}/cancel`));
       await bounded(api('POST', '/browser/stop'));
     }
+    killJudges();
     process.exit(130);
   });
 }
 
 function run(cmd, args, input, cwd, timeoutMs = 300000, extraEnv = {}) {
   return new Promise((resolve, reject) => {
+    if (shuttingDown) return reject(new Error('interrupted'));
     const env = { ...process.env, ...extraEnv };
     for (const k of ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'CODEX_API_KEY']) delete env[k];
     // Its own process group: the npm launchers start the real CLI as a
@@ -578,6 +588,7 @@ async function main() {
       const run = { n, results: [] };
       report.runs.push(run);
       for (const [i, s] of scenarios.entries()) {
+        if (shuttingDown) break;
         console.log(`[run ${n} ${i + 1}/${scenarios.length}] ${s.id}`);
         let r;
         try {
@@ -629,7 +640,11 @@ function selfTest() {
   console.log(`${abs ? 'ok  ' : 'FAIL'} relative frame paths reach the judge as absolute paths`);
   const local = judgeImages({ suite: 'real' }, [turn({ final_frame: '/x/t1-final.jpg' })]).length === 0;
   console.log(`${local ? 'ok  ' : 'FAIL'} real-account pictures stay local`);
-  if (bad || !rx || !abs || !local) process.exit(1);
+  const blind = mechanical({ needs_picture: true, checks: {} }, [turn({ reply: 'Chrome CPU: 42%' })]).ok;
+  console.log(`${!blind ? 'ok  ' : 'FAIL'} a live value without a picture cannot pass`);
+  const seen = mechanical({ needs_picture: true, checks: {} }, [turn({ final_frame: '/x.jpg' })]).ok;
+  console.log(`${seen ? 'ok  ' : 'FAIL'} a live value with a picture goes to the judge`);
+  if (bad || !rx || !abs || !local || blind || !seen) process.exit(1);
 }
 
 async function rejudge(file) {
