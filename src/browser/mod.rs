@@ -372,14 +372,14 @@ const KEYS: &[&str] = &[
 /// An address the owner typed: http(s), or a bare domain (https).
 pub fn normalize_url(raw: &str) -> Result<String> {
     let s = raw.trim();
-    if s.is_empty() || s.len() > 4000 || s.chars().any(char::is_whitespace) {
+    if s.is_empty() || s.len() > 4000 || s.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("enter a web address".into());
     }
     let lower = s.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
         return Ok(s.to_string());
     }
-    if tools::has_scheme(s) {
+    if tools::has_scheme(s) && !tools::host_port(s) {
         return Err("only web pages (http or https) can be opened".into());
     }
     Ok(format!("https://{s}"))
@@ -1563,6 +1563,10 @@ mod tests {
     fn owner_addresses_are_web_pages() {
         assert_eq!(normalize_url("example.com").unwrap(), "https://example.com");
         assert_eq!(
+            normalize_url("localhost:3000/x").unwrap(),
+            "https://localhost:3000/x"
+        );
+        assert_eq!(
             normalize_url(" http://a.test/x ").unwrap(),
             "http://a.test/x"
         );
@@ -1572,6 +1576,9 @@ mod tests {
             "file:///etc/passwd",
             "a b",
             "chrome://settings",
+            "javascript:0;alert(1)",
+            "java\nscript:alert(1)",
+            "localhost:80x",
         ] {
             assert!(normalize_url(bad).is_err(), "{bad}");
         }

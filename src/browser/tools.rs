@@ -72,22 +72,42 @@ pub fn allowed_definitions(all: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
-/// Whether `s` starts with a URL scheme (`javascript:`, `file:`), as
-/// opposed to a bare host (with or without a port).
+/// Whether `s` starts with a URL scheme (`javascript:`, `file:`), the way
+/// a browser's URL parser reads it. That includes `host:port`, which
+/// parsers take as a scheme too.
 pub(crate) fn has_scheme(s: &str) -> bool {
-    let Some((scheme, rest)) = s.split_once(':') else {
+    let Some((scheme, _)) = s.split_once(':') else {
         return false;
     };
-    let scheme_like = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+    scheme.starts_with(|c: char| c.is_ascii_alphabetic())
         && scheme
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-    scheme_like && !rest.starts_with(|c: char| c.is_ascii_digit())
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
-/// Web pages only: http(s), a bare domain, or a blank page.
+/// A bare `host:port` address (`localhost:8080/x`), as the owner may type
+/// it: a host name, then only digits up to the path.
+pub(crate) fn host_port(s: &str) -> bool {
+    let Some((host, rest)) = s.split_once(':') else {
+        return false;
+    };
+    let port_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+        && (1..=5).contains(&port_len)
+        && rest[..port_len].chars().all(|c| c.is_ascii_digit())
+}
+
+/// Web pages only: http(s), a bare domain without a port, or a blank
+/// page. Whitespace and control characters are refused outright: browsers
+/// drop them while parsing, so `java\nscript:` would still run script.
 fn web_address(url: &str) -> bool {
-    let s = url.trim().to_ascii_lowercase();
+    if url.is_empty() || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let s = url.to_ascii_lowercase();
     s.starts_with("http://") || s.starts_with("https://") || s == "about:blank" || !has_scheme(&s)
 }
 
@@ -107,7 +127,11 @@ fn check_args(name: &str, args: &Value) -> std::result::Result<(), String> {
         && let Some(url) = args.get("url")
         && !url.as_str().is_some_and(web_address)
     {
-        return Err("Only web pages (http or https) can be opened.".into());
+        return Err(
+            "Only web pages (http or https) can be opened; write the full address, like \
+             https://example.com or http://localhost:8080."
+                .into(),
+        );
     }
     Ok(())
 }
@@ -365,7 +389,14 @@ pub(crate) mod tests {
     fn refuses_files_and_non_web_addresses() {
         assert!(check_args("browser_navigate", &json!({"url": "https://a.test"})).is_ok());
         assert!(check_args("browser_navigate", &json!({"url": "example.com"})).is_ok());
-        assert!(check_args("browser_navigate", &json!({"url": "localhost:8080/x"})).is_ok());
+        assert!(check_args("browser_navigate", &json!({"url": "localhost/x"})).is_ok());
+        assert!(
+            check_args(
+                "browser_navigate",
+                &json!({"url": "http://localhost:8080/x"})
+            )
+            .is_ok()
+        );
         assert!(
             check_args(
                 "browser_tabs",
@@ -381,6 +412,16 @@ pub(crate) mod tests {
             "chrome://settings",
             "view-source:https://a.test",
             " FILE:///x",
+            // Browsers read these as scripts too: a digit after the colon,
+            // and tabs or line breaks they remove while parsing.
+            "javascript:0;document.body.textContent=document.cookie",
+            "JAVASCRIPT:1",
+            "java\nscript:alert(1)",
+            "java\tscript:alert(1)",
+            "\u{1}javascript:alert(1)",
+            // Parsed as a `localhost:` scheme, not a host and port.
+            "localhost:8080/x",
+            "",
         ] {
             assert!(
                 check_args("browser_navigate", &json!({"url": bad})).is_err(),
