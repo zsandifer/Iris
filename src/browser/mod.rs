@@ -1928,12 +1928,9 @@ mod tests {
             "q=Pw-secret-42 card 4111 1111 1111 1111 or 4111-1111-1111-1111 cvc 737; flight 7370 and Boeing 737",
             &secrets,
         );
-        assert!(!t.contains("Pw-secret") && !t.contains("4111"), "{t}");
-        assert!(t.contains("flight 7370"), "{t}");
-        assert!(
-            t.contains("cvc [hidden]") && t.contains("Boeing [hidden]"),
-            "{t}"
-        );
+        assert!(!t.contains("Pw-secret") && !t.contains("4111"));
+        assert!(t.contains("flight 7370"));
+        assert!(t.contains("cvc [hidden]") && t.contains("Boeing [hidden]"));
         // Short passwords as forms send them, and as snapshots quote them.
         let short = [
             "Go*od+42".to_string(),
@@ -1945,7 +1942,7 @@ mod tests {
             "p=Go*od%2B42 x=Pw%212345 y=pw%2b42 heading \"S3c\\\"ret{42}\" z=Go%2Aod%2B42",
             &short,
         );
-        assert_eq!(t.matches("[hidden]").count(), 5, "{t}");
+        assert_eq!(t.matches("[hidden]").count(), 5);
         let amex = ["378282246310005".to_string()];
         assert_eq!(hide_secrets("3782 822463 10005", &amex), "[hidden]");
         assert_eq!(hide_secrets("nothing here", &secrets), "nothing here");
