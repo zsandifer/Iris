@@ -191,6 +191,10 @@ auth-failure output. When Playwright MCP updates: its tool names (the
 allowlist in `src/browser/tools.rs`), the markdown it returns (page header,
 tab list, `### Result`), and its config file keys (`src/browser/launch.rs`). `scripts/e2e/connectors.sh <model>` checks the
 approval gate end to end with a fake messenger connector.
+`scripts/e2e/browser-loop/` runs real browsing tasks (public sites and
+practice logins) against a separate TEST Iris and has a cheap model judge
+them; see its README before changing browser code or the agent's browser
+guidance.
 
 ## Conventions
 
