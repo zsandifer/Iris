@@ -406,6 +406,17 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     };
     let result = while_agent(b, &ctx, drain, work).await;
     b.set_busy(false);
+    if result.is_err() {
+        // An abandoned call may still write its file (a screenshot) after
+        // Iris stopped waiting for it.
+        let late = b.clone();
+        tokio::spawn(async move {
+            for wait in [2, 10, 30] {
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                late.clear_output();
+            }
+        });
+    }
     let mut out = result.unwrap_or_else(|e| error(e.to_string()));
     // A file picker would block every tool, and the agent may not upload
     // files: Iris cancels it.

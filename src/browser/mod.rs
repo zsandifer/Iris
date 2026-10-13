@@ -1123,13 +1123,31 @@ impl Browser {
         args: &Value,
         timeout: Duration,
     ) -> Result<Value> {
-        let r = run
-            .up
-            .call_tool(name, args, timeout)
-            .await
-            .map_err(|e| format!("the browser did not answer ({e})"))?;
+        let r = run.up.call_tool(name, args, timeout).await;
+        // Nothing Playwright writes is for anyone: screenshots come back
+        // inline, and its console logs may hold what a page printed.
+        self.clear_output();
+        let r = r.map_err(|e| format!("the browser did not answer ({e})"))?;
         self.note_page(&r);
         Ok(r)
+    }
+
+    /// Empty Playwright's output folder (it is recreated as needed). Also
+    /// run once a minute and after an abandoned call, for files written
+    /// after their call stopped waiting.
+    pub(crate) fn clear_output(&self) {
+        for e in std::fs::read_dir(&self.out_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let p = e.path();
+            let _ = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            };
+        }
     }
 
     /// Run Iris's own fixed Playwright code (never the agent's) and read
@@ -1302,6 +1320,7 @@ impl Browser {
             if !run.alive() {
                 break;
             }
+            self.clear_output();
             if let Control::User { .. } = self.control()
                 && now_ms() - self.last_input.load(Ordering::SeqCst) > TAKEOVER_IDLE_MS
             {

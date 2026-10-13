@@ -3615,7 +3615,9 @@ fields (all frames) show one, screenshots, `browser_find`,
 refs are refused (their outcome would tell what is hidden). Expiry dates
 and names lock the page but are not hidden elsewhere. Playwright writes no
 page snapshots to files (`snapshot.mode: none`); `browser_snapshot`
-answers inline, and screenshot files are deleted at once.
+answers inline, and Playwright's output folder (screenshot files, its
+console logs) is emptied after every call, once a minute, and shortly after
+an abandoned call.
 - Addresses that are not web pages in `browser_navigate` and
   `browser_tabs` (`url`): only `http`, `https`, a bare domain without a
   port, or `about:blank`; anything with whitespace or control characters

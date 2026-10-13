@@ -100,7 +100,8 @@ while IFS= read -r line; do
               reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"title\\\":\\\"Sign in\\\",\\\"private\\\":$m}" '' '' ;;
           esac ;;
         browser_take_screenshot)
-          mkdir -p out && echo x > out/page-1.jpeg
+          [ -f slowshot ] && sleep 1
+          mkdir -p out && echo x > out/page-1.jpeg && echo "page said hello" > out/console-1.log
           reply '### Result\n- [Screenshot of viewport](out/page-1.jpeg)' ',{"type":"image","data":"QUJD","mimeType":"image/jpeg"}' '' ;;
         *)
           reply "### Page\\n- Page URL: $url\\n- Page Title: Sign in" '' '' ;;
@@ -676,6 +677,36 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
     f.set("pagetext", "Welcome back");
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
+    // Nothing Playwright wrote stays (the picture came back inline; its
+    // console log may hold what the page printed).
+    assert_eq!(
+        std::fs::read_dir(&b.out_dir)
+            .map(|d| d.count())
+            .unwrap_or(0),
+        0
+    );
+    // Also when the call was abandoned (taken over) and the file came
+    // after.
+    f.set("slowshot", "");
+    let call = {
+        let (st, tk) = (f.state.clone(), token.clone());
+        tokio::spawn(
+            async move { tools::call(&st, &tk, "browser_take_screenshot", &json!({})).await },
+        )
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    b.take_over(&f.owner, "dev").await.unwrap();
+    let r = call.await.unwrap();
+    assert_eq!(text(&r), TAKEN_OVER);
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+    assert_eq!(
+        std::fs::read_dir(&b.out_dir)
+            .map(|d| d.count())
+            .unwrap_or(0),
+        0
+    );
+    std::fs::remove_file(f.file("slowshot")).unwrap();
+    b.hand_back();
     // A dialog can still be answered after a fill (even on a closed page).
     f.set(
         "modal",
@@ -1205,6 +1236,7 @@ async fn real_playwright() {
                 let q = rest.split_whitespace().next().unwrap_or("");
                 format!(
                     "<html><head><title>Sent {q}</title></head><body><p>You sent {q}</p>\
+                     <script>console.log('loaded ' + location.href)</script>\
                      <iframe src='http://127.0.0.1:{other_port}/show?{q}'></iframe></body></html>"
                 )
             } else if let Some(rest) = req.strip_prefix("GET /frameonly?") {
@@ -1578,6 +1610,20 @@ async fn real_playwright() {
                 "screenshot taken"
             );
         }
+    }
+
+    // Nothing of it is left on disk either (Playwright logs the page's
+    // console, which printed its address).
+    for e in std::fs::read_dir(&b.out_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let body = std::fs::read(e.path()).unwrap_or_default();
+        assert!(
+            !String::from_utf8_lossy(&body).contains("Real-Pw-42"),
+            "a secret was written to a file"
+        );
     }
 
     // A saved secret only inside another site's frame: still no picture.
