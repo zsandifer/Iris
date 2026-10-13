@@ -1881,11 +1881,11 @@
         "login",
         "read"
       ],
-      "task": "Sign in to https://quotes.toscrape.com/login in your browser with my saved login, then tell me what extra link appears under each quote now that you're signed in.",
-      "success": "After signing in each quote shows a '(Goodreads page)' link.",
+      "task": "Sign in to https://quotes.toscrape.com/login in your browser with my saved login. Once signed in, each quote gets a '(Goodreads page)' link next to the author; tell me the address that link points to for the first quote on the home page.",
+      "success": "Signs in with the saved login and reports the first quote's Goodreads link: http://goodreads.com/author/show/9810.Albert_Einstein.",
       "checks": {
         "reply_all": [
-          "Goodreads"
+          "9810.Albert_Einstein"
         ],
         "tools_all": [
           "browser_navigate",
