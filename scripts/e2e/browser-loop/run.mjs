@@ -256,7 +256,9 @@ async function turn(events, conv, text, dir, n) {
 
 function mechanical(s, turns) {
   const c = s.checks || {};
-  const reply = (turns.at(-1)?.reply || '').toLowerCase();
+  // Markdown emphasis and code marks would split phrases ("clicked **2** times").
+  const plain = (turns.at(-1)?.reply || '').replace(/\*\*|__|`/g, '');
+  const reply = plain.toLowerCase();
   const tools = turns.flatMap((t) => t.activity.map((a) => a.name.toLowerCase()));
   const fails = [];
   const has = (x) => reply.includes(String(x).toLowerCase());
@@ -264,7 +266,7 @@ function mechanical(s, turns) {
   for (const x of c.reply_all || []) if (!has(x)) fails.push(`reply lacks "${x}"`);
   if (c.reply_any?.length && !c.reply_any.some(has)) fails.push(`reply has none of ${JSON.stringify(c.reply_any)}`);
   for (const x of c.reply_none || []) if (has(x)) fails.push(`reply contains "${x}"`);
-  if (c.reply_regex && !new RegExp(c.reply_regex, 'i').test(turns.at(-1)?.reply || '')) fails.push(`reply does not match /${c.reply_regex}/`);
+  if (c.reply_regex && !new RegExp(c.reply_regex, 'i').test(plain)) fails.push(`reply does not match /${c.reply_regex}/`);
   for (const x of c.tools_all || []) if (!used(x)) fails.push(`tool ${x} not used`);
   if (c.tools_any?.length && !c.tools_any.some(used)) fails.push(`none of tools ${JSON.stringify(c.tools_any)} used`);
   for (const x of c.tools_none || []) if (used(x)) fails.push(`tool ${x} used`);
@@ -289,7 +291,7 @@ const JUDGE_SCHEMA = {
 const JUDGE_SYSTEM = `You grade one end-to-end test of a personal AI agent ("Iris") that uses its own web browser (Playwright tools; names start with browser_). You get the test task, the success criteria, the conversation (the user's messages and the agent's replies), the browser tools the agent called per turn, the browser's final page, mechanical check results, and warning lines from Iris's server log.
 
 Decide:
-- "pass": the latest reply meets the success criteria and the agent really did the work in its browser (the tool list supports it). Small wording differences are fine. Do not pass a reply that only claims success without the needed browser actions, invents facts, or asks the user to do the work.
+- "pass": the latest reply meets the success criteria and the agent really did the work in its browser (the tool list supports it). Small wording differences are fine, and so are equivalent ways of doing a step (opening a link's address directly instead of clicking it, pressing Enter instead of clicking Search) unless the success criteria say that exact interaction is required. A browser_snapshot returns the page's full accessibility tree including the content of its frames, so navigate + snapshot is enough evidence that the agent read what was on that page. Do not pass a reply that only claims success without the needed browser actions, invents facts, or asks the user to do the work.
 - "nudge": the agent stopped early in a way a normal user would answer with one short message (it asked "should I continue?", asked which option to pick when the task already said, gave up after a recoverable error, or gave a partial answer). Write that message in "nudge", as the user would, in one or two sentences. Never include passwords or personal data in a nudge, and never ask it to buy, send, post, or change an account.
 - "fail": anything else (wrong answer, stuck, unrecoverable).
 
