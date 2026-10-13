@@ -1139,7 +1139,10 @@ async fn real_playwright() {
         )
         .await
         .unwrap();
-    assert!(text_of(&typed).contains("hunter2-sëcret"), "{typed}");
+    assert!(
+        text_of(&typed).contains("hunter2-sëcret"),
+        "the typed text is not in the field"
+    );
     b.hand_back();
     for tool in ["browser_snapshot", "browser_take_screenshot"] {
         let r = f.agent(&token, tool, json!({})).await;
@@ -1280,9 +1283,14 @@ async fn real_playwright() {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    // (Never printed: it would be the secret if the check failed.)
     assert!(
-        home_now.contains("Welcome home") && !home_now.contains("Real-Pw-42"),
-        "{home_now}"
+        home_now.contains("Welcome home"),
+        "the sign-in did not move on"
+    );
+    assert!(
+        !home_now.contains("Real-Pw-42"),
+        "the password reached the agent"
     );
 
     // The agent fills a saved card after the owner approves, never seeing
@@ -1372,7 +1380,7 @@ async fn real_playwright() {
     let values = text_of(&values).replace([' ', '\n'], "");
     assert!(
         values.contains(r#"["4111111111111111","4","31","737"]"#),
-        "{values}"
+        "the card fields hold something else"
     );
     let r = f.agent(&chat_token, "browser_snapshot", json!({})).await;
     assert_eq!(text(&r), PRIVATE_PAGE);
