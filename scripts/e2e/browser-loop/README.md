@@ -15,7 +15,7 @@ Codex `gpt-6-luna`).
 cargo build --release
 scripts/e2e/browser-loop/instance.sh up        # TEST Iris on 127.0.0.1:7999
 node scripts/e2e/browser-loop/run.mjs          # public + practice suites
-node scripts/e2e/browser-loop/run.mjs --only internet-tables-due,login-the-internet
+node scripts/e2e/browser-loop/run.mjs --only expand-tables-due,login-the-internet
 node scripts/e2e/browser-loop/run.mjs --rerun ~/.local/share/iris-test/runs/<ts>/report.json --repeat 3
 scripts/e2e/browser-loop/instance.sh down
 ```

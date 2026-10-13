@@ -523,7 +523,14 @@ async function scenario(events, s, defaults, creds, outDir) {
   let mech = null;
   let nudges = 0;
   for (let n = 1; n <= MAX_TURNS; n++) {
-    const t = await turn(events, conversation.id, text, dir, n);
+    let t;
+    try {
+      t = await turn(events, conversation.id, text, dir, n);
+    } catch (e) {
+      e.turns = turns;
+      e.conversation_id = conversation.id;
+      throw e;
+    }
     turns.push(t);
     lastVisit.set(host, Date.now());
     console.log(`  turn ${n}: ${t.status} ${t.seconds}s, ${t.activity.length} tools${t.stopped ? `, stopped: ${t.stopped}` : ''}`);
@@ -629,7 +636,11 @@ async function main() {
         try {
           r = await scenario(events, s, defaults, creds, join(outDir, `run${n}`));
         } catch (e) {
-          r = { id: s.id, suite: s.suite, site: s.site, kinds: s.kinds || [], status: 'error', reason: `harness: ${e.message}`.slice(0, 400), root_cause: 'unknown', turns: [] };
+          r = { id: s.id, suite: s.suite, site: s.site, kinds: s.kinds || [], status: 'error', reason: `harness: ${e.message}`.slice(0, 400), root_cause: 'unknown', turns: e.turns || [] };
+          // Keep what the scenario got before the error (for --rejudge).
+          const dir = join(outDir, `run${n}`, s.id);
+          mkdirSync(dir, { recursive: true });
+          writeFileSync(join(dir, 'result.json'), JSON.stringify({ scenario: s, result: { ...r, conversation_id: e.conversation_id } }, null, 2));
         }
         console.log(`  => ${r.status.toUpperCase()}${r.nudged ? ' (nudged)' : ''}: ${(r.reason || '').slice(0, 200)}`);
         run.results.push(r);
@@ -662,6 +673,18 @@ function selfTest() {
     ['the wrong answer', [turn({ reply: 'Isaac Newton' })], false],
     ['no browser at all', [turn({ activity: [{ name: 'WebFetch', status: 'completed' }] })], false],
   ];
+  // An interaction scenario: the answer alone is not enough.
+  const dialog = { id: 'd', checks: { reply_all: ['entered: iris'], tools_all: ['browser_navigate'], tools_any: ['browser_handle_dialog'] } };
+  const said = { reply: 'You entered: iris' };
+  for (const [name, activity, want] of [
+    ['a dialog answered', [nav('completed'), { name: 'browser/browser_handle_dialog', status: 'completed' }], true],
+    ['a dialog that failed', [nav('completed'), { name: 'browser/browser_handle_dialog', status: 'failed' }], false],
+    ['a dialog never answered', [nav('completed')], false],
+  ]) {
+    const got = mechanical(dialog, [turn({ ...said, activity })]).ok;
+    if (got !== want) bad++;
+    console.log(`${got === want ? 'ok  ' : 'FAIL'} ${name}: ${got ? 'pass' : 'fail'}`);
+  }
   let bad = 0;
   for (const [name, turns, want] of cases) {
     const got = mechanical(s, turns).ok;
