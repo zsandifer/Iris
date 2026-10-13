@@ -2534,7 +2534,7 @@ image:
 
 Typing into a private field (a password, card, or one-time-code field, by
 its type, autocomplete, name, or label, or a field in another site's
-frame; checked for every `text` input), and filling a `password`,
+frame; checked before the first `text` input, again after any other input, and at least every 3 seconds of typing), and filling a `password`,
 `number`, `exp`, or `cvc`, closes that page to the agent before anything is
 typed: its browser tools other than `browser_navigate`,
 `browser_navigate_back`, `browser_tabs`, `browser_handle_dialog`, and the
@@ -3576,7 +3576,7 @@ results link snapshot files the agent cannot open, so the agent calls
   `browser_console_messages`, `browser_resize`, `browser_close`, and any
   tool a newer version adds.
 - Writing results to files: the `filename` option is removed from the
-  definitions and refused.
+  definitions and refused, and so are output options in `_meta`.
 
 Iris adds two tools of its own, after Playwright's:
 

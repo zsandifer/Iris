@@ -228,6 +228,7 @@ pub async fn fill(
     let (values, private) = field_values(&cred, &secret, field)?;
     let site = cred.metadata["site"].as_str().unwrap_or("");
     let (run, _op) = state.browser.owner_input(device_id).await?;
+    state.browser.forget_field_check();
     // The focused element itself is filled (whatever it held is replaced),
     // in the frame it was checked in: focus moving meanwhile stops it.
     let Some(at) = locate(state, &run, Find::Focused).await? else {
@@ -731,6 +732,9 @@ async fn login_inner(
             )));
         }
     };
+    // Checked against the credential as loaded with its secret (an edit of
+    // its site between the two reads must not widen where it goes).
+    let (cred, secret) = load(state, &ctx.user_id, &cred.id).await?;
     for (field, r, at) in &targets {
         if !login_target_ok(&cred, field, at) {
             return Ok(text(format!(
@@ -755,7 +759,6 @@ async fn login_inner(
         Ok(b) => b,
         Err(out) => return Ok(out),
     };
-    let (cred, secret) = load(state, &ctx.user_id, &cred.id).await?;
     if targets.iter().any(|(f, _, _)| *f == "password")
         && secret
             .get("password")

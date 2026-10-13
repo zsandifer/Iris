@@ -164,6 +164,11 @@ fn check_args(name: &str, args: &Value) -> std::result::Result<(), String> {
     if !args.is_object() {
         return Err("arguments must be an object".into());
     }
+    // Playwright reads output options from `_meta` (JSON results escape
+    // values a second time, past what redaction recognizes).
+    if args.get("_meta").is_some() {
+        return Err("Output options (`_meta`) are not available here.".into());
+    }
     if args.get("filename").is_some() {
         return Err(
             "Saving to files is not available here; leave out `filename` to get the result \
@@ -567,6 +572,7 @@ pub(crate) mod tests {
             .is_err()
         );
         assert!(check_args("browser_snapshot", &json!([])).is_err());
+        assert!(check_args("browser_find", &json!({"_meta": {"json": true}})).is_err());
     }
 
     #[test]

@@ -345,16 +345,42 @@ async fn agent_calls_pass_through_and_private_pages_stay_closed() {
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
 
-    // The page may move focus to a private field by itself: every piece
-    // of text is checked.
+    // One check covers a burst of typing (each is a round trip with
+    // Playwright's settle wait); a key, a tap, or time passing checks
+    // again, so a page moving focus by itself is caught.
+    let checks = |f: &Fake| {
+        f.calls()
+            .iter()
+            .filter(|(t, a)| {
+                t == "browser_run_code_unsafe" && a["code"].to_string().contains("activeElement")
+            })
+            .count()
+    };
     b.take_over(&f.owner, "dev").await.unwrap();
-    b.user_input("dev", &json!({"kind": "text", "text": "a"}))
+    let n = checks(&f);
+    for c in ["a", "b", "c"] {
+        b.user_input("dev", &json!({"kind": "text", "text": c}))
+            .await
+            .unwrap();
+    }
+    assert_eq!(checks(&f), n + 1);
+    b.user_input("dev", &json!({"kind": "key", "key": "Tab"}))
         .await
         .unwrap();
+    b.user_input("dev", &json!({"kind": "text", "text": "d"}))
+        .await
+        .unwrap();
+    assert_eq!(checks(&f), n + 2);
     f.set("field", "true");
-    b.user_input("dev", &json!({"kind": "text", "text": "123456"}))
+    b.user_input("dev", &json!({"kind": "text", "text": "1"}))
         .await
         .unwrap();
+    assert_eq!(checks(&f), n + 2);
+    tokio::time::sleep(FIELD_CHECK_FOR).await;
+    b.user_input("dev", &json!({"kind": "text", "text": "23456"}))
+        .await
+        .unwrap();
+    assert_eq!(checks(&f), n + 3);
     b.hand_back();
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_eq!(text(&r), PRIVATE_PAGE);

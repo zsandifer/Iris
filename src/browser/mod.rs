@@ -254,7 +254,15 @@ struct Private {
     /// agent gets back (a page may echo them into its address, title, a
     /// dialog, or its text).
     secrets: Vec<String>,
+    /// When the focused field was last checked for typing (the check is a
+    /// round trip with Playwright's settle wait, too slow for every key).
+    field_checked: Option<std::time::Instant>,
 }
+
+/// How long one check of the focused field covers the owner's typing,
+/// unless they tap, press a key, or move to another page first (a page
+/// moving focus by itself is caught at the next check).
+pub(crate) const FIELD_CHECK_FOR: Duration = Duration::from_secs(3);
 
 /// Reads the owner's saved secrets (`fill::saved_secrets_blocking`).
 pub type SecretSource = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
@@ -1462,6 +1470,7 @@ impl Browser {
     pub async fn take_over(&self, user_id: &str, device_id: &str) -> Result<()> {
         self.ensure().await?;
         self.last_input.store(now_ms(), Ordering::SeqCst);
+        lock(&self.private).field_checked = None;
         self.control.send_replace(Control::User {
             user_id: user_id.into(),
             device_id: device_id.into(),
@@ -1613,7 +1622,12 @@ impl Browser {
                 .map(|v| v.clamp(0.0, 1.0))
         };
         let still = || self.controller(device_id).map(|_| ());
-        match ev["kind"].as_str().unwrap_or("") {
+        let kind = ev["kind"].as_str().unwrap_or("");
+        if kind != "text" && kind != "scroll" {
+            // Focus may move: check the field again before more typing.
+            lock(&self.private).field_checked = None;
+        }
+        match kind {
             "tap" => {
                 let x = frac("x").ok_or("x is required")? * VIEW_W as f64;
                 let y = frac("y").ok_or("y is required")? * VIEW_H as f64;
@@ -1669,15 +1683,21 @@ impl Browser {
     }
 
     /// Type for the owner into the focused field. When that field is
-    /// private, the page is closed to the agent first; this is checked for every piece of text, as the page
-    /// may move focus by itself. Printable ASCII goes through the keyboard
+    /// private, the page is closed to the agent first (checked again after
+    /// `FIELD_CHECK_FOR`, or any tap or key). Printable ASCII goes through the keyboard
     /// key by key; anything else is inserted as text, into whichever frame
     /// has focus.
     pub(crate) async fn type_text(&self, run: &Running, device_id: &str, text: &str) -> Result<()> {
         if text.is_empty() {
             return Ok(());
         }
-        self.focused_field(run, true, false).await?;
+        let fresh = lock(&self.private)
+            .field_checked
+            .is_some_and(|t| t.elapsed() < FIELD_CHECK_FOR);
+        if !fresh {
+            self.focused_field(run, true, false).await?;
+            lock(&self.private).field_checked = Some(std::time::Instant::now());
+        }
         let mut other = String::new();
         for c in text.chars().chain(std::iter::once('\0')) {
             let key = (' '..='~').contains(&c);
@@ -1700,6 +1720,11 @@ impl Browser {
             }
         }
         Ok(())
+    }
+
+    /// The focused field must be checked again before the owner's typing.
+    pub(crate) fn forget_field_check(&self) {
+        lock(&self.private).field_checked = None;
     }
 
     /// Hide a saved secret Iris filled from what the agent gets back.
