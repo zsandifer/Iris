@@ -21,8 +21,9 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       # Iris's browser end to end: Playwright MCP and Chromium installed the
-      # way the app does (latest from npm and Playwright's downloads), so
-      # upstream changes that break the wrapper show up here.
+      # way the app does (the pinned PLAYWRIGHT_MCP_VERSION from npm, then
+      # Playwright's downloads). playwright-mcp-bump.yml runs the same test
+      # on each new release before it moves the pin.
       - uses: actions/setup-node@v7
         with:
           node-version: 22

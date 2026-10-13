@@ -23,7 +23,8 @@ All notable changes to Iris are documented here, following
   Google connections keep working and are asked to sign in again to add them.
 - Iris’s computer: watch its browser, take over, and fill saved logins and
   cards there yourself. The browser is Microsoft’s Playwright MCP server,
-  installed and updated from the app; Iris only wraps it (reviewed tools,
+  installed and updated from the app at a release pinned after the real
+  browser test passes (CI bumps it weekly); Iris only wraps it (reviewed tools,
   live view, take over) instead of automating Chromium itself. Sign-ins are
   filled by Iris without the agent seeing them (`fill_saved_login`,
   `fill_saved_card` with element refs; cards ask you every time); the agent

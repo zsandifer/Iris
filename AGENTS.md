@@ -52,6 +52,9 @@ only run a call unchanged, hold it for approval, or refuse it.
    the vendors' npm packages), only into its engines directory, and only
    when the owner asks in the app or has `engines.auto_update` on. It never
    updates or removes a CLI it did not install (`engines.rs`, `setup.rs`).
+   Playwright MCP (Iris's browser server, not an agent CLI) is the
+   exception to pinning: it stays on a CI-tested release
+   (`PLAYWRIGHT_MCP_VERSION`).
 6. **Stay small.** Low idle memory (two worker threads, one SQLite
    connection, no background polling beyond the minute scheduler) and a
    lean dependency tree. Justify new dependencies.

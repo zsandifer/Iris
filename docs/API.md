@@ -2354,7 +2354,9 @@ starting). Returns `{"browser":
 
 Install (or update) Iris's browser, like
 [`POST /api/engines/browser/install`](#post-apienginesnameinstall-post-apienginesnameupdate):
-the official `@playwright/mcp` npm package into `<engines dir>/chromium`,
+the official `@playwright/mcp` npm package (pinned to a release the real
+browser test passed in CI, moved weekly when a newer one passes; an update
+installs the pin) into `<engines dir>/chromium`,
 started by `<engines dir>/bin/browser`, then its `install-browser chromium`
 into `<engines dir>/chromium/browsers`; the build then moves to the fixed
 `<engines dir>/chromium/app` (`app/chrome` on Linux) and the download

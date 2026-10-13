@@ -10,7 +10,8 @@
 //!   registry integrity hashes. Install scripts are not run.
 //!
 //! - Iris's browser: Microsoft's Playwright MCP server, the official
-//!   `@playwright/mcp` npm package (npm verifies it), then its own
+//!   `@playwright/mcp` npm package at [`PLAYWRIGHT_MCP_VERSION`] (npm
+//!   verifies it), then its own
 //!   `install-browser chromium` command, which downloads Chromium from
 //!   Playwright's download servers into `<root>/chromium/browsers`; the
 //!   build then moves to the fixed `<root>/chromium/app`, the one path the
@@ -102,6 +103,15 @@ pub const ENGINES: &[EngineSource] = &[
         source: "npm: opencode-ai",
     },
 ];
+
+/// The `@playwright/mcp` release Iris installs for its browser: an exact
+/// version the real browser test (`cargo test real_playwright -- --ignored`)
+/// passed with in CI, bumped by `.github/workflows/playwright-mcp-bump.yml`
+/// once a newer release passes it too. Iris wraps this server's tool names
+/// and output, so it does not track npm's latest. This is Iris's browser
+/// server, not one of the agent CLIs, which are never pinned (AGENTS.md
+/// invariant 5). The workflow edits this line; keep it on one line.
+pub const PLAYWRIGHT_MCP_VERSION: &str = "0.0.83";
 
 /// Iris's browser (not an AI engine, but installed and updated the same way).
 pub const BROWSER: EngineSource = EngineSource {
@@ -744,7 +754,11 @@ fn install_browser_with(
         "install",
         "--prefix",
         &prefix.to_string_lossy(),
-        &format!("{PACKAGE}@latest"),
+        // The tested pin, never `@latest`: an update installs the pin, so
+        // an install whose server differs from it moves to it and one that
+        // matches stays put.
+        &format!("{PACKAGE}@{PLAYWRIGHT_MCP_VERSION}"),
+        "--save-exact",
         "--no-fund",
         "--no-audit",
         "--ignore-scripts",
@@ -977,6 +991,10 @@ mod tests {
         assert!(!valid_version("<html>"));
         assert!(!valid_version("1.2"));
         assert!(!valid_version("1.2.3; rm -rf /"));
+        // The browser server is pinned to one exact release (no range or
+        // dist-tag such as `latest`).
+        assert!(valid_version(PLAYWRIGHT_MCP_VERSION));
+        assert!(!PLAYWRIGHT_MCP_VERSION.contains(['-', '+']));
     }
 
     #[test]
@@ -1089,6 +1107,7 @@ mod tests {
             "npm",
             r#"#!/bin/sh
 t="$(dirname "$0")"
+echo "$4" >> "$t/packages"
 m="$3/node_modules/@playwright/mcp"
 mkdir -p "$m" "$3/node_modules/playwright-core"
 echo '// cli' > "$m/cli.js"
@@ -1189,6 +1208,13 @@ touch "$PLAYWRIGHT_BROWSERS_PATH/chromium-$r/INSTALLATION_COMPLETE"
         install().unwrap();
         assert!(browser_ready(&root));
         assert!(launcher_text().starts_with("#!/bin/sh"));
+
+        // Every install and update asked npm for the pinned release, never
+        // `@latest`.
+        let packages = std::fs::read_to_string(tools.join("packages")).unwrap();
+        assert_eq!(packages.lines().count(), 7, "{packages}");
+        let pinned = format!("@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}");
+        assert!(packages.lines().all(|l| l == pinned), "{packages}");
     }
 
     #[test]

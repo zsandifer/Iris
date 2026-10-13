@@ -475,7 +475,9 @@ and lets you watch it live and take over from the app (Iris hub, Iris's
 computer).
 
 - **Getting a browser.** Tap "Set up the browser" in Iris's computer: Iris
-  installs the official `@playwright/mcp` npm package into its engines
+  installs the official `@playwright/mcp` npm package, pinned to a release
+  that passed the real browser test in CI (a weekly workflow moves the pin
+  after a new release passes it), into its engines
   directory (`<engines dir>/chromium`) and runs its own
   `install-browser chromium`, which downloads Chromium from Playwright's
   official servers (needs Node.js). The build lands at one fixed path,

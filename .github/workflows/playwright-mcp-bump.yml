@@ -1,0 +1,141 @@
+# Weekly bump of the Playwright MCP release Iris's browser installs.
+#
+# Iris pins `@playwright/mcp` to one tested release (PLAYWRIGHT_MCP_VERSION
+# in src/engines.rs) because it wraps that server's tool names and output.
+# Dependabot and Renovate cannot track a version string inside Rust source
+# without a custom manager or app, so this small workflow does it: when npm
+# has a newer release, it edits the constant, installs the browser the way
+# the app does, runs the real browser test and the unit tests, and opens a
+# PR if they pass (or an issue if they fail).
+#
+# PRs opened with GITHUB_TOKEN do not trigger other workflows, so CI does
+# not start on the bump PR by itself: re-run it from the Actions tab, or
+# close and reopen the PR.
+
+name: Playwright MCP bump
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: playwright-mcp-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Compare the pin with npm
+        id: check
+        run: |
+          set -euo pipefail
+          current="$(sed -n -E 's/^pub const PLAYWRIGHT_MCP_VERSION: &str = "([^"]+)";$/\1/p' src/engines.rs)"
+          latest="$(npm view @playwright/mcp version)"
+          echo "pinned: ${current:-none}, npm: $latest"
+          if [ -z "$current" ]; then
+            echo "::error::PLAYWRIGHT_MCP_VERSION not found in src/engines.rs"
+            exit 1
+          fi
+          # Only plain releases; this also keeps the sed below safe.
+          if ! printf '%s' "$latest" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::unexpected version from npm: $latest"
+            exit 1
+          fi
+          if [ "$latest" = "$current" ]; then
+            echo "Already on the latest release."
+            exit 0
+          fi
+          branch="playwright-mcp-$latest"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "Branch $branch already exists; nothing to do."
+            exit 0
+          fi
+          if [ -n "$(gh pr list --state all --head "$branch" --json number --jq '.[].number')" ]; then
+            echo "A PR for $branch already exists; nothing to do."
+            exit 0
+          fi
+          echo "version=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Set the pin
+        if: steps.check.outputs.version != ''
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s/^(pub const PLAYWRIGHT_MCP_VERSION: &str = \")[^\"]+(\";)$/\1${VERSION}\2/" src/engines.rs
+          grep -qx "pub const PLAYWRIGHT_MCP_VERSION: &str = \"${VERSION}\";" src/engines.rs
+          git diff --stat
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.check.outputs.version != ''
+      - uses: Swatinem/rust-cache@v2
+        if: steps.check.outputs.version != ''
+
+      - name: Real browser test
+        id: real
+        if: steps.check.outputs.version != ''
+        run: |
+          set -euo pipefail
+          cargo build
+          mkdir -p "$RUNNER_TEMP/engines"
+          chmod 755 "$RUNNER_TEMP/engines"
+          ./target/debug/iris engines install browser --dir "$RUNNER_TEMP/engines"
+          IRIS_REAL_BROWSER="$RUNNER_TEMP/engines" cargo test real_playwright -- --ignored
+
+      - name: Unit tests
+        id: unit
+        if: steps.check.outputs.version != ''
+        run: cargo test
+
+      - name: Open a PR
+        if: steps.check.outputs.version != ''
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          branch="playwright-mcp-$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add src/engines.rs
+          git commit -m "Browser: Playwright MCP $VERSION"
+          git push origin "$branch"
+          gh pr create \
+            --head "$branch" \
+            --title "Browser: Playwright MCP $VERSION" \
+            --body "Bumps the pinned \`@playwright/mcp\` (\`PLAYWRIGHT_MCP_VERSION\` in \`src/engines.rs\`) to $VERSION.
+
+          The real browser test (\`iris engines install browser\`, then \`cargo test real_playwright -- --ignored\`) and \`cargo test\` passed with this release: $RUN_URL
+
+          PRs opened by this workflow do not start CI on their own; re-run CI or close and reopen this PR before merging."
+
+      # Only when the build or a test failed (not, say, a failed push).
+      - name: Open an issue on failure
+        if: failure() && (steps.real.outcome == 'failure' || steps.unit.outcome == 'failure')
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Playwright MCP $VERSION fails the browser test"
+          if gh issue list --state open --search "in:title \"$title\"" --json title --jq '.[].title' \
+            | grep -Fxq "$title"; then
+            echo "An open issue already tracks this."
+            exit 0
+          fi
+          gh issue create --title "$title" --body "The weekly bump to \`@playwright/mcp\` $VERSION failed the real browser test or the unit tests, so the pin stays where it is. Run: $RUN_URL"
