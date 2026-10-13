@@ -206,14 +206,14 @@ try {
   await page.locator('.post .car img').nth(1).tap(); await opened();
   clamped(await metrics(page)); await page.touchscreen.tap(5, 400); await closed();
 
-  // Open the story using its label, then tap the image; Escape closes only
-  // the photo and leaves the paused story available underneath.
+  // Open the story using its label; tapping its photo never opens the
+  // photo viewer (taps step, hold pauses, double tap likes).
   await page.locator('.stile small').tap();
-  await page.locator('.viewer-im').tap({ position: { x: 195, y: 250 } }); await opened();
-  assert.equal(await page.locator('.bars b').evaluate((el) => getComputedStyle(el).animationPlayState), 'paused');
-  await page.keyboard.press('Escape'); await closed();
-  assert.equal(await page.locator('.viewer').count(), 1);
+  await page.locator('.story-viewer').tap({ position: { x: 195, y: 250 } }); await settle(page);
+  assert.equal(await page.locator('.photo-viewer').count(), 0);
+  assert.equal(await page.locator('.story-viewer').count(), 1);
   await page.locator('.viewer-top .x').tap();
+  await page.locator('.story-viewer').waitFor({ state: 'detached' });
 
   await page.getByRole('button', { name: 'Library', exact: true }).tap();
   await page.locator('.grid img[alt="Sample generated photo"]').waitFor();

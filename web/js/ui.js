@@ -201,11 +201,19 @@ export function openSheet(render) { set({ sheet: render }); }
 export function closeSheet() { set({ sheet: null }); }
 
 export function Sheet() {
-  if (!S.sheet) return null;
-  return html`<div class="sheet-wrap" onClick=${closeSheet}>
+  // Keep the last sheet on screen while it slides away.
+  const [last, setLast] = useState(() => S.sheet);
+  useEffect(() => {
+    if (S.sheet) { setLast(() => S.sheet); return undefined; }
+    const id = setTimeout(() => setLast(null), 220);
+    return () => clearTimeout(id);
+  }, [S.sheet]);
+  const render = S.sheet || last;
+  if (!render) return null;
+  return html`<div class=${'sheet-wrap' + (S.sheet ? '' : ' leaving')} onClick=${closeSheet}>
     <div class="sheet" onClick=${(e) => e.stopPropagation()} role="dialog" aria-modal="true">
       <div class="grab" />
-      ${S.sheet()}
+      ${render()}
     </div>
   </div>`;
 }
