@@ -428,6 +428,25 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
         parts.push(json!({"type": "text",
             "text": "(Iris closed the file picker: uploading files is not available.)"}));
     }
+    // A picture is checked again once taken: the page may have shown a
+    // saved secret, or become private, while it was being taken (text is
+    // redacted below; pixels cannot be).
+    if name == "browser_take_screenshot" && out["isError"] != true {
+        let private = b.private_page(&run).await.unwrap_or(true);
+        let shown = if secrets.is_empty() {
+            Some(false)
+        } else {
+            b.run_code(&run, PAGE_TEXT_CODE).await.ok().map(|v| {
+                let t = v.as_str().unwrap_or("");
+                super::hide_secrets(t, &secrets) != t
+            })
+        };
+        if private {
+            out = error(super::PRIVATE_PAGE);
+        } else if shown != Some(false) {
+            out = error(SHOWS_SECRET);
+        }
+    }
     // Files Playwright wrote for this call (a screenshot) are not for the
     // agent: gone at once.
     b.remove_output(&super::text_of(&out));

@@ -3612,7 +3612,9 @@ agent gets (addresses, titles, dialogs, page text; also their common
 encodings and card numbers written in groups). While the page's text or
 fields (all frames) show one, screenshots, `browser_find`,
 `browser_wait_for`, and targets written as selectors instead of snapshot
-refs are refused (their outcome would tell what is hidden). Expiry dates
+refs are refused (their outcome would tell what is hidden); a screenshot
+is checked again once taken and dropped if the page became private or
+showed one meanwhile. Expiry dates
 and names lock the page but are not hidden elsewhere. Playwright writes no
 page snapshots to files (`snapshot.mode: none`); `browser_snapshot`
 answers inline, and Playwright's output folder (screenshot files, its

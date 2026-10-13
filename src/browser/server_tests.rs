@@ -101,6 +101,7 @@ while IFS= read -r line; do
           esac ;;
         browser_take_screenshot)
           [ -f slowshot ] && sleep 1
+          [ -f pagetext_after ] && mv pagetext_after pagetext
           mkdir -p out && echo x > out/page-1.jpeg && echo "page said hello" > out/console-1.log
           reply '### Result\n- [Screenshot of viewport](out/page-1.jpeg)' ',{"type":"image","data":"QUJD","mimeType":"image/jpeg"}' '' ;;
         *)
@@ -677,6 +678,13 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
     f.set("pagetext", "Welcome back");
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
+    // A secret that shows up while the picture is taken: checked again
+    // after, and the picture is dropped.
+    f.set("pagetext_after", "Now showing Pw-5678");
+    let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    assert!(text(&r).starts_with("No screenshot right now"), "{r}");
+    assert!(!r.to_string().contains("QUJD"));
+    f.set("pagetext", "Welcome back");
     // Nothing Playwright wrote stays (the picture came back inline; its
     // console log may hold what the page printed).
     assert_eq!(
@@ -1397,6 +1405,42 @@ async fn real_playwright() {
         let r = f.agent(&token, tool, json!({})).await;
         assert_eq!(text(&r), PRIVATE_PAGE, "{tool}");
     }
+    // The page changes its address without a new document (a single-page
+    // app's route): the document itself stays closed, with what was typed.
+    let js = |f: &str| json!({"function": f});
+    b.tool(
+        &run,
+        "browser_evaluate",
+        &js("() => history.pushState({}, '', '/account/next')"),
+        QUICK,
+    )
+    .await
+    .unwrap();
+    let still = b
+        .tool(
+            &run,
+            "browser_evaluate",
+            &js("() => [location.pathname, document.querySelector('input').value.length]"),
+            QUICK,
+        )
+        .await
+        .unwrap();
+    assert!(
+        text_of(&still).contains("/account/next") && text_of(&still).contains("14"),
+        "the field was not kept"
+    );
+    for tool in ["browser_snapshot", "browser_take_screenshot"] {
+        let r = f.agent(&token, tool, json!({})).await;
+        assert_eq!(text(&r), PRIVATE_PAGE, "{tool} after the address changed");
+    }
+    b.tool(
+        &run,
+        "browser_evaluate",
+        &js("() => history.replaceState({}, '', '/login')"),
+        QUICK,
+    )
+    .await
+    .unwrap();
     // Another tab is open to the agent; coming back to the first is not.
     let home = format!("http://127.0.0.1:{port}/home");
     let r = f
