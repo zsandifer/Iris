@@ -3639,30 +3639,31 @@ Iris locates each field and types its value through Playwright's own
 `browser_run_code_unsafe` on Iris's side (never offered to the agent); the
 values never appear in a tool result, message, log, or command line. The
 answers are `filled`, `filled and submitted`, `denied`, `not filled (...)`,
-or `not found (...)`. A password, card number, or CVC that Iris filled closes
-the page to the agent while one of the owner's saved secrets is still in a
-field of it (inputs, text areas, and editable areas of every frame, also in
-open shadow roots; a frame that cannot be read counts as holding one), for
-example until the sign-in form is sent or cleared, even if the address never
-changes (a sign-in inside a frame). Meanwhile `browser_snapshot` still works
+or `not found (...)`. A password, card number, CVC, or expiry that Iris filled
+closes the page to the agent while one of the owner's saved secrets is still
+on it (in a field value or the text of any frame, also in open shadow roots,
+including the forms Iris hides below; a frame that cannot be read counts as
+holding one), for example until the sign-in form is sent or cleared, even if
+the address never changes (a sign-in inside a frame). Meanwhile `browser_snapshot` still works
 (with the secrets hidden, below), so the agent can tell whether a sign-in
 went through; screenshots, searches, and actions are refused. With `submit`
 or `submit_ref`, `fill_saved_login` waits up to 5 seconds for the password
 to leave the page and answers `filled and submitted (the password is no
 longer on the page: ...)` or `filled and submitted, but the password is
-still in its field (...)`. An expiry date, or a secret too short to look for
-(under 4 characters, except a 3-digit code), closes the page as if the owner
-had typed it (see below). The fill tools themselves stay usable there. The owner's saved passwords and card
+still in its field (...)`. A secret too short to look for (under 4
+characters, except a 3-digit code) closes the page as if the owner had typed
+it (see below). The fill tools themselves stay usable there. The owner's saved passwords and card
 numbers, and every value Iris filled this browser session (a CVC only
 where it stands alone), are replaced with `[hidden]` in every result the
 agent gets (addresses, titles, dialogs, page text; also their common
-encodings and card numbers written in groups). While the page's text or
+encodings, card numbers written in groups, and values trimmed and with
+whitespace runs collapsed, as snapshots show them). While the page's text or
 fields (all frames) show one, screenshots, `browser_find`,
 `browser_wait_for`, and targets written as selectors instead of snapshot
 refs are refused (their outcome would tell what is hidden); a screenshot
 is checked again once taken and dropped if the page became private or
 showed one meanwhile. Expiry dates
-and names lock the page but are not hidden elsewhere. Playwright writes no
+and names are not hidden. Playwright writes no
 page snapshots to files (`snapshot.mode: none`); `browser_snapshot`
 answers inline, and Playwright's output folder (screenshot files, its
 console logs) is emptied after every call, once a minute, and shortly after
@@ -3675,8 +3676,7 @@ an abandoned call.
   `browser_handle_dialog`, and Iris's own tools while the current page holds
   private details the owner typed (see [Input while in
   control](#4-websocket-get-apiws)), and anything but those and
-  `browser_snapshot` while a saved secret Iris filled is still in one of its
-  fields.
+  `browser_snapshot` while a saved secret Iris filled is still on it.
 
 Each call waits while the owner has taken over (up to about 50 seconds,
 then tells the agent the user is still using it), and checks again once it

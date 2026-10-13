@@ -6,7 +6,7 @@
 //! it into the focused field through the browser server. The agent never
 //! gets it: secrets travel from the vault to the page only, never into a
 //! tool result, a message, or a log, and the page is closed to the agent
-//! until it moves on. Logins are only filled into the site they were saved
+//! while they are on it. Logins are only filled into the site they were saved
 //! for (the page's real address, and never into another site's frame on
 //! it), cards and secrets only over HTTPS (plain HTTP only on this
 //! machine).
@@ -17,8 +17,9 @@
 //! through Playwright on Iris's side. Logins go only into fields whose own
 //! frame is the saved site; cards only over HTTPS and only after the owner
 //! approves that use on a card in the chat. Filling a password or card
-//! details closes the page to the agent (see `private_page`) until it moves
-//! on; `submit` presses Enter in the last field so a sign-in can.
+//! details closes the page to the agent (see `page_access`) while a saved
+//! secret is still on it; `submit` presses Enter in the last field so a
+//! sign-in can.
 
 use super::{Running, TurnCtx};
 use crate::db;
@@ -581,9 +582,10 @@ fn watchable(v: &str) -> bool {
 /// Fill `values` (candidates) into a located field of the saved item's
 /// `field`. Whether it was filled. A secret value (a password, card number,
 /// or code) is hidden from everything the agent reads afterwards, and the
-/// page is closed to the agent while it is still on it. Another private
-/// value (an expiry, which ordinary pages show, or a secret too short to
-/// look for) closes the page until it moves on, as if the owner typed it.
+/// page is closed to the agent while one is still on it. An expiry (shown
+/// on ordinary pages, never filled without the number it goes with) is
+/// left to that rule too. A secret too short to look for closes the page
+/// until it moves on, as if the owner typed it.
 #[allow(clippy::too_many_arguments)]
 async fn put(
     state: &AppState,
@@ -596,7 +598,7 @@ async fn put(
     submit: bool,
 ) -> Result<bool> {
     let secret = matches!(field, "password" | "number" | "cvc");
-    let watched = private && secret && values.iter().all(|v| watchable(v));
+    let watched = private && (!secret || values.iter().all(|v| watchable(v)));
     let mark = private && !watched;
     if mark {
         state.browser.remember_private(&at.top);

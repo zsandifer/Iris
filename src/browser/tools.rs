@@ -282,7 +282,7 @@ are fine.
   user you are waiting for them to hand it back. A page where the user typed
   a password or card stays closed to you until it moves on (you can still
   fill saved details there, or open another page). A page where Iris filled
-  a saved password or card is closed only while it is still in a field:
+  a saved password or card is closed only while it is still on the page:
   meanwhile `browser_snapshot` works, with saved details shown as [hidden].
 - If the browser is stuck or crashed (pages never load, tools keep timing
   out), call `restart_browser`: it closes and reopens it, sign-ins kept. Then
@@ -477,8 +477,10 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     // saved secret, or become private, while it was being taken (text is
     // redacted below; pixels cannot be).
     if name == "browser_take_screenshot" && out["isError"] != true {
-        let private = b.private_page(&run).await.unwrap_or(true);
-        let shown = if secrets.is_empty() {
+        let access = b.page_access(&run).await.unwrap_or(Access::Typed);
+        let shown = if access == Access::Filled {
+            Some(true)
+        } else if secrets.is_empty() {
             Some(false)
         } else {
             b.run_code(&run, PAGE_TEXT_CODE).await.ok().map(|v| {
@@ -486,7 +488,7 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
                 super::hide_secrets(t, &secrets) != t
             })
         };
-        if private {
+        if access == Access::Typed {
             out = error(super::PRIVATE_PAGE);
         } else if shown != Some(false) {
             out = error(SHOWS_SECRET);

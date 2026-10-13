@@ -326,10 +326,10 @@ function SaveLoginCard({ c, m }) {
       : !isOwner() ? html`<small class="mu">Only the owner can save this.</small>`
       : html`<p>It goes straight to Logins & wallet. I never see it; I just sign in with it.</p>
         <form class="form" onSubmit=${save}>
-          <label class="lbl">Name</label><input class="field" required value=${f.label} onInput=${up('label')} />
-          <label class="lbl">Website</label><input class="field" required autocapitalize="off" value=${f.site} onInput=${up('site')} />
-          <label class="lbl">Username or email</label><input class="field" autocapitalize="off" autocomplete="off" value=${f.username} onInput=${up('username')} />
-          <label class="lbl">Password</label><input class="field" type="password" autocomplete="new-password" required value=${f.password} onInput=${up('password')} />
+          <label class="lbl" for=${`sl-n-${m.id}`}>Name</label><input id=${`sl-n-${m.id}`} class="field" required value=${f.label} onInput=${up('label')} />
+          <label class="lbl" for=${`sl-s-${m.id}`}>Website</label><input id=${`sl-s-${m.id}`} class="field" required autocapitalize="off" value=${f.site} onInput=${up('site')} />
+          <label class="lbl" for=${`sl-u-${m.id}`}>Username or email</label><input id=${`sl-u-${m.id}`} class="field" autocapitalize="off" autocomplete="off" value=${f.username} onInput=${up('username')} />
+          <label class="lbl" for=${`sl-p-${m.id}`}>Password</label><input id=${`sl-p-${m.id}`} class="field" type="password" autocomplete="new-password" required value=${f.password} onInput=${up('password')} />
           <div class="act"><button disabled=${busy}>${busy ? 'Saving…' : 'Save login'}</button></div>
         </form>`}
   </div>`;

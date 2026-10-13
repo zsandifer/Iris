@@ -538,8 +538,8 @@ computer).
   any tab) until it moves on to a new page, for example after the sign-in;
   it can still open another page, but not that address again until the
   browser closes. A saved password or card Iris filled closes the page only
-  while it is still in a field (sent or cleared forms open it again, even
-  when the address stays the same); meanwhile the agent can still read the
+  while it is still on it, in a field or its text (sent or cleared forms
+  open it again, even when the address stays the same); meanwhile the agent can still read the
   page, with the secret hidden, to see whether the sign-in worked. The agent never gets your saved
   logins or cards. While you are in control, dialogs the page shows are
   answered for you (alerts and confirmations accepted, prompts dismissed),

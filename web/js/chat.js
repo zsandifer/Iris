@@ -1,7 +1,7 @@
 // Chat: messages, live status phrases, receipts, cards, and the composer.
 import { html, useEffect, useLayoutEffect, useRef, useState } from './h.js';
 import { post, put, api, seg, isId } from './api.js';
-import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId, isOwner, convFor, lookUpConv } from './store.js';
+import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId, isOwner, convFor, lookUpConv, peekShown } from './store.js';
 import { Icon, Img, Avatar, agentName, stamp, Spinner } from './ui.js';
 import { openPhoto } from './photo.js';
 import { md } from './md.js';
@@ -47,31 +47,24 @@ function retryFor(list, m) {
   return null;
 }
 
-/** The live browser peek of a finished turn: it often ends by asking the
- * owner to take over, so it stays at least until `until` and until they
- * write again (the server drops it when they take over or the browser
- * closes). */
-function LingeringPeek({ until, later }) {
+/** The live browser peek under an assistant message (`peekShown`). A
+ * finished turn often ends by asking the owner to take over, so its peek
+ * stays a while; this re-renders when that minimum time is up (the server
+ * drops it when they take over or the browser closes). */
+function Peek({ m, list }) {
   const [, tick] = useState(0);
-  const left = until - Date.now();
+  const until = S.browsing[m.id]?.until;
+  const left = until == null ? 0 : until - Date.now();
   useEffect(() => {
     if (left <= 0) return undefined;
     const t = setTimeout(() => tick((x) => x + 1), left + 50);
     return () => clearTimeout(t);
   }, [until]);
-  if (left <= 0 && later) return null;
-  return html`<${BrowserPeek} />`;
+  return peekShown(m.id, list) ? html`<${BrowserPeek} />` : null;
 }
 
-/** The peek under an assistant message: while its turn browses, and for a
- * while after. */
 function peekFor(m, list) {
-  const e = S.browsing[m.id];
-  if (!e) return null;
-  if (e.until == null) return html`<${BrowserPeek} />`;
-  const i = list.findIndex((x) => x.id === m.id);
-  const later = list.slice(i + 1).some((x) => x.role === 'user');
-  return html`<${LingeringPeek} until=${e.until} later=${later} />`;
+  return S.browsing[m.id] ? html`<${Peek} m=${m} list=${list} />` : null;
 }
 
 function Assistant({ m, list }) {

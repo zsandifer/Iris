@@ -86,7 +86,7 @@ while IFS= read -r line; do
                 esac
               fi ;;
             *'walk(document)'*)
-              t=$(cat fields 2>/dev/null)
+              t="$(cat fields 2>/dev/null) $(cat pagetext 2>/dev/null)"
               if [ -f fieldsfail ]; then reply "### Result\\nnull" '' ''
               else reply "### Result\\n\\\"$t\\\"" '' ''; fi ;;
             *innerText*)
@@ -761,7 +761,8 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
     assert!(text(&r).starts_with("No screenshot right now"), "{r}");
     // Nor searching it (a match or not would tell what is hidden), or
-    // naming elements by text; snapshot refs still work.
+    // naming elements by text; and while the page shows it, nothing else
+    // but reading it, redacted.
     for (tool, args) in [
         ("browser_find", json!({"text": "p=P"})),
         ("browser_wait_for", json!({"text": "Pw-5"})),
@@ -770,15 +771,15 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
         let r = f.agent(&token, tool, args).await;
         assert!(text(&r).contains("searching it"), "{tool}: {r}");
     }
-    let r = f
-        .agent(
-            &token,
-            "browser_click",
-            json!({"target": "e3", "element": "Search"}),
-        )
-        .await;
+    let click = json!({"target": "e3", "element": "Search"});
+    let r = f.agent(&token, "browser_click", click.clone()).await;
+    assert_eq!(text(&r), FILLED_PAGE);
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
+    // Once it is gone, the page is the agent's again.
     f.set("pagetext", "Welcome back");
+    let r = f.agent(&token, "browser_click", click).await;
+    assert_ne!(r["isError"], true, "{r}");
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     // A secret that shows up while the picture is taken: checked again
@@ -1022,8 +1023,29 @@ async fn the_agent_fills_a_card_only_after_the_owner_approves() {
     assert!(done[2].0.contains(r#"["2031","31"]"#));
     assert!(done[3].0.contains("737"));
     assert!(done[4].0.contains("S Doe"));
+    // The expiry did not lock the document for good: while the number and
+    // code are in their fields the page can only be read (without them),
+    // and once the form clears them it is open again, on the same page.
+    assert!(!f.file("marked").exists());
+    f.set("fields", "4111111111111111 04 2031 737 S Doe");
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
-    assert_eq!(text(&r), PRIVATE_PAGE);
+    assert!(text(&r).starts_with("No screenshot right now"), "{r}");
+    let r = f
+        .agent(&token, "browser_click", json!({"target": "e9"}))
+        .await;
+    assert_eq!(text(&r), FILLED_PAGE);
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(
+        !r.to_string().contains("4111") && !text(&r).contains(" 737"),
+        "{r}"
+    );
+    f.set("fields", "S Doe");
+    let r = f
+        .agent(&token, "browser_click", json!({"target": "e9"}))
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    f.set("fields", "");
     // The number and code are hidden from now on; the expiry and name are
     // not (ordinary pages show years and months).
     let hidden = b.filled_secrets();
@@ -1559,7 +1581,20 @@ async fn real_playwright() {
             let n = stream.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]);
             let big = "position:absolute;left:0;width:500px;height:200px";
-            let body = if req.starts_with("GET /login") {
+            // A sign-in kept in a cookie that outlives the browser.
+            let mut extra = String::new();
+            let body = if req.starts_with("GET /remember") {
+                extra = "Set-Cookie: iris_smoke=1; Max-Age=86400; Path=/\r\n".into();
+                "<html><body><p>Remembered</p></body></html>".to_string()
+            } else if req.starts_with("GET /me") {
+                let signed = req.lines().any(|l| {
+                    l.to_ascii_lowercase().starts_with("cookie:") && l.contains("iris_smoke=1")
+                });
+                format!(
+                    "<html><body><p>{}</p></body></html>",
+                    if signed { "Signed in" } else { "Signed out" }
+                )
+            } else if req.starts_with("GET /login") {
                 "<html><head><title>Iris smoke sign in</title></head><body style='margin:0'>\
                  <input type=password aria-label=Password style='position:absolute;top:100px;left:0;width:500px;height:100px'>\
                  <p style='margin-top:250px'>Sign in to continue</p></body></html>"
@@ -1658,7 +1693,7 @@ async fn real_playwright() {
             };
             let _ = write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
         }
@@ -2199,8 +2234,18 @@ async fn real_playwright() {
         values.contains(r#"["4111111111111111","3","31","737"]"#),
         "the card fields hold something else"
     );
+    // The expiry does not lock the page for good: it can be read without
+    // the number and code while they are in their fields.
     let r = f.agent(&chat_token, "browser_snapshot", json!({})).await;
-    assert_eq!(text(&r), PRIVATE_PAGE);
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(
+        !r.to_string().contains("4111"),
+        "the card number reached the agent"
+    );
+    let r = f
+        .agent(&chat_token, "browser_press_key", json!({"key": "Tab"}))
+        .await;
+    assert_eq!(text(&r), FILLED_PAGE);
     // Going away and back to the filled form writes nothing of it to disk.
     let r = f
         .agent(
@@ -2374,15 +2419,27 @@ async fn real_playwright() {
     b.hand_back();
 
     // The agent asks the owner to save a login for the open site, and
-    // restarts the browser: a new one, the profile kept.
+    // restarts the browser: a new one, its sign-ins kept.
     let chat = b.begin_turn(&f.owner, &f.conv, "m3", std::slice::from_ref(&f.owner));
     let token = chat.token().to_string();
+    let page = |p: &str| json!({"url": format!("http://127.0.0.1:{port}/{p}")});
+    let me = async |f: &Fake, token: &str| {
+        f.agent(token, "browser_navigate", page("me")).await;
+        text(&f.agent(token, "browser_snapshot", json!({})).await)
+    };
+    assert!(me(&f, &token).await.contains("Signed out"));
+    f.agent(&token, "browser_navigate", page("remember")).await;
+    assert!(me(&f, &token).await.contains("Signed in"));
     let r = f.agent(&token, "ask_to_save_login", json!({})).await;
     assert!(text(&r).starts_with("posted"), "{r}");
     let r = f.agent(&token, "restart_browser", json!({})).await;
     assert!(text(&r).starts_with("restarted"), "{r}");
     let again = b.running().unwrap();
     assert!(!Arc::ptr_eq(&run, &again));
+    assert!(
+        me(&f, &token).await.contains("Signed in"),
+        "the sign-in did not survive the restart"
+    );
     let r = f
         .agent(&token, "browser_navigate", json!({"url": home.clone()}))
         .await;

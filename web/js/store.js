@@ -495,6 +495,18 @@ const loaders = { feed: () => loadFeed(), ideas: loadIdeas, goals: loadGoals, li
 
 // ------------------------------------------------------------------ events
 
+/** Whether the browser peek shows under assistant message `id` of a chat
+ * (`list`, its messages in order): while its turn browses, and after the
+ * turn at least until the entry's `until` and until a user message follows
+ * it. */
+export function peekShown(id, list, now = Date.now()) {
+  const e = S.browsing[id];
+  if (!e) return false;
+  if (e.until == null || now < e.until) return true;
+  const i = list.findIndex((x) => x.id === id);
+  return !list.slice(i + 1).some((x) => x.role === 'user');
+}
+
 /** A message the server returned (also arrives as `message.updated`). */
 export function upsertMessage(msg) {
   upsert(msg.conversation_id, msg);

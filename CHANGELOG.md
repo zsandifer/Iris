@@ -30,7 +30,7 @@ All notable changes to Iris are documented here, following
   `fill_saved_card` with element refs; cards ask you every time); the agent
   cannot read a page where a password was typed until it moves on (in any
   tab, or back in history), and cannot act on one where a saved password or
-  card Iris filled is still in a field (it can read it, with the secret
+  card Iris filled is still on it (it can read it, with the secret
   hidden, to see whether a sign-in worked). The agent can restart a stuck
   browser (`restart_browser`, sign-ins kept) and post a card in the chat
   where you save a login for the open site (`ask_to_save_login`). The chat

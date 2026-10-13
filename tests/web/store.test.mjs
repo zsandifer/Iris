@@ -7,7 +7,7 @@ import { setToken } from '../../web/js/api.js';
 import {
   S, set, loadMessages, loadOlder, handleEvent, loadLibrary, loadMoreSaved, loadMorePhotos, loadMoreItems,
   loadConvs, loadFeed, refreshAll, loadGoals, loadIdeas, touchList,
-  loginMark, applyLoginResponse,
+  loginMark, applyLoginResponse, peekShown,
 } from '../../web/js/store.js';
 
 setToken('t');
@@ -466,4 +466,31 @@ test('a finished browsing turn keeps its peek for a while; the server state can 
   assert.equal(S.browsing.b3.until, null);
   handleEvent({ type: 'browser.state', browser: { active: [] } });
   assert.deepEqual(S.browsing, {});
+});
+
+test('the peek stays at least its minute and until the owner writes again', () => {
+  const reply = { id: 'p1', role: 'assistant' };
+  const later = { id: 'u9', role: 'user' };
+  const t0 = Date.now();
+  handleEvent({ type: 'browser.active', conversation_id: CID, message_id: 'p1' });
+  // While the turn browses: always.
+  assert.equal(peekShown('p1', [reply, later], t0 + 3600000), true);
+  handleEvent({ type: 'browser.done', conversation_id: CID, message_id: 'p1', linger_ms: 60000 });
+  const until = S.browsing.p1.until;
+  // Within the minute: shown, also when the owner already wrote again.
+  assert.equal(peekShown('p1', [reply], until - 1), true);
+  assert.equal(peekShown('p1', [reply, later], until - 1), true);
+  // After it: shown until the owner writes, then gone.
+  assert.equal(peekShown('p1', [reply, { id: 'n', role: 'system' }], until + 3600000), true);
+  assert.equal(peekShown('p1', [reply, later], until), false);
+  // A user message before the reply does not count.
+  assert.equal(peekShown('p1', [later, reply], until + 1), true);
+  // After a reload the server's list gives what is left.
+  handleEvent({ type: 'browser.state', browser: { active: [{ conversation_id: CID, message_id: 'p1', ended_at: 1, linger_ms: 0 }] } });
+  assert.equal(peekShown('p1', [reply], Date.now() + 1), true);
+  assert.equal(peekShown('p1', [reply, later], Date.now() + 1), false);
+  // Taken over: gone.
+  handleEvent({ type: 'browser.state', browser: { active: [] } });
+  assert.equal(peekShown('p1', [reply]), false);
+  assert.ok(t0 <= Date.now());
 });

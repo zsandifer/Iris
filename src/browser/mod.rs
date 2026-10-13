@@ -27,7 +27,7 @@
 //! address (a page brought back from history may still hold what was
 //! typed), until the browser closes. A saved password or card number Iris
 //! filled is known to Iris, so it closes a page only while it is still on
-//! it (in a field of any frame); meanwhile the agent may still
+//! it (in a field or the text of any frame); meanwhile the agent may still
 //! read the page, with the secret hidden, to see whether a sign-in worked.
 
 pub mod apparmor;
@@ -185,9 +185,9 @@ pub const TURN_ENDED: &str = "This browser session has ended.";
 pub const PRIVATE_PAGE: &str = "The user typed private details on this page (like a password, \
     card details, or a code), so you cannot read or use it. Wait until they finish and the page \
     moves on (for example after signing in), or open another page.";
-pub const FILLED_PAGE: &str = "A saved password or card number is still in a field on this page, \
-    so you can only read it with browser_snapshot (saved details show as [hidden]) until the form \
-    is sent or cleared, or open another page. Use fill_saved_login with submit_ref to send a \
+pub const FILLED_PAGE: &str = "A saved password or card number is still on this page, so you \
+    can only read it with browser_snapshot (saved details show as [hidden]) until the form is \
+    sent or cleared, or open another page. Use fill_saved_login with submit_ref to send a \
     sign-in form. If it seems stuck, ask the user to take over.";
 const NOT_INSTALLED: &str = "no browser is installed; set it up from Iris's computer in the app";
 const DISCONNECTED: &str =
@@ -276,8 +276,9 @@ struct Private {
     /// When the focused field was last checked for typing (the check is a
     /// round trip with Playwright's settle wait, too slow for every key).
     field_checked: Option<std::time::Instant>,
-    /// Iris filled a saved secret this session: a page is closed to the
-    /// agent while one is still on it (`page_access`).
+    /// Iris filled a saved secret (or an expiry) this session: a page is
+    /// closed to the agent while a saved secret is still on it
+    /// (`page_access`).
     filled: bool,
 }
 
@@ -500,20 +501,22 @@ const FIELD_FN: &str = r#"() => {
   return { private: priv, frame };
 }"#;
 
-/// What every field holds (inputs, text areas, editable areas; also in
-/// open shadow roots) in every frame of the page, to look for saved
+/// What every field holds (inputs, text areas) and the text of every
+/// frame of the page (also in open shadow roots), to look for saved
 /// secrets Iris filled. `null` when a frame could not be read (counted as
 /// holding one).
 const SECRET_CHECK_CODE: &str = r#"async (page) => {
   const out = [];
   for (const f of page.frames()) {
     const r = await f.evaluate(() => {
-      const vals = [];
+      const vals = [document.body ? document.body.innerText : ''];
       const walk = (root) => {
         for (const e of root.querySelectorAll('*')) {
           if (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA') vals.push(String(e.value));
-          else if (e.isContentEditable && !(e.parentElement && e.parentElement.isContentEditable)) vals.push(e.innerText);
-          if (e.shadowRoot) walk(e.shadowRoot);
+          if (e.shadowRoot) {
+            vals.push(e.shadowRoot.textContent || '');
+            walk(e.shadowRoot);
+          }
         }
       };
       walk(document);
@@ -528,7 +531,7 @@ const SECRET_CHECK_CODE: &str = r#"async (page) => {
   return out.join('\n');
 }"#;
 
-/// Marks the current document private (see `private_page`).
+/// Marks the current document private (see `page_access`).
 pub(crate) const MARK_JS: &str = "(() => { try { Object.defineProperty(window, '__irisPrivate', { value: true }); } catch (_) {} })()";
 
 /// Run `FIELD_FN` from Playwright's Node side, with the real address.
@@ -571,7 +574,8 @@ const KEYS: &[&str] = &[
 
 /// How a value shows up once a page or Playwright has handled it: sent by
 /// a form (`application/x-www-form-urlencoded`), escaped by
-/// `encodeURIComponent`, or quoted in a snapshot (JSON-style escapes).
+/// `encodeURIComponent`, or quoted in a snapshot (JSON-style escapes;
+/// snapshots also trim values and collapse runs of whitespace).
 fn written_forms(secret: &str) -> Vec<String> {
     let encode = |keep: &dyn Fn(u8) -> bool, space_plus: bool| -> String {
         secret
@@ -589,9 +593,17 @@ fn written_forms(secret: &str) -> Vec<String> {
     };
     let form = encode(&|b| b"*-._".contains(&b), true);
     let component = encode(&|b| b"-_.!~*'()".contains(&b), false);
-    let json = serde_json::to_string(secret).unwrap_or_default();
-    let json = json[1..json.len().saturating_sub(1).max(1)].to_string();
-    let mut forms = vec![form, component, json];
+    let quoted = |s: &str| {
+        let json = serde_json::to_string(s).unwrap_or_default();
+        json[1..json.len().saturating_sub(1).max(1)].to_string()
+    };
+    // Snapshots trim a value and collapse its runs of whitespace.
+    let collapsed = secret.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut forms = vec![form, component, quoted(secret)];
+    if collapsed != secret && collapsed.chars().count() >= 4 {
+        forms.push(quoted(&collapsed));
+        forms.push(collapsed);
+    }
     forms.retain(|f| f != secret && !f.is_empty());
     forms.sort();
     forms.dedup();
@@ -1285,7 +1297,7 @@ impl Browser {
         Ok(field)
     }
 
-    /// Keep the agent off this address (see `private_page`).
+    /// Keep the agent off this address (see `page_access`).
     pub(crate) fn remember_private(&self, url: &str) {
         let mut p = lock(&self.private);
         let key = page_key(url).to_string();
@@ -1848,11 +1860,6 @@ impl Browser {
         *lock(&self.secret_source) = Some(source);
     }
 
-    /// Whether the agent must keep off the current page.
-    pub(crate) async fn private_page(&self, run: &Running) -> Result<bool> {
-        Ok(self.page_access(run).await? != Access::Open)
-    }
-
     /// What the agent may do on the current page: the owner typed private
     /// details into this document, or on this address (closed); a saved
     /// secret Iris filled is still on it (redacted reads only); or open.
@@ -1878,8 +1885,8 @@ impl Browser {
         Ok(Access::Open)
     }
 
-    /// Whether a saved secret is still in a field of the current page (any
-    /// frame, also in shadow roots). Unknown counts as yes.
+    /// Whether a saved secret is still on the current page: in a field or
+    /// the text of any frame (also in shadow roots). Unknown counts as yes.
     pub(crate) async fn shows_secret(&self, run: &Running) -> Result<bool> {
         let secrets = self.filled_secrets();
         if secrets.is_empty() {
@@ -2121,6 +2128,16 @@ mod tests {
             &short,
         );
         assert_eq!(t.matches("[hidden]").count(), 5);
+        // Snapshots trim values and collapse whitespace inside them.
+        let spaced = [
+            "red  fox  ocean".to_string(),
+            "  synthetic-passphrase  ".to_string(),
+        ];
+        let t = hide_secrets(
+            "- textbox \"Password\": red fox ocean\n- textbox: synthetic-passphrase",
+            &spaced,
+        );
+        assert!(!t.contains("fox") && !t.contains("passphrase"), "{t}");
         let amex = ["378282246310005".to_string()];
         assert_eq!(hide_secrets("3782 822463 10005", &amex), "[hidden]");
         assert_eq!(hide_secrets("nothing here", &secrets), "nothing here");
