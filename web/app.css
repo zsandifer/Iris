@@ -273,7 +273,6 @@ span.fav { display: inline-block; overflow: hidden; }
 .viewer-heart { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; color: #fff;
   filter: drop-shadow(0 4px 18px rgba(0,0,0,.4)); animation: heart-pop .8s ease-out forwards; }
 @keyframes heart-pop { 0% { opacity: 0; transform: scale(.4); } 25% { opacity: 1; transform: scale(1.1); } 45% { transform: scale(1); } 100% { opacity: 0; transform: scale(1); } }
-@media (prefers-reduced-motion: reduce) { .story-viewer, .viewer-topic, .viewer-story, .viewer-tx { animation: none; } }
 .viewer-blank { background: linear-gradient(160deg, #6d5bd0, #1d1925); }
 .viewer-shade { position: absolute; inset: 0; pointer-events: none; background: linear-gradient(rgba(0,0,0,.45), transparent 22%, transparent 45%, rgba(0,0,0,.8)); }
 .bars { position: absolute; top: calc(var(--sat) + 10px); left: 12px; right: 12px; display: flex; gap: 4px; }
@@ -603,9 +602,10 @@ details.alt p { margin: 8px 0; }
 details.alt::details-content { opacity: 0; transition: opacity .22s, content-visibility .22s allow-discrete; }
 details.alt[open]::details-content { opacity: 1; }
 @media (prefers-reduced-motion: reduce) {
-  .route, .sheet-wrap, .sheet, .toast, .story-viewer, .warn, .warn-box, .feed-note, .feed-run, .rail, .empty, .rcpt-steps, .peek, .retry,
+  .route, .sheet-wrap, .sheet, .toast, .story-viewer, .viewer-topic, .viewer-story, .viewer-tx, .viewer, .warn, .warn-box, .feed-note, .feed-run, .rail, .empty, .rcpt-steps, .peek, .retry,
   .notify-card, .paused-bar, .att, .note, .ap-raw, .effort, .vw-bar, .live-line, .photo-error, .screen, .status, .gnote, .post-b, .md, .photo-layer img {
     animation: none !important; }
+  .viewer-heart { display: none; }
 }
 /* the computer view is fixed to the window: a sliding parent would move it */
 .route:has(.viewer) { animation-name: fade; }

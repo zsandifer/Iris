@@ -327,7 +327,9 @@ export function StoryViewer() {
     addEventListener('keydown', key);
     return () => removeEventListener('keydown', key);
   });
-  useEffect(() => () => clearTimeout(tap.current?.timer), []);
+  // A tap waiting out a double tap belongs to the story it was on: closing,
+  // swiping or moving on drops it.
+  useEffect(() => () => { clearTimeout(tap.current?.timer); tap.current = null; }, [S.story]);
 
   if (!st || !p) return null;
 
@@ -360,7 +362,8 @@ export function StoryViewer() {
     const x = (e.clientX - r.left) / r.width;
     const d = x < 0.25 ? -1 : x > 0.75 ? 1 : 0;
     // Wait out a possible second tap before stepping.
-    tap.current = { at: Date.now(), timer: d ? setTimeout(() => { tap.current = null; step(d); }, 300) : null };
+    const at = S.story;
+    tap.current = { at: Date.now(), timer: d ? setTimeout(() => { tap.current = null; if (S.story === at) step(d); }, 300) : null };
     return undefined;
   };
 
