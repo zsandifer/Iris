@@ -21,15 +21,19 @@
 //!   control (`fill.rs`).
 //!
 //! When the owner types into a private field (a password, card details, a
-//! one-time code) or fills a saved secret, that page is closed to the
-//! agent, so the agent never reads what was typed: the document itself is
-//! marked (it stays closed in any tab, and after the address changes
-//! within it), and so is its address (a page brought back from history may
-//! still hold what was typed), until the browser closes.
+//! one-time code), that page is closed to the agent, so the agent never
+//! reads what was typed: the document itself is marked (it stays closed in
+//! any tab, and after the address changes within it), and so is its
+//! address (a page brought back from history may still hold what was
+//! typed), until the browser closes. A saved password or card number Iris
+//! filled is known to Iris, so it closes a page only while it is still on
+//! it (in a field of any frame); meanwhile the agent may still
+//! read the page, with the secret hidden, to see whether a sign-in worked.
 
 pub mod apparmor;
 pub mod fill;
 pub mod launch;
+pub mod own;
 #[cfg(test)]
 mod server_tests;
 pub mod socket;
@@ -181,6 +185,10 @@ pub const TURN_ENDED: &str = "This browser session has ended.";
 pub const PRIVATE_PAGE: &str = "The user typed private details on this page (like a password, \
     card details, or a code), so you cannot read or use it. Wait until they finish and the page \
     moves on (for example after signing in), or open another page.";
+pub const FILLED_PAGE: &str = "A saved password or card number is still in a field on this page, \
+    so you can only read it with browser_snapshot (saved details show as [hidden]) until the form \
+    is sent or cleared, or open another page. Use fill_saved_login with submit_ref to send a \
+    sign-in form. If it seems stuck, ask the user to take over.";
 const NOT_INSTALLED: &str = "no browser is installed; set it up from Iris's computer in the app";
 const DISCONNECTED: &str =
     "The browser is disconnected; the owner can reopen it in Iris’s computer.";
@@ -210,10 +218,21 @@ impl Drop for TurnGuard {
         if let Some(ctx) = ctx
             && ctx.used.load(Ordering::SeqCst)
         {
+            // The peek stays a while in a chat someone sees (not a job's).
+            let linger = !ctx.audience.is_empty()
+                && self.browser.running().is_some()
+                && self.browser.control() == Control::Agent;
+            if linger {
+                lock(&self.browser.recent).insert(
+                    ctx.conversation_id.clone(),
+                    (ctx.message_id.clone(), now_ms()),
+                );
+            }
             self.browser.hub.to_users(
                 &ctx.audience,
                 json!({"type": "browser.done", "conversation_id": ctx.conversation_id,
-                       "message_id": ctx.message_id}),
+                       "message_id": ctx.message_id,
+                       "linger_ms": if linger { LINGER_MS } else { 0 }}),
             );
             self.browser.broadcast_state();
         }
@@ -257,6 +276,19 @@ struct Private {
     /// When the focused field was last checked for typing (the check is a
     /// round trip with Playwright's settle wait, too slow for every key).
     field_checked: Option<std::time::Instant>,
+    /// Iris filled a saved secret this session: a page is closed to the
+    /// agent while one is still on it (`page_access`).
+    filled: bool,
+}
+
+/// Whether the agent may use the current page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Access {
+    Open,
+    /// The owner typed private details into it: closed until it moves on.
+    Typed,
+    /// A saved secret Iris filled is still on it: only redacted reads.
+    Filled,
 }
 
 /// How long one check of the focused field covers the owner's typing,
@@ -270,6 +302,11 @@ pub type SecretSource = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 /// Most private addresses remembered (the oldest are forgotten first; the
 /// documents themselves stay marked).
 const PRIVATE_PAGES_MAX: usize = 64;
+
+/// After a turn that used the browser ends, the chat keeps its live peek at
+/// least this long (and until the owner writes again, or takes over): the
+/// turn often ends by asking them to take over.
+pub const LINGER_MS: i64 = 60_000;
 
 /// Shared browser state (cheap to clone through `Arc`).
 pub struct Shared {
@@ -292,6 +329,9 @@ pub struct Shared {
     next_watcher: AtomicU64,
     casting: AtomicBool,
     turns: Mutex<HashMap<String, Arc<TurnCtx>>>,
+    /// The last finished turn that used the browser, per conversation:
+    /// (message id, ended at). Its chat peek stays for a while.
+    recent: Mutex<HashMap<String, (String, i64)>>,
     last_used: AtomicI64,
     last_input: AtomicI64,
     /// Serializes actions on the page (tool calls and the owner's input).
@@ -458,6 +498,34 @@ const FIELD_FN: &str = r#"() => {
     try { Object.defineProperty(window, '__irisPrivate', { value: true }); } catch (_) {}
   }
   return { private: priv, frame };
+}"#;
+
+/// What every field holds (inputs, text areas, editable areas; also in
+/// open shadow roots) in every frame of the page, to look for saved
+/// secrets Iris filled. `null` when a frame could not be read (counted as
+/// holding one).
+const SECRET_CHECK_CODE: &str = r#"async (page) => {
+  const out = [];
+  for (const f of page.frames()) {
+    const r = await f.evaluate(() => {
+      const vals = [];
+      const walk = (root) => {
+        for (const e of root.querySelectorAll('*')) {
+          if (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA') vals.push(String(e.value));
+          else if (e.isContentEditable && !(e.parentElement && e.parentElement.isContentEditable)) vals.push(e.innerText);
+          if (e.shadowRoot) walk(e.shadowRoot);
+        }
+      };
+      walk(document);
+      return vals;
+    }).catch(() => null);
+    if (r === null) {
+      if (f.isDetached()) continue;
+      return null;
+    }
+    out.push(...r);
+  }
+  return out.join('\n');
 }"#;
 
 /// Marks the current document private (see `private_page`).
@@ -641,6 +709,7 @@ impl Browser {
             next_watcher: AtomicU64::new(1),
             casting: AtomicBool::new(false),
             turns: Mutex::default(),
+            recent: Mutex::default(),
             last_used: AtomicI64::new(0),
             last_input: AtomicI64::new(0),
             op_lock: tokio::sync::Mutex::new(()),
@@ -805,6 +874,8 @@ impl Browser {
     pub fn mark_used(&self, ctx: &TurnCtx) {
         self.last_used.store(now_ms(), Ordering::SeqCst);
         if !ctx.used.swap(true, Ordering::SeqCst) {
+            // This turn's peek replaces the conversation's earlier one.
+            lock(&self.recent).remove(&ctx.conversation_id);
             self.hub.to_users(
                 &ctx.audience,
                 json!({"type": "browser.active", "conversation_id": ctx.conversation_id,
@@ -814,12 +885,21 @@ impl Browser {
         }
     }
 
+    /// Turns whose chat shows the browser peek: running ones that used it,
+    /// then the last finished one per conversation (with when it ended and
+    /// how much longer it stays at least).
     fn active_turns(&self) -> Vec<Value> {
-        lock(&self.turns)
+        let mut out: Vec<Value> = lock(&self.turns)
             .values()
             .filter(|t| t.used.load(Ordering::SeqCst))
             .map(|t| json!({"conversation_id": t.conversation_id, "message_id": t.message_id}))
-            .collect()
+            .collect();
+        let now = now_ms();
+        out.extend(lock(&self.recent).iter().map(|(conv, (msg, ended))| {
+            json!({"conversation_id": conv, "message_id": msg, "ended_at": ended,
+                   "linger_ms": (ended + LINGER_MS - now).clamp(0, LINGER_MS)})
+        }));
+        out
     }
 
     /// Wait until the agent may drive (the owner is not in control). False
@@ -1307,6 +1387,7 @@ impl Browser {
         launch::clear_session_files(&self.profile_dir);
         let _ = std::fs::remove_dir_all(&self.out_dir);
         *lock(&self.private) = Private::default();
+        lock(&self.recent).clear();
         self.control.send_replace(Control::Agent);
         self.frames.send_replace(None);
         self.broadcast_state();
@@ -1491,6 +1572,8 @@ impl Browser {
         self.ensure().await?;
         self.last_input.store(now_ms(), Ordering::SeqCst);
         lock(&self.private).field_checked = None;
+        // The owner is here now: finished turns' peeks have done their job.
+        lock(&self.recent).clear();
         self.control.send_replace(Control::User {
             user_id: user_id.into(),
             device_id: device_id.into(),
@@ -1765,18 +1848,61 @@ impl Browser {
         *lock(&self.secret_source) = Some(source);
     }
 
-    /// Whether the agent must keep off the current page: the owner typed
-    /// private details into this document, or on this address.
+    /// Whether the agent must keep off the current page.
     pub(crate) async fn private_page(&self, run: &Running) -> Result<bool> {
-        if lock(&self.private).pages.is_empty() {
+        Ok(self.page_access(run).await? != Access::Open)
+    }
+
+    /// What the agent may do on the current page: the owner typed private
+    /// details into this document, or on this address (closed); a saved
+    /// secret Iris filled is still on it (redacted reads only); or open.
+    pub(crate) async fn page_access(&self, run: &Running) -> Result<Access> {
+        let (typed, filled) = {
+            let p = lock(&self.private);
+            (!p.pages.is_empty(), p.filled)
+        };
+        if typed {
+            let (url, marked) = self.page_info(run).await?;
+            if marked
+                || lock(&self.private)
+                    .pages
+                    .iter()
+                    .any(|p| p == page_key(&url))
+            {
+                return Ok(Access::Typed);
+            }
+        }
+        if filled && self.shows_secret(run).await? {
+            return Ok(Access::Filled);
+        }
+        Ok(Access::Open)
+    }
+
+    /// Whether a saved secret is still in a field of the current page (any
+    /// frame, also in shadow roots). Unknown counts as yes.
+    pub(crate) async fn shows_secret(&self, run: &Running) -> Result<bool> {
+        let secrets = self.filled_secrets();
+        if secrets.is_empty() {
             return Ok(false);
         }
-        let (url, marked) = self.page_info(run).await?;
-        Ok(marked
-            || lock(&self.private)
-                .pages
-                .iter()
-                .any(|p| p == page_key(&url)))
+        Ok(match self.run_code(run, SECRET_CHECK_CODE).await? {
+            Value::String(t) => hide_secrets(&t, &secrets) != t,
+            _ => true,
+        })
+    }
+
+    /// Iris filled a saved secret: pages are checked for it from now on.
+    pub(crate) fn note_filled(&self) {
+        lock(&self.private).filled = true;
+    }
+
+    /// Close the browser gracefully (the profile, so sign-ins, is kept) and
+    /// open it again: for the agent when the browser is stuck. Every tab
+    /// closes; what the owner typed goes with them.
+    pub async fn restart(&self) -> Result<Arc<Running>> {
+        crate::info!("browser: restarting");
+        self.close().await;
+        self.ensure().await
     }
 }
 

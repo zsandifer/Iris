@@ -29,7 +29,7 @@ function initialState() {
     toast: null,
     drafts: {},          // conversation id -> composer text
     browser: null,       // GET /api/browser (owner): Iris's computer
-    browsing: {},        // assistant message id -> conversation id, while it uses the browser
+    browsing: {},        // assistant message id -> { cid, until }: while its turn uses the browser (until null), then lingering until `until` (ms)
   };
 }
 
@@ -480,7 +480,9 @@ export async function loadBrowser() {
 
 function setBrowser(b) {
   const browser = { ...(S.browser || {}), ...b };
-  const browsing = b.active ? Object.fromEntries(b.active.map((a) => [a.message_id, a.conversation_id])) : S.browsing;
+  const now = Date.now();
+  const browsing = b.active ? Object.fromEntries(b.active.map((a) => [a.message_id,
+    { cid: a.conversation_id, until: a.ended_at ? now + (a.linger_ms || 0) : null }])) : S.browsing;
   set({ browser, browsing });
 }
 
@@ -492,6 +494,12 @@ export async function loadEngines() {
 const loaders = { feed: () => loadFeed(), ideas: loadIdeas, goals: loadGoals, library: loadLibrary };
 
 // ------------------------------------------------------------------ events
+
+/** A message the server returned (also arrives as `message.updated`). */
+export function upsertMessage(msg) {
+  upsert(msg.conversation_id, msg);
+  set({});
+}
 
 function upsert(cid, msg) {
   const cur = S.msgs[cid];
@@ -569,11 +577,13 @@ export function handleEvent(ev) {
       setBrowser(ev.browser);
       break;
     case 'browser.active':
-      set({ browsing: { ...S.browsing, [ev.message_id]: ev.conversation_id } });
+      set({ browsing: { ...S.browsing, [ev.message_id]: { cid: ev.conversation_id, until: null } } });
       break;
     case 'browser.done': {
+      // The peek stays a while (see `linger_ms`), or goes now.
       const browsing = { ...S.browsing };
-      delete browsing[ev.message_id];
+      if (ev.linger_ms > 0) browsing[ev.message_id] = { cid: ev.conversation_id, until: Date.now() + ev.linger_ms };
+      else delete browsing[ev.message_id];
       set({ browsing });
       break;
     }

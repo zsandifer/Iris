@@ -47,13 +47,39 @@ function retryFor(list, m) {
   return null;
 }
 
+/** The live browser peek of a finished turn: it often ends by asking the
+ * owner to take over, so it stays at least until `until` and until they
+ * write again (the server drops it when they take over or the browser
+ * closes). */
+function LingeringPeek({ until, later }) {
+  const [, tick] = useState(0);
+  const left = until - Date.now();
+  useEffect(() => {
+    if (left <= 0) return undefined;
+    const t = setTimeout(() => tick((x) => x + 1), left + 50);
+    return () => clearTimeout(t);
+  }, [until]);
+  if (left <= 0 && later) return null;
+  return html`<${BrowserPeek} />`;
+}
+
+/** The peek under an assistant message: while its turn browses, and for a
+ * while after. */
+function peekFor(m, list) {
+  const e = S.browsing[m.id];
+  if (!e) return null;
+  if (e.until == null) return html`<${BrowserPeek} />`;
+  const i = list.findIndex((x) => x.id === m.id);
+  const later = list.slice(i + 1).some((x) => x.role === 'user');
+  return html`<${LingeringPeek} until=${e.until} later=${later} />`;
+}
+
 function Assistant({ m, list }) {
   const live = S.live[m.id];
+  const peek = peekFor(m, list);
   if (m.status === 'streaming') {
     const text = live?.text || '';
     const running = (live?.acts || []).some((a) => a.status === 'started');
-    // Only while Iris is browsing in this turn: a live thumbnail.
-    const peek = S.browsing[m.id] && html`<${BrowserPeek} />`;
     const waiting = list.some((x) => x.card?.type === 'approval' && x.card.turn_message_id === m.id && x.card.state === 'pending');
     if (waiting) return html`${text && html`<div class="b" dangerouslySetInnerHTML=${{ __html: md(text) }} />`}<div class="status shimmer" aria-live="polite">Waiting for your OK…</div>${peek}`;
     if (!text) return html`<${StatusLine} live=${live} />${peek}`;
@@ -71,6 +97,7 @@ function Assistant({ m, list }) {
   return html`<${Receipt} meta=${m.meta} />
     ${content ? html`<div class=${'b' + (failed ? ' b-err' : '')} dangerouslySetInnerHTML=${{ __html: md(content) }} />`
       : m.status === 'cancelled' ? html`<div class="note">Stopped.</div>` : null}
+    ${peek}
     ${failed && m.meta?.error?.kind !== 'paused' && retryFor(list, m) && html`<button class="retry" onClick=${retry}><${Icon} name="refresh" size=${15} /> Try again</button>`}`;
 }
 

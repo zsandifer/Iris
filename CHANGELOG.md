@@ -28,9 +28,15 @@ All notable changes to Iris are documented here, following
   live view, take over) instead of automating Chromium itself. Sign-ins are
   filled by Iris without the agent seeing them (`fill_saved_login`,
   `fill_saved_card` with element refs; cards ask you every time); the agent
-  cannot read a page where a password was filled or typed until it moves on
-  (in any tab, or back in history). Sites that fight automation (like X):
-  take over and sign in yourself.
+  cannot read a page where a password was typed until it moves on (in any
+  tab, or back in history), and cannot act on one where a saved password or
+  card Iris filled is still in a field (it can read it, with the secret
+  hidden, to see whether a sign-in worked). The agent can restart a stuck
+  browser (`restart_browser`, sign-ins kept) and post a card in the chat
+  where you save a login for the open site (`ask_to_save_login`). The chat
+  shows only the live picture of the browser, and keeps it for at least a
+  minute after the turn (until you write again or take over). Sites that
+  fight automation (like X): take over and sign in yourself.
 - Iris’s own browser lives at one fixed path that `deploy/setup-engines.sh`
   approves for Chrome’s sandbox where AppArmor restricts user namespaces
   (Ubuntu 23.10+); when the sandbox cannot start, the app shows the exact

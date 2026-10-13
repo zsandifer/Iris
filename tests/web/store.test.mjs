@@ -444,3 +444,26 @@ test('feed refresh and paging retain adaptive status and drop stale status', asy
   assert.equal(S.feed.posts.length, 2);
   assert.equal(S.feed.hasMore, false);
 });
+
+test('a finished browsing turn keeps its peek for a while; the server state can drop it', () => {
+  handleEvent({ type: 'browser.active', conversation_id: CID, message_id: 'b1' });
+  assert.deepEqual(S.browsing.b1, { cid: CID, until: null });
+  const before = Date.now();
+  handleEvent({ type: 'browser.done', conversation_id: CID, message_id: 'b1', linger_ms: 60000 });
+  assert.equal(S.browsing.b1.cid, CID);
+  assert.ok(S.browsing.b1.until >= before + 60000 && S.browsing.b1.until <= Date.now() + 60000);
+  // An older server (or no lingering): it goes at once.
+  handleEvent({ type: 'browser.active', conversation_id: CID, message_id: 'b2' });
+  handleEvent({ type: 'browser.done', conversation_id: CID, message_id: 'b2' });
+  assert.equal(S.browsing.b2, undefined);
+  // The server's list wins: lingering ones carry what is left of the
+  // minute, running ones none; a take over (empty list) drops them.
+  handleEvent({ type: 'browser.state', browser: { active: [
+    { conversation_id: CID, message_id: 'b1', ended_at: 1, linger_ms: 0 },
+    { conversation_id: CID, message_id: 'b3' },
+  ] } });
+  assert.ok(S.browsing.b1.until <= Date.now());
+  assert.equal(S.browsing.b3.until, null);
+  handleEvent({ type: 'browser.state', browser: { active: [] } });
+  assert.deepEqual(S.browsing, {});
+});

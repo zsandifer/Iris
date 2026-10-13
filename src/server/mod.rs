@@ -815,6 +815,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_save_login_card_saves_one_login_and_is_marked_saved() {
+        let h = setup();
+        let token = pair_as(&h, None).await;
+        let (main, card_id, other_id) = h
+            .state
+            .db
+            .with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                let main = db::ensure_main_conversation(c, &owner)?;
+                let card = json!({"type": "save_login", "title": "Save a login for shop.test",
+                    "site": "https://shop.test", "host": "shop.test", "state": "pending"});
+                let m = crate::entities::insert_card(c, &main, &card, "assistant")?;
+                let info = json!({"type": "info", "title": "x", "state": "pending"});
+                let o = crate::entities::insert_card(c, &main, &info, "assistant")?;
+                Ok((main, m.id, o.id))
+            })
+            .unwrap();
+        let login = |message_id: &str| {
+            json!({"kind": "login", "label": "Shop", "site": "https://shop.test",
+                   "username": "sam", "password": "synthetic-password", "message_id": message_id})
+        };
+        let count = |h: &Harness| {
+            h.state
+                .db
+                .with(|c| {
+                    let owner = db::owner_user_id(c)?.unwrap();
+                    crate::entities::list_credentials(c, &owner)
+                })
+                .unwrap()
+                .len()
+        };
+        // Only a save_login card the caller can see; nothing saved otherwise.
+        for (id, want) in [
+            (other_id.as_str(), StatusCode::NOT_FOUND),
+            ("nope", StatusCode::NOT_FOUND),
+        ] {
+            let (status, _) = send(
+                &h.app,
+                "POST",
+                "/api/credentials",
+                Some(&token),
+                Some(login(id)),
+            )
+            .await;
+            assert_eq!(status, want, "{id}");
+        }
+        let (status, _) = send(&h.app, "POST", "/api/credentials", Some(&token),
+            Some(json!({"kind": "card", "label": "C", "number": "4242424242424242", "message_id": card_id}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(count(&h), 0);
+        // Saved: the login, the card marked saved, and a note for the agent.
+        let (status, saved) = send(
+            &h.app,
+            "POST",
+            "/api/credentials",
+            Some(&token),
+            Some(login(&card_id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert!(!saved.to_string().contains("synthetic-password"));
+        assert_eq!(saved["message"]["card"]["state"], "saved");
+        assert_eq!(
+            saved["message"]["card"]["credential_id"],
+            saved["credential"]["id"]
+        );
+        assert_eq!(saved["credential"]["metadata"]["site"], "https://shop.test");
+        let notes: Vec<String> = h
+            .state
+            .db
+            .with(|c| db::list_messages(c, &main, None, 50))
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.kind == "system_note")
+            .map(|m| m.content)
+            .collect();
+        assert_eq!(notes, ["You saved a login for shop.test."]);
+        // One card saves one login.
+        let (status, _) = send(
+            &h.app,
+            "POST",
+            "/api/credentials",
+            Some(&token),
+            Some(login(&card_id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(count(&h), 1);
+    }
+
+    #[tokio::test]
     async fn joined_at_scopes_history_cards_photos_activity_and_live_replays() {
         let h = setup();
         let owner_token = pair_as(&h, None).await;

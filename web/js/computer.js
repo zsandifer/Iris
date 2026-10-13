@@ -40,10 +40,10 @@ frames.onReady.add(() => { sent = ''; syncWatch(); });
 document.addEventListener('visibilitychange', () => syncWatch());
 addEventListener('resize', () => syncWatch());
 
-// How wide each view shows the page (CSS pixels): the chat thumbnail, the
-// full screen (which covers the screen, and the page is twice as tall as
-// wide), and the computer screen's card.
-const PEEK_CSS = () => 72;
+// How wide each view shows the page (CSS pixels): the chat peek, the full
+// screen (which covers the screen, and the page is twice as tall as wide),
+// and the computer screen's card.
+const PEEK_CSS = () => 150;
 const FULL_CSS = () => Math.max(innerWidth, innerHeight / 2);
 const CARD_CSS = () => Math.min(innerWidth, 640);
 
@@ -70,21 +70,17 @@ const src = (f) => `data:image/jpeg;base64,${f.data}`;
 
 // ------------------------------------------------------------- chat peek
 
-/** Small live thumbnail under Iris's status line while it browses. */
+/** The live picture of Iris's browser under its message while it browses:
+ * nothing but the picture. Tapping it opens the full view, where the owner
+ * can take over. */
 export function BrowserPeek() {
   useStore();
   // Opened from a chat: closing the browser returns to that chat.
   const from = encodeURIComponent(S.route.parts.join('/'));
   const f = useFrame('peek', PEEK_CSS);
   const b = S.browser || {};
-  const host = hostOf(b.url);
-  return html`<button class="peek" onClick=${() => go(`iris/computer?view=watch&return=${from}`)} aria-label=${`Watch ${agentName()}'s browser`}>
-    <div class="peek-shot">${f && b.running !== false ? html`<img src=${src(f)} alt="" />` : html`<div class="peek-ph shimmer-bg" />`}</div>
-    <div class="peek-t">
-      <b>${agentName()}'s browser</b>
-      <small>${host || 'Opening a page…'}</small>
-      <span class="peek-go"><${Icon} name="eye" size=${14} /> Watch or take over</span>
-    </div>
+  return html`<button class="peek" onClick=${() => go(`iris/computer?view=watch&return=${from}`)} aria-label=${`Open ${agentName()}'s browser`}>
+    ${f && b.running !== false ? html`<img src=${src(f)} alt="" draggable="false" />` : html`<div class="peek-ph shimmer-bg" />`}
   </button>`;
 }
 

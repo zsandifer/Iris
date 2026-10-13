@@ -60,8 +60,8 @@ pub async fn status(
         let wallet_cards = credentials.iter().filter(|x| x.kind == "card").count();
         let mut stmt = c.prepare("SELECT json_extract(card, '$.type'), json_extract(card, '$.title') FROM messages
             WHERE kind = 'card' AND status = 'complete'
-              AND json_extract(card, '$.type') IN ('engine_signin', 'engine_setup', 'connect', 'connector_reconnect', 'approval', 'action')
-              AND COALESCE(json_extract(card, '$.state'), '') NOT IN ('done', 'connected', 'declined', 'approved', 'denied', 'expired', 'cancelled')
+              AND json_extract(card, '$.type') IN ('engine_signin', 'engine_setup', 'connect', 'connector_reconnect', 'approval', 'action', 'save_login')
+              AND COALESCE(json_extract(card, '$.state'), '') NOT IN ('done', 'connected', 'declined', 'approved', 'denied', 'expired', 'cancelled', 'saved')
               AND conversation_id IN (SELECT conversation_id FROM conversation_members WHERE user_id = ?1
                 AND (SELECT COUNT(*) FROM conversation_members m WHERE m.conversation_id = conversation_members.conversation_id) = 1)
             ORDER BY created_at DESC LIMIT 8")?;

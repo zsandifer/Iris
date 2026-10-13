@@ -50,10 +50,17 @@ own personality. It is not a clone.
 - **While Iris works:** a short, specific shimmering status phrase such as
   "Checking your calendar…" or "Reading your email…". There are no "…" dots
   and no quick-reply chips.
-- **Browser peek:** only while Iris is browsing or researching, a small live
-  thumbnail of its browser appears under the status line (from Iris's first
-  browser step in a turn until the turn ends). Tap it to watch full screen or
-  take over.
+- **Browser peek:** while Iris is browsing, a small live picture of its
+  browser appears under its message: only the picture, no text or buttons
+  (from Iris's first browser step in a turn). Tap it to open the browser
+  full screen, where Take over is. A turn often ends by asking the owner to
+  take over, so the peek stays after the turn for at least a minute and
+  until the owner writes again, or until they take over (or the browser
+  closes).
+- **Save a login card:** when the owner asks Iris to help save a login for
+  the site open in its browser, Iris posts a card with that site filled in;
+  the owner types the username and password into the card, which saves them
+  to Logins & wallet. Iris never sees them.
 - **Approval card:** rendered by Iris (not the agent) for sending email or
   messages, purchases, deleting, bulk exports, and anything that reaches a
   new recipient through a connected service. It says why it asks ("Sends a

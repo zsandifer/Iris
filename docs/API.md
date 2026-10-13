@@ -2022,6 +2022,18 @@ Card fields:
 
 Response `{"credential": {Credential}}`.
 
+Saving from a `save_login` card (posted by the agent's `ask_to_save_login`,
+see [the browser tools](#the-browser-tools)): add `"message_id"` with the
+card's message id (logins only, `400` otherwise). The card must be a
+`save_login` card in a conversation the caller is a member of (`404
+message` otherwise) and still `pending` (`409 conflict`, "this login was
+already saved", and nothing is stored). In one write the credential is
+stored, the card moves to `state: "saved"` with `credential_id` and
+`saved_at`, and a system note "You saved a login for <host>." is added to
+the chat (so the agent knows); both are sent as `message.updated` /
+`message.created`. Response `{"credential": {Credential}, "message":
+{Message}}` (the updated card).
+
 #### `PATCH /api/credentials/{id}`
 
 Any of the fields above for the credential's existing kind (`kind` cannot be
@@ -2302,7 +2314,7 @@ Playwright's own download.
 | `controller` | string | `agent`, or `user` while the owner has taken over. |
 | `controller_device_id` | string or null | The device in control. |
 | `busy` | bool | The agent is carrying out a browser action right now. |
-| `active` | array | `[{"conversation_id", "message_id"}]`: turns that have used the browser and are still running (show the chat peek for these). |
+| `active` | array | `[{"conversation_id", "message_id"}]`: turns that have used the browser and are still running, then, per conversation, the last such turn that finished, with `"ended_at"` (ms) and `"linger_ms"` (how much of its minimum minute, `browser::LINGER_MS` = 60,000, is left). Show the chat peek under each running one; under a finished one while `linger_ms` lasts and after that until a newer user message follows it in the chat. Finished ones are dropped when the owner takes over, when the browser closes, and when a later turn in the chat uses the browser; a turn that ends while the owner is in control (or the browser is closed, or in a job) leaves none. |
 | `watchers` | int | App sockets watching the live view. |
 | `streaming` | bool | The live view is taking screenshots (only while someone watches). |
 | `sandbox` | bool or null | Chrome's sandbox is on (null while closed). |
@@ -2432,7 +2444,7 @@ was emitted). Events are delivered only to the users listed under
 | `engines.changed` | `{"engines": [...]}` (as in `GET /api/engines`) | All users |
 | `browser.state` | `{"browser": {BrowserStatus}}` (may omit the setup fields `managed`, `managed_version`, `requires`, `install`, `sandbox_fix`; merge into what you have) | The owner |
 | `browser.active` | `{"conversation_id", "message_id"}` | Conversation members |
-| `browser.done` | `{"conversation_id", "message_id"}` | Conversation members |
+| `browser.done` | `{"conversation_id", "message_id", "linger_ms"}` | Conversation members |
 | `connectors.changed` | `{}` | The owner |
 
 Example:
@@ -2476,7 +2488,11 @@ Event details:
 
 - **`browser.active`** / **`browser.done`**: the turn answering
   `message_id` used Iris's browser for the first time / ended. Show the
-  browser peek under that streaming message in between.
+  browser peek (only the live picture; tapping it opens the full view)
+  under that message in between, and after `browser.done` for at least
+  `linger_ms` (60,000, or 0 when it does not stay) and until a newer user
+  message follows it; `active` in [BrowserStatus](#browserstatus) has the
+  same list after a reload.
 - **`browser.state`**: Iris's browser opened or closed, changed page or
   title, changed hands (take over / hand back), started or finished an
   action, or its setup state changed.
@@ -3560,7 +3576,7 @@ their results are Playwright MCP's own; see its documentation. Action
 results do not include the page, so the agent calls `browser_snapshot` to
 read it. Iris decides nothing; it only refuses:
 
-- Tools outside the reviewed list. The agent gets `browser_navigate`,
+- Tools outside the reviewed list (Iris's own tools below aside). The agent gets `browser_navigate`,
   `browser_navigate_back`, `browser_tabs`, `browser_snapshot`,
   `browser_find`, `browser_take_screenshot`, `browser_click`,
   `browser_hover`, `browser_drag`, `browser_type`, `browser_fill_form`,
@@ -3578,7 +3594,7 @@ read it. Iris decides nothing; it only refuses:
 - Writing results to files: the `filename` option is removed from the
   definitions and refused, and so are output options in `_meta`.
 
-Iris adds two tools of its own, after Playwright's:
+Iris adds tools of its own, after Playwright's:
 
 - `fill_saved_login` (`username_ref`, `password_ref`, optional `login`,
   `submit`, `submit_ref`): types the owner's saved login for the current site into the
@@ -3600,14 +3616,43 @@ Iris adds two tools of its own, after Playwright's:
   filled.
   Expiry lists are matched against their own options (value, label, number,
   or month name); a year field's hints (`YY`) choose 31 over 2031.
+- `restart_browser` (no arguments): closes the browser gracefully (as
+  `POST /api/browser/stop` does: the profile, so sign-ins, is kept; every
+  tab, with what was typed into it, goes) and opens it again, for a stuck
+  or crashed browser. It waits for the owner's control like any other call
+  and is run to the end once started. Answers `restarted (...)` or an error.
+  Playwright's `browser_close` stays refused.
+- `ask_to_save_login` (optional `label`, `username`: suggestions, one line,
+  at most 100 / 300 characters): posts a `save_login` card in the turn's
+  chat (`message.created`; not in jobs) for the current page's site, taken
+  from the browser (`https://host`, with a port only when it is not the
+  default; never from the agent's arguments), only for an `https` page (or
+  plain HTTP on this machine). Card fields: `type`, `title` ("Save a login
+  for host"), `site`, `host`, `state` (`pending`, then `saved`), optional
+  `label` and `username`, `owner_only`, `turn_message_id`; once saved also
+  `credential_id`, `saved_at`. A suggestion that contains a saved secret is
+  dropped. The owner fills the card in the app, which saves it with
+  [`POST /api/credentials`](#post-apicredentials) plus `message_id`. Answers
+  `posted (...)` or `not posted (...)`.
 
 Iris locates each field and types its value through Playwright's own
 `browser_run_code_unsafe` on Iris's side (never offered to the agent); the
 values never appear in a tool result, message, log, or command line. The
 answers are `filled`, `filled and submitted`, `denied`, `not filled (...)`,
-or `not found (...)`. Filling a password, card number, expiry, or CVC closes
-the page to the agent as if the owner had typed it (see below); the fill
-tools themselves stay usable there. The owner's saved passwords and card
+or `not found (...)`. A password, card number, or CVC that Iris filled closes
+the page to the agent while one of the owner's saved secrets is still in a
+field of it (inputs, text areas, and editable areas of every frame, also in
+open shadow roots; a frame that cannot be read counts as holding one), for
+example until the sign-in form is sent or cleared, even if the address never
+changes (a sign-in inside a frame). Meanwhile `browser_snapshot` still works
+(with the secrets hidden, below), so the agent can tell whether a sign-in
+went through; screenshots, searches, and actions are refused. With `submit`
+or `submit_ref`, `fill_saved_login` waits up to 5 seconds for the password
+to leave the page and answers `filled and submitted (the password is no
+longer on the page: ...)` or `filled and submitted, but the password is
+still in its field (...)`. An expiry date, or a secret too short to look for
+(under 4 characters, except a 3-digit code), closes the page as if the owner
+had typed it (see below). The fill tools themselves stay usable there. The owner's saved passwords and card
 numbers, and every value Iris filled this browser session (a CVC only
 where it stands alone), are replaced with `[hidden]` in every result the
 agent gets (addresses, titles, dialogs, page text; also their common
@@ -3627,9 +3672,11 @@ an abandoned call.
   port, or `about:blank`; anything with whitespace or control characters
   (browsers drop them while parsing) is refused.
 - Anything but `browser_navigate`, `browser_navigate_back`, `browser_tabs`,
-  `browser_handle_dialog`, and the fill tools while the current page holds
-  private details the owner typed or filled (see [Input while in
-  control](#4-websocket-get-apiws)).
+  `browser_handle_dialog`, and Iris's own tools while the current page holds
+  private details the owner typed (see [Input while in
+  control](#4-websocket-get-apiws)), and anything but those and
+  `browser_snapshot` while a saved secret Iris filled is still in one of its
+  fields.
 
 Each call waits while the owner has taken over (up to about 50 seconds,
 then tells the agent the user is still using it), and checks again once it
@@ -3648,8 +3695,17 @@ cancelled (the result says so); the agent answers its own dialogs with
 window plus 300 seconds, using the standard per-server MCP timeout fields.
 
 The agent never handles passwords, card numbers, or codes: its instructions
-tell it to ask the owner to take over for sign-ins and payments (always for
-sites that fight automated browsers, such as X).
+tell it to ask the owner to take over for sign-ins and payments it cannot
+fill (always for sites that fight automated browsers). For X (x.com) the
+instructions say to ask the owner to take over at once, without trying: in
+a check with a made-up username, X's sign-in answered normally in Iris's
+headless browser (its user agent without "HeadlessChrome" is needed: X
+refuses the default one), and no launch option (headed under a virtual
+display, `--disable-blink-features=AutomationControlled`, which Playwright
+MCP already passes, or dropping `--enable-automation`, which Playwright no
+longer adds) changed anything, so the stall owners see after a real
+username comes from checks no browser setting passes (account risk checks,
+passkey prompts).
 
 ### `save_to_library` details
 

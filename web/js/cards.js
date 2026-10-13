@@ -1,10 +1,10 @@
 // Chat cards: agent cards (link, connect, info, result, idea, goal,
 // feed_post) and server cards (action, engine_signin, engine_setup,
-// connector_reconnect, approval).
+// connector_reconnect, approval, save_login).
 import { html, useEffect, useState } from './h.js';
 import { api, get, post, put, patch, seg, isId } from './api.js';
 import {
-  S, set, go, isOwner, toast, loadGoals, loadEngines, loginMark, applyLoginResponse, ensureConnectors,
+  S, set, go, isOwner, toast, loadGoals, loadEngines, loginMark, applyLoginResponse, ensureConnectors, upsertMessage,
 } from './store.js';
 import { Icon, Img, LetterTile, hostOf, safeUrl } from './ui.js';
 import { plain } from './md.js';
@@ -301,6 +301,40 @@ function Countdown({ until }) {
   return html`<span>${s >= 60 ? `${Math.ceil(s / 60)} min` : `${s}s`} left</span>`;
 }
 
+/** Save a login for the site open in Iris's browser (asked for by the
+ * agent; the site comes from the page). Saved straight to Logins & wallet:
+ * the agent never sees what is typed here. */
+function SaveLoginCard({ c, m }) {
+  const [f, setF] = useState({ label: c.label || c.host || '', site: c.site || '', username: c.username || '', password: '' });
+  const [busy, setBusy] = useState(false);
+  const up = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const done = c.state === 'saved';
+  const save = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      const r = await post('/credentials', { kind: 'login', label: f.label.trim() || c.host, site: f.site.trim(), username: f.username.trim(), password: f.password, message_id: m.id });
+      setF({ ...f, password: '' });
+      if (r.message) upsertMessage(r.message);
+      toast('Login saved');
+    } catch (err) { toast(err.message); }
+    setBusy(false);
+  };
+  return html`<div class=${'card-x' + (done ? ' done' : '')}>
+    <div class="card-h"><${LetterTile} name=${c.host || c.title} size=${30} radius=${9} /><b>${c.title}</b></div>
+    ${done ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> Saved to Logins & wallet</div>`
+      : !isOwner() ? html`<small class="mu">Only the owner can save this.</small>`
+      : html`<p>It goes straight to Logins & wallet. I never see it; I just sign in with it.</p>
+        <form class="form" onSubmit=${save}>
+          <label class="lbl">Name</label><input class="field" required value=${f.label} onInput=${up('label')} />
+          <label class="lbl">Website</label><input class="field" required autocapitalize="off" value=${f.site} onInput=${up('site')} />
+          <label class="lbl">Username or email</label><input class="field" autocapitalize="off" autocomplete="off" value=${f.username} onInput=${up('username')} />
+          <label class="lbl">Password</label><input class="field" type="password" autocomplete="new-password" required value=${f.password} onInput=${up('password')} />
+          <div class="act"><button disabled=${busy}>${busy ? 'Saving…' : 'Save login'}</button></div>
+        </form>`}
+  </div>`;
+}
+
 const APPROVAL_DONE = {
   approved: 'You approved this',
   denied: "You said no, so I didn't do it.",
@@ -355,6 +389,7 @@ const CARDS = {
   engine_setup: SetupCard,
   connector_reconnect: ConnectorReconnectCard,
   approval: ApprovalCard,
+  save_login: SaveLoginCard,
 };
 
 export function Card({ m, inactive = false }) {
@@ -363,7 +398,7 @@ export function Card({ m, inactive = false }) {
   if (c.type === 'link' && c.image_url) C = ResultCard;
   // Sign-in cards can contain inputs. Keep them out of iOS's form
   // navigation while the composer has focus; scrolling stays on .scr.
-  const signin = c.type === 'engine_signin' || c.type === 'connector_reconnect';
+  const signin = c.type === 'engine_signin' || c.type === 'connector_reconnect' || c.type === 'save_login';
   const decline = async () => {
     try { await post(`/messages/${seg(m.id)}/decision`, { approve: false }); } catch (e) { toast(e.message); }
   };

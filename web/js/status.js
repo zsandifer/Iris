@@ -51,6 +51,8 @@ function browserPhrase(tool, sum) {
     case 'fill_login': return ['Signing you in', 'Signed you in'];
     case 'fill_saved_card':
     case 'fill_card': return ['Filling in your card', 'Filled in your card'];
+    case 'restart_browser': return ['Restarting the browser', 'Restarted the browser'];
+    case 'ask_to_save_login': return ['Setting up a saved login', 'Asked you to save a login'];
     case 'browser_take_screenshot':
     case 'browser_snapshot':
     case 'screenshot': return ['Looking at the page', 'Looked at the page'];
