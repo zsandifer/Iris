@@ -78,6 +78,8 @@ while IFS= read -r line; do
                   *'const values'*)
                     case "$line" in *'if (true) await page.evaluate'*) : > marked ;; esac
                     reply "### Result\\n{\\\"filled\\\":true}" '' '' ;;
+                  *"h.press('Enter'"*)
+                    reply "### Result\\n{\\\"clicked\\\":true}" '' '' ;;
                   *)
                     reply "### Result\\n{\\\"found\\\":true,\\\"top\\\":\\\"$url\\\",\\\"frame\\\":\\\"$ff\\\",\\\"tag\\\":\\\"input\\\",\\\"kind\\\":\\\"$k\\\"}" '' '' ;;
                 esac
@@ -927,6 +929,69 @@ async fn the_agent_fills_a_card_only_after_the_owner_approves() {
             .count(),
         1
     );
+
+    // Sending: only when every field asked for was filled. A card saved
+    // without its code leaves the form unsent for the user.
+    let sends = |f: &Fake| {
+        f.calls()
+            .iter()
+            .filter(|(t, a)| {
+                let c = a["code"].to_string();
+                t == "browser_run_code_unsafe"
+                    && !c.contains("const values")
+                    && (c.contains("h.click(") || c.contains("h.press('Enter'"))
+            })
+            .count()
+    };
+    let nocode = "card-2".to_string();
+    let secret = f
+        .state
+        .vault
+        .encrypt(
+            json!({"number": "5555555555554444"}).to_string().as_bytes(),
+            &nocode,
+        )
+        .unwrap();
+    f.state
+        .db
+        .with(|c| {
+            crate::entities::insert_credential(
+                c,
+                &nocode,
+                &f.owner,
+                "card",
+                "Spare",
+                &json!({"last4": "4444", "brand": "mastercard", "exp_month": 1, "exp_year": 2030}),
+                &secret,
+            )
+        })
+        .unwrap();
+    for (card, extra, sent) in [
+        ("Spare", json!({"submit_ref": "e10"}), false),
+        ("Everyday", json!({"submit": true}), true),
+    ] {
+        let mut a = json!({"number_ref": "e5", "cvc_ref": "e8", "card": card});
+        a.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let before = sends(&f);
+        let call = {
+            let (st, tk) = (f.state.clone(), token.clone());
+            tokio::spawn(async move { tools::call(&st, &tk, "fill_saved_card", &a).await })
+        };
+        decide(pending().await, true);
+        let r = call.await.unwrap();
+        if sent {
+            assert_eq!(text(&r), "filled and submitted", "{r}");
+            assert_eq!(sends(&f), before + 1);
+        } else {
+            assert!(
+                text(&r).contains("cvc could not be filled, so nothing was sent"),
+                "{r}"
+            );
+            assert_eq!(sends(&f), before);
+        }
+    }
     drop(g);
     b.close().await;
 }
@@ -1258,6 +1323,18 @@ async fn real_playwright() {
             } else if let Some(rest) = req.strip_prefix("GET /show?") {
                 let q = rest.split_whitespace().next().unwrap_or("");
                 format!("<html><body><input aria-label=Shown value='{q}'></body></html>")
+            } else if req.starts_with("GET /hosted") {
+                // A checkout whose card fields live in a payment provider's
+                // frame (another origin).
+                format!(
+                    "<html><head><title>Iris smoke pay box</title></head><body><h1>Pay</h1>\
+                     <iframe src='http://127.0.0.1:{other_port}/cardframe' \
+                     style='width:480px;height:300px;border:0'></iframe></body></html>"
+                )
+            } else if req.starts_with("GET /cardframe") {
+                "<html><body><input aria-label='Provider card number' autocomplete=cc-number>\
+                 <input aria-label='Provider code' autocomplete=cc-csc></body></html>"
+                    .to_string()
             } else if req.starts_with("GET /field") {
                 "<html><body style='margin:0'><input name=q style='width:500px;height:200px'></body></html>"
                     .to_string()
@@ -1830,6 +1907,90 @@ async fn real_playwright() {
             "a secret was written to a file"
         );
     }
+    // A payment provider's frame: its fields' refs resolve, the approval
+    // names that site, and the values land in the frame.
+    f.agent(
+        &chat_token,
+        "browser_navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/hosted")}),
+    )
+    .await;
+    let mut boxed = String::new();
+    for _ in 0..40 {
+        boxed = text(&f.agent(&chat_token, "browser_snapshot", json!({})).await);
+        if boxed.contains("Provider code") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let ref_in_box = |label: &str| {
+        let line = boxed
+            .lines()
+            .find(|l| l.contains(&format!("\"{label}\"")))
+            .unwrap_or_else(|| panic!("{label} in {boxed}"));
+        let at = line.find("[ref=").unwrap() + 5;
+        line[at..line[at..].find(']').unwrap() + at].to_string()
+    };
+    let args = json!({"number_ref": ref_in_box("Provider card number"), "cvc_ref": ref_in_box("Provider code")});
+    assert!(
+        args["number_ref"].as_str().unwrap().starts_with('f'),
+        "{args}"
+    );
+    let call = {
+        let (st, tk) = (f.state.clone(), chat_token.clone());
+        tokio::spawn(async move { tools::call(&st, &tk, "fill_saved_card", &args).await })
+    };
+    let mut waited = 0;
+    let approval = loop {
+        assert!(!call.is_finished(), "the fill ended before asking");
+        waited += 1;
+        assert!(waited < 400, "no approval card");
+        let msgs = f
+            .state
+            .db
+            .with(|c| crate::db::list_messages(c, &f.conv, None, 50))
+            .unwrap();
+        if let Some(m) = msgs.into_iter().find(|m| {
+            m.card
+                .as_ref()
+                .is_some_and(|c| c["service"] == "wallet" && c["state"] == "pending")
+        }) {
+            break m;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let mut card = approval.card.clone().unwrap();
+    assert!(
+        card["preview"]["body"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("The card fields are on: 127.0.0.1:{other_port}")),
+        "{card}"
+    );
+    card["state"] = "approved".into();
+    card["decided_at"] = crate::util::now_ms().into();
+    f.state
+        .db
+        .with(|c| crate::db::update_message_card(c, &approval.id, &card))
+        .unwrap();
+    crate::gateway::decided(&f.state, &approval.id, true);
+    let r = call.await.unwrap();
+    assert_eq!(text(&r), "filled", "{r}");
+    let in_frame = b
+        .run_code(
+            &run,
+            "async (page) => await page.frames()[1].locator('input').evaluateAll((els) => els.map((e) => e.value))",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        in_frame,
+        json!(["4111111111111111", "737"]),
+        "the frame's fields hold something else"
+    );
+    let r = f.agent(&chat_token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE);
+
     drop(chat);
 
     // The owner again: a code field known only by its label is private,

@@ -606,13 +606,23 @@ async fn put(
 /// Click the button the agent named (a sign-in or pay button), still
 /// exactly where it was checked.
 async fn click(state: &AppState, run: &Running, r: &str, at: &Target) -> Result<()> {
+    act_on(state, run, r, at, "h.click({ timeout: 5000 })").await
+}
+
+/// Press Enter in a field Iris filled (to submit its form), still exactly
+/// where it was checked.
+async fn press_enter(state: &AppState, run: &Running, r: &str, at: &Target) -> Result<()> {
+    act_on(state, run, r, at, "h.press('Enter', { timeout: 5000 })").await
+}
+
+async fn act_on(state: &AppState, run: &Running, r: &str, at: &Target, action: &str) -> Result<()> {
     let code = format!(
         "async (page) => {{
   const h = await page.locator({sel}).elementHandle({{ timeout: 3000 }}).catch(() => null);
   if (!h) return {{ moved: true }};
   const frame = await h.ownerFrame();
   if (page.url() !== {top} || !frame || frame.url() !== {frame}) return {{ moved: true }};
-  return {{ clicked: await h.click({{ timeout: 5000 }}).then(() => true, () => false) }};
+  return {{ clicked: await {action}.then(() => true, () => false) }};
 }}",
         sel = serde_json::to_string(&format!("aria-ref={r}"))?,
         top = serde_json::to_string(&at.top)?,
@@ -623,7 +633,7 @@ async fn click(state: &AppState, run: &Running, r: &str, at: &Target) -> Result<
         return Err(PAGE_CHANGED.into());
     }
     if v["clicked"] != true {
-        return Err(format!("the button {r} could not be clicked").into());
+        return Err(format!("{r} could not be used to send the form").into());
     }
     Ok(())
 }
@@ -1131,7 +1141,7 @@ async fn card_inner(
     let submit = args["submit"] == true && button.is_none();
     let last = targets.len() - 1;
     let mut missing = Vec::new();
-    for (i, (field, r, at)) in targets.iter().enumerate() {
+    for (field, r, at) in &targets {
         b.check_agent(ctx)?;
         let values = field_values(&card, &secret, field)
             .map(|(v, _)| v)
@@ -1142,18 +1152,7 @@ async fn card_inner(
         }
         // Everything but the name closes the page to the agent.
         let private = *field != "name";
-        if !put(
-            state,
-            run,
-            Find::Ref(r),
-            at,
-            field,
-            &values,
-            private,
-            submit && i == last,
-        )
-        .await?
-        {
+        if !put(state, run, Find::Ref(r), at, field, &values, private, false).await? {
             if *field == "number" {
                 return Ok(text(
                     "not filled (the card number field could not be filled)",
@@ -1163,9 +1162,18 @@ async fn card_inner(
         }
     }
     drop(secret);
-    if let Some((r, at)) = &button {
+    // Sent only when everything asked for was filled: an incomplete form
+    // is left for the user (the page is closed to the agent now).
+    let sent = missing.is_empty() && (submit || button.is_some());
+    if sent {
         b.check_agent(ctx)?;
-        click(state, run, r, at).await?;
+        match &button {
+            Some((r, at)) => click(state, run, r, at).await?,
+            None => {
+                let (_, r, at) = &targets[last];
+                press_enter(state, run, r, at).await?;
+            }
+        }
     }
     let (uid, cid) = (ctx.user_id.clone(), card.id.clone());
     let _ = state
@@ -1177,13 +1185,16 @@ async fn card_inner(
         card.id,
         approved.message_id
     );
-    Ok(text(if missing.is_empty() {
-        "filled".to_string()
-    } else {
+    Ok(text(if !missing.is_empty() {
         format!(
-            "filled (but {} could not be filled; ask the user to take over for it)",
+            "filled (but {} could not be filled, so nothing was sent; ask the user to take \
+             over for it)",
             missing.join(", ").replace('_', " ")
         )
+    } else if sent {
+        "filled and submitted".to_string()
+    } else {
+        "filled".to_string()
     }))
 }
 

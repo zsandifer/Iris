@@ -3595,7 +3595,9 @@ Iris adds two tools of its own, after Playwright's:
   frame holds a field (a payment provider); the fill goes only to that page
   and those origins (scheme, host, port), every field over HTTPS. One
   approval fills once; a card edited since needs a new one. `submit_ref`
-  (a pay button) must be on the approved page or one of those frames.
+  (a pay button) must be on the approved page or one of those frames; the
+  form is sent (Enter or the button) only when every requested field was
+  filled.
   Expiry lists are matched against their own options (value, label, number,
   or month name); a year field's hints (`YY`) choose 31 over 2031.
 
