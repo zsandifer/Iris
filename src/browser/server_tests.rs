@@ -643,6 +643,32 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
     assert_ne!(r["isError"], true, "{r}");
     drop(g);
     b.close().await;
+
+    // After the browser closes and starts again, nothing was filled in this
+    // run, but saved secrets stay hidden from the first result on (a site
+    // may keep a value from an earlier visit).
+    let g = b.begin_turn(&f.owner, &f.conv, "m", std::slice::from_ref(&f.owner));
+    let token = g.token().to_string();
+    assert!(b.filled_secrets().is_empty());
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://site.test/kept"}),
+    )
+    .await;
+    f.load("https://site.test/kept?remembered=Pw-5678");
+    let r = f
+        .agent(&token, "browser_tabs", json!({"action": "list"}))
+        .await;
+    assert!(
+        text(&r).contains("remembered=[hidden]") && !r.to_string().contains("Pw-5678"),
+        "{r}"
+    );
+    f.set("pagetext", "Your password is Pw-5678");
+    let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    assert!(text(&r).starts_with("No screenshot right now"), "{r}");
+    drop(g);
+    b.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1098,6 +1124,14 @@ async fn real_playwright() {
                     "<html><head><title>Sent {q}</title></head><body><p>You sent {q}</p>\
                      <iframe src='http://127.0.0.1:{other_port}/show?{q}'></iframe></body></html>"
                 )
+            } else if let Some(rest) = req.strip_prefix("GET /frameonly?") {
+                // Nothing on the page itself; the value is only in another
+                // site's frame.
+                let q = rest.split_whitespace().next().unwrap_or("");
+                format!(
+                    "<html><body><p>Nothing to see here</p>\
+                     <iframe src='http://127.0.0.1:{other_port}/show?{q}'></iframe></body></html>"
+                )
             } else if let Some(rest) = req.strip_prefix("GET /show?") {
                 let q = rest.split_whitespace().next().unwrap_or("");
                 format!("<html><body><input aria-label=Shown value='{q}'></body></html>")
@@ -1462,6 +1496,46 @@ async fn real_playwright() {
             );
         }
     }
+
+    // A saved secret only inside another site's frame: still no picture.
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/frameonly?v=Real-Pw-42")}),
+    )
+    .await;
+    let mut in_frame = false;
+    for _ in 0..40 {
+        let v = b
+            .run_code(
+                &run,
+                "async (page) => { const f = page.frames()[1]; return f ? await f.locator('input').inputValue().catch(() => '') : ''; }",
+            )
+            .await
+            .unwrap_or_default();
+        if v.as_str().is_some_and(|v| v.contains("Real-Pw-42")) {
+            in_frame = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(in_frame, "the frame did not load the value");
+    let top = b
+        .run_code(
+            &run,
+            "async (page) => await page.locator('body').innerText()",
+        )
+        .await
+        .unwrap();
+    assert!(
+        !top.to_string().contains("Real-Pw"),
+        "the page itself shows it"
+    );
+    let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    assert!(
+        text(&shot).starts_with("No screenshot right now"),
+        "screenshot taken"
+    );
 
     // The agent fills a saved card after the owner approves, never seeing
     // it.

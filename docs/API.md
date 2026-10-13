@@ -2530,7 +2530,7 @@ image:
 | `key` | `key` | `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, arrows, `Home`, `End`, `PageUp`, `PageDown`. |
 | `back` | none | History back. |
 | `navigate` | `url` | Open an http(s) page (as `POST /api/browser/navigate`). |
-| `fill` | `credential_id`, `field` | Fill one field of a saved [credential](#313-credentials) into the focused element (its contents are replaced; the element is checked and filled in one step, in its own frame): `username` or `password` for a login, `number`, `exp` (MM/YY), `cvc`, or `name` for a card. A login only on the site it was saved for; everything only over HTTPS (plain HTTP only on this machine). The value never comes back to any client. |
+| `fill` | `credential_id`, `field` | Fill one field of a saved [credential](#313-credentials) into the focused element (its contents are replaced; the element is checked and filled in one step, in its own frame): `username` or `password` for a login, `number`, `exp` (MM/YY), `exp_month`, `exp_year` (a list's own option, or what the field takes), `cvc`, or `name` for a card. A login only on the site it was saved for; everything only over HTTPS (plain HTTP only on this machine). The value never comes back to any client. |
 
 Typing into a private field (a password, card, or one-time-code field, by
 its type, autocomplete, name, or label, or a field in another site's

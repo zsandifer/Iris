@@ -87,10 +87,21 @@ const READS: &[&str] = &[
     "browser_wait_for",
 ];
 
-/// How long a take-over or Stop waits for an action already sent to the
-/// browser to finish before the page is handed on (Playwright gives up on
-/// an element that does not become ready after 5 seconds).
-const ACTION_DRAIN: Duration = Duration::from_secs(8);
+/// How long a take-over or Stop keeps the page for an action already sent
+/// to the browser: Playwright cannot be told to stop one, so an action
+/// that changes the page (a click, typing, a multi-field fill) keeps it
+/// until it finishes (at most the call's own limit); opening a page only
+/// for a while, since a slow page finishing its load under the owner's
+/// hands changes nothing they typed.
+fn drain_for(name: &str) -> Duration {
+    if READS.contains(&name) {
+        Duration::ZERO
+    } else if matches!(name, "browser_navigate" | "browser_navigate_back") {
+        Duration::from_secs(8)
+    } else {
+        super::CALL_TIMEOUT
+    }
+}
 
 /// The definitions the agent sees: the allowed ones, without their
 /// `filename` option (results are never written to files for the agent).
@@ -267,6 +278,8 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
         return error(super::TURN_ENDED);
     }
     b.mark_used(&ctx);
+    // The owner's saved secrets are hidden from everything below.
+    super::fill::remember_saved(state, &ctx.user_id).await;
     // A card needs the owner's OK first, asked without holding the page.
     let mut approved = None;
     if name == "fill_saved_card" {
@@ -321,7 +334,6 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     }
     // Saved secrets may show on later pages (echoed into the text or a
     // field): no pictures of those.
-    super::fill::remember_saved(state, &ctx.user_id).await;
     let secrets = b.filled_secrets();
     if name == "browser_take_screenshot" && !secrets.is_empty() {
         let shown = match b.run_code(&run, PAGE_TEXT_CODE).await {
@@ -334,11 +346,7 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     }
     b.set_busy(true);
     let started = std::time::Instant::now();
-    let drain = if READS.contains(&name) {
-        Duration::ZERO
-    } else {
-        ACTION_DRAIN
-    };
+    let drain = drain_for(name);
     let work = async {
         match (name, approved) {
             ("fill_saved_login", _) => Ok(super::fill::agent_login(state, &ctx, &run, &args).await),
@@ -559,6 +567,21 @@ pub(crate) mod tests {
             .is_err()
         );
         assert!(check_args("browser_snapshot", &json!([])).is_err());
+    }
+
+    #[test]
+    fn actions_keep_the_page_until_they_finish() {
+        assert_eq!(drain_for("browser_snapshot"), Duration::ZERO);
+        assert_eq!(drain_for("browser_take_screenshot"), Duration::ZERO);
+        assert_eq!(drain_for("browser_navigate"), Duration::from_secs(8));
+        for action in [
+            "browser_click",
+            "browser_fill_form",
+            "browser_type",
+            "fill_saved_card",
+        ] {
+            assert_eq!(drain_for(action), super::super::CALL_TIMEOUT, "{action}");
+        }
     }
 
     #[tokio::test]

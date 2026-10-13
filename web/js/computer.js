@@ -96,7 +96,7 @@ const PAD = '  ';
 function input(ev) { wsSend({ type: 'browser.input', ...ev }); }
 
 const LOGIN_FIELDS = [['username', 'Username'], ['password', 'Password']];
-const CARD_FIELDS = [['number', 'Number'], ['exp', 'Expiry'], ['cvc', 'CVC'], ['name', 'Name']];
+const CARD_FIELDS = [['number', 'Number'], ['exp', 'Expiry'], ['exp_month', 'Month'], ['exp_year', 'Year'], ['cvc', 'CVC'], ['name', 'Name']];
 
 /** The site a saved login is for, as a host (matches the page's). */
 function siteHost(site) {

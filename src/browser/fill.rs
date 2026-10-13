@@ -171,6 +171,41 @@ fn value_of(
         .ok_or_else(|| "that isn't saved for this item".into())
 }
 
+/// What to fill for one field of a saved item: candidates (the first the
+/// field takes; a month as 04, 4, or its name, a year as 2031 or 31), and
+/// whether it is private.
+fn field_values(
+    cred: &Credential,
+    secret: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<(Vec<String>, bool)> {
+    let month = cred.metadata["exp_month"]
+        .as_i64()
+        .filter(|m| (1..=12).contains(m));
+    let year = cred.metadata["exp_year"].as_i64().filter(|y| *y > 0);
+    let missing = || -> crate::util::BoxError { "that isn't saved for this item".into() };
+    match (cred.kind.as_str(), field) {
+        ("card", "exp_month") => {
+            let m = month.ok_or_else(missing)?;
+            let name = MONTHS[(m - 1) as usize];
+            Ok((
+                vec![
+                    format!("{m:02}"),
+                    m.to_string(),
+                    name.to_string(),
+                    name[..3].to_string(),
+                ],
+                true,
+            ))
+        }
+        ("card", "exp_year") => {
+            let y = year.ok_or_else(missing)?;
+            Ok((vec![y.to_string(), format!("{:02}", y % 100)], true))
+        }
+        _ => value_of(cred, secret, field).map(|(v, p)| (vec![v], p)),
+    }
+}
+
 /// A card's expiry as MM/YY.
 fn expiry(meta: &Value) -> Option<String> {
     let month = meta["exp_month"]
@@ -190,7 +225,7 @@ pub async fn fill(
 ) -> Result<()> {
     let user_id = state.browser.controller(device_id)?;
     let (cred, secret) = load(state, &user_id, credential_id).await?;
-    let (value, private) = value_of(&cred, &secret, field)?;
+    let (values, private) = field_values(&cred, &secret, field)?;
     let site = cred.metadata["site"].as_str().unwrap_or("");
     let (run, _op) = state.browser.owner_input(device_id).await?;
     // The focused element itself is filled (whatever it held is replaced),
@@ -216,7 +251,7 @@ pub async fn fill(
         }
     }
     state.browser.controller(device_id)?;
-    if !put(state, &run, Find::Focused, &at, &[value], private, false).await? {
+    if !put(state, &run, Find::Focused, &at, &values, private, false).await? {
         return Err("That field can't be filled.".into());
     }
     drop(secret);
@@ -949,7 +984,9 @@ async fn ask_approval(
         (Some(m), Some(y)) => format!(", expires {m:02}/{}", y % 100),
         _ => String::new(),
     };
-    let url = reveal_hidden(url);
+    // The address may carry a secret a page echoed: the card is stored in
+    // the chat.
+    let url = reveal_hidden(&super::hide_secrets(url, &state.browser.filled_secrets()));
     let host = reveal_hidden(&host);
     let preview = format!(
         "Fill your {name}{exp} (\"{}\") into the payment form on this page:\n{url}{}\n\n\
@@ -1050,34 +1087,14 @@ async fn card_inner(
              to ask)",
         ));
     }
-    let month = card.metadata["exp_month"]
-        .as_i64()
-        .filter(|m| (1..=12).contains(m));
-    let year = card.metadata["exp_year"].as_i64().filter(|y| *y > 0);
     let submit = args["submit"] == true && button.is_none();
     let last = targets.len() - 1;
     let mut missing = Vec::new();
     for (i, (field, r, at)) in targets.iter().enumerate() {
         b.check_agent(ctx)?;
-        let values: Vec<String> = match *field {
-            "exp_month" => month
-                .map(|m| {
-                    let name = MONTHS[(m - 1) as usize];
-                    vec![
-                        format!("{m:02}"),
-                        m.to_string(),
-                        name.to_string(),
-                        name[..3].to_string(),
-                    ]
-                })
-                .unwrap_or_default(),
-            "exp_year" => year
-                .map(|y| vec![y.to_string(), format!("{:02}", y % 100)])
-                .unwrap_or_default(),
-            f => value_of(&card, &secret, f)
-                .map(|(v, _)| vec![v])
-                .unwrap_or_default(),
-        };
+        let values = field_values(&card, &secret, field)
+            .map(|(v, _)| v)
+            .unwrap_or_default();
         if values.is_empty() {
             missing.push(*field);
             continue;

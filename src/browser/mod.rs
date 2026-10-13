@@ -493,12 +493,52 @@ const KEYS: &[&str] = &[
     "PageDown",
 ];
 
+/// How a value shows up once a page or Playwright has handled it: sent by
+/// a form (`application/x-www-form-urlencoded`), escaped by
+/// `encodeURIComponent`, or quoted in a snapshot (JSON-style escapes).
+fn written_forms(secret: &str) -> Vec<String> {
+    let encode = |keep: &dyn Fn(u8) -> bool, space_plus: bool| -> String {
+        secret
+            .bytes()
+            .map(|b| {
+                if b == b' ' && space_plus {
+                    "+".to_string()
+                } else if b.is_ascii_alphanumeric() || keep(b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    };
+    let form = encode(&|b| b"*-._".contains(&b), true);
+    let component = encode(&|b| b"-_.!~*'()".contains(&b), false);
+    let json = serde_json::to_string(secret).unwrap_or_default();
+    let json = json[1..json.len().saturating_sub(1).max(1)].to_string();
+    let mut forms = vec![form, component, json];
+    forms.retain(|f| f != secret && !f.is_empty());
+    forms.sort();
+    forms.dedup();
+    forms
+}
+
 /// `text` with saved secrets replaced by `[hidden]`: the gateway's matcher
-/// (the value and its common encodings), plus what pages do with card
-/// details: numbers split into groups by spaces or dashes, and short
+/// (the value and its common encodings), the forms pages and Playwright
+/// write values in (`written_forms`, any length), and what pages do with
+/// card details: numbers split into groups by spaces or dashes, and short
 /// security codes (only where they stand alone, not inside longer numbers).
 pub(crate) fn hide_secrets(text: &str, secrets: &[String]) -> String {
     let mut out = crate::gateway::redact(text, secrets);
+    for s in secrets.iter().filter(|s| s.chars().count() >= 4) {
+        for f in written_forms(s) {
+            // Escapes may be written in either case (%2b, %2B).
+            out = if f.contains('%') {
+                crate::gateway::replace_case_insensitive(&out, &f, "[hidden]")
+            } else {
+                out.replace(&f, "[hidden]")
+            };
+        }
+    }
     for s in secrets {
         let digits = !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
         if digits && s.len() >= 12 {
@@ -850,6 +890,18 @@ impl Browser {
     }
 
     fn set_page_info(&self, url: Option<&str>, title: Option<&str>) {
+        // A page may carry a saved secret in its address or title: never
+        // published, even to the owner's app.
+        let secrets = self.filled_secrets();
+        let hide = |t: &str| {
+            if secrets.is_empty() {
+                t.to_string()
+            } else {
+                hide_secrets(t, &secrets)
+            }
+        };
+        let (url, title) = (url.map(hide), title.map(hide));
+        let (url, title) = (url.as_deref(), title.as_deref());
         let changed = {
             let mut v = lock(&self.view);
             let mut changed = false;
@@ -1882,6 +1934,18 @@ mod tests {
             t.contains("cvc [hidden]") && t.contains("Boeing [hidden]"),
             "{t}"
         );
+        // Short passwords as forms send them, and as snapshots quote them.
+        let short = [
+            "Go*od+42".to_string(),
+            "Pw!2345".to_string(),
+            "pw+42".to_string(),
+            "S3c\"ret{42}".to_string(),
+        ];
+        let t = hide_secrets(
+            "p=Go*od%2B42 x=Pw%212345 y=pw%2b42 heading \"S3c\\\"ret{42}\" z=Go%2Aod%2B42",
+            &short,
+        );
+        assert_eq!(t.matches("[hidden]").count(), 5, "{t}");
         let amex = ["378282246310005".to_string()];
         assert_eq!(hide_secrets("3782 822463 10005", &amex), "[hidden]");
         assert_eq!(hide_secrets("nothing here", &secrets), "nothing here");
