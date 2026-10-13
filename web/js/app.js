@@ -163,27 +163,30 @@ const okSeg = (s) => !!s && s !== '.' && s !== '..';
 
 // ------------------------------------------------------------------ top bar
 
-/** Press and hold (or right click) runs `fn` instead of the click. */
+/** Press and hold (or right click) runs `fn` instead of the click. One
+ *  press at a time, so its state lives here and survives the drawer
+ *  rerendering (a streaming reply) mid-press. */
+const press = { timer: null, fired: false, at: null };
 function longPress(fn) {
-  let timer = null;
-  let fired = false;
-  let at = null;
-  const cancel = () => { clearTimeout(timer); timer = null; };
+  const cancel = () => { clearTimeout(press.timer); press.timer = null; press.at = null; };
   return {
     onPointerDown: (e) => {
-      fired = false;
-      at = { x: e.clientX, y: e.clientY };
       cancel();
-      timer = setTimeout(() => { fired = true; navigator.vibrate?.(10); fn(); }, 480);
+      press.fired = false;
+      press.at = { x: e.clientX, y: e.clientY };
+      press.timer = setTimeout(() => { press.timer = null; press.fired = true; navigator.vibrate?.(10); fn(); }, 480);
     },
-    onPointerMove: (e) => { if (at && Math.hypot(e.clientX - at.x, e.clientY - at.y) > 10) cancel(); },
+    onPointerMove: (e) => { if (press.at && Math.hypot(e.clientX - press.at.x, e.clientY - press.at.y) > 10) cancel(); },
     onPointerUp: cancel,
     onPointerLeave: cancel,
     onPointerCancel: cancel,
-    onContextMenu: (e) => { e.preventDefault(); if (!fired) { cancel(); fired = true; fn(); } },
-    onClickCapture: (e) => { if (fired) { e.stopPropagation(); e.preventDefault(); fired = false; } },
+    onContextMenu: (e) => { e.preventDefault(); if (!press.fired) { cancel(); press.fired = true; fn(); } },
+    onClickCapture: (e) => { if (press.fired) { e.stopPropagation(); e.preventDefault(); press.fired = false; } },
   };
 }
+// The drawer can rerender away from the pressed row: a release anywhere ends the press.
+addEventListener('pointerup', () => { clearTimeout(press.timer); press.timer = null; }, true);
+addEventListener('pointercancel', () => { clearTimeout(press.timer); press.timer = null; }, true);
 
 function chatMenu(c) {
   const rename = async () => {

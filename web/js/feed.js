@@ -329,7 +329,7 @@ export function StoryViewer() {
   });
   // A tap waiting out a double tap belongs to the story it was on: closing,
   // swiping or moving on drops it.
-  useEffect(() => () => { clearTimeout(tap.current?.timer); tap.current = null; }, [S.story]);
+  useEffect(() => () => { clearTimeout(tap.current?.timer); tap.current = null; setHeart(0); }, [S.story]);
 
   if (!st || !p) return null;
 
