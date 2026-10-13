@@ -104,8 +104,9 @@ src/
 ├── server/          axum routes (chat, content, admin), WebSocket, app + /console
 ├── demo.rs          `iris demo-seed`: fake demo data for screenshots
 ├── mcp.rs           `iris mcp` stdio MCP bridge (CRUD into the DB), `iris mcp --browser`
-├── browser/         Iris's computer: Chromium over a DevTools pipe, browser tools,
-│                    live view, take over, login/card fill from the vault
+├── browser/         Iris's computer: wrapper around Microsoft's Playwright MCP
+│                    (start/stop, reviewed tools for the agent, live view,
+│                    take over, owner-initiated login/card fill, AppArmor setup)
 ├── jobs.rs          heartbeat and feed jobs, scheduler
 ├── feed/            For you pipeline: sources, polite fetching, page extraction,
 │                    ranking, adaptive size, urgent pushes (two model calls a day)
@@ -160,7 +161,12 @@ Unit tests cover the router and policy, persona assembly, stream parsing,
 pairing/auth, the vault, push encryption (RFC 8291 vector), the MCP bridge,
 the connector gateway (approval gate, trusted people, tripwires, pause,
 disconnect, against a fake connector), connector sign-in (discovery, DCR,
-PKCE, refresh, against a fake provider), import, and the subprocess runner.
+PKCE, refresh, against a fake provider), import, the subprocess runner, and
+the browser wrapper (tool allowlist, take over, private pages, saved-login
+fill, sandbox consent, live view, against a stand-in Playwright MCP server).
+`IRIS_REAL_BROWSER=<engines dir> cargo test real_playwright -- --ignored`
+runs it against the real Playwright MCP and Chromium after
+`iris engines install browser --dir <engines dir>` (CI does this).
 
 End-to-end check against the real CLIs (uses a temp data dir; costs a few
 tiny requests on your subscriptions):
@@ -178,7 +184,9 @@ and `codex exec resume`, `--system-prompt-snapshot`, `developer_instructions`,
 MCP approval (`default_tools_approval_mode`), MCP tool-call timeouts
 (Claude Code per-server `timeout` and `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`,
 Codex `tool_timeout_sec`, Gemini CLI and OpenCode `timeout`), and the
-auth-failure output. `scripts/e2e/connectors.sh <model>` checks the
+auth-failure output. When Playwright MCP updates: its tool names (the
+allowlist in `src/browser/tools.rs`), the markdown it returns (page header,
+tab list, `### Result`), and its config file keys (`src/browser/launch.rs`). `scripts/e2e/connectors.sh <model>` checks the
 approval gate end to end with a fake messenger connector.
 
 ## Conventions

@@ -1967,14 +1967,14 @@ Saved logins and payment cards. All routes are **owner-only** and scoped to
 the caller. Secrets (password, notes, card number, CVC) are encrypted at rest
 and **never returned**; responses only contain non-secret metadata.
 
-The agent uses them only through Iris's browser: `fill_login` and
-`fill_card` ([browser tools](#the-browser-tools)) make Iris type the saved
-values into the current page itself. The secret never reaches a tool result,
-a message, or a log. A login is filled only into the site it was saved for
-(scheme, host, and port must match the saved `site`; subdomains require
-`allow_subdomains: true`) over HTTPS
-(plain HTTP only on this machine). Every card use needs the owner's OK on an
-[approval card](#server-cards).
+The agent never uses them. While the owner has taken over Iris's browser,
+the app fills one field at a time into the page (`browser.input` with
+`kind: "fill"`, see [the WebSocket](#4-websocket-get-apiws)): Iris types the
+saved value into the focused element itself, and it never reaches a tool
+result, a message, a client, or a log. A login is filled only into the site
+it was saved for (scheme, host, and port must match the saved `site`;
+subdomains require `allow_subdomains: true`), and anything only over HTTPS
+(plain HTTP only on this machine). `last_used_at` records the last fill.
 
 #### `GET /api/credentials`
 
@@ -2148,7 +2148,7 @@ official sources, into its engines directory (`engines.dir`, default
 | `codex` | npm `@openai/codex` | npm registry integrity; install scripts not run |
 | `gemini` | npm `@google/gemini-cli` | same |
 | `opencode` | npm `opencode-ai` (its native platform binary) | same |
-| `browser` | Chromium for [Iris's computer](#318-iriss-computer-browser): npm `playwright-core`, then its own `install chromium` from Playwright's official downloads | npm registry integrity for the package; Playwright's installer for the browser |
+| `browser` | [Iris's computer](#319-iriss-computer-browser): npm `@playwright/mcp` (Microsoft's Playwright MCP server), then its own `install-browser chromium` from Playwright's official downloads | npm registry integrity for the package; Playwright's installer for Chromium |
 
 The npm engines need Node.js on the server. Iris only ever updates or
 removes engines it installed; a CLI the operator installed (for example in
@@ -2254,7 +2254,8 @@ Owner only.
 #### `POST /api/safety/disconnect-all`
 
 **Disconnect everything**: turns every connector off, stops their programs,
-cancels waiting approvals, and disconnects and closes the browser. Reopen it
+cancels waiting approvals, ends browser access for running turns, and
+disconnects and closes the browser. Reopen it
 with `POST /api/browser/start` to reconnect browser tools. `{"disconnected": <how many were on>,
 "connectors": [{Connector}]}`. Turn them back on one by one.
 
@@ -2262,21 +2263,22 @@ with `POST /api/browser/start` to reconnect browser tools. `{"disconnected": <ho
 
 ### 3.19 Iris's computer (browser)
 
-Owner only. Iris's own headless Chromium, which the agent drives through
-the [browser tools](#the-browser-tools) and the owner can watch and take
-over from the app. One browser serves the owner's personal conversations
-and jobs; its profile (cookies, so sign-ins) lives in `<data dir>/browser`.
-It starts on first use and closes after `browser.idle_mins` (default 10)
-without use. Chrome's own password manager and form autofill are turned off
-in that profile.
+Owner only. Iris's own headless browser: Microsoft's Playwright MCP server
+(`@playwright/mcp`) running Chromium, whose tools the agent gets (the
+[browser tools](#the-browser-tools)) and which the owner can watch and take
+over from the app. Iris starts the server on its own side and only wraps
+it. One browser serves the owner's personal conversations and jobs; its
+profile (cookies, so sign-ins) lives in `<data dir>/browser/profile`. It
+starts on first use and closes after `browser.idle_mins` (default 10)
+without use. Chrome's own password manager and form autofill are turned
+off in that profile.
 
-Where the browser comes from: `browser.command` in the config; else the copy
-installed from the app (`POST /api/browser/install`, at the fixed path
-`<engines dir>/chromium/app/chrome` that `deploy/setup-engines.sh` approves
-for Chrome's sandbox); else `chromium`, `chromium-browser`, `google-chrome-stable`,
-`google-chrome`, or `chrome` on `PATH` (snap wrappers are skipped); else
-Playwright's browser cache (`$PLAYWRIGHT_BROWSERS_PATH` or
-`~/.cache/ms-playwright`).
+Where it comes from: the server Iris installed from the app
+(`POST /api/browser/install`, `<engines dir>/bin/browser`), else
+`playwright-mcp` on `PATH`. Chromium: `browser.command` in the config; else
+the build Iris installed at the fixed path `<engines dir>/chromium/app/chrome`
+that `deploy/setup-engines.sh` approves for Chrome's sandbox; else
+Playwright's own download.
 
 #### `GET /api/browser`
 
@@ -2289,7 +2291,7 @@ Playwright's browser cache (`$PLAYWRIGHT_BROWSERS_PATH` or
 | Field | Type | Notes |
 |---|---|---|
 | `enabled` | bool | `browser.enabled` in the config. |
-| `available` | bool | A browser executable was found. |
+| `available` | bool | Playwright MCP was found (and the Chromium `browser.command` names, if set). An install from before Playwright MCP is not available until updated. |
 | `running` | bool | The browser is open. |
 | `paused` | bool | "Pause Iris" is on. |
 | `disconnected` | bool | Browser tools are disabled after Disconnect everything; reopening the browser reconnects them. |
@@ -2299,12 +2301,11 @@ Playwright's browser cache (`$PLAYWRIGHT_BROWSERS_PATH` or
 | `busy` | bool | The agent is carrying out a browser action right now. |
 | `active` | array | `[{"conversation_id", "message_id"}]`: turns that have used the browser and are still running (show the chat peek for these). |
 | `watchers` | int | App sockets watching the live view. |
-| `streaming` | bool | The live-view screencast is running (only while someone watches). |
+| `streaming` | bool | The live view is taking screenshots (only while someone watches). |
 | `sandbox` | bool or null | Chrome's sandbox is on (null while closed). |
 | `sandbox_unavailable` | bool | The last start failed only because this system cannot start Chrome's sandbox (for example Ubuntu's AppArmor restriction on unprivileged user namespaces). The app then offers [`POST /api/browser/sandbox`](#post-apibrowsersandbox-owner). |
 | `allow_no_sandbox` | bool | The owner allowed running without the sandbox on such a system. |
 | `sandbox_fix` | object or null | Only with `sandbox_unavailable` and only where AppArmor restricts unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns = 1`): the one-time root step that lets the sandbox start on this machine, `{"kind", "path", "command"}`. `path` is the real path of the browser Iris would start (null if none). `kind` `"apparmor"`: that browser, everything in its directory, and every ancestor are owned by root (or, with the privilege split, the `iris` engine admin account when it owns the engines directory and is neither Iris's nor the agent's account) and not group/other writable, and `command` writes `/etc/apparmor.d/iris-browser` for exactly that path and loads it with `apparmor_parser -r`. `kind` `"setup"`: the browser could be replaced by an unprivileged user, so no profile is offered for it; `command` runs `deploy/setup-engines.sh` (from the Iris source folder) for the account Iris runs as, after which Iris's own browser is installed from the app into the protected engines directory; with it, `install_browser` (bool) is true when the privilege split is configured and that browser is not installed yet or still sits in its pre-fixed-path download directory (an install moves it), so the app offers [`POST /api/browser/install`](#post-apibrowserinstall-owner), `account_conflict` (bool) is true when Iris or its agent runs as the `iris` engine admin account, which the script refuses (move them to another account first), and `configured_command` (bool) is true when `browser.command` is set, which always wins and has to be cleared (then restart Iris). A managed browser at its old, per-build path is never offered a profile: it is moved instead. Show `command` to copy; never run it from a client. Holds paths, never secrets. Computed by `GET /api/browser` (live `browser.state` events from the browser itself omit it). |
-| `version` | string or null | Browser version while open. |
 | `error` | string or null | Why the last start failed (for example missing system libraries, with the command that fixes it). |
 | `managed`, `managed_version` | bool, string or null | Installed from the app. |
 | `requires` | string or null | `"nodejs"` when installing from the app needs Node.js first. |
@@ -2322,7 +2323,8 @@ Closing is graceful, so cookies are saved. Both return
 The calling device takes control (the browser opens if needed). While the
 owner is in control the agent's browser tools wait (up to about 50 seconds
 per call, then tell the agent the user is still using it), and the device
-sends input over the WebSocket (`browser.input`). Control returns to the
+sends input over the WebSocket (`browser.input`), including fills of saved
+logins and cards. Control returns to the
 agent on `POST /api/browser/handback`, when the browser closes, or after 5
 minutes without input. Returns `{"browser": {BrowserStatus}}`.
 
@@ -2350,13 +2352,15 @@ starting). Returns `{"browser":
 
 #### `POST /api/browser/install` (Owner)
 
-Install (or update) Chromium for Iris, like
+Install (or update) Iris's browser, like
 [`POST /api/engines/browser/install`](#post-apienginesnameinstall-post-apienginesnameupdate):
-the official `playwright-core` npm package, then its `install chromium` into
-`<engines dir>/chromium/browsers`; the build then moves to the fixed
-`<engines dir>/chromium/app` (`app/chrome` on Linux), linked as
-`<engines dir>/bin/browser`, and the download directory is removed. An
-update that pins the same Chromium build downloads nothing.
+the official `@playwright/mcp` npm package into `<engines dir>/chromium`,
+started by `<engines dir>/bin/browser`, then its `install-browser chromium`
+into `<engines dir>/chromium/browsers`; the build then moves to the fixed
+`<engines dir>/chromium/app` (`app/chrome` on Linux) and the download
+directory is removed. An update whose Playwright pins the same Chromium
+build downloads only the server. The version reads like
+`0.0.83 (Chromium build 1247)`.
 Needs Node.js. Returns `{"started": bool, "browser": {BrowserStatus}}`;
 progress arrives as `browser.state`. If Chromium then fails to start for
 missing system libraries, `error` says so; the fix needs root once on the
@@ -2493,15 +2497,17 @@ Any other client frame is ignored. Non-owners get `{"type": "error", "code":
 (no `at`):
 
 ```json
-{"type": "browser.frame", "seq": 41, "mode": "full", "width": 500, "height": 857, "data": "<base64 JPEG>"}
+{"type": "browser.frame", "seq": 41, "mode": "full", "width": 500, "height": 1000, "data": "<base64 JPEG>"}
 ```
 
 `width` and `height` are the page viewport in CSS pixels; the JPEG itself
-is up to 1000 px wide (`full`) or 360 px (`peek`). Frames are sent only when
-the page changes, and at most about 6 per second for `full` and 1 per
-second for `peek`; throttling never drops the newest frame, so a still page
-always ends up on screen. A new watcher gets the current picture at once.
-The browser streams only while some app is watching. Stop watching (`"off"`)
+is 1000 px wide (`full`, device pixels) or 500 px (`peek`). Iris takes a
+screenshot through the browser server about every 0.3 seconds (`full`) or
+every second (`peek`) and sends a frame only when the picture changed;
+throttling never drops the newest frame, so a still page always ends up on
+screen. While the agent waits for a slow page, screenshots wait too. A new
+watcher gets the current picture at once. Screenshots are taken only while
+some app is watching. Stop watching (`"off"`)
 when the view is hidden or the app goes to the background.
 
 **Input while in control.** Coordinates are fractions (0 to 1) of the frame
@@ -2512,9 +2518,17 @@ image:
 | `tap` | `x`, `y` | A left click at that point. |
 | `scroll` | `x`, `y` (optional), `dx`, `dy` | Mouse wheel; deltas in CSS pixels (max 4,000). |
 | `text` | `text` (max 2,000 characters) | Typed into the focused element. |
-| `key` | `key` | `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, arrows, `Home`, `End`, `PageUp`, `PageDown`, `Space`, or one character. |
+| `key` | `key` | `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, arrows, `Home`, `End`, `PageUp`, `PageDown`. |
 | `back` | none | History back. |
 | `navigate` | `url` | Open an http(s) page (as `POST /api/browser/navigate`). |
+| `fill` | `credential_id`, `field` | Type one field of a saved [credential](#313-credentials) into the focused element: `username` or `password` for a login, `number`, `exp` (MM/YY), `cvc`, or `name` for a card. A login only on the site it was saved for; everything only over HTTPS (plain HTTP only on this machine). The value never comes back to any client. |
+
+Typing into a private field (a password, card, or one-time-code field, or
+one inside a frame), and filling a `password`, `number`, `exp`, or `cvc`,
+closes the current page to the agent: its browser tools other than
+`browser_navigate`, `browser_navigate_back`, and `browser_tabs` answer that
+the owner typed private details there, until the page's address (ignoring
+the fragment) changes or the agent opens a page.
 
 Input from a device that does not have control, or a failed input, gets
 `{"type": "browser.input_error", "message": "..."}`. Input is carried out in
@@ -2522,7 +2536,7 @@ order on its own task, so a slow page never holds up the socket's frames or
 events (at most 64 inputs wait; more are refused with that error). Each
 input step re-checks that this device still has control; input still
 queued when the socket closes is dropped, and a revoked device loses
-control at once. Typed text is never logged.
+control at once. Typed text and filled values are never logged.
 
 ### Keepalive and revocation
 
@@ -2948,12 +2962,6 @@ changes are re-sent as `message.updated`.
 | `engine_setup` | `state` (`needs_setup`, `done`), `options: [{"harness", "label", "installed", "requires", "action": {"method", "path"}}]` | Each option installs that engine (`POST /api/engines/{name}/install`). |
 | `connector_reconnect` | `connector_id`, `service`, `auth` (`oauth` or `secrets`), `state` (`needs_reconnect`, `done`) | `oauth`: sign in again (`POST /api/connectors/{id}/oauth/start`). `secrets`: open the connector's settings so the owner can update its credentials (`PATCH /api/connectors/{id}`). The card turns `done` (✓) after a successful connection. |
 | `approval` | `service`, `preview: {"to", "subject", "body", "fields": [{"label", "value"}]}`, `details` (the complete arguments, pretty JSON; requests too large to show in full are refused), `reason` (why it asks, e.g. "Sends a message to someone new: sam@example.com"), `tool`, `category`, `connector_id`, `turn_message_id` (the reply of the turn that asked; absent for scheduled jobs), `action_label` (`Send`, `Pay`, `Delete`, or `Allow`), `approver_user_id`, `owner_only: false`, `state` (`pending`, `approved`, `denied`, `expired`, `cancelled`), `expires_at`, `decided_at` | Show the preview exactly as given with Deny / `action_label`; decide with [`POST /api/messages/{id}/decision`](#post-apimessagesiddecision). Built by the gateway from the real arguments of the held call, never from agent text; characters that could hide or reorder text are shown as `[U+XXXX]`, and a body over 4,000 characters is cut with a note (the full text is in `details`). |
-
-Wallet approval cards use this same gate with `service: "wallet"`,
-`action_label: "Fill card"`, and `wallet: {"credential_id", "origin",
-"revision", "used_at"}`. The preview labels are Site and Page. One approval
-fills once in its original running turn, on the approved document/origin.
-The preview comes from the real page and saved card; it contains no vault secret.
 
 
 ### Attachment
@@ -3466,7 +3474,7 @@ as `/api/health`, also supplied to shared and isolated turns), and
 `google_setup` (step, total_steps, phase, more_access, summary, authorized_domain, non-secret
 project_id, and fixed
 error step/message only), engine names/install/sign-in/version, current engine and model,
-isolation, connector names/status/rules, saved login host names, wallet card count,
+isolation, connector names/status/rules, saved login host names (the owner can fill those while in control of the browser), wallet card count,
 agent name, feed/Pause/quiet hours/voice state, eight recent pending card summaries
 (type/title only), and eight recent conversation system notes. It excludes secrets,
 account identities, paths, credential labels/usernames/numbers, connector configs,
@@ -3521,124 +3529,53 @@ It is launched as:
 ```
 
 with `IRIS_BROWSER_TOKEN` in its environment. That process only forwards
-each `tools/call` over a private Unix socket (`<data dir>/run/browser.sock`,
-or a private directory under `$XDG_RUNTIME_DIR` when that path is too long)
-to the server, which owns the browser; the token identifies the turn and
-stops working when the turn ends. Iris carries out each call over the
-DevTools protocol (through a pipe, so no DevTools port is opened); the CLI
-does all the deciding.
+`tools/list` and `tools/call` over a private Unix socket
+(`<data dir>/run/browser.sock`, or a private directory under
+`$XDG_RUNTIME_DIR` when that path is too long) to the server; the token
+identifies the turn and stops working when the turn ends. The server
+forwards each call to [Iris's browser](#319-iriss-computer-browser), the
+Playwright MCP server it runs, and returns that server's result unchanged
+(text, and `image` blocks for screenshots). The tools, their arguments, and
+their results are Playwright MCP's own; see its documentation. Action
+results link snapshot files the agent cannot open, so the agent calls
+`browser_snapshot` to read the page. Iris decides nothing; it only refuses:
 
-| Tool | Arguments | Result |
-|---|---|---|
-| `navigate` | `url` (http(s); a bare domain gets `https://`) | Snapshot of the page |
-| `snapshot` | none | Snapshot: `Page:` title, `URL:`, then one line per heading, text block, image with alt text, and interactive element (`- button "Sign in" [ref=e3]`, with `value=`, `[checked]`, `[disabled]`, `[expanded]`, link targets, select options). Up to 12,000 characters. |
-| `click` | `ref`, `double?` | Clicks (or double-clicks) the element's center with real mouse events, waits for a navigation it starts, returns the new snapshot |
-| `click_at` | `x`, `y` (screenshot pixels), `double?` | Clicks that point; for frames from other sites (CAPTCHAs, widgets), maps, canvases. `Clicked. ...` |
-| `drag` | `from_x`, `from_y`, `to_x`, `to_y` (screenshot pixels) | Press, move in steps, release (sliders, slide-to-verify). `Dragged. ...` |
-| `hover` | `ref` | Moves the mouse over the element (hover menus), returns the snapshot |
-| `type` | `ref`, `text` (max 5,000), `submit?` | Replaces the field's content; with `submit`, presses Enter and returns the new snapshot |
-| `select_option` | `ref`, `value` (option text or value) | `Selected "..."` |
-| `press_key` | `key` | Snapshot |
-| `scroll` | `direction` (`up`/`down`), `pages?` (0.1 to 10) | `Scrolled ...` |
-| `back` | none | Snapshot |
-| `screenshot` | none | Text plus an `image` content block (JPEG of the visible page, 500 px wide) |
-| `wait` | `text?`, `seconds?` (max 30) | Snapshot once the text appears, or after the time |
-| `tabs` | `action` (`list`, `new`, `select`, `close`), `index?`, `url?` | Tab list or snapshot. Tabs a page opens become the current tab. |
-| `fill_login` | `site?`, `submit?` | `filled`, or `not found (<reason>)`; with `submit`, presses Enter in the filled field and answers `filled and submitted.` plus the next snapshot |
-| `fill_card` | `card?` (name or last 4 digits) | `filled` (or `filled (but ...)` naming parts that could not be filled), `denied (...)`, `not filled (...)` (expired/cancelled), or `not found (...)` |
+- Tools outside the reviewed list. The agent gets `browser_navigate`,
+  `browser_navigate_back`, `browser_tabs`, `browser_snapshot`,
+  `browser_find`, `browser_take_screenshot`, `browser_click`,
+  `browser_hover`, `browser_drag`, `browser_type`, `browser_fill_form`,
+  `browser_select_option`, `browser_press_key`, `browser_handle_dialog`,
+  `browser_wait_for`, and the position-based `browser_mouse_click_xy`,
+  `browser_mouse_drag_xy`, `browser_mouse_move_xy`, `browser_mouse_down`,
+  `browser_mouse_up`, `browser_mouse_wheel` (CSS pixels of the 500 x 1000
+  page; for CAPTCHAs, frames from other sites, maps, canvases). Not
+  offered, and refused: `browser_run_code_unsafe` (code inside the server,
+  on Iris's side), `browser_evaluate` (page scripts can read cookies and
+  stored tokens), `browser_file_upload` and `browser_drop` (files on the
+  server), `browser_network_request(s)` (headers carry cookies),
+  `browser_console_messages`, `browser_resize`, `browser_close`, and any
+  tool a newer version adds.
+- Writing results to files: the `filename` option is removed from the
+  definitions and refused.
+- Addresses that are not web pages in `browser_navigate` and
+  `browser_tabs` (`url`): only `http`, `https`, a bare domain, or
+  `about:blank`.
+- Anything but `browser_navigate`, `browser_navigate_back`, and
+  `browser_tabs` while the current page holds private details the owner
+  typed or filled (see [Input while in control](#4-websocket-get-apiws)).
 
-Refs are valid until the page changes (they are unique per document, so an
-old ref never hits an element of a newer page); a stale ref gets an error
-asking for a new snapshot. Values of password fields and card fields are
-shown as `••••` in readable snapshots. Fields Iris fills from the vault
-are masked on screen. JavaScript dialogs are answered (alerts and confirms
-accepted, prompts dismissed) and reported at the top of the next result.
-After a vault secret is filled, every agent read of that document refuses
-with "This page has your password filled in. Submit or leave the page first."
-This includes snapshots, text waits, screenshots, and tab titles/URLs.
-Tainted tabs are listed only by index. Existing refs still work for actions (including submit and Enter);
-an action that runs on a page that is still tainted answers with a note
-saying so (not an error), since one-page sign-ins like X keep every step on
-the same document. Frames from other sites appear in snapshots with their
-position on the screenshot, for `click_at`.
-The restriction follows the filled tab across script redirects and reloads.
-It clears after an explicit agent navigation/click (or Enter submission)
-loads a new document whose path differs from the fill page, or after the
-owner supplies browser input. Query/fragment changes and same-path
-submissions do not clear it. A script redirect immediately after input,
-including one carrying a transformed password in its fragment, stays tainted.
-The owner's live screencast is unaffected. Dialog reports contain only their
-kind and outcome, never page-controlled text.
-Text is read exactly as written (adjacent inline elements are not split
-apart), and a secret split across elements, blocks, or controls is found on
-the page's whole text first, hiding every piece. `wait` matches only the
-redacted text. Every secret Iris filled in the current browser session is replaced with
-`••••` anywhere in a tool result (a page could echo it in a dialog, title,
-or other field). The page helpers do this on the raw text, before folding
-whitespace, cutting long values, or quoting, so no escaped or partial copy
-survives; its URL-encoded forms are covered too, and a line that still
-holds a secret once percent-decoded (an address in some other escaping)
-loses its query. Dialogs, the live title and address, and approval cards
-are redacted the same way; card numbers are found in any grouping
-("3782 822463 10005"), and escapes in UTF-8 or Latin-1, in any letter case.
-The owner's saved passwords, card numbers, and CVCs, and every secret Iris
-ever filled (kept encrypted with the vault in
-`<data dir>/browser/redaction.enc`, so edited or deleted ones too), are
-known to the redactor before a browser session shows or reads anything
-(also when it is started from the app), and credentials saved or edited
-while it runs are added at once: a page may show one it kept from an
-earlier session. If that history cannot be read, the browser does not
-start. (So the same three digits as a saved CVC are hidden on
-pages too.) `screenshot` never shows a page that is, or embeds a frame
-from, a site (origin) Iris ever filled a secret into (stored hashed in
-`<data dir>/browser/tainted-origins.json`; if that file cannot be read,
-no screenshots at all), and refuses on any other page whose text or
-unmasked fields (open shadow roots too) show a secret. The page is checked
-again after capture and the picture is dropped if it changed. A fill does
-not happen unless both files could be written first. Saved secrets shorter than 3 characters are not filled (they
-could not be told apart from ordinary text).
+Each call waits while the owner has taken over (up to about 50 seconds,
+then tells the agent the user is still using it), and checks again once it
+holds the page, so a queued call never acts under the owner's control.
+Takeover also discards the result of a call already under way, even if
+control is immediately handed back. When the turn ends (finished,
+cancelled, or failed), its calls stop at once, even in the middle of a
+wait. Every harness gets a per-server timeout of the effective approval
+window plus 300 seconds, using the standard per-server MCP timeout fields.
 
-Each call waits while the owner has taken over, and checks again once it
-holds the page and right before every command that changes the page, so a
-queued or slow call never acts under the owner's control. Takeover also
-cancels admitted calls and discards their captured text or pixels before
-returning them, even if control is immediately handed back. When the turn
-ends (finished, cancelled, or failed), its calls stop at once, even in the
-middle of a wait, and nothing more is done for it. Every harness gets a
-per-server timeout of the effective approval window plus 300 seconds, using
-the standard per-server MCP timeout fields.
-
-`fill_login` takes the saved login whose `site` matches the current page's
-origin (scheme, host, and port; subdomains only when the saved credential
-opts in via `allow_subdomains`; the most recently used matching login wins), finds the
-sign-in fields (also in same-origin frames), and fills the username and
-password itself (when the page has a password box, the password must go in,
-or the answer is `not found`). Each value is set on that exact element in one step from
-Iris's isolated script world (masked first, through the native value
-setter, with the input and change events a typing user causes), and only
-while the same tab shows the same document whose address was checked; focus
-changes the page makes cannot redirect it. The site check uses the very
-revision of the login whose password is filled. It answers `not found` when
-the page is not that site, not HTTPS (plain HTTP only on this machine), has
-no sign-in field, changed while filling, or nothing is saved for it.
-
-`fill_card` picks the card (the only one, or the one named), checks the
-page has a card number field, and posts an [approval card](#server-cards)
-in the conversation with a push to the owner, built from the real page and
-card. It uses the connector gateway's approval waiter and effective
-`safety.approval_timeout_secs`: denial, expiry, Stop, Pause Iris, Disconnect
-everything, or loss of private membership prevents the fill. An approval
-only releases the held call; it never starts a later turn. The card must
-still have the same revision when filled; editing it requires another OK.
-After approval (still unexpired and unused when it is consumed), Iris fills
-the card number, expiry, CVC, and name itself the same way, on the approved
-page only; each approval fills once and is bound to the browser's exact
-origin (scheme, host, and port). If some part could not be filled (for
-example the expiry dropdown has no matching option) the answer is
-`filled (but the ... could not be filled in; ...)`. A two-digit year box gets
-"31", not "2031". Page titles and
-addresses in the approval card are redacted like tool results. Cards are
-never used in jobs (nobody could approve).
+The agent never handles passwords, card numbers, or codes: its instructions
+tell it to ask the owner to take over for sign-ins and payments (always for
+sites that fight automated browsers, such as X).
 
 ### `save_to_library` details
 

@@ -108,8 +108,9 @@ See [docs/API.md](API.md) for every route, event, and data type.
   - OpenCode 1.19 or newer
 - Node.js (with npm) on the server if you want to install Codex, Gemini CLI,
   or OpenCode from the app (Claude Code installs natively)
-- Optional, for Iris's own browser: Chromium or Chrome, or Node.js to
-  install Chromium from the app
+- Optional, for Iris's own browser: Node.js to install it from the app
+  (Microsoft's Playwright MCP server and its Chromium), or `playwright-mcp`
+  on `PATH`
 - [uv](https://docs.astral.sh/uv/) (`uvx`) on the server if you want to
   connect Google (Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks,
   Contacts, YouTube read-only)
@@ -281,7 +282,7 @@ After pairing your phone you should not need the server again:
 For a stricter setup, `deploy/setup-engines.sh` (run once as root) creates a
 separate `iris` system user that owns the engines directory and performs
 installs through a narrow sudo rule. The rule includes install, update, and
-uninstall for `browser` (managed Chromium); rerun the script if your rule
+uninstall for `browser` (Playwright MCP and its Chromium); rerun the script if your rule
 was created before browser support was added. Where AppArmor restricts
 user namespaces (Ubuntu 23.10 and later), the script also approves Iris's
 own browser for Chrome's sandbox (see
@@ -465,50 +466,64 @@ service account again. The engine-admin split is independent and remains.
 
 ## Iris's computer (browser)
 
-Iris launches and owns one headless Chromium for the agent. Every engine
-gets it as the `browser` MCP tools (open pages, read them, click, type,
-screenshots, tabs), and you can watch it live and take over from the app
-(Iris hub, Iris's computer). Iris itself is not an agent here: it carries
-out each tool call the CLI makes, nothing more.
+Iris's browser is Microsoft's open-source Playwright MCP server
+(`@playwright/mcp`), which runs one headless Chromium. Iris does not
+automate the browser itself: it starts that server on its own side, hands
+its tools to the agent in your own conversations as the `browser` MCP
+server (open pages, read them, click, type, fill forms, screenshots, tabs),
+and lets you watch it live and take over from the app (Iris hub, Iris's
+computer).
 
 - **Getting a browser.** Tap "Set up the browser" in Iris's computer: Iris
-  installs the official `playwright-core` npm package into its engines
-  directory and runs its own `install chromium`, which downloads Chromium
-  from Playwright's official servers (needs Node.js). The build lands at one
-  fixed path, `<engines dir>/chromium/app/chrome` (linked as
-  `<engines dir>/bin/browser`), so the one-time root setup can approve it
-  for Chrome's sandbox (below). Iris updates it daily with the other
-  engines it installed, while the browser is closed. Or install Chromium or
-  Chrome yourself. Iris looks at `browser.command`, then its own installed
-  browser, then `PATH` (`chromium`, `google-chrome`, ...; snap packages are
-  skipped because their sandbox cannot use Iris's profile), then
-  Playwright's cache (`~/.cache/ms-playwright`).
+  installs the official `@playwright/mcp` npm package into its engines
+  directory (`<engines dir>/chromium`) and runs its own
+  `install-browser chromium`, which downloads Chromium from Playwright's
+  official servers (needs Node.js). The build lands at one fixed path,
+  `<engines dir>/chromium/app/chrome`, so the one-time root setup can
+  approve it for Chrome's sandbox (below); `<engines dir>/bin/browser`
+  starts the server. Iris updates both daily with the other engines it
+  installed, while the browser is closed. Or install the server yourself
+  (`npm install -g @playwright/mcp`, then `npx playwright install chromium`);
+  Iris uses `playwright-mcp` from `PATH` when it has no copy of its own.
+  `browser.command` picks another Chromium or Chrome for it.
+- **What the agent may use.** Playwright MCP's page tools pass through
+  unchanged. Iris refuses the ones that reach beyond the page:
+  `browser_run_code_unsafe` (it runs code inside the server, on Iris's
+  side), `browser_evaluate` (page scripts can read cookies and stored
+  tokens), file upload and drop, network request details (headers carry
+  cookies), console messages, resizing and closing the browser, writing
+  results to files, and addresses that are not `http`/`https`. Tools a new
+  version adds stay hidden until they are reviewed in `src/browser/tools.rs`.
 - **System libraries.** A fresh server may lack the libraries Chromium
   needs; the app then shows the error. Fix it once as root with
   `npx playwright install-deps chromium` (or install your distribution's
   Chromium package).
 - **Sign-ins persist.** The profile lives in `<data dir>/browser/profile`,
-  so sites you or Iris signed in to stay signed in. Chrome's own password
-  manager and autofill are turned off there. Chrome's session files
-  (open tabs with what was typed into their forms) are deleted before each
-  start and after each close.
+  so sites you signed in to stay signed in. Chrome's own password manager
+  and autofill are turned off there. Chrome's session files (open tabs with
+  what was typed into their forms) and Playwright's output folder (page
+  snapshots, screenshots) are deleted before each start and after each
+  close.
 - **Memory.** The browser starts on first use and closes after
   `browser.idle_mins` (default 10) without use, so it costs nothing while
-  idle. A running browser with one tab takes roughly 200 to 400 MB.
-- **Live view and take over.** Frames stream over the app's WebSocket only
-  while you watch (about 1 per second for the small peek in chat, up to
-  about 6 full screen, only when the page changes). Take over forwards your
-  taps, scrolling, and typing; the agent's browser tools wait until you hand
-  back.
-- **Saved logins and cards.** The agent asks Iris to fill a login
-  (`fill_login`) or card (`fill_card`) on the current page; Iris types it in
-  from the vault and the agent only hears `filled` or `not found`. Logins go
-  only to the site they were saved for, over HTTPS. Every card use asks you
-  first with an approval card in the chat. After a secret is filled, the agent
-  cannot read that document, query its text, or screenshot it: it can still
-  click the submit button, press Enter, or navigate. Reads resume on a new
-  document (navigation, reload, or a submission that loads a page). The live
-  view on your phone stays available.
+  idle. A running browser with one tab takes a few hundred MB (the
+  Node.js server plus Chromium).
+- **Live view and take over.** While you watch, Iris takes screenshots
+  through the server (about 1 per second for the small peek in chat, about
+  3 full screen) and sends only pictures that changed. While the agent
+  waits for a slow page, the picture waits too. Take over forwards your
+  taps, scrolling, and typing to the same page; the agent's browser tools
+  wait until you hand back.
+- **Signing in is yours.** The agent never types passwords, card numbers,
+  or codes. When a site needs one (and always for sites that fight
+  automated browsers, such as X), it asks you to take over and sign in
+  yourself. The key button in the take-over bar fills a field you tapped
+  from Logins & wallet: logins only on the site they were saved for, and
+  everything only over HTTPS (plain HTTP only on this machine). When you
+  type into a password, card, or code field, or fill a saved secret, the
+  agent cannot use that page at all until it moves on (a new address, for
+  example after the sign-in); it can still open another page. The agent
+  never gets your saved logins or cards.
 - **Who gets it.** Only the owner's own conversations and jobs (the profile
   holds the owner's sign-ins); never shared chats.
 - **Sandbox.** Iris always starts Chrome with its sandbox. Ubuntu 23.10
@@ -530,8 +545,9 @@ out each tool call the CLI makes, nothing more.
   2. Add the printed `[engines]` settings, restart Iris, and tap "Set up the
      browser" in Iris's computer. Iris now uses that copy unless
      `browser.command` is set (it always wins; clear it to use Iris's copy).
-     A browser Iris installed before this layout moves to the fixed path on
-     its next update (Iris's computer offers **Update the browser**).
+     A browser Iris installed before this layout (or before Playwright MCP)
+     is replaced on its next update (Iris's computer offers **Update the
+     browser**).
 
   The script refuses to run when the account running Iris, or the CLI agent
   account, is the `iris` engine admin itself: that account owns the
@@ -566,7 +582,8 @@ out each tool call the CLI makes, nothing more.
     undoing the system's protection, so Iris never suggests one.
 
   **Run without the sandbox** remains: only if you tap it (a saved choice,
-  `POST /api/browser/sandbox`) does Iris run Chromium without it. Iris
+  `POST /api/browser/sandbox`) does Iris start Chromium without it
+  (Playwright's `chromiumSandbox: false`). Iris
   itself never writes AppArmor profiles or runs anything as root. See
   Chromium's `docs/security/apparmor-userns-restrictions.md` for background.
 
@@ -574,9 +591,6 @@ out each tool call the CLI makes, nothing more.
   suggested `/etc/apparmor.d/iris-chrome` for a Playwright cache path):
   once Iris uses its own approved copy, remove the old one with
   `sudo apparmor_parser -R /etc/apparmor.d/iris-chrome && sudo rm /etc/apparmor.d/iris-chrome`.
-- **Approval lifetime.** Wallet fills use the gateway’s approval wait and
-  cancellation rules. Denial, expiry, Stop, Pause, or Disconnect prevents
-  the held fill; a late approval never restarts a turn.
 - **Turning it off.** `[browser] enabled = false` removes the tools.
 ## Connections and approvals
 
@@ -651,8 +665,8 @@ notifies you with a Resume button. Every call is in the activity log
 waiting approvals, and stops connection programs) and starts nothing new
 (chats, check-ins, connection calls) until you resume. A request already
 handed to a remote service before the pause cannot be recalled.
-**Disconnect everything** turns every connection off at once, cancels browser
-approvals, and closes and disconnects the browser. Reopen it in Iris’s
+**Disconnect everything** turns every connection off at once, ends browser
+access for running turns, and closes and disconnects the browser. Reopen it in Iris’s
 computer to enable browser tools again.
 
 **Signing in to services.** Connections that use OAuth (the MCP sign-in
@@ -829,15 +843,16 @@ dropping them; when they end you get one summary notification.
   setup above.
 - Engines installed from the app come only from official sources and are
   verified (checksum or npm integrity); see the privilege split above.
-- Iris's browser is driven over a private pipe (no DevTools port is opened),
-  and its tools reach the server through a Unix socket in the private run
-  directory, accepted only for a running turn. Saved secrets go from the
-  vault straight into the page (set on the exact field, on the same page
-  and site that were checked); filled fields are masked on
-  screen and in what the agent reads, any copy a page echoes (a dialog,
-  another field) is redacted from tool results, and no screenshot is taken
-  while a page shows one. Only `http`/`https` pages can be opened. When a
-  turn ends or you take over, its pending browser actions stop.
+- Iris's browser (Playwright MCP) runs on Iris's side and drives Chromium
+  over a private pipe (no DevTools port is opened). The agent reaches it
+  only through `iris mcp --browser`, which forwards over a Unix socket in
+  the private run directory, accepted only for a running turn, and only
+  for reviewed tools (no code execution in the server, no page scripts, no
+  file access, no request headers). Saved secrets are filled only when you
+  ask while in control, from the vault straight into the page; a page
+  where you typed or filled private details is closed to the agent until
+  it moves on. Only `http`/`https` pages can be opened. When a turn ends or
+  you take over, its pending browser actions stop.
 - "Pause Iris" in Iris's computer stops running turns, closes the browser,
   and holds chats and jobs until you turn it back on.
 

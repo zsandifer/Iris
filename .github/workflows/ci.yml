@@ -19,16 +19,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      # The browser end-to-end tests (web basics, CAPTCHAs, sign-ins) use
-      # the runner's Chrome and fail rather than skip without it.
       - run: cargo test
-        env:
-          IRIS_REQUIRE_BROWSER: "1"
-      # The phone app (web/js) has no build step; its tests use node's own
-      # runner and no packages.
+      # Iris's browser end to end: Playwright MCP and Chromium installed the
+      # way the app does (latest from npm and Playwright's downloads), so
+      # upstream changes that break the wrapper show up here.
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+      - run: |
+          cargo build
+          mkdir -p "$RUNNER_TEMP/engines"
+          chmod 755 "$RUNNER_TEMP/engines"
+          ./target/debug/iris engines install browser --dir "$RUNNER_TEMP/engines"
+          IRIS_REAL_BROWSER="$RUNNER_TEMP/engines" cargo test real_playwright -- --ignored
+      # The phone app (web/js) has no build step; its tests use node's own
+      # runner and no packages.
       - run: node --test 'tests/web/*.test.mjs'
 
   msrv:

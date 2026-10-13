@@ -176,15 +176,17 @@ helper = []
 # Update engines Iris installed once a day.
 auto_update = true
 
-# Iris's computer: a headless Chromium the agent can browse with (through
-# its `browser` tools) and you can watch and take over from the app. Saved
-# logins and cards are filled in by Iris itself; the agent never sees them.
+# Iris's computer: a headless browser run by Microsoft's Playwright MCP
+# server (installed from the app, or `playwright-mcp` on PATH). The agent
+# gets its tools in your own conversations; you can watch and take over
+# from the app, sign in to sites yourself, and fill saved logins and cards
+# there. The agent never sees those.
 [browser]
 enabled = true
-# Chromium or Chrome executable. Empty: the one installed from the app
-# (<engines dir>/chromium/app/chrome; deploy/setup-engines.sh approves that
-# path for Chrome's sandbox on Ubuntu 23.10+), then PATH (chromium,
-# google-chrome, ...), then Playwright's browser cache. Set, it always wins.
+# Chromium or Chrome executable for Playwright to start. Empty: the one
+# installed from the app (<engines dir>/chromium/app/chrome;
+# deploy/setup-engines.sh approves that path for Chrome's sandbox on Ubuntu
+# 23.10+), else Playwright's own download. Set, it always wins.
 command = ""
 # Close the browser after this many idle minutes (frees memory). Sign-ins
 # persist in its profile under <data dir>/browser.
