@@ -203,6 +203,7 @@ async function turn(events, conv, text, dir, n) {
     }
     if (m.type === 'message.completed' && m.message?.id === asstId) done = m.message;
   });
+  activeConversation = conv;
   const { assistant_message } = await api('POST', `/conversations/${conv}/messages`, { text });
   asstId = assistant_message.id;
   let lastSaved = 0;
@@ -234,6 +235,7 @@ async function turn(events, conv, text, dir, n) {
     }
   }
   off();
+  activeConversation = null;
   await sleep(1500); // the last frame
   let finalFrame = null;
   if (events.frame?.at >= started) {
@@ -360,16 +362,24 @@ async function judge(s, turns, mech) {
   }
 }
 
-// Judges still running, so an interrupted suite can stop them too.
+// Judges still running and the chat whose turn is running, so an
+// interrupted suite stops them too (the turn would otherwise run on in Iris
+// until its timeout).
 const children = new Set();
+const judgeDirs = new Set();
+let activeConversation = null;
 for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => {
+  process.on(sig, async () => {
     for (const pid of children) try { process.kill(-pid, 'SIGKILL'); } catch {}
     for (const dir of judgeDirs) rmSync(dir, { recursive: true, force: true });
+    if (!OFFLINE) {
+      const bounded = (p) => Promise.race([p.catch(() => {}), sleep(5000)]);
+      if (activeConversation) await bounded(api('POST', `/conversations/${activeConversation}/cancel`));
+      await bounded(api('POST', '/browser/stop'));
+    }
     process.exit(130);
   });
 }
-const judgeDirs = new Set();
 
 function run(cmd, args, input, cwd, timeoutMs = 300000, extraEnv = {}) {
   return new Promise((resolve, reject) => {
@@ -390,6 +400,8 @@ function run(cmd, args, input, cwd, timeoutMs = 300000, extraEnv = {}) {
     p.stdout.on('data', (d) => (out += d));
     p.stderr.on('data', (d) => (err += d));
     p.on('error', (e) => done(reject, e));
+    // A judge that exits before reading its input must not crash the suite.
+    p.stdin.on('error', (e) => done(reject, e));
     p.on('close', (code) => {
       code === 0 ? done(resolve, out) : done(reject, new Error(`${cmd} exited ${code}: ${(err || out).slice(-300)}`));
     });

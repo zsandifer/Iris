@@ -31,11 +31,12 @@ an engine signed in on this machine for the chat model, and the judge's CLI
   It never touches the main Iris's data.
 - Listens on `127.0.0.1:7999` (`IRIS_TEST_BIND`). Keep it on loopback or a
   private tailnet address.
-- Uses an existing engines directory read-only (`IRIS_TEST_ENGINES`,
-  default `/opt/iris/engines`, else `~/.local/share/iris/engines`) with `engines.auto_update =
-  false` and no install helper. `up` refuses to start if the config would
-  let it install or update anything. Do not install or update engines from
-  the TEST app.
+- Borrows an engines directory (`IRIS_TEST_ENGINES`, default
+  `/opt/iris/engines` from the privilege split) with `engines.auto_update =
+  false`. `up` refuses to start if the config would let it update engines
+  or if this account can write that directory (the TEST app could then
+  change it). Without one, the TEST instance uses its own
+  `data/engines` (install the browser there from its app) and `PATH`.
 - Single-user mode (no agent account), heartbeat, feed, and push off, one
   turn at a time.
 - Pins the chat slots to `IRIS_TEST_MODEL` (default `claude:haiku`).
