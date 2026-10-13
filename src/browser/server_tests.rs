@@ -695,26 +695,46 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
             .unwrap_or(0),
         0
     );
-    // Also when the call was abandoned (taken over) and the file came
-    // after.
+    // Also when the call was abandoned (its turn stopped) and the file
+    // came after, with no other browser call to tidy up meanwhile.
     f.set("slowshot", "");
+    let stopped = b.begin_turn(&f.owner, &f.conv, "m2", std::slice::from_ref(&f.owner));
+    let shots = f.called("browser_take_screenshot");
     let call = {
-        let (st, tk) = (f.state.clone(), token.clone());
+        let (st, tk) = (f.state.clone(), stopped.token().to_string());
         tokio::spawn(
             async move { tools::call(&st, &tk, "browser_take_screenshot", &json!({})).await },
         )
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    b.take_over(&f.owner, "dev").await.unwrap();
+    for _ in 0..100 {
+        if f.called("browser_take_screenshot") > shots {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        f.called("browser_take_screenshot") > shots,
+        "the picture was not asked for"
+    );
+    drop(stopped);
     let r = call.await.unwrap();
-    assert_eq!(text(&r), TAKEN_OVER);
-    tokio::time::sleep(Duration::from_millis(2600)).await;
-    assert_eq!(
+    assert_eq!(text(&r), TURN_ENDED);
+    let files = || {
         std::fs::read_dir(&b.out_dir)
             .map(|d| d.count())
-            .unwrap_or(0),
-        0
-    );
+            .unwrap_or(0)
+    };
+    let mut written = false;
+    for _ in 0..60 {
+        if files() > 0 {
+            written = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(written, "the late picture was never written");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(files(), 0, "the late picture stayed");
     std::fs::remove_file(f.file("slowshot")).unwrap();
     b.hand_back();
     // A dialog can still be answered after a fill (even on a closed page).
