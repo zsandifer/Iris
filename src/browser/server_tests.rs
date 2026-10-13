@@ -1594,6 +1594,12 @@ async fn real_playwright() {
                     "<html><body><p>{}</p></body></html>",
                     if signed { "Signed in" } else { "Signed out" }
                 )
+            } else if req.starts_with("GET /textonly") {
+                // A sign-in form whose page later keeps the password only
+                // in its text (Iris moves it there below).
+                "<html><body><input type=password aria-label=Password>\
+                 <button>Go</button><p id=out></p></body></html>"
+                    .to_string()
             } else if req.starts_with("GET /login") {
                 "<html><head><title>Iris smoke sign in</title></head><body style='margin:0'>\
                  <input type=password aria-label=Password style='position:absolute;top:100px;left:0;width:500px;height:100px'>\
@@ -2140,6 +2146,59 @@ async fn real_playwright() {
         text(&shot).starts_with("No screenshot right now"),
         "screenshot taken"
     );
+
+    // A page that takes the password out of its field but keeps it in its
+    // text, on the same document: still closed to actions (only redacted
+    // reads), until the text goes too.
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/textonly")}),
+    )
+    .await;
+    let snap = text(&f.agent(&token, "browser_snapshot", json!({})).await);
+    let ref_named = |what: &str| {
+        let line = snap
+            .lines()
+            .find(|l| l.contains(what))
+            .unwrap_or_else(|| panic!("{what} in {snap}"));
+        let at = line.find("[ref=").unwrap() + 5;
+        line[at..line[at..].find(']').unwrap() + at].to_string()
+    };
+    let (pw, go) = (
+        ref_named("textbox \"Password\""),
+        ref_named("button \"Go\""),
+    );
+    let r = f
+        .agent(&token, "fill_saved_login", json!({"password_ref": pw}))
+        .await;
+    assert_eq!(text(&r), "filled", "{r}");
+    b.run_code(
+        &run,
+        "async (page) => { await page.evaluate(() => { const i = document.querySelector('input'); \
+         document.getElementById('out').textContent = 'You typed ' + i.value; i.value = ''; }); return true; }",
+    )
+    .await
+    .unwrap();
+    let r = f
+        .agent(&token, "browser_click", json!({"target": go}))
+        .await;
+    assert_eq!(text(&r), FILLED_PAGE);
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert!(
+        text(&r).contains("You typed") && !r.to_string().contains("Real-Pw-42"),
+        "the password reached the agent"
+    );
+    b.run_code(
+        &run,
+        "async (page) => { await page.evaluate(() => { document.getElementById('out').textContent = 'Done'; }); return true; }",
+    )
+    .await
+    .unwrap();
+    let r = f
+        .agent(&token, "browser_click", json!({"target": go}))
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
 
     // The agent fills a saved card after the owner approves, never seeing
     // it.

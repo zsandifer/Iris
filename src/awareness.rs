@@ -12,7 +12,16 @@ pub const TOOLS: &[&str] = &[
 pub fn resolved(card: &Value) -> bool {
     matches!(
         card["state"].as_str(),
-        Some("done" | "connected" | "declined" | "approved" | "denied" | "expired" | "cancelled")
+        Some(
+            "done"
+                | "connected"
+                | "declined"
+                | "approved"
+                | "denied"
+                | "expired"
+                | "cancelled"
+                | "saved"
+        )
     )
 }
 
