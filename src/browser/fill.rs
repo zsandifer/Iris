@@ -252,7 +252,18 @@ pub async fn fill(
         }
     }
     state.browser.controller(device_id)?;
-    if !put(state, &run, Find::Focused, &at, &values, private, false).await? {
+    if !put(
+        state,
+        &run,
+        Find::Focused,
+        &at,
+        field,
+        &values,
+        private,
+        false,
+    )
+    .await?
+    {
         return Err("That field can't be filled.".into());
     }
     drop(secret);
@@ -560,20 +571,26 @@ async fn locate_any(state: &AppState, run: &Running, find: Find<'_>) -> Result<O
     }))
 }
 
-/// Fill `values` (candidates) into a located field. Whether it was filled.
-/// A private value closes the page to the agent first and is hidden from
-/// everything the agent reads afterwards.
+/// Fill `values` (candidates) into a located field of the saved item's
+/// `field`. Whether it was filled. A private value closes the page to the
+/// agent first; a secret one (a password, card number, or code; not an
+/// expiry, which ordinary pages show) is also hidden from everything the
+/// agent reads afterwards.
+#[allow(clippy::too_many_arguments)]
 async fn put(
     state: &AppState,
     run: &Running,
     find: Find<'_>,
     at: &Target,
+    field: &str,
     values: &[String],
     private: bool,
     submit: bool,
 ) -> Result<bool> {
     if private {
         state.browser.remember_private(&at.top);
+    }
+    if matches!(field, "password" | "number" | "cvc") {
         for v in values {
             state.browser.remember_secret(v);
         }
@@ -780,6 +797,7 @@ async fn login_inner(
             run,
             Find::Ref(r),
             at,
+            field,
             &[value],
             private,
             submit && i == last,
@@ -1129,6 +1147,7 @@ async fn card_inner(
             run,
             Find::Ref(r),
             at,
+            field,
             &values,
             private,
             submit && i == last,

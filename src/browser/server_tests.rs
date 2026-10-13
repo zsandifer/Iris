@@ -655,6 +655,24 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
     f.set("pagetext", "You searched for Pw-5678");
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
     assert!(text(&r).starts_with("No screenshot right now"), "{r}");
+    // Nor searching it (a match or not would tell what is hidden), or
+    // naming elements by text; snapshot refs still work.
+    for (tool, args) in [
+        ("browser_find", json!({"text": "p=P"})),
+        ("browser_wait_for", json!({"text": "Pw-5"})),
+        ("browser_click", json!({"target": "text=/Pw-5/"})),
+    ] {
+        let r = f.agent(&token, tool, args).await;
+        assert!(text(&r).contains("searching it"), "{tool}: {r}");
+    }
+    let r = f
+        .agent(
+            &token,
+            "browser_click",
+            json!({"target": "e3", "element": "Search"}),
+        )
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
     f.set("pagetext", "Welcome back");
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
@@ -844,6 +862,15 @@ async fn the_agent_fills_a_card_only_after_the_owner_approves() {
     assert!(done[4].0.contains("S Doe"));
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
     assert_eq!(text(&r), PRIVATE_PAGE);
+    // The number and code are hidden from now on; the expiry and name are
+    // not (ordinary pages show years and months).
+    let hidden = b.filled_secrets();
+    assert!(
+        hidden.contains(&"4111111111111111".to_string()) && hidden.contains(&"737".to_string())
+    );
+    for shown in ["2031", "31", "04", "April", "S Doe"] {
+        assert!(!hidden.contains(&shown.to_string()), "{shown}");
+    }
     // That OK was for one fill; the ones refused above were never used.
     let approved: Vec<Value> = f
         .state
@@ -1688,6 +1715,31 @@ async fn real_playwright() {
     );
     let r = f.agent(&chat_token, "browser_snapshot", json!({})).await;
     assert_eq!(text(&r), PRIVATE_PAGE);
+    // Going away and back to the filled form writes nothing of it to disk.
+    let r = f
+        .agent(
+            &chat_token,
+            "browser_navigate",
+            json!({"url": format!("http://127.0.0.1:{port}/home")}),
+        )
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    let r = f
+        .agent(&chat_token, "browser_navigate_back", json!({}))
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    for e in std::fs::read_dir(&b.out_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let body = std::fs::read(e.path()).unwrap_or_default();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            !body.contains("4111111111111111") && !body.contains("Real-Pw-42"),
+            "a secret was written to a file"
+        );
+    }
     drop(chat);
 
     // The owner again: a code field known only by its label is private,

@@ -3557,8 +3557,8 @@ forwards each call to [Iris's browser](#319-iriss-computer-browser), the
 Playwright MCP server it runs, and returns that server's result unchanged
 (text, and `image` blocks for screenshots). The tools, their arguments, and
 their results are Playwright MCP's own; see its documentation. Action
-results link snapshot files the agent cannot open, so the agent calls
-`browser_snapshot` to read the page. Iris decides nothing; it only refuses:
+results do not include the page, so the agent calls `browser_snapshot` to
+read it. Iris decides nothing; it only refuses:
 
 - Tools outside the reviewed list. The agent gets `browser_navigate`,
   `browser_navigate_back`, `browser_tabs`, `browser_snapshot`,
@@ -3609,8 +3609,13 @@ tools themselves stay usable there. The owner's saved passwords and card
 numbers, and every value Iris filled this browser session (a CVC only
 where it stands alone), are replaced with `[hidden]` in every result the
 agent gets (addresses, titles, dialogs, page text; also their common
-encodings and card numbers written in groups), and a screenshot is refused
-while the page's text or fields (all frames) show one.
+encodings and card numbers written in groups). While the page's text or
+fields (all frames) show one, screenshots, `browser_find`,
+`browser_wait_for`, and targets written as selectors instead of snapshot
+refs are refused (their outcome would tell what is hidden). Expiry dates
+and names lock the page but are not hidden elsewhere. Playwright writes no
+page snapshots to files (`snapshot.mode: none`); `browser_snapshot`
+answers inline, and screenshot files are deleted at once.
 - Addresses that are not web pages in `browser_navigate` and
   `browser_tabs` (`url`): only `http`, `https`, a bare domain without a
   port, or `about:blank`; anything with whitespace or control characters

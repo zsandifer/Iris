@@ -120,6 +120,10 @@ pub fn config(server: &Server, profile: &Path, out_dir: &Path, no_sandbox: bool)
         "webmcp": false,
         // Results carry no generated code (it would echo what was typed).
         "codegen": "none",
+        // Actions write no page snapshots to files (they would hold what
+        // was typed or filled); `browser_snapshot` still answers inline,
+        // through Iris's redaction.
+        "snapshot": {"mode": "none"},
         // Iris closes the browser when idle (`browser.idle_mins`).
         "timeouts": {"idle": 0},
     })

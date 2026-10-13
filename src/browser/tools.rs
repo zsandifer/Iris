@@ -76,6 +76,44 @@ const PAGE_TEXT_CODE: &str = "async (page) => {
 
 const SHOWS_SECRET: &str = "No screenshot right now: this page shows saved sign-in or card \
     details. Use browser_snapshot instead.";
+const SEARCH_SECRET: &str = "This page shows saved sign-in or card details, so searching it \
+    or naming elements by their text is not available. Use browser_snapshot and its refs.";
+
+/// Calls whose outcome depends on what the page shows, beyond the
+/// redacted text: pictures, searches, waiting for text, and targets
+/// written as selectors instead of snapshot refs.
+fn probes_page(name: &str, args: &Value) -> bool {
+    fn selector_target(v: &Value) -> bool {
+        match v {
+            Value::Object(m) => m.iter().any(|(k, v)| {
+                let k = k.to_ascii_lowercase();
+                (k.ends_with("target") || k.contains("selector") || k == "ref")
+                    && v.as_str().is_some_and(|t| !is_ref(t))
+                    || selector_target(v)
+            }),
+            Value::Array(a) => a.iter().any(selector_target),
+            _ => false,
+        }
+    }
+    matches!(
+        name,
+        "browser_take_screenshot" | "browser_find" | "browser_wait_for"
+    ) || selector_target(args)
+}
+
+/// A snapshot ref (`e12`, `f1e3`).
+fn is_ref(s: &str) -> bool {
+    let s = s.trim();
+    let rest = match s.strip_prefix('f') {
+        Some(r) => match r.find('e') {
+            Some(i) if i > 0 && r[..i].bytes().all(|b| b.is_ascii_digit()) => &r[i..],
+            _ => return false,
+        },
+        None => s,
+    };
+    rest.strip_prefix('e')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
 
 /// Tools that only read the page. Everything else acts on it, and Playwright
 /// keeps going with an action (waiting for its target) even when its answer
@@ -209,8 +247,8 @@ are fine.
 
 - `browser_navigate`, then `browser_snapshot` to read the page and get element
   refs; act with `browser_click`, `browser_type`, `browser_fill_form`,
-  `browser_select_option`, `browser_press_key`. Action results only link to
-  files you cannot open: call `browser_snapshot` to see the page.
+  `browser_select_option`, `browser_press_key`. Action results do not show
+  the page: call `browser_snapshot` to see it, and use its refs as targets.
 - `browser_take_screenshot` when you need to see the page. For what the
   snapshot cannot reach (CAPTCHA boxes and picture grids, frames from other
   sites, maps, canvases), click or drag by position with
@@ -338,15 +376,20 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
         }
     }
     // Saved secrets may show on later pages (echoed into the text or a
-    // field): no pictures of those.
+    // field): no pictures of those, and no searching them (a match or not
+    // tells what is hidden, a character at a time).
     let secrets = b.filled_secrets();
-    if name == "browser_take_screenshot" && !secrets.is_empty() {
+    if !secrets.is_empty() && probes_page(name, &args) {
         let shown = match b.run_code(&run, PAGE_TEXT_CODE).await {
             Ok(v) => v.as_str().unwrap_or("").to_string(),
             Err(e) => return error(e.to_string()),
         };
         if super::hide_secrets(&shown, &secrets) != shown {
-            return error(SHOWS_SECRET);
+            return error(if name == "browser_take_screenshot" {
+                SHOWS_SECRET
+            } else {
+                SEARCH_SECRET
+            });
         }
     }
     b.set_busy(true);
@@ -374,6 +417,9 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
         parts.push(json!({"type": "text",
             "text": "(Iris closed the file picker: uploading files is not available.)"}));
     }
+    // Files Playwright wrote for this call (a screenshot) are not for the
+    // agent: gone at once.
+    b.remove_output(&super::text_of(&out));
     // Anything else that could carry them (addresses, titles, dialogs,
     // page text) has them hidden.
     let secrets = b.filled_secrets();
@@ -573,6 +619,31 @@ pub(crate) mod tests {
         );
         assert!(check_args("browser_snapshot", &json!([])).is_err());
         assert!(check_args("browser_find", &json!({"_meta": {"json": true}})).is_err());
+    }
+
+    #[test]
+    fn page_probes_are_known() {
+        assert!(probes_page("browser_find", &json!({"text": "x"})));
+        assert!(probes_page("browser_wait_for", &json!({"text": "x"})));
+        assert!(probes_page("browser_take_screenshot", &json!({})));
+        assert!(!probes_page("browser_click", &json!({"target": "e12"})));
+        assert!(!probes_page(
+            "browser_click",
+            &json!({"target": "f2e7", "element": "Sign in"})
+        ));
+        assert!(probes_page(
+            "browser_click",
+            &json!({"target": "text=/p=E/"})
+        ));
+        assert!(probes_page(
+            "browser_fill_form",
+            &json!({"fields": [{"target": "e3", "value": "x"}, {"target": "#q", "value": "y"}]})
+        ));
+        assert!(probes_page(
+            "browser_drag",
+            &json!({"startTarget": "e1", "endTarget": "css=div"})
+        ));
+        assert!(!probes_page("browser_snapshot", &json!({})));
     }
 
     #[test]
