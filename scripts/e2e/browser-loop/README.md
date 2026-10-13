@@ -78,12 +78,21 @@ it to a tailnet address or put it behind `tailscale serve` (tailnet only).
 
 The judge (`--judge codex:gpt-6-luna`, `claude:haiku`, or `none`) gets the
 task, the success criteria, every message, the tools each turn called, the
-browser's final page, check results, and warning lines from Iris's log. It
+browser's final page, check results, warning lines from Iris's log, and the
+live view's picture at the end of each turn (not for the `real` suite, whose
+pages stay on this machine), so a reply that contradicts the page fails. It
 answers `pass`, `fail`, or `nudge` (a short follow-up a user would send when
 the agent stopped early; at most `--max-nudges`, default 1), and for
 failures a root cause: `site_blocking`, `iris_bug`, `model_behavior`,
-`task_or_check`, or `unknown`. It runs without tools in an empty temporary
-directory.
+`task_or_check`, or `unknown`. It runs without tools (Codex with the same
+switches Iris uses for tool-less calls, no user config or project
+instructions) in an empty temporary directory.
+
+A scenario passes only when its last reply completed normally, the
+required tools succeeded, the checks pass, and the judge says pass.
+`--rejudge <run>/run1/<id>/result.json` grades a saved scenario again
+without new turns (for tuning the judge or a scenario), and `--self-test`
+checks the pass/fail rules on synthetic turns.
 
 ## Safety
 
