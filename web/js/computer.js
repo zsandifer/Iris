@@ -10,33 +10,50 @@ import { activityTitle, placeLabel } from './hub.js';
 
 // ---------------------------------------------------------------- watching
 
-// Each mounted view asks for a mode; the socket watches with the best one
-// and stops when nothing is on screen (or the app is in the background).
+// Each mounted view asks for a mode and the width it shows pictures at; the
+// socket watches with the best mode and the largest width (in device
+// pixels, so pictures are as sharp as the screen and no larger), and stops
+// when nothing is on screen (or the app is in the background).
 const modes = new Map();
 let sent = 'off';
 let lastFrame = null;
 
+/** Device pixels for a picture shown `css` CSS pixels wide. */
+export function frameWidth(css, dpr = globalThis.devicePixelRatio || 1) {
+  return Math.round(Math.max(1, css) * Math.min(Math.max(dpr, 1), 4));
+}
+
 function syncWatch(force = false) {
   const vals = [...modes.values()];
-  let want = vals.includes('full') ? 'full' : vals.length ? 'peek' : 'off';
+  let want = vals.some((v) => v.mode === 'full') ? 'full' : vals.length ? 'peek' : 'off';
   if (document.visibilityState === 'hidden') want = 'off';
-  if (want !== sent || force) {
-    sent = want;
-    wsSend({ type: 'browser.watch', mode: want });
+  const width = want === 'off' ? 0 : Math.max(...vals.map((v) => frameWidth(v.css())));
+  const key = `${want}:${width}`;
+  if (key !== sent || force) {
+    sent = key;
+    wsSend(want === 'off' ? { type: 'browser.watch', mode: want } : { type: 'browser.watch', mode: want, width });
   }
 }
 
 frames.subs.add((f) => { lastFrame = f; });
-frames.onReady.add(() => { sent = 'off'; syncWatch(); });
+frames.onReady.add(() => { sent = ''; syncWatch(); });
 document.addEventListener('visibilitychange', () => syncWatch());
+addEventListener('resize', () => syncWatch());
+
+// How wide each view shows the page (CSS pixels): the chat thumbnail, the
+// full screen (which covers the screen, and the page is twice as tall as
+// wide), and the computer screen's card.
+const PEEK_CSS = () => 72;
+const FULL_CSS = () => Math.max(innerWidth, innerHeight / 2);
+const CARD_CSS = () => Math.min(innerWidth, 640);
 
 /** The latest live-view frame while mounted (null until one arrives). */
-function useFrame(mode, on = true) {
+function useFrame(mode, css, on = true) {
   const [f, setF] = useState(on ? lastFrame : null);
   useEffect(() => {
     if (!on) return undefined;
     const id = {};
-    modes.set(id, mode);
+    modes.set(id, { mode, css });
     syncWatch();
     const sub = (ev) => setF(ev);
     frames.subs.add(sub);
@@ -45,7 +62,7 @@ function useFrame(mode, on = true) {
       modes.delete(id);
       syncWatch();
     };
-  }, [mode, on]);
+  }, [mode, css, on]);
   return on ? f : null;
 }
 
@@ -58,7 +75,7 @@ export function BrowserPeek() {
   useStore();
   // Opened from a chat: closing the browser returns to that chat.
   const from = encodeURIComponent(S.route.parts.join('/'));
-  const f = useFrame('peek');
+  const f = useFrame('peek', PEEK_CSS);
   const b = S.browser || {};
   const host = hostOf(b.url);
   return html`<button class="peek" onClick=${() => go(`iris/computer?view=watch&return=${from}`)} aria-label=${`Watch ${agentName()}'s browser`}>
@@ -116,7 +133,7 @@ function Viewer({ control }) {
   const from = S.route.query.get('return');
   const view = (v) => `iris/computer?view=${v}${from ? `&return=${encodeURIComponent(from)}` : ''}`;
   const b = S.browser || {};
-  const f = useFrame('full', !!b.running);
+  const f = useFrame('full', FULL_CSS, !!b.running);
   const img = useRef();
   const kb = useRef();
   const drag = useRef(null);
@@ -342,7 +359,7 @@ function Setup({ b }) {
 }
 
 function LiveScreen({ b }) {
-  const f = useFrame('full');
+  const f = useFrame('full', CARD_CSS);
   return html`<button class="screen live" onClick=${() => go('iris/computer?view=watch')} aria-label="Watch full screen">
     ${f ? html`<img src=${src(f)} alt=${`Live view of ${agentName()}'s browser`} />` : html`<${Spinner} />`}
     ${b.busy && html`<span class="live-dot">LIVE</span>`}

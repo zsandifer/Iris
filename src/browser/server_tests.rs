@@ -72,6 +72,8 @@ while IFS= read -r line; do
                     reply "### Result\\n{\\\"found\\\":true,\\\"top\\\":\\\"$url\\\",\\\"frame\\\":\\\"$ff\\\",\\\"tag\\\":\\\"input\\\"}" '' '' ;;
                 esac
               fi ;;
+            *captureScreenshot*)
+              reply '### Result\n\"QUJD\"' '' '' ;;
             *insertText*)
               reply "### Page\\n- Page URL: $url" '' '' ;;
             *activeElement*)
@@ -184,7 +186,8 @@ async fn agent_calls_pass_through_and_private_pages_stay_closed() {
     let g = b.begin_turn(&f.owner, &f.conv, "m", &[]);
     let token = g.token().to_string();
 
-    // Only reviewed tools, without file options; listing starts no browser.
+    // Only reviewed tools, without file options, then Iris's own fill
+    // tools; listing starts no browser.
     let listed = tools::list(&f.state, &token).await;
     let names: Vec<_> = listed["tools"]
         .as_array()
@@ -198,7 +201,9 @@ async fn agent_calls_pass_through_and_private_pages_stay_closed() {
             "browser_navigate",
             "browser_snapshot",
             "browser_take_screenshot",
-            "browser_tabs"
+            "browser_tabs",
+            "fill_saved_login",
+            "fill_saved_card"
         ]
     );
     assert!(
@@ -702,12 +707,22 @@ async fn the_sandbox_stays_on_without_the_owners_consent() {
     assert!(b.running().is_none());
 }
 
+/// Live-view pictures taken so far.
+fn frames(f: &Fake) -> usize {
+    f.calls()
+        .iter()
+        .filter(|(t, a)| {
+            t == "browser_run_code_unsafe" && a["code"].to_string().contains("captureScreenshot")
+        })
+        .count()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_view_sends_new_pictures_and_removes_its_files() {
     let f = Fake::new();
     let b = f.browser();
     b.ensure().await.unwrap();
-    let (guard, mut rx) = b.watch(Mode::Peek);
+    let (guard, mut rx) = b.watch(Mode::Peek, Some(216));
     let frame = tokio::time::timeout(Duration::from_secs(5), rx.wait_for(Option::is_some))
         .await
         .unwrap()
@@ -726,18 +741,27 @@ async fn live_view_sends_new_pictures_and_removes_its_files() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     // The same picture is not sent again; the file Playwright saved is gone.
     assert!(!rx.has_changed().unwrap());
-    assert!(f.called("browser_take_screenshot") >= 2);
-    assert!(!b.out_dir.join("page-1.jpeg").exists());
+    assert!(frames(&f) >= 2);
+    // Pictures come straight from Chrome at the asked size and quality;
+    // nothing is written to disk.
+    let code = f
+        .calls()
+        .into_iter()
+        .rev()
+        .find_map(|(t, a)| (t == "browser_run_code_unsafe").then(|| a["code"].to_string()))
+        .unwrap();
+    assert!(
+        code.contains("quality: 50") && code.contains("scale: 216 /"),
+        "{code}"
+    );
+    assert_eq!(f.called("browser_take_screenshot"), 0);
+    assert!(!b.out_dir.exists() || std::fs::read_dir(&b.out_dir).unwrap().next().is_none());
     assert_eq!(b.state_json()["streaming"], true);
     drop(guard);
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    let n = f.called("browser_take_screenshot");
+    let n = frames(&f);
     tokio::time::sleep(Duration::from_millis(1200)).await;
-    assert_eq!(
-        f.called("browser_take_screenshot"),
-        n,
-        "stops when nobody watches"
-    );
+    assert_eq!(frames(&f), n, "stops when nobody watches");
     b.close().await;
 }
 
@@ -975,7 +999,7 @@ async fn real_playwright() {
     assert!(!text_of(&ua).contains("HeadlessChrome"), "{ua}");
 
     // Live view.
-    let (watching, mut rx) = b.watch(Mode::Full);
+    let (watching, mut rx) = b.watch(Mode::Full, None);
     let frame = tokio::time::timeout(Duration::from_secs(10), rx.wait_for(Option::is_some))
         .await
         .unwrap()

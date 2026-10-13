@@ -98,13 +98,45 @@ impl Mode {
             Mode::Full => Duration::from_millis(300),
         }
     }
-    /// Playwright's screenshot scale: CSS pixels, or device pixels.
-    fn scale(self) -> &'static str {
+    /// Picture width when the viewer does not say (device pixels).
+    fn default_width(self) -> u32 {
         match self {
-            Mode::Peek => "css",
-            Mode::Full => "device",
+            Mode::Peek => VIEW_W,
+            Mode::Full => FRAME_MAX_W,
         }
     }
+    /// JPEG quality: text stays readable at the sizes viewers ask for.
+    fn quality(self) -> u32 {
+        match self {
+            Mode::Peek => 50,
+            Mode::Full => 55,
+        }
+    }
+}
+
+/// Live view picture widths (device pixels): never sharper than the page
+/// itself (`VIEW_W` x `SCALE`), never too small to make out.
+const FRAME_MAX_W: u32 = 1000;
+const FRAME_MIN_W: u32 = 120;
+
+/// One live-view picture of the visible page at `width` device pixels,
+/// through Chrome's own capture (any size, set quality, nothing written to
+/// disk). The DevTools session is kept on the page for the next frame.
+fn frame_code(width: u32, quality: u32) -> String {
+    format!(
+        "async (page) => {{
+  try {{
+    const s = page.__irisCast || (page.__irisCast = await page.context().newCDPSession(page));
+    const {{ cssVisualViewport: v }} = await s.send('Page.getLayoutMetrics');
+    const r = await s.send('Page.captureScreenshot', {{ format: 'jpeg', quality: {quality},
+      clip: {{ x: v.pageX, y: v.pageY, width: v.clientWidth, height: v.clientHeight, scale: {width} / v.clientWidth }} }});
+    return r.data;
+  }} catch (e) {{
+    page.__irisCast = undefined;
+    throw e;
+  }}
+}}"
+    )
 }
 
 /// One encoded frame, serialized once for every watcher.
@@ -240,7 +272,8 @@ pub struct Shared {
     control: watch::Sender<Control>,
     frames: watch::Sender<Option<Arc<Frame>>>,
     frame_seq: AtomicU64,
-    watchers: Mutex<HashMap<u64, Mode>>,
+    /// Who watches: the mode and picture width (device pixels) each wants.
+    watchers: Mutex<HashMap<u64, (Mode, u32)>>,
     next_watcher: AtomicU64,
     casting: AtomicBool,
     turns: Mutex<HashMap<String, Arc<TurnCtx>>>,
@@ -1158,11 +1191,20 @@ impl Browser {
 
     // ----------------------------------------------------------- watching
 
-    /// Start watching (one per app socket). Frames arrive through the
-    /// returned receiver; dropping the guard stops watching.
-    pub fn watch(&self, mode: Mode) -> (WatchGuard, watch::Receiver<Option<Arc<Frame>>>) {
+    /// Start watching (one per app socket), with pictures `width` device
+    /// pixels wide (the viewer's size on screen; the mode's default if not
+    /// given). Frames arrive through the returned receiver; dropping the
+    /// guard stops watching.
+    pub fn watch(
+        &self,
+        mode: Mode,
+        width: Option<u32>,
+    ) -> (WatchGuard, watch::Receiver<Option<Arc<Frame>>>) {
         let id = self.next_watcher.fetch_add(1, Ordering::SeqCst);
-        lock(&self.watchers).insert(id, mode);
+        let width = width
+            .unwrap_or(mode.default_width())
+            .clamp(FRAME_MIN_W, FRAME_MAX_W);
+        lock(&self.watchers).insert(id, (mode, width));
         self.update_screencast();
         (
             WatchGuard {
@@ -1192,16 +1234,23 @@ impl Browser {
         });
     }
 
-    /// Screenshots of the current tab at the best mode anyone watches,
-    /// published only when the picture changed. The page header refreshes
-    /// every couple of seconds.
+    /// Pictures of the current tab at the best mode and the largest width
+    /// anyone watches, published only when the picture changed. The page
+    /// header refreshes every couple of seconds.
     async fn cast(&self, run: &Arc<Running>) {
         use std::hash::{Hash, Hasher};
-        let mut last: Option<(Mode, u64)> = None;
+        let mut last: Option<(Mode, u32, u64)> = None;
         let mut header_at: Option<tokio::time::Instant> = None;
         loop {
-            let Some(mode) = lock(&self.watchers).values().copied().max() else {
-                return;
+            let (mode, width) = {
+                let w = lock(&self.watchers);
+                let Some(mode) = w.values().map(|(m, _)| *m).max() else {
+                    return;
+                };
+                (
+                    mode,
+                    w.values().map(|(_, px)| *px).max().unwrap_or(FRAME_MAX_W),
+                )
             };
             if !self.is_current(run) {
                 return;
@@ -1218,28 +1267,14 @@ impl Browser {
                     let _ = self.follow_new_tab(run).await;
                 }
             }
-            let shot = self
-                .tool(
-                    run,
-                    "browser_take_screenshot",
-                    &json!({"type": "jpeg", "scale": mode.scale()}),
-                    QUICK,
-                )
-                .await;
-            if let Ok(r) = shot {
-                self.remove_output(&text_of(&r));
-                let image = r["content"]
-                    .as_array()
-                    .and_then(|c| c.iter().find(|p| p["type"] == "image"))
-                    .and_then(|p| p["data"].as_str());
-                if let Some(data) = image {
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    data.hash(&mut h);
-                    let key = (mode, h.finish());
-                    if last != Some(key) {
-                        last = Some(key);
-                        self.publish_frame(mode, data);
-                    }
+            let shot = self.run_code(run, &frame_code(width, mode.quality())).await;
+            if let Ok(Value::String(data)) = shot {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                data.hash(&mut h);
+                let key = (mode, width, h.finish());
+                if last != Some(key) {
+                    last = Some(key);
+                    self.publish_frame(mode, &data);
                 }
             }
             tokio::time::sleep(mode.min_interval().saturating_sub(started.elapsed())).await;
@@ -1675,11 +1710,20 @@ mod tests {
     #[test]
     fn watchers_pick_the_best_mode() {
         let (_t, b) = browser();
-        let (g1, _r1) = b.watch(Mode::Peek);
-        let (g2, _r2) = b.watch(Mode::Full);
-        assert_eq!(lock(&b.watchers).values().max(), Some(&Mode::Full));
+        let (g1, _r1) = b.watch(Mode::Peek, Some(216));
+        let (g2, _r2) = b.watch(Mode::Full, None);
+        let (g3, _r3) = b.watch(Mode::Full, Some(5000));
+        assert_eq!(
+            lock(&b.watchers).values().copied().max(),
+            Some((Mode::Full, FRAME_MAX_W))
+        );
+        assert_eq!(lock(&b.watchers)[&1], (Mode::Peek, 216));
+        drop(g3);
         drop(g2);
-        assert_eq!(lock(&b.watchers).values().max(), Some(&Mode::Peek));
+        assert_eq!(
+            lock(&b.watchers).values().map(|(m, _)| *m).max(),
+            Some(Mode::Peek)
+        );
         drop(g1);
         assert!(lock(&b.watchers).is_empty());
         assert!(Mode::Peek.min_interval() > Mode::Full.min_interval());

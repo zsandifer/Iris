@@ -2489,7 +2489,7 @@ Main chat, and `entities.changed` for data it changed.
 |---|---|
 | `{"type": "auth", "token": "..."}` | Only meaningful as the first frame. |
 | `{"type": "ping"}` | Server replies `{"type": "pong"}`. |
-| `{"type": "browser.watch", "mode": "peek" \| "full" \| "off"}` | Owner only. Start (or change, or stop) the live view of Iris's browser on this socket. |
+| `{"type": "browser.watch", "mode": "peek" \| "full" \| "off", "width": 1000}` | Owner only. Start (or change, or stop) the live view of Iris's browser on this socket. `width` (optional): how many device pixels wide the app shows the picture (its CSS width times `devicePixelRatio`). |
 | `{"type": "browser.input", "kind": ...}` | Owner only, while this device has [taken over](#post-apibrowsertakeover-owner). See below. |
 
 Any other client frame is ignored. Non-owners get `{"type": "error", "code":
@@ -2502,10 +2502,14 @@ Any other client frame is ignored. Non-owners get `{"type": "error", "code":
 {"type": "browser.frame", "seq": 41, "mode": "full", "width": 500, "height": 1000, "data": "<base64 JPEG>"}
 ```
 
-`width` and `height` are the page viewport in CSS pixels; the JPEG itself
-is 1000 px wide (`full`, device pixels) or 500 px (`peek`). Iris takes a
-screenshot through the browser server about every 0.3 seconds (`full`) or
-every second (`peek`) and sends a frame only when the picture changed;
+`width` and `height` are the page viewport in CSS pixels. The JPEG itself is
+as wide as the widest watcher asked (between 120 and 1000 px; without
+`width`, 1000 for `full` and 500 for `peek`), at JPEG quality 55 (`full`)
+or 50 (`peek`), captured by Chrome directly through the browser server
+(nothing is written to disk). On typical pages that is about 9 to 16 KB
+for the chat thumbnail and 90 to 220 KB for full screen, down from 70 to
+170 KB and 170 to 450 KB. Iris takes one about every 0.3 seconds (`full`)
+or every second (`peek`) and sends a frame only when the picture changed;
 throttling never drops the newest frame, so a still page always ends up on
 screen. While the agent waits for a slow page, screenshots wait too. A new
 watcher gets the current picture at once. Screenshots are taken only while

@@ -6,8 +6,9 @@
 //! The server then sends `{"type":"ready",...}` followed by events.
 //!
 //! The owner's app can also watch Iris's browser on the same socket:
-//! `{"type":"browser.watch","mode":"peek"|"full"|"off"}` starts or stops
-//! `browser.frame` events, and while the owner has taken over,
+//! `{"type":"browser.watch","mode":"peek"|"full"|"off","width":N}` starts
+//! or stops `browser.frame` events (pictures about `width` device pixels
+//! wide), and while the owner has taken over,
 //! `{"type":"browser.input",...}` sends taps, scrolls, keys, text, and
 //! fills of saved logins and cards.
 
@@ -238,7 +239,8 @@ async fn pump(
                                 watching = crate::browser::Mode::parse(v["mode"].as_str().unwrap_or(""))
                                     .map(|mode| {
                                         // Replaces (and so ends) any earlier watch.
-                                        let (guard, rx) = state.browser.watch(mode);
+                                        let width = v["width"].as_u64().map(|w| w.min(u32::MAX as u64) as u32);
+                                        let (guard, rx) = state.browser.watch(mode, width);
                                         let mut rx = rx;
                                         rx.mark_changed();
                                         Watching { _guard: guard, rx, mode, last_sent: None, pending: false }
