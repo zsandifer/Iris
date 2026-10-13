@@ -569,10 +569,13 @@ pub fn browser_binary(root: &Path) -> PathBuf {
 const MCP_CLI: &str = "node_modules/@playwright/mcp/cli.js";
 
 /// Iris installed the browser as it is now: Playwright MCP behind its
-/// launcher (an install from before has only Chromium and is offered an
-/// update).
+/// launcher, and Chromium (an install from before has only Chromium, and
+/// one whose first Chromium download failed has only the server; both are
+/// offered setup again).
 pub fn browser_ready(root: &Path) -> bool {
-    install_dir(root, "browser").join(MCP_CLI).is_file() && is_installed(root, "browser")
+    install_dir(root, "browser").join(MCP_CLI).is_file()
+        && is_installed(root, "browser")
+        && browser_executable(root).is_some()
 }
 
 /// The installed Chromium's executable (Linux, then the macOS app bundles
@@ -1121,6 +1124,12 @@ touch "$PLAYWRIGHT_BROWSERS_PATH/chromium-$r/INSTALLATION_COMPLETE"
 
         std::fs::write(tools.join("mcp"), "0.0.80").unwrap();
         std::fs::write(tools.join("rev"), "1200").unwrap();
+        // A first install whose Chromium download fails is not ready (the
+        // app keeps offering setup).
+        std::fs::write(tools.join("fail"), "").unwrap();
+        assert!(install().is_err());
+        assert!(!browser_ready(&root));
+        std::fs::remove_file(tools.join("fail")).unwrap();
         let r = install().unwrap();
         assert!(r.changed);
         assert_eq!(r.version.as_deref(), Some("0.0.80 (Chromium build 1200)"));
@@ -1142,7 +1151,7 @@ touch "$PLAYWRIGHT_BROWSERS_PATH/chromium-$r/INSTALLATION_COMPLETE"
             !root.join("chromium/browsers").exists(),
             "download dir removed"
         );
-        assert_eq!(downloads(), 1);
+        assert_eq!(downloads(), 2);
 
         // Same pinned build: nothing is downloaded; a new server version
         // still counts as a change.
@@ -1151,7 +1160,7 @@ touch "$PLAYWRIGHT_BROWSERS_PATH/chromium-$r/INSTALLATION_COMPLETE"
         assert!(r.changed);
         assert_eq!(r.version.as_deref(), Some("0.0.81 (Chromium build 1200)"));
         assert!(!install().unwrap().changed);
-        assert_eq!(downloads(), 1);
+        assert_eq!(downloads(), 2);
 
         // A failed download keeps the working browser and its version.
         std::fs::write(tools.join("rev"), "1300").unwrap();
