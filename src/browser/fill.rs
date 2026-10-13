@@ -391,6 +391,9 @@ async fn credentials(state: &AppState, user_id: &str, kind: &'static str) -> Vec
 }
 
 /// One saved item of several, by the agent's hint (`None`: the only one).
+/// A hint that is exactly one item's name picks it even when it is also
+/// part of another's ("Shop" next to "Shop (work)"): the agent repeats the
+/// name Iris listed when it asked which one.
 fn choose<'a>(
     items: &'a [Credential],
     hint: Option<&str>,
@@ -401,6 +404,17 @@ fn choose<'a>(
         Some(h) => items.iter().filter(|c| matches(c, h)).collect(),
         None => items.iter().collect(),
     };
+    if let (Some(h), [_, _, ..]) = (hint, chosen.as_slice()) {
+        let h = h.to_lowercase();
+        let exact: Vec<&Credential> = chosen
+            .iter()
+            .copied()
+            .filter(|c| c.label.trim().to_lowercase() == h)
+            .collect();
+        if let [one] = exact.as_slice() {
+            return Ok(*one);
+        }
+    }
     match chosen.as_slice() {
         [one] => Ok(*one),
         _ => Err(chosen),
@@ -1310,6 +1324,46 @@ mod tests {
         assert!(!reusable(&card("approved", 5, Value::Null), old, 5, now));
         assert!(reusable(&card("pending", 5, Value::Null), recent, 5, now));
         assert!(reusable(&card("denied", 5, Value::Null), recent, 5, now));
+    }
+
+    #[test]
+    fn an_exact_name_picks_one_of_several() {
+        let cred = |id: &str, label: &str| Credential {
+            id: id.into(),
+            kind: "login".into(),
+            label: label.into(),
+            metadata: json!({"site": "example.test", "username": id}),
+            created_at: 0,
+            updated_at: 0,
+            last_used_at: None,
+        };
+        let items = [
+            cred("a", "Shop"),
+            cred("b", "Shop (work)"),
+            cred("c", "Other"),
+        ];
+        let by_label = |c: &Credential, h: &str| c.label.to_lowercase().contains(&h.to_lowercase());
+        let pick = |hint: Option<&str>| {
+            choose(&items, hint, by_label)
+                .map(|c| c.id.clone())
+                .map_err(|many| many.len())
+        };
+        // The exact name wins over a longer name that contains it.
+        assert_eq!(pick(Some("Shop")), Ok("a".into()));
+        assert_eq!(pick(Some(" shop ")), Ok("a".into()));
+        assert_eq!(pick(Some("Shop (work)")), Ok("b".into()));
+        assert_eq!(pick(Some("work")), Ok("b".into()));
+        // Still ambiguous, or nothing: the agent is told which there are.
+        assert_eq!(pick(Some("Sh")), Err(2));
+        assert_eq!(pick(None), Err(3));
+        assert_eq!(pick(Some("none")), Err(0));
+        let twins = [cred("a", "Shop"), cred("b", "shop")];
+        assert_eq!(
+            choose(&twins, Some("Shop"), by_label)
+                .map(|c| c.id.clone())
+                .map_err(|m| m.len()),
+            Err(2)
+        );
     }
 
     #[test]
