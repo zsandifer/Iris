@@ -2137,7 +2137,8 @@ mod tests {
             "- textbox \"Password\": red fox ocean\n- textbox: synthetic-passphrase",
             &spaced,
         );
-        assert!(!t.contains("fox") && !t.contains("passphrase"), "{t}");
+        // (Never printed: it would be the secret if the check failed.)
+        assert!(!t.contains("fox") && !t.contains("passphrase"));
         let amex = ["378282246310005".to_string()];
         assert_eq!(hide_secrets("3782 822463 10005", &amex), "[hidden]");
         assert_eq!(hide_secrets("nothing here", &secrets), "nothing here");
