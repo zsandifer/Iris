@@ -3591,6 +3591,10 @@ read it. Iris decides nothing; it only refuses:
   server), `browser_network_request(s)` (headers carry cookies),
   `browser_console_messages`, `browser_resize`, `browser_close`, and any
   tool a newer version adds.
+- Calls naming arguments their tool does not have, when they would fail
+  anyway (a required argument is missing, or no argument the tool knows
+  was given; for example `ref` instead of `target`): the answer names the
+  tool's real arguments. Calls are never renamed or changed.
 - Writing results to files: the `filename` option is removed from the
   definitions and refused, and so are output options in `_meta`.
 

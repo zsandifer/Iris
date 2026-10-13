@@ -232,6 +232,68 @@ fn check_args(name: &str, args: &Value) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// A call naming arguments its tool does not have, when it would fail
+/// anyway (a required one is missing, or none it knows was given).
+/// Playwright ignores unknown names and then fails on the missing one with
+/// a message models misread ("expected string, received undefined → at
+/// target"), so the same wrong call came back several times. Iris refuses
+/// it with the tool's real argument names instead; it never renames them.
+fn unknown_args(def: &Value, name: &str, args: &Value) -> Option<String> {
+    let props = def["inputSchema"]["properties"].as_object()?;
+    let given = args.as_object()?;
+    let unknown: Vec<&str> = given
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !props.contains_key(*k))
+        .collect();
+    if unknown.is_empty() {
+        return None;
+    }
+    let required: Vec<&str> = def["inputSchema"]["required"]
+        .as_array()
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|r| !given.contains_key(*r))
+        .collect();
+    if missing.is_empty() && given.keys().any(|k| props.contains_key(k)) {
+        return None;
+    }
+    let quote = |v: &[&str]| {
+        v.iter()
+            .map(|k| format!("`{k}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut known: Vec<String> = props
+        .keys()
+        .filter(|k| *k != "filename")
+        .map(|k| {
+            if required.contains(&k.as_str()) {
+                format!("`{k}` (required)")
+            } else {
+                format!("`{k}`")
+            }
+        })
+        .collect();
+    known.sort_by_key(|k| !k.ends_with("(required)"));
+    let mut out = format!(
+        "{name} has no argument {}. Its arguments: {}.",
+        quote(&unknown),
+        known.join(", ")
+    );
+    if props.values().any(|p| {
+        p["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("element reference from the page snapshot"))
+    }) {
+        out.push_str(" Element refs from browser_snapshot (like e12) go in `target`.");
+    }
+    Some(out)
+}
+
 fn error(text: impl Into<String>) -> Value {
     json!({"content": [{"type": "text", "text": text.into()}], "isError": true})
 }
@@ -253,7 +315,8 @@ are fine.
 - `browser_navigate`, then `browser_snapshot` to read the page and get element
   refs; act with `browser_click`, `browser_type`, `browser_fill_form`,
   `browser_select_option`, `browser_press_key`. Action results do not show
-  the page: call `browser_snapshot` to see it, and use its refs as targets.
+  the page: call `browser_snapshot` to see it, and pass its refs (like
+  `e12`) as `target`.
 - `browser_take_screenshot` when you need to see the page. For what the
   snapshot cannot reach (CAPTCHA boxes and picture grids, frames from other
   sites, maps, canvases), click or drag by position with
@@ -329,6 +392,13 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
         args.clone()
     };
     if let Err(e) = check_args(name, &args) {
+        return error(e);
+    }
+    if !fill
+        && let Ok(defs) = b.tool_list().await
+        && let Some(def) = defs.iter().find(|d| d["name"] == name)
+        && let Some(e) = unknown_args(def, name, &args)
+    {
         return error(e);
     }
     if b.is_paused() {
@@ -596,6 +666,63 @@ pub(crate) mod tests {
             h.enabled = false;
         }
         AppState::new(cfg, paths, db).unwrap()
+    }
+
+    #[test]
+    fn calls_with_unknown_argument_names_are_refused_with_the_real_ones() {
+        let target = json!({"type": "string",
+            "description": "Exact target element reference from the page snapshot, or a unique element selector"});
+        let click = json!({"name": "browser_click", "inputSchema": {"type": "object",
+            "properties": {"element": {"type": "string"}, "target": target,
+                           "doubleClick": {"type": "boolean"}},
+            "required": ["target"], "additionalProperties": false}});
+        let navigate = json!({"name": "browser_navigate", "inputSchema": {"type": "object",
+            "properties": {"url": {"type": "string"}}, "required": ["url"]}});
+        let find = json!({"name": "browser_find", "inputSchema": {"type": "object",
+            "properties": {"text": {"type": "string"}, "regex": {"type": "string"},
+                           "filename": {"type": "string"}}}});
+        // The old Playwright name for the element: refused, naming `target`.
+        let e = unknown_args(&click, "browser_click", &json!({"ref": "e9"})).unwrap();
+        assert!(e.contains("no argument `ref`"), "{e}");
+        assert!(e.contains("`target` (required)"), "{e}");
+        assert!(e.contains("go in `target`"), "{e}");
+        let e = unknown_args(
+            &click,
+            "browser_click",
+            &json!({"element": "Add", "ref": "e9"}),
+        );
+        assert!(e.is_some());
+        let e = unknown_args(
+            &navigate,
+            "browser_navigate",
+            &json!({"file_path": "https://example.test/"}),
+        )
+        .unwrap();
+        assert!(
+            e.contains("`url` (required)") && !e.contains("go in `target`"),
+            "{e}"
+        );
+        // Nothing it knows: refused (Playwright would only say "provide text").
+        let e = unknown_args(&find, "browser_find", &json!({"query": "Cart"})).unwrap();
+        assert!(
+            e.contains("`text`") && e.contains("`regex`") && !e.contains("filename"),
+            "{e}"
+        );
+        // Calls that would work go through, extra names and all.
+        for (def, args) in [
+            (&click, json!({"target": "e9"})),
+            (&click, json!({"target": "e9", "ref": "e9"})),
+            (&navigate, json!({"url": "https://example.test/"})),
+            (&find, json!({"text": "Cart", "query": "Cart"})),
+            (&find, json!({})),
+        ] {
+            assert_eq!(unknown_args(def, "t", &args), None, "{args}");
+        }
+        // No schema to compare with: nothing to say.
+        assert_eq!(
+            unknown_args(&json!({"name": "x"}), "x", &json!({"ref": "e1"})),
+            None
+        );
     }
 
     #[test]

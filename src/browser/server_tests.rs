@@ -259,6 +259,19 @@ async fn agent_calls_pass_through_and_private_pages_stay_closed() {
             json!({"url": "https://site.test/login"})
         )
     );
+    // A wrong argument name is refused with the real one, never forwarded.
+    let before = f.calls().len();
+    let r = f
+        .agent(
+            &token,
+            "browser_navigate",
+            json!({"file_path": "https://site.test/other"}),
+        )
+        .await;
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(text(&r).contains("no argument `file_path`"), "{r}");
+    assert!(text(&r).contains("`url` (required)"), "{r}");
+    assert_eq!(f.calls().len(), before);
 
     // The owner takes over and types a password: taps become mouse
     // input at page coordinates, typing becomes key presses (and inserted
