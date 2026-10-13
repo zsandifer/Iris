@@ -266,29 +266,40 @@ pub async fn fill(
 
 // ------------------------------------------------------- agent fills
 
-/// Remember the owner's saved passwords and card numbers (not short
-/// codes, which would hide too much) so a page can never show them to the
-/// agent, also ones it kept from an earlier visit.
-pub async fn remember_saved(state: &AppState, user_id: &str) {
-    if !state.browser.take_saved_load() {
-        return;
-    }
-    for c in credentials(state, user_id, "login")
-        .await
-        .into_iter()
-        .chain(credentials(state, user_id, "card").await)
-    {
-        let Ok((_, secret)) = load(state, user_id, &c.id).await else {
+/// The owner's saved passwords and card numbers (not short codes, which
+/// would hide too much), read from the vault when the browser starts: a
+/// page can never show them to the agent, also ones a site kept from an
+/// earlier visit.
+pub fn saved_secrets_blocking(db: &crate::db::Db, vault: &crate::secrets::Vault) -> Vec<String> {
+    let records = db.with(|c| {
+        let Some(owner) = crate::db::owner_user_id(c)? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for cred in entities::list_credentials(c, &owner)? {
+            if let Some(ct) = entities::get_credential_ciphertext(c, &owner, &cred.id)? {
+                out.push((cred.id, ct));
+            }
+        }
+        Ok(out)
+    });
+    let mut secrets = Vec::new();
+    for (id, ct) in records.unwrap_or_default() {
+        let Ok(plain) = vault.decrypt(&ct, &id) else {
             continue;
         };
+        let fields: serde_json::Map<String, Value> =
+            serde_json::from_slice(&plain).unwrap_or_default();
         for k in ["password", "number"] {
-            if let Some(v) = secret.get(k).and_then(Value::as_str)
+            if let Some(v) = fields.get(k).and_then(Value::as_str)
                 && v.chars().count() >= MIN_HIDDEN
+                && !secrets.iter().any(|s| s == v)
             {
-                state.browser.remember_secret(v);
+                secrets.push(v.to_string());
             }
         }
     }
+    secrets
 }
 
 /// Iris's own tools for the agent, listed after Playwright's.
@@ -475,12 +486,21 @@ fn field_code(
     const norm = (x) => String(x).trim().toLowerCase();
     const num = (x) => (/^\\d+$/.test(norm(x)) ? Number(norm(x)) : NaN);
     const words = (x) => norm(x).split(/[^a-z0-9]+/).filter(Boolean);
+    // What people read wins over internal values (months may be valued
+    // 0 to 11): labels first, for every candidate, then values.
+    const matchers = [
+      (o, v) => norm(o.label) === norm(v),
+      (o, v) => words(o.label).includes(norm(v)),
+      (o, v) => !Number.isNaN(num(v)) && num(o.label) === num(v),
+      (o, v) => o.value === v,
+      (o, v) => !Number.isNaN(num(v)) && num(o.value) === num(v),
+    ];
     let pick = null;
-    for (const v of values) {{
-      pick = opts.find((o) => o.value === v)
-        || opts.find((o) => norm(o.label) === norm(v))
-        || opts.find((o) => !Number.isNaN(num(v)) && (num(o.value) === num(v) || num(o.label) === num(v)))
-        || opts.find((o) => words(o.label).includes(norm(v)));
+    for (const m of matchers) {{
+      for (const v of values) {{
+        pick = opts.find((o) => m(o, v));
+        if (pick) break;
+      }}
       if (pick) break;
     }}
     if (pick) filled = await h.selectOption({{ value: pick.value }}, {{ timeout: 5000 }}).then(() => true, () => false);

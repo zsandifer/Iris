@@ -649,21 +649,25 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
     // may keep a value from an earlier visit).
     let g = b.begin_turn(&f.owner, &f.conv, "m", std::slice::from_ref(&f.owner));
     let token = g.token().to_string();
-    assert!(b.filled_secrets().is_empty());
-    f.agent(
-        &token,
-        "browser_navigate",
-        json!({"url": "https://site.test/kept"}),
-    )
-    .await;
-    f.load("https://site.test/kept?remembered=Pw-5678");
+    assert!(b.filled_secrets().is_empty() && b.running().is_none());
+    // The very first call starts the browser and lands on a page whose
+    // address carries the saved password.
     let r = f
-        .agent(&token, "browser_tabs", json!({"action": "list"}))
+        .agent(
+            &token,
+            "browser_navigate",
+            json!({"url": "https://site.test/kept?remembered=Pw-5678"}),
+        )
         .await;
     assert!(
         text(&r).contains("remembered=[hidden]") && !r.to_string().contains("Pw-5678"),
         "{r}"
     );
+    assert!(!b.state_json().to_string().contains("Pw-5678"));
+    let r = f
+        .agent(&token, "browser_tabs", json!({"action": "list"}))
+        .await;
+    assert!(!r.to_string().contains("Pw-5678"), "{r}");
     f.set("pagetext", "Your password is Pw-5678");
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
     assert!(text(&r).starts_with("No screenshot right now"), "{r}");
@@ -990,21 +994,32 @@ async fn dialogs_file_pickers_and_new_windows_during_take_over() {
         1
     );
     b.hand_back();
-    // A window already open when the owner takes over is shown to them.
+    // Taking over keeps the tab the agent was on, even with newer tabs
+    // open (the agent selects a sign-in window before asking); a window
+    // opened while the owner is in control is still followed.
+    let selects = |f: &Fake| {
+        f.calls()
+            .iter()
+            .filter(|(t, a)| t == "browser_tabs" && a["action"] == "select")
+            .count()
+    };
+    let before = selects(&f);
     f.set("tabs", "3");
     b.take_over(&f.owner, "dev").await.unwrap();
-    let mut shown = false;
-    for _ in 0..50 {
-        shown = f
-            .calls()
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    b.user_input("dev", &tap).await.unwrap();
+    assert_eq!(selects(&f), before);
+    f.set("tabs", "4");
+    b.user_input("dev", &tap).await.unwrap();
+    assert_eq!(selects(&f), before + 1);
+    assert_eq!(
+        f.calls()
             .iter()
-            .any(|(t, a)| t == "browser_tabs" && a["action"] == "select" && a["index"] == 2);
-        if shown {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(shown);
+            .rfind(|(t, _)| t == "browser_tabs")
+            .unwrap()
+            .1["index"],
+        3
+    );
     b.hand_back();
 
     // The agent answers its own dialogs, but a file picker (it may not
@@ -1098,12 +1113,27 @@ async fn real_playwright() {
                  <input name=pw type=password aria-label=Password><button>Sign in</button></form></body></html>"
                     .to_string()
             } else if req.starts_with("GET /pay") {
-                // A checkout: number, month list (values without leading
-                // zeros), a two-digit year known only by its placeholder,
+                // A checkout: number, month list (valued 0 to 11, labelled
+                // by name), a two-digit year known only by its placeholder,
                 // and a CVC.
-                let months: String = (1..=12)
-                    .map(|m| format!("<option value={m}>{m:02}</option>"))
-                    .collect();
+                let months: String = [
+                    "January",
+                    "February",
+                    "March",
+                    "April",
+                    "May",
+                    "June",
+                    "July",
+                    "August",
+                    "September",
+                    "October",
+                    "November",
+                    "December",
+                ]
+                .iter()
+                .enumerate()
+                .map(|(i, m)| format!("<option value={i}>{m}</option>"))
+                .collect();
                 format!(
                     "<html><head><title>Iris smoke checkout</title></head><body><form>\
                      <input name=n aria-label='Card number' autocomplete=cc-number>\
@@ -1627,7 +1657,7 @@ async fn real_playwright() {
         .unwrap();
     let values = text_of(&values).replace([' ', '\n'], "");
     assert!(
-        values.contains(r#"["4111111111111111","4","31","737"]"#),
+        values.contains(r#"["4111111111111111","3","31","737"]"#),
         "the card fields hold something else"
     );
     let r = f.agent(&chat_token, "browser_snapshot", json!({})).await;

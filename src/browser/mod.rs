@@ -254,11 +254,10 @@ struct Private {
     /// agent gets back (a page may echo them into its address, title, a
     /// dialog, or its text).
     secrets: Vec<String>,
-    /// The owner's saved passwords and card numbers were added to
-    /// `secrets` (once per browser run: a site may keep a value it was
-    /// given before, in its own storage, and show it again).
-    saved_loaded: bool,
 }
+
+/// Reads the owner's saved secrets (`fill::saved_secrets_blocking`).
+pub type SecretSource = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 
 /// Most private addresses remembered (the oldest are forgotten first; the
 /// documents themselves stay marked).
@@ -303,6 +302,7 @@ pub struct Shared {
     /// The server's tools the agent may use (asked once per install).
     tools: Mutex<Option<Vec<Value>>>,
     private: Mutex<Private>,
+    secret_source: Mutex<Option<SecretSource>>,
     /// Tests run a stand-in server.
     #[cfg(test)]
     server_override: Mutex<Option<launch::Server>>,
@@ -642,6 +642,7 @@ impl Browser {
             switch_lock: tokio::sync::Mutex::new(()),
             tools: Mutex::new(None),
             private: Mutex::default(),
+            secret_source: Mutex::new(None),
             #[cfg(test)]
             server_override: Mutex::new(None),
         }))
@@ -1019,7 +1020,20 @@ impl Browser {
             v.url = "about:blank".into();
             v.title = String::new();
         }
-        *lock(&self.private) = Private::default();
+        // Saved secrets are hidden from the first result on (a site may
+        // show one it kept from an earlier visit); read before the browser
+        // is published to anyone.
+        let source = lock(&self.secret_source).clone();
+        let saved = match source {
+            Some(f) => tokio::task::spawn_blocking(move || f())
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        *lock(&self.private) = Private {
+            secrets: saved,
+            ..Private::default()
+        };
         *lock(&self.running) = Some(run.clone());
         self.last_used.store(now_ms(), Ordering::SeqCst);
         let b = self.clone();
@@ -1454,26 +1468,15 @@ impl Browser {
         });
         crate::info!("browser: owner took over");
         self.broadcast_state();
-        // A window already open (a sign-in popup the agent's click opened)
-        // is what the owner sees: the newest tab, once the page is free.
+        // The owner gets the tab the agent was on (it selects a sign-in
+        // window before asking); tabs open now are not new.
         let b = self.clone();
         tokio::spawn(async move {
             let _op = b.op_lock.lock().await;
-            if !matches!(b.control(), Control::User { .. }) {
-                return;
-            }
-            let Some(run) = b.running() else { return };
-            if let Ok(n) = b.count_tabs(&run).await {
+            if let Some(run) = b.running()
+                && let Ok(n) = b.count_tabs(&run).await
+            {
                 lock(&b.private).tabs = n;
-                if n > 1 {
-                    let _ = b
-                        .act(
-                            &run,
-                            "browser_tabs",
-                            json!({"action": "select", "index": n - 1}),
-                        )
-                        .await;
-                }
             }
         });
         Ok(())
@@ -1712,10 +1715,9 @@ impl Browser {
         lock(&self.private).secrets.clone()
     }
 
-    /// Whether the owner's saved secrets still need adding (and from now
-    /// on, they are being added).
-    pub(crate) fn take_saved_load(&self) -> bool {
-        !std::mem::replace(&mut lock(&self.private).saved_loaded, true)
+    /// Where the owner's saved secrets come from (set once at startup).
+    pub fn set_secret_source(&self, source: SecretSource) {
+        *lock(&self.secret_source) = Some(source);
     }
 
     /// Whether the agent must keep off the current page: the owner typed

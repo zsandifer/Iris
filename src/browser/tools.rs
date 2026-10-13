@@ -218,7 +218,9 @@ are fine.
   saved login and you never see it (for two-step forms, call it again on the
   password step). If it answers `not found`, or the site asks for a code or a
   check, or fights automated browsers (for example X), ask the user to take
-  over the browser in the app and sign in themselves, then wait. Sign-ins
+  over the browser in the app and sign in themselves, then wait (if the
+  sign-in opened in a new tab or window, select it with `browser_tabs`
+  first: the user sees the tab you are on). Sign-ins
   stay in the browser, so this is usually needed once per site.
 - Paying: call `fill_saved_card` with the refs of the payment fields. The user
   approves every use in the chat; tell them you are waiting for their OK.
@@ -278,8 +280,6 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
         return error(super::TURN_ENDED);
     }
     b.mark_used(&ctx);
-    // The owner's saved secrets are hidden from everything below.
-    super::fill::remember_saved(state, &ctx.user_id).await;
     // A card needs the owner's OK first, asked without holding the page.
     let mut approved = None;
     if name == "fill_saved_card" {

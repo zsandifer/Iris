@@ -865,7 +865,8 @@ dropping them; when they end you get one summary notification.
   where you typed or filled private details is closed to the agent until
   it moves on. Only `http`/`https` pages can be opened. When a turn ends or
   you take over, its pending browser reads stop, and an action already
-  sent gets a few seconds to finish before you get the page.
+  sent finishes first (opening a page: at most 8 seconds; other actions:
+  up to the call's 90-second limit).
 - "Pause Iris" in Iris's computer stops running turns, closes the browser,
   and holds chats and jobs until you turn it back on.
 

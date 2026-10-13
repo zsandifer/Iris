@@ -2524,7 +2524,7 @@ image:
 
 | `kind` | Fields | Effect |
 |---|---|---|
-| `tap` | `x`, `y` | A left click at that point. A window the page opens (a sign-in popup) becomes the current tab; so does the newest tab when the owner takes over. |
+| `tap` | `x`, `y` | A left click at that point. A window the page opens while the owner is in control (a sign-in popup) becomes the current tab. Taking over keeps the tab the agent was on (the agent selects a sign-in window before asking). |
 | `scroll` | `x`, `y` (optional), `dx`, `dy` | Mouse wheel; deltas in CSS pixels (max 4,000). |
 | `text` | `text` (max 2,000 characters) | Typed into the focused element. |
 | `key` | `key` | `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, arrows, `Home`, `End`, `PageUp`, `PageDown`. |
@@ -3627,9 +3627,11 @@ Takeover also discards the result of a call already under way, even if
 control is immediately handed back. When the turn ends (finished,
 cancelled, or failed), its calls stop at once, even in the middle of a
 wait. Reads (`browser_snapshot`, `browser_find`, `browser_take_screenshot`,
-`browser_wait_for`) are dropped at once; an action already sent to the
-browser keeps the page for up to 8 seconds while it finishes, so it never
-lands under the owner's hands. A file picker the agent's action opens is
+`browser_wait_for`) are dropped at once. An action already sent to the
+browser keeps the page until it finishes (Playwright cannot stop one; at
+most the call's 90-second limit), so it never lands under the owner's
+hands; opening a page (`browser_navigate`, `browser_navigate_back`) keeps
+it for at most 8 seconds. A file picker the agent's action opens is
 cancelled (the result says so); the agent answers its own dialogs with
 `browser_handle_dialog`. Every harness gets a per-server timeout of the effective approval
 window plus 300 seconds, using the standard per-server MCP timeout fields.
