@@ -65,12 +65,16 @@ while IFS= read -r line; do
               ff=$(cat fieldframe 2>/dev/null || echo "$url")
               r=$(printf '%s' "$line" | sed -n 's/.*aria-ref=\([a-z0-9]*\).*/\1/p')
               [ -n "$r" ] || r=focused
+              f2=$(grep "^$r " frames 2>/dev/null | cut -d' ' -f2)
+              [ -n "$f2" ] && ff=$f2
               k=$(grep "^$r " kinds 2>/dev/null | cut -d' ' -f2)
               [ -n "$k" ] || k=text
               if [ -f noref ]; then
                 reply "### Result\\n{\\\"found\\\":false}" '' ''
               else
                 case "$line" in
+                  *'h.click('*)
+                    reply "### Result\\n{\\\"clicked\\\":true}" '' '' ;;
                   *'const values'*)
                     case "$line" in *'if (true) await page.evaluate'*) : > marked ;; esac
                     reply "### Result\\n{\\\"filled\\\":true}" '' '' ;;
@@ -440,7 +444,7 @@ async fn owner_fills_saved_logins_only_on_their_site() {
     let done = fills(&f);
     assert_eq!(done.len(), 1);
     assert!(done[0].0.contains("hasFocus") && done[0].0.contains("Pw-1234"));
-    assert!(done[0].0.contains("h.fill(v)"));
+    assert!(done[0].0.contains("h.fill(v, "));
     assert_eq!(f.called("browser_press_key"), 0);
     b.hand_back();
     let g = b.begin_turn(&f.owner, &f.conv, "m", &[]);
@@ -575,6 +579,36 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
     assert!(!done[0].1);
     assert!(done[1].0.contains("aria-ref=e4") && done[1].0.contains("Pw-5678"));
     assert!(done[1].1);
+    // A sign-in button instead of Enter: clicked by Iris, only on the site.
+    let clicks = |f: &Fake| {
+        f.calls()
+            .iter()
+            .filter(|(t, a)| {
+                t == "browser_run_code_unsafe" && a["code"].to_string().contains("h.click(")
+            })
+            .count()
+    };
+    f.set("frames", "e9 https://evil.test/x\n");
+    let r = f
+        .agent(
+            &token,
+            "fill_saved_login",
+            json!({"password_ref": "e4", "submit_ref": "e9"}),
+        )
+        .await;
+    assert!(text(&r).contains("not on the same site"), "{r}");
+    assert_eq!(clicks(&f), 0);
+    f.set("frames", "");
+    let r = f
+        .agent(
+            &token,
+            "fill_saved_login",
+            json!({"password_ref": "e4", "submit_ref": "e9"}),
+        )
+        .await;
+    assert_eq!(text(&r), "filled and submitted", "{r}");
+    assert_eq!(clicks(&f), 1);
+    assert!(!fills(&f).last().unwrap().1, "no Enter with a button");
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_eq!(text(&r), PRIVATE_PAGE);
     // Filling still works there (the password step of a two-step form).
@@ -709,6 +743,29 @@ async fn the_agent_fills_a_card_only_after_the_owner_approves() {
     assert!(text(&r).starts_with("denied"), "{r}");
     assert!(fills(&f).is_empty());
 
+    // Approved, but meanwhile a field's frame became another site, or the
+    // page another origin (a port is enough): nothing is typed.
+    for (file, moved, back) in [
+        (
+            "fieldframe",
+            "https://evil.test/card",
+            "https://pay.test/card",
+        ),
+        ("url", "https://shop.test:8443/pay", "https://shop.test/pay"),
+    ] {
+        let call = {
+            let (st, tk, a) = (f.state.clone(), token.clone(), args.clone());
+            tokio::spawn(async move { tools::call(&st, &tk, "fill_saved_card", &a).await })
+        };
+        let m = pending().await;
+        f.set(file, moved);
+        decide(m, true);
+        let r = call.await.unwrap();
+        assert!(text(&r).contains("not the one the user approved"), "{r}");
+        assert!(fills(&f).is_empty());
+        f.set(file, back);
+    }
+
     // Approved: every field filled by Iris, and the page closes.
     let call = {
         let (st, tk, a) = (f.state.clone(), token.clone(), args.clone());
@@ -721,22 +778,33 @@ async fn the_agent_fills_a_card_only_after_the_owner_approves() {
     let done = fills(&f);
     assert_eq!(done.len(), 5);
     assert!(done[0].0.contains("4111111111111111"));
-    assert!(done[1].0.contains(r#"["04","4"]"#), "{}", done[1].0);
+    assert!(
+        done[1].0.contains(r#"["04","4","April","Apr"]"#),
+        "{}",
+        done[1].0
+    );
     assert!(done[2].0.contains(r#"["2031","31"]"#));
     assert!(done[3].0.contains("737"));
     assert!(done[4].0.contains("S Doe"));
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
     assert_eq!(text(&r), PRIVATE_PAGE);
-    // That OK was for one fill.
-    let used = f
+    // That OK was for one fill; the ones refused above were never used.
+    let approved: Vec<Value> = f
         .state
         .db
         .with(|c| crate::db::list_messages(c, &f.conv, None, 50))
         .unwrap()
         .into_iter()
-        .find_map(|m| m.card.filter(|c| c["state"] == "approved"))
-        .unwrap();
-    assert!(used["wallet"]["used_at"].is_i64());
+        .filter_map(|m| m.card.filter(|c| c["state"] == "approved"))
+        .collect();
+    assert_eq!(approved.len(), 3);
+    assert_eq!(
+        approved
+            .iter()
+            .filter(|c| c["wallet"]["used_at"].is_i64())
+            .count(),
+        1
+    );
     drop(g);
     b.close().await;
 }
@@ -896,6 +964,22 @@ async fn dialogs_file_pickers_and_new_windows_during_take_over() {
         1
     );
     b.hand_back();
+    // A window already open when the owner takes over is shown to them.
+    f.set("tabs", "3");
+    b.take_over(&f.owner, "dev").await.unwrap();
+    let mut shown = false;
+    for _ in 0..50 {
+        shown = f
+            .calls()
+            .iter()
+            .any(|(t, a)| t == "browser_tabs" && a["action"] == "select" && a["index"] == 2);
+        if shown {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(shown);
+    b.hand_back();
 
     // The agent answers its own dialogs, but a file picker (it may not
     // upload) is cancelled for it so the browser is not stuck.
@@ -1001,6 +1085,22 @@ async fn real_playwright() {
                      <input name=y aria-label='Expiry year' placeholder=YY>\
                      <input name=c aria-label='Security code' autocomplete=cc-csc></form></body></html>"
                 )
+            } else if req.starts_with("GET /reflect") {
+                // A sign-in form that sends with GET: the password lands in
+                // the next page's address, text, and a frame's field.
+                "<html><body><form method=get action=/echo>\
+                 <input name=u aria-label=Username><input name=p type=password aria-label=Password>\
+                 <button>Go</button></form></body></html>"
+                    .to_string()
+            } else if let Some(rest) = req.strip_prefix("GET /echo?") {
+                let q = rest.split_whitespace().next().unwrap_or("");
+                format!(
+                    "<html><head><title>Sent {q}</title></head><body><p>You sent {q}</p>\
+                     <iframe src='http://127.0.0.1:{other_port}/show?{q}'></iframe></body></html>"
+                )
+            } else if let Some(rest) = req.strip_prefix("GET /show?") {
+                let q = rest.split_whitespace().next().unwrap_or("");
+                format!("<html><body><input aria-label=Shown value='{q}'></body></html>")
             } else if req.starts_with("GET /field") {
                 "<html><body style='margin:0'><input name=q style='width:500px;height:200px'></body></html>"
                     .to_string()
@@ -1244,6 +1344,14 @@ async fn real_playwright() {
         line[at..line[at..].find(']').unwrap() + at].to_string()
     };
     let (user_ref, pw_ref) = (ref_of("Username"), ref_of("Password"));
+    let button_ref = {
+        let line = snap
+            .lines()
+            .find(|l| l.contains("button \"Sign in\""))
+            .unwrap_or_else(|| panic!("button in {snap}"));
+        let at = line.find("[ref=").unwrap() + 5;
+        line[at..line[at..].find(']').unwrap() + at].to_string()
+    };
     let r = f
         .agent(
             &token,
@@ -1271,7 +1379,7 @@ async fn real_playwright() {
         .agent(
             &token,
             "fill_saved_login",
-            json!({"password_ref": pw_ref, "submit": true}),
+            json!({"password_ref": pw_ref, "submit_ref": button_ref}),
         )
         .await;
     assert_eq!(text(&r), "filled and submitted", "{r}");
@@ -1292,6 +1400,68 @@ async fn real_playwright() {
         !home_now.contains("Real-Pw-42"),
         "the password reached the agent"
     );
+
+    // A page that echoes the password (a sign-in form sending with GET):
+    // the agent's results have it hidden, and no picture is taken.
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/reflect")}),
+    )
+    .await;
+    let snap = text(&f.agent(&token, "browser_snapshot", json!({})).await);
+    let ref_in = |label: &str| {
+        let line = snap
+            .lines()
+            .find(|l| l.contains(&format!("textbox \"{label}\"")))
+            .unwrap_or_else(|| panic!("{label} in {snap}"));
+        let at = line.find("[ref=").unwrap() + 5;
+        line[at..line[at..].find(']').unwrap() + at].to_string()
+    };
+    let r = f
+        .agent(
+            &token,
+            "fill_saved_login",
+            json!({"username_ref": ref_in("Username"), "password_ref": ref_in("Password"), "submit": true}),
+        )
+        .await;
+    assert_eq!(text(&r), "filled and submitted", "{r}");
+    let mut on_echo = false;
+    for _ in 0..40 {
+        let url = b.current_url(&run).await.unwrap();
+        if url.contains("/echo?") {
+            // (The page really holds it.)
+            assert!(url.contains("Real-Pw-42"), "the page did not get the value");
+            on_echo = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(on_echo, "the form did not send");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for (tool, args) in [
+        ("browser_tabs", json!({"action": "list"})),
+        ("browser_snapshot", json!({})),
+        ("browser_navigate_back", json!({})),
+        ("browser_navigate_back", json!({})),
+    ] {
+        let r = f.agent(&token, tool, args).await;
+        assert!(
+            !r.to_string().contains("Real-Pw-42"),
+            "{tool} showed the password"
+        );
+        if tool == "browser_snapshot" {
+            assert!(
+                text(&r).contains("You sent") && text(&r).contains("[hidden]"),
+                "{tool}"
+            );
+            let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
+            assert!(
+                text(&shot).starts_with("No screenshot right now"),
+                "screenshot taken"
+            );
+        }
+    }
 
     // The agent fills a saved card after the owner approves, never seeing
     // it.
@@ -1343,7 +1513,11 @@ async fn real_playwright() {
         let (st, tk) = (f.state.clone(), chat_token.clone());
         tokio::spawn(async move { tools::call(&st, &tk, "fill_saved_card", &args).await })
     };
+    let mut waited = 0;
     let approval = loop {
+        assert!(!call.is_finished(), "the fill ended before asking");
+        waited += 1;
+        assert!(waited < 400, "no approval card");
         let msgs = f
             .state
             .db

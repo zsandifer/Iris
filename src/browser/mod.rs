@@ -254,6 +254,10 @@ struct Private {
     /// agent gets back (a page may echo them into its address, title, a
     /// dialog, or its text).
     secrets: Vec<String>,
+    /// The owner's saved passwords and card numbers were added to
+    /// `secrets` (once per browser run: a site may keep a value it was
+    /// given before, in its own storage, and show it again).
+    saved_loaded: bool,
 }
 
 /// Most private addresses remembered (the oldest are forgotten first; the
@@ -488,6 +492,62 @@ const KEYS: &[&str] = &[
     "PageUp",
     "PageDown",
 ];
+
+/// `text` with saved secrets replaced by `[hidden]`: the gateway's matcher
+/// (the value and its common encodings), plus what pages do with card
+/// details: numbers split into groups by spaces or dashes, and short
+/// security codes (only where they stand alone, not inside longer numbers).
+pub(crate) fn hide_secrets(text: &str, secrets: &[String]) -> String {
+    let mut out = crate::gateway::redact(text, secrets);
+    for s in secrets {
+        let digits = !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if digits && s.len() >= 12 {
+            let groups: &[usize] = if s.len() == 15 {
+                &[4, 6, 5]
+            } else {
+                &[4, 4, 4, 4, 4]
+            };
+            let mut parts = Vec::new();
+            let mut at = 0;
+            for g in groups {
+                if at >= s.len() {
+                    break;
+                }
+                let end = (at + g).min(s.len());
+                parts.push(&s[at..end]);
+                at = end;
+            }
+            for sep in [" ", "-", "  ", " - "] {
+                out = out.replace(&parts.join(sep), "[hidden]");
+            }
+        } else if digits && (3..=4).contains(&s.len()) {
+            out = hide_standalone(&out, s);
+        }
+    }
+    out
+}
+
+/// Replace `code` where no other digit touches it.
+fn hide_standalone(text: &str, code: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut i = 0;
+    while let Some(pos) = text[i..].find(code) {
+        let start = i + pos;
+        let end = start + code.len();
+        let before = start > 0 && b[start - 1].is_ascii_digit();
+        let after = end < b.len() && b[end].is_ascii_digit();
+        if !before && !after {
+            out.push_str(&text[last..start]);
+            out.push_str("[hidden]");
+            last = end;
+        }
+        i = end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
 
 /// An address the owner typed: http(s), or a bare domain (https).
 pub fn normalize_url(raw: &str) -> Result<String> {
@@ -1334,18 +1394,36 @@ impl Browser {
     // ----------------------------------------------------------- take over
 
     pub async fn take_over(&self, user_id: &str, device_id: &str) -> Result<()> {
-        let run = self.ensure().await?;
+        self.ensure().await?;
         self.last_input.store(now_ms(), Ordering::SeqCst);
-        // Tabs open now are not new to the owner.
-        if let Ok(n) = self.count_tabs(&run).await {
-            lock(&self.private).tabs = n;
-        }
         self.control.send_replace(Control::User {
             user_id: user_id.into(),
             device_id: device_id.into(),
         });
         crate::info!("browser: owner took over");
         self.broadcast_state();
+        // A window already open (a sign-in popup the agent's click opened)
+        // is what the owner sees: the newest tab, once the page is free.
+        let b = self.clone();
+        tokio::spawn(async move {
+            let _op = b.op_lock.lock().await;
+            if !matches!(b.control(), Control::User { .. }) {
+                return;
+            }
+            let Some(run) = b.running() else { return };
+            if let Ok(n) = b.count_tabs(&run).await {
+                lock(&b.private).tabs = n;
+                if n > 1 {
+                    let _ = b
+                        .act(
+                            &run,
+                            "browser_tabs",
+                            json!({"action": "select", "index": n - 1}),
+                        )
+                        .await;
+                }
+            }
+        });
         Ok(())
     }
 
@@ -1582,6 +1660,12 @@ impl Browser {
         lock(&self.private).secrets.clone()
     }
 
+    /// Whether the owner's saved secrets still need adding (and from now
+    /// on, they are being added).
+    pub(crate) fn take_saved_load(&self) -> bool {
+        !std::mem::replace(&mut lock(&self.private).saved_loaded, true)
+    }
+
     /// Whether the agent must keep off the current page: the owner typed
     /// private details into this document, or on this address.
     pub(crate) async fn private_page(&self, run: &Running) -> Result<bool> {
@@ -1779,6 +1863,28 @@ mod tests {
         assert!(outside.exists());
         b.remove_output("### Result\n- [Screenshot of viewport](out/page-1.jpeg)");
         assert!(!shot.exists());
+    }
+
+    #[test]
+    fn filled_secrets_are_hidden_in_what_pages_echo() {
+        let secrets = [
+            "Pw-secret-42".to_string(),
+            "4111111111111111".to_string(),
+            "737".to_string(),
+        ];
+        let t = hide_secrets(
+            "q=Pw-secret-42 card 4111 1111 1111 1111 or 4111-1111-1111-1111 cvc 737; flight 7370 and Boeing 737",
+            &secrets,
+        );
+        assert!(!t.contains("Pw-secret") && !t.contains("4111"), "{t}");
+        assert!(t.contains("flight 7370"), "{t}");
+        assert!(
+            t.contains("cvc [hidden]") && t.contains("Boeing [hidden]"),
+            "{t}"
+        );
+        let amex = ["378282246310005".to_string()];
+        assert_eq!(hide_secrets("3782 822463 10005", &amex), "[hidden]");
+        assert_eq!(hide_secrets("nothing here", &secrets), "nothing here");
     }
 
     #[test]

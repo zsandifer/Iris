@@ -231,6 +231,31 @@ pub async fn fill(
 
 // ------------------------------------------------------- agent fills
 
+/// Remember the owner's saved passwords and card numbers (not short
+/// codes, which would hide too much) so a page can never show them to the
+/// agent, also ones it kept from an earlier visit.
+pub async fn remember_saved(state: &AppState, user_id: &str) {
+    if !state.browser.take_saved_load() {
+        return;
+    }
+    for c in credentials(state, user_id, "login")
+        .await
+        .into_iter()
+        .chain(credentials(state, user_id, "card").await)
+    {
+        let Ok((_, secret)) = load(state, user_id, &c.id).await else {
+            continue;
+        };
+        for k in ["password", "number"] {
+            if let Some(v) = secret.get(k).and_then(Value::as_str)
+                && v.chars().count() >= MIN_HIDDEN
+            {
+                state.browser.remember_secret(v);
+            }
+        }
+    }
+}
+
 /// Iris's own tools for the agent, listed after Playwright's.
 pub fn definitions() -> Vec<Value> {
     let r = |d: &str| json!({"type": "string", "description": d});
@@ -240,13 +265,15 @@ pub fn definitions() -> Vec<Value> {
             "description": "Sign in with the user's saved login for this site. Give the refs \
                 (from browser_snapshot) of the username and/or password fields; Iris types the \
                 saved values in itself and you never see them. Set `submit` to press Enter in \
-                the last field filled. After a password is filled you cannot read the page \
-                until it moves on, so usually submit. Answers `filled`, or `not found (...)`.",
+                the last field filled, or `submit_ref` to click the sign-in button. After a \
+                password is filled you cannot read the page until it moves on, so usually \
+                submit. Answers `filled`, or `not found (...)`.",
             "inputSchema": {"type": "object", "properties": {
                 "username_ref": r("Ref of the username or email field"),
                 "password_ref": r("Ref of the password field"),
                 "login": r("Which saved login, by its name or username (only if several are saved for this site)"),
                 "submit": {"type": "boolean", "description": "Press Enter after filling to sign in"},
+                "submit_ref": r("Ref of the sign-in button to click after filling (instead of Enter)"),
             }},
         }),
         json!({
@@ -266,6 +293,7 @@ pub fn definitions() -> Vec<Value> {
                 "name_ref": r("Ref of the name on card field"),
                 "card": r("Which card, by its name or last 4 digits (only if several are saved)"),
                 "submit": {"type": "boolean", "description": "Press Enter in the last field after filling"},
+                "submit_ref": r("Ref of the pay button to click after filling (instead of Enter)"),
             }, "required": ["number_ref"]},
         }),
     ]
@@ -405,10 +433,22 @@ fn field_code(
   const values = {values};
   let filled = false;
   if (info.tag === 'select') {{
+    // The option is picked from the list itself (selecting one that is not
+    // there would wait for it): by value, label, number, or a word of the
+    // label (\"04 - April\").
+    const opts = await h.evaluate((e) => Array.from(e.options, (o) => ({{ value: o.value, label: (o.label || o.textContent || '').trim() }})));
+    const norm = (x) => String(x).trim().toLowerCase();
+    const num = (x) => (/^\\d+$/.test(norm(x)) ? Number(norm(x)) : NaN);
+    const words = (x) => norm(x).split(/[^a-z0-9]+/).filter(Boolean);
+    let pick = null;
     for (const v of values) {{
-      if (await h.selectOption(v).then(() => true, () => false)) {{ filled = true; break; }}
-      if (await h.selectOption({{ label: v }}).then(() => true, () => false)) {{ filled = true; break; }}
+      pick = opts.find((o) => o.value === v)
+        || opts.find((o) => norm(o.label) === norm(v))
+        || opts.find((o) => !Number.isNaN(num(v)) && (num(o.value) === num(v) || num(o.label) === num(v)))
+        || opts.find((o) => words(o.label).includes(norm(v)));
+      if (pick) break;
     }}
+    if (pick) filled = await h.selectOption({{ value: pick.value }}, {{ timeout: 5000 }}).then(() => true, () => false);
   }} else {{
     // Several forms (a year as 2031 or 31): what the field says it takes.
     const hint = await h.evaluate((e) => [e.placeholder, e.getAttribute('aria-label'), e.name, e.id,
@@ -418,9 +458,9 @@ fn field_code(
     const fits = values.filter((v) => !max || v.length <= max);
     const pick = fits.length ? fits : values;
     const v = short ? pick.reduce((a, b) => (b.length < a.length ? b : a)) : pick[0];
-    filled = await h.fill(v).then(() => true, () => false);
+    filled = await h.fill(v, {{ timeout: 5000 }}).then(() => true, () => false);
   }}
-  if (filled && {submit}) await h.press('Enter').catch(() => {{}});
+  if (filled && {submit}) await h.press('Enter', {{ timeout: 5000 }}).catch(() => {{}});
   return {{ filled }};
 }}",
         top = serde_json::to_string(&at.top)?,
@@ -432,7 +472,17 @@ fn field_code(
     ))
 }
 
+/// A form field (`locate_any`: any element, for a button).
 async fn locate(state: &AppState, run: &Running, find: Find<'_>) -> Result<Option<Target>> {
+    Ok(locate_any(state, run, find).await?.filter(|at| {
+        matches!(
+            at.tag.as_str(),
+            "input" | "textarea" | "select" | "editable"
+        )
+    }))
+}
+
+async fn locate_any(state: &AppState, run: &Running, find: Find<'_>) -> Result<Option<Target>> {
     if let Find::Ref(r) = find
         && !valid_ref(r)
     {
@@ -446,9 +496,6 @@ async fn locate(state: &AppState, run: &Running, find: Find<'_>) -> Result<Optio
         return Ok(None);
     }
     let tag = v["tag"].as_str().unwrap_or("").to_string();
-    if !matches!(tag.as_str(), "input" | "textarea" | "select" | "editable") {
-        return Ok(None);
-    }
     Ok(Some(Target {
         top: v["top"].as_str().unwrap_or("").into(),
         frame: v["frame"].as_str().unwrap_or("").into(),
@@ -481,6 +528,57 @@ async fn put(
         return Err(PAGE_CHANGED.into());
     }
     Ok(v["filled"] == true)
+}
+
+/// Click the button the agent named (a sign-in or pay button), still
+/// exactly where it was checked.
+async fn click(state: &AppState, run: &Running, r: &str, at: &Target) -> Result<()> {
+    let code = format!(
+        "async (page) => {{
+  const h = await page.locator({sel}).elementHandle({{ timeout: 3000 }}).catch(() => null);
+  if (!h) return {{ moved: true }};
+  const frame = await h.ownerFrame();
+  if (page.url() !== {top} || !frame || frame.url() !== {frame}) return {{ moved: true }};
+  return {{ clicked: await h.click({{ timeout: 5000 }}).then(() => true, () => false) }};
+}}",
+        sel = serde_json::to_string(&format!("aria-ref={r}"))?,
+        top = serde_json::to_string(&at.top)?,
+        frame = serde_json::to_string(&at.frame)?,
+    );
+    let v = state.browser.run_code(run, &code).await?;
+    if v["moved"] == true {
+        return Err(PAGE_CHANGED.into());
+    }
+    if v["clicked"] != true {
+        return Err(format!("the button {r} could not be clicked").into());
+    }
+    Ok(())
+}
+
+/// The `submit_ref` button, located (None: not given). Err: a tool result.
+async fn submit_target<'a>(
+    state: &AppState,
+    run: &Running,
+    args: &'a Value,
+    allowed: impl Fn(&Target) -> bool,
+) -> std::result::Result<Option<(&'a str, Target)>, Value> {
+    let Some(r) = args["submit_ref"]
+        .as_str()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    else {
+        return Ok(None);
+    };
+    match locate_any(state, run, Find::Ref(r)).await {
+        Ok(Some(at)) if allowed(&at) => Ok(Some((r, at))),
+        Ok(Some(_)) => Err(text(format!(
+            "not filled (the button {r} is not on the same site as the fields)"
+        ))),
+        Ok(None) => Err(text(format!(
+            "not found (no button for ref {r}; take a new browser_snapshot)"
+        ))),
+        Err(e) => Err(error(format!("not filled ({e})"))),
+    }
 }
 
 /// `scheme://host:port` of a web address (port always written).
@@ -592,6 +690,16 @@ async fn login_inner(
             )));
         }
     }
+    let button = match submit_target(state, run, args, |at| {
+        secure_url(&at.frame)
+            && credential_matches(&at.frame, &cred)
+            && credential_matches(&at.top, &cred)
+    })
+    .await
+    {
+        Ok(b) => b,
+        Err(out) => return Ok(out),
+    };
     let (cred, secret) = load(state, &ctx.user_id, &cred.id).await?;
     if targets.iter().any(|(f, _, _)| *f == "password")
         && secret
@@ -604,7 +712,7 @@ async fn login_inner(
              user to take over and fill it)",
         ));
     }
-    let submit = args["submit"] == true;
+    let submit = args["submit"] == true && button.is_none();
     let last = targets.len() - 1;
     for (i, (field, r, at)) in targets.iter().enumerate() {
         b.check_agent(ctx)?;
@@ -626,13 +734,17 @@ async fn login_inner(
         }
     }
     drop(secret);
+    if let Some((r, at)) = &button {
+        b.check_agent(ctx)?;
+        click(state, run, r, at).await?;
+    }
     let (uid, cid) = (ctx.user_id.clone(), cred.id.clone());
     let _ = state
         .db
         .call(move |c| entities::mark_credential_used(c, &uid, &cid))
         .await;
     crate::info!("browser: filled saved login {} for the agent", cred.id);
-    Ok(text(if submit {
+    Ok(text(if submit || button.is_some() {
         "filled and submitted"
     } else {
         "filled"
@@ -648,6 +760,21 @@ pub struct Approved {
     /// Origins of the frames holding the fields, as shown on the approval.
     frames: Vec<String>,
 }
+
+const MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
 
 /// The card fields `fill_saved_card` may name, with their argument.
 const CARD_FIELDS: &[(&str, &str)] = &[
@@ -882,6 +1009,16 @@ async fn card_inner(
             ));
         }
     }
+    let button = match submit_target(state, run, args, |at| {
+        full_origin(&at.top).as_deref() == Some(approved.page.as_str())
+            && full_origin(&at.frame)
+                .is_some_and(|o| o == approved.page || approved.frames.contains(&o))
+    })
+    .await
+    {
+        Ok(b) => b,
+        Err(out) => return Ok(out),
+    };
     b.check_agent(ctx)?;
     let revision = approved.card.updated_at;
     let (card, secret) = load(state, &ctx.user_id, &approved.card.id).await?;
@@ -917,14 +1054,22 @@ async fn card_inner(
         .as_i64()
         .filter(|m| (1..=12).contains(m));
     let year = card.metadata["exp_year"].as_i64().filter(|y| *y > 0);
-    let submit = args["submit"] == true;
+    let submit = args["submit"] == true && button.is_none();
     let last = targets.len() - 1;
     let mut missing = Vec::new();
     for (i, (field, r, at)) in targets.iter().enumerate() {
         b.check_agent(ctx)?;
         let values: Vec<String> = match *field {
             "exp_month" => month
-                .map(|m| vec![format!("{m:02}"), m.to_string()])
+                .map(|m| {
+                    let name = MONTHS[(m - 1) as usize];
+                    vec![
+                        format!("{m:02}"),
+                        m.to_string(),
+                        name.to_string(),
+                        name[..3].to_string(),
+                    ]
+                })
                 .unwrap_or_default(),
             "exp_year" => year
                 .map(|y| vec![y.to_string(), format!("{:02}", y % 100)])
@@ -959,6 +1104,10 @@ async fn card_inner(
         }
     }
     drop(secret);
+    if let Some((r, at)) = &button {
+        b.check_agent(ctx)?;
+        click(state, run, r, at).await?;
+    }
     let (uid, cid) = (ctx.user_id.clone(), card.id.clone());
     let _ = state
         .db

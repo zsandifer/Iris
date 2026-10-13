@@ -202,7 +202,8 @@ are fine.
   screenshot), then screenshot again to check.
 - Signing in: never type a password, card number, or code yourself, and
   never ask for one in chat. Call `fill_saved_login` with the refs of the
-  username and password fields and `submit: true`; Iris fills the user's
+  username and password fields and `submit: true` (or `submit_ref`, the
+  sign-in button's ref, when Enter does not sign in); Iris fills the user's
   saved login and you never see it (for two-step forms, call it again on the
   password step). If it answers `not found`, or the site asks for a code or a
   check, or fights automated browsers (for example X), ask the user to take
@@ -318,15 +319,16 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
             Err(e) => return error(e.to_string()),
         }
     }
-    // Saved secrets Iris filled may show on later pages (echoed into the
-    // text or a field): no pictures of those.
+    // Saved secrets may show on later pages (echoed into the text or a
+    // field): no pictures of those.
+    super::fill::remember_saved(state, &ctx.user_id).await;
     let secrets = b.filled_secrets();
     if name == "browser_take_screenshot" && !secrets.is_empty() {
         let shown = match b.run_code(&run, PAGE_TEXT_CODE).await {
             Ok(v) => v.as_str().unwrap_or("").to_string(),
             Err(e) => return error(e.to_string()),
         };
-        if crate::gateway::redact(&shown, &secrets) != shown {
+        if super::hide_secrets(&shown, &secrets) != shown {
             return error(SHOWS_SECRET);
         }
     }
@@ -367,7 +369,7 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     {
         for p in parts.iter_mut() {
             if let Some(t) = p["text"].as_str() {
-                let hidden = crate::gateway::redact(t, &secrets);
+                let hidden = super::hide_secrets(t, &secrets);
                 p["text"] = hidden.into();
             }
         }
