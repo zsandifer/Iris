@@ -595,7 +595,7 @@ details.alt p { margin: 8px 0; }
 @keyframes viewer-out { to { opacity: 0; transform: scale(.96); } }
 /* things that appear inside a screen ease in instead of popping */
 .warn, .warn-box, .feed-note, .feed-run, .rail, .empty, .rcpt-steps, .peek, .retry, .notify-card, .paused-bar,
-.att, .note, .ap-raw, .effort, .vw-bar, .live-line, .photo-error, .screen, .status, .gnote, .post-b, .md, .photo-layer img {
+.att, .note, .ap-raw, .effort, .vw-bar, .live-line, .photo-error, .screen, .status:not(.shimmer), .gnote, .post-b, .md, .photo-layer img {
   animation: appear .22s ease-out; }
 @keyframes appear { from { opacity: 0; transform: translateY(4px); } }
 .nav button, .seg button, .pills button, .send, .inp, .it, .effort button, .chk { transition: color .2s, background-color .2s, border-color .2s, box-shadow .2s; }
@@ -603,7 +603,7 @@ details.alt::details-content { opacity: 0; transition: opacity .22s, content-vis
 details.alt[open]::details-content { opacity: 1; }
 @media (prefers-reduced-motion: reduce) {
   .route, .sheet-wrap, .sheet, .toast, .story-viewer, .viewer-topic, .viewer-story, .viewer-tx, .viewer, .warn, .warn-box, .feed-note, .feed-run, .rail, .empty, .rcpt-steps, .peek, .retry,
-  .notify-card, .paused-bar, .att, .note, .ap-raw, .effort, .vw-bar, .live-line, .photo-error, .screen, .status, .gnote, .post-b, .md, .photo-layer img {
+  .notify-card, .paused-bar, .att, .note, .ap-raw, .effort, .vw-bar, .live-line, .photo-error, .screen, .status:not(.shimmer), .gnote, .post-b, .md, .photo-layer img {
     animation: none !important; }
   .viewer-heart { display: none; }
 }
