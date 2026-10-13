@@ -56,19 +56,32 @@ impl BrowserBridge {
             "initialize" => initialize_result(
                 req,
                 "browser",
-                "Iris's own web browser, which the user can watch and take over from \
-                 their phone. Saved logins and cards are filled in by Iris; you never see them.",
+                "Iris's own web browser (Playwright), which the user can watch and take over \
+                 from their phone. Saved logins and cards are filled in by Iris; you never see \
+                 them.",
             ),
             "ping" => json!({}),
-            "tools/list" => json!({"tools": crate::browser::tools::definitions()}),
+            "tools/list" => {
+                let r = crate::browser::socket::forward(
+                    &self.socket,
+                    &self.token,
+                    "tools/list",
+                    &json!({}),
+                );
+                if r["tools"].is_array() {
+                    r
+                } else {
+                    json!({"tools": []})
+                }
+            }
             "tools/call" => crate::browser::socket::forward(
                 &self.socket,
                 &self.token,
-                req["params"]["name"].as_str().unwrap_or(""),
-                &req["params"]
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
+                "tools/call",
+                &json!({
+                    "name": req["params"]["name"].as_str().unwrap_or(""),
+                    "arguments": req["params"].get("arguments").cloned().unwrap_or_else(|| json!({})),
+                }),
             ),
             "resources/list" => json!({"resources": []}),
             "prompts/list" => json!({"prompts": []}),
@@ -860,11 +873,12 @@ mod tests {
         let tools = b
             .handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
             .unwrap();
-        assert!(tools["result"]["tools"].as_array().unwrap().len() > 5);
-        // No server: a friendly tool error, not a protocol error.
+        // No server: no tools, and calls get a friendly tool error, not a
+        // protocol error.
+        assert_eq!(tools["result"]["tools"], json!([]));
         let r = b
             .handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                            "params": {"name": "snapshot", "arguments": {}}}))
+                            "params": {"name": "browser_snapshot", "arguments": {}}}))
             .unwrap();
         assert_eq!(r["result"]["isError"], true);
         assert!(

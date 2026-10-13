@@ -44,10 +44,19 @@ const IRIS_TOOLS = {
 function browserPhrase(tool, sum) {
   const h = host(sum);
   switch (tool) {
+    // Playwright's tool names, and the earlier ones in older activity.
+    case 'browser_navigate':
     case 'navigate': return h ? [`Opening ${h}`, `Opened ${h}`] : ['Opening a page', 'Opened a page'];
+    case 'fill_saved_login':
     case 'fill_login': return ['Signing you in', 'Signed you in'];
+    case 'fill_saved_card':
     case 'fill_card': return ['Filling in your card', 'Filled in your card'];
+    case 'browser_take_screenshot':
+    case 'browser_snapshot':
     case 'screenshot': return ['Looking at the page', 'Looked at the page'];
+    case 'browser_type':
+    case 'browser_fill_form':
+    case 'browser_select_option':
     case 'type': return ['Filling in a form', 'Filled in a form'];
     default: return ['Browsing the web', 'Browsed the web'];
   }

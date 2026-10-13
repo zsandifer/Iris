@@ -1,6 +1,7 @@
 //! Iris's computer: browser status, start/stop, take over / hand back, and
-//! installing Chromium from the app. Owner only. The live view and the
-//! owner's input travel over the WebSocket (`browser.watch`,
+//! installing the browser (Playwright MCP and Chromium) from the app. Owner
+//! only. The live view and the owner's input (including filling saved
+//! logins and cards) travel over the WebSocket (`browser.watch`,
 //! `browser.input`; see `ws.rs`).
 
 use super::{ApiError, ApiResult, AuthUser, JsonBody, ok};
@@ -47,7 +48,7 @@ pub fn status_json(state: &AppState) -> Value {
 /// `browser::apparmor::recovery`).
 fn sandbox_fix(state: &AppState, root: &std::path::Path) -> Value {
     use crate::browser::apparmor;
-    let browser = state.browser.executable();
+    let browser = state.browser.chromium();
     apparmor::recovery_here(
         &apparmor::Setup {
             root,
@@ -137,8 +138,8 @@ async fn navigate(
     ok(json!({"ok": true}))
 }
 
-/// Install (or update) Chromium from Playwright's official download into
-/// the engines directory.
+/// Install (or update) the browser into the engines directory: Playwright
+/// MCP from npm, then Chromium from Playwright's official download.
 async fn install(State(state): State<AppState>, user: AuthUser) -> ApiResult {
     user.require_owner()?;
     let started = crate::setup::start_op(&state, "browser", "install")?;

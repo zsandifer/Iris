@@ -1859,7 +1859,7 @@ async fn mcp_servers(
 /// Whether this turn gets the browser tools: enabled, not paused, a
 /// browser is installed (the caller requires the owner's own private chat).
 fn browser_allowed(state: &AppState) -> bool {
-    state.browser.enabled() && !state.browser.is_paused() && state.browser.executable().is_some()
+    state.browser.enabled() && !state.browser.is_paused() && state.browser.available()
 }
 
 /// Store a user message and an assistant placeholder, broadcast both, and

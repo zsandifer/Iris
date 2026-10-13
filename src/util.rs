@@ -7,6 +7,22 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub type Result<T, E = BoxError> = std::result::Result<T, E>;
 
 /// Milliseconds since the Unix epoch.
+/// Start a program, retrying briefly while its file is busy (`ETXTBSY`): a
+/// script written a moment ago can still be open in a child that another
+/// thread forked and has not yet replaced with its own program.
+pub fn spawn_retrying<T>(mut spawn: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    const ETXTBSY: i32 = 26;
+    for _ in 0..40 {
+        match spawn() {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            r => return r,
+        }
+    }
+    spawn()
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

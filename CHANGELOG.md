@@ -21,7 +21,16 @@ All notable changes to Iris are documented here, following
   Allow / Ask / Off per action and an on/off switch, enforced in the gateway.
 - Google adds Docs, Sheets, Slides, Forms, Tasks and Contacts; existing
   Google connections keep working and are asked to sign in again to add them.
-- Iris’s computer: watch its browser, take over, and fill saved logins securely.
+- Iris’s computer: watch its browser, take over, and fill saved logins and
+  cards there yourself. The browser is Microsoft’s Playwright MCP server,
+  installed and updated from the app at a release pinned after the real
+  browser test passes (CI bumps it weekly); Iris only wraps it (reviewed tools,
+  live view, take over) instead of automating Chromium itself. Sign-ins are
+  filled by Iris without the agent seeing them (`fill_saved_login`,
+  `fill_saved_card` with element refs; cards ask you every time); the agent
+  cannot read a page where a password was filled or typed until it moves on
+  (in any tab, or back in history). Sites that fight automation (like X):
+  take over and sign in yourself.
 - Iris’s own browser lives at one fixed path that `deploy/setup-engines.sh`
   approves for Chrome’s sandbox where AppArmor restricts user namespaces
   (Ubuntu 23.10+); when the sandbox cannot start, the app shows the exact

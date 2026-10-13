@@ -156,12 +156,16 @@ own personality. It is not a clone.
   invites or notifies people ask). A connection's own page adds recent
   use, its starting rules, sign-in app, and advanced settings. A
   connection a tripwire paused shows why, with Resume.
-- **Logins & wallet:** an encrypted store. The app explains that Iris can use
-  these but never sees them. Cards always ask before paying.
+- **Logins & wallet:** an encrypted store for the owner. Iris signs in with
+  saved logins in its browser without ever seeing them; cards ask the owner
+  on an approval card every time. While in control of Iris's browser, a key
+  button fills a saved login or card into the field they tapped.
 - **Iris's computer:** a live screen with Watch / Take over, recent activity,
   Pause Iris, and Disconnect everything. Watch is a dark full-screen view;
   Take over forwards taps, drags (scrolling), and typing (a keyboard button,
-  an address bar, Back) while Iris waits, until "Hand back". When there is
+  a key button for saved logins and cards, an address bar, Back) while Iris
+  waits, until "Hand back". Sites that resist automated sign-in (for example
+  X) are signed in to here by the owner. When there is
   no browser yet, the screen offers to set one up. Pause Iris stops what it
   is doing and holds chats and check-ins until turned back on.
   Trusted people manages recipients who can receive messages without another approval.

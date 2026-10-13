@@ -6,9 +6,11 @@
 //! The server then sends `{"type":"ready",...}` followed by events.
 //!
 //! The owner's app can also watch Iris's browser on the same socket:
-//! `{"type":"browser.watch","mode":"peek"|"full"|"off"}` starts or stops
-//! `browser.frame` events, and while the owner has taken over,
-//! `{"type":"browser.input",...}` sends taps, scrolls, keys, and text.
+//! `{"type":"browser.watch","mode":"peek"|"full"|"off","width":N}` starts
+//! or stops `browser.frame` events (pictures about `width` device pixels
+//! wide), and while the owner has taken over,
+//! `{"type":"browser.input",...}` sends taps, scrolls, keys, text, and
+//! fills of saved logins and cards.
 
 use super::{AuthUser, auth_from_token};
 use crate::auth;
@@ -139,6 +141,15 @@ async fn browser_input(state: &AppState, device_id: &str, ev: &Value) -> crate::
     if !device_active(state, device_id).await {
         return Err("device revoked".into());
     }
+    if ev["kind"] == "fill" {
+        return crate::browser::fill::fill(
+            state,
+            device_id,
+            ev["credential_id"].as_str().unwrap_or(""),
+            ev["field"].as_str().unwrap_or(""),
+        )
+        .await;
+    }
     state.browser.user_input(device_id, ev).await
 }
 
@@ -228,7 +239,8 @@ async fn pump(
                                 watching = crate::browser::Mode::parse(v["mode"].as_str().unwrap_or(""))
                                     .map(|mode| {
                                         // Replaces (and so ends) any earlier watch.
-                                        let (guard, rx) = state.browser.watch(mode);
+                                        let width = v["width"].as_u64().map(|w| w.min(u32::MAX as u64) as u32);
+                                        let (guard, rx) = state.browser.watch(mode, width);
                                         let mut rx = rx;
                                         rx.mark_changed();
                                         Watching { _guard: guard, rx, mode, last_sent: None, pending: false }
@@ -437,7 +449,7 @@ mod tests {
             .db
             .with(|c| crate::db::revoke_device(c, &device.user_id, &device.id))
             .unwrap();
-        for kind in ["navigate", "tap", "text", "key", "scroll"] {
+        for kind in ["navigate", "tap", "text", "key", "scroll", "fill"] {
             assert_eq!(
                 browser_input(&state, &device.id, &json!({"kind":kind}))
                     .await

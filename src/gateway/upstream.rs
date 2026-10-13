@@ -291,8 +291,7 @@ async fn serve(
     cmd.stdin(PStdio::null())
         .stdout(PStdio::null())
         .stderr(PStdio::piped());
-    let mut child = cmd
-        .spawn()
+    let mut child = crate::util::spawn_retrying(|| cmd.spawn())
         .map_err(|e| UpstreamError::Transport(format!("could not start {command}: {e}")))?;
     let stderr = Arc::new(Mutex::new(String::new()));
     keep_tail(child.stderr.take().expect("piped"), stderr.clone());
@@ -544,8 +543,7 @@ impl StdioConn {
         cmd.stdin(PStdio::piped())
             .stdout(PStdio::piped())
             .stderr(PStdio::piped());
-        let mut child = cmd
-            .spawn()
+        let mut child = crate::util::spawn_retrying(|| cmd.spawn())
             .map_err(|e| UpstreamError::Transport(format!("could not start {command}: {e}")))?;
         let pid = child.id();
         let stdin = Arc::new(tokio::sync::Mutex::new(child.stdin.take().expect("piped")));

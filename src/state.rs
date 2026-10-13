@@ -234,13 +234,9 @@ impl AppState {
                 .is_some(),
         );
         {
-            let (db, vault, history) = (
-                db.clone(),
-                vault.clone(),
-                crate::browser::fill::history_path(&paths),
-            );
+            let (db, vault) = (db.clone(), vault.clone());
             browser.set_secret_source(Arc::new(move || {
-                crate::browser::fill::load_secrets_blocking(&db, &vault, &history)
+                crate::browser::fill::saved_secrets_blocking(&db, &vault)
             }));
         }
         Ok(Self(Arc::new(Inner {

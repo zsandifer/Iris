@@ -324,7 +324,9 @@ pub fn recovery(host: &Host, setup: &Setup, meta: Meta) -> Value {
         downloads.as_ref().is_some_and(|d| p.starts_with(d))
             && !app.as_ref().is_some_and(|a| p.starts_with(a))
     };
-    let managed = engines::is_installed(setup.root, "browser");
+    // Installed by Iris as it is now (Playwright MCP with Chromium at the
+    // fixed path); older installs are offered an update.
+    let managed = engines::browser_ready(setup.root);
     let managed_moved = engines::launcher(setup.root, "browser")
         .canonicalize()
         .ok()
@@ -774,7 +776,15 @@ mod tests {
         std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
         std::fs::write(&bin, "").unwrap();
         std::fs::create_dir_all(root.join("bin")).unwrap();
-        std::os::unix::fs::symlink(&bin, root.join("bin/browser")).unwrap();
+        if old {
+            // Before Playwright MCP, the launcher was Chromium itself.
+            std::os::unix::fs::symlink(&bin, root.join("bin/browser")).unwrap();
+        } else {
+            let cli = root.join("chromium/node_modules/@playwright/mcp/cli.js");
+            std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+            std::fs::write(&cli, "").unwrap();
+            std::fs::write(root.join("bin/browser"), "#!/bin/sh\n").unwrap();
+        }
         for p in bin.ancestors().take_while(|p| p.starts_with(tmp.path())) {
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
         }

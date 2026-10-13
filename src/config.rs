@@ -56,17 +56,18 @@ impl Default for AgentConfig {
     }
 }
 
-/// Iris's own browser: a headless Chromium the agent drives through the
-/// `browser` MCP tools, with a live view in the app.
+/// Iris's own browser: a headless Chromium run by Microsoft's Playwright
+/// MCP server, whose tools the agent gets in the owner's own conversations,
+/// with a live view and take over in the app.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BrowserConfig {
     /// Offer browser tools to the agent (owner's own conversations only).
     pub enabled: bool,
-    /// Chromium or Chrome executable. Empty: the one Iris installed
-    /// (`<engines dir>/chromium/app/chrome`, the path the root setup
-    /// approves for Chrome's sandbox), then PATH (`chromium`,
-    /// `google-chrome`, ...), then Playwright's cache. Set, it always wins.
+    /// Chromium or Chrome executable for Playwright to start. Empty: the
+    /// one Iris installed (`<engines dir>/chromium/app/chrome`, the path
+    /// the root setup approves for Chrome's sandbox), else Playwright's own
+    /// download. Set, it always wins.
     pub command: String,
     /// Close the browser after this many minutes without use. Sign-ins
     /// persist in its profile.

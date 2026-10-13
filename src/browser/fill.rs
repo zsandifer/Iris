@@ -1,16 +1,26 @@
-//! Filling saved logins and wallet cards into Iris's browser.
+//! Filling saved logins and wallet cards, when the owner asks while in
+//! control of Iris's browser.
 //!
-//! The secret goes from the vault straight into the page as typed input
-//! (`Input.insertText` over the browser's private pipe). It is never put in
-//! a tool result, a message, or a log line, and the filled fields are
-//! masked on screen and in snapshots (`page.js`), so the agent cannot read
-//! it back. Logins are only filled into the site they were saved for, over
-//! HTTPS (plain HTTP only on this machine). Cards always need the owner's
-//! OK on an approval card in the chat first.
+//! The owner taps a field on the page, then picks a saved item and which
+//! of its fields to fill (`browser.input` with `kind: "fill"`). Iris types
+//! it into the focused field through the browser server. The agent never
+//! gets it: secrets travel from the vault to the page only, never into a
+//! tool result, a message, or a log, and the page is closed to the agent
+//! until it moves on. Logins are only filled into the site they were saved
+//! for (the page's real address, and never into another site's frame on
+//! it), cards and secrets only over HTTPS (plain HTTP only on this
+//! machine).
+//!
+//! The agent fills them too, without ever seeing them: `fill_saved_login`
+//! and `fill_saved_card` (Iris's own tools next to Playwright's) take the
+//! element refs of the fields, and Iris types each value into its field
+//! through Playwright on Iris's side. Logins go only into fields whose own
+//! frame is the saved site; cards only over HTTPS and only after the owner
+//! approves that use on a card in the chat. Filling a password or card
+//! details closes the page to the agent (see `private_page`) until it moves
+//! on; `submit` presses Enter in the last field so a sign-in can.
 
-use super::tools::{Output, eval, eval_mut};
 use super::{Running, TurnCtx};
-use crate::browser::Browser;
 use crate::db;
 use crate::entities::{self, Credential};
 use crate::state::AppState;
@@ -104,62 +114,6 @@ pub fn secure_enough(scheme: &str, host: &str) -> bool {
     scheme == "https" || (scheme == "http" && is_loopback(host))
 }
 
-/// The page a fill was checked against (its address was validated when
-/// the fill began): secrets go only into that tab's same document, whose
-/// origin cannot change. A new page load is a new document.
-struct Pin {
-    target: String,
-    doc: String,
-    origin: String,
-    path: String,
-}
-
-struct PageInfo {
-    url: String,
-    title: String,
-    scheme: String,
-    host: String,
-    /// The browser's own origin (scheme, host, and port).
-    origin: String,
-    doc: String,
-    path: String,
-}
-
-async fn page_info(run: &Running) -> Result<PageInfo> {
-    let info = eval(run, "info()").await?;
-    let nav = eval(run, "navigationState()").await?;
-    let url = info["url"].as_str().unwrap_or("").to_string();
-    // Display URLs are redacted and may even mask part of a port. Matching
-    // uses Chromium's origin, which is independent of that display text.
-    let origin = info["origin"].as_str().unwrap_or("").to_string();
-    let (scheme, host) = origin_of(&origin).ok_or("this page has no web address")?;
-    Ok(PageInfo {
-        title: info["title"].as_str().unwrap_or("").to_string(),
-        doc: info["doc"].as_str().unwrap_or("").to_string(),
-        origin,
-        path: nav["path"].as_str().ok_or("the page is not ready")?.into(),
-        url,
-        scheme,
-        host,
-    })
-}
-
-const PAGE_CHANGED: &str = "the page changed while filling, so I stopped";
-const TOO_SHORT: &str =
-    "the saved secret is too short to keep out of what I read; ask the user to take over";
-
-async fn credentials(state: &AppState, user_id: &str, kind: &'static str) -> Vec<Credential> {
-    let uid = user_id.to_string();
-    state
-        .db
-        .call(move |c| entities::list_credentials(c, &uid))
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|c| c.kind == kind)
-        .collect()
-}
-
 /// A credential's metadata and decrypted secret, read together.
 async fn load(
     state: &AppState,
@@ -183,100 +137,154 @@ async fn load(
     Ok((cred, serde_json::from_slice(&plain).unwrap_or_default()))
 }
 
-/// Fill the field `r` with `text`, in one step bound to that element (see
-/// `fillField` in page.js). Returns false if the field is not usable, and an
-/// error if the page changed, the turn ended, or the owner took over:
-/// nothing is filled then. Secrets are masked first and remembered for
-/// redaction.
-async fn type_into(
-    state: &AppState,
-    ctx: &TurnCtx,
-    run: &Running,
-    pin: &Pin,
-    r: &str,
-    text: &str,
-    secret: bool,
-) -> Result<bool> {
-    if run.page().target_id != pin.target {
-        return Err(PAGE_CHANGED.into());
-    }
-    let b = &state.browser;
-    if secret {
-        if text.chars().count() < super::MIN_SECRET {
-            return Err(TOO_SHORT.into());
+/// The value of one field of a saved item, and whether it is private
+/// (closes the page to the agent).
+fn value_of(
+    cred: &Credential,
+    secret: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<(String, bool)> {
+    let s = |k: &str| {
+        secret
+            .get(k)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(String::from)
+    };
+    let m = |k: &str| {
+        cred.metadata[k]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .map(String::from)
+    };
+    let (value, private) = match (cred.kind.as_str(), field) {
+        ("login", "username") => (m("username"), false),
+        ("login", "password") => (s("password"), true),
+        ("card", "number") => (s("number"), true),
+        ("card", "cvc") => (s("cvc"), true),
+        ("card", "exp") => (expiry(&cred.metadata), true),
+        ("card", "name") => (m("cardholder"), false),
+        _ => return Err("that can't be filled".into()),
+    };
+    value
+        .map(|v| (v, private))
+        .ok_or_else(|| "that isn't saved for this item".into())
+}
+
+/// What to fill for one field of a saved item: candidates (the first the
+/// field takes; a month as 04, 4, or its name, a year as 2031 or 31), and
+/// whether it is private.
+fn field_values(
+    cred: &Credential,
+    secret: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<(Vec<String>, bool)> {
+    let month = cred.metadata["exp_month"]
+        .as_i64()
+        .filter(|m| (1..=12).contains(m));
+    let year = cred.metadata["exp_year"].as_i64().filter(|y| *y > 0);
+    let missing = || -> crate::util::BoxError { "that isn't saved for this item".into() };
+    match (cred.kind.as_str(), field) {
+        ("card", "exp_month") => {
+            let m = month.ok_or_else(missing)?;
+            let name = MONTHS[(m - 1) as usize];
+            Ok((
+                vec![
+                    format!("{m:02}"),
+                    m.to_string(),
+                    name.to_string(),
+                    name[..3].to_string(),
+                ],
+                true,
+            ))
         }
-        // Recorded (on disk, encrypted where secret) before the page gets
-        // it, or not filled at all: redaction and the screenshot block
-        // must survive restarts.
-        run.remember_secret(text);
-        save_history(state, run)?;
-        b.taint_origin(&pin.origin)?;
+        ("card", "exp_year") => {
+            let y = year.ok_or_else(missing)?;
+            Ok((vec![y.to_string(), format!("{:02}", y % 100)], true))
+        }
+        _ => value_of(cred, secret, field).map(|(v, p)| (vec![v], p)),
     }
-    // Any vault fill taints this document, including a username-only
-    // sign-in step. Actions can continue, but agent reads must wait for
-    // an explicit action loads a different path, or the owner acts. Record
-    // both document and tab before the page sees the value.
-    run.remember_secret_doc(&pin.doc);
-    run.taint_tab(&pin.target, &pin.doc, &pin.path);
-    // Checked again right before the single command that fills.
-    let p = eval_mut(
-        run,
-        b,
-        ctx,
-        &format!(
-            "fillField({}, {}, {secret}, {})",
-            json!(r),
-            json!(text),
-            json!(pin.doc)
-        ),
+}
+
+/// A card's expiry as MM/YY.
+fn expiry(meta: &Value) -> Option<String> {
+    let month = meta["exp_month"]
+        .as_i64()
+        .filter(|m| (1..=12).contains(m))?;
+    let year = meta["exp_year"].as_i64().filter(|y| *y > 0)?;
+    Some(format!("{month:02}/{:02}", year % 100))
+}
+
+/// Fill one field of a saved login or card into the focused field, for
+/// the owner in control from `device_id`.
+pub async fn fill(
+    state: &AppState,
+    device_id: &str,
+    credential_id: &str,
+    field: &str,
+) -> Result<()> {
+    let user_id = state.browser.controller(device_id)?;
+    let (cred, secret) = load(state, &user_id, credential_id).await?;
+    let (values, private) = field_values(&cred, &secret, field)?;
+    let site = cred.metadata["site"].as_str().unwrap_or("");
+    let (run, _op) = state.browser.owner_input(device_id).await?;
+    state.browser.forget_field_check();
+    // The focused element itself is filled (whatever it held is replaced),
+    // in the frame it was checked in: focus moving meanwhile stops it.
+    let Some(at) = locate(state, &run, Find::Focused).await? else {
+        return Err("Tap the field to fill first.".into());
+    };
+    if !secure_url(&at.top) || !secure_url(&at.frame) {
+        return Err("I only fill saved details into secure (https) pages.".into());
+    }
+    if cred.kind == "login" {
+        if !credential_matches(&at.top, &cred) {
+            return Err(format!("This login is saved for {site}, not this page.").into());
+        }
+        // The page's address says nothing about a frame from another site
+        // (an ad, a widget) that has focus.
+        if !credential_matches(&at.frame, &cred) {
+            return Err(format!(
+                "That field belongs to another site inside this page, so I won't fill your \
+                 {site} login there."
+            )
+            .into());
+        }
+    }
+    state.browser.controller(device_id)?;
+    if !put(
+        state,
+        &run,
+        Find::Focused,
+        &at,
+        field,
+        &values,
+        private,
+        false,
     )
-    .await?;
-    if p["changed"] == true {
-        return Err(PAGE_CHANGED.into());
+    .await?
+    {
+        return Err("That field can't be filled.".into());
     }
-    Ok(p["ok"] == true)
+    drop(secret);
+    let (uid, cid) = (user_id, cred.id.clone());
+    let _ = state
+        .db
+        .call(move |c| entities::mark_credential_used(c, &uid, &cid))
+        .await;
+    crate::info!("browser: the owner filled a saved {} field", cred.kind);
+    Ok(())
 }
 
-/// Pick a dropdown option (not secret), on the pinned page only.
-async fn choose(
-    b: &Browser,
-    ctx: &TurnCtx,
-    run: &Running,
-    pin: &Pin,
-    r: &str,
-    options: Value,
-) -> Result<bool> {
-    if run.page().target_id != pin.target {
-        return Err(PAGE_CHANGED.into());
-    }
-    let info = eval(run, "info()").await?;
-    if info["doc"].as_str() != Some(pin.doc.as_str()) {
-        return Err(PAGE_CHANGED.into());
-    }
-    let r = eval_mut(run, b, ctx, &format!("choose({}, {options})", json!(r))).await?;
-    Ok(r["ok"] == true)
-}
+// ------------------------------------------------------- agent fills
 
-fn not_found_for(e: crate::util::BoxError) -> Result<Output> {
-    let msg = e.to_string();
-    if msg == PAGE_CHANGED || msg == TOO_SHORT {
-        Ok(Output::text(format!("not found ({msg})")))
-    } else {
-        Err(e)
-    }
-}
-
-/// Every secret the redactor must know: the owner's saved passwords,
-/// card numbers, and CVCs, and the encrypted history of every secret ever
-/// filled (so edited or deleted ones too). Blocking. An unreadable history
-/// is an error: the browser then stays off rather than read pages blind.
-pub fn load_secrets_blocking(
-    db: &crate::db::Db,
-    vault: &crate::secrets::Vault,
-    history: &std::path::Path,
-) -> Result<Vec<String>> {
-    let rows = db.with(|c| {
-        let Some(owner) = db::owner_user_id(c)? else {
+/// The owner's saved passwords and card numbers (not short codes, which
+/// would hide too much), read from the vault when the browser starts: a
+/// page can never show them to the agent, also ones a site kept from an
+/// earlier visit.
+pub fn saved_secrets_blocking(db: &crate::db::Db, vault: &crate::secrets::Vault) -> Vec<String> {
+    let records = db.with(|c| {
+        let Some(owner) = crate::db::owner_user_id(c)? else {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
@@ -286,145 +294,116 @@ pub fn load_secrets_blocking(
             }
         }
         Ok(out)
-    })?;
+    });
     let mut secrets = Vec::new();
-    for (id, ct) in rows {
-        let plain = vault.decrypt(&ct, &id)?;
+    for (id, ct) in records.unwrap_or_default() {
+        let Ok(plain) = vault.decrypt(&ct, &id) else {
+            continue;
+        };
         let fields: serde_json::Map<String, Value> =
             serde_json::from_slice(&plain).unwrap_or_default();
-        // CVCs too: a page may show one it kept, even after a restart (the
-        // cost is that the same three digits elsewhere are hidden as well).
-        for k in ["password", "number", "cvc"] {
-            if let Some(v) = fields.get(k).and_then(Value::as_str) {
+        for k in ["password", "number"] {
+            if let Some(v) = fields.get(k).and_then(Value::as_str)
+                && v.chars().count() >= MIN_HIDDEN
+                && !secrets.iter().any(|s| s == v)
+            {
                 secrets.push(v.to_string());
             }
         }
     }
-    match std::fs::read(history) {
-        Ok(ct) => {
-            let plain = vault.decrypt(&ct, HISTORY_AAD)?;
-            let list: Vec<String> = serde_json::from_slice(&plain)?;
-            secrets.extend(list);
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
-    Ok(secrets)
+    secrets
 }
 
-/// File of the encrypted history (see `load_secrets_blocking`).
-pub fn history_path(paths: &crate::config::Paths) -> std::path::PathBuf {
-    paths.browser_dir().join("redaction.enc")
+/// Iris's own tools for the agent, listed after Playwright's.
+pub fn definitions() -> Vec<Value> {
+    let r = |d: &str| json!({"type": "string", "description": d});
+    vec![
+        json!({
+            "name": "fill_saved_login",
+            "description": "Sign in with the user's saved login for this site. Give the refs \
+                (from browser_snapshot) of the username and/or password fields; Iris types the \
+                saved values in itself and you never see them. Set `submit` to press Enter in \
+                the last field filled, or `submit_ref` to click the sign-in button. After a \
+                password is filled you cannot read the page until it moves on, so usually \
+                submit. Answers `filled`, or `not found (...)`.",
+            "inputSchema": {"type": "object", "properties": {
+                "username_ref": r("Ref of the username or email field"),
+                "password_ref": r("Ref of the password field"),
+                "login": r("Which saved login, by its name or username (only if several are saved for this site)"),
+                "submit": {"type": "boolean", "description": "Press Enter after filling to sign in"},
+                "submit_ref": r("Ref of the sign-in button to click after filling (instead of Enter)"),
+            }},
+        }),
+        json!({
+            "name": "fill_saved_card",
+            "description": "Fill the payment form with a card from the user's wallet. The user \
+                approves every use first (a card in the chat; tell them you are waiting for \
+                their OK). Give the refs (from browser_snapshot) of the fields the form has; \
+                Iris types the card in itself and you never see it. After filling you cannot \
+                read the page until it moves on. Answers `filled`, `denied`, `not filled \
+                (...)`, or `not found (...)`.",
+            "inputSchema": {"type": "object", "properties": {
+                "number_ref": r("Ref of the card number field"),
+                "exp_ref": r("Ref of a single expiry field (MM/YY)"),
+                "exp_month_ref": r("Ref of a separate expiry month field or list"),
+                "exp_year_ref": r("Ref of a separate expiry year field or list"),
+                "cvc_ref": r("Ref of the security code (CVC) field"),
+                "name_ref": r("Ref of the name on card field"),
+                "card": r("Which card, by its name or last 4 digits (only if several are saved)"),
+                "submit": {"type": "boolean", "description": "Press Enter in the last field after filling"},
+                "submit_ref": r("Ref of the pay button to click after filling (instead of Enter)"),
+            }, "required": ["number_ref"]},
+        }),
+    ]
 }
 
-pub const HISTORY_AAD: &str = "browser-redaction-history";
+pub const TOOLS: &[&str] = &["fill_saved_login", "fill_saved_card"];
 
-fn history_file(state: &AppState) -> std::path::PathBuf {
-    history_path(&state.paths)
+fn text(t: impl Into<String>) -> Value {
+    json!({"content": [{"type": "text", "text": t.into()}]})
 }
 
-/// Every secret Iris ever filled (also ones since edited or deleted),
-/// encrypted with the vault: pages may show them in later sessions.
-fn save_history(state: &AppState, run: &Running) -> Result<()> {
-    let body = serde_json::to_vec(&run.originals())?;
-    let ct = state.vault.encrypt(&body, HISTORY_AAD)?;
-    let file = history_file(state);
-    if let Some(dir) = file.parent() {
-        crate::config::ensure_private_dir(dir)?;
-    }
-    crate::config::write_private_file(&file, &ct)
+fn error(t: impl Into<String>) -> Value {
+    json!({"content": [{"type": "text", "text": t.into()}], "isError": true})
 }
 
-/// `fill_login`: answers "filled" or "not found (...)".
-pub async fn login(
-    state: &AppState,
-    ctx: &TurnCtx,
-    run: &Running,
-    site: Option<&str>,
-) -> Result<Output> {
-    let page = page_info(run).await?;
-    let pinned_target = run.page().target_id;
-    let host = page.host.clone();
-    if let Some(want) = site.filter(|s| !s.trim().is_empty()) {
-        match site_matches(&page.origin, want, false) {
-            true => {}
-            _ => {
-                return Ok(Output::text(
-                    "not found (the current page is not that site; open its sign-in page first)",
-                ));
-            }
-        }
-    }
-    if !secure_enough(&page.scheme, &host) {
-        return Ok(Output::text(
-            "not found (this page is not secure, so saved logins are not filled here)",
-        ));
-    }
-    let mut matches: Vec<Credential> = credentials(state, &ctx.user_id, "login")
-        .await
-        .into_iter()
-        .filter(|c| credential_matches(&page.origin, c))
-        .collect();
-    matches.sort_by_key(|c| std::cmp::Reverse(c.last_used_at.unwrap_or(c.updated_at)));
-    let Some(cred) = matches.into_iter().next() else {
-        return Ok(Output::text("not found (no saved login for this site)"));
-    };
-    // The site check uses the very revision whose password is filled.
-    let (cred, secret) = load(state, &ctx.user_id, &cred.id).await?;
-    if !credential_matches(&page.origin, &cred) {
-        return Ok(Output::text("not found (no saved login for this site)"));
-    }
-    let pin = Pin {
-        target: pinned_target,
-        doc: page.doc,
-        origin: page.origin,
-        path: page.path,
-    };
-    let fields = eval(run, "loginFields()").await?;
-    let (user_ref, pass_ref) = (fields["user"].as_str(), fields["pass"].as_str());
-    let username = cred.metadata["username"].as_str().unwrap_or("").to_string();
-    let password = secret
-        .get("password")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    drop(secret);
-    let mut filled = false;
-    if let Some(r) = user_ref
-        && !username.is_empty()
-    {
-        match type_into(state, ctx, run, &pin, r, &username, false).await {
-            Ok(f) => filled |= f,
-            Err(e) => return not_found_for(e),
-        }
-    }
-    if let Some(r) = pass_ref {
-        // A password box is there: the sign-in is only filled if it is.
-        let ok = !password.is_empty()
-            && match type_into(state, ctx, run, &pin, r, &password, true).await {
-                Ok(f) => f,
-                Err(e) => return not_found_for(e),
-            };
-        if !ok {
-            return Ok(Output::text(if password.is_empty() {
-                "not found (no password is saved for this site)"
-            } else {
-                "not found (the password field would not take it; ask the user to take over)"
-            }));
-        }
-        filled = true;
-    }
-    drop(password);
-    if !filled {
-        return Ok(Output::text("not found (no sign-in field on this page)"));
-    }
-    let (uid, cid) = (ctx.user_id.clone(), cred.id.clone());
-    let _ = state
+/// A Playwright element ref (`e12`, or `f1e12` inside a frame).
+fn valid_ref(r: &str) -> bool {
+    let r = r.strip_prefix('f').map_or(Some(r), |rest| {
+        let n = rest.find('e')?;
+        (n > 0 && rest[..n].bytes().all(|b| b.is_ascii_digit())).then(|| &rest[n..])
+    });
+    r.and_then(|r| r.strip_prefix('e'))
+        .is_some_and(|n| !n.is_empty() && n.len() <= 9 && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+async fn credentials(state: &AppState, user_id: &str, kind: &'static str) -> Vec<Credential> {
+    let uid = user_id.to_string();
+    state
         .db
-        .call(move |c| entities::mark_credential_used(c, &uid, &cid))
-        .await;
-    crate::info!("browser: filled saved login {}", cred.id);
-    Ok(Output::text("filled"))
+        .call(move |c| entities::list_credentials(c, &uid))
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.kind == kind)
+        .collect()
+}
+
+/// One saved item of several, by the agent's hint (`None`: the only one).
+fn choose<'a>(
+    items: &'a [Credential],
+    hint: Option<&str>,
+    matches: impl Fn(&Credential, &str) -> bool,
+) -> std::result::Result<&'a Credential, Vec<&'a Credential>> {
+    let hint = hint.map(str::trim).filter(|h| !h.is_empty());
+    let chosen: Vec<&Credential> = match hint {
+        Some(h) => items.iter().filter(|c| matches(c, h)).collect(),
+        None => items.iter().collect(),
+    };
+    match chosen.as_slice() {
+        [one] => Ok(*one),
+        _ => Err(chosen),
+    }
 }
 
 fn card_name(c: &Credential) -> String {
@@ -437,6 +416,496 @@ fn card_name(c: &Credential) -> String {
         "{b} ending {}",
         c.metadata["last4"].as_str().unwrap_or("????")
     )
+}
+
+/// Where a field is: the page's and the field's own frame's real
+/// addresses (from Playwright's Node side), and what kind of element.
+#[derive(Debug, Clone)]
+struct Target {
+    top: String,
+    frame: String,
+    /// `input`, `textarea`, `select`, or `editable`.
+    tag: String,
+    /// An input's type (`password`, `text`, `email`, ...).
+    kind: String,
+}
+
+/// Which field: by the agent's element ref, or the one the owner focused.
+#[derive(Clone, Copy)]
+enum Find<'a> {
+    Ref(&'a str),
+    Focused,
+}
+
+/// A secret too short to hide reliably from what the agent reads.
+const MIN_HIDDEN: usize = 4;
+
+/// Iris's fixed Playwright code for one field: find it; with `fill`
+/// (candidate values: the first that fits the field), check it is still
+/// exactly where it was checked (`Target`), mark the page private, fill
+/// the element itself (replacing what it held), and press Enter. The
+/// values travel to Playwright only, inside this code; the result never
+/// contains them.
+fn field_code(
+    find: Find,
+    fill: Option<(&Target, &[String], bool, bool)>,
+) -> std::result::Result<String, serde_json::Error> {
+    let locate = match find {
+        Find::Ref(r) => format!(
+            "const h = await page.locator({}).elementHandle({{ timeout: 3000 }}).catch(() => null);
+  if (!h) return {{ found: false }};
+  const frame = await h.ownerFrame();",
+            serde_json::to_string(&format!("aria-ref={r}"))?
+        ),
+        // The deepest frame whose document has focus on a field (frames of
+        // other sites included: Playwright reaches them from Node).
+        Find::Focused => "let h = null, frame = null;
+  for (const f of page.frames()) {
+    const c = await f.evaluateHandle(() => {
+      let e = document.hasFocus() ? document.activeElement : null;
+      while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
+      return e && !['IFRAME', 'FRAME', 'BODY', 'HTML'].includes(e.tagName) ? e : null;
+    }).catch(() => null);
+    const el = c && c.asElement();
+    if (el) { h = el; frame = f; }
+  }
+  if (!h) return { found: false };"
+            .to_string(),
+    };
+    let find = format!(
+        "{locate}
+  const info = {{ found: true, top: page.url(), frame: frame ? frame.url() : '',
+    ...(await h.evaluate((e) => ({{
+      tag: e.isContentEditable ? 'editable' : e.tagName.toLowerCase(),
+      kind: (e.type || '').toLowerCase(),
+    }}))) }};"
+    );
+    let Some((at, values, mark, submit)) = fill else {
+        return Ok(format!("async (page) => {{\n  {find}\n  return info;\n}}"));
+    };
+    Ok(format!(
+        "async (page) => {{
+  {find}
+  if (info.top !== {top} || info.frame !== {frame} || info.tag !== {tag} || info.kind !== {kind}) return {{ moved: true }};
+  if ({mark}) await page.evaluate({mark_js});
+  const values = {values};
+  let filled = false;
+  if (info.tag === 'select') {{
+    // The option is picked from the list itself (selecting one that is not
+    // there would wait for it): by value, label, number, or a word of the
+    // label (\"04 - April\").
+    const opts = await h.evaluate((e) => Array.from(e.options, (o) => ({{ value: o.value, label: (o.label || o.textContent || '').trim() }})));
+    const norm = (x) => String(x).trim().toLowerCase();
+    const num = (x) => (/^\\d+$/.test(norm(x)) ? Number(norm(x)) : NaN);
+    const words = (x) => norm(x).split(/[^a-z0-9]+/).filter(Boolean);
+    // What people read wins over internal values (months may be valued
+    // 0 to 11): labels first, for every candidate, then values.
+    const matchers = [
+      (o, v) => norm(o.label) === norm(v),
+      (o, v) => words(o.label).includes(norm(v)),
+      (o, v) => !Number.isNaN(num(v)) && num(o.label) === num(v),
+      (o, v) => o.value === v,
+      (o, v) => !Number.isNaN(num(v)) && num(o.value) === num(v),
+    ];
+    let pick = null;
+    for (const m of matchers) {{
+      for (const v of values) {{
+        pick = opts.find((o) => m(o, v));
+        if (pick) break;
+      }}
+      if (pick) break;
+    }}
+    if (pick) filled = await h.selectOption({{ value: pick.value }}, {{ timeout: 5000 }}).then(() => true, () => false);
+  }} else {{
+    // Several forms (a year as 2031 or 31): what the field says it takes.
+    const hint = await h.evaluate((e) => [e.placeholder, e.getAttribute('aria-label'), e.name, e.id,
+      e.pattern, ...Array.from(e.labels || [], (l) => l.textContent)].filter(Boolean).join(' ').toLowerCase());
+    const max = await h.evaluate((e) => (e.maxLength > 0 ? e.maxLength : 0));
+    const short = !/yyyy|\\{{4\\}}/.test(hint) && /yy|\\{{2\\}}/.test(hint);
+    const fits = values.filter((v) => !max || v.length <= max);
+    const pick = fits.length ? fits : values;
+    const v = short ? pick.reduce((a, b) => (b.length < a.length ? b : a)) : pick[0];
+    filled = await h.fill(v, {{ timeout: 5000 }}).then(() => true, () => false);
+  }}
+  if (filled && {submit}) await h.press('Enter', {{ timeout: 5000 }}).catch(() => {{}});
+  return {{ filled }};
+}}",
+        top = serde_json::to_string(&at.top)?,
+        frame = serde_json::to_string(&at.frame)?,
+        tag = serde_json::to_string(&at.tag)?,
+        kind = serde_json::to_string(&at.kind)?,
+        mark_js = serde_json::to_string(super::MARK_JS)?,
+        values = serde_json::to_string(values)?,
+    ))
+}
+
+/// A form field (`locate_any`: any element, for a button).
+async fn locate(state: &AppState, run: &Running, find: Find<'_>) -> Result<Option<Target>> {
+    Ok(locate_any(state, run, find).await?.filter(|at| {
+        matches!(
+            at.tag.as_str(),
+            "input" | "textarea" | "select" | "editable"
+        )
+    }))
+}
+
+async fn locate_any(state: &AppState, run: &Running, find: Find<'_>) -> Result<Option<Target>> {
+    if let Find::Ref(r) = find
+        && !valid_ref(r)
+    {
+        return Ok(None);
+    }
+    let v = state
+        .browser
+        .run_code(run, &field_code(find, None)?)
+        .await?;
+    if v["found"] != true {
+        return Ok(None);
+    }
+    let tag = v["tag"].as_str().unwrap_or("").to_string();
+    Ok(Some(Target {
+        top: v["top"].as_str().unwrap_or("").into(),
+        frame: v["frame"].as_str().unwrap_or("").into(),
+        tag,
+        kind: v["kind"].as_str().unwrap_or("").into(),
+    }))
+}
+
+/// Fill `values` (candidates) into a located field of the saved item's
+/// `field`. Whether it was filled. A private value closes the page to the
+/// agent first; a secret one (a password, card number, or code; not an
+/// expiry, which ordinary pages show) is also hidden from everything the
+/// agent reads afterwards.
+#[allow(clippy::too_many_arguments)]
+async fn put(
+    state: &AppState,
+    run: &Running,
+    find: Find<'_>,
+    at: &Target,
+    field: &str,
+    values: &[String],
+    private: bool,
+    submit: bool,
+) -> Result<bool> {
+    if private {
+        state.browser.remember_private(&at.top);
+    }
+    if matches!(field, "password" | "number" | "cvc") {
+        for v in values {
+            state.browser.remember_secret(v);
+        }
+    }
+    let code = field_code(find, Some((at, values, private, submit)))?;
+    let v = state.browser.run_code(run, &code).await?;
+    if v["moved"] == true {
+        return Err(PAGE_CHANGED.into());
+    }
+    Ok(v["filled"] == true)
+}
+
+/// Click the button the agent named (a sign-in or pay button), still
+/// exactly where it was checked.
+async fn click(state: &AppState, run: &Running, r: &str, at: &Target) -> Result<()> {
+    act_on(state, run, r, at, "h.click({ timeout: 5000 })").await
+}
+
+/// Press Enter in a field Iris filled (to submit its form), still exactly
+/// where it was checked.
+async fn press_enter(state: &AppState, run: &Running, r: &str, at: &Target) -> Result<()> {
+    act_on(state, run, r, at, "h.press('Enter', { timeout: 5000 })").await
+}
+
+async fn act_on(state: &AppState, run: &Running, r: &str, at: &Target, action: &str) -> Result<()> {
+    let code = format!(
+        "async (page) => {{
+  const h = await page.locator({sel}).elementHandle({{ timeout: 3000 }}).catch(() => null);
+  if (!h) return {{ moved: true }};
+  const frame = await h.ownerFrame();
+  if (page.url() !== {top} || !frame || frame.url() !== {frame}) return {{ moved: true }};
+  return {{ clicked: await {action}.then(() => true, () => false) }};
+}}",
+        sel = serde_json::to_string(&format!("aria-ref={r}"))?,
+        top = serde_json::to_string(&at.top)?,
+        frame = serde_json::to_string(&at.frame)?,
+    );
+    let v = state.browser.run_code(run, &code).await?;
+    if v["moved"] == true {
+        return Err(PAGE_CHANGED.into());
+    }
+    if v["clicked"] != true {
+        return Err(format!("{r} could not be used to send the form").into());
+    }
+    Ok(())
+}
+
+/// The `submit_ref` button, located (None: not given). Err: a tool result.
+async fn submit_target<'a>(
+    state: &AppState,
+    run: &Running,
+    args: &'a Value,
+    allowed: impl Fn(&Target) -> bool,
+) -> std::result::Result<Option<(&'a str, Target)>, Value> {
+    let Some(r) = args["submit_ref"]
+        .as_str()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    else {
+        return Ok(None);
+    };
+    match locate_any(state, run, Find::Ref(r)).await {
+        Ok(Some(at)) if allowed(&at) => Ok(Some((r, at))),
+        Ok(Some(_)) => Err(text(format!(
+            "not filled (the button {r} is not on the same site as the fields)"
+        ))),
+        Ok(None) => Err(text(format!(
+            "not found (no button for ref {r}; take a new browser_snapshot)"
+        ))),
+        Err(e) => Err(error(format!("not filled ({e})"))),
+    }
+}
+
+/// `scheme://host:port` of a web address (port always written).
+fn full_origin(url: &str) -> Option<String> {
+    if !url.contains("://") {
+        return None;
+    }
+    let (scheme, host, port) = login_origin(url)?;
+    Some(format!("{scheme}://{host}:{port}"))
+}
+
+fn secure_url(url: &str) -> bool {
+    origin_of(url).is_some_and(|(s, h)| secure_enough(&s, &h))
+}
+
+/// Where a saved login may go: the field's own frame and the page are the
+/// saved site, over HTTPS (HTTP only on this machine), and a password only
+/// into a password field (a page could echo any other field into its
+/// address).
+fn login_target_ok(cred: &Credential, field: &str, at: &Target) -> bool {
+    let kind_ok = match field {
+        "password" => at.tag == "input" && at.kind == "password",
+        _ => matches!(at.tag.as_str(), "input" | "editable") && at.kind != "password",
+    };
+    kind_ok
+        && secure_url(&at.frame)
+        && credential_matches(&at.frame, cred)
+        && credential_matches(&at.top, cred)
+}
+
+const PAGE_CHANGED: &str = "the page changed while filling, so I stopped";
+
+/// `fill_saved_login`.
+pub async fn agent_login(state: &AppState, ctx: &TurnCtx, run: &Running, args: &Value) -> Value {
+    match login_inner(state, ctx, run, args).await {
+        Ok(v) => v,
+        Err(e) => error(format!("not filled ({e})")),
+    }
+}
+
+async fn login_inner(
+    state: &AppState,
+    ctx: &TurnCtx,
+    run: &Running,
+    args: &Value,
+) -> Result<Value> {
+    let b = &state.browser;
+    let refs: Vec<(&str, &str)> = [("username", "username_ref"), ("password", "password_ref")]
+        .iter()
+        .filter_map(|(f, k)| args[*k].as_str().map(|r| (*f, r.trim())))
+        .filter(|(_, r)| !r.is_empty())
+        .collect();
+    if refs.is_empty() {
+        return Ok(error(
+            "Give username_ref and/or password_ref from browser_snapshot.",
+        ));
+    }
+    // Every field first, so nothing is typed into a form that is not all
+    // the saved site's.
+    let mut targets = Vec::new();
+    for (field, r) in &refs {
+        let Some(at) = locate(state, run, Find::Ref(r)).await? else {
+            return Ok(text(format!(
+                "not found (no field for ref {r}; take a new browser_snapshot)"
+            )));
+        };
+        targets.push((*field, *r, at));
+    }
+    let page = targets[0].2.top.clone();
+    let logins: Vec<Credential> = credentials(state, &ctx.user_id, "login")
+        .await
+        .into_iter()
+        .filter(|c| credential_matches(&page, c))
+        .collect();
+    let cred = match choose(&logins, args["login"].as_str(), |c, h| {
+        let h = h.to_lowercase();
+        c.label.to_lowercase().contains(&h)
+            || c.metadata["username"]
+                .as_str()
+                .is_some_and(|u| u.to_lowercase() == h)
+    }) {
+        Ok(c) => c.clone(),
+        Err(many) if many.is_empty() => {
+            return Ok(text(
+                "not found (no saved login for this site; ask the user to add it in Logins & \
+                 wallet, or to take over the browser and sign in)",
+            ));
+        }
+        Err(many) => {
+            let names: Vec<String> = many.iter().map(|c| format!("\"{}\"", c.label)).collect();
+            return Ok(error(format!(
+                "Several logins are saved for this site: {}. Call fill_saved_login again with \
+                 `login` set to one of them.",
+                names.join(", ")
+            )));
+        }
+    };
+    // Checked against the credential as loaded with its secret (an edit of
+    // its site between the two reads must not widen where it goes).
+    let (cred, secret) = load(state, &ctx.user_id, &cred.id).await?;
+    for (field, r, at) in &targets {
+        if !login_target_ok(&cred, field, at) {
+            return Ok(text(format!(
+                "not filled (ref {r} is not a {} field on {} over a secure connection, so I \
+                 won't fill the login there)",
+                if *field == "password" {
+                    "password"
+                } else {
+                    "username"
+                },
+                cred.metadata["site"].as_str().unwrap_or("the saved site")
+            )));
+        }
+    }
+    let button = match submit_target(state, run, args, |at| {
+        secure_url(&at.frame)
+            && credential_matches(&at.frame, &cred)
+            && credential_matches(&at.top, &cred)
+    })
+    .await
+    {
+        Ok(b) => b,
+        Err(out) => return Ok(out),
+    };
+    if targets.iter().any(|(f, _, _)| *f == "password")
+        && secret
+            .get("password")
+            .and_then(Value::as_str)
+            .is_some_and(|p| p.chars().count() < MIN_HIDDEN)
+    {
+        return Ok(text(
+            "not filled (this saved password is too short to keep out of what I read; ask the \
+             user to take over and fill it)",
+        ));
+    }
+    let submit = args["submit"] == true && button.is_none();
+    let last = targets.len() - 1;
+    for (i, (field, r, at)) in targets.iter().enumerate() {
+        b.check_agent(ctx)?;
+        let (value, private) = value_of(&cred, &secret, field)?;
+        if !put(
+            state,
+            run,
+            Find::Ref(r),
+            at,
+            field,
+            &[value],
+            private,
+            submit && i == last,
+        )
+        .await?
+        {
+            return Ok(text(format!(
+                "not filled (the {field} field {r} could not be filled)"
+            )));
+        }
+    }
+    drop(secret);
+    if let Some((r, at)) = &button {
+        b.check_agent(ctx)?;
+        click(state, run, r, at).await?;
+    }
+    let (uid, cid) = (ctx.user_id.clone(), cred.id.clone());
+    let _ = state
+        .db
+        .call(move |c| entities::mark_credential_used(c, &uid, &cid))
+        .await;
+    crate::info!("browser: filled saved login {} for the agent", cred.id);
+    Ok(text(if submit || button.is_some() {
+        "filled and submitted"
+    } else {
+        "filled"
+    }))
+}
+
+/// A card the owner approved for this page and these receiving frames.
+pub struct Approved {
+    card: Credential,
+    message_id: String,
+    /// The page's origin (`scheme://host:port`).
+    page: String,
+    /// Origins of the frames holding the fields, as shown on the approval.
+    frames: Vec<String>,
+}
+
+const MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// The card fields `fill_saved_card` may name, with their argument.
+const CARD_FIELDS: &[(&str, &str)] = &[
+    ("number", "number_ref"),
+    ("exp", "exp_ref"),
+    ("exp_month", "exp_month_ref"),
+    ("exp_year", "exp_year_ref"),
+    ("cvc", "cvc_ref"),
+    ("name", "name_ref"),
+];
+
+/// The fields the agent named: located, all over HTTPS. A tool result
+/// instead when one is missing or not secure.
+async fn card_targets<'a>(
+    state: &AppState,
+    run: &Running,
+    args: &'a Value,
+) -> std::result::Result<Vec<(&'static str, &'a str, Target)>, Value> {
+    let mut targets = Vec::new();
+    for (field, key) in CARD_FIELDS {
+        let Some(r) = args[*key].as_str().map(str::trim).filter(|r| !r.is_empty()) else {
+            continue;
+        };
+        let at = match locate(state, run, Find::Ref(r)).await {
+            Ok(Some(at)) => at,
+            Ok(None) => {
+                return Err(text(format!(
+                    "not found (no field for ref {r}; take a new browser_snapshot and call \
+                     fill_saved_card again)"
+                )));
+            }
+            Err(e) => return Err(error(format!("not filled ({e})"))),
+        };
+        if !secure_url(&at.top) || !secure_url(&at.frame) {
+            return Err(text(
+                "not found (this page or one of its fields is not secure, so cards are not \
+                 filled here)",
+            ));
+        }
+        targets.push((*field, r, at));
+    }
+    if !targets.iter().any(|(f, _, _)| *f == "number") {
+        return Err(error("Give number_ref (from browser_snapshot)."));
+    }
+    Ok(targets)
 }
 
 /// Whether an earlier approval card still answers this request: same card
@@ -455,102 +924,200 @@ fn reusable(c: &Value, created_at: i64, revision: i64, now: i64) -> bool {
     }
 }
 
-/// `fill_card`: answers "filled", "denied", "not filled", or
-/// "not found (...)".
-pub async fn card(
+/// `fill_saved_card`, first step (without holding the page): which card,
+/// and the owner's OK for it on this page. A tool result instead when
+/// there is nothing to fill.
+pub async fn approve_card(
     state: &AppState,
     ctx: &TurnCtx,
-    run: &Running,
-    hint: Option<&str>,
-) -> Result<Output> {
-    let b = &state.browser;
+    args: &Value,
+) -> std::result::Result<Approved, Value> {
     if ctx.audience.is_empty() {
-        return Ok(Output::text(
+        return Err(text(
             "not found (cards can only be used in a chat, where the user can approve)",
         ));
     }
-    let page = page_info(run).await?;
-    let pinned_target = run.page().target_id;
-    if !secure_enough(&page.scheme, &page.host) {
-        return Ok(Output::text(
-            "not found (this page is not secure, so cards are not filled here)",
-        ));
+    let b = &state.browser;
+    let run = b
+        .ensure()
+        .await
+        .map_err(|e| error(format!("The browser could not start: {e}")))?;
+    // The fields first: the owner approves the page and every site that
+    // would receive the card.
+    let targets = card_targets(state, &run, args).await?;
+    let top = targets[0].2.top.clone();
+    let page = full_origin(&top).ok_or_else(|| text("not found (this page has no address)"))?;
+    let mut frames: Vec<String> = targets
+        .iter()
+        .filter_map(|(_, _, at)| full_origin(&at.frame))
+        .collect();
+    frames.sort();
+    frames.dedup();
+    if targets.iter().any(|(_, _, at)| at.top != top) || frames.is_empty() {
+        return Err(text("not filled (the page changed; try again)"));
     }
     let cards = credentials(state, &ctx.user_id, "card").await;
-    let hint = hint.map(str::trim).filter(|h| !h.is_empty());
-    let chosen: Vec<&Credential> = match hint {
-        Some(h) => {
-            let digits: String = h.chars().filter(char::is_ascii_digit).collect();
-            let low = h.to_lowercase();
-            cards
-                .iter()
-                .filter(|c| {
-                    c.label.to_lowercase().contains(&low)
-                        || (digits.len() == 4 && c.metadata["last4"].as_str() == Some(&digits))
-                })
-                .collect()
+    let card = match choose(&cards, args["card"].as_str(), |c, h| {
+        let digits: String = h.chars().filter(char::is_ascii_digit).collect();
+        c.label.to_lowercase().contains(&h.to_lowercase())
+            || (digits.len() == 4 && c.metadata["last4"].as_str() == Some(&digits))
+    }) {
+        Ok(c) => c.clone(),
+        Err(many) if many.is_empty() => {
+            return Err(text("not found (no saved card like that)"));
         }
-        None => cards.iter().collect(),
-    };
-    let card = match chosen.as_slice() {
-        [] => return Ok(Output::text("not found (no saved card like that)")),
-        [one] => *one,
-        many => {
+        Err(many) => {
             let names: Vec<String> = many
                 .iter()
                 .map(|c| format!("\"{}\" ({})", c.label, card_name(c)))
                 .collect();
-            return Ok(Output::error(format!(
-                "Several cards are saved: {}. Call fill_card again with `card` set to one of \
-                 the names or the last 4 digits.",
+            return Err(error(format!(
+                "Several cards are saved: {}. Call fill_saved_card again with `card` set to one \
+                 of the names or the last 4 digits.",
                 names.join(", ")
             )));
         }
     };
-    let fields = eval(run, "cardFields()").await?;
-    if fields["number"].as_str().is_none() {
-        return Ok(Output::text(
-            "not found (no card number field on this page)",
-        ));
-    }
-    // Approvals bind to the browser's exact origin (scheme, host, port).
-    let origin = page.origin.clone();
-    if origin.is_empty() || origin == "null" || run.shows_secret(&origin) {
-        return Ok(Output::text(
-            "not found (this page's address cannot be used for a card)",
-        ));
-    }
-
-    // The owner approves every use of a card, for this card as it is now.
-    let revision = card.updated_at;
-    let (answer, msg) = ask_approval(state, ctx, run, card, &page, &origin).await;
+    let (answer, msg) = ask_approval(state, ctx, &card, &top, &page, &frames).await;
     match answer {
         crate::gateway::Answer::Approved => {}
         crate::gateway::Answer::Denied => {
-            return Ok(Output::text(
+            return Err(text(
                 "denied (the user said no; do not use the card or try another way)",
             ));
         }
         crate::gateway::Answer::Expired | crate::gateway::Answer::Cancelled => {
-            return Ok(Output::text(
+            return Err(text(
                 "not filled (the approval expired or was cancelled; nothing was done)",
             ));
         }
     }
     let Some(msg) = msg else {
-        return Ok(Output::text("not filled (the approval was cancelled)"));
+        return Err(text("not filled (the approval was cancelled)"));
     };
-    // While waiting, the owner may have taken over or the page moved on.
+    Ok(Approved {
+        card,
+        message_id: msg.id,
+        page,
+        frames,
+    })
+}
+
+/// Post an approval card (built from the real page and card, never from
+/// agent text) and notify the owner if they are away.
+async fn ask_approval(
+    state: &AppState,
+    ctx: &TurnCtx,
+    card: &Credential,
+    url: &str,
+    page: &str,
+    frames: &[String],
+) -> (crate::gateway::Answer, Option<db::Message>) {
+    use crate::gateway::policy::reveal_hidden;
+    let host = origin_of(url).map(|(_, h)| h).unwrap_or_default();
+    // Fields inside another site's frame (a payment provider) are named:
+    // that site receives the card.
+    let others: Vec<&str> = frames
+        .iter()
+        .filter(|f| *f != page)
+        .map(|f| f.split("://").nth(1).unwrap_or(f))
+        .collect();
+    let receivers = if others.is_empty() {
+        String::new()
+    } else {
+        format!("\nThe card fields are on: {}", others.join(", "))
+    };
+    let name = reveal_hidden(&card_name(card));
+    let exp = match (
+        card.metadata["exp_month"].as_u64(),
+        card.metadata["exp_year"].as_u64(),
+    ) {
+        (Some(m), Some(y)) => format!(", expires {m:02}/{}", y % 100),
+        _ => String::new(),
+    };
+    // The address may carry a secret a page echoed: the card is stored in
+    // the chat.
+    let url = reveal_hidden(&super::hide_secrets(url, &state.browser.filled_secrets()));
+    let host = reveal_hidden(&host);
+    let preview = format!(
+        "Fill your {name}{exp} (\"{}\") into the payment form on this page:\n{url}{}\n\n\
+         Approving lets me fill it in this once, to finish what you asked for.",
+        reveal_hidden(&card.label),
+        reveal_hidden(&receivers),
+    );
+    let title_text = format!("Use your {name} on {host}");
+    let mut value = entities::approval_card(&entities::ApprovalRequest {
+        title: &title_text,
+        service: "wallet",
+        to: &host,
+        subject: "",
+        preview: &preview,
+        action_label: "Fill card",
+        approver_user_id: &ctx.user_id,
+    });
+    value["wallet"] = json!({"credential_id": card.id, "origin": page, "frames": frames,
+                             "revision": card.updated_at, "used_at": null});
+    crate::gateway::approve_browser_card(state, ctx, value).await
+}
+
+/// `fill_saved_card`, second step (holding the page): fill the approved
+/// card into the fields the agent named.
+pub async fn agent_card(
+    state: &AppState,
+    ctx: &TurnCtx,
+    run: &Running,
+    args: &Value,
+    approved: Approved,
+) -> Value {
+    match card_inner(state, ctx, run, args, approved).await {
+        Ok(v) => v,
+        Err(e) => error(format!("not filled ({e})")),
+    }
+}
+
+async fn card_inner(
+    state: &AppState,
+    ctx: &TurnCtx,
+    run: &Running,
+    args: &Value,
+    approved: Approved,
+) -> Result<Value> {
+    let b = &state.browser;
+    let targets = match card_targets(state, run, args).await {
+        Ok(t) => t,
+        Err(out) => return Ok(out),
+    };
+    // Still the page and the receiving sites the owner approved.
+    for (_, _, at) in &targets {
+        let frame_ok = full_origin(&at.frame).is_some_and(|o| approved.frames.contains(&o));
+        if full_origin(&at.top).as_deref() != Some(approved.page.as_str()) || !frame_ok {
+            return Ok(text(
+                "not filled (the page or a field is not the one the user approved; call \
+                 fill_saved_card again to ask)",
+            ));
+        }
+    }
+    let button = match submit_target(state, run, args, |at| {
+        full_origin(&at.top).as_deref() == Some(approved.page.as_str())
+            && full_origin(&at.frame)
+                .is_some_and(|o| o == approved.page || approved.frames.contains(&o))
+    })
+    .await
+    {
+        Ok(b) => b,
+        Err(out) => return Ok(out),
+    };
     b.check_agent(ctx)?;
-    let (card, secret) = load(state, &ctx.user_id, &card.id).await?;
+    let revision = approved.card.updated_at;
+    let (card, secret) = load(state, &ctx.user_id, &approved.card.id).await?;
     if card.updated_at != revision {
-        return Ok(Output::text(
-            "not filled (the card was edited since the user approved; call \
-             fill_card again to ask)",
+        return Ok(text(
+            "not filled (the card was edited since the user approved; call fill_saved_card \
+             again to ask)",
         ));
     }
     // Consume the approval before typing, so one OK fills once.
-    let mid = msg.id.clone();
+    let mid = approved.message_id.clone();
     let consumed = state
         .db
         .call(move |c| {
@@ -558,7 +1125,6 @@ pub async fn card(
                 return Ok(false);
             };
             let mut card = m.card.unwrap_or_default();
-            // Still approved, unused, unexpired, and for this revision.
             if card["state"] != "approved" || !reusable(&card, m.created_at, revision, now_ms()) {
                 return Ok(false);
             }
@@ -567,208 +1133,95 @@ pub async fn card(
         })
         .await?;
     if !consumed {
-        return Ok(Output::text(
-            "not filled (that OK was already used or has expired; call fill_card \
-             again to ask)",
+        return Ok(text(
+            "not filled (that OK was already used or has expired; call fill_saved_card again \
+             to ask)",
         ));
     }
-    let pin = Pin {
-        target: pinned_target,
-        doc: page.doc.clone(),
-        origin: page.origin.clone(),
-        path: page.path.clone(),
-    };
-    let number = secret
-        .get("number")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let cvc = secret
-        .get("cvc")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    drop(secret);
-    let result = fill_card_fields(state, ctx, run, &pin, &fields, &card, &number, &cvc).await;
-    drop((number, cvc));
-    let missing = match result {
-        Ok(Some(missing)) => missing,
-        Ok(None) => {
-            return Ok(Output::text(
-                "not found (the card number field could not be filled)",
-            ));
+    let submit = args["submit"] == true && button.is_none();
+    let last = targets.len() - 1;
+    let mut missing = Vec::new();
+    for (field, r, at) in &targets {
+        b.check_agent(ctx)?;
+        let values = field_values(&card, &secret, field)
+            .map(|(v, _)| v)
+            .unwrap_or_default();
+        if values.is_empty() {
+            missing.push(*field);
+            continue;
         }
-        Err(e) => return not_found_for(e),
-    };
+        // Everything but the name closes the page to the agent.
+        let private = *field != "name";
+        if !put(state, run, Find::Ref(r), at, field, &values, private, false).await? {
+            if *field == "number" {
+                return Ok(text(
+                    "not filled (the card number field could not be filled)",
+                ));
+            }
+            missing.push(*field);
+        }
+    }
+    drop(secret);
+    // Sent only when everything asked for was filled: an incomplete form
+    // is left for the user (the page is closed to the agent now).
+    let sent = missing.is_empty() && (submit || button.is_some());
+    if sent {
+        b.check_agent(ctx)?;
+        match &button {
+            Some((r, at)) => click(state, run, r, at).await?,
+            None => {
+                let (_, r, at) = &targets[last];
+                press_enter(state, run, r, at).await?;
+            }
+        }
+    }
     let (uid, cid) = (ctx.user_id.clone(), card.id.clone());
     let _ = state
         .db
         .call(move |c| entities::mark_credential_used(c, &uid, &cid))
         .await;
     crate::info!(
-        "browser: filled wallet card {} after approval {}",
+        "browser: filled wallet card {} for the agent after approval {}",
         card.id,
-        msg.id
+        approved.message_id
     );
-    if missing.is_empty() {
-        Ok(Output::text("filled"))
+    Ok(text(if !missing.is_empty() {
+        format!(
+            "filled (but {} could not be filled, so nothing was sent; ask the user to take \
+             over for it)",
+            missing.join(", ").replace('_', " ")
+        )
+    } else if sent {
+        "filled and submitted".to_string()
     } else {
-        Ok(Output::text(format!(
-            "filled (but the {} could not be filled in; check the form, or ask the user to \
-             take over for it)",
-            missing.join(" and ")
-        )))
-    }
-}
-
-/// Fill the card form. None if the number could not be filled (then
-/// nothing else is); otherwise the parts that could not be filled.
-#[allow(clippy::too_many_arguments)]
-async fn fill_card_fields(
-    state: &AppState,
-    ctx: &TurnCtx,
-    run: &Running,
-    pin: &Pin,
-    fields: &Value,
-    card: &Credential,
-    number: &str,
-    cvc: &str,
-) -> Result<Option<Vec<&'static str>>> {
-    let b = &state.browser;
-    let m = &card.metadata;
-    let Some(r) = fields["number"].as_str() else {
-        return Ok(None);
-    };
-    if !type_into(state, ctx, run, pin, r, number, true).await? {
-        return Ok(None);
-    }
-    let mut missing = Vec::new();
-    if let Some(r) = fields["cvc"].as_str()
-        && (cvc.is_empty() || !type_into(state, ctx, run, pin, r, cvc, true).await?)
-    {
-        missing.push("security code");
-    }
-    let month = m["exp_month"].as_u64().map(|v| format!("{v:02}"));
-    let year = m["exp_year"].as_u64().map(|v| v.to_string());
-    let has_exp_field =
-        fields["exp"].is_string() || (fields["month"].is_string() && fields["year"].is_string());
-    if let (Some(mm), Some(yyyy)) = (&month, &year) {
-        let yy = &yyyy[yyyy.len().saturating_sub(2)..];
-        let selects = &fields["selects"];
-        let mut ok = true;
-        if let Some(r) = fields["exp"].as_str() {
-            ok &= if selects["exp"].as_bool() == Some(true) {
-                let opts = json!([format!("{mm}/{yy}"), format!("{mm}/{yyyy}")]);
-                choose(b, ctx, run, pin, r, opts).await?
-            } else {
-                type_into(state, ctx, run, pin, r, &format!("{mm}/{yy}"), false).await?
-            };
-        }
-        if let (Some(rm), Some(ry)) = (fields["month"].as_str(), fields["year"].as_str()) {
-            ok &= if selects["month"].as_bool() == Some(true) {
-                let n = mm.trim_start_matches('0');
-                choose(b, ctx, run, pin, rm, json!([mm, n])).await?
-            } else {
-                type_into(state, ctx, run, pin, rm, mm, false).await?
-            };
-            ok &= if selects["year"].as_bool() == Some(true) {
-                choose(b, ctx, run, pin, ry, json!([yyyy, yy])).await?
-            } else {
-                let year = if fields["shortYear"] == true {
-                    yy
-                } else {
-                    yyyy
-                };
-                type_into(state, ctx, run, pin, ry, year, false).await?
-            };
-        }
-        if has_exp_field && !ok {
-            missing.push("expiry date");
-        }
-    } else if has_exp_field {
-        missing.push("expiry date");
-    }
-    if let Some(r) = fields["name"].as_str() {
-        match m["cardholder"].as_str().filter(|n| !n.is_empty()) {
-            Some(name) => {
-                if !type_into(state, ctx, run, pin, r, name, false).await? {
-                    missing.push("name on the card");
-                }
-            }
-            None => missing.push("name on the card"),
-        }
-    }
-    Ok(Some(missing))
-}
-
-/// Post an approval card (built from the real page and card, never from
-/// agent text) and notify the owner if they are away.
-async fn ask_approval(
-    state: &AppState,
-    ctx: &TurnCtx,
-    run: &Running,
-    card: &Credential,
-    page: &PageInfo,
-    origin: &str,
-) -> (crate::gateway::Answer, Option<db::Message>) {
-    let name = crate::gateway::policy::reveal_hidden(&run.redact(&card_name(card)));
-    // Page-derived text is stored: a page may have echoed an earlier secret.
-    let (url, page_title) = (
-        crate::gateway::policy::reveal_hidden(&run.redact(&page.url)),
-        crate::gateway::policy::reveal_hidden(&run.redact(&page.title)),
-    );
-    let host = &crate::gateway::policy::reveal_hidden(&run.redact(&page.host));
-    let exp = match (
-        card.metadata["exp_month"].as_u64(),
-        card.metadata["exp_year"].as_u64(),
-    ) {
-        (Some(m), Some(y)) => format!(", expires {m:02}/{}", y % 100),
-        _ => String::new(),
-    };
-    let preview = format!(
-        "Fill your {name}{exp} (\"{}\") into the payment form on this page:\n{}\n\n\
-         Approving lets me fill it in this once, to finish what you asked for.",
-        crate::gateway::policy::reveal_hidden(&run.redact(&card.label)),
-        url
-    );
-    let title_text = format!("Use your {name} on {host}");
-    let mut value = entities::approval_card(&entities::ApprovalRequest {
-        title: &title_text,
-        service: "wallet",
-        to: host,
-        subject: &page_title,
-        preview: &preview,
-        action_label: "Fill card",
-        approver_user_id: &ctx.user_id,
-    });
-    value["wallet"] = json!({"credential_id": card.id, "origin": origin,
-                             "revision": card.updated_at, "used_at": null});
-    crate::gateway::approve_browser_card(state, ctx, value).await
+        "filled".to_string()
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn redaction_history_fails_closed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = crate::browser::tools::tests::test_state(tmp.path());
-        let file = history_path(&state.paths);
-        // No history yet: fine.
-        assert!(load_secrets_blocking(&state.db, &state.vault, &file).is_ok());
-        // A history that cannot be read: the browser must not start blind.
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, b"garbage").unwrap();
-        assert!(load_secrets_blocking(&state.db, &state.vault, &file).is_err());
-        // A good one round-trips.
-        let ct = state
-            .vault
-            .encrypt(br#"["old-password-1"]"#, HISTORY_AAD)
-            .unwrap();
-        std::fs::write(&file, ct).unwrap();
-        let list = load_secrets_blocking(&state.db, &state.vault, &file).unwrap();
-        assert!(list.contains(&"old-password-1".to_string()));
+    fn element_refs_only() {
+        for ok in ["e1", "e123", "f1e5", "f12e3"] {
+            assert!(valid_ref(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "e",
+            "f",
+            "fe1",
+            "e1x",
+            "1",
+            "e1\"); x(\"",
+            "aria-ref=e1",
+            "#id",
+            "f1",
+        ] {
+            assert!(!valid_ref(bad), "{bad}");
+        }
     }
 
     #[test]
@@ -786,8 +1239,46 @@ mod tests {
         let old = now - APPROVAL_TTL_MS - 1;
         assert!(!reusable(&card("approved", 5, Value::Null), old, 5, now));
         assert!(reusable(&card("pending", 5, Value::Null), recent, 5, now));
-        // A fresh "no" stands for a little while.
         assert!(reusable(&card("denied", 5, Value::Null), recent, 5, now));
+    }
+
+    #[test]
+    fn fields_of_saved_items() {
+        let cred = |kind: &str, metadata: Value| Credential {
+            id: "c".into(),
+            kind: kind.into(),
+            label: "x".into(),
+            metadata,
+            created_at: 0,
+            updated_at: 0,
+            last_used_at: None,
+        };
+        let secret = |v: Value| v.as_object().unwrap().clone();
+        let login = cred("login", json!({"site": "example.test", "username": "sam"}));
+        let s = secret(json!({"password": "pw-1234", "notes": "n"}));
+        assert_eq!(
+            value_of(&login, &s, "username").unwrap(),
+            ("sam".into(), false)
+        );
+        assert_eq!(
+            value_of(&login, &s, "password").unwrap(),
+            ("pw-1234".into(), true)
+        );
+        assert!(value_of(&login, &s, "notes").is_err());
+        assert!(value_of(&login, &secret(json!({})), "password").is_err());
+        let card = cred(
+            "card",
+            json!({"exp_month": 3, "exp_year": 2031, "cardholder": "S Doe"}),
+        );
+        let s = secret(json!({"number": "4242424242424242", "cvc": "123"}));
+        assert!(value_of(&card, &s, "number").unwrap().1);
+        assert_eq!(value_of(&card, &s, "exp").unwrap(), ("03/31".into(), true));
+        assert_eq!(
+            value_of(&card, &s, "name").unwrap(),
+            ("S Doe".into(), false)
+        );
+        assert!(value_of(&card, &s, "password").is_err());
+        assert_eq!(expiry(&json!({"exp_month": 13, "exp_year": 2031})), None);
     }
 
     #[test]

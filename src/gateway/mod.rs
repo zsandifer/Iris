@@ -510,8 +510,7 @@ pub fn redact(text: &str, secrets: &[String]) -> String {
     out
 }
 
-/// Common reversible encodings of a secret, shared with browser redaction.
-/// Callers cache these forms when remembering a filled value.
+/// Common reversible encodings of a secret.
 pub(crate) fn encoded_secret_forms(secret: &str) -> Vec<String> {
     use base64::{
         Engine as _,

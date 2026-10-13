@@ -93,7 +93,7 @@ export function Logins() {
   const logins = list.filter((c) => c.kind === 'login');
   const cards = list.filter((c) => c.kind === 'card');
   return html`<${Page} title="Logins & wallet" sub=${`${agentName()} can use these but never sees them`}>
-    <div class="lock"><${Icon} name="lock" size=${15} /> Stored encrypted on your server, separate from ${agentName()}. ${agentName()} signs in for you in its own browser: the password is typed into the site directly and never enters its chat or memory. Cards always ask you first, every time.</div>
+    <div class="lock"><${Icon} name="lock" size=${15} /> Stored encrypted on your server, separate from ${agentName()}. ${agentName()} signs in for you in its own browser: the password is typed into the site directly and never enters its chat or memory. Cards always ask you first, every time. When you take over the browser, tap the key to fill one yourself.</div>
     ${!data ? html`<${Spinner} />` : html`
     <${Group} label="Logins">
       ${logins.map((c) => html`<${Row} icon=${html`<${LetterTile} name=${c.metadata.site || c.label} />`} title=${c.label}

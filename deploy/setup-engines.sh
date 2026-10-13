@@ -4,7 +4,8 @@
 #
 # Iris (running as your normal user, the "agent user") can then install and
 # update the official CLIs (Claude Code, Codex, Gemini CLI, OpenCode) and
-# Chromium from the app, but downloads and writes happen as a system user
+# its browser (Playwright MCP with Chromium) from the app, but downloads
+# and writes happen as a system user
 # that owns the engines directory. The agent user can run the engines and
 # cannot modify them.
 #

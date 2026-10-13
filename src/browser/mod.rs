@@ -1,57 +1,69 @@
-//! Iris's computer: one headless Chromium that Iris launches and owns, with
-//! a persistent profile in the data directory (so sign-ins survive
-//! restarts), a live view for the app, and take-over from the phone.
+//! Iris's computer: one headless browser with a persistent profile in the
+//! data directory (so sign-ins survive restarts), a live view in the app,
+//! and take over from the phone.
 //!
-//! Iris is not an agent here either: the harness CLI decides what to do and
-//! calls the `browser` MCP tools (`iris mcp --browser`, see `tools.rs`);
-//! Iris only carries out each call over the DevTools protocol. The tools
-//! reach this process through a private Unix socket in the run directory.
+//! Iris does not automate the browser. Microsoft's Playwright MCP server
+//! (`@playwright/mcp`, installed and updated like the CLIs, see
+//! `engines.rs`) runs it, and the harness CLI decides what to call. Iris
+//! is only the wrapper around that server:
+//! - It starts the server on Iris's side (never as the agent) when the
+//!   browser is first needed and stops it after `browser.idle_mins`.
+//! - Turns in the owner's own conversations get its tools through `iris mcp
+//!   --browser`, which forwards over a private socket (`socket.rs`); only
+//!   reviewed tools pass, unchanged (`tools.rs`).
+//! - Live view: while an app watches, Iris takes screenshots through the
+//!   same server and sends new ones to the sockets that asked
+//!   (`browser.watch`).
+//! - Take over: the owner's taps, scrolls, and typing go to the same page
+//!   through the same server; the agent's tools wait until control comes
+//!   back. Sites that fight automation are signed in to this way.
+//! - Saved logins and cards: filled only when the owner asks while in
+//!   control (`fill.rs`).
 //!
-//! - Live view: CDP screencast frames go to app sockets that asked to watch
-//!   (`browser.watch` over the WebSocket), throttled per mode (a small,
-//!   slow thumbnail for the chat peek; sharper and faster full screen), and
-//!   the screencast stops when nobody watches.
-//! - Take over: the owner's taps, scrolls, and typing are forwarded as real
-//!   input events; the agent's browser tools wait until the owner hands
-//!   control back.
-//! - Saved logins and cards (`fill.rs`): filled from the vault straight
-//!   into the page; tool results only say `filled` or `not found`.
-//!
-//! The browser starts on first use and closes after `browser.idle_mins`.
+//! When the owner types into a private field (a password, card details, a
+//! one-time code) or fills a saved secret, that page is closed to the
+//! agent, so the agent never reads what was typed: the document itself is
+//! marked (it stays closed in any tab, and after the address changes
+//! within it), and so is its address (a page brought back from history may
+//! still hold what was typed), until the browser closes.
 
 pub mod apparmor;
-pub mod cdp;
-#[cfg(test)]
-mod e2e_tests;
 pub mod fill;
 pub mod launch;
+#[cfg(test)]
+mod server_tests;
 pub mod socket;
 pub mod tools;
 
 use crate::config::{BrowserConfig, Paths};
 use crate::events::Hub;
+use crate::gateway::upstream::Upstream;
 use crate::util::{Result, new_id, now_ms};
-use cdp::{Cdp, Event};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 
-/// Window of Iris's browser: phone-shaped, so the live view fills a phone
-/// screen and responsive sites show their mobile layout. (500 is Chrome's
-/// narrowest window; a real window size and scale factor, rather than
-/// emulation, keep every frame the same size across navigations.)
+/// The page size in CSS pixels: phone-shaped, so the live view fills a
+/// phone screen and responsive sites show their mobile layout.
 pub const VIEW_W: u32 = 500;
 pub const VIEW_H: u32 = 1000;
-/// Device scale factor (sharp text in the live view on phones).
+/// Device scale factor (sharp text in the full-screen live view).
 pub const SCALE: f64 = 2.0;
 /// How long a tool call waits while the owner has taken over.
 const CONTROL_WAIT: Duration = Duration::from_secs(50);
 /// Take-over without any input for this long hands control back.
 const TAKEOVER_IDLE_MS: i64 = 5 * 60 * 1000;
+/// Longest one call to the server may take (Playwright's own navigation
+/// limit is 60 seconds).
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(90);
+/// Starting the server and Chromium.
+const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// Iris's own quick calls (tab list, screenshots, input).
+const QUICK: Duration = Duration::from_secs(20);
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -64,8 +76,8 @@ pub enum Control {
     User { user_id: String, device_id: String },
 }
 
-/// Live view quality. A socket watching in `Full` gets every frame up to
-/// ~6 per second; `Peek` gets a small thumbnail about once a second.
+/// Live view quality. `Full` is the sharp full-screen view, a few frames a
+/// second; `Peek` a small thumbnail about once a second.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Mode {
     Peek,
@@ -83,26 +95,49 @@ impl Mode {
     pub fn min_interval(self) -> Duration {
         match self {
             Mode::Peek => Duration::from_millis(1000),
-            Mode::Full => Duration::from_millis(160),
+            Mode::Full => Duration::from_millis(300),
         }
     }
-    fn max_width(self) -> u32 {
+    /// Picture width when the viewer does not say (device pixels).
+    fn default_width(self) -> u32 {
         match self {
-            Mode::Peek => 360,
-            Mode::Full => (VIEW_W as f64 * SCALE) as u32,
+            Mode::Peek => VIEW_W,
+            Mode::Full => FRAME_MAX_W,
         }
     }
+    /// JPEG quality: text stays readable at the sizes viewers ask for.
     fn quality(self) -> u32 {
         match self {
-            Mode::Peek => 45,
-            Mode::Full => 60,
+            Mode::Peek => 50,
+            Mode::Full => 55,
         }
     }
 }
 
-/// Loads every secret the redactor must know (the owner's saved ones and
-/// the encrypted history of filled ones). Blocking; runs off the runtime.
-pub type SecretSource = Arc<dyn Fn() -> Result<Vec<String>> + Send + Sync>;
+/// Live view picture widths (device pixels): never sharper than the page
+/// itself (`VIEW_W` x `SCALE`), never too small to make out.
+const FRAME_MAX_W: u32 = 1000;
+const FRAME_MIN_W: u32 = 120;
+
+/// One live-view picture of the visible page at `width` device pixels,
+/// through Chrome's own capture (any size, set quality, nothing written to
+/// disk). The DevTools session is kept on the page for the next frame.
+fn frame_code(width: u32, quality: u32) -> String {
+    format!(
+        "async (page) => {{
+  try {{
+    const s = page.__irisCast || (page.__irisCast = await page.context().newCDPSession(page));
+    const {{ cssVisualViewport: v }} = await s.send('Page.getLayoutMetrics');
+    const r = await s.send('Page.captureScreenshot', {{ format: 'jpeg', quality: {quality},
+      clip: {{ x: v.pageX, y: v.pageY, width: v.clientWidth, height: v.clientHeight, scale: {width} / v.clientWidth }} }});
+    return r.data;
+  }} catch (e) {{
+    page.__irisCast = undefined;
+    throw e;
+  }}
+}}"
+    )
+}
 
 /// One encoded frame, serialized once for every watcher.
 pub struct Frame {
@@ -127,6 +162,7 @@ impl TurnCtx {
         *self.ended.borrow()
     }
 
+    /// Ends with the turn (approvals held for it are cancelled).
     pub(crate) fn cancellation(&self) -> watch::Sender<bool> {
         self.ended.clone()
     }
@@ -142,6 +178,15 @@ impl TurnCtx {
 pub const TAKEN_OVER: &str = "The user has taken over the browser and is still using it. Wait a \
     bit and try again, or tell them you are waiting for them to hand it back.";
 pub const TURN_ENDED: &str = "This browser session has ended.";
+pub const PRIVATE_PAGE: &str = "The user typed private details on this page (like a password, \
+    card details, or a code), so you cannot read or use it. Wait until they finish and the page \
+    moves on (for example after signing in), or open another page.";
+const NOT_INSTALLED: &str = "no browser is installed; set it up from Iris's computer in the app";
+const DISCONNECTED: &str =
+    "The browser is disconnected; the owner can reopen it in Iris’s computer.";
+/// Error when Chrome's sandbox cannot start here and the owner has not
+/// agreed to run without it.
+pub const SANDBOX_UNAVAILABLE: &str = "Chrome's security sandbox cannot start on this server (the owner can sort this out in Iris's computer in the app)";
 
 /// Unregisters the turn when dropped; tells the chat the browser peek can
 /// go away.
@@ -175,314 +220,15 @@ impl Drop for TurnGuard {
     }
 }
 
-/// The running browser.
+/// The running server (and the Chromium it started).
 pub struct Running {
-    pub cdp: Arc<Cdp>,
-    child: Mutex<Option<tokio::process::Child>>,
-    page: Mutex<PageRef>,
+    up: Upstream,
     pub no_sandbox: bool,
-    pub version: String,
-    /// Screencast actually running: (session, mode).
-    cast: Mutex<Option<(String, Mode)>>,
-    /// Serializes screencast changes (latest wish wins).
-    cast_lock: tokio::sync::Mutex<()>,
-    /// Serializes switching tabs.
-    attach_lock: tokio::sync::Mutex<()>,
-    /// Dialogs Iris answered since the last tool result.
-    dialogs: Mutex<Vec<String>>,
-    /// Viewport size reported with the last frame (CSS pixels).
-    last_meta: Mutex<(f64, f64)>,
-    /// Secrets Iris typed into pages in this browser session, so any copy a
-    /// page reflects (a dialog, another field, the title) is redacted from
-    /// what the agent reads. Memory only; gone when the browser closes.
-    secrets: Mutex<Vec<String>>,
-    originals: Mutex<Vec<String>>,
-    /// Documents Iris filled a secret into: no agent reads (a page can
-    /// transform a value it was given in ways no redactor can recognize).
-    secret_docs: Mutex<std::collections::HashSet<String>>,
-    filled_tabs: Mutex<std::collections::HashMap<String, (String, String)>>,
-    /// Serializes recovering from a closed tab.
-    recover_lock: tokio::sync::Mutex<()>,
-    /// The owner's saved secrets were loaded for redaction (a page may show
-    /// one it kept from an earlier session).
-    pub(crate) seeded: AtomicBool,
-}
-
-/// Shortest secret Iris fills: shorter ones could not be told apart from
-/// ordinary text when redacting, so Iris will not fill them.
-pub const MIN_SECRET: usize = 3;
-
-fn origin_hash(origin: &str) -> String {
-    use sha2::Digest;
-    crate::util::hex(&sha2::Sha256::digest(origin.as_bytes()))
-}
-
-/// The saved list of filled origins: empty if there is none yet, None if
-/// it exists but cannot be read.
-fn load_tainted(file: &std::path::Path) -> Option<std::collections::HashSet<String>> {
-    match std::fs::read(file) {
-        Ok(b) => serde_json::from_slice(&b).ok(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Default::default()),
-        Err(_) => None,
-    }
-}
-
-fn is_card_number(s: &str) -> bool {
-    (12..=19).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
-}
-
-/// Replace `digits` written with any separators between them (spaces,
-/// dashes, dots); also says whether anything was replaced.
-fn redact_digit_run(text: &str, digits: &str) -> (String, bool) {
-    let want: Vec<char> = digits.chars().collect();
-    let chars: Vec<char> = text.chars().collect();
-    let sep = |c: char| c.is_whitespace() || matches!(c, '-' | '.');
-    let mut out = String::with_capacity(text.len());
-    let (mut i, mut hit) = (0, false);
-    while i < chars.len() {
-        if chars[i] == want[0] {
-            let (mut j, mut k) = (i + 1, 1);
-            while k < want.len() && j < chars.len() {
-                if chars[j] == want[k] {
-                    k += 1;
-                } else if !sep(chars[j]) {
-                    break;
-                }
-                j += 1;
-            }
-            if k == want.len() {
-                out.push_str("••••");
-                hit = true;
-                i = j;
-                continue;
-            }
-        }
-        out.push(chars[i]);
-        i += 1;
-    }
-    (out, hit)
-}
-
-/// Percent-decoding that never fails (bad escapes kept), as UTF-8 or,
-/// for pages in legacy encodings, Windows-1252.
-fn decode_pct(s: &str, plus_space: bool, legacy: bool) -> String {
-    let b = s.as_bytes();
-    let hex = |c: u8| (c as char).to_digit(16);
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'+' if plus_space => out.push(b' '),
-            b'%' if i + 2 < b.len() => match (hex(b[i + 1]), hex(b[i + 2])) {
-                (Some(h), Some(l)) => {
-                    out.push((h * 16 + l) as u8);
-                    i += 3;
-                    continue;
-                }
-                _ => out.push(b'%'),
-            },
-            c => out.push(c),
-        }
-        i += 1;
-    }
-    if !legacy && let Ok(s) = String::from_utf8(out.clone()) {
-        return s;
-    }
-    const CP1252: [char; 32] = [
-        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž',
-        '\u{8f}', '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}',
-        'ž', 'Ÿ',
-    ];
-    out.iter()
-        .map(|&b| {
-            if (0x80..0xa0).contains(&b) {
-                CP1252[(b - 0x80) as usize]
-            } else {
-                b as char
-            }
-        })
-        .collect()
-}
-
-/// Every reading of a possibly escaped string: `+` kept or as a space,
-/// UTF-8 or Windows-1252.
-fn decodings(s: &str) -> [String; 4] {
-    [
-        decode_pct(s, false, false),
-        decode_pct(s, true, false),
-        decode_pct(s, false, true),
-        decode_pct(s, true, true),
-    ]
-}
-
-#[cfg(test)]
-fn decode_loose(s: &str) -> String {
-    decode_pct(s, true, false)
-}
-
-/// Percent-encoding as JavaScript's `encodeURIComponent`.
-fn uri_encode(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct PageRef {
-    pub target_id: String,
-    pub session_id: String,
 }
 
 impl Running {
-    pub fn page(&self) -> PageRef {
-        lock(&self.page).clone()
-    }
-
-    pub fn take_dialogs(&self) -> Vec<String> {
-        std::mem::take(&mut *lock(&self.dialogs))
-    }
-
-    /// Remember a secret Iris typed (and common spaced forms of card
-    /// numbers) for redaction.
-    pub fn remember_secret(&self, secret: &str) {
-        if secret.chars().count() < MIN_SECRET {
-            return;
-        }
-        {
-            let mut o = lock(&self.originals);
-            if !o.iter().any(|x| x == secret) {
-                o.push(secret.to_string());
-            }
-        }
-        let mut forms = crate::gateway::encoded_secret_forms(secret);
-        forms.push(secret.to_string());
-        // As it appears in addresses and submitted forms.
-        let enc = uri_encode(secret);
-        forms.push(enc.replace("%20", "+"));
-        forms.push(enc);
-        let folded = secret.split_whitespace().collect::<Vec<_>>().join(" ");
-        if folded.chars().count() >= 3 && folded != secret {
-            forms.push(folded);
-        }
-        let mut s = lock(&self.secrets);
-        for f in forms {
-            if !s.contains(&f) {
-                s.push(f);
-            }
-        }
-        // Longest first, so a secret containing another is replaced whole.
-        s.sort_by_key(|x| std::cmp::Reverse(x.len()));
-    }
-
-    /// Replace every remembered secret in text the agent will read. A line
-    /// that still holds one once percent-decoded (an address shown in some
-    /// other escaping) loses its query, or the whole line.
-    pub fn redact(&self, text: &str) -> String {
-        let secrets = lock(&self.secrets);
-        if secrets.is_empty() {
-            return text.to_string();
-        }
-        let mut out = text.to_string();
-        for s in secrets.iter() {
-            out = crate::gateway::replace_case_insensitive(&out, s, "••••");
-        }
-        // Card numbers in any grouping ("3782 822463 10005").
-        for s in secrets.iter().filter(|s| is_card_number(s)) {
-            out = redact_digit_run(&out, s).0;
-        }
-        let folded_secrets: Vec<_> = secrets.iter().map(|s| s.to_lowercase()).collect();
-        let leaks = |t: &str| {
-            decodings(t).iter().any(|d| {
-                let folded = d.to_lowercase();
-                folded_secrets.iter().any(|s| {
-                    folded.contains(s.as_str()) || (is_card_number(s) && redact_digit_run(d, s).1)
-                })
-            })
-        };
-        if !out.lines().any(leaks) {
-            return out;
-        }
-        out.split('\n')
-            .map(|line| match line.find('?') {
-                _ if !leaks(line) => line.to_string(),
-                // Drop the query, unless what is left still shows it.
-                Some(q) if !leaks(&line[..q]) => format!("{}?••••", &line[..q]),
-                _ => "••••".to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// The screencast running now, if any.
-    pub fn casting(&self) -> Option<Mode> {
-        lock(&self.cast).as_ref().map(|(_, m)| *m)
-    }
-
-    pub fn taint_tab(&self, target: &str, doc: &str, path: &str) {
-        lock(&self.filled_tabs).insert(target.into(), (doc.into(), path.into()));
-    }
-
-    pub fn tab_tainted(&self, target: &str) -> bool {
-        lock(&self.filled_tabs).contains_key(target)
-    }
-
-    /// A new document after a submit may be read, but all remembered secret
-    /// encodings stay redacted across redirects, including new paths.
-    pub fn agent_navigated(&self, target: &str, action_doc: &str, new_doc: &str, path: &str) {
-        let mut tabs = lock(&self.filled_tabs);
-        if tabs.get(target).is_some_and(|(filled_doc, filled_path)| {
-            new_doc != action_doc && new_doc != filled_doc && path != filled_path
-        }) {
-            tabs.remove(target);
-        }
-    }
-
-    fn owner_acted(&self, target: &str) {
-        if let Some((doc, _)) = lock(&self.filled_tabs).remove(target) {
-            lock(&self.secret_docs).remove(&doc);
-        }
-    }
-
-    pub fn remember_secret_doc(&self, doc: &str) {
-        lock(&self.secret_docs).insert(doc.to_string());
-    }
-
-    pub fn has_secret_doc(&self, doc: &str) -> bool {
-        lock(&self.secret_docs).contains(doc)
-    }
-
-    pub fn secret_docs(&self) -> Vec<String> {
-        lock(&self.secret_docs).iter().cloned().collect()
-    }
-
-    /// The secrets themselves (not their encoded forms), for the encrypted
-    /// redaction history.
-    pub fn originals(&self) -> Vec<String> {
-        lock(&self.originals).clone()
-    }
-
-    /// The remembered secrets (to hand to the page helpers' isolated world).
-    pub fn secrets(&self) -> Vec<String> {
-        lock(&self.secrets).clone()
-    }
-
-    /// Whether text contains a remembered secret (also percent-encoded).
-    pub fn shows_secret(&self, text: &str) -> bool {
-        let secrets = lock(&self.secrets);
-        let mut all = decodings(text).to_vec();
-        all.push(text.to_string());
-        let folded: Vec<_> = all.iter().map(|t| t.to_lowercase()).collect();
-        secrets.iter().any(|s| {
-            let needle = s.to_lowercase();
-            folded.iter().any(|t| t.contains(&needle))
-                || (is_card_number(s) && all.iter().any(|t| redact_digit_run(t, s).1))
-        })
+    fn alive(&self) -> bool {
+        self.up.alive()
     }
 }
 
@@ -496,24 +242,59 @@ struct View {
     sandbox_unavailable: bool,
 }
 
+/// Where the owner typed what the agent must not read.
+#[derive(Debug, Default)]
+struct Private {
+    /// Addresses (without fragments) of pages where the owner typed or
+    /// filled private details, kept until the browser closes.
+    pages: Vec<String>,
+    /// Tabs open when last counted (new ones during take over are followed).
+    tabs: usize,
+    /// Saved secrets Iris filled this session: hidden from everything the
+    /// agent gets back (a page may echo them into its address, title, a
+    /// dialog, or its text).
+    secrets: Vec<String>,
+    /// When the focused field was last checked for typing (the check is a
+    /// round trip with Playwright's settle wait, too slow for every key).
+    field_checked: Option<std::time::Instant>,
+}
+
+/// How long one check of the focused field covers the owner's typing,
+/// unless they tap, press a key, or move to another page first (a page
+/// moving focus by itself is caught at the next check).
+pub(crate) const FIELD_CHECK_FOR: Duration = Duration::from_secs(3);
+
+/// Reads the owner's saved secrets (`fill::saved_secrets_blocking`).
+pub type SecretSource = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// Most private addresses remembered (the oldest are forgotten first; the
+/// documents themselves stay marked).
+const PRIVATE_PAGES_MAX: usize = 64;
+
 /// Shared browser state (cheap to clone through `Arc`).
 pub struct Shared {
     cfg: BrowserConfig,
     profile_dir: PathBuf,
-    tmp_dir: PathBuf,
+    /// The server's working directory; its output folder is inside.
+    work_dir: PathBuf,
+    out_dir: PathBuf,
+    config_file: PathBuf,
     hub: Hub,
     launch_lock: tokio::sync::Mutex<()>,
+    list_lock: tokio::sync::Mutex<()>,
     running: Mutex<Option<Arc<Running>>>,
     view: Mutex<View>,
     control: watch::Sender<Control>,
     frames: watch::Sender<Option<Arc<Frame>>>,
     frame_seq: AtomicU64,
-    watchers: Mutex<HashMap<u64, Mode>>,
+    /// Who watches: the mode and picture width (device pixels) each wants.
+    watchers: Mutex<HashMap<u64, (Mode, u32)>>,
     next_watcher: AtomicU64,
+    casting: AtomicBool,
     turns: Mutex<HashMap<String, Arc<TurnCtx>>>,
     last_used: AtomicI64,
     last_input: AtomicI64,
-    /// Serializes actions on the page (tool calls and fills).
+    /// Serializes actions on the page (tool calls and the owner's input).
     pub(crate) op_lock: tokio::sync::Mutex<()>,
     /// "Pause Iris" in the app: no turns, jobs, or browsing until resumed.
     paused: AtomicBool,
@@ -522,17 +303,17 @@ pub struct Shared {
     /// The owner agreed (in the app) to run without Chrome's sandbox on a
     /// system where it cannot start.
     allow_no_sandbox: AtomicBool,
-    /// Chromium is being installed, updated, or removed.
+    /// The browser is being installed, updated, or removed.
     maintenance: AtomicBool,
-    /// Origins Iris ever filled a secret into (kept on disk; not secret).
-    /// The agent never gets screenshots of them: a page can keep a value
-    /// and paint it later, even after a restart.
-    /// None: the list on disk exists but could not be read.
-    tainted: Mutex<Option<std::collections::HashSet<String>>>,
-    tainted_file: PathBuf,
     /// Orders changes of the saved safety switches (pause, sandbox).
     pub switch_lock: tokio::sync::Mutex<()>,
+    /// The server's tools the agent may use (asked once per install).
+    tools: Mutex<Option<Vec<Value>>>,
+    private: Mutex<Private>,
     secret_source: Mutex<Option<SecretSource>>,
+    /// Tests run a stand-in server.
+    #[cfg(test)]
+    server_override: Mutex<Option<launch::Server>>,
 }
 
 #[derive(Clone)]
@@ -554,19 +335,303 @@ pub struct WatchGuard {
 impl Drop for WatchGuard {
     fn drop(&mut self) {
         lock(&self.browser.watchers).remove(&self.id);
-        self.browser.update_screencast();
     }
+}
+
+/// All text parts of a tool result.
+pub(crate) fn text_of(result: &Value) -> String {
+    result["content"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+fn is_error(result: &Value) -> bool {
+    result["isError"] == true
+}
+
+/// A tool result's text, or its error as a short message.
+fn ok_text(result: &Value) -> Result<String> {
+    let text = text_of(result);
+    if !is_error(result) {
+        return Ok(text);
+    }
+    let line = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("Error:"))
+        .unwrap_or("the browser could not do that");
+    Err(crate::util::truncate_chars(launch::error_line(line), 200).into())
+}
+
+/// The value after `prefix` on a line of `text` (Playwright's page header:
+/// `- Page URL: ...`).
+fn line_value<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    text.lines()
+        .find_map(|l| l.trim_start().strip_prefix(prefix))
+        .map(str::trim)
+}
+
+/// How many tabs a `browser_tabs` result lists (`- 0: [Title](url)`).
+fn tab_count(text: &str) -> usize {
+    text.lines()
+        .filter(|l| {
+            l.strip_prefix("- ")
+                .and_then(|r| r.split_once(':'))
+                .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        })
+        .count()
+}
+
+/// The `### Page` section of a result (Playwright's page header), which
+/// comes before anything the page wrote itself.
+fn page_section(text: &str) -> Option<&str> {
+    let start = if text.starts_with("### Page\n") {
+        0
+    } else {
+        text.find("\n### Page\n")? + 1
+    };
+    let body = &text[start + "### Page\n".len()..];
+    Some(&body[..body.find("\n###").unwrap_or(body.len())])
+}
+
+/// The first JSON value after `### Result` (Iris's own page checks).
+fn result_value(text: &str) -> Option<Value> {
+    let after = &text[text.find("### Result")? + "### Result".len()..];
+    let end = after.find("\n###").unwrap_or(after.len());
+    serde_json::from_str(after[..end].trim()).ok()
+}
+
+/// An address without its fragment (a fragment never loads a new page).
+fn page_key(url: &str) -> &str {
+    url.split('#').next().unwrap_or(url)
+}
+
+/// Iris's own look at the page, run by Playwright's Node side (not
+/// through the page's scripts): the real address and title, and whether
+/// this document was marked private. `PAGE_FN` is evaluated in the page.
+const PAGE_CODE: &str = r#"async (page) => ({
+  url: page.url(),
+  title: await page.title(),
+  private: await page.evaluate("window.__irisPrivate === true"),
+})"#;
+
+/// The focused field, followed into shadow roots and same-origin frames:
+/// whether it takes private details (passwords, card fields, one-time
+/// codes; a field in another site's frame cannot be inspected and counts
+/// as private) and whether it is in another site's frame. With `MARK`, a
+/// private field marks the document private before anything is typed;
+/// with `FORCE` it counts as private whatever it is.
+const FIELD_FN: &str = r#"() => {
+  const sensitive = (e) => {
+    const doc = e.ownerDocument;
+    const named = (e.getAttribute('aria-labelledby') || '').split(/\s+/)
+      .map((id) => id && doc.getElementById(id)).filter(Boolean).map((l) => l.textContent);
+    const a = [e.type, e.autocomplete, e.name, e.id, e.getAttribute('aria-label'), e.placeholder,
+      ...Array.from(e.labels || [], (l) => l.textContent), ...named]
+      .filter(Boolean).join(' ').toLowerCase();
+    if (/password|passcode|cc-|card|cvc|cvv|csc|security code|expir|one-time|otp|\bpin\b|verification|2fa|mfa|totp|authenticat/.test(a)) return true;
+    return /\bcode\b/.test(a) && !/postal|zip|promo|coupon|discount|gift|voucher|referral|country|area code|dial/.test(a);
+  };
+  let e = document.activeElement;
+  let frame = false;
+  let inner = false;
+  for (;;) {
+    while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
+    if (!e || (e.tagName !== 'IFRAME' && e.tagName !== 'FRAME')) break;
+    let d = null;
+    try { d = e.contentDocument; } catch (_) {}
+    if (!d) { frame = true; break; }
+    e = d.activeElement;
+    inner = true;
+  }
+  const field = !!e && e !== e.ownerDocument.body && e !== e.ownerDocument.documentElement;
+  // Focus inside a frame but on no field of it: where typing goes is unclear.
+  if (inner && !field) frame = true;
+  const priv = FORCE || frame || (field && sensitive(e));
+  if (MARK && priv) {
+    try { Object.defineProperty(window, '__irisPrivate', { value: true }); } catch (_) {}
+  }
+  return { private: priv, frame };
+}"#;
+
+/// Marks the current document private (see `private_page`).
+pub(crate) const MARK_JS: &str = "(() => { try { Object.defineProperty(window, '__irisPrivate', { value: true }); } catch (_) {} })()";
+
+/// Run `FIELD_FN` from Playwright's Node side, with the real address.
+fn field_code(mark: bool, force: bool) -> String {
+    let f = FIELD_FN
+        .replace("FORCE", if force { "true" } else { "false" })
+        .replace("MARK", if mark { "true" } else { "false" });
+    format!(
+        "async (page) => ({{ url: page.url(), ...(await page.evaluate({})) }})",
+        serde_json::to_string(&format!("({f})()")).unwrap_or_default()
+    )
+}
+
+/// The focused field, as `FIELD_FN` sees it, and the page's real address.
+#[derive(Debug)]
+pub(crate) struct Field {
+    pub url: String,
+    pub private: bool,
+    /// In another site's frame.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub frame: bool,
+}
+
+/// Keys the owner can press while in control (names as in the DOM).
+const KEYS: &[&str] = &[
+    "Enter",
+    "Tab",
+    "Escape",
+    "Backspace",
+    "Delete",
+    "ArrowUp",
+    "ArrowDown",
+    "ArrowLeft",
+    "ArrowRight",
+    "Home",
+    "End",
+    "PageUp",
+    "PageDown",
+];
+
+/// How a value shows up once a page or Playwright has handled it: sent by
+/// a form (`application/x-www-form-urlencoded`), escaped by
+/// `encodeURIComponent`, or quoted in a snapshot (JSON-style escapes).
+fn written_forms(secret: &str) -> Vec<String> {
+    let encode = |keep: &dyn Fn(u8) -> bool, space_plus: bool| -> String {
+        secret
+            .bytes()
+            .map(|b| {
+                if b == b' ' && space_plus {
+                    "+".to_string()
+                } else if b.is_ascii_alphanumeric() || keep(b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    };
+    let form = encode(&|b| b"*-._".contains(&b), true);
+    let component = encode(&|b| b"-_.!~*'()".contains(&b), false);
+    let json = serde_json::to_string(secret).unwrap_or_default();
+    let json = json[1..json.len().saturating_sub(1).max(1)].to_string();
+    let mut forms = vec![form, component, json];
+    forms.retain(|f| f != secret && !f.is_empty());
+    forms.sort();
+    forms.dedup();
+    forms
+}
+
+/// `text` with saved secrets replaced by `[hidden]`: the gateway's matcher
+/// (the value and its common encodings), the forms pages and Playwright
+/// write values in (`written_forms`, any length), and what pages do with
+/// card details: numbers split into groups by spaces or dashes, and short
+/// security codes (only where they stand alone, not inside longer numbers).
+pub(crate) fn hide_secrets(text: &str, secrets: &[String]) -> String {
+    let mut out = crate::gateway::redact(text, secrets);
+    for s in secrets.iter().filter(|s| s.chars().count() >= 4) {
+        for f in written_forms(s) {
+            // Escapes may be written in either case (%2b, %2B).
+            out = if f.contains('%') {
+                crate::gateway::replace_case_insensitive(&out, &f, "[hidden]")
+            } else {
+                out.replace(&f, "[hidden]")
+            };
+        }
+    }
+    for s in secrets {
+        let digits = !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if digits && s.len() >= 12 {
+            let groups: &[usize] = if s.len() == 15 {
+                &[4, 6, 5]
+            } else {
+                &[4, 4, 4, 4, 4]
+            };
+            let mut parts = Vec::new();
+            let mut at = 0;
+            for g in groups {
+                if at >= s.len() {
+                    break;
+                }
+                let end = (at + g).min(s.len());
+                parts.push(&s[at..end]);
+                at = end;
+            }
+            for sep in [" ", "-", "  ", " - "] {
+                out = out.replace(&parts.join(sep), "[hidden]");
+            }
+        } else if digits && (3..=4).contains(&s.len()) {
+            out = hide_standalone(&out, s);
+        }
+    }
+    out
+}
+
+/// Replace `code` where no other letter or digit touches it (so neither a
+/// longer number nor a snapshot ref like `e737` is cut).
+fn hide_standalone(text: &str, code: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut i = 0;
+    while let Some(pos) = text[i..].find(code) {
+        let start = i + pos;
+        let end = start + code.len();
+        let before = start > 0 && b[start - 1].is_ascii_alphanumeric();
+        let after = end < b.len() && b[end].is_ascii_alphanumeric();
+        if !before && !after {
+            out.push_str(&text[last..start]);
+            out.push_str("[hidden]");
+            last = end;
+        }
+        i = end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// An address the owner typed: http(s), or a bare domain (https).
+pub fn normalize_url(raw: &str) -> Result<String> {
+    let s = raw.trim();
+    if s.is_empty() || s.len() > 4000 || s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("enter a web address".into());
+    }
+    let lower = s.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Ok(s.to_string());
+    }
+    if tools::has_scheme(s) && !tools::host_port(s) {
+        return Err("only web pages (http or https) can be opened".into());
+    }
+    Ok(format!("https://{s}"))
 }
 
 impl Browser {
     pub fn new(cfg: BrowserConfig, paths: &Paths, hub: Hub) -> Self {
         let dir = paths.browser_dir();
+        // Leftovers of Iris's earlier browser layer (encrypted redaction
+        // history, hashed origins, scratch space): no longer used.
+        let _ = std::fs::remove_file(dir.join("redaction.enc"));
+        let _ = std::fs::remove_file(dir.join("tainted-origins.json"));
+        let _ = std::fs::remove_dir_all(dir.join("tmp"));
+        let work_dir = dir.join("work");
         Self(Arc::new(Shared {
             cfg,
             profile_dir: dir.join("profile"),
-            tmp_dir: dir.join("tmp"),
+            out_dir: work_dir.join("out"),
+            work_dir,
+            config_file: dir.join("playwright.json"),
             hub,
             launch_lock: tokio::sync::Mutex::new(()),
+            list_lock: tokio::sync::Mutex::new(()),
             running: Mutex::new(None),
             view: Mutex::default(),
             control: watch::Sender::new(Control::Agent),
@@ -574,6 +639,7 @@ impl Browser {
             frame_seq: AtomicU64::new(0),
             watchers: Mutex::default(),
             next_watcher: AtomicU64::new(1),
+            casting: AtomicBool::new(false),
             turns: Mutex::default(),
             last_used: AtomicI64::new(0),
             last_input: AtomicI64::new(0),
@@ -582,70 +648,22 @@ impl Browser {
             disconnected: AtomicBool::new(false),
             allow_no_sandbox: AtomicBool::new(false),
             maintenance: AtomicBool::new(false),
-            tainted: Mutex::new(load_tainted(&dir.join("tainted-origins.json"))),
-            tainted_file: dir.join("tainted-origins.json"),
             switch_lock: tokio::sync::Mutex::new(()),
+            tools: Mutex::new(None),
+            private: Mutex::default(),
             secret_source: Mutex::new(None),
+            #[cfg(test)]
+            server_override: Mutex::new(None),
         }))
     }
 
-    pub fn set_secret_source(&self, source: SecretSource) {
-        *lock(&self.secret_source) = Some(source);
-    }
-
-    /// Know every saved and earlier filled secret before a session shows
-    /// anything (fails closed if they cannot be read).
-    async fn seed(&self, run: &Running) -> Result<()> {
-        let source = lock(&self.secret_source).clone();
-        if let Some(source) = source {
-            let list = tokio::task::spawn_blocking(move || source())
-                .await
-                .map_err(|e| e.to_string())??;
-            for s in list {
-                run.remember_secret(&s);
-            }
+    /// Playwright MCP and the Chromium it should start (see `launch.rs`).
+    fn server(&self) -> Option<launch::Server> {
+        #[cfg(test)]
+        if let Some(s) = lock(&self.server_override).clone() {
+            return Some(s);
         }
-        run.seeded.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// A credential was saved or edited: a running session learns it now.
-    pub fn learn_secrets(&self, secrets: &[String]) {
-        if let Some(run) = self.running() {
-            for s in secrets {
-                run.remember_secret(s);
-            }
-        }
-    }
-
-    /// Remember (on disk, before anything is filled) that Iris fills a
-    /// secret into `origin`. Origins are stored hashed. An error means the
-    /// fill must not happen.
-    pub fn taint_origin(&self, origin: &str) -> Result<()> {
-        let h = origin_hash(origin);
-        let mut t = lock(&self.tainted);
-        let Some(set) = t.as_mut() else {
-            return Err("the browser's safety list could not be read".into());
-        };
-        if set.contains(&h) {
-            return Ok(());
-        }
-        let mut next = set.clone();
-        next.insert(h);
-        if let Some(dir) = self.tainted_file.parent() {
-            crate::config::ensure_private_dir(dir)?;
-        }
-        crate::config::write_private_file(&self.tainted_file, &serde_json::to_vec(&next)?)?;
-        *set = next;
-        Ok(())
-    }
-
-    /// True for origins Iris filled a secret into, and for everything when
-    /// the saved list could not be read (fail closed).
-    pub fn is_tainted(&self, origin: &str) -> bool {
-        lock(&self.tainted)
-            .as_ref()
-            .is_none_or(|set| set.contains(&origin_hash(origin)))
+        launch::find(&self.cfg.command)
     }
 
     /// Stop/Pause: the turns of a conversation (or all) end now for the
@@ -658,21 +676,23 @@ impl Browser {
         }
     }
 
-    #[cfg(test)]
-    pub async fn launch_lock_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.launch_lock.lock().await
-    }
-
     pub fn enabled(&self) -> bool {
         self.cfg.enabled && !self.disconnected.load(Ordering::SeqCst)
     }
 
-    pub fn executable(&self) -> Option<PathBuf> {
-        launch::find(&self.cfg.command)
+    /// Playwright MCP (and the configured Chromium, if any) is installed.
+    pub fn available(&self) -> bool {
+        self.server().is_some()
+    }
+
+    /// The Chromium the server would start, when Iris knows it (Chrome's
+    /// sandbox fix names its real path).
+    pub fn chromium(&self) -> Option<PathBuf> {
+        self.server().and_then(|s| s.chromium)
     }
 
     pub fn running(&self) -> Option<Arc<Running>> {
-        lock(&self.running).clone().filter(|r| !r.cdp.is_closed())
+        lock(&self.running).clone().filter(|r| r.alive())
     }
 
     pub fn control(&self) -> Control {
@@ -723,11 +743,13 @@ impl Browser {
         self.allow_no_sandbox.store(allow, Ordering::SeqCst);
     }
 
-    /// While Chromium's files are being installed, updated, or removed, the
-    /// browser is closed and cannot start.
+    /// While the browser's files are being installed, updated, or removed,
+    /// it is closed and cannot start.
     pub async fn begin_maintenance(&self) {
         self.maintenance.store(true, Ordering::SeqCst);
         self.close().await;
+        // A new version may offer other tools.
+        *lock(&self.tools) = None;
     }
 
     pub fn end_maintenance(&self) {
@@ -819,9 +841,7 @@ impl Browser {
             return Err(TURN_ENDED.into());
         }
         if self.disconnected.load(Ordering::SeqCst) {
-            return Err(
-                "The browser is disconnected; the owner can reopen it in Iris’s computer.".into(),
-            );
+            return Err(DISCONNECTED.into());
         }
         if self.is_paused() {
             return Err("The owner paused Iris, so the browser is off.".into());
@@ -853,7 +873,7 @@ impl Browser {
         json!({
             "enabled": self.cfg.enabled,
             "disconnected": self.disconnected.load(Ordering::SeqCst),
-            "available": self.executable().is_some(),
+            "available": self.available(),
             "running": run.is_some(),
             "paused": self.is_paused(),
             "url": if run.is_some() { v.url } else { String::new() },
@@ -863,11 +883,10 @@ impl Browser {
             "busy": v.busy && run.is_some(),
             "active": self.active_turns(),
             "watchers": lock(&self.watchers).len(),
-            "streaming": run.as_ref().and_then(|r| r.casting()).is_some(),
+            "streaming": run.is_some() && self.casting.load(Ordering::SeqCst),
             "sandbox": run.as_ref().map(|r| !r.no_sandbox),
             "sandbox_unavailable": v.sandbox_unavailable,
             "allow_no_sandbox": self.allows_no_sandbox(),
-            "version": run.as_ref().map(|r| r.version.clone()),
             "error": v.error,
         })
     }
@@ -880,11 +899,18 @@ impl Browser {
         );
     }
 
-    /// Every page address and title shown in the app goes through here,
-    /// redacted (a page may echo a filled secret into either).
-    fn set_page_info(&self, run: &Running, url: Option<&str>, title: Option<&str>) {
-        let url = url.map(|u| run.redact(u));
-        let title = title.map(|t| run.redact(t));
+    fn set_page_info(&self, url: Option<&str>, title: Option<&str>) {
+        // A page may carry a saved secret in its address or title: never
+        // published, even to the owner's app.
+        let secrets = self.filled_secrets();
+        let hide = |t: &str| {
+            if secrets.is_empty() {
+                t.to_string()
+            } else {
+                hide_secrets(t, &secrets)
+            }
+        };
+        let (url, title) = (url.map(hide), title.map(hide));
         let (url, title) = (url.as_deref(), title.as_deref());
         let changed = {
             let mut v = lock(&self.view);
@@ -908,23 +934,43 @@ impl Browser {
         }
     }
 
+    /// Keep the app's address bar current from a tool result's page
+    /// header (`current_url` corrects it from the browser itself).
+    fn note_page(&self, result: &Value) {
+        let text = text_of(result);
+        let Some(page) = page_section(&text) else {
+            return;
+        };
+        let url = line_value(page, "- Page URL:");
+        let title = line_value(page, "- Page Title:");
+        if url.is_some() || title.is_some() {
+            self.set_page_info(url, title);
+        }
+    }
+
     // ------------------------------------------------------------ launch
 
-    /// The running browser, starting it if needed.
-    pub async fn ensure(&self) -> Result<Arc<Running>> {
+    /// Why the browser cannot be used right now, if it cannot.
+    fn usable(&self) -> Result<()> {
         if !self.cfg.enabled {
             return Err(
                 "the browser is turned off in the server's config ([browser] enabled)".into(),
             );
         }
         if self.disconnected.load(Ordering::SeqCst) {
-            return Err(
-                "The browser is disconnected; the owner can reopen it in Iris’s computer.".into(),
-            );
+            return Err(DISCONNECTED.into());
         }
         if self.is_paused() {
             return Err("Iris is paused".into());
         }
+        Ok(())
+    }
+
+    /// The running browser, starting it if needed.
+    pub async fn ensure(&self) -> Result<Arc<Running>> {
+        /// Learned once per run: this system cannot start Chrome's sandbox.
+        static NO_SANDBOX: AtomicBool = AtomicBool::new(false);
+        self.usable()?;
         if let Some(r) = self.running() {
             return Ok(r);
         }
@@ -933,115 +979,48 @@ impl Browser {
             return Err("the browser is being updated; try again in a minute".into());
         }
         // Pause may have come while waiting for the lock.
-        if self.disconnected.load(Ordering::SeqCst) {
-            return Err(
-                "The browser is disconnected; the owner can reopen it in Iris’s computer.".into(),
-            );
-        }
-        if self.is_paused() {
-            return Err("Iris is paused".into());
-        }
+        self.usable()?;
         if let Some(r) = self.running() {
             return Ok(r);
         }
-        let program = self.executable().ok_or(
-            "no browser is installed; set it up from Iris's computer in the app \
-             (or install Chromium on the server)",
-        )?;
-        crate::config::ensure_private_dir(&self.profile_dir)?;
-        crate::config::ensure_private_dir(&self.tmp_dir)?;
-        crate::info!("browser: starting {}", program.display());
-        let launched = launch::launch(&launch::LaunchOptions {
-            program: &program,
-            profile_dir: &self.profile_dir,
-            tmp_dir: &self.tmp_dir,
-            width: VIEW_W,
-            height: VIEW_H,
-            scale: SCALE,
-            allow_no_sandbox: self.allows_no_sandbox(),
-        })
-        .await;
-        let launched = match launched {
-            Ok(l) => l,
-            Err(e) => {
-                crate::warn!("browser: could not start: {e}");
-                {
-                    let mut v = lock(&self.view);
-                    v.sandbox_unavailable = e.to_string() == launch::SANDBOX_UNAVAILABLE;
-                    v.error = Some(e.to_string());
+        let server = self.server().ok_or(NOT_INSTALLED)?;
+        crate::info!("browser: starting {}", server.program.display());
+        let mut no_sandbox = self.allows_no_sandbox() && NO_SANDBOX.load(Ordering::Relaxed);
+        let run = loop {
+            match self.launch(&server, no_sandbox).await {
+                Ok(run) => break run,
+                Err(Start::Sandbox) if self.allows_no_sandbox() => {
+                    crate::warn!(
+                        "browser: Chrome's sandbox is unavailable on this system; running \
+                         without it (allowed by the owner)"
+                    );
+                    NO_SANDBOX.store(true, Ordering::Relaxed);
+                    no_sandbox = true;
                 }
-                self.broadcast_state();
-                return Err(e);
+                Err(e) => {
+                    let (sandbox, msg) = match e {
+                        Start::Sandbox => (true, SANDBOX_UNAVAILABLE.to_string()),
+                        Start::Failed(m) => (false, m),
+                    };
+                    crate::warn!("browser: could not start: {msg}");
+                    {
+                        let mut v = lock(&self.view);
+                        v.sandbox_unavailable = sandbox;
+                        v.error = Some(msg.clone());
+                    }
+                    self.broadcast_state();
+                    return Err(msg.into());
+                }
             }
         };
-        let cdp = launched.cdp.clone();
-        let version = cdp
-            .call("Browser.getVersion", json!({}), None)
-            .await
-            .ok()
-            .and_then(|v| v["product"].as_str().map(String::from))
-            .unwrap_or_default();
-        let run = Arc::new(Running {
-            cdp: cdp.clone(),
-            child: Mutex::new(Some(launched.child)),
-            page: Mutex::default(),
-            no_sandbox: launched.no_sandbox,
-            version,
-            cast: Mutex::new(None),
-            cast_lock: tokio::sync::Mutex::new(()),
-            attach_lock: tokio::sync::Mutex::new(()),
-            dialogs: Mutex::default(),
-            last_meta: Mutex::new((VIEW_W as f64, VIEW_H as f64)),
-            secrets: Mutex::default(),
-            originals: Mutex::default(),
-            secret_docs: Mutex::default(),
-            filled_tabs: Mutex::default(),
-            recover_lock: tokio::sync::Mutex::new(()),
-            seeded: AtomicBool::new(false),
-        });
-        let events = cdp.subscribe();
-        cdp.call("Target.setDiscoverTargets", json!({"discover": true}), None)
-            .await?;
-        let targets = cdp.call("Target.getTargets", json!({}), None).await?;
-        let first = targets["targetInfos"]
-            .as_array()
-            .and_then(|t| t.iter().find(|t| t["type"] == "page"))
-            .and_then(|t| t["targetId"].as_str())
-            .map(String::from);
-        let target = match first {
-            Some(t) => t,
-            None => cdp
-                .call("Target.createTarget", json!({"url": "about:blank"}), None)
-                .await?["targetId"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-        };
-        // Secrets first: nothing from a page is read or shown before the
-        // redactor knows them all.
-        if let Err(e) = self.seed(&run).await {
-            crate::warn!("browser: could not load its safety data: {e}");
-            Self::shut(&run).await;
-            return Err("the browser's safety data could not be read".into());
-        }
-        if let Err(e) = self.attach(&run, &target).await {
-            Self::shut(&run).await;
-            return Err(e);
-        }
         // Paused, or the owner took back running without the sandbox,
         // while it was starting: do not publish it.
-        if self.disconnected.load(Ordering::SeqCst) {
-            return Err(
-                "The browser is disconnected; the owner can reopen it in Iris’s computer.".into(),
-            );
-        }
-        if self.is_paused() {
-            Self::shut(&run).await;
-            return Err("Iris is paused".into());
-        }
-        if run.no_sandbox && !self.allows_no_sandbox() {
-            Self::shut(&run).await;
-            return Err(launch::SANDBOX_UNAVAILABLE.into());
+        let stop = self.usable().err().or_else(|| {
+            (run.no_sandbox && !self.allows_no_sandbox()).then(|| SANDBOX_UNAVAILABLE.into())
+        });
+        if let Some(e) = stop {
+            self.shut(&run).await;
+            return Err(e);
         }
         {
             let mut v = lock(&self.view);
@@ -1050,11 +1029,22 @@ impl Browser {
             v.url = "about:blank".into();
             v.title = String::new();
         }
+        // Saved secrets are hidden from the first result on (a site may
+        // show one it kept from an earlier visit); read before the browser
+        // is published to anyone.
+        let source = lock(&self.secret_source).clone();
+        let saved = match source {
+            Some(f) => tokio::task::spawn_blocking(move || f())
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        *lock(&self.private) = Private {
+            secrets: saved,
+            ..Private::default()
+        };
         *lock(&self.running) = Some(run.clone());
         self.last_used.store(now_ms(), Ordering::SeqCst);
-        let b = self.clone();
-        let r = run.clone();
-        tokio::spawn(async move { b.event_loop(r, events).await });
         let b = self.clone();
         let r = run.clone();
         tokio::spawn(async move { b.idle_loop(r).await });
@@ -1064,113 +1054,195 @@ impl Browser {
         Ok(run)
     }
 
-    /// Attach to a page target and make it the current tab.
-    pub async fn attach(&self, run: &Running, target_id: &str) -> Result<()> {
-        self.attach_if(run, target_id, None, &|| Ok(())).await
-    }
-
-    /// Tab switch by the agent: abandoned if it lost control meanwhile.
-    pub async fn attach_guarded(
+    /// Start the server with Iris's config at `config` (its own file, so
+    /// a second server only asked for its tool list never changes the
+    /// running one's).
+    async fn start_server(
         &self,
-        run: &Running,
-        target_id: &str,
-        guard: &(dyn Fn() -> Result<()> + Sync),
-    ) -> Result<()> {
-        self.attach_if(run, target_id, None, guard).await
-    }
-
-    /// Attach, but only if the current tab is still `expect` (when given):
-    /// another path may already have switched tabs.
-    async fn attach_if(
-        &self,
-        run: &Running,
-        target_id: &str,
-        expect: Option<&str>,
-        guard: &(dyn Fn() -> Result<()> + Sync),
-    ) -> Result<()> {
-        let _g = run.attach_lock.lock().await;
-        let current = run.page().target_id;
-        if current == target_id || expect.is_some_and(|e| e != current) {
-            return Ok(());
+        server: &launch::Server,
+        no_sandbox: bool,
+        config: &Path,
+    ) -> Result<Upstream> {
+        for dir in [&self.profile_dir, &self.work_dir] {
+            crate::config::ensure_private_dir(dir)?;
         }
-        let cdp = &run.cdp;
-        let a = cdp
-            .call(
-                "Target.attachToTarget",
-                json!({"targetId": target_id, "flatten": true}),
-                None,
+        if let Some(dir) = config.parent() {
+            crate::config::ensure_private_dir(dir)?;
+        }
+        let cfg = launch::config(server, &self.profile_dir, &self.out_dir, no_sandbox);
+        crate::config::write_private_file(config, cfg.to_string().as_bytes())?;
+        Upstream::start(
+            launch::command(server, config, &self.work_dir),
+            START_TIMEOUT,
+        )
+        .await
+        .map_err(|e| format!("the browser server did not start: {e}").into())
+    }
+
+    /// Start the server and Chromium (which otherwise starts on the first
+    /// call), so problems show here.
+    async fn launch(
+        &self,
+        server: &launch::Server,
+        no_sandbox: bool,
+    ) -> std::result::Result<Arc<Running>, Start> {
+        // Nothing of an earlier session's output or typed form data stays.
+        let _ = std::fs::remove_dir_all(&self.out_dir);
+        launch::clear_session_files(&self.profile_dir);
+        if let Err(e) = launch::set_profile_prefs(&self.profile_dir) {
+            crate::warn!("browser: could not set profile preferences: {e}");
+        }
+        let up = self
+            .start_server(server, no_sandbox, &self.config_file)
+            .await
+            .map_err(|e| Start::Failed(e.to_string()))?;
+        let opened = up
+            .call_tool("browser_tabs", &json!({"action": "list"}), START_TIMEOUT)
+            .await;
+        let problem = match &opened {
+            Ok(r) if !is_error(r) => None,
+            Ok(r) => Some(text_of(r)),
+            Err(e) => Some(format!("{e}\n{}", up.stderr_tail())),
+        };
+        if let Some(text) = problem {
+            up.close().await;
+            return Err(if !no_sandbox && launch::sandbox_failure(&text) {
+                Start::Sandbox
+            } else {
+                Start::Failed(launch::explain_failure(&text))
+            });
+        }
+        Ok(Arc::new(Running { up, no_sandbox }))
+    }
+
+    /// One call to the server, for Iris itself or forwarded for the agent
+    /// (the result as the server sent it).
+    pub(crate) async fn tool(
+        &self,
+        run: &Running,
+        name: &str,
+        args: &Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let r = run.up.call_tool(name, args, timeout).await;
+        // Nothing Playwright writes is for anyone: screenshots come back
+        // inline, and its console logs may hold what a page printed.
+        self.clear_output();
+        let r = r.map_err(|e| format!("the browser did not answer ({e})"))?;
+        self.note_page(&r);
+        Ok(r)
+    }
+
+    /// Empty Playwright's output folder (it is recreated as needed). Also
+    /// run once a minute and after an abandoned call, for files written
+    /// after their call stopped waiting.
+    pub(crate) fn clear_output(&self) {
+        for e in std::fs::read_dir(&self.out_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let p = e.path();
+            let _ = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            };
+        }
+    }
+
+    /// Run Iris's own fixed Playwright code (never the agent's) and read
+    /// its JSON result.
+    pub(crate) async fn run_code(&self, run: &Running, code: &str) -> Result<Value> {
+        let r = self
+            .tool(
+                run,
+                "browser_run_code_unsafe",
+                &json!({"code": code}),
+                QUICK,
             )
             .await?;
-        let session = a["sessionId"]
-            .as_str()
-            .ok_or("could not attach to the tab")?
-            .to_string();
-        let s = Some(session.as_str());
-        cdp.call("Page.enable", json!({}), s).await?;
-        // Behave like the focused window it is to the user: pages get focus
-        // events (headless pages otherwise never do).
-        let _ = cdp
-            .call(
-                "Emulation.setFocusEmulationEnabled",
-                json!({"enabled": true}),
-                s,
-            )
-            .await;
-        let ua = cdp
-            .call("Browser.getVersion", json!({}), None)
-            .await
-            .ok()
-            .and_then(|v| v["userAgent"].as_str().map(String::from))
-            .unwrap_or_default();
-        if ua.contains("HeadlessChrome") {
-            // Some sites refuse "headless" browsers outright.
-            let _ = cdp
-                .call(
-                    "Emulation.setUserAgentOverride",
-                    json!({"userAgent": ua.replace("HeadlessChrome", "Chrome")}),
-                    s,
-                )
-                .await;
+        let text = ok_text(&r)?;
+        self.remove_output(&text);
+        result_value(&text).ok_or_else(|| "the browser gave no answer".into())
+    }
+
+    /// The current tab: its address and title (from the browser, not from
+    /// anything the page wrote) and whether the owner typed private
+    /// details into this document.
+    pub(crate) async fn page_info(&self, run: &Running) -> Result<(String, bool)> {
+        let v = self.run_code(run, PAGE_CODE).await?;
+        let url = v["url"].as_str().ok_or("the browser has no open page")?;
+        self.set_page_info(Some(url), v["title"].as_str());
+        Ok((url.to_string(), v["private"] == true))
+    }
+
+    /// The current tab's address.
+    pub(crate) async fn current_url(&self, run: &Running) -> Result<String> {
+        Ok(self.page_info(run).await?.0)
+    }
+
+    /// The focused field (`FIELD_FN`); with `mark`, a private one closes
+    /// the page to the agent before anything is typed.
+    pub(crate) async fn focused_field(
+        &self,
+        run: &Running,
+        mark: bool,
+        force: bool,
+    ) -> Result<Field> {
+        let v = self.run_code(run, &field_code(mark, force)).await?;
+        let field = Field {
+            url: v["url"]
+                .as_str()
+                .ok_or("the browser has no open page")?
+                .into(),
+            private: v["private"] != false,
+            frame: v["frame"] != false,
+        };
+        if mark && field.private {
+            self.remember_private(&field.url);
         }
-        if let Err(e) = guard() {
-            let _ = cdp
-                .call(
-                    "Target.detachFromTarget",
-                    json!({"sessionId": session}),
-                    None,
-                )
-                .await;
-            return Err(e);
+        Ok(field)
+    }
+
+    /// Keep the agent off this address (see `private_page`).
+    pub(crate) fn remember_private(&self, url: &str) {
+        let mut p = lock(&self.private);
+        let key = page_key(url).to_string();
+        if !p.pages.contains(&key) {
+            if p.pages.len() >= PRIVATE_PAGES_MAX {
+                p.pages.remove(0);
+            }
+            p.pages.push(key);
         }
-        let old = std::mem::replace(
-            &mut *lock(&run.page),
-            PageRef {
-                target_id: target_id.to_string(),
-                session_id: session.clone(),
-            },
-        );
-        if !old.session_id.is_empty() {
-            let _ = cdp
-                .call(
-                    "Target.detachFromTarget",
-                    json!({"sessionId": old.session_id}),
-                    None,
-                )
-                .await;
+    }
+
+    /// The server's tools the agent may use. Asked once per install (a
+    /// short-lived server answers when the browser is closed; Chromium does
+    /// not start for it).
+    pub async fn tool_list(&self) -> Result<Vec<Value>> {
+        if let Some(t) = lock(&self.tools).clone() {
+            return Ok(t);
         }
-        // Move the screencast to the new tab if someone is watching.
-        self.update_screencast();
-        if let Ok(info) = cdp
-            .call("Target.getTargetInfo", json!({"targetId": target_id}), None)
-            .await
-        {
-            self.set_page_info(
-                run,
-                info["targetInfo"]["url"].as_str(),
-                info["targetInfo"]["title"].as_str(),
-            );
+        let _g = self.list_lock.lock().await;
+        if let Some(t) = lock(&self.tools).clone() {
+            return Ok(t);
         }
-        Ok(())
+        let all = match self.running() {
+            Some(run) => run.up.list_tools(QUICK).await,
+            None => {
+                let server = self.server().ok_or(NOT_INSTALLED)?;
+                let config = self.config_file.with_file_name("playwright-tools.json");
+                let up = self.start_server(&server, false, &config).await?;
+                let all = up.list_tools(QUICK).await;
+                up.close().await;
+                all
+            }
+        }
+        .map_err(|e| format!("the browser did not list its tools ({e})"))?;
+        let tools = tools::allowed_definitions(all);
+        *lock(&self.tools) = Some(tools.clone());
+        Ok(tools)
     }
 
     /// Close the browser (gracefully, so the profile and cookies are saved).
@@ -1183,11 +1255,8 @@ impl Browser {
             return;
         };
         crate::info!("browser: closing");
-        Self::shut(&run).await;
-        launch::clear_session_files(&self.profile_dir);
-        self.control.send_replace(Control::Agent);
-        self.frames.send_replace(None);
-        self.broadcast_state();
+        self.shut(&run).await;
+        self.closed();
     }
 
     /// Close `run` only if it is still the browser and still idle, checked
@@ -1197,7 +1266,21 @@ impl Browser {
         let current = lock(&self.running)
             .as_ref()
             .is_some_and(|r| Arc::ptr_eq(r, run));
-        let busy = lock(&self.turns)
+        if !current {
+            return true;
+        }
+        if self.in_use(idle_ms) {
+            return false;
+        }
+        crate::info!("browser: idle; closing to free memory");
+        lock(&self.running).take();
+        self.shut(run).await;
+        self.closed();
+        true
+    }
+
+    fn in_use(&self, idle_ms: i64) -> bool {
+        lock(&self.turns)
             .values()
             .any(|t| t.used.load(Ordering::SeqCst))
             || !lock(&self.watchers).is_empty()
@@ -1207,275 +1290,80 @@ impl Browser {
                     .last_used
                     .load(Ordering::SeqCst)
                     .max(self.last_input.load(Ordering::SeqCst))
-                <= idle_ms;
-        if !current || busy {
-            return !current;
-        }
-        crate::info!("browser: idle; closing to free memory");
-        lock(&self.running).take();
-        Self::shut(run).await;
-        launch::clear_session_files(&self.profile_dir);
-        self.frames.send_replace(None);
-        self.broadcast_state();
-        true
+                <= idle_ms
     }
 
-    async fn shut(run: &Running) {
+    async fn shut(&self, run: &Running) {
         let _ = run
-            .cdp
-            .call_timeout("Browser.close", json!({}), None, Duration::from_secs(2))
+            .up
+            .call_tool("browser_close", &json!({}), Duration::from_secs(5))
             .await;
-        let child = lock(&run.child).take();
-        if let Some(mut child) = child
-            && tokio::time::timeout(Duration::from_secs(3), child.wait())
-                .await
-                .is_err()
-        {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
+        run.up.close().await;
+    }
+
+    /// After the browser is gone: no session files or output stay, and
+    /// nobody is in control of it.
+    fn closed(&self) {
+        launch::clear_session_files(&self.profile_dir);
+        let _ = std::fs::remove_dir_all(&self.out_dir);
+        *lock(&self.private) = Private::default();
+        self.control.send_replace(Control::Agent);
+        self.frames.send_replace(None);
+        self.broadcast_state();
     }
 
     async fn idle_loop(&self, run: Arc<Running>) {
         let idle_ms = (self.cfg.idle_mins as i64) * 60_000;
+        // Once a minute (a server that died is already skipped by
+        // `running()`; this only tidies up after it).
         loop {
-            tokio::select! {
-                _ = run.cdp.wait_closed() => break,
-                _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            if !run.alive() {
+                break;
             }
-            let now = now_ms();
+            self.clear_output();
             if let Control::User { .. } = self.control()
-                && now - self.last_input.load(Ordering::SeqCst) > TAKEOVER_IDLE_MS
+                && now_ms() - self.last_input.load(Ordering::SeqCst) > TAKEOVER_IDLE_MS
             {
                 crate::info!("browser: take-over idle; handing control back");
                 self.hand_back();
             }
-            let in_turn = lock(&self.turns)
-                .values()
-                .any(|t| t.used.load(Ordering::SeqCst));
-            let watched = !lock(&self.watchers).is_empty();
-            let user = self.control() != Control::Agent;
-            let last = self
-                .last_used
-                .load(Ordering::SeqCst)
-                .max(self.last_input.load(Ordering::SeqCst));
-            if !in_turn
-                && !watched
-                && !user
-                && now - last > idle_ms
-                && self.close_if_idle(&run, idle_ms).await
-            {
-                break;
+            if !self.in_use(idle_ms) && self.close_if_idle(&run, idle_ms).await {
+                return;
             }
         }
         // Crashed or closed: forget it so the next use starts a fresh one.
-        let mut cur = lock(&self.running);
-        if cur.as_ref().is_some_and(|r| Arc::ptr_eq(r, &run)) {
-            *cur = None;
-            drop(cur);
-            self.frames.send_replace(None);
-            self.control.send_replace(Control::Agent);
-            self.broadcast_state();
-        }
-    }
-
-    // ------------------------------------------------------------ events
-
-    async fn event_loop(&self, run: Arc<Running>, mut rx: broadcast::Receiver<Arc<Event>>) {
-        loop {
-            let ev = tokio::select! {
-                ev = rx.recv() => match ev {
-                    Ok(ev) => ev,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
-                _ = run.cdp.wait_closed() => break,
-            };
-            let page = run.page();
-            let current = ev.session_id.as_deref() == Some(page.session_id.as_str());
-            match ev.method.as_str() {
-                "Page.screencastFrame" if current => self.on_frame(&run, &ev.params, &page),
-                "Page.screencastFrame" => {
-                    // A frame from a tab we left: acknowledge so it stops.
-                    run.cdp.send(
-                        "Page.screencastFrameAck",
-                        json!({"sessionId": ev.params["sessionId"]}),
-                        ev.session_id.as_deref(),
-                    );
-                }
-                "Page.javascriptDialogOpening" if current => {
-                    let kind = ev.params["type"].as_str().unwrap_or("alert");
-                    // Dialog text is page-controlled and may transform a filled
-                    // secret. Report only the outcome, never its contents.
-                    // Alerts and confirms follow from what was just clicked;
-                    // prompts would need text, so they are dismissed.
-                    let accept = kind != "prompt";
-                    {
-                        // A page can open dialogs endlessly: keep a few.
-                        let mut d = lock(&run.dialogs);
-                        if d.len() >= 5 {
-                            d.remove(0);
-                        }
-                        d.push(format!(
-                            "{kind} was {}",
-                            if accept { "accepted" } else { "dismissed" }
-                        ));
-                    }
-                    let cdp = run.cdp.clone();
-                    let s = page.session_id.clone();
-                    tokio::spawn(async move {
-                        let _ = cdp
-                            .call(
-                                "Page.handleJavaScriptDialog",
-                                json!({"accept": accept}),
-                                Some(&s),
-                            )
-                            .await;
-                    });
-                }
-                "Target.targetInfoChanged" => {
-                    let info = &ev.params["targetInfo"];
-                    if info["targetId"].as_str() == Some(page.target_id.as_str()) {
-                        self.set_page_info(&run, info["url"].as_str(), info["title"].as_str());
-                    }
-                }
-                "Target.targetCreated" => {
-                    let info = &ev.params["targetInfo"];
-                    // A link or script opened a new tab from the current
-                    // one: follow it, like a person would.
-                    if info["type"] == "page"
-                        && info["openerId"].as_str() == Some(page.target_id.as_str())
-                        && let Some(t) = info["targetId"].as_str()
-                    {
-                        let (b, r, t) = (self.clone(), run.clone(), t.to_string());
-                        tokio::spawn(async move {
-                            let _ = b.attach(&r, &t).await;
-                        });
-                    }
-                }
-                "Target.targetDestroyed" | "Target.detachedFromTarget" => {
-                    let gone = ev.params["targetId"].as_str() == Some(page.target_id.as_str())
-                        || ev.params["sessionId"].as_str() == Some(page.session_id.as_str());
-                    if gone {
-                        let (b, r, t) = (self.clone(), run.clone(), page.target_id.clone());
-                        tokio::spawn(async move {
-                            let _ = b.switch_to_any(&r, &t).await;
-                        });
-                    }
-                }
-                _ => {}
+        let mine = {
+            let mut cur = lock(&self.running);
+            let mine = cur.as_ref().is_some_and(|r| Arc::ptr_eq(r, &run));
+            if mine {
+                *cur = None;
             }
-        }
-    }
-
-    /// The tab `gone` closed: use another one (or open a blank tab). Runs
-    /// once however many paths notice; a no-op if it was already replaced.
-    pub async fn switch_to_any(&self, run: &Running, gone: &str) -> Result<()> {
-        let _g = run.recover_lock.lock().await;
-        if run.page().target_id != gone {
-            return Ok(());
-        }
-        let current = gone.to_string();
-        let targets = run.cdp.call("Target.getTargets", json!({}), None).await?;
-        let other = targets["targetInfos"]
-            .as_array()
-            .and_then(|t| {
-                t.iter()
-                    .find(|t| t["type"] == "page" && t["targetId"].as_str() != Some(&current))
-            })
-            .and_then(|t| t["targetId"].as_str())
-            .map(String::from);
-        let target = match other {
-            Some(t) => t,
-            None => run
-                .cdp
-                .call("Target.createTarget", json!({"url": "about:blank"}), None)
-                .await?["targetId"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
+            mine
         };
-        self.attach_if(run, &target, Some(gone), &|| Ok(())).await
-    }
-
-    fn on_frame(&self, run: &Arc<Running>, p: &Value, page: &PageRef) {
-        let ack_id = p["sessionId"].clone();
-        let meta = &p["metadata"];
-        let (w, h) = (
-            meta["deviceWidth"].as_f64().unwrap_or(VIEW_W as f64),
-            meta["deviceHeight"].as_f64().unwrap_or(VIEW_H as f64),
-        );
-        *lock(&run.last_meta) = (w, h);
-        let mode = lock(&run.cast)
-            .as_ref()
-            .filter(|(s, _)| *s == page.session_id)
-            .map(|(_, m)| *m);
-        if let (Some(mode), Some(data)) = (mode, p["data"].as_str()) {
-            self.publish_frame(mode, w, h, data);
+        if mine {
+            crate::warn!("browser: the browser server stopped");
+            run.up.close().await;
+            self.closed();
         }
-        // Acknowledge at once: the browser drops frames while acks are
-        // outstanding, which could leave a stale picture once the page goes
-        // still. Each app socket is throttled instead (ws.rs), always
-        // ending on the newest frame.
-        run.cdp.send(
-            "Page.screencastFrameAck",
-            json!({"sessionId": ack_id}),
-            Some(&page.session_id),
-        );
-    }
-
-    fn publish_frame(&self, mode: Mode, w: f64, h: f64, data: &str) {
-        let seq = self.frame_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let json = json!({
-            "type": "browser.frame",
-            "seq": seq,
-            "mode": if mode == Mode::Full { "full" } else { "peek" },
-            "width": w,
-            "height": h,
-            "data": data,
-        })
-        .to_string();
-        self.frames.send_replace(Some(Arc::new(Frame { json })));
-    }
-
-    /// The screencast only sends frames when the page changes, so a new
-    /// watcher of a still page gets one picture taken right away.
-    async fn publish_still(&self, run: &Running, mode: Mode) -> Result<()> {
-        let page = run.page();
-        let s = Some(page.session_id.as_str());
-        let m = run.cdp.call("Page.getLayoutMetrics", json!({}), s).await?;
-        let vv = &m["cssVisualViewport"];
-        let (w, h) = (
-            vv["clientWidth"].as_f64().unwrap_or(VIEW_W as f64),
-            vv["clientHeight"].as_f64().unwrap_or(VIEW_H as f64),
-        );
-        let scale = (mode.max_width() as f64 / (w * SCALE)).min(1.0);
-        // Bounded: a page that never paints must not hold up the live view.
-        let shot = run
-            .cdp
-            .call_timeout(
-                "Page.captureScreenshot",
-                json!({"format": "jpeg", "quality": mode.quality(), "clip": {
-                    "x": vv["pageX"].as_f64().unwrap_or(0.0),
-                    "y": vv["pageY"].as_f64().unwrap_or(0.0),
-                    "width": w, "height": h, "scale": scale}}),
-                s,
-                Duration::from_secs(3),
-            )
-            .await?;
-        if let Some(data) = shot["data"].as_str() {
-            self.publish_frame(mode, w, h, data);
-        }
-        Ok(())
     }
 
     // ----------------------------------------------------------- watching
 
-    /// Start watching (one per app socket). Frames arrive through the
-    /// returned receiver; dropping the guard stops watching.
-    pub fn watch(&self, mode: Mode) -> (WatchGuard, watch::Receiver<Option<Arc<Frame>>>) {
+    /// Start watching (one per app socket), with pictures `width` device
+    /// pixels wide (the viewer's size on screen; the mode's default if not
+    /// given). Frames arrive through the returned receiver; dropping the
+    /// guard stops watching.
+    pub fn watch(
+        &self,
+        mode: Mode,
+        width: Option<u32>,
+    ) -> (WatchGuard, watch::Receiver<Option<Arc<Frame>>>) {
         let id = self.next_watcher.fetch_add(1, Ordering::SeqCst);
-        lock(&self.watchers).insert(id, mode);
+        let width = width
+            .unwrap_or(mode.default_width())
+            .clamp(FRAME_MIN_W, FRAME_MAX_W);
+        lock(&self.watchers).insert(id, (mode, width));
         self.update_screencast();
         (
             WatchGuard {
@@ -1486,52 +1374,115 @@ impl Browser {
         )
     }
 
-    /// Start, restart, or stop the screencast to match the watchers.
+    /// Run the live view while anyone watches the running browser.
     fn update_screencast(&self) {
         let Some(run) = self.running() else {
             return;
         };
+        if lock(&self.watchers).is_empty() || self.casting.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let b = self.clone();
-        tokio::spawn(async move { b.reconcile_screencast(&run).await });
+        tokio::spawn(async move {
+            b.cast(&run).await;
+            b.casting.store(false, Ordering::SeqCst);
+            // A watcher may have come just as the loop ended.
+            if !lock(&b.watchers).is_empty() {
+                b.update_screencast();
+            }
+        });
     }
 
-    /// One change at a time, always toward the latest wish: the best mode
-    /// any watcher wants, on the current tab.
-    async fn reconcile_screencast(&self, run: &Running) {
-        let _g = run.cast_lock.lock().await;
-        let want = lock(&self.watchers).values().copied().max();
-        let page = run.page();
-        if page.session_id.is_empty() {
-            return;
-        }
-        let have = lock(&run.cast).clone();
-        let target = want.map(|m| (page.session_id.clone(), m));
-        if have == target {
-            return;
-        }
-        let cdp = &run.cdp;
-        // A screencast on a tab we left ended when we detached from it.
-        if let Some((sess, _)) = &have
-            && *sess == page.session_id
-        {
-            let _ = cdp.call("Page.stopScreencast", json!({}), Some(sess)).await;
-        }
-        *lock(&run.cast) = None;
-        if let Some(m) = want {
-            let w = m.max_width();
-            let started = cdp
-                .call(
-                    "Page.startScreencast",
-                    json!({"format": "jpeg", "quality": m.quality(), "maxWidth": w,
-                           "maxHeight": w * 2, "everyNthFrame": 1}),
-                    Some(&page.session_id),
+    /// Pictures of the current tab at the best mode and the largest width
+    /// anyone watches, published only when the picture changed. The page
+    /// header refreshes every couple of seconds.
+    async fn cast(&self, run: &Arc<Running>) {
+        use std::hash::{Hash, Hasher};
+        let mut last: Option<(Mode, u32, u64)> = None;
+        let mut header_at: Option<tokio::time::Instant> = None;
+        loop {
+            let (mode, width) = {
+                let w = lock(&self.watchers);
+                let Some(mode) = w.values().map(|(m, _)| *m).max() else {
+                    return;
+                };
+                (
+                    mode,
+                    w.values().map(|(_, px)| *px).max().unwrap_or(FRAME_MAX_W),
                 )
-                .await;
-            if started.is_ok() {
-                *lock(&run.cast) = target;
-                let _ = self.publish_still(run, m).await;
+            };
+            if !self.is_current(run) {
+                return;
+            }
+            let started = tokio::time::Instant::now();
+            if header_at.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
+                header_at = Some(started);
+                let _ = self.current_url(run).await;
+                // A sign-in window the page opened while the owner is in
+                // control: show it to them (if no input is running).
+                if matches!(self.control(), Control::User { .. })
+                    && let Ok(_op) = self.op_lock.try_lock()
+                {
+                    let _ = self.follow_new_tab(run).await;
+                }
+            }
+            let shot = self.run_code(run, &frame_code(width, mode.quality())).await;
+            if let Ok(Value::String(data)) = shot {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                data.hash(&mut h);
+                let key = (mode, width, h.finish());
+                if last != Some(key) {
+                    last = Some(key);
+                    self.publish_frame(mode, &data);
+                }
+            }
+            tokio::time::sleep(mode.min_interval().saturating_sub(started.elapsed())).await;
+        }
+    }
+
+    fn is_current(&self, run: &Arc<Running>) -> bool {
+        run.alive()
+            && lock(&self.running)
+                .as_ref()
+                .is_some_and(|r| Arc::ptr_eq(r, run))
+    }
+
+    /// Playwright saves every screenshot to its output folder; the live
+    /// view's are deleted right away (`- [Screenshot ...](out/page-....jpeg)`).
+    fn remove_output(&self, text: &str) {
+        for line in text.lines() {
+            let Some(start) = line.find("](") else {
+                continue;
+            };
+            let Some(rel) = line[start + 2..].strip_suffix(')') else {
+                continue;
+            };
+            let rel = Path::new(rel);
+            let plain = rel.components().all(|c| {
+                matches!(
+                    c,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            });
+            let path = self.work_dir.join(rel);
+            if plain && path.starts_with(&self.out_dir) {
+                let _ = std::fs::remove_file(path);
             }
         }
+    }
+
+    fn publish_frame(&self, mode: Mode, data: &str) {
+        let seq = self.frame_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let json = json!({
+            "type": "browser.frame",
+            "seq": seq,
+            "mode": if mode == Mode::Full { "full" } else { "peek" },
+            "width": VIEW_W,
+            "height": VIEW_H,
+            "data": data,
+        })
+        .to_string();
+        self.frames.send_replace(Some(Arc::new(Frame { json })));
     }
 
     // ----------------------------------------------------------- take over
@@ -1539,12 +1490,24 @@ impl Browser {
     pub async fn take_over(&self, user_id: &str, device_id: &str) -> Result<()> {
         self.ensure().await?;
         self.last_input.store(now_ms(), Ordering::SeqCst);
+        lock(&self.private).field_checked = None;
         self.control.send_replace(Control::User {
             user_id: user_id.into(),
             device_id: device_id.into(),
         });
         crate::info!("browser: owner took over");
         self.broadcast_state();
+        // The owner gets the tab the agent was on (it selects a sign-in
+        // window before asking); tabs open now are not new.
+        let b = self.clone();
+        tokio::spawn(async move {
+            let _op = b.op_lock.lock().await;
+            if let Some(run) = b.running()
+                && let Ok(n) = b.count_tabs(&run).await
+            {
+                lock(&b.private).tabs = n;
+            }
+        });
         Ok(())
     }
 
@@ -1561,48 +1524,152 @@ impl Browser {
         self.broadcast_state();
     }
 
+    /// The user in control from `device_id` (an error if that device does
+    /// not have control).
+    pub(crate) fn controller(&self, device_id: &str) -> Result<String> {
+        match self.control() {
+            Control::User {
+                user_id,
+                device_id: d,
+            } if d == device_id => Ok(user_id),
+            _ => Err("take over first".into()),
+        }
+    }
+
+    /// Run the owner's input on the page: in control from `device_id`,
+    /// one input at a time.
+    pub(crate) async fn owner_input<'a>(
+        &'a self,
+        device_id: &str,
+    ) -> Result<(Arc<Running>, tokio::sync::MutexGuard<'a, ()>)> {
+        self.controller(device_id)?;
+        let run = self.running().ok_or("the browser is not running")?;
+        self.last_input.store(now_ms(), Ordering::SeqCst);
+        let op = self.op_lock.lock().await;
+        // Control may have changed while waiting.
+        self.controller(device_id)?;
+        Ok((run, op))
+    }
+
+    /// One of Iris's own calls for the owner; its result only matters as
+    /// success or a short error. A dialog or file picker the page opened
+    /// is answered first (the owner cannot see either in the live view),
+    /// and the call is tried again if it was refused because of it.
+    async fn act(&self, run: &Running, name: &str, args: Value) -> Result<()> {
+        let mut r = self.tool(run, name, &args, CALL_TIMEOUT).await?;
+        self.remove_output(&text_of(&r));
+        if self.answer_modal(run, &text_of(&r), true).await && is_error(&r) {
+            r = self.tool(run, name, &args, CALL_TIMEOUT).await?;
+            self.remove_output(&text_of(&r));
+            self.answer_modal(run, &text_of(&r), true).await;
+        }
+        ok_text(&r).map(|_| ())
+    }
+
+    /// Answer what blocks the page, as Iris always has: alerts and
+    /// confirmations are accepted (they follow from what was just tapped),
+    /// prompts dismissed (they would need text), and file pickers
+    /// cancelled (files on the server are never uploaded). Whether
+    /// anything was answered. Dialogs only with `dialogs` (the agent
+    /// answers its own).
+    pub(crate) async fn answer_modal(&self, run: &Running, text: &str, dialogs: bool) -> bool {
+        let Some(modal) = text.find("### Modal state").map(|i| &text[i..]) else {
+            return false;
+        };
+        let mut answered = false;
+        if modal.contains("can be handled by browser_file_upload") {
+            let r = self
+                .tool(run, "browser_file_upload", &json!({}), QUICK)
+                .await;
+            if let Ok(r) = &r {
+                self.remove_output(&text_of(r));
+            }
+            answered |= r.is_ok_and(|r| !is_error(&r));
+        }
+        if let Some(line) = modal
+            .lines()
+            .find(|l| dialogs && l.contains("can be handled by browser_handle_dialog"))
+        {
+            let accept = !line.trim_start().starts_with("- [\"prompt\"");
+            let r = self
+                .tool(
+                    run,
+                    "browser_handle_dialog",
+                    &json!({"accept": accept}),
+                    QUICK,
+                )
+                .await;
+            if let Ok(r) = &r {
+                self.remove_output(&text_of(r));
+            }
+            answered |= r.is_ok_and(|r| !is_error(&r));
+        }
+        answered
+    }
+
+    async fn count_tabs(&self, run: &Running) -> Result<usize> {
+        let r = self
+            .tool(run, "browser_tabs", &json!({"action": "list"}), QUICK)
+            .await?;
+        Ok(tab_count(&ok_text(&r)?))
+    }
+
+    /// While the owner is in control, a tab the page opened (a sign-in or
+    /// payment window) becomes the one they see and use. Call with the
+    /// page held (`op_lock`).
+    async fn follow_new_tab(&self, run: &Running) -> Result<()> {
+        let n = self.count_tabs(run).await?;
+        let seen = std::mem::replace(&mut lock(&self.private).tabs, n);
+        if n > seen && n > 1 && matches!(self.control(), Control::User { .. }) {
+            self.act(
+                run,
+                "browser_tabs",
+                json!({"action": "select", "index": n - 1}),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Input from the owner's phone while they have control. Coordinates
     /// are fractions (0..1) of the live view image.
     pub async fn user_input(&self, device_id: &str, ev: &Value) -> Result<()> {
-        match self.control() {
-            Control::User { device_id: d, .. } if d == device_id => {}
-            _ => return Err("take over first".into()),
-        }
-        let run = self.running().ok_or("the browser is not running")?;
-        self.last_input.store(now_ms(), Ordering::SeqCst);
-        let page = run.page();
-        let s = Some(page.session_id.as_str());
-        let (w, h) = *lock(&run.last_meta);
+        let (run, _op) = self.owner_input(device_id).await?;
         let frac = |k: &str| {
             ev[k]
                 .as_f64()
                 .filter(|v| v.is_finite())
                 .map(|v| v.clamp(0.0, 1.0))
         };
-        let cdp = &run.cdp;
-        // Control may change while an input is under way: check before
-        // every step.
-        let still = || match self.control() {
-            Control::User { device_id: d, .. } if d == device_id => Ok(()),
-            _ => Err::<(), crate::util::BoxError>("take over first".into()),
-        };
-        match ev["kind"].as_str().unwrap_or("") {
+        let still = || self.controller(device_id).map(|_| ());
+        let kind = ev["kind"].as_str().unwrap_or("");
+        if kind != "text" && kind != "scroll" {
+            // Focus may move: check the field again before more typing.
+            lock(&self.private).field_checked = None;
+        }
+        match kind {
             "tap" => {
-                let (x, y) = (
-                    frac("x").ok_or("x is required")? * w,
-                    frac("y").ok_or("y is required")? * h,
-                );
-                tools::click_at(cdp, s, x, y, &still).await?;
+                let x = frac("x").ok_or("x is required")? * VIEW_W as f64;
+                let y = frac("y").ok_or("y is required")? * VIEW_H as f64;
+                // One click (not down and up): Playwright stops waiting for
+                // it when the page opens a dialog.
+                self.act(&run, "browser_mouse_click_xy", json!({"x": x, "y": y}))
+                    .await?;
+                // The tap may have opened a window (followed later too, by
+                // the live view, if it opens slowly).
+                let _ = self.follow_new_tab(&run).await;
             }
             "scroll" => {
-                let x = frac("x").unwrap_or(0.5) * w;
-                let y = frac("y").unwrap_or(0.5) * h;
-                let dy = ev["dy"].as_f64().unwrap_or(0.0).clamp(-4000.0, 4000.0);
-                let dx = ev["dx"].as_f64().unwrap_or(0.0).clamp(-4000.0, 4000.0);
-                cdp.call(
-                    "Input.dispatchMouseEvent",
-                    json!({"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy}),
-                    s,
+                let x = frac("x").unwrap_or(0.5) * VIEW_W as f64;
+                let y = frac("y").unwrap_or(0.5) * VIEW_H as f64;
+                let delta = |k: &str| ev[k].as_f64().unwrap_or(0.0).clamp(-4000.0, 4000.0);
+                self.act(&run, "browser_mouse_move_xy", json!({"x": x, "y": y}))
+                    .await?;
+                still()?;
+                self.act(
+                    &run,
+                    "browser_mouse_wheel",
+                    json!({"deltaX": delta("dx"), "deltaY": delta("dy")}),
                 )
                 .await?;
             }
@@ -1611,27 +1678,113 @@ impl Browser {
                 if text.chars().count() > 2000 {
                     return Err("text is too long".into());
                 }
-                if !text.is_empty() {
-                    cdp.call("Input.insertText", json!({"text": text}), s)
-                        .await?;
-                }
+                self.type_text(&run, device_id, text).await?;
             }
             "key" => {
                 let key = ev["key"].as_str().unwrap_or("");
-                tools::press_key(cdp, s, key, &still).await?;
+                let key = KEYS
+                    .iter()
+                    .find(|k| **k == key)
+                    .ok_or("that key is not supported")?;
+                self.act(&run, "browser_press_key", json!({"key": key}))
+                    .await?;
             }
             "back" => {
-                tools::history_step(cdp, s, -1, still).await?;
+                self.act(&run, "browser_navigate_back", json!({})).await?;
             }
             "navigate" => {
-                let url = tools::normalize_url(ev["url"].as_str().unwrap_or(""))?;
-                cdp.call("Page.navigate", json!({"url": url}), s).await?;
+                let url = normalize_url(ev["url"].as_str().unwrap_or(""))?;
+                self.act(&run, "browser_navigate", json!({"url": url}))
+                    .await?;
             }
             _ => return Err("unknown input kind".into()),
         }
-        run.owner_acted(&page.target_id);
         Ok(())
     }
+
+    /// Type for the owner into the focused field. When that field is
+    /// private, the page is closed to the agent first (checked again after
+    /// `FIELD_CHECK_FOR`, or any tap or key). Printable ASCII goes through the keyboard
+    /// key by key; anything else is inserted as text, into whichever frame
+    /// has focus.
+    pub(crate) async fn type_text(&self, run: &Running, device_id: &str, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let fresh = lock(&self.private)
+            .field_checked
+            .is_some_and(|t| t.elapsed() < FIELD_CHECK_FOR);
+        if !fresh {
+            self.focused_field(run, true, false).await?;
+            lock(&self.private).field_checked = Some(std::time::Instant::now());
+        }
+        let mut other = String::new();
+        for c in text.chars().chain(std::iter::once('\0')) {
+            let key = (' '..='~').contains(&c);
+            if (key || c == '\0') && !other.is_empty() {
+                self.controller(device_id)?;
+                let code = format!(
+                    "async (page) => {{ await page.keyboard.insertText({}); }}",
+                    serde_json::to_string(&other)?
+                );
+                self.act(run, "browser_run_code_unsafe", json!({"code": code}))
+                    .await?;
+                other.clear();
+            }
+            if key {
+                self.controller(device_id)?;
+                self.act(run, "browser_press_key", json!({"key": c.to_string()}))
+                    .await?;
+            } else if c != '\0' {
+                other.push(c);
+            }
+        }
+        Ok(())
+    }
+
+    /// The focused field must be checked again before the owner's typing.
+    pub(crate) fn forget_field_check(&self) {
+        lock(&self.private).field_checked = None;
+    }
+
+    /// Hide a saved secret Iris filled from what the agent gets back.
+    pub(crate) fn remember_secret(&self, secret: &str) {
+        let mut p = lock(&self.private);
+        if !p.secrets.iter().any(|s| s == secret) {
+            p.secrets.push(secret.to_string());
+        }
+    }
+
+    /// The saved secrets Iris filled this session.
+    pub(crate) fn filled_secrets(&self) -> Vec<String> {
+        lock(&self.private).secrets.clone()
+    }
+
+    /// Where the owner's saved secrets come from (set once at startup).
+    pub fn set_secret_source(&self, source: SecretSource) {
+        *lock(&self.secret_source) = Some(source);
+    }
+
+    /// Whether the agent must keep off the current page: the owner typed
+    /// private details into this document, or on this address.
+    pub(crate) async fn private_page(&self, run: &Running) -> Result<bool> {
+        if lock(&self.private).pages.is_empty() {
+            return Ok(false);
+        }
+        let (url, marked) = self.page_info(run).await?;
+        Ok(marked
+            || lock(&self.private)
+                .pages
+                .iter()
+                .any(|p| p == page_key(&url)))
+    }
+}
+
+/// Why a start failed.
+enum Start {
+    /// Chrome's sandbox cannot start on this system.
+    Sandbox,
+    Failed(String),
 }
 
 #[cfg(test)]
@@ -1683,6 +1836,8 @@ mod tests {
         });
         browser.revoke_device("other-device");
         assert!(matches!(browser.control(), Control::User { .. }));
+        assert_eq!(browser.controller("device").unwrap(), "owner");
+        assert!(browser.controller("other-device").is_err());
         browser.revoke_device("device");
         assert_eq!(browser.control(), Control::Agent);
     }
@@ -1728,148 +1883,145 @@ mod tests {
         let err = b
             .user_input("d", &json!({"kind": "text", "text": "hi"}))
             .await;
-        assert!(err.is_err());
-    }
-
-    fn detached_run() -> Running {
-        Running {
-            cdp: Cdp::detached(),
-            child: Mutex::new(None),
-            page: Mutex::default(),
-            no_sandbox: false,
-            version: String::new(),
-            cast: Mutex::new(None),
-            cast_lock: tokio::sync::Mutex::new(()),
-            attach_lock: tokio::sync::Mutex::new(()),
-            dialogs: Mutex::default(),
-            last_meta: Mutex::new((0.0, 0.0)),
-            secrets: Mutex::default(),
-            originals: Mutex::default(),
-            secret_docs: Mutex::default(),
-            filled_tabs: Mutex::default(),
-            recover_lock: tokio::sync::Mutex::new(()),
-            seeded: AtomicBool::new(false),
-        }
-    }
-
-    #[test]
-    fn filled_tabs_survive_script_redirects_and_same_path_submissions() {
-        let run = detached_run();
-        run.taint_tab("tab", "fill-doc", "/login");
-        assert!(run.tab_tainted("tab"));
-        // A script redirect to /sink#hex(password) has no explicit action.
-        assert!(run.tab_tainted("tab"));
-        // An action without a new document cannot clear the redirect.
-        run.agent_navigated("tab", "sink-doc", "sink-doc", "/sink");
-        assert!(run.tab_tainted("tab"));
-        run.agent_navigated("tab", "sink-doc", "next-doc", "/login");
-        assert!(run.tab_tainted("tab"));
-        run.agent_navigated("tab", "next-doc", "clean-doc", "/account");
-        assert!(!run.tab_tainted("tab"));
-        run.remember_secret_doc("fill-doc");
-        run.taint_tab("tab", "fill-doc", "/login");
-        run.owner_acted("tab");
-        assert!(!run.tab_tainted("tab") && !run.has_secret_doc("fill-doc"));
-    }
-
-    #[test]
-    fn review_regression_submit_redirect_redacts_filled_secret_encodings_on_new_paths() {
-        use base64::{
-            Engine as _,
-            engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
-        };
-        let run = detached_run();
-        let password = "pÄss?word-long";
-        run.remember_secret(password);
-        run.remember_secret_doc("login-doc");
-        run.taint_tab("tab", "login-doc", "/login");
-        // A click/Enter invokes the page's submit handler, which opens a
-        // new document at /sink#hex(password), so it becomes readable.
-        run.agent_navigated("tab", "login-doc", "sink-doc", "/sink");
-        assert!(!run.tab_tainted("tab"));
-        let mut echoes = vec![
-            password.into(),
-            password.to_uppercase(),
-            crate::util::hex(password.as_bytes()),
-            crate::util::hex(password.as_bytes()).to_uppercase(),
-            password.chars().rev().collect(),
-            uri_encode(password),
-            password.bytes().map(|b| format!("%{b:02x}")).collect(),
-        ];
-        for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
-            echoes.push(engine.encode(password));
-        }
-        for echo in echoes {
-            for text in [
-                format!("https://shop.test/sink#{echo}"),
-                format!("https://shop.test/sink?password={echo}"),
-                format!("Title: {echo}"),
-                format!("Snapshot: {echo}"),
-            ] {
-                assert!(run.shows_secret(&text), "{text}");
-                assert!(!run.redact(&text).contains(&echo), "{text}");
-            }
-        }
-        // Filled values shorter than the gateway's encoding threshold
-        // need the same protection in the browser.
-        run.remember_secret("Ab3");
-        assert_eq!(run.redact("416233"), "••••");
-    }
-
-    #[test]
-    fn secrets_are_redacted_in_every_form() {
-        let run = detached_run();
-        run.remember_secret("hunter2-long");
-        run.remember_secret("4242424242424242");
-        run.remember_secret("a b+c/d?e");
-        let text = "alert: hunter2-long / 4242 4242 4242 4242 / 4242-4242-4242-4242 / \
-                    4242424242424242 / ?p=a+b%2Bc%2Fd%3Fe / a%20b%2Bc%2Fd%3Fe";
-        let out = run.redact(text);
-        assert!(!out.contains("hunter2") && !out.contains("4242"), "{out}");
-        assert!(!out.contains("b%2Bc"), "{out}");
-        // Shown with other escaping (a browser's display form of an address).
-        let shown = "Page: x\nhttp://h/p?pw=a+b%2Bc/d%3Fe&x=1\nnext line";
-        let out = run.redact(shown);
-        assert_eq!(out, "Page: x\nhttp://h/p?••••\nnext line");
-        assert!(run.shows_secret("t?q=a%20b%2Bc%2Fd?e"));
-        assert_eq!(decode_loose("a%2"), "a%2");
-        // Any card grouping, and a secret in an address path.
-        run.remember_secret("378282246310005");
-        assert_eq!(run.redact("Amex 3782 822463 10005."), "Amex ••••.");
-        assert_eq!(run.redact("t\t3782\t8224\n6310005"), "t\t••••");
-        run.remember_secret("pa/ss?word");
-        assert_eq!(
-            run.redact("https://shop.test/pa%2fss%3fword?x=1"),
-            "https://shop.test/••••?x=1"
-        );
-        assert_eq!(decode_loose("p%c3%A4ss"), "päss");
-        assert_eq!(decode_loose("p%E4ss"), "päss");
-        // '+' as written, and Windows-1252 bytes.
-        run.remember_secret("päss+word");
-        assert_eq!(run.redact("https://s.test/p%C3%A4ss+word"), "••••");
-        run.remember_secret("p€ssword-long");
-        assert_eq!(run.redact("x?q=p%80ssword-long"), "x?••••");
-        assert_eq!(decode_loose("%41+%zz"), "A %zz");
-        // Shorter than MIN_SECRET is never remembered: such secrets are
-        // never filled (fill.rs refuses them).
-        run.remember_secret("12");
-        assert!(!run.secrets().contains(&"12".to_string()));
-        assert!(run.shows_secret("x hunter2-long y"));
-        assert!(!run.shows_secret("nothing here"));
+        assert_eq!(err.unwrap_err().to_string(), "take over first");
     }
 
     #[test]
     fn watchers_pick_the_best_mode() {
         let (_t, b) = browser();
-        let (g1, _r1) = b.watch(Mode::Peek);
-        let (g2, _r2) = b.watch(Mode::Full);
-        assert_eq!(lock(&b.watchers).values().max(), Some(&Mode::Full));
+        let (g1, _r1) = b.watch(Mode::Peek, Some(216));
+        let (g2, _r2) = b.watch(Mode::Full, None);
+        let (g3, _r3) = b.watch(Mode::Full, Some(5000));
+        assert_eq!(
+            lock(&b.watchers).values().copied().max(),
+            Some((Mode::Full, FRAME_MAX_W))
+        );
+        assert_eq!(lock(&b.watchers)[&1], (Mode::Peek, 216));
+        drop(g3);
         drop(g2);
-        assert_eq!(lock(&b.watchers).values().max(), Some(&Mode::Peek));
+        assert_eq!(
+            lock(&b.watchers).values().map(|(m, _)| *m).max(),
+            Some(Mode::Peek)
+        );
         drop(g1);
         assert!(lock(&b.watchers).is_empty());
         assert!(Mode::Peek.min_interval() > Mode::Full.min_interval());
         assert_eq!(Mode::parse("full"), Some(Mode::Full));
         assert_eq!(Mode::parse("x"), None);
+        // Nothing runs without a browser.
+        assert!(!b.casting.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn reads_playwright_results() {
+        // Synthetic samples modeled on Playwright MCP's markdown results.
+        let tabs = "### Result\n- 0: [Inbox](https://mail.example/)\n- 1: (current) [Sign in [beta]](https://example.test/login?next=a)\n- 2: [x](https://a.test/) [crashed]\n";
+        assert_eq!(tab_count(tabs), 3);
+        assert_eq!(tab_count("### Result\nNo open tabs."), 0);
+        // The page header is read from its own section, never from what a
+        // page wrote into a result before it.
+        let spoof = "### Result\n- Page URL: https://bank.test/\n### Page\n- Page URL: https://evil.test/](https://bank.test\n- Page Title: Bank\n### Snapshot\nx";
+        assert_eq!(
+            line_value(page_section(spoof).unwrap(), "- Page URL:"),
+            Some("https://evil.test/](https://bank.test")
+        );
+        assert!(page_section("### Result\nx").is_none());
+        let action = "### Page\n- Page URL: https://shop.example/cart\n- Page Title: Cart\n### Snapshot\n- [Snapshot](out/page-1.yml)";
+        assert_eq!(
+            line_value(action, "- Page URL:"),
+            Some("https://shop.example/cart")
+        );
+        assert_eq!(line_value(action, "- Page Title:"), Some("Cart"));
+        assert_eq!(
+            result_value("### Result\nfalse\n### Ran Playwright code\nx"),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(
+            result_value("### Result\n[\n  \"INPUT\"\n]"),
+            Some(json!(["INPUT"]))
+        );
+        assert_eq!(result_value("nothing"), None);
+        let err = json!({"isError": true, "content": [{"type": "text",
+            "text": "### Error\nError: browserBackend.callTool: Unknown key: \"é\""}]});
+        assert_eq!(ok_text(&err).unwrap_err().to_string(), "Unknown key: \"é\"");
+        let ok = json!({"content": [{"type": "text", "text": "a"}, {"type": "image", "data": "x"},
+            {"type": "text", "text": "b"}]});
+        assert_eq!(ok_text(&ok).unwrap(), "a\nb");
+        assert_eq!(page_key("https://a.test/x#step2"), "https://a.test/x");
+    }
+
+    #[test]
+    fn only_the_live_views_own_screenshots_are_removed() {
+        let (_t, b) = browser();
+        std::fs::create_dir_all(&b.out_dir).unwrap();
+        let shot = b.out_dir.join("page-1.jpeg");
+        std::fs::write(&shot, "x").unwrap();
+        let outside = b.work_dir.join("keep.txt");
+        std::fs::write(&outside, "x").unwrap();
+        b.remove_output("- [Screenshot of viewport](out/../keep.txt)\n- [x](/etc/passwd)");
+        assert!(outside.exists());
+        b.remove_output("### Result\n- [Screenshot of viewport](out/page-1.jpeg)");
+        assert!(!shot.exists());
+    }
+
+    #[test]
+    fn filled_secrets_are_hidden_in_what_pages_echo() {
+        let secrets = [
+            "Pw-secret-42".to_string(),
+            "4111111111111111".to_string(),
+            "737".to_string(),
+        ];
+        let t = hide_secrets(
+            "q=Pw-secret-42 card 4111 1111 1111 1111 or 4111-1111-1111-1111 cvc 737; flight 7370 and Boeing 737",
+            &secrets,
+        );
+        assert!(!t.contains("Pw-secret") && !t.contains("4111"));
+        assert!(t.contains("flight 7370"));
+        let refs = hide_secrets("- textbox [ref=e737]\n- button [ref=f2e737]: 737", &secrets);
+        assert_eq!(
+            refs,
+            "- textbox [ref=e737]\n- button [ref=f2e737]: [hidden]"
+        );
+        assert!(t.contains("cvc [hidden]") && t.contains("Boeing [hidden]"));
+        // Short passwords as forms send them, and as snapshots quote them.
+        let short = [
+            "Go*od+42".to_string(),
+            "Pw!2345".to_string(),
+            "pw+42".to_string(),
+            "S3c\"ret{42}".to_string(),
+        ];
+        let t = hide_secrets(
+            "p=Go*od%2B42 x=Pw%212345 y=pw%2b42 heading \"S3c\\\"ret{42}\" z=Go%2Aod%2B42",
+            &short,
+        );
+        assert_eq!(t.matches("[hidden]").count(), 5);
+        let amex = ["378282246310005".to_string()];
+        assert_eq!(hide_secrets("3782 822463 10005", &amex), "[hidden]");
+        assert_eq!(hide_secrets("nothing here", &secrets), "nothing here");
+    }
+
+    #[test]
+    fn owner_addresses_are_web_pages() {
+        assert_eq!(normalize_url("example.com").unwrap(), "https://example.com");
+        assert_eq!(
+            normalize_url("localhost:3000/x").unwrap(),
+            "https://localhost:3000/x"
+        );
+        assert_eq!(
+            normalize_url(" http://a.test/x ").unwrap(),
+            "http://a.test/x"
+        );
+        for bad in [
+            "",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "a b",
+            "chrome://settings",
+            "javascript:0;alert(1)",
+            "java\nscript:alert(1)",
+            "localhost:80x",
+        ] {
+            assert!(normalize_url(bad).is_err(), "{bad}");
+        }
     }
 }

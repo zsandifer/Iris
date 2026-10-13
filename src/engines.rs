@@ -9,12 +9,13 @@
 //!   (`@openai/codex`, `@google/gemini-cli`, `opencode-ai`); npm verifies
 //!   registry integrity hashes. Install scripts are not run.
 //!
-//! - Iris's browser: Chromium as packaged by Playwright. The official
-//!   `playwright-core` npm package is installed (npm verifies it), then its
-//!   own `install chromium` command downloads Chromium from Playwright's
-//!   download servers into `<root>/chromium/browsers`; the build then moves
-//!   to the fixed `<root>/chromium/app`, the one path the root setup
-//!   approves for Chrome's sandbox (`deploy/setup-engines.sh`).
+//! - Iris's browser: Microsoft's Playwright MCP server, the official
+//!   `@playwright/mcp` npm package at [`PLAYWRIGHT_MCP_VERSION`] (npm
+//!   verifies it), then its own
+//!   `install-browser chromium` command, which downloads Chromium from
+//!   Playwright's download servers into `<root>/chromium/browsers`; the
+//!   build then moves to the fixed `<root>/chromium/app`, the one path the
+//!   root setup approves for Chrome's sandbox (`deploy/setup-engines.sh`).
 //!
 //! Everything lands in one engines directory (`<root>/<name>/...`, with
 //! launchers in `<root>/bin`) that Iris searches before PATH. Only engines
@@ -47,8 +48,8 @@ pub enum Method {
         package: &'static str,
         launcher: Launcher,
     },
-    /// Chromium via `playwright-core install chromium`.
-    PlaywrightChromium,
+    /// Playwright MCP, then Chromium via its `install-browser chromium`.
+    PlaywrightMcp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,12 +104,21 @@ pub const ENGINES: &[EngineSource] = &[
     },
 ];
 
+/// The `@playwright/mcp` release Iris installs for its browser: an exact
+/// version the real browser test (`cargo test real_playwright -- --ignored`)
+/// passed with in CI, bumped by `.github/workflows/playwright-mcp-bump.yml`
+/// once a newer release passes it too. Iris wraps this server's tool names
+/// and output, so it does not track npm's latest. This is Iris's browser
+/// server, not one of the agent CLIs, which are never pinned (AGENTS.md
+/// invariant 5). The workflow edits this line; keep it on one line.
+pub const PLAYWRIGHT_MCP_VERSION: &str = "0.0.83";
+
 /// Iris's browser (not an AI engine, but installed and updated the same way).
 pub const BROWSER: EngineSource = EngineSource {
     name: "browser",
-    label: "Browser (Chromium)",
-    method: Method::PlaywrightChromium,
-    source: "npm: playwright-core, then Chromium from Playwright's official downloads",
+    label: "Browser (Playwright MCP)",
+    method: Method::PlaywrightMcp,
+    source: "npm: @playwright/mcp, then Chromium from Playwright's official downloads",
 };
 
 pub fn source(name: &str) -> Option<&'static EngineSource> {
@@ -381,7 +391,7 @@ fn output_with_timeout(
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .process_group(0);
-    let mut child = cmd.spawn()?;
+    let mut child = crate::util::spawn_retrying(|| cmd.spawn())?;
     let drain = |r: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -565,9 +575,22 @@ pub fn browser_binary(root: &Path) -> PathBuf {
     browser_app_dir(root).join("chrome")
 }
 
-/// The installed browser's executable (Linux, then the macOS app bundles
+/// Playwright MCP's entry point inside the browser's install directory.
+const MCP_CLI: &str = "node_modules/@playwright/mcp/cli.js";
+
+/// Iris installed the browser as it is now: Playwright MCP behind its
+/// launcher, and Chromium (an install from before has only Chromium, and
+/// one whose first Chromium download failed has only the server; both are
+/// offered setup again).
+pub fn browser_ready(root: &Path) -> bool {
+    install_dir(root, "browser").join(MCP_CLI).is_file()
+        && is_installed(root, "browser")
+        && browser_executable(root).is_some()
+}
+
+/// The installed Chromium's executable (Linux, then the macOS app bundles
 /// Playwright ships).
-fn app_executable(root: &Path) -> Option<PathBuf> {
+pub fn browser_executable(root: &Path) -> Option<PathBuf> {
     let app = browser_app_dir(root);
     std::iter::once(browser_binary(root))
         .chain(
@@ -581,19 +604,88 @@ fn app_executable(root: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// The Chromium build the installed `playwright-core` pins
-/// (`browsers.json`), so an unchanged build is not downloaded again.
-fn pinned_chromium_revision(prefix: &Path) -> Option<String> {
-    let text =
-        std::fs::read_to_string(prefix.join("node_modules/playwright-core/browsers.json")).ok()?;
+/// Major version of the Chromium build Iris installed (for a user agent
+/// without "HeadlessChrome").
+pub fn chromium_major(root: &Path) -> Option<String> {
+    let v = std::fs::read_to_string(install_dir(root, "browser").join("CHROMIUM_VERSION")).ok()?;
+    let major = v.trim().split('.').next()?;
+    (!major.is_empty() && major.len() <= 4 && major.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| major.to_string())
+}
+
+/// The Chromium build the `playwright-core` that Playwright MCP loads pins
+/// (`browsers.json`): its revision, and its version when given, so an
+/// unchanged build is not downloaded again. Node resolves MCP's own copy
+/// first (npm nests it there when an older install left a different
+/// `playwright-core` at the top), then the top-level one.
+fn pinned_chromium(prefix: &Path) -> Option<(String, Option<String>)> {
+    let text = [
+        "node_modules/@playwright/mcp/node_modules/playwright-core/browsers.json",
+        "node_modules/playwright-core/browsers.json",
+    ]
+    .iter()
+    .find_map(|f| std::fs::read_to_string(prefix.join(f)).ok())?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    v["browsers"]
+    let entry = v["browsers"]
         .as_array()?
         .iter()
-        .find(|b| b["name"] == "chromium")?["revision"]
+        .find(|b| b["name"] == "chromium")?;
+    let rev = entry["revision"]
         .as_str()
-        .filter(|r| !r.is_empty() && r.len() <= 12 && r.bytes().all(|b| b.is_ascii_digit()))
-        .map(String::from)
+        .filter(|r| !r.is_empty() && r.len() <= 12 && r.bytes().all(|b| b.is_ascii_digit()))?;
+    let version = entry["browserVersion"]
+        .as_str()
+        .filter(|v| v.len() <= 32 && v.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+        .map(String::from);
+    Some((rev.to_string(), version))
+}
+
+/// The newest full Chromium in a Playwright browsers directory, falling
+/// back to the headless shell.
+fn newest_in_playwright_cache(dir: &Path) -> Option<PathBuf> {
+    let mut builds: Vec<(u32, bool, PathBuf)> = Vec::new();
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let (shell, rev) = if let Some(r) = name.strip_prefix("chromium_headless_shell-") {
+            (true, r)
+        } else if let Some(r) = name.strip_prefix("chromium-") {
+            (false, r)
+        } else {
+            continue;
+        };
+        let Ok(rev) = rev.parse::<u32>() else {
+            continue;
+        };
+        let candidates: &[&str] = if shell {
+            &[
+                "chrome-headless-shell-linux64/chrome-headless-shell",
+                "chrome-headless-shell-linux-arm64/chrome-headless-shell",
+                "chrome-headless-shell-mac-arm64/chrome-headless-shell",
+                "chrome-headless-shell-mac-x64/chrome-headless-shell",
+                "chrome-linux/headless_shell",
+            ]
+        } else {
+            &[
+                "chrome-linux64/chrome",
+                "chrome-linux-arm64/chrome",
+                "chrome-linux/chrome",
+                "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
+                "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+            ]
+        };
+        if let Some(p) = candidates
+            .iter()
+            .map(|c| e.path().join(c))
+            .find(|p| p.is_file())
+        {
+            builds.push((rev, shell, p));
+        }
+    }
+    // Full Chromium first (better site compatibility), newest first.
+    builds.sort_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
+    builds.into_iter().next().map(|(_, _, p)| p)
 }
 
 /// Move a Chromium build Playwright downloaded (`bin`, inside
@@ -639,11 +731,11 @@ fn adopt_browser_build(root: &Path, browsers: &Path, bin: &Path) -> Result<PathB
     Ok(app.join(exe))
 }
 
-/// Chromium for Iris's browser: the official `playwright-core` package,
-/// then its own installer, which downloads Chromium from Playwright's
-/// servers into `<root>/chromium/browsers`. The build then moves to the
-/// fixed `<root>/chromium/app` (see [`browser_app_dir`]) and the download
-/// directory is removed.
+/// Iris's browser: the official `@playwright/mcp` package, then its own
+/// installer, which downloads Chromium from Playwright's servers into
+/// `<root>/chromium/browsers`. The build then moves to the fixed
+/// `<root>/chromium/app` (see [`browser_app_dir`]) and the download
+/// directory is removed. `<root>/bin/browser` starts the server.
 fn install_browser(root: &Path) -> Result<Report> {
     let npm = crate::harness::resolve_command("npm").ok_or(
         "Node.js (npm) is needed to install the browser; install Node.js on the server first",
@@ -659,6 +751,7 @@ fn install_browser_with(
     npm: &Path,
     node: &dyn Fn() -> Result<PathBuf>,
 ) -> Result<Report> {
+    const PACKAGE: &str = "@playwright/mcp";
     let prefix = install_dir(root, "browser");
     std::fs::create_dir_all(&prefix)?;
     let before = installed_version(root, "browser");
@@ -667,7 +760,11 @@ fn install_browser_with(
         "install",
         "--prefix",
         &prefix.to_string_lossy(),
-        "playwright-core@latest",
+        // The tested pin, never `@latest`: an update installs the pin, so
+        // an install whose server differs from it moves to it and one that
+        // matches stays put.
+        &format!("{PACKAGE}@{PLAYWRIGHT_MCP_VERSION}"),
+        "--save-exact",
         "--no-fund",
         "--no-audit",
         "--ignore-scripts",
@@ -678,7 +775,7 @@ fn install_browser_with(
     .env("npm_config_update_notifier", "false")
     .stdin(std::process::Stdio::null());
     let out = output_with_timeout(cmd, NPM_TIMEOUT)
-        .map_err(|e| format!("npm install of playwright-core failed: {e}"))?;
+        .map_err(|e| format!("npm install of {PACKAGE} failed: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let line = err
@@ -686,73 +783,99 @@ fn install_browser_with(
             .rev()
             .find(|l| l.contains("ERR"))
             .unwrap_or("npm install failed");
-        return Err(format!("npm install of playwright-core failed: {}", line.trim()).into());
+        return Err(format!("npm install of {PACKAGE} failed: {}", line.trim()).into());
     }
-    let cli = prefix.join("node_modules/playwright-core/cli.js");
+    let cli = prefix.join(MCP_CLI);
     if !cli.is_file() {
-        return Err("playwright-core did not provide its installer".into());
+        return Err(format!("{PACKAGE} did not provide its server").into());
     }
-    // The pinned build is already in place: nothing to download.
-    let pinned = pinned_chromium_revision(&prefix).map(|r| format!("build {r}"));
-    if pinned.is_some()
-        && pinned == before
-        && let Some(bin) = app_executable(root)
-    {
-        set_launcher_symlink(root, "browser", &bin)?;
-        return Ok(Report {
-            name: "browser".into(),
-            changed: false,
-            version: before,
-            path: Some(launcher(root, "browser").to_string_lossy().into_owned()),
-        });
-    }
+    let mcp_version =
+        std::fs::read_to_string(prefix.join("node_modules/@playwright/mcp/package.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v["version"].as_str().map(String::from))
+            .filter(|v| valid_version(v));
     let node = node()?;
-    let browsers = prefix.join("browsers");
-    let mut cmd = std::process::Command::new(&node);
-    cmd.arg(&cli)
-        .args(["install", "chromium", "--no-shell"])
-        .env("PLAYWRIGHT_BROWSERS_PATH", &browsers)
-        .env("PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS", "1")
-        .stdin(std::process::Stdio::null());
-    let out = output_with_timeout(cmd, NPM_TIMEOUT)
-        .map_err(|e| format!("Chromium install failed: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let line = err
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("Chromium download failed");
-        return Err(format!(
-            "Chromium install failed: {}",
-            crate::util::truncate_chars(line.trim(), 200)
-        )
-        .into());
-    }
-    let bin = crate::browser::launch::newest_in_playwright_cache(&browsers)
-        .ok_or("the Chromium download has no browser for this platform")?;
-    let version = bin
-        .strip_prefix(&browsers)
+    // The server starts from here on (also with the Chromium already in
+    // place if its download below fails).
+    set_launcher_script(
+        root,
+        "browser",
+        &format!(
+            "#!/bin/sh\n# Installed by Iris from npm ({PACKAGE}).\nexec {} {} \"$@\"\n",
+            sh_quote(&node.to_string_lossy()),
+            sh_quote(&cli.to_string_lossy())
+        ),
+    )?;
+    let pinned = pinned_chromium(&prefix);
+    let have = std::fs::read_to_string(prefix.join("CHROMIUM_BUILD"))
         .ok()
-        .and_then(|r| r.components().next())
-        .and_then(|c| c.as_os_str().to_str())
-        .and_then(|n| n.strip_prefix("chromium-"))
-        .map(|r| format!("build {r}"));
-    let bin = adopt_browser_build(root, &browsers, &bin)?;
-    set_launcher_symlink(root, "browser", &bin)?;
-    // The download directory only held this build (now moved) and
-    // Playwright's markers.
-    let _ = std::fs::remove_dir_all(&browsers);
-    match &version {
-        Some(v) => std::fs::write(prefix.join("VERSION"), v)?,
-        None => {
-            let _ = std::fs::remove_file(prefix.join("VERSION"));
+        .map(|s| s.trim().to_string());
+    let build = match &pinned {
+        // The pinned build is already in place: nothing to download.
+        Some((rev, _)) if have.as_ref() == Some(rev) && browser_executable(root).is_some() => {
+            rev.clone()
         }
-    }
+        _ => {
+            let browsers = prefix.join("browsers");
+            let mut cmd = std::process::Command::new(&node);
+            cmd.arg(&cli)
+                .args(["install-browser", "chromium", "--no-shell"])
+                .env("PLAYWRIGHT_BROWSERS_PATH", &browsers)
+                .env("PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS", "1")
+                .stdin(std::process::Stdio::null());
+            let out = output_with_timeout(cmd, NPM_TIMEOUT)
+                .map_err(|e| format!("Chromium install failed: {e}"))?;
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                let line = err
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("Chromium download failed");
+                return Err(format!(
+                    "Chromium install failed: {}",
+                    crate::util::truncate_chars(line.trim(), 200)
+                )
+                .into());
+            }
+            let bin = newest_in_playwright_cache(&browsers)
+                .ok_or("the Chromium download has no browser for this platform")?;
+            let rev = bin
+                .strip_prefix(&browsers)
+                .ok()
+                .and_then(|r| r.components().next())
+                .and_then(|c| c.as_os_str().to_str())
+                .and_then(|n| n.strip_prefix("chromium-"))
+                .unwrap_or("")
+                .to_string();
+            adopt_browser_build(root, &browsers, &bin)?;
+            // The download directory only held this build (now moved) and
+            // Playwright's markers.
+            let _ = std::fs::remove_dir_all(&browsers);
+            std::fs::write(prefix.join("CHROMIUM_BUILD"), &rev)?;
+            match pinned
+                .as_ref()
+                .filter(|(r, _)| *r == rev)
+                .and_then(|(_, v)| v.as_ref())
+            {
+                Some(v) => std::fs::write(prefix.join("CHROMIUM_VERSION"), v)?,
+                None => {
+                    let _ = std::fs::remove_file(prefix.join("CHROMIUM_VERSION"));
+                }
+            }
+            rev
+        }
+    };
+    let version = format!(
+        "{} (Chromium build {build})",
+        mcp_version.as_deref().unwrap_or("unknown")
+    );
+    std::fs::write(prefix.join("VERSION"), &version)?;
     Ok(Report {
         name: "browser".into(),
-        changed: before != version,
-        version,
+        changed: before.as_deref() != Some(version.as_str()),
+        version: Some(version),
         path: Some(launcher(root, "browser").to_string_lossy().into_owned()),
     })
 }
@@ -764,7 +887,7 @@ pub fn install(root: &Path, name: &str) -> Result<Report> {
     match src.method {
         Method::ClaudeNative => install_claude(root),
         Method::Npm { package, launcher } => install_npm(root, name, package, launcher),
-        Method::PlaywrightChromium => install_browser(root),
+        Method::PlaywrightMcp => install_browser(root),
     }
 }
 
@@ -874,6 +997,10 @@ mod tests {
         assert!(!valid_version("<html>"));
         assert!(!valid_version("1.2"));
         assert!(!valid_version("1.2.3; rm -rf /"));
+        // The browser server is pinned to one exact release (no range or
+        // dist-tag such as `latest`).
+        assert!(valid_version(PLAYWRIGHT_MCP_VERSION));
+        assert!(!PLAYWRIGHT_MCP_VERSION.contains(['-', '+']));
     }
 
     #[test]
@@ -943,13 +1070,13 @@ mod tests {
                 "",
             )
             .unwrap();
-            crate::browser::launch::newest_in_playwright_cache(&browsers).unwrap()
+            newest_in_playwright_cache(&browsers).unwrap()
         };
         let bin = adopt_browser_build(root, &browsers, &download("1200", "v1")).unwrap();
         assert_eq!(bin, browser_binary(root));
         assert_eq!(std::fs::read_to_string(&bin).unwrap(), "v1");
         assert!(root.join("chromium/app/locales").is_dir());
-        assert_eq!(app_executable(root), Some(bin.clone()));
+        assert_eq!(browser_executable(root), Some(bin.clone()));
         std::fs::remove_dir_all(&browsers).unwrap();
         // An update replaces the contents; the path stays.
         let bin2 = adopt_browser_build(root, &browsers, &download("1300", "v2")).unwrap();
@@ -964,7 +1091,7 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
         // Outside the download directory: refused.
         assert!(adopt_browser_build(root, &browsers, Path::new("/bin/sh")).is_err());
-        assert!(app_executable(&root.join("missing")).is_none());
+        assert!(browser_executable(&root.join("missing")).is_none());
     }
 
     #[test]
@@ -980,22 +1107,27 @@ mod tests {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
             p
         };
-        // npm: "installs" playwright-core pinning the revision in rev.
+        // npm: "installs" @playwright/mcp (version in mcp) with a
+        // playwright-core pinning the revision in rev.
         let npm = script(
             "npm",
             r#"#!/bin/sh
-d="$3/node_modules/playwright-core"
-mkdir -p "$d"
-echo '// cli' > "$d/cli.js"
-printf '{"browsers": [{"name": "chromium", "revision": "%s"}]}\n' "$(cat "$(dirname "$0")/rev")" > "$d/browsers.json"
+t="$(dirname "$0")"
+echo "$4" >> "$t/packages"
+m="$3/node_modules/@playwright/mcp"
+mkdir -p "$m" "$3/node_modules/playwright-core"
+echo '// cli' > "$m/cli.js"
+printf '{"name": "@playwright/mcp", "version": "%s"}\n' "$(cat "$t/mcp")" > "$m/package.json"
+printf '{"browsers": [{"name": "chromium", "revision": "%s", "browserVersion": "150.0.1.2"}]}\n' "$(cat "$t/rev")" > "$3/node_modules/playwright-core/browsers.json"
 "#,
         );
-        // node cli.js install chromium: downloads that revision (or fails
-        // halfway when fail exists), counting its runs.
+        // node cli.js install-browser chromium: downloads that revision (or
+        // fails halfway when fail exists), counting its runs.
         let node = script(
             "node",
             r#"#!/bin/sh
 t="$(dirname "$0")"
+[ "$2" = install-browser ] || exit 2
 echo run >> "$t/downloads"
 r="$(cat "$t/rev")"
 d="$PLAYWRIGHT_BROWSERS_PATH/chromium-$r/chrome-linux64"
@@ -1013,29 +1145,48 @@ touch "$PLAYWRIGHT_BROWSERS_PATH/chromium-$r/INSTALLATION_COMPLETE"
         };
         let install = || install_browser_with(&root, &npm, &|| Ok(node.clone()));
         let fixed = browser_binary(&root);
-        let launcher_target = || std::fs::canonicalize(launcher(&root, "browser")).unwrap();
+        let launcher_text = || std::fs::read_to_string(launcher(&root, "browser")).unwrap();
 
+        std::fs::write(tools.join("mcp"), "0.0.80").unwrap();
         std::fs::write(tools.join("rev"), "1200").unwrap();
+        // A first install whose Chromium download fails is not ready (the
+        // app keeps offering setup).
+        std::fs::write(tools.join("fail"), "").unwrap();
+        assert!(install().is_err());
+        assert!(!browser_ready(&root));
+        std::fs::remove_file(tools.join("fail")).unwrap();
+        let before = downloads();
         let r = install().unwrap();
         assert!(r.changed);
-        assert_eq!(r.version.as_deref(), Some("build 1200"));
-        assert_eq!(launcher_target(), fixed.canonicalize().unwrap());
+        assert_eq!(r.version.as_deref(), Some("0.0.80 (Chromium build 1200)"));
+        assert!(browser_ready(&root));
+        // The launcher starts Playwright MCP with the node found at install.
+        assert!(
+            launcher_text().contains("@playwright/mcp/cli.js"),
+            "{}",
+            launcher_text()
+        );
+        assert!(launcher_text().contains(&*node.to_string_lossy()));
         assert_eq!(std::fs::read_to_string(&fixed).unwrap(), "chrome 1200\n");
+        assert_eq!(chromium_major(&root).as_deref(), Some("150"));
         assert_eq!(
             installed_version(&root, "browser").as_deref(),
-            Some("build 1200")
+            Some("0.0.80 (Chromium build 1200)")
         );
         assert!(
             !root.join("chromium/browsers").exists(),
             "download dir removed"
         );
-        assert_eq!(downloads(), 1);
+        assert_eq!(downloads(), before + 1);
 
-        // Same pinned build: nothing is downloaded.
+        // Same pinned build: nothing is downloaded; a new server version
+        // still counts as a change.
+        std::fs::write(tools.join("mcp"), "0.0.81").unwrap();
         let r = install().unwrap();
-        assert!(!r.changed);
-        assert_eq!(downloads(), 1);
-        assert_eq!(launcher_target(), fixed.canonicalize().unwrap());
+        assert!(r.changed);
+        assert_eq!(r.version.as_deref(), Some("0.0.81 (Chromium build 1200)"));
+        assert!(!install().unwrap().changed);
+        assert_eq!(downloads(), before + 1);
 
         // A failed download keeps the working browser and its version.
         std::fs::write(tools.join("rev"), "1300").unwrap();
@@ -1044,37 +1195,40 @@ touch "$PLAYWRIGHT_BROWSERS_PATH/chromium-$r/INSTALLATION_COMPLETE"
         assert_eq!(std::fs::read_to_string(&fixed).unwrap(), "chrome 1200\n");
         assert_eq!(
             installed_version(&root, "browser").as_deref(),
-            Some("build 1200")
+            Some("0.0.81 (Chromium build 1200)")
         );
-        assert_eq!(launcher_target(), fixed.canonicalize().unwrap());
+        assert!(browser_ready(&root));
 
         // A new build replaces it at the same path.
         std::fs::remove_file(tools.join("fail")).unwrap();
         let r = install().unwrap();
         assert!(r.changed);
-        assert_eq!(r.version.as_deref(), Some("build 1300"));
+        assert_eq!(r.version.as_deref(), Some("0.0.81 (Chromium build 1300)"));
         assert_eq!(std::fs::read_to_string(&fixed).unwrap(), "chrome 1300\n");
         assert!(!root.join("chromium/browsers").exists());
 
-        // An install from before the fixed path (launcher into Playwright's
-        // download directory) moves over without downloading again.
-        std::fs::remove_dir_all(browser_app_dir(&root)).unwrap();
-        let old = root.join("chromium/browsers/chromium-1300/chrome-linux64");
-        std::fs::create_dir_all(&old).unwrap();
-        std::fs::write(old.join("chrome"), "chrome 1300\n").unwrap();
-        set_launcher_symlink(&root, "browser", &old.join("chrome")).unwrap();
-        let before = downloads();
+        // An install from before Playwright MCP (the launcher pointed at
+        // Chromium itself) is not ready until updated.
+        set_launcher_symlink(&root, "browser", &fixed).unwrap();
+        std::fs::remove_dir_all(root.join("chromium/node_modules")).unwrap();
+        assert!(!browser_ready(&root));
         install().unwrap();
-        assert_eq!(launcher_target(), fixed.canonicalize().unwrap());
-        assert_eq!(std::fs::read_to_string(&fixed).unwrap(), "chrome 1300\n");
-        assert_eq!(downloads(), before + 1, "Playwright only checks its cache");
+        assert!(browser_ready(&root));
+        assert!(launcher_text().starts_with("#!/bin/sh"));
+
+        // Every install and update asked npm for the pinned release, never
+        // `@latest`.
+        let packages = std::fs::read_to_string(tools.join("packages")).unwrap();
+        assert!(packages.lines().count() >= 6, "{packages}");
+        let pinned = format!("@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}");
+        assert!(packages.lines().all(|l| l == pinned), "{packages}");
     }
 
     #[test]
     fn reads_the_chromium_build_playwright_pins() {
         let tmp = tempfile::tempdir().unwrap();
         let prefix = tmp.path();
-        assert_eq!(pinned_chromium_revision(prefix), None);
+        assert_eq!(pinned_chromium(prefix), None);
         let dir = prefix.join("node_modules/playwright-core");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -1085,13 +1239,85 @@ touch "$PLAYWRIGHT_BROWSERS_PATH/chromium-$r/INSTALLATION_COMPLETE"
                 {"name": "ffmpeg", "revision": "1011"}]}"#,
         )
         .unwrap();
-        assert_eq!(pinned_chromium_revision(prefix).as_deref(), Some("1200"));
+        assert_eq!(
+            pinned_chromium(prefix),
+            Some(("1200".into(), Some("150.0.1.2".into())))
+        );
         std::fs::write(
             dir.join("browsers.json"),
             r#"{"browsers": [{"name": "chromium", "revision": "12/../x"}]}"#,
         )
         .unwrap();
-        assert_eq!(pinned_chromium_revision(prefix), None);
+        assert_eq!(pinned_chromium(prefix), None);
+        // The version only ever feeds a user agent: digits and dots.
+        std::fs::write(
+            dir.join("browsers.json"),
+            r#"{"browsers": [{"name": "chromium", "revision": "1", "browserVersion": "1; x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(pinned_chromium(prefix), Some(("1".into(), None)));
+        // MCP's own nested copy wins over one an older install left at the
+        // top (that is the one its install-browser uses).
+        let nested = prefix.join("node_modules/@playwright/mcp/node_modules/playwright-core");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("browsers.json"),
+            r#"{"browsers": [{"name": "chromium", "revision": "1247"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(pinned_chromium(prefix), Some(("1247".into(), None)));
+        std::fs::create_dir_all(prefix.join("e/chromium")).unwrap();
+        std::fs::write(prefix.join("e/chromium/CHROMIUM_VERSION"), "x.1").unwrap();
+        assert_eq!(chromium_major(&prefix.join("e")), None);
+    }
+
+    #[test]
+    fn prefers_newest_full_chromium_in_playwright_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        for (dir, bin) in [
+            ("chromium-1100", "chrome-linux64/chrome"),
+            ("chromium-1200", "chrome-linux64/chrome"),
+            (
+                "chromium_headless_shell-1300",
+                "chrome-headless-shell-linux64/chrome-headless-shell",
+            ),
+            ("firefox-1500", "firefox/firefox"),
+        ] {
+            let p = d.join(dir).join(bin);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+        }
+        assert_eq!(
+            newest_in_playwright_cache(d).unwrap(),
+            d.join("chromium-1200/chrome-linux64/chrome")
+        );
+        std::fs::remove_dir_all(d.join("chromium-1100")).unwrap();
+        std::fs::remove_dir_all(d.join("chromium-1200")).unwrap();
+        assert!(
+            newest_in_playwright_cache(d)
+                .unwrap()
+                .ends_with("chrome-headless-shell")
+        );
+        assert!(newest_in_playwright_cache(&d.join("missing")).is_none());
+        // Current layouts on other platforms.
+        for (dir, bin) in [
+            ("a/chromium-1300", "chrome-linux-arm64/chrome"),
+            (
+                "b/chromium-1300",
+                "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+            ),
+            (
+                "c/chromium-1300",
+                "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+            ),
+        ] {
+            let p = d.join(dir).join(bin);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+            let root = d.join(dir).parent().unwrap().to_path_buf();
+            assert_eq!(newest_in_playwright_cache(&root).unwrap(), p);
+        }
     }
 
     #[test]
