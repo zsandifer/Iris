@@ -199,14 +199,31 @@ fn live_by_hash(conn: &Connection, hash: &str) -> rusqlite::Result<Option<Item>>
     .optional()
 }
 
-/// Whether a note with this text was archived or superseded at or after
-/// `since` (ms).
-pub fn set_aside_since(conn: &Connection, hash: &str, since: i64) -> rusqlite::Result<bool> {
+/// The batch of the latest change to a note.
+pub fn last_batch(conn: &Connection, id: i64) -> rusqlite::Result<Option<String>> {
     conn.prepare_cached(
-        "SELECT 1 FROM memory_items WHERE content_hash = ?1
-         AND (archived = 1 OR superseded_by IS NOT NULL) AND updated_at >= ?2",
+        "SELECT batch_id FROM memory_history WHERE item_id = ?1 ORDER BY id DESC LIMIT 1",
     )?
-    .exists(params![hash, since])
+    .query_row([id], |r| r.get(0))
+    .optional()
+    .map(Option::flatten)
+}
+
+/// Whether a note with this text was archived or superseded at or after
+/// `since` (ms) by a change outside `batch`.
+pub fn set_aside_since(
+    conn: &Connection,
+    hash: &str,
+    since: i64,
+    batch: &str,
+) -> rusqlite::Result<bool> {
+    conn.prepare_cached(
+        "SELECT 1 FROM memory_items m WHERE m.content_hash = ?1
+         AND (m.archived = 1 OR m.superseded_by IS NOT NULL) AND m.updated_at >= ?2
+         AND COALESCE((SELECT h.batch_id FROM memory_history h WHERE h.item_id = m.id
+                       ORDER BY h.id DESC LIMIT 1), '') != ?3",
+    )?
+    .exists(params![hash, since, batch])
 }
 
 /// Every live note (not archived, not superseded), oldest first.

@@ -3284,7 +3284,8 @@ routes yet and is reachable only from the owner's private chats (the
 `memory_history` records every change: `item_id`, `op` (`add`, `update`,
 `supersede`, `archive`, `restore`, `delete`), `before` / `after` (JSON
 snapshots of the note, null for none), `actor` (`agent`, `dream`, `owner`,
-`import`), `batch_id` (changes made together), and `at`. `memory_items_fts`
+`import`), `batch_id` (changes made together: one per agent turn, `turn-<message
+id>`, or per import), and `at`. `memory_items_fts`
 is an FTS5 index over `text` (Porter stemming), kept in sync by triggers.
 
 **Export.** After every change, in the same transaction, Iris rewrites
@@ -3304,9 +3305,10 @@ without a title is
 named after its file name), with its topic guessed from the path and
 headings. The originals are copied to
 `memory-backup/<UTC time>/` in the data directory first, then removed from
-`memory/`. If the import fails, any original the export replaced is put
-back so the next start imports it again. Importing is idempotent: notes
-already stored are not added again. `iris import openclaw` imports OpenClaw memory files the same way.
+`memory/`. The notes are stored before any file is replaced, so an
+interrupted import finishes on the next start; importing is idempotent
+(notes already stored are not added again). A file the export replaces
+that is too large (over 2 MiB) or not text is kept only in the backup. `iris import openclaw` imports OpenClaw memory files the same way.
 
 ### Settings
 
@@ -3608,7 +3610,7 @@ a new turn. Resolved cards are explicitly described as resolved in replay histor
 | `list_feed_posts` | `limit?: int` (1 to 50, default 10) | `{"posts": [FeedPost]}` |
 | `create_feed_post` | `title` (required, max 300), `body` (required, Markdown, max 50,000), `topic?` (max 100), `source_url?`, `source_name?` (max 100), `image_url?` (http(s), max 2,000), `images?: string[]` (the page's original photos, http(s), max 10), `why?` (max 300) | `{"post": FeedPost}` |
 | `read_memory` | `path` (required, relative `.md` path, owner private context only): `MEMORY.md` or a topic file (`you.md`, `people.md`, `projects.md`, `routines.md`) | `{"content": string}`; error when the file does not exist |
-| `write_memory` | `path`, `content` (required, Markdown, one note per bullet; max 1,000,000 characters for `MEMORY.md` and topic files, 50,000 otherwise; owner private context only) | `{"written": true, "added": int, "unchanged": int, "removed": [string], "kept_pinned": [string], "kept_recent": [string], "not_restored": [string], "note"?: string}`. For `MEMORY.md` or a topic file, the notes that file shows become exactly the notes written (an empty file removes them all): new ones are added (importance 4 in `MEMORY.md`, with the topic of the heading above them; 3 in a topic file), notes stored elsewhere are moved there, and notes left out are archived everywhere. Pinned notes are kept (`kept_pinned`), and so are notes another chat saved or changed after this turn began (`kept_recent`, dated from the turn's message); a note in the content that another chat removed or corrected after the turn began is not saved again (`not_restored`). A note under headings that name its subject (`## Alex`, `### Work`) is saved as `Alex — Work: ...`. Any other path only adds notes (prefixed with the file's title), needs at least one, and returns a `note`. |
+| `write_memory` | `path`, `content` (required, Markdown, one note per bullet; max 1,000,000 characters for `MEMORY.md` and topic files, 50,000 otherwise; owner private context only) | `{"written": true, "added": int, "unchanged": int, "removed": [string], "kept_pinned": [string], "kept_recent": [string], "not_restored": [string], "note"?: string}`. For `MEMORY.md` or a topic file, the notes that file shows become exactly the notes written (an empty file removes them all): new ones are added (importance 4 in `MEMORY.md`, with the topic of the heading above them; 3 in a topic file), notes stored elsewhere are moved there, and notes left out are archived everywhere. Pinned notes are kept (`kept_pinned`), and so are notes another chat saved or changed after this turn began (`kept_recent`, dated from the turn's message); a note in the content that another chat removed or corrected after the turn began is not saved again (`not_restored`). Changes the same turn made can be changed again. A note under headings that name its subject (`## Alex`, `### Work`) is saved as `Alex — Work: ...`. Any other path only adds notes (prefixed with the file's title), needs at least one, and returns a `note`. |
 | `save_to_library` | `title` (required, max 300), exactly one of `content` or `path`, `mime?`, `kind?: "artifact" \| "media"`, `description?` (max 2,000) | `{"item": LibraryItem}` |
 | `list_library` | `kind?: "artifact" \| "media"` | `{"items": [LibraryItem]}` (max 500) |
 | `create_card` | `type` (required, one of the [card types](#card)), `title` (required), `body?`, `url?`, `image_url?`, `action_label?`, `service?`, `ref_id?` (id of a related goal, idea, or feed post) | `{"card_message_id": "...", "shown": true}` |

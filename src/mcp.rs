@@ -394,6 +394,15 @@ impl Bridge {
             .map_or(self.started_at, |m| m.created_at.min(self.started_at))
     }
 
+    /// One memory batch per turn, so the turn's changes undo together and
+    /// later writes in the turn can change them again.
+    fn turn_batch(&self) -> String {
+        match &self.message_id {
+            Some(id) => format!("turn-{id}"),
+            None => format!("bridge-{}-{}", std::process::id(), self.started_at),
+        }
+    }
+
     fn private_status_context(&self) -> bool {
         self.owner_context()
             && self.conversation_id.as_ref().is_some_and(|conv| {
@@ -481,6 +490,7 @@ impl Bridge {
                         content,
                         &source,
                         self.turn_started(),
+                        &self.turn_batch(),
                     )
                     .map_err(db_err)?;
                     let mut out = json!({
@@ -1239,6 +1249,41 @@ mod tests {
             assert_eq!(r["isError"], true, "{name}");
         }
         assert_eq!(b.db.with(crate::memory::live).unwrap().len(), before);
+    }
+
+    #[test]
+    fn memory_changes_date_from_the_turn_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = bridge(tmp.path());
+        let conv = b.conversation_id.clone().unwrap();
+        let msg =
+            b.db.with(|c| {
+                db::insert_message(
+                    c,
+                    &db::NewMessage {
+                        conversation_id: &conv,
+                        role: "assistant",
+                        author_user_id: None,
+                        kind: "text",
+                        content: "",
+                        attachments: &[],
+                        card: None,
+                        status: "streaming",
+                        harness: None,
+                        model: None,
+                        effort: None,
+                        meta: None,
+                    },
+                )
+            })
+            .unwrap();
+        // The bridge started (or restarted) well after the turn began.
+        b.message_id = Some(msg.id.clone());
+        b.started_at = msg.created_at + 60_000;
+        assert_eq!(b.turn_started(), msg.created_at);
+        assert_eq!(b.turn_batch(), format!("turn-{}", msg.id));
+        b.message_id = Some("missing".into());
+        assert_eq!(b.turn_started(), b.started_at);
     }
 
     #[test]

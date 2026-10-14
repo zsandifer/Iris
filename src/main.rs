@@ -435,6 +435,17 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
 /// Import Markdown notes Iris did not generate and rewrite the memory export.
 fn prepare_memory(db: &db::Db, paths: &Paths) -> Result<()> {
     let report = memory::files::prepare(db, paths)?;
+    if report.unreadable > 0 {
+        warn!(
+            "memory: {} files too large or not text were replaced by the export; originals in {}",
+            report.unreadable,
+            report
+                .backup
+                .as_deref()
+                .unwrap_or(paths.data_dir.as_path())
+                .display()
+        );
+    }
     if report.files > 0 {
         info!(
             "memory: imported {} new notes ({} already known) from {} files; originals in {}",

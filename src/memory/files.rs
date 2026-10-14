@@ -307,7 +307,8 @@ fn with_export<R>(
         })
     });
     if out.is_err() {
-        let _ = db.with(|c| render_export(c, paths));
+        // Serialized like any change, so it never overwrites a newer export.
+        let _ = db.with(|c| write_tx(c, |tx| render_export(tx, paths)));
     }
     out
 }
@@ -327,10 +328,12 @@ pub fn import_notes(db: &Db, paths: &Paths, files: &[(String, String)]) -> Resul
     })
 }
 
-/// A Markdown file in the memory folder that Iris did not generate.
+/// A file in the memory folder that Iris did not generate.
 struct Foreign {
     rel: String,
-    content: String,
+    /// None when it cannot be read as notes (too large, not UTF-8). Kept
+    /// only in the backup when the export replaces it.
+    content: Option<String>,
     legacy_template: bool,
 }
 
@@ -354,25 +357,28 @@ fn collect(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Foreign>) {
             collect(root, &path, depth + 1, out);
             continue;
         }
-        if !ft.is_file()
-            || !crate::persona::is_text_note(&path)
-            || entry
-                .metadata()
-                .map_or(true, |m| m.len() > MAX_IMPORT_BYTES)
-        {
+        if !ft.is_file() || !crate::persona::is_text_note(&path) {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
         let Ok(rel) = path.strip_prefix(root) else {
             continue;
         };
         let rel = rel.to_string_lossy().into_owned();
-        if is_export_name(&rel) && is_generated(&content) {
-            continue;
+        let content = entry
+            .metadata()
+            .is_ok_and(|m| m.len() <= MAX_IMPORT_BYTES)
+            .then(|| std::fs::read_to_string(&path).ok())
+            .flatten();
+        match &content {
+            Some(c) if is_export_name(&rel) && is_generated(c) => continue,
+            // Left alone unless the export would replace it.
+            None if !is_export_name(&rel) => continue,
+            _ => {}
         }
-        let legacy_template = rel == CORE_FILE && content.trim() == LEGACY_TEMPLATE.trim();
+        let legacy_template = rel == CORE_FILE
+            && content
+                .as_deref()
+                .is_some_and(|c| c.trim() == LEGACY_TEMPLATE.trim());
         out.push(Foreign {
             rel,
             content,
@@ -387,6 +393,9 @@ pub struct Prepared {
     pub files: usize,
     pub counts: Counts,
     pub backup: Option<PathBuf>,
+    /// Files too large or not text, replaced by the export and kept only
+    /// in the backup.
+    pub unreadable: usize,
 }
 
 /// At startup: import the Markdown notes Iris did not generate (the notes
@@ -400,51 +409,49 @@ pub fn prepare(db: &Db, paths: &Paths) -> Result<Prepared> {
     let mut found = Vec::new();
     collect(&root, &root, 0, &mut found);
     let mut report = Prepared::default();
-    // Copy first: the export overwrites MEMORY.md.
-    let notes: Vec<&Foreign> = found.iter().filter(|f| !f.legacy_template).collect();
-    if !notes.is_empty() {
+    // Copy first: the export overwrites MEMORY.md and the topic files.
+    let kept: Vec<&Foreign> = found.iter().filter(|f| !f.legacy_template).collect();
+    if !kept.is_empty() {
         let stamp = crate::util::rfc3339(now_ms() / 1000).replace(':', "-");
         let mut dest = backup_root(paths).join(&stamp);
         if dest.exists() {
             dest = backup_root(paths).join(format!("{stamp}-{}", new_id()));
         }
-        for f in &notes {
+        for f in &kept {
             let to = dest.join(&f.rel);
             if let Some(parent) = to.parent() {
                 ensure_private_dir(parent)?;
             }
-            write_private_file(&to, f.content.as_bytes())?;
+            write_private_file(&to, &std::fs::read(root.join(&f.rel))?)?;
         }
         report.backup = Some(dest);
     }
-    let imported = db.with(|c| {
+    let notes: Vec<(&str, &str)> = kept
+        .iter()
+        .filter_map(|f| Some((f.rel.as_str(), f.content.as_deref()?)))
+        .collect();
+    report.unreadable = kept.len() - notes.len();
+    // Store the notes before touching any file: if this stops early, the
+    // originals are still in place and the next start imports them (notes
+    // already stored are not added twice).
+    db.with(|c| {
         write_tx(c, |tx| {
             let batch = new_id();
-            for f in &notes {
-                let source = json!({"type": "import", "file": f.rel});
-                let counts = ingest(tx, &f.rel, &f.content, Actor::Import, &source, &batch)?;
+            for (rel, content) in &notes {
+                let source = json!({"type": "import", "file": rel});
+                let counts = ingest(tx, rel, content, Actor::Import, &source, &batch)?;
                 report.counts.added += counts.added;
                 report.counts.existing += counts.existing;
             }
-            render_export(tx, paths)
+            Ok(())
         })
-    });
-    if let Err(e) = imported {
-        // Nothing was stored: put back any original the export replaced, so
-        // the next start imports it again.
-        for f in &notes {
-            let path = root.join(&f.rel);
-            if std::fs::read_to_string(&path).is_ok_and(|c| is_generated(&c)) {
-                let _ = write_private_file(&path, f.content.as_bytes());
-            }
-        }
-        return Err(e);
-    }
+    })?;
     report.files = notes.len();
+    db.with(|c| write_tx(c, |tx| render_export(tx, paths)))?;
     // The originals are in the backup and their notes in the database.
     for f in &found {
         let path = root.join(&f.rel);
-        if std::fs::read_to_string(&path).is_ok_and(|c| !is_generated(&c)) {
+        if f.content.is_some() && std::fs::read_to_string(&path).is_ok_and(|c| !is_generated(&c)) {
             std::fs::remove_file(&path)?;
         }
     }
@@ -491,9 +498,10 @@ pub struct Written {
 /// become exactly the notes in `content`: new ones are added, ones left out
 /// are archived (kept in history, so it can be undone). A note also appears
 /// in its topic file, so removing it from `MEMORY.md` removes it there
-/// too. Notes saved or changed since `turn_started` (ms) by anything but
-/// this turn (`source`) are never removed: the turn may have read the file
-/// before they existed. Any other path only adds notes.
+/// too. `batch` identifies the turn's changes: notes another change saved
+/// or changed since `turn_started` (ms) are never removed, and notes it
+/// removed are not brought back, since the turn may have read the file
+/// before. Any other path only adds notes.
 pub fn write(
     db: &Db,
     paths: &Paths,
@@ -501,13 +509,13 @@ pub fn write(
     content: &str,
     source: &Value,
     turn_started: i64,
+    batch: &str,
 ) -> Result<Written> {
     let export = is_export_name(rel);
     if !export && markdown::parse(content).notes.is_empty() {
         return Err("write at least one note (one per bullet)".into());
     }
     with_export(db, paths, |tx| {
-        let batch = new_id();
         let mut out = Written::default();
         let live = super::live(tx)?;
         let fixed_topic = Topic::ALL.into_iter().find(|t| t.file() == rel);
@@ -536,7 +544,7 @@ pub fn write(
             }
             // Removed or corrected elsewhere after this turn began: the
             // turn is writing back what it read before that.
-            if super::set_aside_since(tx, &hash, turn_started)? {
+            if super::set_aside_since(tx, &hash, turn_started, batch)? {
                 out.not_restored.push(c.text.clone());
                 continue;
             }
@@ -547,12 +555,12 @@ pub fn write(
                 importance,
                 source,
             };
-            match super::add(tx, &new, Actor::Agent, &batch)? {
+            match super::add(tx, &new, Actor::Agent, batch)? {
                 Added::New => out.added += 1,
                 // Stored elsewhere: show it here as well.
                 Added::Existing(item) => {
                     let topic = fixed_topic.unwrap_or(item.topic);
-                    super::regroup(tx, &item, importance, topic, Actor::Agent, &batch)?;
+                    super::regroup(tx, &item, importance, topic, Actor::Agent, batch)?;
                     out.unchanged += 1;
                 }
             }
@@ -560,10 +568,12 @@ pub fn write(
         for item in view.iter().filter(|i| !wanted.contains(&i.content_hash)) {
             if item.pinned {
                 out.kept_pinned.push(item.text.clone());
-            } else if item.updated_at >= turn_started && item.source != *source {
+            } else if item.updated_at >= turn_started
+                && super::last_batch(tx, item.id)?.as_deref() != Some(batch)
+            {
                 out.kept_recent.push(item.text.clone());
             } else {
-                super::archive(tx, item, Actor::Agent, &batch)?;
+                super::archive(tx, item, Actor::Agent, batch)?;
                 out.removed.push(item.text.clone());
             }
         }
@@ -748,7 +758,8 @@ mod tests {
             "people/sam.md",
             "# Sam\n- Likes jazz\n",
             &src,
-            0,
+            i64::MAX,
+            "t",
         )
         .unwrap();
         assert_eq!((w.added, w.removed.len()), (1, 0));
@@ -758,18 +769,28 @@ mod tests {
             "people/sam.md",
             "# Sam\n- Plays chess\n",
             &src,
-            0,
+            i64::MAX,
+            "t",
         )
         .unwrap();
         assert_eq!((w.added, w.removed.len()), (1, 0));
         assert!(read(&paths, "people.md").contains("- Sam: Likes jazz\n- Sam: Plays chess\n"));
 
         // MEMORY.md: read it, add a line under a topic heading, write it back.
-        let w = write(&db, &paths, CORE_FILE, "- Prefers mornings\n", &src, 0).unwrap();
+        let w = write(
+            &db,
+            &paths,
+            CORE_FILE,
+            "- Prefers mornings\n",
+            &src,
+            i64::MAX,
+            "t",
+        )
+        .unwrap();
         assert_eq!(w.added, 1);
         let core = read(&paths, CORE_FILE);
         let edited = format!("{core}\n## Projects\n\n- Building a bookshelf\n");
-        let w = write(&db, &paths, CORE_FILE, &edited, &src, 0).unwrap();
+        let w = write(&db, &paths, CORE_FILE, &edited, &src, i64::MAX, "t").unwrap();
         assert_eq!((w.added, w.unchanged, w.removed.len()), (1, 1, 0));
         assert!(read(&paths, "projects.md").contains("- Building a bookshelf"));
         assert!(read(&paths, CORE_FILE).contains("## Projects\n\n- Building a bookshelf\n"));
@@ -780,7 +801,8 @@ mod tests {
             CORE_FILE,
             &format!("{}\n- Sam: Plays chess\n", read(&paths, CORE_FILE)),
             &src,
-            0,
+            i64::MAX,
+            "t",
         )
         .unwrap();
         assert_eq!((w.added, w.unchanged), (0, 3));
@@ -789,7 +811,7 @@ mod tests {
 
         // Editing a line: the old note is set aside, the new one added.
         let core = read(&paths, CORE_FILE).replace("Prefers mornings", "Prefers evenings");
-        let w = write(&db, &paths, CORE_FILE, &core, &src, 0).unwrap();
+        let w = write(&db, &paths, CORE_FILE, &core, &src, i64::MAX, "t").unwrap();
         assert_eq!(
             (w.added, w.removed.clone()),
             (1, vec!["Prefers mornings".to_string()])
@@ -799,7 +821,7 @@ mod tests {
         assert!(!texts.contains(&"Prefers mornings".to_string()));
         // Removing a note from its topic file removes it everywhere.
         let people = read(&paths, "people.md").replace("- Sam: Plays chess\n", "");
-        let w = write(&db, &paths, "people.md", &people, &src, 0).unwrap();
+        let w = write(&db, &paths, "people.md", &people, &src, i64::MAX, "t").unwrap();
         assert_eq!(w.removed, ["Sam: Plays chess"]);
         assert!(!read(&paths, CORE_FILE).contains("chess"));
         // Archived, not deleted, and every change has a history row.
@@ -833,12 +855,21 @@ mod tests {
             )
         })
         .unwrap();
-        let w = write(&db, &paths, CORE_FILE, "- Something else\n", &src, 0).unwrap();
+        let w = write(
+            &db,
+            &paths,
+            CORE_FILE,
+            "- Something else\n",
+            &src,
+            i64::MAX,
+            "t",
+        )
+        .unwrap();
         assert_eq!(w.kept_pinned, ["Prefers evenings"]);
         assert!(read(&paths, CORE_FILE).contains("## Always in mind\n\n- Prefers evenings\n"));
         // Old-style paths need at least one note; an export file can be emptied.
-        assert!(write(&db, &paths, "notes.md", "# Notes\n", &src, 0).is_err());
-        let w = write(&db, &paths, "people.md", "# People\n", &src, 0).unwrap();
+        assert!(write(&db, &paths, "notes.md", "# Notes\n", &src, i64::MAX, "t").is_err());
+        let w = write(&db, &paths, "people.md", "# People\n", &src, i64::MAX, "t").unwrap();
         assert_eq!(w.removed, ["Sam: Likes jazz"]);
         assert!(!paths.memory_dir().join("people.md").exists());
     }
@@ -848,7 +879,16 @@ mod tests {
         let (_t, paths, db) = setup();
         let mine = json!({"type": "conversation", "conversation_id": "c1", "message_ids": ["m1"]});
         let other = json!({"type": "conversation", "conversation_id": "c2", "message_ids": ["m2"]});
-        write(&db, &paths, "people.md", "- Old friend\n", &other, 0).unwrap();
+        write(
+            &db,
+            &paths,
+            "people.md",
+            "- Old friend\n",
+            &other,
+            i64::MAX,
+            "other1",
+        )
+        .unwrap();
         let started = crate::util::now_ms() + 1;
         while crate::util::now_ms() < started {}
         // This turn reads people.md; meanwhile another chat adds a note.
@@ -859,7 +899,8 @@ mod tests {
             "people.md",
             "- Old friend\n- New neighbour\n",
             &other,
-            0,
+            i64::MAX,
+            "other2",
         )
         .unwrap();
         let w = write(
@@ -869,6 +910,7 @@ mod tests {
             &format!("{seen}- Just added here\n"),
             &mine,
             started,
+            "mine",
         )
         .unwrap();
         assert_eq!(
@@ -883,6 +925,7 @@ mod tests {
             &seen.replace("- Old friend\n", ""),
             &mine,
             started,
+            "mine",
         )
         .unwrap();
         assert_eq!(w.removed, ["Old friend", "Just added here"]);
@@ -894,12 +937,21 @@ mod tests {
     fn a_failed_change_leaves_the_export_as_stored() {
         let (_t, paths, db) = setup();
         let src = json!({"type": "owner"});
-        write(&db, &paths, CORE_FILE, "- Prefers mornings\n", &src, 0).unwrap();
+        write(
+            &db,
+            &paths,
+            CORE_FILE,
+            "- Prefers mornings\n",
+            &src,
+            i64::MAX,
+            "t",
+        )
+        .unwrap();
         let before = read(&paths, CORE_FILE);
         // people.md cannot be written; MEMORY.md is written first.
         std::fs::create_dir(paths.memory_dir().join("people.md")).unwrap();
         let edited = format!("{before}\n## People\n\n- Has a brother\n");
-        assert!(write(&db, &paths, CORE_FILE, &edited, &src, 0).is_err());
+        assert!(write(&db, &paths, CORE_FILE, &edited, &src, i64::MAX, "t").is_err());
         assert_eq!(read(&paths, CORE_FILE), before);
         assert_eq!(live_texts(&db).len(), 1);
     }
@@ -934,22 +986,121 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_first_import_leaves_the_originals_to_import_again() {
+    fn an_interrupted_first_import_is_finished_on_the_next_start() {
         let (_t, paths, db) = setup();
         let mem = paths.memory_dir();
         let original = "# Memory\n\n## Routines\n- Run at 7\n";
         std::fs::write(mem.join(CORE_FILE), original).unwrap();
-        // routines.md cannot be written; MEMORY.md is written first.
+        // routines.md cannot be written, so the export fails after the
+        // notes are stored.
         std::fs::create_dir(mem.join("routines.md")).unwrap();
         assert!(prepare(&db, &paths).is_err());
-        assert_eq!(read(&paths, CORE_FILE), original);
-        assert!(live_texts(&db).is_empty());
+        let stored = live_texts(&db);
+        assert_eq!(stored, [("Run at 7".to_string(), Topic::Routines, 4)]);
         std::fs::remove_dir(mem.join("routines.md")).unwrap();
         prepare(&db, &paths).unwrap();
+        assert_eq!(live_texts(&db), stored);
+        assert!(read(&paths, "routines.md").contains("- Run at 7"));
+        // Stopped before the notes were stored: the original is untouched
+        // and imported next time.
+        let (_t2, paths2, db2) = setup();
+        std::fs::write(paths2.memory_dir().join(CORE_FILE), original).unwrap();
+        db2.with(|c| c.execute_batch("CREATE TRIGGER fail BEFORE INSERT ON memory_items BEGIN SELECT RAISE(ABORT, 'full'); END;"))
+            .unwrap();
+        assert!(prepare(&db2, &paths2).is_err());
+        assert_eq!(read(&paths2, CORE_FILE), original);
+        db2.with(|c| c.execute_batch("DROP TRIGGER fail")).unwrap();
+        prepare(&db2, &paths2).unwrap();
+        assert_eq!(live_texts(&db2), stored);
+    }
+
+    #[test]
+    fn an_oversized_legacy_core_is_backed_up_before_it_is_replaced() {
+        let (_t, paths, db) = setup();
+        let big = format!("- {}\n", "x".repeat(MAX_IMPORT_BYTES as usize + 1));
+        std::fs::write(paths.memory_dir().join(CORE_FILE), &big).unwrap();
+        std::fs::write(paths.memory_dir().join("huge-notes.md"), &big).unwrap();
+        let report = prepare(&db, &paths).unwrap();
+        assert_eq!((report.files, report.unreadable), (0, 1));
+        let backup = report.backup.unwrap();
         assert_eq!(
-            live_texts(&db),
-            [("Run at 7".to_string(), Topic::Routines, 4)]
+            std::fs::read_to_string(backup.join(CORE_FILE)).unwrap(),
+            big
         );
+        assert!(is_generated(&read(&paths, CORE_FILE)));
+        // A large note file that is not an export name is left alone.
+        assert!(paths.memory_dir().join("huge-notes.md").exists());
+    }
+
+    #[test]
+    fn a_turn_can_correct_what_it_changed_but_not_what_others_changed() {
+        let (_t, paths, db) = setup();
+        let import = json!({"type": "import", "file": "people.md"});
+        import_notes(
+            &db,
+            &paths,
+            &[("people.md".into(), "- Neighbour Kim\n".into())],
+        )
+        .unwrap();
+        let started = crate::util::now_ms() + 1;
+        while crate::util::now_ms() < started {}
+        let me = json!({"type": "conversation", "conversation_id": "c", "message_ids": ["m"]});
+        // This turn promotes an imported note into MEMORY.md, then corrects it.
+        let w = write(
+            &db,
+            &paths,
+            CORE_FILE,
+            "- Neighbour Kim\n",
+            &me,
+            started,
+            "turn-m",
+        )
+        .unwrap();
+        assert_eq!((w.added, w.unchanged), (0, 1));
+        let w = write(
+            &db,
+            &paths,
+            CORE_FILE,
+            "- Neighbour Kim has a cat\n",
+            &me,
+            started,
+            "turn-m",
+        )
+        .unwrap();
+        assert_eq!(w.removed, ["Neighbour Kim"]);
+        assert!(w.kept_recent.is_empty());
+        // Another turn promotes a note this turn has not seen in MEMORY.md.
+        write(
+            &db,
+            &paths,
+            "people.md",
+            "- Neighbour Kim has a cat\n- Sam\n",
+            &me,
+            started,
+            "turn-m",
+        )
+        .unwrap();
+        write(
+            &db,
+            &paths,
+            CORE_FILE,
+            &format!("{}- Sam\n", read(&paths, CORE_FILE)),
+            &import,
+            started,
+            "turn-x",
+        )
+        .unwrap();
+        let w = write(
+            &db,
+            &paths,
+            CORE_FILE,
+            "- Neighbour Kim has a cat\n",
+            &me,
+            started,
+            "turn-m",
+        )
+        .unwrap();
+        assert_eq!(w.kept_recent, ["Sam"]);
     }
 
     #[test]
@@ -957,7 +1108,16 @@ mod tests {
         let (_t, paths, db) = setup();
         let a = json!({"type": "conversation", "conversation_id": "a", "message_ids": ["ma"]});
         let b = json!({"type": "conversation", "conversation_id": "b", "message_ids": ["mb"]});
-        write(&db, &paths, "people.md", "- Alex lives in Boston\n", &b, 0).unwrap();
+        write(
+            &db,
+            &paths,
+            "people.md",
+            "- Alex lives in Boston\n",
+            &b,
+            i64::MAX,
+            "b1",
+        )
+        .unwrap();
         let started = crate::util::now_ms() + 1;
         while crate::util::now_ms() < started {}
         // Chat A reads people.md; chat B then corrects the note.
@@ -969,6 +1129,7 @@ mod tests {
             "- Alex lives in Seattle\n",
             &b,
             started,
+            "b2",
         )
         .unwrap();
         // A writes its stale copy with an unrelated addition.
@@ -979,6 +1140,7 @@ mod tests {
             &format!("{seen}- Sam bakes bread\n"),
             &a,
             started,
+            "a",
         )
         .unwrap();
         assert_eq!(w.added, 1);

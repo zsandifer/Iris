@@ -440,6 +440,8 @@ CREATE UNIQUE INDEX memory_items_live_hash ON memory_items(content_hash)
 WHERE archived = 0 AND superseded_by IS NULL;
 CREATE INDEX memory_items_live_topic ON memory_items(topic, created_at)
 WHERE archived = 0 AND superseded_by IS NULL;
+-- Finds set-aside notes by text too.
+CREATE INDEX memory_items_hash ON memory_items(content_hash);
 
 -- Every change, so any change can be undone. No foreign key: a tombstone
 -- outlives the row it describes.
