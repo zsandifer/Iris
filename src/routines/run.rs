@@ -216,8 +216,15 @@ fn insert_run(
 
 /// Start due retries and claim due slots; returns the runs to start.
 pub fn claim_due(conn: &Connection, now: i64) -> rusqlite::Result<Vec<String>> {
+    claim_due_changes(conn, now).map(|(runs, _)| runs)
+}
+
+/// [`claim_due`], and whether anything changed (slots skipped, retries
+/// given up, routines finished) even when nothing starts.
+pub fn claim_due_changes(conn: &Connection, now: i64) -> rusqlite::Result<(Vec<String>, bool)> {
     db::write_tx(conn, |c| {
         let mut out = Vec::new();
+        let mut changed = false;
         let retries: Vec<(String, String, i64, String)> = c
             .prepare(
                 "SELECT r.id, r.routine_id, r.retry_at, t.misfire
@@ -228,6 +235,7 @@ pub fn claim_due(conn: &Connection, now: i64) -> rusqlite::Result<Vec<String>> {
             )?
             .query_map([now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<_>>()?;
+        changed |= !retries.is_empty();
         for (run, routine, retry_at, misfire) in retries {
             // A retry missed while Iris was offline or paused follows the
             // routine's missed-run rule, like a missed slot.
@@ -266,6 +274,7 @@ pub fn claim_due(conn: &Connection, now: i64) -> rusqlite::Result<Vec<String>> {
             )?
             .query_map([now], super::routine_from_row)?
             .collect::<rusqlite::Result<_>>()?;
+        changed |= !due.is_empty();
         for r in due {
             let Ok(plan) = r.spec.plan() else {
                 // Cannot be scheduled any more (e.g. a time zone removed
@@ -308,7 +317,7 @@ pub fn claim_due(conn: &Connection, now: i64) -> rusqlite::Result<Vec<String>> {
                 params![r.id, run_count, state.name(), next, now],
             )?;
         }
-        Ok(out)
+        Ok((out, changed))
     })
 }
 
@@ -665,11 +674,10 @@ pub async fn tick(state: &AppState) {
         Ok(_) => {}
         Err(e) => crate::warn!("routines: expiring approvals failed: {e}"),
     }
-    match state.db.call(move |c| claim_due(c, now)).await {
-        Ok(claimed) => {
-            if !claimed.is_empty()
-                && let Ok(Some(owner)) = state.db.call(db::owner_user_id).await
-            {
+    match state.db.call(move |c| claim_due_changes(c, now)).await {
+        Ok((claimed, any)) => {
+            // Skipped slots and finished routines change the list too.
+            if any && let Ok(Some(owner)) = state.db.call(db::owner_user_id).await {
                 changed(state, &owner);
             }
             for id in claimed {

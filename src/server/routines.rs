@@ -463,6 +463,12 @@ async fn approve(
                 None => None,
             };
             let docs = edited.as_ref().and_then(|(_, d)| d.clone());
+            // Checked first: a failed attach must not leave it approved.
+            if let Some(d) = &docs
+                && let Err(e) = routines::check_docs(c, &owner, d)
+            {
+                return Ok(Err(e));
+            }
             let res = routines::approve_change(c, &owner, &id, edited.map(|(s, _)| s), now_ms());
             if let (Ok(d), Some(docs)) = (&res, docs)
                 && let Some(r) = &d.routine

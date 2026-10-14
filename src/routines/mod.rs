@@ -635,15 +635,22 @@ pub fn check_doc(conn: &Connection, owner: &str, id: &str) -> Result<(), String>
 }
 
 /// Make the routine's documents exactly `ids`.
+/// Check documents can be attached (each an uploaded document of the
+/// owner's still in the Library).
+pub fn check_docs(conn: &Connection, owner: &str, ids: &[String]) -> Result<(), String> {
+    for id in ids {
+        check_doc(conn, owner, id)?;
+    }
+    Ok(())
+}
+
 pub fn set_docs(
     conn: &Connection,
     owner: &str,
     routine_id: &str,
     ids: &[String],
 ) -> Result<(), String> {
-    for id in ids {
-        check_doc(conn, owner, id)?;
-    }
+    check_docs(conn, owner, ids)?;
     db::write_tx(conn, |c| {
         for d in list_docs(c, routine_id)? {
             if !ids.contains(&d.id) {

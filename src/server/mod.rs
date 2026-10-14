@@ -3894,6 +3894,46 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
     }
 
     #[tokio::test]
+    async fn setting_up_a_proposal_with_a_missing_document_changes_nothing() {
+        let t = turn_setup(|_| {}).await;
+        let h = &t.h;
+        let main = t.main_of(&t.owner_t).await;
+        let p = h
+            .state
+            .db
+            .call(move |c| {
+                let owner = crate::db::owner_user_id(c)?.unwrap();
+                let spec = crate::routines::Spec::from_json(
+                    &json!({"title": "Dinner", "instructions": "Order my usual.",
+                            "schedule_kind": "rule", "tz": "UTC",
+                            "rule": {"freq": "weekly", "days": [6], "time": "17:30"}}),
+                    "UTC",
+                )
+                .unwrap();
+                let target = crate::routines::CardTarget {
+                    conversation_id: &main,
+                    status: "complete",
+                };
+                Ok(crate::routines::propose_create(c, &owner, spec, &target).unwrap())
+            })
+            .await
+            .unwrap();
+        let approve = format!("/api/routines/changes/{}/approve", p.change.id);
+        let edited = json!({"routine": {"title": "Dinner", "instructions": "Order my usual.",
+            "schedule_kind": "rule", "tz": "UTC", "doc_ids": ["deleted-doc"],
+            "rule": {"freq": "weekly", "days": [6], "time": "17:30"}}});
+        let (s, b) = send(&h.app, "POST", &approve, Some(&t.owner_t), Some(edited)).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{b}");
+        // Still a proposal: not scheduled, and the owner can try again.
+        let path = format!("/api/routines/{}", p.routine.id);
+        let (_, b) = send(&h.app, "GET", &path, Some(&t.owner_t), None).await;
+        assert_eq!(b["routine"]["state"], "pending_approval", "{b}");
+        let (s, b) = send(&h.app, "POST", &approve, Some(&t.owner_t), None).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["routine"]["state"], "active");
+    }
+
+    #[tokio::test]
     async fn routine_attempts_that_used_tools_are_never_replayed() {
         let t = turn_setup(|_| {}).await;
         let (h, tok) = (&t.h, t.owner_t.as_str());

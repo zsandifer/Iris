@@ -719,8 +719,15 @@ fn retries_missed_while_offline_follow_the_missed_run_rule() {
     let stale = mk(&skip.id, "2026-10-10T17:30", now - 20 * 60_000);
     let fine = mk(&window.id, "2026-10-10T17:30", now - 20 * 60_000);
     let too_old = mk(&window.id, "2026-10-03T17:30", now - 3 * 3_600_000);
-    let claimed = db.with(|c| run::claim_due(c, now)).unwrap();
+    let (claimed, changed) = db.with(|c| run::claim_due_changes(c, now)).unwrap();
     assert_eq!(claimed, std::slice::from_ref(&fine));
+    assert!(changed);
+    // A quiet minute changes nothing.
+    assert_eq!(
+        db.with(|c| run::claim_due_changes(c, now + 60_000))
+            .unwrap(),
+        (Vec::new(), false)
+    );
     let get = |id: &str| db.with(|c| run::get_run(c, id)).unwrap().unwrap();
     for id in [&stale, &too_old] {
         let r = get(id);
