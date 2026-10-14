@@ -129,6 +129,13 @@ classifier_model = false
 long_chars = 1200
 very_long_chars = 6000
 
+# Nightly memory consolidation, using your Background engine with no tools.
+# Local hour (one-hour window). No new chat = no run.
+[dream]
+enabled = true
+hour = 3
+min_messages = 4
+
 # Proactive check-in: reads persona/HEARTBEAT.md and messages you in Main chat
 # only when something needs attention. Uses the `background` slot.
 [heartbeat]

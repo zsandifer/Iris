@@ -495,6 +495,9 @@ impl Bridge {
                             "I can only use memory in the owner's private chats.",
                         ));
                     }
+                    if matches!(name, "remember" | "update_memory" | "forget") {
+                        crate::memory::dream::learning_allowed(c)?;
+                    }
                     use crate::memory::recall as r;
                     let id = || {
                         a["id"]
@@ -1401,6 +1404,34 @@ mod tests {
             assert_eq!(r["isError"], true, "{name}");
         }
         assert_eq!(b.db.with(crate::memory::live).unwrap().len(), before);
+    }
+
+    #[test]
+    fn pause_learning_blocks_every_agent_memory_write_but_keeps_recall() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = bridge(tmp.path());
+        let saved = call(&b, "remember", json!({"text":"Likes hiking","kind":"fact"}));
+        let id = saved["structuredContent"]["item"]["id"].as_i64().unwrap();
+        b.db.with(|c| crate::db::set_setting(c, crate::memory::dream::PAUSED, "true"))
+            .unwrap();
+        for (tool, args) in [
+            ("remember", json!({"text":"Likes biking","kind":"fact"})),
+            ("update_memory", json!({"id":id,"text":"Likes biking"})),
+            ("forget", json!({"id":id})),
+            (
+                "write_memory",
+                json!({"path":"MEMORY.md","content":"- Likes biking"}),
+            ),
+        ] {
+            let out = call(&b, tool, args);
+            assert_eq!(out["isError"], true, "{tool}: {out}");
+            assert!(out.to_string().contains("paused learning"), "{out}");
+        }
+        assert_eq!(
+            call(&b, "search_memory", json!({"query":"hiking"}))["isError"],
+            false
+        );
+        assert_eq!(b.db.with(crate::memory::live).unwrap().len(), 1);
     }
 
     #[test]

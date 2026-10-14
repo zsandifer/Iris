@@ -250,6 +250,11 @@ pub fn save(
         && Some(duplicate.id) != id
     {
         if duplicate.valid_to.is_some_and(|t| t <= now_ms()) {
+            if actor == Actor::Dream && duplicate.pinned {
+                return Err(invalid(
+                    "I keep pinned notes always in mind. Please edit this one in Memory.",
+                ));
+            }
             super::archive(c, &duplicate, actor, batch)?;
         } else {
             return Ok(json!({"item": duplicate, "duplicate": true, "changed": false}));
@@ -263,8 +268,8 @@ pub fn save(
     let saved_id;
     if let Some(old) = before.as_ref().filter(|_| !replace) {
         saved_id = old.id;
-        c.execute("UPDATE memory_items SET kind = ?2, topic = ?3, text = ?4, importance = ?5, pinned = ?6, observed_at = ?7, valid_to = ?8, content_hash = ?9, updated_at = ?10 WHERE id = ?1",
-            params![old.id, kind, topic.name(), text, importance, edit.pinned.unwrap_or(old.pinned), edit.observed_at.unwrap_or(old.observed_at), edit.valid_to.unwrap_or(old.valid_to), hash, now])?;
+        c.execute("UPDATE memory_items SET kind = ?2, topic = ?3, text = ?4, importance = ?5, pinned = ?6, observed_at = ?7, valid_to = ?8, content_hash = ?9, updated_at = ?10, source = ?11, mentioned_at = ?12 WHERE id = ?1",
+            params![old.id, kind, topic.name(), text, importance, edit.pinned.unwrap_or(old.pinned), edit.observed_at.unwrap_or(old.observed_at), edit.valid_to.unwrap_or(old.valid_to), hash, now, if actor == Actor::Dream { source } else { &old.source }.to_string(), if actor == Actor::Dream { Some(now) } else { old.mentioned_at }])?;
         record(
             c,
             old.id,

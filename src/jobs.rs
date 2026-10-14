@@ -4,6 +4,8 @@
 //! - heartbeat: a `Purpose::Scheduled` turn on the `background` slot reads
 //!   HEARTBEAT.md and, only when something needs attention, posts a message
 //!   in the owner's Main chat (and pushes it).
+//! - dream: bounded private-memory consolidation through a tool-free CLI
+//!   helper, with history and morning-card data.
 //! - feed: the For you pipeline (`crate::feed`): mostly code, plus at most
 //!   two small model calls a day. Publishes one batch per local day.
 
@@ -21,21 +23,24 @@ use std::time::Duration;
 pub const HEARTBEAT_OK: &str = "HEARTBEAT_OK";
 
 static HEARTBEAT_RUNNING: AtomicBool = AtomicBool::new(false);
+static DREAM_RUNNING: AtomicBool = AtomicBool::new(false);
 static FEED_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Job {
     Heartbeat,
     Feed,
+    Dream,
 }
 
 impl Job {
-    pub const ALL: [Job; 2] = [Job::Heartbeat, Job::Feed];
+    pub const ALL: [Job; 3] = [Job::Heartbeat, Job::Feed, Job::Dream];
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "heartbeat" => Some(Job::Heartbeat),
             "feed" => Some(Job::Feed),
+            "dream" => Some(Job::Dream),
             _ => None,
         }
     }
@@ -43,31 +48,38 @@ impl Job {
         match self {
             Job::Heartbeat => "heartbeat",
             Job::Feed => "feed",
-        }
-    }
-    fn cfg(self, state: &AppState) -> &JobConfig {
-        match self {
-            Job::Heartbeat => &state.cfg.heartbeat,
-            Job::Feed => &state.cfg.feed,
+            Job::Dream => "dream",
         }
     }
     async fn effective_cfg(self, state: &AppState) -> JobConfig {
-        let mut cfg = self.cfg(state).clone();
-        if self == Job::Feed {
-            cfg.enabled = crate::feed::enabled(state).await;
+        match self {
+            Job::Heartbeat => state.cfg.heartbeat.clone(),
+            Job::Feed => {
+                let mut cfg = state.cfg.feed.clone();
+                cfg.enabled = crate::feed::enabled(state).await;
+                cfg
+            }
+            Job::Dream => JobConfig {
+                enabled: state.cfg.dream.enabled
+                    && state.setting(crate::memory::dream::PAUSED).await.as_deref() != Some("true"),
+                interval_mins: 1440,
+                active_start: format!("{:02}:00", state.cfg.dream.hour),
+                active_end: format!("{:02}:00", (state.cfg.dream.hour + 1) % 24),
+            },
         }
-        cfg
     }
     fn flag(self) -> &'static AtomicBool {
         match self {
             Job::Heartbeat => &HEARTBEAT_RUNNING,
             Job::Feed => &FEED_RUNNING,
+            Job::Dream => &DREAM_RUNNING,
         }
     }
     fn last_run_key(self) -> &'static str {
         match self {
             Job::Heartbeat => "job.heartbeat.last_run",
             Job::Feed => "job.feed.last_run",
+            Job::Dream => "job.dream.last_run",
         }
     }
 }
@@ -230,12 +242,14 @@ pub fn spawn_scheduler(state: AppState) {
                     .setting(job.last_run_key())
                     .await
                     .and_then(|s| s.parse::<i64>().ok());
-                if due(
-                    &job.effective_cfg(&state).await,
-                    last,
-                    now_ms(),
-                    local_minutes_now(),
-                ) {
+                let cfg = job.effective_cfg(&state).await;
+                let ready = if job == Job::Dream {
+                    crate::memory::dream::due(&state.cfg.dream, last, now_ms(), local_minutes_now())
+                        && cfg.enabled
+                } else {
+                    due(&cfg, last, now_ms(), local_minutes_now())
+                };
+                if ready {
                     trigger(&state, job, false);
                 }
             }
@@ -277,6 +291,9 @@ pub async fn run_job(state: &AppState, job: Job, manual: bool) -> crate::util::R
             .await?;
         crate::feed::run(state, &owner, manual).await?;
         return Ok(());
+    }
+    if job == Job::Dream {
+        return crate::memory::dream::run(state, &owner, manual).await;
     }
     let prompt = heartbeat_prompt(state);
     let (o, name) = (owner.clone(), job.name());

@@ -32,6 +32,7 @@ pub struct Config {
     pub router: RouterConfig,
     pub heartbeat: JobConfig,
     pub feed: JobConfig,
+    pub dream: DreamConfig,
     pub push: PushConfig,
     pub engines: EnginesConfig,
     pub agent: AgentConfig,
@@ -206,6 +207,25 @@ pub struct JobConfig {
     pub active_end: String,
 }
 
+/// Nightly, activity-gated owner memory consolidation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DreamConfig {
+    pub enabled: bool,
+    pub hour: u32,
+    pub min_messages: usize,
+}
+
+impl Default for DreamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hour: 3,
+            min_messages: 4,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PushConfig {
@@ -362,6 +382,7 @@ impl Default for Config {
             router: RouterConfig::default(),
             heartbeat: JobConfig::default(),
             feed: JobConfig::feed_default(),
+            dream: DreamConfig::default(),
             push: PushConfig::default(),
             engines: EnginesConfig::default(),
             agent: AgentConfig::default(),
@@ -456,6 +477,9 @@ impl Config {
                 "agent.user must be a valid account name and agent.launcher an absolute path"
                     .into(),
             );
+        }
+        if self.dream.hour > 23 || !(1..=80).contains(&self.dream.min_messages) {
+            return Err("dream.hour must be 0–23 and dream.min_messages must be 1–80".into());
         }
         if self.max_concurrent_turns == 0 {
             return Err("max_concurrent_turns must be at least 1".into());

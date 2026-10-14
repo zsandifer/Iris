@@ -12,6 +12,7 @@
 //! [`packing`]), and one file per topic lists every note of that topic.
 //! Memory is only ever reachable from the owner's private chats.
 
+pub mod dream;
 pub mod files;
 pub mod gate;
 pub mod markdown;
@@ -86,6 +87,7 @@ pub enum Actor {
     /// Imported from Markdown notes.
     Import,
     Owner,
+    Dream,
 }
 
 impl Actor {
@@ -94,6 +96,7 @@ impl Actor {
             Actor::Agent => "agent",
             Actor::Import => "import",
             Actor::Owner => "owner",
+            Actor::Dream => "dream",
         }
     }
 }

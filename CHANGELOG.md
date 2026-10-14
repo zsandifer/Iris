@@ -7,6 +7,15 @@ All notable changes to Iris are documented here, following
 
 ### Added
 
+- Nightly memory tidying through the owner's Background engine: bounded private
+  chat input, strict validated decisions, history snapshots and undo, a guard
+  against setting aside too many notes, and a success-only progress cursor.
+  The backend supplies one morning-note card a day with per-change undo and a
+  Memory link; dedicated card UI follows separately. Configure `[dream]` (3am,
+  four new messages by default). Pause learning and morning-note preferences
+  are owner settings; pausing learning also stops agent memory writes while
+  recall and owner edits remain available.
+
 - Personal and shared chat with photos, streaming replies and saved history.
 - Claude Code, Codex, Gemini and OpenCode engines, with installation and sign-in
   from the app, automatic model ranking and effort selection.
