@@ -244,57 +244,7 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
         out.push_str(&crate::browser::tools::guide(server));
     }
 
-    if ctx.scope == Scope::Shared {
-        out.push_str(
-            "\n## Memory\n\nThe owner's personal memory is not available in shared \
-             conversations. Do not look for it or reveal personal details about anyone \
-             that were not shared in this conversation.\n",
-        );
-    } else if !private {
-        out.push_str(
-            "\n## Memory\n\nLong-term memory is not available in this conversation. Do \
-             not look for memory or personal files on the server, and do not reveal \
-             details about other people who use this server.\n",
-        );
-    } else {
-        let memory_dir = paths.memory_dir();
-        let mut entries = Vec::new();
-        collect_memory(&memory_dir, &memory_dir, 0, &mut entries);
-        entries.retain(|(rel, _, _)| rel != "MEMORY.md");
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        out.push_str(
-            "\n## Memory\n\nIris keeps the owner's long-term memory as notes. MEMORY.md \
-             (below) holds the notes always in mind, as many as fit: pinned notes first, \
-             then the most important and recently used. Every note is also listed in its \
-             topic file (you.md, people.md, projects.md, routines.md; the ones with notes \
-             are listed below). Read a topic file with the Iris read_memory tool when its \
-             topic comes up, or when MEMORY.md says notes did not fit. To save, correct or remove notes, use write_memory with the \
-             file's full new content, one note per bullet (MEMORY.md for short, \
-             always-relevant facts); bullets you leave out are removed everywhere. These \
-             tools are only available in the owner's private chats.\n",
-        );
-        if entries.is_empty() {
-            out.push_str("\n(No other memory files yet.)\n");
-        } else {
-            out.push('\n');
-            let total = entries.len();
-            for (rel, title, size) in entries.iter().take(MAX_MEMORY_INDEX_ENTRIES) {
-                out.push_str(&format!("- `{rel}` ({}) {title}\n", human_size(*size)));
-            }
-            if total > MAX_MEMORY_INDEX_ENTRIES {
-                out.push_str(&format!(
-                    "- ... and {} more files\n",
-                    total - MAX_MEMORY_INDEX_ENTRIES
-                ));
-            }
-        }
-        if let Some(core) = crate::memory::files::core_for_prompt(paths) {
-            out.push_str(&format!(
-                "\n<memory file=\"MEMORY.md\">\n{}\n</memory>\n",
-                truncate_chars(&core, MAX_MEMORY_INLINE_CHARS)
-            ));
-        }
-    }
+    out.push_str(&memory_prompt(paths, ctx.scope));
 
     if !ctx.notices.is_empty() {
         out.push_str("\n## Notices\n\n");
@@ -361,6 +311,66 @@ tell the user plainly what did not happen and do not retry unless they ask.
 Never try to get around an approval (for example by using another tool or
 service for the same action).
 ";
+
+/// Current memory context, including the packed core, topic index and
+/// capacity notices. Also sent on stdin when a CLI cannot refresh the
+/// system prompt of a resumed session. Non-owner scopes read no memory.
+pub fn memory_prompt(paths: &Paths, scope: Scope) -> String {
+    let mut out = String::new();
+    if scope == Scope::Shared {
+        out.push_str(
+            "\n## Memory\n\nThe owner's personal memory is not available in shared \
+             conversations. Do not look for it or reveal personal details about anyone \
+             that were not shared in this conversation.\n",
+        );
+    } else if scope != Scope::Private {
+        out.push_str(
+            "\n## Memory\n\nLong-term memory is not available in this conversation. Do \
+             not look for memory or personal files on the server, and do not reveal \
+             details about other people who use this server.\n",
+        );
+    } else {
+        let memory_dir = paths.memory_dir();
+        let mut entries = Vec::new();
+        collect_memory(&memory_dir, &memory_dir, 0, &mut entries);
+        entries.retain(|(rel, _, _)| rel != "MEMORY.md");
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        out.push_str(
+            "\n## Memory\n\nIris keeps the owner's long-term memory as notes. MEMORY.md \
+             (below) holds the notes always in mind, as many as fit: pinned notes first, \
+             then the most important and recently used. Every note is also listed in its \
+             topic file (you.md, people.md, projects.md, routines.md; the ones with notes \
+             are listed below). Read a topic file with the Iris read_memory tool when its \
+             topic comes up, or when MEMORY.md says notes did not fit. To save, correct or remove notes, use write_memory with the \
+             file's full new content, one note per bullet (MEMORY.md for short, \
+             always-relevant facts); bullets you leave out are removed everywhere. These \
+             tools are only available in the owner's private chats.\n",
+        );
+        if entries.is_empty() {
+            out.push_str("\n(No other memory files yet.)\n");
+        } else {
+            out.push('\n');
+            let total = entries.len();
+            for (rel, title, size) in entries.iter().take(MAX_MEMORY_INDEX_ENTRIES) {
+                out.push_str(&format!("- `{rel}` ({}) {title}\n", human_size(*size)));
+            }
+            if total > MAX_MEMORY_INDEX_ENTRIES {
+                out.push_str(&format!(
+                    "- ... and {} more files\n",
+                    total - MAX_MEMORY_INDEX_ENTRIES
+                ));
+            }
+        }
+        if let Some(core) = crate::memory::files::core_for_prompt(paths) {
+            out.push_str(&format!(
+                "\n<memory file=\"MEMORY.md\">\n{}\n</memory>\n",
+                truncate_chars(&core, MAX_MEMORY_INLINE_CHARS)
+            ));
+        }
+    }
+
+    out
+}
 
 /// Hash of the inputs that define who the agent is (name, conversation
 /// kind, privacy scope, persona files, and in private scope
@@ -557,6 +567,29 @@ mod tests {
         assert!(with_browser.contains("take over"));
         b.scope = Scope::Shared;
         assert!(!assemble(&p, &b).contains("## Your browser"));
+    }
+
+    #[test]
+    fn memory_refresh_keeps_private_notes_out_of_other_scopes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        seed(&p).unwrap();
+        std::fs::write(
+            p.memory_dir().join("MEMORY.md"),
+            "- Synthetic private note\n",
+        )
+        .unwrap();
+        std::fs::write(
+            p.memory_dir().join("people.md"),
+            "# Synthetic topic\n- Detail\n",
+        )
+        .unwrap();
+        let private = memory_prompt(&p, Scope::Private);
+        assert!(private.contains("Synthetic private note") && private.contains("people.md"));
+        for scope in [Scope::Personal, Scope::Shared] {
+            let other = memory_prompt(&p, scope);
+            assert!(!other.contains("Synthetic") && !other.contains("people.md"));
+        }
     }
 
     #[test]

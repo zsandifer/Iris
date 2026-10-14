@@ -477,6 +477,9 @@ END;
 -- When the note last joined the always-in-prompt core (MEMORY.md); null
 -- while it is not in it. Set when the export is written (memory/packing.rs).
 ALTER TABLE memory_items ADD COLUMN core_since INTEGER;
+-- Last turn that explicitly included this note in a MEMORY.md write.
+-- Automatic packing must not make same-turn topic writes removable there.
+ALTER TABLE memory_items ADD COLUMN core_written_batch TEXT;
 "#,
 ];
 
@@ -1756,6 +1759,9 @@ mod tests {
             let core_since: Option<i64> =
                 c.query_row("SELECT core_since FROM memory_items WHERE id = ?1", [id], |r| r.get(0))?;
             assert_eq!(core_since, None, "not in the core until the export is written");
+            let core_written_batch: Option<String> =
+                c.query_row("SELECT core_written_batch FROM memory_items WHERE id = ?1", [id], |r| r.get(0))?;
+            assert_eq!(core_written_batch, None, "not acknowledged by a core write yet");
             let found: i64 = c.query_row(
                 "SELECT rowid FROM memory_items_fts WHERE memory_items_fts MATCH 'plant'",
                 [],

@@ -125,11 +125,15 @@ pub struct Item {
     /// written, so it is not part of history snapshots.
     #[serde(skip)]
     pub core_since: Option<i64>,
+    /// Last batch that explicitly wrote this note to MEMORY.md. Packing
+    /// alone does not count as the turn having seen the note there.
+    #[serde(skip)]
+    pub core_written_batch: Option<String>,
 }
 
 const COLUMNS: &str = "id, kind, topic, text, importance, pinned, created_at, observed_at, \
     mentioned_at, valid_to, superseded_by, source, last_used_at, use_count, content_hash, \
-    archived, updated_at, core_since";
+    archived, updated_at, core_since, core_written_batch";
 
 fn from_row(r: &rusqlite::Row) -> rusqlite::Result<Item> {
     let topic: String = r.get(2)?;
@@ -153,6 +157,7 @@ fn from_row(r: &rusqlite::Row) -> rusqlite::Result<Item> {
         archived: r.get(15)?,
         updated_at: r.get(16)?,
         core_since: r.get(17)?,
+        core_written_batch: r.get(18)?,
     })
 }
 
@@ -370,6 +375,7 @@ pub(crate) mod tests {
             archived: false,
             updated_at: id,
             core_since: None,
+            core_written_batch: None,
         }
     }
 

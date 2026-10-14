@@ -473,7 +473,7 @@ pub struct Written {
     /// Pinned notes are the owner's; the agent cannot remove them.
     pub kept_pinned: Vec<String>,
     /// Notes another chat saved or changed after this turn began, or that
-    /// joined `MEMORY.md` after it began (another change made room): left
+    /// joined `MEMORY.md` after it began without an explicit core write: left
     /// out of the content, but kept, since this turn may not have seen them.
     pub kept_recent: Vec<String>,
     /// Notes in the content that were removed or corrected after this
@@ -494,7 +494,8 @@ pub struct Written {
 /// too. `MEMORY.md` shows the notes packed into the core when the export
 /// was last written (see [`packing`]). `batch` identifies the turn's
 /// changes: notes another change saved or changed since `turn_started`
-/// (ms), or that joined `MEMORY.md` since then, are never removed, and notes
+/// (ms), or that joined `MEMORY.md` since then without being explicitly
+/// included in this batch's core writes, are never removed, and notes
 /// it removed are not brought back, since the turn may have read the file
 /// before. Any other path only adds notes.
 pub fn write(
@@ -536,6 +537,9 @@ pub fn write(
                 continue;
             }
             if shown.contains(hash.as_str()) {
+                if rel == CORE_FILE {
+                    mark_core_write(tx, &hash, batch)?;
+                }
                 out.unchanged += 1;
                 saved.push((hash, c.text));
                 continue;
@@ -562,6 +566,9 @@ pub fn write(
                     out.unchanged += 1;
                 }
             }
+            if rel == CORE_FILE {
+                mark_core_write(tx, &hash, batch)?;
+            }
             saved.push((hash, c.text));
         }
         for item in view.iter().filter(|i| !wanted.contains(&i.content_hash)) {
@@ -569,14 +576,14 @@ pub fn write(
                 out.kept_pinned.push(item.text.clone());
                 continue;
             }
-            // Changed elsewhere, or moved into MEMORY.md by another change,
+            // Changed elsewhere or automatically packed into MEMORY.md
             // after this turn began: it may not have seen the note here.
-            let since = item.updated_at.max(if fixed_topic.is_none() {
-                item.core_since.unwrap_or(i64::MIN)
-            } else {
-                i64::MIN
-            });
-            if since >= turn_started && super::last_batch(tx, item.id)?.as_deref() != Some(batch) {
+            let joined_unseen = rel == CORE_FILE
+                && item.core_since.is_some_and(|t| t >= turn_started)
+                && item.core_written_batch.as_deref() != Some(batch);
+            let changed_elsewhere = item.updated_at >= turn_started
+                && super::last_batch(tx, item.id)?.as_deref() != Some(batch);
+            if joined_unseen || changed_elsewhere {
                 out.kept_recent.push(item.text.clone());
             } else {
                 super::archive(tx, item, Actor::Agent, batch)?;
@@ -594,6 +601,15 @@ pub fn write(
             .collect();
     }
     Ok(out)
+}
+
+fn mark_core_write(conn: &Connection, hash: &str, batch: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE memory_items SET core_written_batch = ?2
+         WHERE content_hash = ?1 AND archived = 0 AND superseded_by IS NULL",
+        rusqlite::params![hash, batch],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -730,7 +746,7 @@ mod tests {
         assert!(mem.join("photo.jpg").exists() && mem.join(".hidden.md").exists());
         let core = read(&paths, CORE_FILE);
         assert!(core.starts_with(HEADER) && core.contains("## About you\n\n- Prefers mornings.\n"));
-        assert!(!core.contains("Curated long-term facts") && !core.contains("Alex"));
+        assert!(!core.contains("Curated long-term facts") && core.contains("Alex"));
         let people = read(&paths, "people.md");
         assert!(people.contains("# People\n\n- Alex: Friend from the climbing gym\n"));
         assert!(read(&paths, "routines.md").contains("- Mornings: Run at 7"));
@@ -799,7 +815,10 @@ mod tests {
             &db,
             &paths,
             CORE_FILE,
-            "- Prefers mornings\n",
+            &format!(
+                "{}\n## About you\n\n- Prefers mornings\n",
+                read(&paths, CORE_FILE)
+            ),
             &src,
             i64::MAX,
             "t",
@@ -809,10 +828,10 @@ mod tests {
         let core = read(&paths, CORE_FILE);
         let edited = format!("{core}\n## Projects\n\n- Building a bookshelf\n");
         let w = write(&db, &paths, CORE_FILE, &edited, &src, i64::MAX, "t").unwrap();
-        assert_eq!((w.added, w.unchanged, w.removed.len()), (1, 1, 0));
+        assert_eq!((w.added, w.unchanged, w.removed.len()), (1, 3, 0));
         assert!(read(&paths, "projects.md").contains("- Building a bookshelf"));
         assert!(read(&paths, CORE_FILE).contains("## Projects\n\n- Building a bookshelf\n"));
-        // A note already stored elsewhere joins the core instead of repeating.
+        // A note already in the core is not duplicated by a repeated bullet.
         let w = write(
             &db,
             &paths,
@@ -823,7 +842,7 @@ mod tests {
             "t",
         )
         .unwrap();
-        assert_eq!((w.added, w.unchanged), (0, 3));
+        assert_eq!((w.added, w.unchanged), (0, 4));
         assert!(read(&paths, CORE_FILE).contains("Sam: Plays chess"));
         assert_eq!(live_texts(&db).len(), 4);
 
@@ -860,7 +879,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(archived, 2);
-        assert_eq!(agent_rows, 8);
+        assert_eq!(agent_rows, 7);
         let source: String = db
             .with(|c| c.query_row("SELECT source FROM memory_items LIMIT 1", [], |r| r.get(0)))
             .unwrap();
@@ -877,7 +896,7 @@ mod tests {
             &db,
             &paths,
             CORE_FILE,
-            "- Something else\n",
+            "## About you\n- Something else\n\n## People\n- Sam: Likes jazz\n",
             &src,
             i64::MAX,
             "t",
@@ -1201,13 +1220,16 @@ mod tests {
             "t",
         )
         .unwrap();
-        // Ordinary notes stay in their topic files.
-        assert!(core_ids(&db).is_empty());
+        // Ordinary notes fill spare core capacity as well as their topic files.
+        assert_eq!(core_ids(&db).len(), 2);
         let w = write(
             &db,
             &paths,
             CORE_FILE,
-            "- Prefers mornings\n",
+            &format!(
+                "{}\n## About you\n\n- Prefers mornings\n",
+                read(&paths, CORE_FILE)
+            ),
             &src,
             i64::MAX,
             "t",
@@ -1216,15 +1238,14 @@ mod tests {
         assert!(w.outside_core.is_empty());
         let core = read(&paths, CORE_FILE);
         assert!(core.contains("- Prefers mornings\n"));
-        assert!(
-            !core.contains("Sam")
-                && core.contains("<!-- 2 more notes are only in the topic files. -->")
-        );
+        assert!(core.contains("Sam") && core.contains("Alex"));
+        assert!(!core.contains("only in the topic files"));
         let prompt = core_for_prompt(&paths).unwrap();
-        assert!(prompt.contains("Prefers mornings") && prompt.contains("2 more notes"));
+        assert!(prompt.contains("Prefers mornings") && prompt.contains("Sam"));
         let live = db.with(super::super::live).unwrap();
         let mornings = live.iter().find(|i| i.text == "Prefers mornings").unwrap();
-        assert_eq!(core_ids(&db), [mornings.id]);
+        assert_eq!(core_ids(&db).len(), 3);
+        assert!(core_ids(&db).contains(&mornings.id));
         let since = mornings.core_since.unwrap();
         // Membership keeps its date while the note stays in the core, and
         // is cleared when it leaves.
@@ -1286,7 +1307,7 @@ mod tests {
             prompt
                 .contains("<!-- 1 pinned note did not fit here; read them in the topic files. -->")
         );
-        assert_eq!(core_ids(&db).len(), 2);
+        assert_eq!(core_ids(&db).len(), 3);
         assert!(prompt.chars().count() <= packing::BUDGET_CHARS + 200);
     }
 
@@ -1321,6 +1342,61 @@ mod tests {
         )
         .unwrap();
         assert!(w.outside_core.is_empty());
+    }
+
+    #[test]
+    fn a_topic_write_in_this_turn_does_not_make_an_unseen_core_note_removable() {
+        let (_t, paths, db) = setup();
+        let src = json!({"type": "conversation", "conversation_id": "c", "message_ids": ["m"]});
+        let seen = read(&paths, CORE_FILE);
+        let started = crate::util::now_ms();
+        write(
+            &db,
+            &paths,
+            "people.md",
+            "- A friend bakes bread\n",
+            &src,
+            started,
+            "turn-m",
+        )
+        .unwrap();
+        assert!(read(&paths, CORE_FILE).contains("A friend bakes bread"));
+        let w = write(
+            &db,
+            &paths,
+            CORE_FILE,
+            &format!("{seen}- Likes tea\n"),
+            &src,
+            started,
+            "turn-m",
+        )
+        .unwrap();
+        assert_eq!(w.kept_recent, ["A friend bakes bread"]);
+        assert!(w.removed.is_empty());
+        // An explicit core write acknowledges the note, so a later write
+        // in the same turn can correct/remove it.
+        write(
+            &db,
+            &paths,
+            CORE_FILE,
+            &read(&paths, CORE_FILE),
+            &src,
+            started,
+            "turn-m",
+        )
+        .unwrap();
+        let w = write(
+            &db,
+            &paths,
+            CORE_FILE,
+            "- Likes tea\n",
+            &src,
+            started,
+            "turn-m",
+        )
+        .unwrap();
+        assert_eq!(w.removed, ["A friend bakes bread"]);
+        assert!(w.kept_recent.is_empty());
     }
 
     #[test]
@@ -1377,7 +1453,10 @@ mod tests {
         .unwrap();
         assert_eq!(w.added, 1);
         assert_eq!(w.not_restored, std::slice::from_ref(&removed));
-        assert_eq!(w.kept_recent, std::slice::from_ref(&unseen));
+        assert_eq!(
+            w.kept_recent,
+            [unseen.clone(), "Sam bakes bread".to_string()]
+        );
         assert!(w.removed.is_empty());
         let texts: Vec<String> = live_texts(&db).into_iter().map(|t| t.0).collect();
         assert!(texts.contains(&unseen) && texts.contains(&"Sam bakes bread".to_string()));

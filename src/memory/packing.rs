@@ -1,9 +1,7 @@
 //! The always-in-prompt core: which notes `MEMORY.md` holds.
 //!
-//! The core is small and curated: pinned notes, profile and preference
-//! notes (who the owner is), notes of importance 4 or more (what the agent
-//! writes to `MEMORY.md`), and notes whose score shows heavy recent use.
-//! They are packed whole under a character budget in three tiers: pinned,
+//! All current live notes compete for the core. They are packed whole
+//! under a character budget in three tiers: pinned,
 //! then profile and preference, then the rest by score. A note that does
 //! not fit is skipped and smaller ones after it may still fit. Notes past
 //! their `valid_to` are left out. The result depends only on the notes and
@@ -32,12 +30,8 @@ pub const BUDGET_CHARS: usize = 11_000;
 const RECENCY_HALF_LIFE_MS: f64 = 30.0 * 24.0 * 3_600_000.0;
 /// Uses at which the use term reaches its maximum (log scale).
 const USE_SATURATION: f64 = 20.0;
-/// Importance that keeps a note in mind: notes written to `MEMORY.md` (or
-/// imported from it) get it.
+/// Importance assigned to notes written to `MEMORY.md` or imported from it.
 pub const CORE_IMPORTANCE: i64 = 4;
-/// Score at which any note joins the core: an importance 3 note used about
-/// four times lately, or an importance 2 note used about ten times.
-const PROMOTE_SCORE: f64 = 2.0;
 
 /// A note's score at `now` (ms): recency + importance + use, each 0..1.
 ///
@@ -71,11 +65,6 @@ fn current(item: &Item, now: i64) -> bool {
     item.valid_to.is_none_or(|t| t > now)
 }
 
-/// Whether a note with this `score` belongs in the core when it fits.
-fn candidate(item: &Item, score: f64) -> bool {
-    tier(item) < 2 || item.importance >= CORE_IMPORTANCE || score >= PROMOTE_SCORE
-}
-
 /// The packed core.
 #[derive(Debug)]
 pub struct Packed<'a> {
@@ -90,7 +79,6 @@ pub fn pack(live: &[Item], now: i64) -> Packed<'_> {
         .iter()
         .filter(|i| current(i, now))
         .map(|i| (tier(i), score(i, now), i))
-        .filter(|(_, score, i)| candidate(i, *score))
         .collect();
     ranked.sort_by(|a, b| {
         a.0.cmp(&b.0)
@@ -256,16 +244,16 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_notes_join_only_when_used_a_lot() {
+    fn ordinary_notes_fill_spare_capacity_and_use_changes_the_order() {
         let mut live = vec![note(1, "Has a bike"), note(2, "Cousin in Leeds")];
         live[1].importance = 2;
         let p = pack(&live, NOW);
-        assert!(p.items.is_empty());
-        assert_eq!(p.left_out.other, 2);
+        assert_eq!(ids(&p), [1, 2]);
+        assert_eq!(p.left_out.other, 0);
         live[0].use_count = 4;
-        assert_eq!(ids(&pack(&live, NOW)), [1]);
-        // Use that is not recent fades.
-        assert!(pack(&live, NOW + 60 * DAY).items.is_empty());
+        assert_eq!(ids(&pack(&live, NOW)), [1, 2]);
+        // Even old, low-scoring notes fit when space remains.
+        assert_eq!(ids(&pack(&live, NOW + 60 * DAY)), [1, 2]);
         live[0].last_used_at = Some(NOW + 60 * DAY);
         live[1].use_count = 10;
         live[1].last_used_at = Some(NOW + 60 * DAY);

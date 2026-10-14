@@ -582,7 +582,7 @@ async fn run_locked(
         let keys = crate::keys::env_for(state, &harness_name).await;
         let participants: Vec<String> = ctx.names.values().cloned().collect();
         // Reads persona files and indexes the memory tree: blocking I/O.
-        let mut system_prompt = {
+        let (mut system_prompt, memory_refresh) = {
             let (paths, name, kind, purpose, app_tools) = (
                 state.paths.clone(),
                 agent_name.clone(),
@@ -592,8 +592,16 @@ async fn run_locked(
             );
             let browser = browser_server.clone();
             let notices = notices.clone();
+            let refresh_memory = session.is_some()
+                && !entry.harness.resume_updates_system_prompt()
+                && scope == Scope::Private;
             tokio::task::spawn_blocking(move || {
-                persona::assemble(
+                let memory_refresh = if refresh_memory {
+                    persona::memory_prompt(&paths, scope)
+                } else {
+                    String::new()
+                };
+                let system_prompt = persona::assemble(
                     &paths,
                     &PromptContext {
                         agent_name: &name,
@@ -605,11 +613,20 @@ async fn run_locked(
                         scope,
                         notices: &notices,
                     },
-                )
+                );
+                (system_prompt, memory_refresh)
             })
             .await
             .unwrap_or_default()
         };
+        if !memory_refresh.is_empty() {
+            prompt = format!(
+                "<current_memory>\nThis is the current memory snapshot. It replaces earlier \
+                 memory snapshots in this conversation, including notes that were corrected \
+                 or removed. Use this snapshot for MEMORY.md writes. Read topic files again \
+                 before replacing them.\n{memory_refresh}\n</current_memory>\n\n{prompt}"
+            );
+        }
         if let Some(status) = system_status {
             system_prompt.push_str(&format!("\n## System status\n\n{status}\n"));
             if session.is_some() && !entry.harness.resume_updates_system_prompt() {
@@ -2039,6 +2056,139 @@ mod tests {
         assert!(p.contains("Sam: m99"));
         assert!(!p.contains("Sam: m10\n"));
         assert_eq!(p.matches("Sam: m").count(), MAX_REPLAY_MESSAGES);
+    }
+
+    #[tokio::test]
+    async fn resumed_codex_receives_memory_corrected_in_another_chat() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = crate::browser::tools::tests::test_state(tmp.path());
+        let cli = tmp.path().join("fake-codex");
+        std::fs::write(
+            &cli,
+            r#"#!/bin/sh
+if [ "$1" = mcp ]; then
+    printf '%s\n' '[]'
+    exit 0
+fi
+printf '%s\n' "$@" > "$(dirname "$0")/args"
+cat > "$(dirname "$0")/prompt"
+printf '%s\n' '{"type":"thread.started","thread_id":"synthetic-session"}' \
+    '{"type":"item.completed","item":{"type":"agent_message","text":"Synthetic reply"}}' \
+    '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let inner = std::sync::Arc::get_mut(&mut state.0).unwrap();
+        inner.cfg.harness.get_mut("codex").unwrap().enabled = true;
+        let entry = inner.harnesses.get_mut("codex").unwrap();
+        entry.cfg.command = cli.to_string_lossy().into_owned();
+        entry.cfg.enabled = true;
+        {
+            let mut status = entry.status.write().unwrap();
+            status.enabled = true;
+            status.installed = true;
+            status.auth = AuthState::Ok;
+        }
+        let (owner, conv, other) = state
+            .db
+            .with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                let conv = db::create_conversation(c, &owner, "side", "Test", None)?.id;
+                let other = db::create_conversation(c, &owner, "side", "Other", None)?.id;
+                Ok((owner, conv, other))
+            })
+            .unwrap();
+        let source = json!({"type":"conversation", "conversation_id":other});
+        crate::memory::files::write(
+            &state.db,
+            &state.paths,
+            "MEMORY.md",
+            "- Prefers mornings\n",
+            &source,
+            i64::MAX,
+            "other-1",
+        )
+        .unwrap();
+
+        let mut events = state.hub.subscribe();
+        for turn in 0..2 {
+            if turn == 1 {
+                crate::memory::files::write(
+                    &state.db,
+                    &state.paths,
+                    "MEMORY.md",
+                    "- Prefers evenings\n",
+                    &source,
+                    i64::MAX,
+                    "other-2",
+                )
+                .unwrap();
+            }
+            let (_, assistant) = start_chat_turn(
+                &state,
+                &conv,
+                Some(&owner),
+                "Check memory",
+                &[],
+                Purpose::Chat,
+                &owner,
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let event = events.recv().await.unwrap();
+                    let value: Value = serde_json::from_str(&event.json).unwrap();
+                    if value["type"] == "message.completed"
+                        && value["message"]["id"] == assistant.id
+                    {
+                        assert_eq!(value["message"]["status"], "complete", "{value}");
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let args = std::fs::read_to_string(tmp.path().join("args")).unwrap();
+            let prompt = std::fs::read_to_string(tmp.path().join("prompt")).unwrap();
+            assert_eq!(args.lines().any(|a| a == "resume"), turn == 1, "{args}");
+            if turn == 0 {
+                assert!(prompt.contains("Prefers mornings"));
+            } else {
+                assert!(
+                    prompt.contains("<current_memory>")
+                        && prompt.contains("Prefers evenings")
+                        && prompt.contains("you.md"),
+                    "{prompt}"
+                );
+                assert!(!prompt.contains("Prefers mornings"));
+                // A whole-core write based on the delivered refresh keeps
+                // the correction instead of restoring the old snapshot.
+                let core = prompt
+                    .split("<memory file=\"MEMORY.md\">\n")
+                    .nth(1)
+                    .unwrap()
+                    .split("\n</memory>")
+                    .next()
+                    .unwrap();
+                crate::memory::files::write(
+                    &state.db,
+                    &state.paths,
+                    "MEMORY.md",
+                    &format!("{core}\n- Likes tea\n"),
+                    &json!({"type":"conversation", "conversation_id":conv}),
+                    assistant.created_at,
+                    "mine",
+                )
+                .unwrap();
+                let notes = state.db.with(crate::memory::live).unwrap();
+                assert!(notes.iter().any(|n| n.text == "Prefers evenings"));
+                assert!(!notes.iter().any(|n| n.text == "Prefers mornings"));
+            }
+        }
     }
 
     #[tokio::test]
