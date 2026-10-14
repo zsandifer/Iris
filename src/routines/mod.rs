@@ -12,4 +12,5 @@
 //!
 //! Plain SQL shared by the HTTP API, the scheduler, and the MCP bridge.
 
+pub mod docs;
 pub mod schedule;
