@@ -12,6 +12,7 @@ import { CATALOG_IDS, ServiceSignIn, ServiceTile, labelOf } from './connect.js';
 
 import { ExternalLink } from './external-link.js';
 import { MorningCard } from './memory.js';
+import { RoutineCard } from './routines.js';
 
 const apiPath = (p) => String(p || '').replace(/^\/api(?=\/)/, '');
 
@@ -371,7 +372,7 @@ function ApprovalCard({ c, m }) {
       ${raw && html`<pre class="ap-raw">${c.details}</pre>`}`}
     ${c.state === 'approved' ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> ${APPROVAL_DONE.approved}</div>`
       : !pending ? html`<div class="mu small">${APPROVAL_DONE[c.state] || 'Decided.'}</div>`
-      : mine ? html`<div class="ap-bt"><button disabled=${busy} onClick=${() => decide(false)}>Deny</button>
+      : mine ? html`<div class="ap-bt"><button disabled=${busy} onClick=${() => decide(false)}>${c.deny_label || 'Deny'}</button>
           <button class="y" disabled=${busy} onClick=${() => decide(true)}>${c.action_label || 'Approve'}</button></div>`
       : html`<small class="mu">Waiting for the person this is for.</small>`}
   </div>`;
@@ -392,6 +393,7 @@ const CARDS = {
   approval: ApprovalCard,
   save_login: SaveLoginCard,
   memory_morning: MorningCard,
+  routine: RoutineCard,
 };
 
 export function Card({ m, inactive = false }) {

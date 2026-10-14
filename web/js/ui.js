@@ -53,6 +53,8 @@ const P = {
   keyboard: 'M4 6h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1zM7 10h.01M11 10h.01M15 10h.01M18 10h.01M8 14h8',
   archive: 'M4 5h16v4H4zM5.5 9v10h13V9M10 13h4',
   memory: 'M7 3.5h10a1 1 0 0 1 1 1V20l-6-4-6 4V4.5a1 1 0 0 1 1-1z',
+  repeat: 'M17 3l3 3-3 3M4 12v-1a5 5 0 0 1 5-5h11M7 21l-3-3 3-3M20 12v1a5 5 0 0 1-5 5H4',
+  upload: 'M12 16V5M7 9.5l5-5 5 5M5 20h14',
 };
 
 export function Icon({ name, size = 22, fill = false, cls = '' }) {

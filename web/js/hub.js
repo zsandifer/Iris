@@ -1,14 +1,15 @@
-// The Iris hub: Connections, Logins & wallet, System files (Iris's computer
+// The Iris hub: Routines (routines.js), Connections, Logins & wallet, System files (Iris's computer
 // lives in computer.js).
 import { html, useEffect, useState } from './h.js';
 import { get, post, patch, put, del, seg } from './api.js';
-import { S, set, useStore, go, back, toast, isOwner } from './store.js';
+import { S, set, useStore, go, back, toast, isOwner, loadRoutines } from './store.js';
 import {
   Icon, Avatar, Row, Group, Page, Empty, Spinner, Toggle, LetterTile,
   agentName, ago, since, confirmSheet,
 } from './ui.js';
 import { describe, visible } from './status.js';
 import { md } from './md.js';
+import { routinesSub } from './routines.js';
 
 function useData(path, deps = []) {
   const [data, setData] = useState(null);
@@ -25,6 +26,7 @@ export function Hub() {
   const owner = isOwner();
   const [cons] = useData(owner ? '/connectors' : '/me');
   const [creds] = useData(owner ? '/credentials' : '/me');
+  useEffect(() => { if (owner) loadRoutines().catch(() => {}); }, [owner]);
   const working = Object.keys(S.live).length > 0;
   const computer = S.settings?.paused ? 'paused' : S.browser?.busy ? 'browsing' : working ? 'working' : 'idle';
   const nCon = cons?.connectors?.filter((c) => c.enabled).length;
@@ -35,6 +37,7 @@ export function Hub() {
       <small>${S.online ? 'Online on your server' : 'Reconnecting to your server…'}</small></div></div>
     <${Group}>
       ${owner && html`
+      <${Row} icon="repeat" title="Routines" sub=${routinesSub()} onClick=${() => go('iris/routines')} />
       <${Row} icon="plug" title="Connections" sub=${nCon == null ? ' ' : nCon ? `${nCon} connected` : 'Nothing connected yet'} onClick=${() => go('iris/connections')} />
       <${Row} icon="lock" title="Logins & wallet" sub=${creds ? `${logins} login${logins === 1 ? '' : 's'} · ${cards} card${cards === 1 ? '' : 's'}` : ' '} onClick=${() => go('iris/logins')} />
       <${Row} icon="monitor" title=${`${agentName()}'s computer`} sub=${computer} onClick=${() => go('iris/computer')} />
@@ -125,7 +128,11 @@ export function activityTitle(item) {
 }
 
 export function placeLabel(item) {
-  if (item.conversation_kind === 'job') return item.conversation_title === 'feed' ? 'Feed' : 'Background check-in';
+  if (item.conversation_kind === 'job') {
+    if (item.conversation_title === 'feed') return 'Feed';
+    if (String(item.conversation_title || '').startsWith('Routine: ')) return item.conversation_title;
+    return 'Background check-in';
+  }
   if (item.conversation_kind === 'main') return 'Main chat';
   return item.conversation_title || 'Side chat';
 }

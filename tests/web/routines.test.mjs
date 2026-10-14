@@ -1,0 +1,43 @@
+// web/js/routines.js: plain-language run statuses, the hub line, loading.
+import { onFetch, reply } from './env.mjs';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+const { runStatus, routinesSub } = await import('../../web/js/routines.js');
+const { S, set, loadRoutines } = await import('../../web/js/store.js');
+
+test('every run status reads as words, not just a colour', () => {
+  assert.deepEqual(runStatus({ status: 'ok' }), ['ok', 'Done']);
+  assert.deepEqual(runStatus({ status: 'skipped' }), ['mu', 'Skipped']);
+  assert.deepEqual(runStatus({ status: 'waiting' }), ['warn', 'Waiting for your OK']);
+  assert.deepEqual(runStatus({ status: 'running' }), ['ac', 'Running now']);
+  assert.deepEqual(runStatus({ status: 'failed', retry_at: 1 }), ['warn', 'Trying again soon']);
+  assert.deepEqual(runStatus({ status: 'failed', retry_at: null }), ['bad', "Couldn't finish"]);
+});
+
+test('the hub line counts active routines and what waits for the owner', async () => {
+  set({ me: { user: { id: 'o', is_owner: true } }, routines: null });
+  assert.equal(routinesSub(), ' ');
+  onFetch((url, opts) => {
+    assert.equal(url, '/api/routines');
+    return reply(opts, {
+      body: {
+        default_tz: 'America/Chicago',
+        max_doc_bytes: 1048576,
+        routines: [
+          { id: 'a', state: 'active' },
+          { id: 'b', state: 'active', open_run: { status: 'running' } },
+          { id: 'c', state: 'paused' },
+        ],
+      },
+    });
+  });
+  await loadRoutines();
+  assert.equal(S.routines.length, 3);
+  assert.equal(S.routinesInfo.max_doc_bytes, 1048576);
+  assert.equal(routinesSub(), '2 active');
+  set({ routines: [...S.routines, { id: 'd', state: 'pending_approval', pending_change: { id: 'x', action: 'create' } }] });
+  assert.equal(routinesSub(), '1 waiting for you');
+  set({ routines: [] });
+  assert.equal(routinesSub(), 'Nothing scheduled yet');
+});
