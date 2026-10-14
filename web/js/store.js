@@ -548,9 +548,10 @@ export function memoryReset() {
   // Memory sheets (a note, What I noted, Export) show what was forgotten.
   // A list load still in flight carries notes from before the reset.
   const sheet = S.sheet?.memory ? null : S.sheet;
-  const reload = !!S.memory;
-  if (reload) touchList('memory');
-  set({ msgs, sheet, memory: reload ? { items: [], more: false } : null });
+  const reload = !!S.memory || memoryLoads > 0;
+  touchList('memory');
+  if (memoryLoads > 0) memoryChanged = true;
+  set({ msgs, sheet, memory: S.memory ? { items: [], more: false } : null });
   if (reload) loadMemory().catch(() => {});
 }
 
@@ -806,6 +807,8 @@ function reconcileLive() {
 
 /** Refetch whatever is loaded (after a reconnect or a resync). */
 export function refreshAll() {
+  // Events may have been missed: open note sheets reload too.
+  set({ memoryRev: S.memoryRev + 1 });
   loadConvs().catch(() => {});
   for (const cid of Object.keys(S.msgs)) loadMessages(cid).catch(() => {});
   reconcileLive();

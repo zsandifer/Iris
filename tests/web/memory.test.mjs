@@ -7,7 +7,7 @@ import { setToken } from '../../web/js/api.js';
 import { S, set, handleEvent, loadMemory, loadMessages, loadOlder, toast, parentRoute } from '../../web/js/store.js';
 import {
   whenWord, noteMark, groupNotes, countLabel, historyLines, historyText, changeTag, notedLine, sourceOf,
-  undoTracker, undos, withoutMemory,
+  undoTracker, undos, withoutMemory, reconcileDraft,
 } from '../../web/js/memory-text.js';
 
 setToken('t');
@@ -250,4 +250,45 @@ test('chat pages asked for before Forget everything arrive without the forgotten
   const k = S.msgs[CID].list.find((m) => m.id === 'k');
   assert.equal(k.card, null, 'older page stripped');
   assert.equal(k.content, 'I cleared my notes.');
+});
+
+test('a note refresh keeps unsaved text and says when the note changed underneath it', () => {
+  // First load: the stored text.
+  assert.deepEqual(reconcileDraft({ draft: '', saved: null, fresh: 'Porch: morning sun' }), { text: 'Porch: morning sun', moved: false });
+  // Refresh (after Pin) while editing: the draft stays.
+  assert.deepEqual(reconcileDraft({ draft: 'Porch: sun until noon', saved: 'Porch: morning sun', fresh: 'Porch: morning sun' }),
+    { text: 'Porch: sun until noon', moved: false });
+  // Changed elsewhere while editing: the draft stays, and it is flagged.
+  assert.deepEqual(reconcileDraft({ draft: 'Porch: sun until noon', saved: 'Porch: morning sun', fresh: 'Porch: shaded' }),
+    { text: 'Porch: sun until noon', moved: true });
+  // Not editing: show the newest stored text.
+  assert.deepEqual(reconcileDraft({ draft: 'Porch: morning sun', saved: 'Porch: morning sun', fresh: 'Porch: shaded' }), { text: 'Porch: shaded', moved: false });
+  // Reopened after cancelling Forget: the carried draft stays.
+  assert.deepEqual(reconcileDraft({ draft: 'my edit', saved: 'stored', fresh: 'stored' }), { text: 'my edit', moved: false });
+});
+
+test('a reset caught up during the first Memory load drops that load and starts over', async () => {
+  set({ me: { user: { id: 'o', is_owner: true } }, memory: null });
+  let calls = 0;
+  let release;
+  onFetch((url, opts) => {
+    if (!String(url).includes('/memory')) return reply(opts, { body: { conversations: [], messages: [], has_more: false, browser: {} } });
+    calls += 1;
+    if (calls === 1) return new Promise((r) => { release = () => r(reply(opts, { body: { items: [note(1, { text: 'forgotten' })], has_more: false } })); });
+    return reply(opts, { body: { items: [], has_more: false } });
+  });
+  const first = loadMemory();
+  await new Promise((r) => setTimeout(r, 0));
+  handleEvent({ type: 'memory.reset', reset: '10' });
+  release();
+  await first;
+  await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(S.memory.items, [], 'the pre-reset notes never show');
+});
+
+test('reconnecting asks open note sheets to reload', () => {
+  const before = S.memoryRev;
+  onFetch((url, opts) => reply(opts, { body: { conversations: [], messages: [], items: [], has_more: false, browser: {} } }));
+  handleEvent({ type: 'resync' });
+  assert.equal(S.memoryRev, before + 1);
 });

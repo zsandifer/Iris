@@ -153,6 +153,18 @@ export function notedLine(changes = []) {
 export const verbFor = (op) => VERB[op] || 'Noted';
 
 /**
+ * What the note editor shows when the note is (re)loaded. `draft` is the
+ * editor's text right now, `saved` the stored text it started from (null on
+ * a first load), `fresh` the stored text just loaded. A draft that differs
+ * from what it started from is kept; `moved` says the stored text changed
+ * underneath it (another device, a chat, overnight).
+ */
+export function reconcileDraft({ draft = '', saved = null, fresh }) {
+  const editing = saved != null && !!draft.trim() && draft.trim() !== saved.trim();
+  return { text: editing ? draft : fresh, moved: editing && fresh.trim() !== saved.trim() };
+}
+
+/**
  * Undo/Redo of changes shown in Noted sheets and morning notes. Each undo
  * (and redo) is itself a new change, and only a note's newest change can be
  * undone, so the next tap always goes to the newest one. `first(id)` makes

@@ -7,7 +7,7 @@ import { api, get, post, patch, put, del, seg } from './api.js';
 import { S, set, useStore, go, toast, isOwner, loadMemory, memoryReset } from './store.js';
 import { Icon, Row, Group, Page, Empty, Spinner, Toggle, openSheet, closeSheet, confirmSheet } from './ui.js';
 import {
-  TOPICS, TOPIC_TITLE, noteMark, groupNotes, countLabel, historyLines, shortDate, changeTag, notedLine, sourceOf, undos,
+  TOPICS, TOPIC_TITLE, noteMark, groupNotes, countLabel, historyLines, shortDate, changeTag, notedLine, sourceOf, undos, reconcileDraft,
 } from './memory-text.js';
 
 const apiPath = (p) => String(p || '').replace(/^\/api(?=\/)/, '');
@@ -76,18 +76,30 @@ function NoteSheet({ id: first, draft }) {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [moved, setMoved] = useState(false); // changed elsewhere while editing
-  // `keepDraft`: a refresh (after Pin) must not throw away unsaved text.
-  const load = (which = id, keepDraft = false) => get(`/memory/${num(which)}`)
-    .then((r) => {
-      setData(r);
-      const d = pending.current;
-      pending.current = null;
-      const editing = keepDraft && data && text.trim() && text.trim() !== data.item.text.trim();
-      if (editing && r.item.text !== data.item.text) setMoved(true);
-      setText(d?.trim() ? d : editing ? text : r.item.text);
-      setErr(null);
-    })
-    .catch((e) => setErr(e.status === 404 ? "I can't find that note anymore. It may have been forgotten." : e.message));
+  // Responses apply to the latest typing and the stored text it started
+  // from (refs, not this render's values); only the newest request applies.
+  const typed = useRef('');
+  const base = useRef(null);
+  const asked = useRef(0);
+  const edit = (v) => { typed.current = v; setText(v); };
+  // `keepDraft`: a refresh (Pin, a change elsewhere) keeps unsaved text.
+  const load = (which = id, keepDraft = false) => {
+    const n = ++asked.current;
+    return get(`/memory/${num(which)}`)
+      .then((r) => {
+        if (n !== asked.current) return;
+        const d = pending.current;
+        pending.current = null;
+        const out = d != null ? reconcileDraft({ draft: d, saved: r.item.text, fresh: r.item.text })
+          : reconcileDraft({ draft: typed.current, saved: keepDraft ? base.current : null, fresh: r.item.text });
+        base.current = r.item.text;
+        if (out.moved) setMoved(true);
+        setData(r);
+        edit(out.text);
+        setErr(null);
+      })
+      .catch((e) => { if (n === asked.current) setErr(e.status === 404 ? "I can't find that note anymore. It may have been forgotten." : e.message); });
+  };
   useEffect(() => { setMoved(false); load(id); }, [id]);
   // Changed elsewhere (another device, a chat, overnight): show the newest
   // version, keeping an unsaved draft.
@@ -113,7 +125,7 @@ function NoteSheet({ id: first, draft }) {
   };
   const save = () => act(async () => {
     const r = await patch(`/memory/${num(item.id)}`, { text: text.trim() });
-    if (r.duplicate) { toast('I already remember that.'); setText(item.text); return; }
+    if (r.duplicate) { toast('I already remember that.'); edit(item.text); return; }
     toast('Saved. I’ll remember it this way.');
     setMoved(false);
     await load(r.item?.id ?? item.id);
@@ -160,7 +172,7 @@ function NoteSheet({ id: first, draft }) {
     ${!current && html`<div class="lock"><${Icon} name="archive" size=${15} /> I've set this aside, so I don't use it any more. Undo the last change to bring it back.</div>`}
     <b class="mem-h">What I remember</b>
     ${moved && dirty && html`<div class="lock">This note changed while you were editing. It now says: “${item.text}”. Saving replaces that with your version.</div>`}
-    ${current ? html`<${Grow} value=${text} onInput=${setText} label="What I remember" />`
+    ${current ? html`<${Grow} value=${text} onInput=${edit} label="What I remember" />`
       : html`<div class="mem-ed ro">${item.text}</div>`}
     <b class="mem-h">Where I learned it</b>
     <div class="mem-hist">${src.cid
