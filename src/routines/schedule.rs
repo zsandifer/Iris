@@ -331,8 +331,8 @@ impl Plan {
         }
     }
 
-    /// Up to `n` upcoming runs after `after_ms`, stopping after `max_runs`
-    /// in total (`done` have already happened).
+    /// Up to `n` upcoming runs after `after_ms`, and at most `remaining`
+    /// (what is left of `max_runs`).
     pub fn upcoming(&self, after_ms: i64, n: usize, remaining: Option<i64>) -> Vec<i64> {
         let n = remaining.map_or(n, |r| n.min(r.max(0) as usize));
         let mut out = Vec::with_capacity(n);

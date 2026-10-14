@@ -410,8 +410,10 @@ async fn preview(
     let now = now_ms();
     let mut spec = Spec::from_json(&body, &tz)?;
     let plan = spec.validate(now)?;
+    // Runs the routine already had count toward `max_runs`.
+    let done = body["done"].as_i64().unwrap_or(0).max(0);
     let runs: Vec<Value> = plan
-        .upcoming(now, count, spec.max_runs)
+        .upcoming(now, count, spec.max_runs.map(|m| m - done))
         .into_iter()
         .map(|t| json!({"at": t, "text": plan.local_text(t)}))
         .collect();

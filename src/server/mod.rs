@@ -2207,6 +2207,27 @@ mod tests {
                 .unwrap()
                 .contains("runs too often")
         );
+        // Runs already done count toward "after N runs".
+        let limited = json!({"schedule_kind": "rule", "tz": "UTC", "max_runs": 5,
+                             "rule": {"freq": "daily", "time": "09:00"}});
+        for (done, left) in [(0, 3), (4, 1), (5, 0)] {
+            let mut body = limited.clone();
+            body["done"] = json!(done);
+            let (s, b) = send(
+                &h.app,
+                "POST",
+                "/api/routines/preview",
+                Some(&t),
+                Some(body),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+            assert_eq!(
+                b["runs"].as_array().unwrap().len(),
+                left,
+                "after {done} runs"
+            );
+        }
     }
 
     /// A stand-in for `claude` that implements `--version`, `auth status`

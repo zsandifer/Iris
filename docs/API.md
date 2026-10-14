@@ -2267,7 +2267,8 @@ Detach a document (it stays in the Library). Returns `{"routine": Routine}`;
 
 The editor's live preview. Body: draft schedule fields (`schedule_kind`,
 `run_at`, `rule`, `cron_expr`, `tz`, `starts_at`, `end_at`, `max_runs`;
-other spec fields are optional) and `count` (1 to 10, default 3). Returns
+other spec fields are optional), `count` (1 to 10, default 3), and `done`
+(runs the routine already had, which count toward `max_runs`; default 0). Returns
 `{"runs": [{"at": ms, "text": "Sat Oct 17, 5:30 PM"}], "schedule_text",
 "cron_text" (cron only, e.g. "At 17:30, on Saturday."), "tz"}`, or `400`
 with the reason the schedule is not valid.

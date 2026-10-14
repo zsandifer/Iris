@@ -33,6 +33,14 @@ export function runStatus(r) {
   return ['bad', "Couldn't finish"];
 }
 
+/** Enter or Space on a focused row opens it, like a click (not when the
+ * key was meant for a control inside it). */
+export const onActivate = (fn) => (e) => {
+  if (e.target !== e.currentTarget || (e.key !== 'Enter' && e.key !== ' ')) return;
+  e.preventDefault();
+  fn();
+};
+
 function Ico({ r, size = 36 }) {
   return html`<div class="rtn-ico" style=${`width:${size}px;height:${size}px`}>${r.emoji || html`<${Icon} name="repeat" size=${18} />`}</div>`;
 }
@@ -103,7 +111,8 @@ function WaitingRow({ r }) {
         <button class=${'b1 sm' + (c.action === 'delete' ? ' danger' : '')} disabled=${busy} onClick=${() => act(true)}>${yes}</button></div>
     </div>`;
   }
-  return html`<div class="rtn-row tap" onClick=${() => go(`chat/${mainId()}`)} role="button" tabindex="0">
+  const open = () => go(`chat/${mainId()}`);
+  return html`<div class="rtn-row tap" onClick=${open} onKeyDown=${onActivate(open)} role="button" tabindex="0">
     <div class="rtn-line"><${Ico} r=${r} /><div class="grow"><b>${r.title}</b><small>Ready and waiting for your OK in the chat</small></div>
       <${Icon} name="chev" size=${16} cls="rc" /></div></div>`;
 }
@@ -125,7 +134,8 @@ function RoutineRow({ r }) {
   const toggle = async (on) => {
     try { await post(`/routines/${seg(r.id)}/${on ? 'resume' : 'pause'}`); await loadRoutines(); } catch (e) { toast(e.message); }
   };
-  return html`<div class="rtn-row tap" role="button" tabindex="0" onClick=${(e) => { if (!e.target.closest('button')) summarySheet(r); }}>
+  return html`<div class="rtn-row tap" role="button" tabindex="0" aria-label=${`${r.title}, ${r.schedule_text}`}
+      onClick=${(e) => { if (!e.target.closest('button')) summarySheet(r); }} onKeyDown=${onActivate(() => summarySheet(r))}>
     <div class="rtn-line"><${Ico} r=${r} />
       <div class="grow"><b>${r.title}</b><small>${r.schedule_text}${r.ask_before_acting ? ' · asks first' : ''}</small></div>
       ${r.state !== 'done' && html`<${Toggle} on=${r.state === 'active'} label=${r.state === 'active' ? 'Pause' : 'Resume'} onChange=${toggle} />`}
@@ -206,8 +216,12 @@ export function RoutineEditor({ id }) {
   const [routine, setRoutine] = useState(null);
   const [draft, setDraft] = useState(null);
   const [docs, setDocs] = useState([]);
+  // The latest documents, for an upload that finishes after a tab change.
+  const docsRef = useRef(docs);
+  docsRef.current = docs;
   const [tab, setTab] = useState('what');
   const [busy, setBusy] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [err, setErr] = useState(null);
   const load = async () => {
     if (fresh) {
@@ -224,6 +238,18 @@ export function RoutineEditor({ id }) {
     } catch (e) { setErr(e.message); }
   };
   useEffect(() => { load(); }, [id]);
+  // Keep the list loaded so routine events reach this screen too.
+  useEffect(() => { if (!S.routines) loadRoutines().catch(() => {}); }, []);
+  // A run started, finished or is waiting (or another device changed it):
+  // refresh status and history, keeping unsaved edits and documents.
+  const first = useRef(true);
+  useEffect(() => {
+    if (first.current) { first.current = false; return; }
+    if (fresh) return;
+    let live = true;
+    get(`/routines/${seg(id)}`).then(({ routine: r }) => { if (live) setRoutine(r); }).catch(() => {});
+    return () => { live = false; };
+  }, [S.routines]);
   if (err) return html`<${Page} title="Routine"><${Empty} icon="repeat" title="I couldn't open this routine">${err}<//><//>`;
   if (!draft) return html`<${Page}><${Spinner} /><//>`;
   const up = (patchObj) => setDraft((d) => ({ ...d, ...patchObj }));
@@ -231,6 +257,7 @@ export function RoutineEditor({ id }) {
   // Existing routines get document changes right away; new or proposed ones on save.
   const liveDocs = routine && !pending;
   const save = async () => {
+    if (uploading) return;
     setBusy(true);
     const body = { ...draft, doc_ids: docs.map((d) => d.id) };
     try {
@@ -257,21 +284,22 @@ export function RoutineEditor({ id }) {
   };
   const tabs = [['what', 'What'], ['when', 'When'], ['rules', 'Rules'], ...(fresh ? [] : [['history', 'History']])];
   return html`<${Page} onBack=${() => go('iris/routines')}
-      right=${html`<button class="b1 sm" disabled=${busy} onClick=${save}>${pending ? 'Set it up' : 'Save'}</button>`}>
+      right=${html`<button class="b1 sm" disabled=${busy || uploading} title=${uploading ? 'Waiting for the upload to finish' : null}
+        onClick=${save}>${pending ? 'Set it up' : 'Save'}</button>`}>
     <div class="rtn-line rtn-head"><${Ico} r=${draft} size=${40} /><h1 class="ttl grow">${draft.title || (fresh ? 'New routine' : 'Routine')}</h1></div>
     ${pending && html`<div class="rtn-note">I suggested this routine. Check it over, then tap Set it up.</div>`}
     <div class="seg rtn-tabs" role="tablist">${tabs.map(([k, label]) => html`<button role="tab" aria-selected=${tab === k ? 'true' : 'false'}
       class=${tab === k ? 'on' : ''} onClick=${() => setTab(k)}>${label}</button>`)}</div>
-    ${tab === 'what' && html`<${WhatTab} draft=${draft} up=${up} docs=${docs} setDocs=${setDocs} routineId=${liveDocs ? id : null} />`}
-    ${tab === 'when' && html`<${WhenTab} draft=${draft} up=${up} />`}
+    ${tab === 'what' && html`<${WhatTab} draft=${draft} up=${up} docs=${docs} setDocs=${setDocs} routineId=${liveDocs ? id : null}
+      latestDocs=${() => docsRef.current} uploading=${uploading} setUploading=${setUploading} />`}
+    ${tab === 'when' && html`<${WhenTab} draft=${draft} up=${up} done=${pending ? 0 : routine?.run_count || 0} />`}
     ${tab === 'rules' && html`<${RulesTab} draft=${draft} up=${up} routine=${routine} />`}
     ${tab === 'history' && routine && html`<${HistoryTab} routine=${routine} reload=${load} />`}
   <//>`;
 }
 
-function WhatTab({ draft, up, docs, setDocs, routineId }) {
+function WhatTab({ draft, up, docs, setDocs, routineId, latestDocs, uploading, setUploading }) {
   const file = useRef();
-  const [uploading, setUploading] = useState(false);
   const upload = async (e) => {
     const f = e.target.files?.[0];
     e.target.value = '';
@@ -279,9 +307,10 @@ function WhatTab({ draft, up, docs, setDocs, routineId }) {
     setUploading(true);
     try {
       const { doc } = await api('POST', `/routines/docs?name=${encodeURIComponent(f.name)}`, f);
-      const next = [...docs, doc];
+      // The tab may have changed meanwhile: add to the latest list.
+      const next = [...latestDocs(), doc];
       if (routineId) await patch(`/routines/${seg(routineId)}`, { doc_ids: next.map((d) => d.id) });
-      setDocs(next);
+      setDocs([...latestDocs().filter((d) => d.id !== doc.id), doc]);
     } catch (err) { toast(err.message); }
     setUploading(false);
   };
@@ -311,14 +340,14 @@ function WhatTab({ draft, up, docs, setDocs, routineId }) {
   </div>`;
 }
 
-function usePreview(draft) {
+function usePreview(draft, done) {
   const [out, setOut] = useState(null);
-  const key = JSON.stringify([draft.schedule_kind, draft.run_at, draft.rule, draft.cron_expr, draft.tz, draft.starts_at, draft.end_at, draft.max_runs]);
+  const key = JSON.stringify([draft.schedule_kind, draft.run_at, draft.rule, draft.cron_expr, draft.tz, draft.starts_at, draft.end_at, draft.max_runs, done]);
   useEffect(() => {
     let live = true;
     const t = setTimeout(async () => {
       try {
-        const r = await post('/routines/preview', { ...draft, count: 3 });
+        const r = await post('/routines/preview', { ...draft, count: 3, done });
         if (live) setOut({ ok: r });
       } catch (e) { if (live) setOut({ err: e.message }); }
     }, 300);
@@ -336,8 +365,8 @@ function Fld({ label, children }) {
   return html`<label class="rtn-fld"><span>${label}</span>${children}</label>`;
 }
 
-function WhenTab({ draft, up }) {
-  const preview = usePreview(draft);
+function WhenTab({ draft, up, done = 0 }) {
+  const preview = usePreview(draft, done);
   const rule = draft.rule || blankDraft().rule;
   const setRule = (p) => up({ rule: { ...rule, ...p } });
   const kind = draft.schedule_kind;
