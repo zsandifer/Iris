@@ -4,7 +4,7 @@ import { onFetch, reply, calls } from './env.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setToken } from '../../web/js/api.js';
-import { S, set, handleEvent, loadMemory, toast, parentRoute } from '../../web/js/store.js';
+import { S, set, handleEvent, loadMemory, loadMessages, loadOlder, toast, parentRoute } from '../../web/js/store.js';
 import {
   whenWord, noteMark, groupNotes, countLabel, historyLines, historyText, changeTag, notedLine, sourceOf,
   undoTracker, undos, withoutMemory,
@@ -225,4 +225,29 @@ test('a note that changes while Memory first loads is not lost', async () => {
   });
   await loadMemory();
   assert.deepEqual(S.memory.items.map((i) => i.id).sort(), [1, 2, 3, 4]);
+});
+
+test('chat pages asked for before Forget everything arrive without the forgotten payloads', async () => {
+  const old = (id, at) => ({ id, conversation_id: CID, role: 'assistant', kind: 'text', content: 'Sure', status: 'complete', meta: { noted: [{ history_id: 1, text: 'Likes tea' }] }, created_at: at, updated_at: at });
+  const card = (id, at) => ({ id, conversation_id: CID, role: 'assistant', kind: 'card', content: 'x', status: 'complete', card: { type: 'memory_morning' }, created_at: at, updated_at: at });
+  let release;
+  onFetch((url, opts) => (!String(url).includes('/messages') ? reply(opts, { body: { items: [], has_more: false } }) : new Promise((r) => {
+    const before = new URL(url, 'http://iris.test').searchParams.get('before');
+    release = () => r(reply(opts, { body: { messages: before ? [card('k', 5)] : [old('a', 10), old('b', 11)], has_more: !before } }));
+  })));
+  set({ msgs: {}, memory: null });
+  const latest = loadMessages(CID);
+  await new Promise((r) => setTimeout(r, 0));
+  handleEvent({ type: 'memory.reset', reset: '8' });
+  release();
+  await latest;
+  assert.ok(S.msgs[CID].list.every((m) => !m.meta?.noted), 'latest page stripped');
+  const older = loadOlder(CID);
+  await new Promise((r) => setTimeout(r, 0));
+  handleEvent({ type: 'memory.reset', reset: '9' });
+  release();
+  await older;
+  const k = S.msgs[CID].list.find((m) => m.id === 'k');
+  assert.equal(k.card, null, 'older page stripped');
+  assert.equal(k.content, 'I cleared my notes.');
 });

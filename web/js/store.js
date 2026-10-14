@@ -24,6 +24,7 @@ function initialState() {
     goals: null,
     library: null,
     memory: null,        // {items, more}: the owner's notes (Memory screen)
+    memoryRev: 0,        // bumped when memory changes (open note sheets refresh)
     route: parseRoute(),
     drawer: false,
     story: null,         // {topic index, story index}
@@ -253,16 +254,22 @@ function doneLoading(cid, patch) {
   if (again) loadMessages(cid);
 }
 
+// Bumped by Forget everything. Chat pages asked for before it may still
+// carry the Noted lines and morning notes it removed: those are stripped.
+let memoryGen = 0;
+const sinceReset = (gen, msgs) => (gen === memoryGen ? msgs : msgs.map(withoutMemory));
+
 export async function loadMessages(cid) {
   if (S.msgs[cid]?.loading) {
     patchBox(cid, { stale: true });
     return;
   }
   patchBox(cid, { loading: true, stale: false });
+  const gen = memoryGen;
   try {
     const r = await get(`/conversations/${seg(cid)}/messages?limit=60`);
     const cur = S.msgs[cid] || { list: [] };
-    const { list, joined } = mergeSnapshot(cur.list, r.messages);
+    const { list, joined } = mergeSnapshot(cur.list, sinceReset(gen, r.messages));
     const live = { ...S.live };
     for (const m of list) {
       if (m.status !== 'streaming') delete live[m.id];
@@ -283,11 +290,12 @@ export async function loadOlder(cid) {
   const cur = S.msgs[cid];
   if (!cur || !cur.hasMore || cur.loading || !cur.list.length) return;
   patchBox(cid, { loading: true });
+  const gen = memoryGen;
   try {
     const r = await get(`/conversations/${seg(cid)}/messages?limit=60&before=${cur.list[0].created_at}`);
     const now = S.msgs[cid]?.list || [];
     const ids = new Set(now.map((m) => m.id));
-    doneLoading(cid, { list: [...r.messages.filter((m) => !ids.has(m.id)), ...now], hasMore: r.has_more });
+    doneLoading(cid, { list: [...sinceReset(gen, r.messages).filter((m) => !ids.has(m.id)), ...now], hasMore: r.has_more });
   } catch (e) {
     // Release the flag so paging and reconnect refreshes keep working.
     doneLoading(cid, {});
@@ -533,6 +541,7 @@ export async function loadMemory() {
  * lose their Noted lines and morning notes read as cleared, as on the server.
  */
 export function memoryReset() {
+  memoryGen++;
   undos.clear();
   const msgs = {};
   for (const [cid, box] of Object.entries(S.msgs)) msgs[cid] = { ...box, list: box.list.map(withoutMemory) };
@@ -736,7 +745,10 @@ export function handleEvent(ev) {
       }
       break;
     case 'entities.changed':
-      if (ev.kinds.includes('memory') && memoryLoads > 0) memoryChanged = true;
+      if (ev.kinds.includes('memory')) {
+        if (memoryLoads > 0) memoryChanged = true;
+        set({ memoryRev: S.memoryRev + 1 });
+      }
       for (const k of ev.kinds) if (S[k] && loaders[k]) loaders[k]().catch(() => {});
       if (ev.kinds.includes('feed') && S.library) loadLibrary().catch(() => {});
       break;

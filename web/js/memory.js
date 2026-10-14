@@ -75,18 +75,29 @@ function NoteSheet({ id: first, draft }) {
   const [err, setErr] = useState(null);
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
+  const [moved, setMoved] = useState(false); // changed elsewhere while editing
   // `keepDraft`: a refresh (after Pin) must not throw away unsaved text.
   const load = (which = id, keepDraft = false) => get(`/memory/${num(which)}`)
     .then((r) => {
       setData(r);
       const d = pending.current;
       pending.current = null;
-      setText((cur) => (d?.trim() ? d
-        : keepDraft && cur.trim() && data && cur.trim() !== data.item.text.trim() ? cur : r.item.text));
+      const editing = keepDraft && data && text.trim() && text.trim() !== data.item.text.trim();
+      if (editing && r.item.text !== data.item.text) setMoved(true);
+      setText(d?.trim() ? d : editing ? text : r.item.text);
       setErr(null);
     })
     .catch((e) => setErr(e.status === 404 ? "I can't find that note anymore. It may have been forgotten." : e.message));
-  useEffect(() => { load(id); }, [id]);
+  useEffect(() => { setMoved(false); load(id); }, [id]);
+  // Changed elsewhere (another device, a chat, overnight): show the newest
+  // version, keeping an unsaved draft.
+  const rev = S.memoryRev;
+  const seenRev = useRef(rev);
+  useEffect(() => {
+    if (seenRev.current === rev) return;
+    seenRev.current = rev;
+    load(id, true);
+  }, [rev]);
   if (err) return html`<div class="sheet-body"><h3>Memory</h3><p class="mu">${err}</p>
     <div class="btns"><button class="b2" onClick=${closeSheet}>Close</button></div></div>`;
   if (!data) return html`<div class="sheet-body"><${Spinner} /></div>`;
@@ -104,6 +115,7 @@ function NoteSheet({ id: first, draft }) {
     const r = await patch(`/memory/${num(item.id)}`, { text: text.trim() });
     if (r.duplicate) { toast('I already remember that.'); setText(item.text); return; }
     toast('Saved. I’ll remember it this way.');
+    setMoved(false);
     await load(r.item?.id ?? item.id);
   });
   const pin = () => act(async () => {
@@ -147,6 +159,7 @@ function NoteSheet({ id: first, draft }) {
     <h3>${TOPIC_TITLE[item.topic] || 'Memory'}${item.pinned && html` <span class="mem-pin">· always in mind</span>`}</h3>
     ${!current && html`<div class="lock"><${Icon} name="archive" size=${15} /> I've set this aside, so I don't use it any more. Undo the last change to bring it back.</div>`}
     <b class="mem-h">What I remember</b>
+    ${moved && dirty && html`<div class="lock">This note changed while you were editing. It now says: “${item.text}”. Saving replaces that with your version.</div>`}
     ${current ? html`<${Grow} value=${text} onInput=${setText} label="What I remember" />`
       : html`<div class="mem-ed ro">${item.text}</div>`}
     <b class="mem-h">Where I learned it</b>
@@ -193,32 +206,43 @@ export function MemoryScreen() {
   useStore();
   const [topic, setTopic] = useState(null);
   const [q, setQ] = useState('');
-  const [found, setFound] = useState(null); // {query, items} or {query, error}
+  const [found, setFound] = useState(null); // {query, topic, items, more} or with error
   const [err, setErr] = useState(null);
   const asked = useRef(0);
   useEffect(() => { loadMemory().catch((e) => setErr(e.message)); }, []);
   const query = q.trim();
   // Search with the same keyword search I use; again after any change.
-  useEffect(() => {
-    if (!query) { setFound(null); return undefined; }
+  const search = (offset = 0, prev = []) => {
     const n = ++asked.current;
-    const t = setTimeout(() => {
-      get(`/memory?limit=100&query=${encodeURIComponent(query)}`)
-        .then((r) => { if (n === asked.current) setFound({ query, items: r.items }); })
-        .catch((e) => { if (n === asked.current) setFound({ query, items: [], error: e.message }); });
-    }, 250);
+    const q = `/memory?limit=100&offset=${offset}&query=${encodeURIComponent(query)}${topic ? `&topic=${topic}` : ''}`;
+    return get(q)
+      .then((r) => {
+        if (n !== asked.current) return;
+        const ids = new Set(prev.map((i) => i.id));
+        setFound({ query, topic, items: [...prev, ...r.items.filter((i) => !ids.has(i.id))], more: !!r.has_more, offset: offset + r.items.length });
+      })
+      .catch((e) => {
+        if (n !== asked.current) return;
+        if (prev.length) toast(e.message);
+        setFound({ query, topic, items: prev, error: e.message, more: prev.length > 0, offset });
+      });
+  };
+  useEffect(() => {
+    if (!query) { setFound(null); asked.current++; return undefined; }
+    const t = setTimeout(() => search(), 250);
     return () => clearTimeout(t);
-  }, [query, S.memory]);
+  }, [query, topic, S.memory]);
   const all = S.memory?.items;
   const searching = !!query;
-  const shown = searching ? (found?.query === query ? found.items : null) : all;
+  const fresh = found && found.query === query && found.topic === topic;
+  const shown = searching ? (fresh ? found.items : null) : all;
   const label = TOPICS.find(([k]) => k === topic)?.[1];
   let body;
   if (err && !all) body = html`<${Empty} icon="memory" title="I can't open my notes right now">${err}<//>`;
   else if (!shown) body = html`<${Spinner} />`;
   else if (searching) {
-    const list = topic ? shown.filter((i) => i.topic === topic) : shown;
-    body = list.length ? html`<div class="gl">Results</div><div class="grp mem-grp">${list.map((i) => html`<${NoteRow} item=${i} key=${i.id} />`)}</div>`
+    body = shown.length ? html`<div class="gl">Results</div><div class="grp mem-grp">${shown.map((i) => html`<${NoteRow} item=${i} key=${i.id} />`)}</div>
+      ${found.more && html`<button class="b2 wide" onClick=${() => search(found.offset, found.items)}>Show more</button>`}`
       : html`<${Empty} icon="search" title="Nothing found">${found?.error || `I don't remember anything about “${query}”${label ? ` under ${label}` : ''}.`}<//>`;
   } else {
     const groups = groupNotes(shown, topic);
