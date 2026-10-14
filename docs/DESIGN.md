@@ -18,7 +18,7 @@ own personality. It is not a clone.
    from the app: sign-ins, connectors, engines, models and updates.
 4. **Model agnostic.** Works with any installed harness (Claude Code, Codex,
    Gemini CLI, OpenCode with local models), in any combination.
-5. **You own everything.** Self-hosted; plain-text persona and memory files;
+5. **You own everything.** Self-hosted; plain-text persona files and a readable memory copy;
    no telemetry.
 
 ## Look
@@ -177,7 +177,9 @@ own personality. It is not a clone.
   is doing and holds chats and check-ins until turned back on.
   Trusted people manages recipients who can receive messages without another approval.
 - **System files:** the persona markdown files and memory/workspace folders,
-  each with a plain-language label, editable.
+  each with a plain-language label, editable. Memory ("What Iris always
+  keeps in mind" and the memory folder) is a read-only copy with a lock note
+  in Iris's voice: you change memory by asking in chat.
 - **Settings:**
   - Name, picture, voice replies, notifications, quiet hours.
   - Advanced: **AI engine**, devices, people, activity log (all steps, or

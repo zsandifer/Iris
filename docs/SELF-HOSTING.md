@@ -71,8 +71,10 @@ phone / browser ──HTTPS (Tailscale) or loopback──▶ iris serve (axum, S
 ```
 
 - **Persona**: `IDENTITY.md`, `SOUL.md`, `USER.md`, `TOOLS.md`,
-  `PROACTIVE_PREFERENCES.md`, `HEARTBEAT.md`, and `memory/MEMORY.md` live in
-  your data directory and are editable from the app. They are assembled into
+  `PROACTIVE_PREFERENCES.md`, and `HEARTBEAT.md` live in your data directory
+  and are editable from the app. Memory is stored as notes in the database;
+  `memory/MEMORY.md` (what the agent always keeps in mind) and one file per
+  topic are a read-only copy Iris rewrites after every change. They are assembled into
   a system prompt for every turn and injected through each CLI's own
   mechanism (`--append-system-prompt-file` for Claude Code,
   `GEMINI_SYSTEM_MD` for Gemini CLI, an `instructions` file for OpenCode),
@@ -204,7 +206,8 @@ Data directory layout:
 ~/.local/share/iris/
 ├── iris.db          # SQLite (WAL), 0600
 ├── persona/         # IDENTITY.md, SOUL.md, USER.md, TOOLS.md, ...
-├── memory/          # MEMORY.md plus notes the agent reads and writes
+├── memory/          # read-only Markdown copy of memory: MEMORY.md, you.md, people.md, ...
+├── memory-backup/   # Markdown notes as they were before Iris imported them
 ├── workspace-legacy/ # old shared cwd, quarantined on upgrade
 ├── library/         # artifacts and media the agent saved
 ├── uploads/         # images you sent, custom avatar
@@ -904,9 +907,16 @@ iris import openclaw ~/openclaw-workspace
 ```
 
 Copies persona files (`IDENTITY.md`, `SOUL.md`, `USER.md`, `TOOLS.md`,
-`HEARTBEAT.md`), `MEMORY.md`, and `memory/**/*.md` into the data directory.
-The source is never modified. Existing files are kept unless you pass
-`--force`. Symlinks, hidden files, and non-text files are skipped.
+`HEARTBEAT.md`) into the data directory, and imports `MEMORY.md` and
+`memory/**/*.md` as memory notes (one note per bullet or paragraph; notes
+Iris already has are not added again). OpenClaw's `AGENTS.md` is not
+imported. The source is never modified. Existing persona files are kept
+unless you pass `--force`. Symlinks, hidden files, and non-text files are
+skipped.
+
+When you upgrade from a version that kept memory as Markdown files, Iris
+imports the files in `memory/` the same way on its first start, copies the
+originals to `memory-backup/`, and from then on writes `memory/` itself.
 
 ## Running as a service
 
