@@ -63,6 +63,8 @@ pub fn scrub_document(text: &str) -> String {
             "refreshtoken",
             "client_secret",
             "clientsecret",
+            "secret_access_key",
+            "secretaccesskey",
             "secret",
             "token",
             "authorization",

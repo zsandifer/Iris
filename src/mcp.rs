@@ -1518,6 +1518,58 @@ mod tests {
     }
 
     #[test]
+    fn aws_secret_access_keys_never_reach_notes_history_or_exports() {
+        for secret in [
+            "AWS_SECRET_ACCESS_KEY=synthetic-canary",
+            "aws_secret_access_key = synthetic-canary",
+            r#"{"SecretAccessKey": "synthetic-canary"}"#,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let b = bridge(tmp.path());
+            let saved = call(
+                &b,
+                "remember",
+                json!({"text":format!("Likes tea\n{secret}"),"kind":"fact"}),
+            );
+            assert_eq!(saved["isError"], false);
+            assert_eq!(saved["structuredContent"]["item"]["text"], "Likes tea");
+            let id = saved["structuredContent"]["item"]["id"].as_i64().unwrap();
+            let updated = call(
+                &b,
+                "update_memory",
+                json!({"id":id,"text":format!("Likes coffee\n{secret}")}),
+            );
+            assert_eq!(updated["isError"], false);
+            assert_eq!(updated["structuredContent"]["item"]["text"], "Likes coffee");
+            assert_eq!(
+                call(
+                    &b,
+                    "write_memory",
+                    json!({"path":"you.md","content":format!("- Likes walking\n{secret}")}),
+                )["isError"],
+                false
+            );
+            let imported = crate::memory::files::import_notes(
+                &b.db,
+                &b.paths,
+                &[("you.md".into(), format!("- Likes climbing\n{secret}"))],
+            )
+            .unwrap();
+            assert_eq!(imported[0].added, 1);
+            let stored = b.db.with(|c| {
+                let mut rows = c.prepare("SELECT text FROM memory_items UNION ALL SELECT coalesce(before, '') || coalesce(after, '') FROM memory_history")?;
+                rows.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()
+            }).unwrap();
+            assert!(stored.iter().all(|s| !s.contains("synthetic-canary")));
+            for path in ["MEMORY.md", "you.md"] {
+                let export = std::fs::read_to_string(b.paths.memory_dir().join(path)).unwrap();
+                assert!(export.contains("Likes climbing"));
+                assert!(!export.contains("synthetic-canary"));
+            }
+        }
+    }
+
+    #[test]
     fn credential_formats_are_scrubbed_by_tools_and_legacy_import() {
         let tmp = tempfile::tempdir().unwrap();
         let b = bridge(tmp.path());
@@ -1574,6 +1626,9 @@ mod tests {
             "password: |- # comment\n  synthetic-canary",
             "password: first\n  synthetic-canary",
             "{\"password\": [\n\"synthetic-canary\"]}",
+            "AWS_SECRET_ACCESS_KEY=\n  synthetic-canary",
+            "aws_secret_access_key: |\n  synthetic-canary",
+            "{\"SecretAccessKey\":\n  \"synthetic-canary\"}",
         ] {
             assert_eq!(
                 call(&b, "remember", json!({"text":text,"kind":"fact"}))["isError"],

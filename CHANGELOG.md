@@ -59,7 +59,8 @@ All notable changes to Iris are documented here, following
   Ordinary notes fill spare capacity too, and resumed Codex chats receive
   current memory after another chat saves or corrects a note.
 - Owner-private memory recall tools and past conversation keyword search, with
-  secret/private-text filtering, duplicate protection, similarity hints,
+  secret/private-text filtering (including AWS secret-access-key assignments),
+  duplicate protection, similarity hints,
   history-backed corrections and Forget/Undo. Owner-only Memory API supports
   search, topic filters, detail, editing and pinning; private turn writes persist
   Noted metadata and emit an owner-only event for the later app UI.

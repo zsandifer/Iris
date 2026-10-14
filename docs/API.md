@@ -2435,7 +2435,8 @@ IDs are positive integers, stable across owner edits and never reused after Forg
   item was deleted and detail returns `404`.
 
 Writes share the MCP write gate: strip nested/unclosed `<private>` spans,
-PEM private keys, credential assignments (including camelCase labels and JSON/Markdown formatting
+PEM private keys, credential assignments (including AWS secret-access-key labels,
+camelCase labels and JSON/Markdown formatting
 and repeated labels), authorization lines and recognized
 API token formats before hashing or recording history. Ambiguous/multiline
 credential assignments reject the entire write conservatively; imports skip
