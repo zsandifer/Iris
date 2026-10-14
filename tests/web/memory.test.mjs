@@ -169,7 +169,7 @@ test('Undo, Redo, Undo, Redo always targets the newest change', async () => {
   assert.equal(t.isOff(10), false);
 });
 
-test('Forget everything (here or on another device) clears cached Noted lines and morning notes', () => {
+test('Forget everything (here or on another device) clears cached Noted lines and morning notes', async () => {
   const card = { id: 'k', conversation_id: CID, role: 'assistant', kind: 'card', content: 'I tidied my notes overnight', card: { type: 'memory_morning', changes: [] }, created_at: 1, updated_at: 1 };
   const noted = { id: 'n', conversation_id: CID, role: 'assistant', kind: 'text', content: 'Sure', meta: { purpose: 'chat', noted: [{ history_id: 1 }] }, created_at: 2, updated_at: 2 };
   const other = { id: 'o', conversation_id: CID, role: 'user', kind: 'text', content: 'hi', created_at: 3, updated_at: 3 };
@@ -177,14 +177,35 @@ test('Forget everything (here or on another device) clears cached Noted lines an
   assert.equal(withoutMemory(card).card, null);
   assert.equal(withoutMemory(card).content, 'I cleared my notes.');
   assert.deepEqual(withoutMemory(noted).meta, { purpose: 'chat' });
-  set({ msgs: { [CID]: { list: [card, noted, other], hasMore: true } }, memory: null });
-  handleEvent({ type: 'memory.reset' });
+  await undos.toggle(7, async () => ({ history_id: 8 }), async () => ({ history_id: 9 }));
+  assert.equal(undos.isOff(7), true);
+  const sheet = () => 'note';
+  sheet.memory = true;
+  set({ msgs: { [CID]: { list: [card, noted, other], hasMore: true } }, memory: null, sheet });
+  handleEvent({ type: 'memory.reset', reset: '5' });
   const list = S.msgs[CID].list;
   assert.equal(list[0].card, null);
   assert.equal(list[1].meta.noted, undefined);
   assert.deepEqual(list[2], other);
   assert.equal(S.msgs[CID].hasMore, true, 'paging state stays');
-  assert.equal(undos.isOff(1), false);
+  assert.equal(undos.isOff(7), false, 'undo state starts over');
+  assert.equal(S.sheet, null, 'an open memory sheet closes');
+  // Another sheet stays open through a reset.
+  const other2 = () => 'quiet hours';
+  set({ sheet: other2 });
+  handleEvent({ type: 'memory.reset', reset: '6' });
+  assert.equal(S.sheet, other2);
+});
+
+test('a reset missed while disconnected is caught up from the reconnect settings', () => {
+  const noted = (id) => ({ id, conversation_id: CID, role: 'assistant', kind: 'text', content: 'Sure', meta: { noted: [{ history_id: 1 }] }, created_at: 1, updated_at: 1 });
+  set({ msgs: { [CID]: { list: [noted('a')] } }, memory: null });
+  const ready = (reset) => handleEvent({ type: 'ready', settings: { memory: { learning_paused: false, morning_note: true, reset } }, harnesses: [] });
+  onFetch((url, opts) => reply(opts, { body: { conversations: [], messages: [], has_more: false, browser: {} } }));
+  ready('6');
+  assert.ok(S.msgs[CID].list[0].meta.noted, 'the same marker changes nothing');
+  ready('7');
+  assert.equal(S.msgs[CID].list[0].meta.noted, undefined, 'a new marker clears cached copies');
 });
 
 test('a note that changes while Memory first loads is not lost', async () => {

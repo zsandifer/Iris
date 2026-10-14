@@ -804,6 +804,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{reset}");
         assert_eq!(reset, json!({"forgotten":1}));
+        let (_, settings) = send(&h.app, "GET", "/api/settings", Some(&owner), None).await;
+        assert!(settings["memory"]["reset"].is_string(), "{settings}");
         // Owner apps hear about the reset (and only the owner's).
         let mut heard = false;
         while let Ok(env) = rx.try_recv() {
@@ -910,7 +912,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             settings["memory"],
-            json!({"learning_paused":true,"morning_note":false})
+            json!({"learning_paused":true,"morning_note":false,"reset":null})
         );
         let (_, settings) = send(&h.app, "GET", "/api/settings", Some(&guest), None).await;
         assert_eq!(settings["memory"], Value::Null);

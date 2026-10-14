@@ -1201,12 +1201,15 @@ Returns the [Settings](#settings) object directly (not wrapped):
   "allow_claude_for_shared": false,
   "feed_prompt": "...",
   "paused": false,
-  "memory": {"learning_paused": false, "morning_note": true},
+  "memory": {"learning_paused": false, "morning_note": true, "reset": null},
   "voice": {"enabled": false, "status": "not_implemented"}
 }
 ```
 
-`memory` is owner-only (`null` for other users).
+`memory` is owner-only (`null` for other users). `memory.reset` is an opaque
+marker (`null` until the first Forget everything) that changes with every
+Forget everything; an app that sees it change (for example in `ready` after
+reconnecting) drops cached Noted lines and morning cards.
 
 `paused` is true while the owner has paused Iris
 ([3.18](#318-safety-pause-disconnect-trusted-people)); change it with
@@ -2558,7 +2561,7 @@ was emitted). Events are delivered only to the users listed under
 | `message.activity` | `{"conversation_id", "message_id", "activity": {Activity}}` | Conversation members |
 | `message.completed` | `{"conversation_id", "message": {Message}}` | Conversation members |
 | `memory.noted` | `{"conversation_id", "message_id", "changes": [{"history_id", "item_id", "op", "text"}]}` | Owner only |
-| `memory.reset` | `{}` after Forget everything: drop cached Noted metadata and morning cards (they now read "I cleared my notes.") | Owner only |
+| `memory.reset` | `{"reset"}` (the new `Settings.memory.reset` marker) after Forget everything: drop cached Noted metadata and morning cards (they now read "I cleared my notes.") and close open memory sheets | Owner only |
 | `turn.status` | `{"conversation_id", "message_id", "status": "queued" \| "running"}` | Conversation members |
 | `conversation.created` | `{"conversation": {Conversation}}` | Conversation members |
 | `entities.changed` | `{"kinds": ["goals" \| "ideas" \| "feed" \| "library" \| "memory", ...]}` | The affected user |

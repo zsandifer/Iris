@@ -65,6 +65,8 @@ export function set(patch) {
 export function resetUserState() {
   connectorsLoading = null;
   connectorsTried = false;
+  seenReset = undefined;
+  undos.clear();
   userGen++;
   const fresh = initialState();
   for (const k of Object.keys(S)) if (!(k in fresh)) delete S[k];
@@ -534,8 +536,23 @@ export function memoryReset() {
   undos.clear();
   const msgs = {};
   for (const [cid, box] of Object.entries(S.msgs)) msgs[cid] = { ...box, list: box.list.map(withoutMemory) };
-  set({ msgs });
-  if (S.memory) loadMemory().catch(() => {});
+  // Memory sheets (a note, What I noted, Export) show what was forgotten.
+  // A list load still in flight carries notes from before the reset.
+  const sheet = S.sheet?.memory ? null : S.sheet;
+  const reload = !!S.memory;
+  if (reload) touchList('memory');
+  set({ msgs, sheet, memory: reload ? { items: [], more: false } : null });
+  if (reload) loadMemory().catch(() => {});
+}
+
+// The reset marker last seen in settings: one that changes while this app
+// was away (a missed memory.reset event) clears the cached copies too.
+let seenReset;
+function noteResetMark(settings) {
+  if (!settings?.memory) return;
+  const mark = settings.memory.reset ?? null;
+  if (seenReset !== undefined && mark !== seenReset) memoryReset();
+  seenReset = mark;
 }
 
 /** A memory.noted event: show the Noted line under that reply. */
@@ -639,6 +656,7 @@ export function applyLoginResponse(harness, login, mark) {
 export function handleEvent(ev) {
   switch (ev.type) {
     case 'ready':
+      noteResetMark(ev.settings);
       set({ settings: ev.settings, harnesses: ev.harnesses, logins: currentLogins(ev.harnesses) });
       refreshAll();
       frames.onReady.forEach((f) => f());
@@ -706,6 +724,7 @@ export function handleEvent(ev) {
       break;
     case 'memory.reset':
       memoryReset();
+      seenReset = ev.reset ?? null;
       break;
     case 'memory.noted':
       applyNoted(ev.conversation_id, ev.message_id, ev.changes || []);
@@ -722,6 +741,7 @@ export function handleEvent(ev) {
       if (ev.kinds.includes('feed') && S.library) loadLibrary().catch(() => {});
       break;
     case 'settings.changed':
+      noteResetMark(ev.settings);
       set({ settings: ev.settings });
       break;
     case 'harness.status':

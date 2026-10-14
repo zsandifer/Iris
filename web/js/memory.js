@@ -43,9 +43,16 @@ async function toggleUndo(historyId, first = undoChange) {
 
 // ------------------------------------------------------------ note sheet
 
-/** Open the sheet for one note (from the list, a Noted line, or a card). */
-export function openNote(id) {
-  openSheet(() => html`<${NoteSheet} id=${id} key=${'note-' + id} />`);
+/** A sheet showing memory: closed when everything is forgotten. */
+function memorySheet(render) {
+  render.memory = true;
+  openSheet(render);
+}
+
+/** Open the sheet for one note (from the list, a Noted line, or a card).
+ * `draft`: unsaved text to show instead of the saved text. */
+export function openNote(id, draft = null) {
+  memorySheet(() => html`<${NoteSheet} id=${id} draft=${draft} key=${'note-' + id} />`);
 }
 
 function Grow({ value, onInput, label }) {
@@ -60,9 +67,10 @@ function Grow({ value, onInput, label }) {
     onInput=${(e) => onInput(e.target.value)} />`;
 }
 
-function NoteSheet({ id: first }) {
+function NoteSheet({ id: first, draft }) {
   useStore();
   const [id, setId] = useState(first);
+  const pending = useRef(draft);
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
   const [text, setText] = useState('');
@@ -71,7 +79,10 @@ function NoteSheet({ id: first }) {
   const load = (which = id, keepDraft = false) => get(`/memory/${num(which)}`)
     .then((r) => {
       setData(r);
-      setText((cur) => (keepDraft && cur.trim() && data && cur.trim() !== data.item.text.trim() ? cur : r.item.text));
+      const d = pending.current;
+      pending.current = null;
+      setText((cur) => (d?.trim() ? d
+        : keepDraft && cur.trim() && data && cur.trim() !== data.item.text.trim() ? cur : r.item.text));
       setErr(null);
     })
     .catch((e) => setErr(e.status === 404 ? "I can't find that note anymore. It may have been forgotten." : e.message));
@@ -107,7 +118,7 @@ function NoteSheet({ id: first }) {
       yes: 'Forget',
       danger: true,
     });
-    if (!ok) { openNote(item.id); return; }
+    if (!ok) { openNote(item.id, dirty ? text : null); return; }
     const r = await del(`/memory/${num(item.id)}`);
     closeSheet();
     toast('Forgotten', {
@@ -259,7 +270,7 @@ export function NotedLine({ m }) {
   const changes = m.meta?.noted;
   if (!isOwner() || !Array.isArray(changes) || !changes.length) return null;
   const allOff = changes.every((ch) => undos.isOff(ch.history_id));
-  return html`<button class=${'noted' + (allOff ? ' undone' : '')} onClick=${() => openSheet(() => html`<${NotedSheet} changes=${changes} />`)}>
+  return html`<button class=${'noted' + (allOff ? ' undone' : '')} onClick=${() => memorySheet(() => html`<${NotedSheet} changes=${changes} />`)}>
     <${Icon} name="memory" size=${13} /><span>${notedLine(changes)}</span></button>`;
 }
 
@@ -331,7 +342,7 @@ export function MemorySettings() {
     <//>
     <${Group} label="Your notes">
       <${Row} icon="memory" title="See everything I remember" onClick=${() => go('iris/memory')} />
-      <${Row} icon="download" title="Export as Markdown" sub="Download a copy of all my notes" onClick=${() => openSheet(() => html`<${ExportSheet} />`)} chevron=${false} />
+      <${Row} icon="download" title="Export as Markdown" sub="Download a copy of all my notes" onClick=${() => memorySheet(() => html`<${ExportSheet} />`)} chevron=${false} />
     <//>
     <${Group} note="Removes every note and its history. Chats stay.">
       <${Row} title="Forget everything" danger chevron=${false} onClick=${forgetAll} />

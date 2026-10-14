@@ -209,9 +209,10 @@ async fn forget_everything(
         .map_err(error)?;
     // Memory reset also removed historical Noted/card payloads: owner apps
     // drop their cached copies.
+    let mark = state.setting(crate::memory::lifecycle::RESET_AFTER).await;
     state.hub.send(
         crate::events::Audience::Owner,
-        json!({"type":"memory.reset"}),
+        json!({"type":"memory.reset", "reset": mark}),
     );
     changed(&state);
     ok(out)
