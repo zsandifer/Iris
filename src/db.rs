@@ -543,6 +543,8 @@ CREATE TRIGGER memory_history_identity AFTER INSERT ON memory_history BEGIN
     UPDATE settings SET value = CAST(MAX(CAST(value AS INTEGER), NEW.id) AS TEXT)
     WHERE key = 'memory.history_highwater';
 END;
+-- SQLite must find child rows without scanning the entire store per deletion.
+CREATE INDEX memory_supersession ON memory_items(superseded_by);
 CREATE INDEX memory_expiry ON memory_items(valid_to, id)
 WHERE archived = 0 AND superseded_by IS NULL AND valid_to IS NOT NULL;
 "#,
@@ -1854,6 +1856,7 @@ mod tests {
     #[test]
     fn memory_identity_migration_keeps_deleted_item_and_history_ids() {
         let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         for migration in &MIGRATIONS[..11] {
             conn.execute_batch(migration).unwrap();
         }
@@ -1875,6 +1878,18 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("77")
+        );
+        let plan: Vec<String> = conn
+            .prepare("EXPLAIN QUERY PLAN DELETE FROM memory_items")
+            .unwrap()
+            .query_map([], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|line| line
+                .contains("SEARCH memory_items USING COVERING INDEX memory_supersession")),
+            "{plan:?}"
         );
         conn.execute("DELETE FROM memory_history", []).unwrap();
         let saved = crate::memory::recall::save(

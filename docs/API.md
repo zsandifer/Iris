@@ -3458,9 +3458,11 @@ Other notes need 90 days since creation, last use or last edit and a packing
 score below 0.6. Archived rows leave recall and generated files but retain
 history for owner undo. Undo refreshes the inactivity grace. These deterministic
 changes use actor `dream`, batch `forgetting-<id>`; they do not make morning cards.
+Dream's stale-text guard uses the removal time for those batches, so pre-expiry
+assertions cannot recreate the expired note without its validity.
 Owner Forget still hard-deletes with a tombstone.
 
-Migration 12 adds the partial `memory_expiry` index and monotonic ID triggers,
+Migration 12 adds the partial `memory_expiry` and `memory_supersession` indexes and monotonic ID triggers,
 without new tables. Settings `memory.item_highwater`, `memory.history_highwater`,
 `memory.forgetting.cursor`, and `memory.reset_after` are internal bookkeeping;
 `memory.dream.evidence_after` remains durable across resets. No new MCP tools.

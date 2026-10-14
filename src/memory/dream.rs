@@ -327,11 +327,15 @@ fn fresh_text(
     batch: &str,
 ) -> rusqlite::Result<bool> {
     let text = gate::scrub(text).map_err(recall::invalid)?;
+    // Consolidation records assertion time to support chronological backlog.
+    // Deterministic forgetting records removal time: earlier discussion must
+    // not recreate expired/decayed notes with a fresh, unbounded validity.
     let blocked = c.prepare_cached("SELECT 1 FROM memory_history
         WHERE json_extract(before, '$.content_hash') = ?1 AND COALESCE(batch_id, '') != ?3
         AND (after IS NULL OR json_extract(after, '$.content_hash') != ?1
              OR json_extract(after, '$.archived') = 1 OR json_extract(after, '$.superseded_by') IS NOT NULL)
-        AND CASE WHEN actor = 'dream' THEN COALESCE(json_extract(after, '$.mentioned_at'), at) ELSE at END >= ?2")?
+        AND CASE WHEN actor = 'dream' AND COALESCE(batch_id, '') NOT LIKE 'forgetting-%'
+                 THEN COALESCE(json_extract(after, '$.mentioned_at'), at) ELSE at END >= ?2")?
         .exists(params![super::content_hash(&text), asserted_at(input, aliases), batch])?;
     Ok(!blocked)
 }
