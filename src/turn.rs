@@ -873,16 +873,24 @@ async fn run_locked(
                     kind: "auth_required",
                     detail: harness_name.clone(),
                 };
-                if acc.text.is_empty() {
+                // Rerouted only if this attempt did nothing yet: one that
+                // used tools may have sent or bought something already.
+                if acc.text.is_empty() && acc.activities.is_empty() {
                     routing_notes.push(format!("{} signed out; rerouted", d.model));
                     excluded.push(harness_name);
                     continue;
                 }
                 break;
             }
-            Some(Terminal::Error(message)) if resumed && acc.text.is_empty() && !fresh_session => {
+            Some(Terminal::Error(message))
+                if resumed
+                    && acc.text.is_empty()
+                    && acc.activities.is_empty()
+                    && !fresh_session =>
+            {
                 // Typically a session the CLI no longer has; start fresh and
-                // replay the conversation instead.
+                // replay the conversation instead (never after tool use,
+                // which may already have acted).
                 crate::warn!("turn {msg_id}: resume failed, retrying with a fresh session");
                 let (c, h) = (conv_id.to_string(), harness_name.clone());
                 let _ = state

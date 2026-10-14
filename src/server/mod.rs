@@ -3700,6 +3700,11 @@ cat > "$r/stdin"
 touch "$r/started"
 while [ -f "{d}/hold" ]; do sleep 0.02; done
 echo '{{"type":"system","subtype":"init","session_id":"sess-'$n'"}}'
+if [ -f "{d}/fail" ]; then
+  grep -q tool "{d}/fail" && printf '%s\n' '{{"type":"assistant","message":{{"id":"m0","content":[{{"type":"tool_use","id":"t1","name":"mcp__notes__send_message","input":{{}}}}]}}}}'
+  printf '%s\n' '{{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}}'
+  exit 1
+fi
 text=ok
 [ -f "{d}/reply" ] && text=$(cat "{d}/reply")
 printf '%s\n' '{{"type":"assistant","message":{{"id":"m1","content":[{{"type":"text","text":"'"$text"'"}}]}}}}'
@@ -3886,6 +3891,91 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
             guest_id,
             guest_t,
         }
+    }
+
+    #[tokio::test]
+    async fn routine_attempts_that_used_tools_are_never_replayed() {
+        let t = turn_setup(|_| {}).await;
+        let (h, tok) = (&t.h, t.owner_t.as_str());
+        let create = |body: Value| async move {
+            let (s, b) = send(&h.app, "POST", "/api/routines", Some(tok), Some(body)).await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+            format!("/api/routines/{}", b["routine"]["id"].as_str().unwrap())
+        };
+        let last_run = |path: String, want: &'static str| async move {
+            let mut run = Value::Null;
+            for _ in 0..250 {
+                let (_, b) = send(&h.app, "GET", &path, Some(tok), None).await;
+                run = b["routine"]["runs"][0].clone();
+                if run["status"] == want {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(run["status"], want, "{run}");
+            run
+        };
+        let run_now = |path: String| async move {
+            let (s, b) = send(&h.app, "POST", &format!("{path}/run"), Some(tok), None).await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+        };
+        // Acts without asking: an attempt that failed after using a tool is
+        // not tried again (it may have sent the message).
+        let direct = create(
+            json!({"title": "Rent reminder", "instructions": "Text Sam.",
+            "schedule_kind": "rule", "ask_before_acting": false, "max_retries": 2,
+            "rule": {"freq": "monthly", "day": 1, "time": "09:00"}, "tz": "UTC"}),
+        )
+        .await;
+        std::fs::write(t.dir.join("fail"), "tool").unwrap();
+        run_now(direct.clone()).await;
+        let run = last_run(direct.clone(), "failed").await;
+        assert!(run["retry_at"].is_null(), "{run}");
+        assert!(
+            run["reason"].as_str().unwrap().contains("didn't try again"),
+            "{run}"
+        );
+        assert_eq!(t.runs(), 1);
+        // Without any tool use it is safe to try again later.
+        std::fs::write(t.dir.join("fail"), "plain").unwrap();
+        run_now(direct.clone()).await;
+        let mut run = Value::Null;
+        for _ in 0..250 {
+            run = last_run(direct.clone(), "failed").await;
+            if run["retry_at"].is_i64() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(run["retry_at"].is_i64(), "{run}");
+        assert_eq!(t.runs(), 2);
+        // The step after the owner's OK resumes the prepared session. If it
+        // fails after using a tool, the turn does not start over with a
+        // fresh session either (that would repeat the action).
+        std::fs::remove_file(t.dir.join("fail")).unwrap();
+        let asks = create(json!({"title": "Dinner", "instructions": "Order my usual.",
+            "schedule_kind": "rule",
+            "rule": {"freq": "weekly", "days": [6], "time": "17:30"}, "tz": "UTC"}))
+        .await;
+        std::fs::write(t.dir.join("reply"), "Cart ready.\\nNEEDS_OK: Order it.").unwrap();
+        run_now(asks.clone()).await;
+        let run = last_run(asks.clone(), "waiting").await;
+        assert_eq!(t.runs(), 3);
+        std::fs::write(t.dir.join("fail"), "tool").unwrap();
+        let card = run["card_message_id"].as_str().unwrap();
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/messages/{card}/decision"),
+            Some(tok),
+            Some(json!({"approve": true})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let run = last_run(asks.clone(), "failed").await;
+        assert!(run["retry_at"].is_null());
+        assert!(t.read(3, "args").contains("--resume"));
+        assert_eq!(t.runs(), 4, "no fresh-session replay of the acting step");
     }
 
     #[tokio::test]
