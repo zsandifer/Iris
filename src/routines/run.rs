@@ -103,6 +103,8 @@ pub struct RunRow {
     pub reason: String,
     pub summary: String,
     pub attempts: i64,
+    /// This attempt was allowed to act without asking first.
+    pub may_act: bool,
     pub retry_at: Option<i64>,
     pub conversation_id: Option<String>,
     pub card_message_id: Option<String>,
@@ -122,6 +124,7 @@ fn run_from_row(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
         reason: r.get("reason")?,
         summary: r.get("summary")?,
         attempts: r.get("attempts")?,
+        may_act: r.get("may_act")?,
         retry_at: r.get("retry_at")?,
         conversation_id: r.get("conversation_id")?,
         card_message_id: r.get("card_message_id")?,
@@ -215,6 +218,7 @@ fn insert_run(
 }
 
 /// Start due retries and claim due slots; returns the runs to start.
+#[cfg(test)]
 pub fn claim_due(conn: &Connection, now: i64) -> rusqlite::Result<Vec<String>> {
     claim_due_changes(conn, now).map(|(runs, _)| runs)
 }
@@ -425,23 +429,36 @@ fn finish_run(
     Ok(())
 }
 
+/// What startup recovery found.
+#[derive(Debug, Default, PartialEq)]
+pub struct Recovered {
+    /// Runs that were going.
+    pub interrupted: usize,
+    /// Notes for the owner's Main chat: (owner, text, push), for runs that
+    /// may have acted and were stopped.
+    pub notices: Vec<(String, String, bool)>,
+}
+
 /// After a restart: runs that were going cannot be finished. Retry them
 /// (the preparing step, within the hour) or record the failure.
-pub fn recover(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
+pub fn recover(conn: &Connection, now: i64) -> rusqlite::Result<Recovered> {
     db::write_tx(conn, |c| {
         let running: Vec<RunRow> = c
             .prepare("SELECT * FROM routine_runs WHERE status = 'running'")?
             .query_map([], run_from_row)?
             .collect::<rusqlite::Result<_>>()?;
+        let mut out = Recovered {
+            interrupted: running.len(),
+            ..Default::default()
+        };
         for run in &running {
             let routine = get_routine_any(c, &run.routine_id)?;
             let retries = routine.as_ref().map_or(0, |r| r.spec.max_retries);
             // An attempt allowed to act (the step after the owner's OK, or a
-            // routine that does not ask first) may have bought or sent
-            // something before the restart: never do it again on its own.
-            let may_have_acted = run.approved_at.is_some()
-                || routine.as_ref().is_none_or(|r| !r.spec.ask_before_acting);
-            if may_have_acted {
+            // routine that did not ask first when it started) may have
+            // bought or sent something before the restart: never do it
+            // again on its own, and tell the owner.
+            if run.approved_at.is_some() || run.may_act {
                 finish_run(
                     c,
                     &run.id,
@@ -451,6 +468,17 @@ pub fn recover(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
                     None,
                     now,
                 )?;
+                if let Some(r) = &routine {
+                    out.notices.push((
+                        r.owner.clone(),
+                        format!(
+                            "I was restarted partway through your routine “{}”, so I stopped. \
+                             Part of it may already be done; check before running it again.",
+                            r.spec.title
+                        ),
+                        r.spec.notify_when_done,
+                    ));
+                }
             } else if run.attempts <= retries && now - run.scheduled_for <= MISFIRE_WINDOW_MS {
                 c.execute(
                     "UPDATE routine_runs SET status = 'failed', retry_at = ?2, updated_at = ?3,
@@ -469,8 +497,20 @@ pub fn recover(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
                 )?;
             }
         }
-        Ok(running.len())
+        Ok(out)
     })
+}
+
+/// Post startup recovery's notes to the owners' Main chats.
+pub async fn post_recovery_notices(state: &AppState, notices: &[(String, String, bool)]) {
+    for (owner, text, push) in notices {
+        if let Err(e) =
+            crate::jobs::post_note_to_main(state, owner, text, None, "routine", *push).await
+        {
+            crate::warn!("routines: posting a recovery note failed: {e}");
+        }
+        changed(state, owner);
+    }
 }
 
 /// Split a prepared reply into what to tell the owner and, when Iris needs
@@ -575,6 +615,7 @@ pub fn start_conversation(
     owner: &str,
     title: &str,
     prompt: &str,
+    may_act: bool,
 ) -> rusqlite::Result<(String, Message, Message)> {
     db::write_tx(conn, |c| {
         let run = get_run(c, run_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
@@ -592,8 +633,9 @@ pub fn start_conversation(
             None,
         )?;
         c.execute(
-            "UPDATE routine_runs SET conversation_id = ?2, updated_at = ?3 WHERE id = ?1",
-            params![run_id, conv.id, now_ms()],
+            "UPDATE routine_runs SET conversation_id = ?2, may_act = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![run_id, conv.id, may_act, now_ms()],
         )?;
         c.execute(
             "DELETE FROM conversations WHERE kind = 'job' AND id IN (
@@ -776,9 +818,10 @@ async fn execute(state: &AppState, run_id: &str, step: Step) -> crate::util::Res
                 owner.clone(),
                 ctx.routine.spec.title.clone(),
             );
+            let may_act = !ctx.routine.spec.ask_before_acting;
             state
                 .db
-                .call(move |c| start_conversation(c, &rid, &o, &t, &prompt))
+                .call(move |c| start_conversation(c, &rid, &o, &t, &prompt, may_act))
                 .await?
         }
         Step::Act => {

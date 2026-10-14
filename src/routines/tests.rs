@@ -515,7 +515,7 @@ fn runs_use_a_private_job_conversation() {
         .unwrap()
         .unwrap();
     let (conv, user, assistant) = db
-        .with(|c| run::start_conversation(c, &id, &owner, &r.spec.title, "do it"))
+        .with(|c| run::start_conversation(c, &id, &owner, &r.spec.title, "do it", false))
         .unwrap();
     let (kind, members) = db
         .with(|c| {
@@ -531,7 +531,7 @@ fn runs_use_a_private_job_conversation() {
     assert_eq!(assistant.status, "streaming");
     // A retry starts over in a new conversation; the old one is removed.
     let (again, _, _) = db
-        .with(|c| run::start_conversation(c, &id, &owner, &r.spec.title, "do it"))
+        .with(|c| run::start_conversation(c, &id, &owner, &r.spec.title, "do it", false))
         .unwrap();
     assert_ne!(again, conv);
     assert!(
@@ -645,22 +645,35 @@ fn interrupted_runs_are_recovered() {
     // Inside the retry window with retries left: only its approval stops it.
     let acting = mk("2026-10-17T17:20", 1, Some(1));
     let old = mk("2026-10-03T17:30", 1, None);
-    // A routine that acts without asking first: its run may have acted.
+    // A run that started while its routine acted without asking first may
+    // have acted, even though the owner switched "ask first" on since.
     let mut direct = saturday_dinner();
     direct.title = "Rent reminder".into();
-    direct.ask_before_acting = false;
     let d = active(&db, &owner, direct, at("2026-10-13T12:00"));
     let direct_run = new_id();
     db.with(|c| {
         c.execute(
             "INSERT INTO routine_runs (id, routine_id, scheduled_for, status, attempts,
-                 created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'running', 1, 0, 0)",
+                 may_act, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'running', 1, 1, 0, 0)",
             params![direct_run, d.id, at("2026-10-17T17:30")],
         )
     })
     .unwrap();
-    assert_eq!(db.with(|c| run::recover(c, now)).unwrap(), 4);
+    let rec = db.with(|c| run::recover(c, now)).unwrap();
+    assert_eq!(rec.interrupted, 4);
+    // The owner hears about both runs that may have acted.
+    assert_eq!(rec.notices.len(), 2, "{:?}", rec.notices);
+    assert!(
+        rec.notices
+            .iter()
+            .all(|(o, text, _)| o == &owner && text.contains("check"))
+    );
+    assert!(
+        rec.notices
+            .iter()
+            .any(|(_, text, _)| text.contains("Rent reminder"))
+    );
     let get = |id: &str| db.with(|c| run::get_run(c, id)).unwrap().unwrap();
     let f = get(&fresh);
     assert_eq!(
@@ -763,7 +776,7 @@ fn deleting_a_routine_closes_its_open_approval() {
     })
     .unwrap();
     let (conv, _, _) = db
-        .with(|c| run::start_conversation(c, "r1", &owner, &r.spec.title, "prepare"))
+        .with(|c| run::start_conversation(c, "r1", &owner, &r.spec.title, "prepare", false))
         .unwrap();
     let deleted = db
         .with(|c| delete_routine(c, &owner, &r.id))

@@ -417,9 +417,13 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
             .db
             .call(|c| routines::run::recover(c, util::now_ms()))
             .await?;
-        if recovered > 0 {
-            warn!("{recovered} routine run(s) were interrupted by the last shutdown");
+        if recovered.interrupted > 0 {
+            warn!(
+                "{} routine run(s) were interrupted by the last shutdown",
+                recovered.interrupted
+            );
         }
+        routines::run::post_recovery_notices(&state, &recovered.notices).await;
         gateway::listen(state.clone())?;
         let probe = state.clone();
         tokio::spawn(async move {

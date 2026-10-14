@@ -593,6 +593,9 @@ CREATE TABLE routine_runs (
     reason          TEXT NOT NULL DEFAULT '',
     summary         TEXT NOT NULL DEFAULT '',
     attempts        INTEGER NOT NULL DEFAULT 0,
+    -- The current attempt was allowed to act (a routine that does not ask
+    -- first, as it was when the attempt started).
+    may_act         INTEGER NOT NULL DEFAULT 0,
     retry_at        INTEGER,
     conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
     card_message_id TEXT,

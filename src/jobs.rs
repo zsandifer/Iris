@@ -440,12 +440,24 @@ pub async fn post_to_main_opts(
     initiated_by: &str,
     push: bool,
 ) -> crate::util::Result<()> {
+    post_note_to_main(state, user_id, text, Some(source), initiated_by, push).await
+}
+
+/// [`post_to_main_opts`] for a note no engine wrote (`source` None).
+pub async fn post_note_to_main(
+    state: &AppState,
+    user_id: &str,
+    text: &str,
+    source: Option<&db::Message>,
+    initiated_by: &str,
+    push: bool,
+) -> crate::util::Result<()> {
     let (uid, text_s) = (user_id.to_string(), text.to_string());
-    let meta = json!({"initiated_by": initiated_by, "routing": source.meta.get("routing")});
+    let meta = json!({"initiated_by": initiated_by, "routing": source.and_then(|s| s.meta.get("routing"))});
     let (harness, model, effort) = (
-        source.harness.clone(),
-        source.model.clone(),
-        source.effort.clone(),
+        source.and_then(|s| s.harness.clone()),
+        source.and_then(|s| s.model.clone()),
+        source.and_then(|s| s.effort.clone()),
     );
     let msg = state
         .db
