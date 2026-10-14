@@ -43,6 +43,15 @@ fn is_generated(content: &str) -> bool {
     content.starts_with(HEADER)
 }
 
+/// [`is_generated`] reading only the start of the file.
+fn starts_with_header(path: &Path) -> bool {
+    use std::io::Read;
+    let mut start = vec![0; HEADER.len()];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut start))
+        .is_ok_and(|_| start == HEADER.as_bytes())
+}
+
 fn io_err(e: impl Into<crate::util::BoxError>) -> rusqlite::Error {
     // Carries the I/O error out of the transaction (and rolls it back).
     rusqlite::Error::ToSqlConversionFailure(e.into())
@@ -364,6 +373,10 @@ fn collect(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Foreign>) {
             continue;
         };
         let rel = rel.to_string_lossy().into_owned();
+        // A generated export of any size is Iris's own.
+        if is_export_name(&rel) && starts_with_header(&path) {
+            continue;
+        }
         let content = entry
             .metadata()
             .is_ok_and(|m| m.len() <= MAX_IMPORT_BYTES)
@@ -1030,6 +1043,12 @@ mod tests {
         assert!(is_generated(&read(&paths, CORE_FILE)));
         // A large note file that is not an export name is left alone.
         assert!(paths.memory_dir().join("huge-notes.md").exists());
+        // A generated export larger than the import limit is not imported
+        // or backed up again.
+        let huge = format!("{HEADER}\n# People\n\n{big}");
+        std::fs::write(paths.memory_dir().join("people.md"), &huge).unwrap();
+        let again = prepare(&db, &paths).unwrap();
+        assert!(again.backup.is_none() && again.unreadable == 0);
     }
 
     #[test]

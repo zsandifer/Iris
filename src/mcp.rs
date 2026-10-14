@@ -510,9 +510,9 @@ impl Bridge {
                     }
                     if !w.kept_recent.is_empty() {
                         out["note"] = json!(
-                            "The kept_recent notes were saved from another chat after you \
-                             started; read the file again and write it without them to \
-                             remove them."
+                            "The kept_recent notes were saved or changed from another chat \
+                             during this turn, so they were kept. They can be removed in a \
+                             later turn if they are wrong."
                         );
                     }
                     if !w.not_restored.is_empty() {
