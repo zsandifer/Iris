@@ -1324,6 +1324,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_memory_folder_is_a_read_only_export() {
+        let h = setup();
+        let t = pair_as(&h, None).await;
+        let (s, files) = send(&h.app, "GET", "/api/files", Some(&t), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let memory = files["system_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "MEMORY.md")
+            .unwrap();
+        assert_eq!(memory["read_only"], true);
+        let soul = &files["system_files"][1];
+        assert_eq!(
+            (soul["name"].as_str(), soul["read_only"].as_bool()),
+            (Some("SOUL.md"), Some(false))
+        );
+        assert_eq!(files["folders"][0]["area"], "memory");
+        assert_eq!(files["folders"][0]["read_only"], true);
+        let export = std::fs::read_to_string(h.state.paths.memory_dir().join("MEMORY.md")).unwrap();
+        let blocked = [
+            (
+                "PUT",
+                "/api/files/system/MEMORY.md".to_string(),
+                Some(json!({"content": "x"})),
+            ),
+            (
+                "PUT",
+                "/api/files/content/memory?path=MEMORY.md".into(),
+                Some(json!({"content": "x"})),
+            ),
+            (
+                "PUT",
+                "/api/files/content/memory?path=notes/new.md".into(),
+                Some(json!({"content": "x"})),
+            ),
+            (
+                "DELETE",
+                "/api/files/content/memory?path=MEMORY.md".into(),
+                None,
+            ),
+        ];
+        for (method, uri, body) in blocked {
+            let (s, e) = send(&h.app, method, &uri, Some(&t), body).await;
+            assert_eq!(s, StatusCode::CONFLICT, "{method} {uri}");
+            assert_eq!(e["error"]["code"], "read_only");
+            assert!(
+                e["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("my memory")
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(h.state.paths.memory_dir().join("MEMORY.md")).unwrap(),
+            export
+        );
+        assert!(!h.state.paths.memory_dir().join("notes").exists());
+        // Reading still works, and other folders stay editable.
+        let (s, r) = send(&h.app, "GET", "/api/files/system/MEMORY.md", Some(&t), None).await;
+        assert_eq!(
+            (s, r["content"].as_str()),
+            (StatusCode::OK, Some(export.as_str()))
+        );
+        let (s, _) = send(
+            &h.app,
+            "GET",
+            "/api/files/content/memory?path=MEMORY.md",
+            Some(&t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = send(
+            &h.app,
+            "PUT",
+            "/api/files/system/SOUL.md",
+            Some(&t),
+            Some(json!({"content": "Calm."})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = send(
+            &h.app,
+            "PUT",
+            "/api/files/content/workspace?path=draft.md",
+            Some(&t),
+            Some(json!({"content": "x"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn feed_like_without_body_and_message_paging() {
         let h = setup();
         let t = pair_as(&h, None).await;

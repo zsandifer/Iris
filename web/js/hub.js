@@ -137,9 +137,11 @@ const FRIENDLY = {
   'TOOLS.md': 'Notes on tools and accounts',
   'PROACTIVE_PREFERENCES.md': 'When {name} acts on its own',
   'HEARTBEAT.md': 'What {name} checks on',
-  'MEMORY.md': "{name}'s long-term memory",
+  'MEMORY.md': 'What {name} always keeps in mind',
 };
-const AREA = { memory: 'Memory notes', workspace: "{name}'s working folder", persona: 'Persona files' };
+const AREA = { memory: "{name}'s memory", workspace: "{name}'s working folder", persona: 'Persona files' };
+// Generated from what Iris remembers; changed through chat, not edited here.
+const READ_ONLY_NOTE = 'A copy of what I remember, kept up to date as I learn. Ask me in a chat to remember, change, or forget something.';
 const fill = (s) => s.replace(/\{name\}/g, agentName());
 
 export function Files() {
@@ -148,17 +150,18 @@ export function Files() {
     ${!data ? html`<${Spinner} />` : html`
       <${Group} label="Personality and memory">
         ${data.system_files.map((f) => html`<${Row} icon="file" title=${fill(FRIENDLY[f.name] || f.description)}
-          sub=${f.name + (f.exists ? '' : ' · empty')} onClick=${() => go(`iris/files/system/${f.name}`)} />`)}
+          sub=${f.name + (f.read_only ? ' · read-only copy' : f.exists ? '' : ' · empty')} onClick=${() => go(`iris/files/system/${f.name}`)} />`)}
       <//>
       <${Group} label="Folders">
         ${data.folders.filter((d) => d.area !== 'persona').map((d) => html`<${Row} icon="folder" title=${fill(AREA[d.area] || d.description)}
-          sub=${d.area} onClick=${() => go(`iris/files/${d.area}`)} />`)}
+          sub=${d.read_only ? 'Read-only copy' : d.area} onClick=${() => go(`iris/files/${d.area}`)} />`)}
       <//>`}
   <//>`;
 }
 
 export function FileEditor({ area, path }) {
   const system = area === 'system';
+  const readOnly = area === 'memory' || (system && path === 'MEMORY.md');
   const url = system ? `/files/system/${seg(path)}` : `/files/content/${seg(area)}?path=${encodeURIComponent(path)}`;
   const [text, setText] = useState(null);
   const [orig, setOrig] = useState('');
@@ -178,10 +181,11 @@ export function FileEditor({ area, path }) {
   };
   const name = path.split('/').pop();
   return html`<${Page} title=${system ? fill(FRIENDLY[path] || path) : name} sub=${system ? path : `${area}/${path}`}
-    right=${html`<button class="b1 sm" disabled=${!dirty || busy} onClick=${save}>Save</button>`}>
-    ${text == null ? html`<${Spinner} />` : html`<textarea class="editor" value=${text} spellcheck=${false}
-      onInput=${(e) => setText(e.target.value)} aria-label=${`Edit ${name}`} />`}
-    ${!system && html`<${Group}><${Row} title="Delete file" danger chevron=${false} onClick=${remove} /><//>`}
+    right=${readOnly ? null : html`<button class="b1 sm" disabled=${!dirty || busy} onClick=${save}>Save</button>`}>
+    ${readOnly && html`<div class="lock"><${Icon} name="lock" size=${15} /> ${READ_ONLY_NOTE}</div>`}
+    ${text == null ? html`<${Spinner} />` : html`<textarea class="editor" value=${text} spellcheck=${false} readOnly=${readOnly}
+      onInput=${(e) => setText(e.target.value)} aria-label=${readOnly ? name : `Edit ${name}`} />`}
+    ${!system && !readOnly && html`<${Group}><${Row} title="Delete file" danger chevron=${false} onClick=${remove} /><//>`}
   <//>`;
 }
 
@@ -190,6 +194,7 @@ export function Folder({ area, path = '' }) {
   const sub = path ? `${area}/${path}` : area;
   const open = (e) => go(`iris/files/${area}/${[path, e.name].filter(Boolean).join('/')}${e.type === 'dir' ? '' : '?edit=1'}`);
   return html`<${Page} title=${path ? path.split('/').pop() : fill(AREA[area] || area)} sub=${sub}>
+    ${area === 'memory' && !path && html`<div class="lock"><${Icon} name="lock" size=${15} /> ${READ_ONLY_NOTE}</div>`}
     ${err ? html`<${Empty} icon="folder" title="Nothing here yet">This folder is empty.<//>`
       : !data ? html`<${Spinner} />` : data.entries.length ? html`<${Group}>
         ${data.entries.map((e) => html`<${Row} icon=${e.type === 'dir' ? 'folder' : 'file'} title=${e.name}
