@@ -74,7 +74,10 @@ pub fn render_export(conn: &Connection, paths: &Paths) -> rusqlite::Result<CoreH
     )
     .map_err(io_err)?;
     for topic in Topic::ALL {
-        let mut of: Vec<&Item> = live.iter().filter(|i| i.topic == topic).collect();
+        let mut of: Vec<&Item> = live
+            .iter()
+            .filter(|i| i.topic == topic && i.valid_to.is_none_or(|t| t > now))
+            .collect();
         of.sort_by_key(|i| (!i.pinned, i.created_at, i.id));
         let path = dir.join(topic.file());
         if !of.is_empty() {
@@ -184,7 +187,8 @@ fn generic_heading(h: &str) -> bool {
 /// after its file name. The export's own headings add nothing, so its
 /// notes read back unchanged.
 fn candidates(rel: &str, content: &str) -> Vec<Candidate> {
-    let parsed = markdown::parse(content);
+    let public = super::gate::scrub_document(content);
+    let parsed = markdown::parse(&public);
     let own_file = !is_export_name(rel);
     let title = match parsed.title.as_deref() {
         Some(t) if !generic_heading(t) => t.to_string(),
@@ -201,7 +205,7 @@ fn candidates(rel: &str, content: &str) -> Vec<Candidate> {
         .notes
         .iter()
         .filter(|n| !(rel == CORE_FILE && is_legacy_template_block(&n.text)))
-        .map(|n| {
+        .filter_map(|n| {
             let context = std::iter::once(title.as_str())
                 .chain(
                     n.headings
@@ -226,7 +230,11 @@ fn candidates(rel: &str, content: &str) -> Vec<Candidate> {
                     parsed.title.as_deref().filter(|_| own_file),
                 )
             });
-            Candidate { text, topic }
+            let text = super::gate::scrub_document(&text);
+            if text.is_empty() {
+                return None;
+            }
+            Some(Candidate { text, topic })
         })
         .collect()
 }
@@ -508,6 +516,12 @@ pub fn write(
     batch: &str,
 ) -> Result<Written> {
     let export = is_export_name(rel);
+    if !markdown::parse(content).notes.is_empty() && candidates(rel, content).is_empty() {
+        return Err(
+            "I couldn't save this file safely. Please leave out private text and credentials."
+                .into(),
+        );
+    }
     if !export && markdown::parse(content).notes.is_empty() {
         return Err("write at least one note (one per bullet)".into());
     }

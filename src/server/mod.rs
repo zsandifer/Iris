@@ -7,6 +7,7 @@ mod browser;
 mod chat;
 mod connect;
 mod content;
+mod memory;
 mod web;
 mod ws;
 
@@ -175,6 +176,7 @@ pub fn router(state: AppState) -> Router {
         .route("/users/{id}/pairing-code", post(user_pairing_code))
         .merge(chat::routes())
         .merge(content::routes())
+        .merge(memory::routes())
         .merge(admin::routes())
         .merge(browser::routes())
         .merge(connect::routes())
@@ -648,6 +650,301 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK, "{body}");
         body["token"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn memory_routes_are_owner_only_and_edits_pin_forget_and_undo_work() {
+        let h = setup();
+        let owner = pair_as(&h, None).await;
+        let guest = h
+            .state
+            .db
+            .with(|c| {
+                c.execute(
+                    "INSERT INTO users(id,display_name,created_at) VALUES ('guest','Guest',0)",
+                    [],
+                )?;
+                Ok("guest".to_string())
+            })
+            .unwrap();
+        let other = pair_as(&h, Some(&guest)).await;
+        let (status, saved) = send(
+            &h.app,
+            "POST",
+            "/api/memory",
+            Some(&owner),
+            Some(json!({"text":"Likes hiking", "kind":"preference"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        let id = saved["item"]["id"].as_i64().unwrap();
+        let path = format!("/api/memory/{id}");
+        let (status, pin) = send(
+            &h.app,
+            "PATCH",
+            &path,
+            Some(&owner),
+            Some(json!({"pinned":true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{pin}");
+        assert_eq!(pin["item"]["pinned"], true);
+        let undo_path = format!("/api/memory/history/{}/undo", pin["history_id"]);
+        for (method, url, body) in [
+            ("GET", "/api/memory", None),
+            ("GET", &path, None),
+            ("POST", "/api/memory", Some(json!({"text":"x"}))),
+            ("PATCH", &path, Some(json!({"pinned":false}))),
+            ("DELETE", &path, None),
+            ("POST", &undo_path, Some(json!({}))),
+        ] {
+            assert_eq!(
+                send(&h.app, method, url, Some(&other), body).await.0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            send(&h.app, "GET", "/api/memory", None, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, detail) = send(&h.app, "GET", &path, Some(&owner), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["history"].as_array().unwrap().len(), 2);
+        assert_eq!(detail["item"]["use_count"], 0);
+        let (status, list) = send(
+            &h.app,
+            "GET",
+            "/api/memory?query=hiking&topic=you&since=0",
+            Some(&owner),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert_eq!(list["items"][0]["id"], id);
+        assert_eq!(
+            send(&h.app, "POST", &undo_path, Some(&owner), Some(json!({})))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let (_, detail) = send(&h.app, "GET", &path, Some(&owner), None).await;
+        assert_eq!(detail["item"]["pinned"], false);
+        assert_eq!(
+            send(&h.app, "POST", &undo_path, Some(&owner), Some(json!({})))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, deleted) = send(&h.app, "DELETE", &path, Some(&owner), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            send(&h.app, "GET", &path, Some(&owner), None).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            send(
+                &h.app,
+                "POST",
+                &format!("/api/memory/history/{}/undo", deleted["history_id"]),
+                Some(&owner),
+                Some(json!({}))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let core = std::fs::read_to_string(h.state.paths.memory_dir().join("MEMORY.md")).unwrap();
+        assert!(core.contains("Likes hiking"));
+        assert_eq!(
+            send(
+                &h.app,
+                "POST",
+                "/api/memory",
+                Some(&owner),
+                Some(json!({"text":"token=synthetic-canary"}))
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            send(
+                &h.app,
+                "GET",
+                "/api/memory?query=%22%2A%22",
+                Some(&owner),
+                None
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_correction_undo_can_be_undone_repeatedly_through_rest() {
+        let h = setup();
+        let owner = pair_as(&h, None).await;
+        let (id, mut change) = h
+            .state
+            .db
+            .with(|c| {
+                crate::memory::recall::mutate(c, &h.state.paths, |c| {
+                    use crate::memory::recall::{Edit, save};
+                    let a = save(
+                        c,
+                        &Edit {
+                            text: Some("Likes tea".into()),
+                            ..Default::default()
+                        },
+                        None,
+                        crate::memory::Actor::Owner,
+                        &json!({}),
+                        "a",
+                    )?;
+                    let id = a["item"]["id"].as_i64().unwrap();
+                    let b = save(
+                        c,
+                        &Edit {
+                            text: Some("Likes coffee".into()),
+                            ..Default::default()
+                        },
+                        Some(id),
+                        crate::memory::Actor::Agent,
+                        &json!({}),
+                        "b",
+                    )?;
+                    Ok(json!({"id":id,"history_id":b["history_id"]}))
+                })
+            })
+            .map(|v| (v["id"].as_i64().unwrap(), v["history_id"].as_i64().unwrap()))
+            .unwrap();
+        for text in ["Likes tea", "Likes coffee", "Likes tea", "Likes coffee"] {
+            let (status, response) = send(
+                &h.app,
+                "POST",
+                &format!("/api/memory/history/{change}/undo"),
+                Some(&owner),
+                Some(json!({})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            let (_, notes) = send(&h.app, "GET", "/api/memory", Some(&owner), None).await;
+            assert_eq!(notes["items"].as_array().unwrap().len(), 1, "{notes}");
+            assert_eq!(notes["items"][0]["text"], text);
+            let (_, detail) = send(
+                &h.app,
+                "GET",
+                &format!("/api/memory/{id}"),
+                Some(&owner),
+                None,
+            )
+            .await;
+            change = detail["history"][0]["id"].as_i64().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_addition_undo_returns_a_discoverable_reversal() {
+        let h = setup();
+        let owner = pair_as(&h, None).await;
+        let (_, added) = send(
+            &h.app,
+            "POST",
+            "/api/memory",
+            Some(&owner),
+            Some(json!({"text":"Likes tea"})),
+        )
+        .await;
+        let id = added["item"]["id"].as_i64().unwrap();
+        let (status, undone) = send(
+            &h.app,
+            "POST",
+            &format!("/api/memory/history/{}/undo", added["history_id"]),
+            Some(&owner),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{undone}");
+        assert!(undone["item"].is_null());
+        assert_eq!(
+            send(
+                &h.app,
+                "GET",
+                &format!("/api/memory/{id}"),
+                Some(&owner),
+                None
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        let (status, redone) = send(
+            &h.app,
+            "POST",
+            &format!("/api/memory/history/{}/undo", undone["history_id"]),
+            Some(&owner),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{redone}");
+        assert_eq!(redone["item"]["id"], id);
+        assert_eq!(redone["item"]["text"], "Likes tea");
+        assert!(redone["history_id"].as_i64().unwrap() > undone["history_id"].as_i64().unwrap());
+        assert_eq!(
+            send(
+                &h.app,
+                "POST",
+                "/api/memory",
+                Some(&owner),
+                Some(json!({"text":"password: |\n  synthetic-canary"}))
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_edits_retain_omitted_timestamps_and_clear_explicit_nulls() {
+        let h = setup();
+        let owner = pair_as(&h, None).await;
+        let (_, a) = send(
+            &h.app,
+            "POST",
+            "/api/memory",
+            Some(&owner),
+            Some(json!({"text":"Likes tea","valid_to":i64::MAX,"observed_at":100})),
+        )
+        .await;
+        let id = a["item"]["id"].as_i64().unwrap();
+        let path = format!("/api/memory/{id}");
+        let (status, b) = send(
+            &h.app,
+            "PATCH",
+            &path,
+            Some(&owner),
+            Some(json!({"importance":4})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{b}");
+        assert_eq!(b["item"]["valid_to"], i64::MAX);
+        assert_eq!(b["item"]["observed_at"], 100);
+        let (status, c) = send(
+            &h.app,
+            "PATCH",
+            &path,
+            Some(&owner),
+            Some(json!({"valid_to":null,"observed_at":null})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{c}");
+        assert_eq!(c["item"]["id"], id);
+        assert!(c["item"]["valid_to"].is_null());
+        assert!(c["item"]["observed_at"].is_null());
+        let (_, d) = send(&h.app, "GET", &path, Some(&owner), None).await;
+        assert!(d["history"][0]["after"]["valid_to"].is_null());
+        assert_eq!(d["history"][0]["before"]["valid_to"], i64::MAX);
     }
 
     #[tokio::test]
@@ -3105,6 +3402,9 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         std::fs::write(paths.persona_dir().join("USER.md"), "owner-user-fact").unwrap();
         std::fs::write(paths.memory_dir().join("MEMORY.md"), "owner-memory-fact").unwrap();
         let db = crate::db::Db::open(&paths.db_file()).unwrap();
+        // Match startup: import the synthetic legacy memory into the database
+        // before private turns repack the generated export.
+        crate::memory::files::prepare(&db, &paths).unwrap();
         let mut cfg = Config::default();
         for h in cfg.harness.values_mut() {
             h.enabled = false;

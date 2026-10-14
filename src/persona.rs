@@ -340,11 +340,13 @@ pub fn memory_prompt(paths: &Paths, scope: Scope) -> String {
              (below) holds the notes always in mind, as many as fit: pinned notes first, \
              then the most important and recently used. Every note is also listed in its \
              topic file (you.md, people.md, projects.md, routines.md; the ones with notes \
-             are listed below). Read a topic file with the Iris read_memory tool when its \
-             topic comes up, or when MEMORY.md says notes did not fit. To save, correct or remove notes, use write_memory with the \
-             file's full new content, one note per bullet (MEMORY.md for short, \
-             always-relevant facts); bullets you leave out are removed everywhere. These \
-             tools are only available in the owner's private chats.\n",
+             are listed below). Use search_memory to recall relevant notes, get_memory for \
+             their full text, sources and history, and search_conversations for past private \
+             chats. Save individual notes with remember, correct them with update_memory, \
+             and remove them with forget. Never save secrets or <private> spans. A similarity \
+             hint is advisory: read that note and decide whether to update it; never merge \
+             automatically. read_memory/write_memory remain available for the Markdown \
+             view. Memory tools are only available in the owner's private chats.\n",
         );
         if entries.is_empty() {
             out.push_str("\n(No other memory files yet.)\n");
