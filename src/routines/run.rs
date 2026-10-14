@@ -336,45 +336,34 @@ pub fn close_card(conn: &Connection, card_id: &str, to: &str) -> rusqlite::Resul
 /// closed cards.
 pub fn expire_waiting(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Message>> {
     db::write_tx(conn, |c| {
+        // A decision moves its run on in the same step (`decide_in_tx`), so
+        // a run still waiting here was not answered in time.
         let waiting: Vec<(String, Option<String>, i64)> = c
             .prepare(
                 "SELECT r.id, r.card_message_id, t.approval_timeout_mins
                  FROM routine_runs r JOIN routines t ON t.id = r.routine_id
-                 WHERE r.status = 'waiting' AND r.expires_at <= ?1",
+                 WHERE r.status = 'waiting' AND (r.expires_at IS NULL OR r.expires_at <= ?1)",
             )?
             .query_map([now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let mut cards = Vec::new();
         for (run, card, mins) in waiting {
-            let card_state = match &card {
-                Some(id) => db::get_message(c, id)?
-                    .and_then(|m| m.card)
-                    .map(|c| c["state"].as_str().unwrap_or("").to_string()),
-                None => None,
-            };
-            // Tapped just now: the decision is on its way.
-            if card_state.as_deref().is_some_and(|s| s != "pending") {
-                continue;
-            }
             if let Some(id) = &card
                 && let Some(m) = close_card(c, id, "expired")?
             {
                 cards.push(m);
             }
-            finish_run(
-                c,
-                &run,
-                "skipped",
-                &format!(
-                    "You didn't answer within {}, so I didn't do it.",
-                    wait_text(mins)
-                ),
-                None,
-                now,
-            )?;
+            finish_run(c, &run, "skipped", &timeout_reason(mins), None, now)?;
         }
         Ok(cards)
     })
+}
+
+fn timeout_reason(mins: i64) -> String {
+    format!(
+        "You didn't answer within {}, so I didn't do it.",
+        wait_text(mins)
+    )
 }
 
 fn wait_text(mins: i64) -> String {
@@ -985,39 +974,75 @@ async fn after_turn(
     Ok(())
 }
 
-/// The owner decided a run's approval card (`POST /api/messages/{id}/decision`).
-pub async fn decided(state: &AppState, run_id: &str, approve: bool) {
-    let (id, now) = (run_id.to_string(), now_ms());
-    let res = state
-        .db
-        .call(move |c| {
-            let Some(run) = get_run(c, &id)? else {
-                return Ok(None);
-            };
-            if run.status != "waiting" {
-                return Ok(None);
-            }
-            if approve {
-                c.execute(
-                    "UPDATE routine_runs SET status = 'running', approved_at = ?2, reason = '',
-                         updated_at = ?2
-                     WHERE id = ?1",
-                    params![id, now],
-                )?;
-            } else {
-                finish_run(
-                    c,
-                    &id,
-                    "skipped",
-                    "You said no, so I didn't do it.",
-                    None,
-                    now,
-                )?;
-            }
-            Ok(get_routine_any(c, &run.routine_id)?.map(|r| r.owner))
-        })
-        .await;
-    let Ok(Some(owner)) = res else { return };
+/// What deciding a run's approval card does to the run.
+#[derive(Debug, PartialEq)]
+pub enum RunDecision {
+    /// The run moved on (to its acting step, or skipped on a no); the
+    /// routine's owner.
+    Proceed(String),
+    /// Too late (past its deadline, now skipped) or no longer waiting: the
+    /// card closes without doing anything.
+    Closed,
+}
+
+/// The owner decided a run's approval card (`POST /api/messages/{id}/decision`),
+/// inside the transaction that records the card's decision.
+pub fn decide_in_tx(
+    c: &Connection,
+    run_id: &str,
+    approve: bool,
+    now: i64,
+) -> rusqlite::Result<RunDecision> {
+    let Some(run) = get_run(c, run_id)? else {
+        return Ok(RunDecision::Closed);
+    };
+    if run.status != "waiting" {
+        return Ok(RunDecision::Closed);
+    }
+    let Some(routine) = get_routine_any(c, &run.routine_id)? else {
+        return Ok(RunDecision::Closed);
+    };
+    if run.expires_at.is_none_or(|t| t <= now) {
+        finish_run(
+            c,
+            run_id,
+            "skipped",
+            &timeout_reason(routine.spec.approval_timeout_mins),
+            None,
+            now,
+        )?;
+        return Ok(RunDecision::Closed);
+    }
+    if approve {
+        c.execute(
+            "UPDATE routine_runs SET status = 'running', approved_at = ?2, reason = '',
+                 updated_at = ?2
+             WHERE id = ?1",
+            params![run_id, now],
+        )?;
+    } else {
+        finish_run(
+            c,
+            run_id,
+            "skipped",
+            "You said no, so I didn't do it.",
+            None,
+            now,
+        )?;
+    }
+    Ok(RunDecision::Proceed(routine.owner))
+}
+
+/// After the decision is saved: tell the app, and do the approved work.
+/// `owner` is None when the card closed without a decision.
+pub async fn after_decision(state: &AppState, run_id: &str, owner: Option<String>, approve: bool) {
+    let owner = match owner {
+        Some(o) => o,
+        None => match state.db.call(db::owner_user_id).await {
+            Ok(Some(o)) => o,
+            _ => return,
+        },
+    };
     changed(state, &owner);
     if approve {
         spawn_run(state, run_id.to_string(), Step::Act);

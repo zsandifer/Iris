@@ -573,9 +573,54 @@ fn unanswered_approvals_expire_into_skipped_runs() {
         "You didn't answer within 2 hours, so I didn't do it."
     );
     assert_eq!(card_state(&db, &ids[0].1), "expired");
-    // Tapped just before the deadline: the decision wins.
-    let tapped = db.with(|c| run::get_run(c, &ids[1].0)).unwrap().unwrap();
-    assert_eq!(tapped.status, "waiting");
+    // A decision moves its run on in the same step, so a run still waiting
+    // with a decided card (saved by an older version) never blocks the
+    // routine: it is skipped too.
+    let stuck = db.with(|c| run::get_run(c, &ids[1].0)).unwrap().unwrap();
+    assert_eq!(stuck.status, "skipped");
+}
+
+#[test]
+fn approval_decisions_move_the_run_on_at_once_and_respect_the_deadline() {
+    let (db, owner, _) = setup();
+    let r = active(&db, &owner, saturday_dinner(), at("2026-10-13T12:00"));
+    let now = at("2026-10-17T18:00");
+    let mk = |slot: &str, expires_at: i64| {
+        let id = new_id();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO routine_runs (id, routine_id, scheduled_for, status, attempts,
+                     expires_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'waiting', 1, ?4, 0, 0)",
+                params![id, r.id, at(slot), expires_at],
+            )
+        })
+        .unwrap();
+        id
+    };
+    let get = |id: &str| db.with(|c| run::get_run(c, id)).unwrap().unwrap();
+    let decide = |id: &str, yes: bool| db.with(|c| run::decide_in_tx(c, id, yes, now)).unwrap();
+    // Before the deadline: a yes starts the acting step.
+    let yes = mk("2026-10-17T17:30", now + 60_000);
+    assert_eq!(decide(&yes, true), run::RunDecision::Proceed(owner.clone()));
+    let y = get(&yes);
+    assert_eq!((y.status.as_str(), y.approved_at), ("running", Some(now)));
+    // A second tap finds nothing waiting.
+    assert_eq!(decide(&yes, true), run::RunDecision::Closed);
+    // A no skips it.
+    let no = mk("2026-10-10T17:30", now + 60_000);
+    assert_eq!(decide(&no, false), run::RunDecision::Proceed(owner.clone()));
+    assert_eq!(get(&no).status, "skipped");
+    // Past the deadline (the minute tick has not caught up yet, or Iris
+    // was paused): too late, nothing is done.
+    let late = mk("2026-10-03T17:30", now);
+    assert_eq!(decide(&late, true), run::RunDecision::Closed);
+    let l = get(&late);
+    assert_eq!((l.status.as_str(), l.approved_at), ("skipped", None));
+    assert_eq!(
+        l.reason,
+        "You didn't answer within 2 hours, so I didn't do it."
+    );
 }
 
 #[test]

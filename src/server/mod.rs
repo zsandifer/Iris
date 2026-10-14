@@ -3990,6 +3990,61 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
         assert_eq!(run["status"], "skipped");
         assert_eq!(run["reason"], "You said no, so I didn't do it.");
         assert_eq!(t.runs(), 3, "no acting step after a no");
+
+        // A tap after the deadline (before the minute tick closed the card)
+        // is too late: the card closes, the run is skipped, nothing acts.
+        std::fs::write(t.dir.join("reply"), "Cart ready.\\nNEEDS_OK: Order again.").unwrap();
+        send(
+            &h.app,
+            "POST",
+            &format!("{path}/run"),
+            Some(&t.owner_t),
+            None,
+        )
+        .await;
+        let mut run = Value::Null;
+        for _ in 0..250 {
+            run = run_status().await;
+            if run["status"] == "waiting" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(run["status"], "waiting", "{run}");
+        let late_run = run["id"].as_str().unwrap().to_string();
+        h.state
+            .db
+            .call(move |c| {
+                c.execute(
+                    "UPDATE routine_runs SET expires_at = 1 WHERE id = ?1",
+                    [late_run],
+                )
+            })
+            .await
+            .unwrap();
+        let card_id = run["card_message_id"].as_str().unwrap().to_string();
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/messages/{card_id}/decision"),
+            Some(&t.owner_t),
+            Some(json!({"approve": true})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        let run = run_status().await;
+        assert_eq!(run["status"], "skipped", "{run}");
+        assert!(run["approved_at"].is_null());
+        let card = h
+            .state
+            .db
+            .call(move |c| crate::db::get_message(c, &card_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(card.card.unwrap()["state"], "expired");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(t.runs(), 4, "no acting step after the deadline");
         // Paused: run now is refused politely.
         h.state
             .db

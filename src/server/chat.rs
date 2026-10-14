@@ -673,6 +673,16 @@ struct Decision {
     approve: bool,
 }
 
+enum Decided {
+    /// The card (and the note saying so), and the owner of a routine run
+    /// that moved on with it.
+    Done(Box<(db::Message, db::Message, Option<String>)>),
+    /// A routine run's card whose deadline passed (closed now, if it was
+    /// still open).
+    Expired(Option<db::Message>),
+    Conflict,
+}
+
 /// Approve or deny an `approval` card. Only its approver may decide, once.
 async fn decide_approval(
     State(state): State<AppState>,
@@ -716,22 +726,40 @@ async fn decide_approval(
         "denied"
     };
     let mid = id.clone();
-    // Check and update under the one database lock so two taps cannot both win.
-    let updated = state
+    let approve = body.approve;
+    // Check and update under the one database lock so two taps cannot both
+    // win. A routine run waiting on this card moves on in the same step, so
+    // a restart can never leave the card decided and the run waiting.
+    let decided = state
         .db
         .call(move |c| {
-            let Some(current) = db::get_message(c, &mid)? else {
-                return Ok(None);
-            };
-            let mut card = current.card.unwrap_or_default();
-            if (setup_request && crate::awareness::resolved(&card))
-                || (!setup_request && card["state"] != "pending")
-            {
-                return Ok(None);
-            }
-            card["state"] = state_name.into();
-            card["decided_at"] = crate::util::now_ms().into();
             db::write_tx(c, |c| {
+                let Some(current) = db::get_message(c, &mid)? else {
+                    return Ok(Decided::Conflict);
+                };
+                let mut card = current.card.unwrap_or_default();
+                if (setup_request && crate::awareness::resolved(&card))
+                    || (!setup_request && card["state"] != "pending")
+                {
+                    return Ok(Decided::Conflict);
+                }
+                let mut run_owner = None;
+                if !setup_request && let Some(run) = card["routine_run_id"].as_str() {
+                    let now = crate::util::now_ms();
+                    match crate::routines::run::decide_in_tx(c, run, approve, now)? {
+                        crate::routines::run::RunDecision::Proceed(owner) => {
+                            run_owner = Some(owner)
+                        }
+                        crate::routines::run::RunDecision::Closed => {
+                            // Past its deadline, or the run is gone: the
+                            // card closes and nothing happens.
+                            let closed = crate::routines::run::close_card(c, &mid, "expired")?;
+                            return Ok(Decided::Expired(closed));
+                        }
+                    }
+                }
+                card["state"] = state_name.into();
+                card["decided_at"] = crate::util::now_ms().into();
                 let updated = db::update_message_card(c, &mid, &card)?;
                 let text = if setup_request {
                     "You declined the setup request."
@@ -741,18 +769,30 @@ async fn decide_approval(
                     "You declined the request. Nothing was done."
                 };
                 let note = crate::awareness::insert_note(c, &updated.conversation_id, text)?;
-                Ok(Some((updated, note)))
+                Ok(Decided::Done(Box::new((updated, note, run_owner))))
             })
         })
-        .await?
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::CONFLICT,
-                "conflict",
-                "this was already decided or has expired",
-            )
-        })?;
-    let (updated, note) = updated;
+        .await?;
+    let conflict = || {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "this was already decided or has expired",
+        )
+    };
+    let (updated, note, run_owner) = match decided {
+        Decided::Done(d) => *d,
+        Decided::Expired(closed) => {
+            if let Some(m) = closed {
+                crate::login::broadcast_updated(&state, &m).await;
+                if let Some(run) = m.card.as_ref().and_then(|c| c["routine_run_id"].as_str()) {
+                    crate::routines::run::after_decision(&state, run, None, false).await;
+                }
+            }
+            return Err(conflict());
+        }
+        Decided::Conflict => return Err(conflict()),
+    };
     crate::awareness::broadcast_created(&state, &note).await;
     // Release the held connector call, if one is waiting.
     crate::gateway::decided(&state, &id, body.approve);
@@ -763,7 +803,7 @@ async fn decide_approval(
         .as_ref()
         .and_then(|c| c["routine_run_id"].as_str())
     {
-        crate::routines::run::decided(&state, run, body.approve).await;
+        crate::routines::run::after_decision(&state, run, run_owner, body.approve).await;
     }
     ok(json!({"message": updated}))
 }
