@@ -50,6 +50,14 @@ All notable changes to Iris are documented here, following
   originals kept in `memory-backup/`; `iris import openclaw` imports memory
   the same way. The agent's `read_memory` / `write_memory` tools keep
   working on the new files.
+- What the agent always keeps in mind is packed from the memory notes under a
+  fixed size: pinned notes first, then notes about who you are, then the most
+  important and recently used, whole notes only (instead of cutting the file
+  off at 12,000 characters). Saving an ordinary note no longer restarts a
+  Codex session, and a note that moved into `MEMORY.md` while a chat was
+  answering is never removed by that chat's out-of-date copy.
+  Ordinary notes fill spare capacity too, and resumed Codex chats receive
+  current memory after another chat saves or corrects a note.
 - Optional separation of Iris and its agents into different OS users.
 - Self-awareness of setup and connection status, with sign-in and setup cards.
 - An installable mobile app with keyboard handling and a full-screen photo viewer.
