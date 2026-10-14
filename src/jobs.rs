@@ -232,6 +232,19 @@ pub fn spawn_scheduler(state: AppState) {
             let st = state.clone();
             tokio::spawn(async move { crate::setup::maybe_auto_update(&st).await });
             crate::gateway::reap_idle(&state).await;
+            let paths = state.paths.clone();
+            match state
+                .db
+                .call(move |c| crate::memory::lifecycle::maintain(c, &paths, now_ms()))
+                .await
+            {
+                Ok(n) if n > 0 => state.hub.send(
+                    crate::events::Audience::Owner,
+                    json!({"type":"entities.changed","kinds":["memory"]}),
+                ),
+                Err(_) => crate::warn!("memory housekeeping failed"),
+                _ => (),
+            }
             if state.is_paused().await {
                 continue;
             }

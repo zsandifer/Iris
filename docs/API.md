@@ -338,6 +338,8 @@ All paths are under `/api`. "Any" means any authenticated user.
 | POST | `/push/test` | Any | Send yourself a test push |
 | GET | `/memory` | **Owner** | List or search live memory notes |
 | POST | `/memory` | **Owner** | Add a note |
+| POST | `/memory/forget-everything` | **Owner** | Confirmed irreversible reset of learned memory |
+| GET | `/memory/export` | **Owner** | Download complete Markdown notes |
 | GET | `/memory/{id}` | **Owner** | Note, sources and change history |
 | PATCH | `/memory/{id}` | **Owner** | Edit or pin a note |
 | DELETE | `/memory/{id}` | **Owner** | Forget a note with undo |
@@ -2413,6 +2415,27 @@ Chromium package).
 ### 3.20 Memory
 
 All Memory routes require the owner (`403` for other paired users).
+
+- `POST /api/memory/forget-everything` requires exactly `{confirm: true}`
+  (`400` for missing/false confirmation or unknown fields), returns `{forgotten: N}`
+  counting all removed notes, including archived and superseded rows. It deletes
+  notes and all undo history, clears generated Markdown content, removes historical
+  Noted metadata and morning-card payloads, and discards owner CLI sessions.
+  This reset cannot be undone. An empty generated `MEMORY.md` remains; topic
+  exports disappear. Chats, persona files, original import copies in
+  `memory-backup/`, and external backups remain. It is a learned-memory reset,
+  not a secure disk erase or chat deletion.
+  The durable Dream evidence boundary advances before history is cleared, so
+  old chat evidence and in-flight Dream proposals cannot refill memory. Writes
+  from turns begun before reset are refused kindly; a new message can learn
+  again. Item and history IDs remain monotonic, making stale edit/undo links safe.
+  Learning and morning-note settings are retained.
+- `GET /api/memory/export` returns a UTF-8 Markdown attachment named
+  `iris-memory.md` (`Content-Type: text/markdown; charset=utf-8`, `Cache-Control:
+  no-store`). It renders directly from SQLite, includes full current notes and
+  archived/expired/replaced notes grouped by topic, and records kind, pin and
+  validity metadata in comments. It does not download chat transcripts or secrets.
+
 IDs are positive integers, stable across owner edits and never reused after Forget.
 
 - `GET /api/memory?query=words&topic=you&since=timestamp&limit=30&offset=0`
@@ -3426,6 +3449,21 @@ owner chats, and the read-only Markdown export in `memory/`.
 | `archived` | bool | Set aside; kept for undo. |
 | `core_since` | int or null | ms when the note last joined `MEMORY.md` (the packed core); null while it is not in it. Written with the export. |
 | `core_written_batch` | string or null | Last turn batch that explicitly included the note in a `MEMORY.md` write; automatic packing does not count as the turn seeing it there. Internal bookkeeping, excluded from history snapshots. |
+
+**Automatic forgetting.** Each minute, even with learning or Iris paused, Iris
+archives at most 50 expired `valid_to` rows plus a page of at most 100 score
+candidates (durable round-robin cursor). Expiry applies to pinned notes too;
+score decay never archives pinned, profile, preference, or importance 4–5 notes.
+Other notes need 90 days since creation, last use or last edit and a packing
+score below 0.6. Archived rows leave recall and generated files but retain
+history for owner undo. Undo refreshes the inactivity grace. These deterministic
+changes use actor `dream`, batch `forgetting-<id>`; they do not make morning cards.
+Owner Forget still hard-deletes with a tombstone.
+
+Migration 12 adds the partial `memory_expiry` index and monotonic ID triggers,
+without new tables. Settings `memory.item_highwater`, `memory.history_highwater`,
+`memory.forgetting.cursor`, and `memory.reset_after` are internal bookkeeping;
+`memory.dream.evidence_after` remains durable across resets. No new MCP tools.
 
 `memory_history` records every change: `item_id`, `op` (`add`, `update`,
 `supersede`, `archive`, `restore`, `delete`), `before` / `after` (JSON

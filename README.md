@@ -157,6 +157,11 @@ To reach Iris from your phone, share it on your private network over HTTPS
 Then open Iris on your phone, enter the code, and tap **Add to Home Screen**.
 That's the last time you need the terminal.
 
+Memory notes can be downloaded as Markdown or reset through the owner API.
+Automatic expiry and archiving preserve undo history; pause-learning and
+morning-note controls are available too. The dedicated Memory UI is coming
+in a separate change; see the [API reference](docs/API.md#320-memory).
+
 Moving from OpenClaw? `iris import openclaw <workspace>` brings your agent's
 personality and memory along.
 

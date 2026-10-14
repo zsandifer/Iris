@@ -1,0 +1,44 @@
+[
+  {
+    "category": "extraction",
+    "sessions": [["I prefer jasmine tea.", "Remember that jasmine tea is my preferred drink.", "I drink jasmine tea in the morning.", "Jasmine tea is my everyday preference."]],
+    "ops": [{"op":"ADD","text":"Prefers jasmine tea","kind":"preference","importance":4,"messages":[1,2,3,4]}],
+    "query":"jasmine",
+    "expected":["Prefers jasmine tea"],
+    "absent":[]
+  },
+  {
+    "category": "multi-session",
+    "sessions": [["My community garden plot is called Willow.","I plant carrots at Willow."],["I now grow beets at Willow too.","Remember that Willow has carrots and beets."]],
+    "ops":[{"op":"ADD","text":"Willow garden grows carrots and beets","kind":"project","importance":3,"messages":[1,2,3,4]}],
+    "query":"Willow",
+    "expected":["Willow garden grows carrots and beets"],
+    "absent":[]
+  },
+  {
+    "category":"temporal",
+    "initial":{"text":"Willow garden meeting is on Tuesday","expired":true},
+    "sessions":[["The Tuesday Willow meeting has finished.","The next Willow meeting is Friday.","Friday is the next meeting, not Tuesday.","Remember the upcoming Willow meeting is Friday."]],
+    "ops":[{"op":"ADD","text":"Next Willow garden meeting is Friday","kind":"event","importance":3,"messages":[2,3,4]}],
+    "query":"Willow",
+    "expected":["Next Willow garden meeting is Friday"],
+    "absent":["Tuesday"]
+  },
+  {
+    "category":"knowledge-update",
+    "initial":{"text":"Willow garden uses red pots","expired":false},
+    "sessions":[["Willow garden now uses blue pots.","The red pots at Willow were replaced.","Remember the pots at Willow are blue now.","Blue pots are the current choice for Willow."]],
+    "ops":[{"op":"UPDATE","alias":1,"text":"Willow garden uses blue pots","kind":"project","importance":3,"messages":[1,2,3,4]}],
+    "query":"Willow",
+    "expected":["Willow garden uses blue pots"],
+    "absent":["red pots"]
+  },
+  {
+    "category":"abstention",
+    "sessions":[["I have not chosen a garden fertilizer.","Do not assume which fertilizer I buy.","I am comparing fertilizer options.","My fertilizer choice is still unknown."]],
+    "ops":[{"op":"NOOP"}],
+    "query":"fertilizer",
+    "expected":[],
+    "absent":["fertilizer"]
+  }
+]

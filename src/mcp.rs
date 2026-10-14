@@ -483,6 +483,7 @@ impl Bridge {
             }
             let source = json!({"type":"conversation", "conversation_id": self.conversation_id, "message_ids": self.message_id.iter().collect::<Vec<_>>()});
             let batch = self.turn_batch();
+            let turn_started = self.turn_started();
             let out = self.db.with(|c| {
                 crate::db::write_tx(c, |c| {
                     // Recheck membership while holding the write lock.
@@ -497,6 +498,7 @@ impl Bridge {
                     }
                     if matches!(name, "remember" | "update_memory" | "forget") {
                         crate::memory::dream::learning_allowed(c)?;
+                        crate::memory::lifecycle::write_allowed(c, turn_started)?;
                     }
                     use crate::memory::recall as r;
                     let id = || {
@@ -1404,6 +1406,62 @@ mod tests {
             assert_eq!(r["isError"], true, "{name}");
         }
         assert_eq!(b.db.with(crate::memory::live).unwrap().len(), before);
+    }
+
+    #[test]
+    fn reset_blocks_existing_turn_writes_including_legacy_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = bridge(tmp.path());
+        assert_eq!(
+            call(
+                &b,
+                "remember",
+                json!({"text":"Old garden note","kind":"fact"})
+            )["isError"],
+            false
+        );
+        b.db.with(|c| crate::memory::lifecycle::forget_everything(c, &b.paths))
+            .unwrap();
+        for (tool, args) in [
+            ("remember", json!({"text":"Old garden note","kind":"fact"})),
+            (
+                "write_memory",
+                json!({"path":"MEMORY.md","content":"- Old garden note"}),
+            ),
+        ] {
+            let out = call(&b, tool, args);
+            assert_eq!(out["isError"], true, "{out}");
+            assert!(
+                out["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("new message")
+            );
+        }
+        assert_eq!(
+            call(&b, "search_memory", json!({"query":"garden"}))["structuredContent"]["hits"],
+            json!([])
+        );
+        b.started_at =
+            b.db.with(|c| {
+                Ok(
+                    crate::db::get_setting(c, crate::memory::lifecycle::RESET_AFTER)?
+                        .unwrap()
+                        .parse::<i64>()
+                        .unwrap()
+                        + 1,
+                )
+            })
+            .unwrap();
+        b.message_id = None;
+        assert_eq!(
+            call(
+                &b,
+                "remember",
+                json!({"text":"New garden note","kind":"fact"})
+            )["isError"],
+            false
+        );
     }
 
     #[test]

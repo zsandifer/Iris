@@ -528,6 +528,24 @@ CREATE TRIGGER conversation_fts_owner_changed AFTER UPDATE OF is_owner ON users 
         (SELECT id FROM conversations WHERE created_by = NEW.id);
 END;
 "#,
+    r#"
+-- Preserve identities after Forget everything clears both tables. Old UI
+-- links and active CLI turns must never resolve to newly created notes.
+INSERT INTO settings(key,value,updated_at) VALUES ('memory.item_highwater',
+    (SELECT CAST(MAX(id) AS TEXT) FROM (SELECT COALESCE(MAX(id),0) AS id FROM memory_items UNION ALL SELECT COALESCE(MAX(item_id),0) FROM memory_history)), 0);
+INSERT INTO settings(key,value,updated_at) VALUES ('memory.history_highwater',
+    (SELECT CAST(COALESCE(MAX(id),0) AS TEXT) FROM memory_history), 0);
+CREATE TRIGGER memory_item_identity AFTER INSERT ON memory_items BEGIN
+    UPDATE settings SET value = CAST(MAX(CAST(value AS INTEGER), NEW.id) AS TEXT)
+    WHERE key = 'memory.item_highwater';
+END;
+CREATE TRIGGER memory_history_identity AFTER INSERT ON memory_history BEGIN
+    UPDATE settings SET value = CAST(MAX(CAST(value AS INTEGER), NEW.id) AS TEXT)
+    WHERE key = 'memory.history_highwater';
+END;
+CREATE INDEX memory_expiry ON memory_items(valid_to, id)
+WHERE archived = 0 AND superseded_by IS NULL AND valid_to IS NOT NULL;
+"#,
 ];
 
 /// Run `f` in a write transaction taken up front (`BEGIN IMMEDIATE`), so a
@@ -1831,6 +1849,48 @@ mod tests {
             assert!(!c.prepare("PRAGMA foreign_key_check")?.exists([])?);
             Ok(())
         }).unwrap();
+    }
+
+    #[test]
+    fn memory_identity_migration_keeps_deleted_item_and_history_ids() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..11] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO memory_history(id,item_id,op,actor,at) VALUES (77,42,'delete','owner',0)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 11).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            get_setting(&conn, "memory.item_highwater")
+                .unwrap()
+                .as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            get_setting(&conn, "memory.history_highwater")
+                .unwrap()
+                .as_deref(),
+            Some("77")
+        );
+        conn.execute("DELETE FROM memory_history", []).unwrap();
+        let saved = crate::memory::recall::save(
+            &conn,
+            &crate::memory::recall::Edit {
+                text: Some("New synthetic note".into()),
+                ..Default::default()
+            },
+            None,
+            crate::memory::Actor::Owner,
+            &serde_json::json!({}),
+            "new",
+        )
+        .unwrap();
+        assert_eq!(saved["item"]["id"], 43);
+        assert_eq!(saved["history_id"], 78);
     }
 
     #[test]

@@ -703,6 +703,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_reset_requires_owner_and_confirmation_and_export_is_downloadable() {
+        let h = setup();
+        let owner = pair_as(&h, None).await;
+        h.state
+            .db
+            .with(|c| {
+                c.execute(
+                    "INSERT INTO users(id,display_name,created_at) VALUES ('guest','Guest',0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let guest = pair_as(&h, Some("guest")).await;
+        let (_, saved) = send(
+            &h.app,
+            "POST",
+            "/api/memory",
+            Some(&owner),
+            Some(json!({"text":"Garden project note","kind":"project"})),
+        )
+        .await;
+        let id = saved["item"]["id"].as_i64().unwrap();
+        for token in [None, Some(guest.as_str())] {
+            let expected = if token.is_none() {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            assert_eq!(
+                send(
+                    &h.app,
+                    "POST",
+                    "/api/memory/forget-everything",
+                    token,
+                    Some(json!({"confirm":true}))
+                )
+                .await
+                .0,
+                expected
+            );
+            assert_eq!(
+                send(&h.app, "GET", "/api/memory/export", token, None)
+                    .await
+                    .0,
+                expected
+            );
+        }
+        for body in [
+            json!({}),
+            json!({"confirm":false}),
+            json!({"confirm":true,"extra":1}),
+        ] {
+            assert_eq!(
+                send(
+                    &h.app,
+                    "POST",
+                    "/api/memory/forget-everything",
+                    Some(&owner),
+                    Some(body)
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let req = HttpRequest::builder()
+            .uri("/api/memory/export")
+            .header("authorization", format!("Bearer {owner}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = h.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/markdown; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers()["content-disposition"],
+            "attachment; filename=\"iris-memory.md\""
+        );
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("Garden project note")
+        );
+        let (status, reset) = send(
+            &h.app,
+            "POST",
+            "/api/memory/forget-everything",
+            Some(&owner),
+            Some(json!({"confirm":true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reset}");
+        assert_eq!(reset, json!({"forgotten":1}));
+        assert_eq!(
+            send(
+                &h.app,
+                "GET",
+                &format!("/api/memory/{id}"),
+                Some(&owner),
+                None
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        let (_, list) = send(&h.app, "GET", "/api/memory", Some(&owner), None).await;
+        assert_eq!(list["items"], json!([]));
+    }
+
+    #[tokio::test]
     async fn morning_undo_and_learning_settings_are_owner_only() {
         let h = setup();
         let owner_token = pair_as(&h, None).await;

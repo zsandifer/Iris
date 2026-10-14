@@ -698,3 +698,38 @@ fn removal_boundary_rolls_back_with_history_and_preserves_returned_history_id() 
     })
     .unwrap();
 }
+
+#[path = "eval.rs"]
+mod eval;
+
+#[tokio::test]
+async fn reset_blocks_inflight_dream_and_old_backlog_but_new_assertions_learn() {
+    let (state, tmp, owner, main) = setup().await;
+    add_messages(&state, &owner, &main, 4);
+    let input = state.db.with(|c| prepare(c, 4)).unwrap().unwrap();
+    state
+        .db
+        .with(|c| {
+            crate::memory::lifecycle::forget_everything(c, &state.paths)?;
+            assert!(
+                apply(
+                    c,
+                    &input,
+                    parse(&json!({"ops":[add_op("Old orchard note")]}).to_string())?,
+                    &owner,
+                    "stale-dream"
+                )
+                .is_err()
+            );
+            assert!(prepare(c, 4)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    add_messages(&state, &owner, &main, 4);
+    reply(&tmp, json!({"ops":[add_op("New orchard note")]}));
+    run(&state, &owner, true).await.unwrap();
+    assert_eq!(
+        state.db.with(super::super::live).unwrap()[0].text,
+        "New orchard note"
+    );
+}

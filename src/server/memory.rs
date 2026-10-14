@@ -13,6 +13,8 @@ use serde_json::{Value, json};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/memory", get(list).post(create))
+        .route("/memory/forget-everything", post(forget_everything))
+        .route("/memory/export", get(export))
         .route("/memory/{id}", get(detail).patch(edit).delete(forget))
         .route("/memory/history/{id}/undo", post(undo))
         .route("/memory/morning/{id}/undo", post(undo_morning))
@@ -180,4 +182,57 @@ async fn undo_morning(
         .map_err(error)?;
     changed(&state);
     ok(out)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResetBody {
+    confirm: bool,
+}
+
+async fn forget_everything(
+    State(state): State<AppState>,
+    user: AuthUser,
+    JsonBody(body): JsonBody<ResetBody>,
+) -> ApiResult {
+    user.require_owner()?;
+    if !body.confirm {
+        return Err(ApiError::bad_request(
+            "Please confirm that you want me to forget all my notes.",
+        ));
+    }
+    let paths = state.paths.clone();
+    let out = state
+        .db
+        .call(move |c| crate::memory::lifecycle::forget_everything(c, &paths))
+        .await
+        .map_err(error)?;
+    changed(&state);
+    // Memory reset also removed historical Noted/card payloads.
+    ok(out)
+}
+
+async fn export(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::{http::header, response::IntoResponse};
+    user.require_owner()?;
+    let text = state
+        .db
+        .call(crate::memory::lifecycle::export)
+        .await
+        .map_err(error)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/markdown; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"iris-memory.md\"",
+            ),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        text,
+    )
+        .into_response())
 }
