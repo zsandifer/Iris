@@ -449,11 +449,30 @@ fn iris_proposals_wait_for_the_owner() {
         .unwrap();
     let mut mine = saturday_dinner();
     mine.title = "Thai night".into();
+    mine.instructions = "Order pad thai.".into();
+    mine.ask_before_acting = false;
     let d = db
         .with(|c| Ok(approve_change(c, &owner, &p.change.id, Some(mine), now)))
         .unwrap()
         .unwrap();
     assert_eq!(d.routine.unwrap().spec.title, "Thai night");
+    // The card shows what was set up, not what Iris first proposed.
+    let card = db
+        .with(|c| db::get_message(c, &p.card.id))
+        .unwrap()
+        .unwrap()
+        .card
+        .unwrap();
+    assert_eq!(card["state"], "approved");
+    assert_eq!(card["title"], "Thai night");
+    assert_eq!(card["instructions"], "Order pad thai.");
+    assert_eq!(card["asks_first"], false);
+    assert!(
+        !card["body"]
+            .as_str()
+            .unwrap()
+            .contains("asks before acting")
+    );
 }
 
 #[test]

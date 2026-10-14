@@ -1188,6 +1188,18 @@ pub fn approve_change(
         };
         let (state, next) = settle(&spec, target, routine.run_count, now);
         save_routine(c, &routine.id, &spec, state, next)?;
+        // Set up with the owner's edits: the card shows what was set up.
+        let mut cards = cards;
+        if change.action == "create" && spec != routine.spec {
+            for m in cards.iter_mut() {
+                let old = m.card.clone().unwrap_or_default();
+                let mut card = change_card(&routine, &spec, &change, owner, now);
+                card["body"] = create_summary(&spec).into();
+                card["state"] = old["state"].clone();
+                card["decided_at"] = old["decided_at"].clone();
+                *m = db::update_message_card(c, &m.id, &card)?;
+            }
+        }
         Ok(Decided {
             routine: get_routine(c, owner, &routine.id)?,
             cards,
