@@ -82,6 +82,9 @@ function NoteSheet({ id: first, draft }) {
   const base = useRef(null);
   const asked = useRef(0);
   const edit = (v) => { typed.current = v; setText(v); };
+  // The owner's own Save or Undo is the new stored text, so the refresh its
+  // change event triggers sees no draft and nothing "changed underneath".
+  const settle = (t) => { base.current = t; edit(t); setMoved(false); };
   // `keepDraft`: a refresh (Pin, a change elsewhere) keeps unsaved text.
   const load = (which = id, keepDraft = false) => {
     const n = ++asked.current;
@@ -127,7 +130,7 @@ function NoteSheet({ id: first, draft }) {
     const r = await patch(`/memory/${num(item.id)}`, { text: text.trim() });
     if (r.duplicate) { toast('I already remember that.'); edit(item.text); return; }
     toast('Saved. I’ll remember it this way.');
-    setMoved(false);
+    if (r.item) settle(r.item.text);
     await load(r.item?.id ?? item.id);
   });
   const pin = () => act(async () => {
@@ -163,6 +166,7 @@ function NoteSheet({ id: first, draft }) {
       return;
     }
     toast('Undone');
+    settle(r.item.text);
     if (r.item.id !== id) setId(r.item.id);
     else await load(id);
   });
