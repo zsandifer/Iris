@@ -547,7 +547,7 @@ async fn start_idea(
             let Some(idea) = entities::get_idea(c, &uid, &id)? else {
                 return Ok(None);
             };
-            let seed = json!({"type": "idea", "id": idea.id});
+            let seed = json!({"type": "idea", "id": idea.id, "generated_starter": true});
             let conv = db::create_conversation(c, &uid, "side", &idea.title, Some(&seed))?;
             entities::update_idea(c, &uid, &idea.id, Some("started"), Some(&conv.id))?;
             Ok(Some((idea, conv)))
@@ -566,7 +566,7 @@ async fn start_idea(
         &state,
         &conv.id,
         Some(user.id()),
-        &prompt,
+        turn::ChatPrompt::Idea(&prompt),
         &[],
         Purpose::Chat,
         user.id(),

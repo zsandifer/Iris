@@ -526,6 +526,7 @@ pub fn write(
         return Err("write at least one note (one per bullet)".into());
     }
     let (mut out, saved, core) = with_export(db, paths, |tx| {
+        super::dream::learning_allowed(tx)?;
         let mut out = Written::default();
         let live = super::live(tx)?;
         let fixed_topic = Topic::ALL.into_iter().find(|t| t.file() == rel);

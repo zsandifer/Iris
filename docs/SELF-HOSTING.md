@@ -192,6 +192,7 @@ Iris to the open internet.
 | `[engines]` | | Engines directory, privileged install helper, daily auto-update. |
 | `[agent]` | `user = ""`, `launcher = "/usr/local/bin/iris"` | Optional OS isolation for CLI turns, status probes and sign-in. |
 | `[heartbeat]` | disabled | Proactive check-in with active hours. |
+| `[dream]` | enabled, 3am, 4 messages | Nightly private memory tidying (`hour` 0–23 local, `min_messages` 1–80). |
 | `[feed]` | enabled | The For you pipeline: checks hourly between 06:00 and 22:00, publishes one batch a day. |
 | `[push]` | enabled | Web Push (VAPID). Needs `vapid_subject` (a `mailto:` URL) unless `public_url` is `https:`. |
 | `[safety]` | | Approval timeout (300 s) and tripwires: sends (5), calls (200), and data read (25 MB) per connector per hour. |
@@ -831,6 +832,17 @@ Python 3).
     stored a token; otherwise add channels as sources.
 - **Ideas**: the agent may propose things it could do for you; tapping one
   starts a chat that does it.
+
+Dream (`[dream]`) tidies memory after at least four new messages you wrote
+in your own private chats, using the Background engine with tools disabled.
+It runs within the 3am local hour by default, and skips idle days. Invalid updates leave notes and progress alone;
+failed attempts retry the following night. Its morning-card data includes
+per-change undo; dedicated app rendering follows separately. Owner settings
+`memory_learning_paused` and `memory_morning_note` on `PUT /api/settings`
+control automatic learning and morning cards. Pausing learning also blocks
+agent memory tools from writing; you can still read, edit and undo notes.
+`POST /api/jobs/dream/run` skips the time gate, keeping all privacy, activity,
+enabled and pause checks.
 
 The heartbeat is off by default. Both jobs respect active hours and can be
 triggered manually (`POST /api/jobs/{heartbeat|feed}/run`, or "Find

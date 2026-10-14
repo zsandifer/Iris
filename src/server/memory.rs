@@ -15,6 +15,7 @@ pub fn routes() -> Router<AppState> {
         .route("/memory", get(list).post(create))
         .route("/memory/{id}", get(detail).patch(edit).delete(forget))
         .route("/memory/history/{id}/undo", post(undo))
+        .route("/memory/morning/{id}/undo", post(undo_morning))
 }
 
 fn error(e: crate::util::BoxError) -> ApiError {
@@ -147,6 +148,34 @@ async fn undo(
     let out: Value = state
         .db
         .call(move |c| recall::mutate(c, &paths, |c| recall::undo(c, id, &crate::util::new_id())))
+        .await
+        .map_err(error)?;
+    changed(&state);
+    ok(out)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MorningUndo {
+    history_id: i64,
+}
+
+async fn undo_morning(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody<MorningUndo>,
+) -> ApiResult {
+    user.require_owner()?;
+    let paths = state.paths.clone();
+    let owner = user.id().to_string();
+    let out = state
+        .db
+        .call(move |c| {
+            recall::mutate(c, &paths, |c| {
+                crate::memory::dream::undo_card(c, &id, body.history_id, &owner)
+            })
+        })
         .await
         .map_err(error)?;
     changed(&state);

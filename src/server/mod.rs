@@ -653,6 +653,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idea_start_marks_generated_text_before_publishing_or_learning() {
+        let h = setup();
+        let token = pair_as(&h, None).await;
+        let idea = h
+            .state
+            .db
+            .with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                crate::entities::create_idea(
+                    c,
+                    &owner,
+                    "Plan a garden",
+                    "A generated suggestion",
+                    Some("As a pear grower, plan my garden"),
+                )
+            })
+            .unwrap();
+        let (status, body) = send(
+            &h.app,
+            "POST",
+            &format!("/api/ideas/{}/start", idea.id),
+            Some(&token),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["user_message"]["meta"]["initiated_by"], "idea");
+        assert_eq!(body["conversation"]["seed"]["generated_starter"], true);
+        let initial = body["user_message"]["id"].as_str().unwrap();
+        let stored = h
+            .state
+            .db
+            .with(|c| db::get_message(c, initial))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.meta["initiated_by"], "idea");
+        let conv = stored.conversation_id;
+        let (status, followup) = send(
+            &h.app,
+            "POST",
+            &format!("/api/conversations/{conv}/messages"),
+            Some(&token),
+            Some(json!({"text":"I actually grow apples"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{followup}");
+        assert_eq!(followup["user_message"]["meta"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn morning_undo_and_learning_settings_are_owner_only() {
+        let h = setup();
+        let owner_token = pair_as(&h, None).await;
+        let (card_id,history_id,item_id) = h.state.db.with(|c| {
+            c.execute("INSERT INTO users(id,display_name,created_at) VALUES ('guest','Guest',0)",[])?;
+            let owner=db::owner_user_id(c)?.unwrap();
+            let main=db::ensure_main_conversation(c,&owner)?;
+            let saved=crate::memory::recall::mutate(c,&h.state.paths,|c| crate::memory::recall::save(c,
+                &crate::memory::recall::Edit {text:Some("Likes hiking".into()),kind:Some("fact".into()),..Default::default()},
+                None,crate::memory::Actor::Dream,&json!({"type":"dream"}),"dream-test"))?;
+            let card=crate::entities::insert_card(c,&main,&json!({"type":"memory_morning","batch_id":"dream-test","title":"I tidied my notes overnight"}),"assistant")?;
+            Ok((card.id,saved["history_id"].as_i64().unwrap(),saved["item"]["id"].as_i64().unwrap()))
+        }).unwrap();
+        let guest = pair_as(&h, Some("guest")).await;
+        let path = format!("/api/memory/morning/{card_id}/undo");
+        assert_eq!(
+            send(
+                &h.app,
+                "POST",
+                &path,
+                Some(&guest),
+                Some(json!({"history_id":history_id}))
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(
+                &h.app,
+                "POST",
+                &path,
+                Some(&owner_token),
+                Some(json!({"history_id":history_id+999}))
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, undone) = send(
+            &h.app,
+            "POST",
+            &path,
+            Some(&owner_token),
+            Some(json!({"history_id":history_id})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{undone}");
+        assert_eq!(undone["item"], Value::Null);
+        assert!(
+            h.state
+                .db
+                .with(|c| crate::memory::get(c, item_id))
+                .unwrap()
+                .is_none()
+        );
+        let body = json!({"memory_learning_paused":true,"memory_morning_note":false});
+        assert_eq!(
+            send(
+                &h.app,
+                "PUT",
+                "/api/settings",
+                Some(&guest),
+                Some(body.clone())
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        let (status, settings) = send(
+            &h.app,
+            "PUT",
+            "/api/settings",
+            Some(&owner_token),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            settings["memory"],
+            json!({"learning_paused":true,"morning_note":false})
+        );
+        let (_, settings) = send(&h.app, "GET", "/api/settings", Some(&guest), None).await;
+        assert_eq!(settings["memory"], Value::Null);
+        // Owner corrections remain available while automatic learning is paused.
+        assert_eq!(
+            send(
+                &h.app,
+                "POST",
+                "/api/memory",
+                Some(&owner_token),
+                Some(json!({"text":"Likes gardening"}))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let (_, jobs) = send(&h.app, "GET", "/api/jobs", Some(&owner_token), None).await;
+        assert_eq!(
+            jobs["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|j| j["name"] == "dream")
+                .unwrap()["enabled"],
+            false
+        );
+    }
+
+    #[tokio::test]
     async fn memory_routes_are_owner_only_and_edits_pin_forget_and_undo_work() {
         let h = setup();
         let owner = pair_as(&h, None).await;

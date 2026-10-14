@@ -747,6 +747,10 @@ impl AppState {
             "feed_prompt": if owner { Some(self.feed_prompt().await) } else { None },
             "voice": {"enabled": false, "status": "not_implemented"},
             "paused": self.is_paused().await,
+            "memory": if owner { Some(json!({
+                "learning_paused": self.setting(crate::memory::dream::PAUSED).await.as_deref() == Some("true"),
+                "morning_note": self.setting(crate::memory::dream::MORNING).await.as_deref() != Some("false"),
+            })) } else { None },
         })
     }
 

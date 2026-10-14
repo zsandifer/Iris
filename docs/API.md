@@ -1199,9 +1199,12 @@ Returns the [Settings](#settings) object directly (not wrapped):
   "allow_claude_for_shared": false,
   "feed_prompt": "...",
   "paused": false,
+  "memory": {"learning_paused": false, "morning_note": true},
   "voice": {"enabled": false, "status": "not_implemented"}
 }
 ```
+
+`memory` is owner-only (`null` for other users).
 
 `paused` is true while the owner has paused Iris
 ([3.18](#318-safety-pause-disconnect-trusted-people)); change it with
@@ -1216,6 +1219,8 @@ All fields optional; only supplied fields change.
 | `agent_name` | string | Non-blank, max 40, must not contain newline, carriage return, `<`, `>`, or a backtick. Trimmed. |
 | `allow_claude_for_shared` | bool | Owner opt-in to let Claude answer in conversations with more than one person ([individual-use policy](#individual-use-policy)). `false` clears the app setting (the config value still applies). |
 | `feed_prompt` | string | Max 4,000. Blank resets to the default. |
+| `memory_learning_paused` | bool | Stops Dream and agent memory writes (including legacy `write_memory`). Recall and owner edits/undo stay available. Default false; stored as `memory.learning_paused`. |
+| `memory_morning_note` | bool | Show a morning note after Dream changes notes. Default true; stored as `memory.morning_note`. |
 | `paused` | bool | "Pause Iris". `true` stops every running turn (its CLI process group is killed), closes the browser, and until it is turned off again: chat turns end at once with a short first-person note (error kind `paused`, no push), scheduled jobs do not run, and the browser tools are refused. Saved in the database, so it survives restarts. |
 
 Unknown fields are ignored. Models are no longer set here: pin slots with
@@ -2127,7 +2132,7 @@ Returns `{"delivered": 0, "failed": 0}` when push is disabled.
 
 ### 3.15 Jobs
 
-Both routes are **owner-only**. Jobs: `heartbeat` and `feed` (see
+Both routes are **owner-only**. Jobs: `heartbeat`, `feed`, and `dream` (see
 [section 5](#scheduled-jobs)).
 
 #### `GET /api/jobs`
@@ -2140,19 +2145,24 @@ Both routes are **owner-only**. Jobs: `heartbeat` and `feed` (see
      "last_run_at": null, "running": false},
     {"name": "feed", "enabled": false, "interval_mins": 360,
      "active_start": "08:00", "active_end": "22:00",
-     "last_run_at": 1760000000000, "running": false}
+     "last_run_at": 1760000000000, "running": false},
+    {"name": "dream", "enabled": true, "interval_mins": 1440,
+     "active_start": "03:00", "active_end": "04:00",
+     "last_run_at": null, "running": false}
   ]
 }
 ```
 
 `enabled`, `interval_mins`, `active_start`, `active_end` come from config
 (values above are the defaults). `last_run_at` is when the last run
-**started**.
+**started**. Dream uses a local calendar day rather than an elapsed 24 hours;
+its effective enabled flag also reflects Pause learning.
 
 #### `POST /api/jobs/{name}/run`
 
-`{name}` is `heartbeat` or `feed` (else `404 job not found`). Starts the job
-now, even if disabled or outside its active hours. Response **`202`**:
+`{name}` is `heartbeat`, `feed`, or `dream` (else `404 job not found`). Starts the job
+now. Heartbeat/feed manual runs bypass enabled/active-hour checks. Dream manual runs bypass
+only the hour and once-a-day check; enabled, activity, pause and privacy gates still apply. Response **`202`**:
 `{"started": true}`, or `false` if it was already running.
 
 ### 3.16 Voice
@@ -2433,6 +2443,28 @@ IDs are positive integers, stable across owner edits and never reused after Forg
   replacement or duplicate live text rejects the entire undo (`400`) without
   modifying anything. Undo returns the new change ID so it can also be undone even when its
   item was deleted and detail returns `404`.
+
+- `POST /api/memory/morning/{message_id}/undo` takes `{history_id}` and returns
+  the same object as history undo. Verifies the message is an owner-private
+  `memory_morning` card and the change belongs to its Dream batch (`400` otherwise).
+  Changes beyond the preview can be undone through this route too. No batch-wide
+  rollback: each change independently checks for subsequent edits and duplicate text.
+
+Dream morning cards have `type: "memory_morning"`, `owner_only: true`,
+`title: "I tidied my notes overnight"`, `body`, `batch_id`, `day` (local date),
+`changes` (first 3), `all_changes` (complete bounded list), `preview_limit: 3`,
+`total_changes`, `more_count`, `more_label` (`"and N more ›"`),
+`memory_url: "/#/iris/memory"`, `action_label: "See everything I remember ›"`,
+and `undo_url` pointing to the card-specific POST route. Each change contains
+`history_id`, `item_id`, and a scrubbed text preview (up to 240 characters).
+`Message.meta.initiated_by: "idea"` identifies generated Idea starters; new Idea
+conversation seeds also carry `generated_starter: true`. Owner-written follow-ups
+keep ordinary empty metadata and remain eligible for Dream.
+
+One card at most per local day, only after actual changes, only in the owner's
+still-private Main chat. It emits owner-only `message.created`, with no push.
+The card is a historical summary; undo still verifies current history. Dedicated
+card rendering and the Memory screen are delivered separately from this backend.
 
 Writes share the MCP write gate: strip nested/unclosed `<private>` spans,
 PEM private keys, credential assignments (including AWS secret-access-key labels,
@@ -2804,7 +2836,7 @@ CLI model name.
 
 The `heartbeat` job runs as a turn with `purpose: "scheduled"` in a hidden
 job conversation owned by the owner, on the `background` slot (low effort);
-the `feed` job is the For you pipeline (below). Both are the owner's own
+the `feed` job is the For you pipeline (below). These are the owner's own
 use, so any signed-in engine may run them, Claude included. Each heartbeat
 run starts a fresh CLI session (no resume, no replay), and each job
 conversation is trimmed to its last 20 messages before every run. Job turns
@@ -2815,6 +2847,53 @@ inside `[active_start, active_end)` (windows may wrap past midnight; equal
 start and end means all day), and at least `interval_mins` have passed since
 the last start. Manual runs (`POST /api/jobs/{name}/run`,
 `POST /api/feed/refresh`) skip those checks.
+
+- **dream**: nightly memory consolidation through an isolated, session-less,
+  tool-free official CLI on the `background` slot. `[dream]` config defaults:
+  `enabled = true`, `hour = 3` (0–23, server local time), `min_messages = 4`
+  (1–80). The minute scheduler checks within that local hour, at most
+  one attempt per local calendar day. No activity means no CLI call and no
+  attempt timestamp. Failed runs retain the watermark; retry next night or
+  manually sooner. Global pause/shutdown cancels the CLI; Pause learning stops
+  new runs and rejects in-flight results at commit.
+  Input is new, completed, owner-authored plain text from never-shared sole-owner
+  main/side chats, after `memory.dream.watermark` (message creation timestamp).
+  Assistant replies, generated Idea starters (including legacy Idea seeds),
+  jobs/heartbeat/feed, cards, attachments, all metadata-bearing
+  messages (including untrusted/browser/connector records), and messages over
+  4,000 characters are excluded structurally. Private spans and secrets are
+  scrubbed before the prompt. A batch reads at most 80 messages / 24,000 scrubbed
+  characters plus up to 24 FTS-retrieved candidates / 16,000 note characters,
+  with integer aliases instead of database IDs. Fully scrubbed batches advance
+  as a host NOOP. Whole messages are used; later input stays behind the watermark.
+  Strict JSON `{ops: [...]}` accepts 1–40 ADD/UPDATE/SUPERSEDE/NOOP/REJECT
+  decisions, no unknown fields, prose, fences or trailing junk. Changes must
+  cite supplied message aliases; pinned candidates and overlapping edits are
+  rejected. Old evidence cannot undo an existing Forget/correction: normalized
+  owner/agent Forget/text correction atomically moves `memory.dream.evidence_after`
+  past every existing message. Earlier sources become ineligible regardless of
+  proposed wording, preventing paraphrased re-learning. This deliberately skips
+  unrelated unprocessed history too. On upgrade, prior removal/correction history
+  without that boundary conservatively excludes the current backlog once.
+  New messages remain eligible. Normalized tombstone matches and changes to more
+  recent Dream notes become host NOOPs, allowing
+  the watermark to progress. Newer assertions can teach the fact again. Candidate
+  recency is included in the prompt; Dream tracks cited assertion time separately
+  from execution time so bounded backlog batches remain chronological.
+  UPDATE preserves ID and stores new Dream source refs; SUPERSEDE
+  archives with a non-future `valid_to`, never deletes. The whole batch fails
+  if more than 25% of changed existing notes would be set aside (new additions
+  and unchanged updates do not dilute the guard). Parse, evidence, mutation or
+  export failure rolls back notes/history/watermark/card together. Sources and
+  history revision are rechecked at commit against concurrent edits/sharing.
+  History actor is `dream`, batch IDs are `dream-<id>`, and sources are
+  `{type: "dream", messages: [{conversation_id, message_id}], asserted_at}`.
+  Settings: `job.dream.last_run` (attempt ms), `memory.dream.watermark` (success
+  cursor), `memory.dream.card_day` (last published local date), and
+  `memory.dream.evidence_after` (durable source boundary after owner/agent removals/corrections).
+  Future Forget-everything implementations must preserve/advance that boundary
+  before clearing history. No new tables or
+  MCP tools. Morning-card data and undo are described in [Memory](#320-memory).
 
 - **heartbeat**: the agent works through `HEARTBEAT.md`. If it replies
   `HEARTBEAT_OK` (or the reply contains it, or is empty), nothing happens.
@@ -3068,6 +3147,7 @@ changes are re-sent as `message.updated`.
 
 | `type` | Extra fields | Action |
 |---|---|---|
+| `memory_morning` | `batch_id`, `day`, `changes`, `all_changes`, `preview_limit`, `total_changes`, `more_count`, `more_label`, `memory_url`, `undo_url` | Historical Dream summary; per-change undo with `{history_id}` at `undo_url`, or open Memory. See [Memory](#320-memory). |
 | `action` | `action: {"method", "path", "body"}` | Call that Iris API route with that JSON body when the owner taps `action_label` (e.g. `PUT /api/settings {"allow_claude_for_shared": true}`). |
 | `engine_signin` | `harness`, `flow` (`code_paste`, `device_code`, `manual`), `state` (`needs_reconnect`, `starting`, `waiting_for_code`, `waiting_for_approval`, `verifying`, `done`, `failed`, `cancelled`), `url`, `user_code`, `error`, `instructions` (manual flow), `login_id` | Start with `POST /api/harnesses/{harness}/login`. For `waiting_for_code`, show `url` and a code field (`/login/code`); for `waiting_for_approval`, show `url` and `user_code`; for `manual`, show `instructions` and a "Check again" button (the same `POST`). |
 | `engine_setup` | `state` (`needs_setup`, `done`), `options: [{"harness", "label", "installed", "requires", "action": {"method", "path"}}]` | Each option installs that engine (`POST /api/engines/{name}/install`). |

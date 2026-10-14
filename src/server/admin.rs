@@ -84,6 +84,8 @@ struct SettingsBody {
     allow_claude_for_shared: Option<bool>,
     /// "Pause Iris": stop what it is doing and start nothing new.
     paused: Option<bool>,
+    memory_learning_paused: Option<bool>,
+    memory_morning_note: Option<bool>,
 }
 
 async fn put_settings(
@@ -93,6 +95,14 @@ async fn put_settings(
 ) -> ApiResult {
     user.require_owner()?;
     let mut writes: Vec<(&'static str, Option<String>)> = Vec::new();
+    for (key, value) in [
+        (crate::memory::dream::PAUSED, body.memory_learning_paused),
+        (crate::memory::dream::MORNING, body.memory_morning_note),
+    ] {
+        if let Some(value) = value {
+            writes.push((key, Some(value.to_string())));
+        }
+    }
     if let Some(name) = &body.agent_name {
         check_text("agent_name", name, 40, true)?;
         if name.contains(['\n', '\r', '<', '>', '`']) {
