@@ -3458,8 +3458,11 @@ Other notes need 90 days since creation, last use or last edit and a packing
 score below 0.6. Archived rows leave recall and generated files but retain
 history for owner undo. Undo refreshes the inactivity grace. These deterministic
 changes use actor `dream`, batch `forgetting-<id>`; they do not make morning cards.
-Dream's stale-text guard uses the removal time for those batches, so pre-expiry
-assertions cannot recreate the expired note without its validity.
+Forgetting atomically advances the durable Dream evidence boundary, excluding
+all pre-archive messages independently of proposed wording (including unrelated
+unprocessed backlog, conservatively). In-flight proposals are rejected. New
+assertions after the boundary remain learnable. The stale-text guard also uses
+removal time for forgetting batches.
 Owner Forget still hard-deletes with a tombstone.
 
 Migration 12 adds the partial `memory_expiry` and `memory_supersession` indexes and monotonic ID triggers,

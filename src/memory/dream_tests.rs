@@ -746,7 +746,7 @@ async fn deterministic_forgetting_blocks_pre_expiry_backlog_even_for_pinned_note
         }).unwrap();
     }
     add_messages(&state, &owner, &main, 4);
-    state
+    let old_input = state
         .db
         .with(|c| {
             let mut ids: Vec<String> = c
@@ -759,23 +759,35 @@ async fn deterministic_forgetting_blocks_pre_expiry_backlog_even_for_pinned_note
                     params![id, 2000 + n as i64],
                 )?;
             }
+            let input = prepare(c, 4)?.unwrap();
             assert_eq!(
                 crate::memory::lifecycle::maintain(c, &state.paths, now_ms())?,
                 2
             );
+            Ok(input)
+        })
+        .unwrap();
+    state
+        .db
+        .with(|c| {
+            for text in [
+                "Ordinary orchard note",
+                "An orchard fact phrased differently",
+                "Pinned orchard note",
+                "Pinned information reworded",
+            ] {
+                let proposal = parse(&json!({"ops":[add_op(text)]}).to_string())?;
+                assert!(apply(c, &old_input, proposal, &owner, "old-expiry").is_err());
+            }
+            assert!(
+                prepare(c, 4)?.is_none(),
+                "old evidence must never reach a later CLI run"
+            );
             Ok(())
         })
         .unwrap();
-    reply(
-        &tmp,
-        json!({"ops":[add_op("Ordinary orchard note"),add_op("Pinned orchard note")]}),
-    );
     run(&state, &owner, true).await.unwrap();
     assert!(state.db.with(super::super::live).unwrap().is_empty());
-    assert!(
-        progress(&state) > 0,
-        "stale notes are NOOP rather than blocking progress"
-    );
     assert!(cards(&state).is_empty());
     // A new assertion after forgetting is allowed to establish new validity.
     add_messages(&state, &owner, &main, 4);

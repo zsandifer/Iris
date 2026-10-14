@@ -845,7 +845,10 @@ The minute scheduler archives expired notes and low-score incidental notes
 without a model call, even while learning is paused. Score decay requires at
 least 90 days without use/edit and protects pinned, profile/preference and
 importance 4–5 notes. Explicit validity expiry applies to all notes. Archived
-notes remain in the database with undo history.
+notes remain in the database with undo history. Forgetting also moves Dream's
+source boundary past existing messages, so old discussions cannot revive a
+paraphrased fact. This conservatively skips unrelated unprocessed backlog;
+new assertions remain eligible.
 
 The owner can download all current and archived notes from
 `GET /api/memory/export` as `iris-memory.md`. A confirmed

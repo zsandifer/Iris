@@ -258,3 +258,42 @@ fn download_includes_full_current_archived_and_replaced_notes() {
     })
     .unwrap();
 }
+
+#[test]
+fn expiry_plan_stays_selective_with_fk_index_and_archive_boundary_rolls_back() {
+    let (db, _tmp, paths) = setup();
+    db.with(|c| {
+        let plan: Vec<String> = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", expiry_sql()))?
+            .query_map(params![now_ms(), EXPIRY_LIMIT], |r| r.get(3))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert!(
+            plan.iter()
+                .any(|p| p.contains("SEARCH memory_items USING INDEX memory_expiry")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|p| p.contains("TEMP B-TREE")), "{plan:?}");
+        let id = note(c, "A decayed garden fact")?;
+        c.execute("UPDATE memory_items SET created_at=0,updated_at=0", [])?;
+        files::render_export(c, &paths)?;
+        std::fs::rename(
+            paths.memory_dir().join("MEMORY.md"),
+            paths.memory_dir().join("saved.md"),
+        )
+        .unwrap();
+        std::fs::create_dir(paths.memory_dir().join("MEMORY.md")).unwrap();
+        assert!(maintain(c, &paths, now_ms()).is_err());
+        assert!(!get(c, id)?.unwrap().archived);
+        assert!(db::get_setting(c, super::super::dream::EVIDENCE_AFTER)?.is_none());
+        std::fs::remove_dir(paths.memory_dir().join("MEMORY.md")).unwrap();
+        std::fs::rename(
+            paths.memory_dir().join("saved.md"),
+            paths.memory_dir().join("MEMORY.md"),
+        )
+        .unwrap();
+        assert_eq!(maintain(c, &paths, now_ms())?, 1);
+        assert!(db::get_setting(c, super::super::dream::EVIDENCE_AFTER)?.is_some());
+        Ok(())
+    })
+    .unwrap();
+}

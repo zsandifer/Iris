@@ -11,6 +11,15 @@ const SCAN_CURSOR: &str = "memory.forgetting.cursor";
 const DAY: i64 = 24 * 3_600_000;
 const SCAN_LIMIT: i64 = 100;
 const EXPIRY_LIMIT: i64 = 50;
+// Force the selective index: the supersession index is deliberately broad
+// for FK deletion and can otherwise win SQLite's planner without ANALYZE.
+fn expiry_sql() -> String {
+    format!(
+        "SELECT {COLUMNS} FROM memory_items INDEXED BY memory_expiry
+        WHERE archived = 0 AND superseded_by IS NULL AND valid_to IS NOT NULL
+        AND valid_to <= ?1 ORDER BY valid_to, id LIMIT ?2"
+    )
+}
 
 /// A reset invalidates writes from turns that already had the old memory.
 pub fn write_allowed(c: &Connection, started: i64) -> rusqlite::Result<()> {
@@ -36,10 +45,7 @@ pub fn maintain(c: &Connection, paths: &Paths, now: i64) -> rusqlite::Result<usi
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
         let mut expired: Vec<_> = c
-            .prepare(&format!(
-                "SELECT {COLUMNS} FROM memory_items WHERE archived = 0 AND superseded_by IS NULL
-             AND valid_to IS NOT NULL AND valid_to <= ?1 ORDER BY valid_to, id LIMIT ?2"
-            ))?
+            .prepare(&expiry_sql())?
             .query_map(params![now, EXPIRY_LIMIT], from_row)?
             .collect::<rusqlite::Result<_>>()?;
         let page: Vec<_> = c
@@ -75,6 +81,10 @@ pub fn maintain(c: &Connection, paths: &Paths, now: i64) -> rusqlite::Result<usi
         if expired.is_empty() {
             return Ok(0);
         }
+        // With no semantic matching, a global source boundary is the safe
+        // way to keep old discussions from re-learning a paraphrased note.
+        // Skip unrelated backlog conservatively; fresh assertions still learn.
+        super::dream::exclude_prior(c)?;
         let batch = format!("forgetting-{}", new_id());
         for item in &expired {
             super::archive(c, item, Actor::Dream, &batch)?;
