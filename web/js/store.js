@@ -22,11 +22,13 @@ function initialState() {
     ideas: null,
     goals: null,
     library: null,
+    memory: null,        // {items, more}: the owner's notes (Memory screen)
     route: parseRoute(),
     drawer: false,
     story: null,         // {topic index, story index}
     sheet: null,         // bottom sheet render function
     toast: null,
+    toastAction: null,   // {label, run} shown in the toast (e.g. Undo)
     drafts: {},          // conversation id -> composer text
     browser: null,       // GET /api/browser (owner): Iris's computer
     browsing: {},        // assistant message id -> { cid, until }: while its turn uses the browser (until null), then lingering until `until` (ms)
@@ -142,10 +144,11 @@ window.addEventListener('hashchange', () => {
 });
 
 let toastTimer;
-export function toast(text) {
+/** A short message; `action` ({label, run}) adds a button such as Undo. */
+export function toast(text, action = null) {
   clearTimeout(toastTimer);
-  set({ toast: text });
-  toastTimer = setTimeout(() => set({ toast: null }), 3200);
+  set({ toast: text, toastAction: action });
+  toastTimer = setTimeout(() => set({ toast: null, toastAction: null }), action ? 6000 : 3200);
 }
 
 export const isOwner = () => !!S.me?.user?.is_owner;
@@ -486,12 +489,42 @@ function setBrowser(b) {
   set({ browser, browsing });
 }
 
+// The Memory screen shows every current note (filtered on the phone), so
+// switching topics is instant and the count is right. Paged by offset;
+// a note that moves between pages while loading is shown once.
+const MEMORY_PAGE = 100;
+const MEMORY_MAX = 2000;
+export async function loadMemory() {
+  if (!isOwner()) return;
+  const apply = refreshOf('memory');
+  const items = [];
+  const ids = new Set();
+  let more = true;
+  let offset = 0;
+  while (more && offset < MEMORY_MAX) {
+    const r = await get(`/memory?limit=${MEMORY_PAGE}&offset=${offset}`);
+    for (const i of r.items) if (!ids.has(i.id)) { ids.add(i.id); items.push(i); }
+    more = !!r.has_more && r.items.length > 0;
+    offset += r.items.length;
+  }
+  apply(() => set({ memory: { items, more } }));
+}
+
+/** A memory.noted event: show the Noted line under that reply. */
+export function applyNoted(cid, mid, changes) {
+  const cur = S.msgs[cid];
+  const m = cur?.list.find((x) => x.id === mid);
+  if (!m) return;
+  upsert(cid, { ...m, meta: { ...(m.meta || {}), noted: changes } });
+  set({});
+}
+
 export async function loadEngines() {
   if (!isOwner()) return;
   set({ engines: await get('/engines') });
 }
 
-const loaders = { feed: () => loadFeed(), ideas: loadIdeas, goals: loadGoals, library: loadLibrary };
+const loaders = { feed: () => loadFeed(), ideas: loadIdeas, goals: loadGoals, library: loadLibrary, memory: loadMemory };
 
 // ------------------------------------------------------------------ events
 
@@ -642,6 +675,9 @@ export function handleEvent(ev) {
     case 'message.updated':
       upsert(ev.conversation_id, ev.message);
       set({});
+      break;
+    case 'memory.noted':
+      applyNoted(ev.conversation_id, ev.message_id, ev.changes || []);
       break;
     case 'conversation.created':
       for (const seen of convWatch) seen.push(ev.conversation);

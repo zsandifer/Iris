@@ -599,8 +599,65 @@ details.alt p { margin: 8px 0; }
 .toast.leaving { animation: fade-out .2s ease forwards; }
 .story-viewer.leaving { animation: viewer-out .22s ease forwards; pointer-events: none; }
 @keyframes viewer-out { to { opacity: 0; transform: scale(.96); } }
+/* ------------------------------------------------------------ memory */
+.mem-search { margin: 2px 0 10px; }
+.mem-search input::-webkit-search-cancel-button { display: none; }
+.mem-search .icon-btn { padding: 4px; }
+.mem-seg { overflow-x: auto; scrollbar-width: none; margin-bottom: 2px; }
+.mem-seg::-webkit-scrollbar { display: none; }
+.mem-seg button { font-size: 13px; padding: 7px 6px; white-space: nowrap; color: var(--ink); }
+.mem-grp { padding: 0 14px; }
+.mem-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 11px 0; border: 0; background: none; text-align: left; font-size: 14.5px; color: var(--ink); }
+.mem-row + .mem-row { border-top: 1px solid var(--ln); }
+.mem-tx { overflow-wrap: anywhere; white-space: pre-line; }
+.mem-row .mem-tx { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; }
+.mem-pin { color: var(--ac); font-size: 12px; font-weight: 500; white-space: nowrap; }
+h3 .mem-pin { font: 500 13px/1 -apple-system, system-ui, sans-serif; }
+.mem-mark { display: block; color: var(--mu); font-size: 12px; margin-top: 2px; }
+.mem-mark.recent { color: var(--ac); font-weight: 600; }
+.mem-mark .mem-pin { font-weight: 600; }
+.mem-mark.recent::before { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--ac); margin: 0 5px 1px 0; }
+.mem-paused .lk-m { display: block; padding: 4px 0 0; }
+.mem-h { display: block; font-size: 14px; margin: 14px 0 5px; }
+.mem-sheet .mem-h:first-of-type { margin-top: 10px; }
+.mem-ed { display: block; width: 100%; background: var(--sf2); border: 1px solid transparent; border-radius: 12px; padding: 9px 11px;
+  font: inherit; font-size: 16px; line-height: 1.4; color: var(--ink); resize: none; min-height: 44px; }
+.mem-ed:focus { border-color: var(--ac); background: var(--sf); }
+.mem-ed.ro { white-space: pre-line; overflow-wrap: anywhere; color: var(--mu); }
+.mem-hist { font-size: 13px; color: var(--mu); border-left: 2px solid var(--ln); padding-left: 10px; margin: 4px 0 6px; }
+.mem-hl { display: flex; align-items: baseline; gap: 10px; padding: 3px 0; }
+.mem-hl > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.mem-src { border: 0; background: none; padding: 2px 0; color: var(--ac); font-size: 13px; font-weight: 600; text-align: left; }
+.mem-undo { flex: none; margin-left: auto; border: 0; background: none; color: var(--ac); font-weight: 600; font-size: 13px; padding: 2px; }
+.mem-undo.mu { color: var(--mu); margin-left: 0; }
+.mem-undo + .mem-undo { margin-left: 4px; }
+.mem-acts { display: flex; gap: 8px; margin-top: 16px; }
+.mem-acts button { flex: 1; border-radius: 12px; border: 1px solid var(--ln); background: var(--sf); color: var(--ink); padding: 10px 8px; font-size: 14px; font-weight: 500; }
+.mem-acts .pri { background: var(--ac); border-color: var(--ac); color: #fff; font-weight: 600; }
+.mem-acts .del { color: var(--bad); }
+.mem-sheet .gnote { margin-top: 8px; }
+.mem-li { display: flex; align-items: flex-start; gap: 8px; padding: 8px 0; border-top: 1px solid var(--ln); font-size: 14px; }
+.mem-card .mem-li:first-of-type, .mem-grp .mem-li:first-child { border-top: 0; }
+.mem-grp .mem-li { padding: 11px 0; }
+.mem-li .grow { overflow-wrap: anywhere; }
+.mem-li.undone .grow, .mem-li.undone .mem-tag { opacity: .45; text-decoration: line-through; }
+.mem-tag { flex: none; font-size: 11px; font-weight: 600; border-radius: 999px; padding: 1px 7px; margin-top: 1px; background: var(--sf2); color: var(--mu); }
+.mem-tag.new { color: var(--ok); } .mem-tag.chg { color: var(--ac); }
+.mem-was { display: block; font-size: 12px; color: var(--mu); margin-top: 1px; }
+.mem-card { max-width: 94%; }
+.mem-card > p { margin-bottom: 2px; }
+.lnk { display: block; border: 0; background: none; color: var(--ac); font-weight: 600; font-size: 13.5px; padding: 6px 0 0; text-align: left; }
+.noted { display: inline-flex; align-items: center; gap: 5px; max-width: 84%; font-size: 12px; color: var(--mu); background: var(--sf2);
+  border: 0; border-radius: 999px; padding: 4px 10px; margin: -1px 0 6px 4px; text-align: left; }
+.noted span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.noted .ic { color: var(--ac); }
+.noted.undone span { text-decoration: line-through; opacity: .6; }
+.toast.has-act { display: flex; align-items: center; gap: 14px; text-align: left; padding-right: 10px; }
+.toast-act { border: 0; background: none; padding: 4px 6px; font-weight: 700; font-size: 13.5px; color: color-mix(in srgb, var(--ac) 55%, var(--bg)); }
+@media (max-width: 360px) { .mem-seg button { font-size: 12.5px; padding: 7px 4px; } }
+
 /* things that appear inside a screen ease in instead of popping */
-.warn, .warn-box, .feed-note, .feed-run, .rail, .empty, .rcpt-steps, .peek, .retry, .notify-card, .paused-bar,
+.warn, .warn-box, .feed-note, .feed-run, .rail, .empty, .rcpt-steps, .peek, .retry, .notify-card, .paused-bar, .noted,
 .att, .note, .ap-raw, .effort, .vw-bar, .live-line, .photo-error, .screen, .status:not(.shimmer), .gnote, .post-b, .md, .photo-layer img {
   animation: appear .22s ease-out; }
 @keyframes appear { from { opacity: 0; transform: translateY(4px); } }

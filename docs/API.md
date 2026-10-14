@@ -2479,15 +2479,18 @@ Dream morning cards have `type: "memory_morning"`, `owner_only: true`,
 `total_changes`, `more_count`, `more_label` (`"and N more ›"`),
 `memory_url: "/#/iris/memory"`, `action_label: "See everything I remember ›"`,
 and `undo_url` pointing to the card-specific POST route. Each change contains
-`history_id`, `item_id`, and a scrubbed text preview (up to 240 characters).
+`history_id`, `item_id`, `op` (`add`, `update`, or `supersede`; the app shows
+New, Updated, or Done), `was` (for `update`, the previous text, up to 240
+characters; otherwise `null`), and a scrubbed text preview (up to 240
+characters). Cards made before `op`/`was` existed lack them and show no tags.
 `Message.meta.initiated_by: "idea"` identifies generated Idea starters; new Idea
 conversation seeds also carry `generated_starter: true`. Owner-written follow-ups
 keep ordinary empty metadata and remain eligible for Dream.
 
 One card at most per local day, only after actual changes, only in the owner's
 still-private Main chat. It emits owner-only `message.created`, with no push.
-The card is a historical summary; undo still verifies current history. Dedicated
-card rendering and the Memory screen are delivered separately from this backend.
+The card is a historical summary; undo still verifies current history. The app
+renders it as the morning note and opens the Memory screen (`#/iris/memory`).
 
 Writes share the MCP write gate: strip nested/unclosed `<private>` spans,
 PEM private keys, credential assignments (including AWS secret-access-key labels,
@@ -2779,8 +2782,10 @@ and sent as `memory.noted` after `message.completed`, including when the turn
 fails after a successful write. Changes contain history IDs for Undo and current
 note IDs for Edit (corrections group their add/supersede into one entry), with text previews capped at 240 characters (up to 100 changes).
 If conversation privacy is lost before completion, the reply is withheld and
-neither Noted metadata nor its event is exposed. The app can render a Noted chip
-from metadata when reconnecting; the UI is added separately.
+neither Noted metadata nor its event is exposed. The app shows a "Noted: …"
+line under the reply from this metadata (also after reconnecting) and patches
+it in from `memory.noted`; each change can be undone through
+`POST /api/memory/history/{history_id}/undo` or edited by `item_id`.
 
 On a finished assistant message (`message.completed`):
 

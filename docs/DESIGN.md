@@ -39,8 +39,8 @@ own personality. It is not a clone.
 - **Drawer (slides from the left):** search, then chats (Main chat, side
   chats, + New side chat), then "Together" (shared chats). An **Iris profile**
   entry is pinned at the bottom and opens the **Iris hub**.
-- **Iris hub:** Connections · Logins & wallet · Iris's computer · System files
-  · Settings.
+- **Iris hub:** Connections · Logins & wallet · Iris's computer · Memory ·
+  System files · Settings.
 
 ## Chat
 
@@ -176,21 +176,41 @@ own personality. It is not a clone.
   no browser yet, the screen offers to set one up. Pause Iris stops what it
   is doing and holds chats and check-ins until turned back on.
   Trusted people manages recipients who can receive messages without another approval.
-- **Memory** (dedicated screen and card rendering arrive in the UI PR):
-  search notes by You, People, Projects or Routines; pinned notes first. Each
-  note has its source, changes with Undo, Edit, Pin ("always in mind"), and Forget.
+- **Memory** (above System files; owner only): "What I know about you · N
+  things", a "Search my memory" box (the same keyword search Iris uses), and
+  segments All · You · People · Projects · Routines. Pinned notes come first
+  ("Always in mind"), then notes grouped by topic. Recent changes are marked
+  in violet ("Learned last night", "Updated yesterday"); older ones say
+  "Since June". Tapping a note opens a sheet: the editable text with Save,
+  "Where I learned it" (the chat it came from opens with one tap; older notes
+  say "From my older notes", the owner's own "You told me here"), History in
+  plain words ("Updated overnight from …", "Pinned by you") with Undo on the
+  newest change, Pin / Unpin, and Forget (a toast offers Undo). While learning
+  is paused, the screen says so with Resume learning. The sliders button opens
+  Settings → Memory.
   Old incidental notes are quietly set aside, with history retained for Undo.
   Pinned and identity notes stay until edited or their explicit validity ends.
-  Settings → Memory has Pause learning and Morning note on/off, a Markdown
-  download, and Forget everything. Forget everything needs a confirmation
-  explaining that learned notes and undo history disappear, while chats and
-  backup copies remain. Pause learning stops new agent notes and overnight
+- **Noted line:** when Iris saves, changes or forgets something during a
+  private chat, a small "Noted: …" pill sits under its reply ("+2 more" for
+  several). Tapping it opens "What I noted" with New / Updated / Forgot tags,
+  Undo (then Redo) and Edit for each change.
+- **Morning note:** after an overnight tidy-up that changed something, one
+  card in Main chat at most once a day: "I tidied my notes overnight", "From
+  our chats yesterday. Tap Undo if I got something wrong.", the first three
+  changes tagged New / Updated (with "was: …") / Done, each with Undo (then
+  Redo), "and N more ›" to show the rest, and "See everything I remember ›".
+- **Settings → Memory:** Pause learning, Morning note on/off, See everything
+  I remember, Export as Markdown (a sheet that downloads `iris-memory.md`),
+  and Forget everything. Forget everything needs a confirmation explaining
+  that learned notes and undo history disappear, while chats and backup
+  copies remain. Pause learning stops new agent notes and overnight
   learning; recall, manual edits and automatic expiry remain available.
 - **System files:** the persona markdown files and memory/workspace folders,
   each with a plain-language label. Files open as rendered Markdown with an
   Edit button for the plain text (empty files open straight in the editor).
   Memory ("What Iris always keeps in mind" and the memory folder) is a
-  read-only copy with a lock note in Iris's voice: you change memory by asking in chat.
+  read-only copy with a lock note in Iris's voice and an "Open Memory ›"
+  link: you change memory in Memory or by asking in chat.
 - **Settings:**
   - Name, picture, voice replies, notifications, quiet hours.
   - Advanced: **AI engine**, devices, people, activity log (all steps, or

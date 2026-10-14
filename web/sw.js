@@ -28,6 +28,8 @@ const SHELL = [
   '/js/hub.js',
   '/js/lists.js',
   '/js/md.js',
+  '/js/memory.js',
+  '/js/memory-text.js',
   '/js/photo.js',
   '/js/photo-math.js',
   '/js/push.js',
