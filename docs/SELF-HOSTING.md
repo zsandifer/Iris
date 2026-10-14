@@ -841,6 +841,24 @@ per-change undo; dedicated app rendering follows separately. Owner settings
 `memory_learning_paused` and `memory_morning_note` on `PUT /api/settings`
 control automatic learning and morning cards. Pausing learning also blocks
 agent memory tools from writing; you can still read, edit and undo notes.
+The minute scheduler archives expired notes and low-score incidental notes
+without a model call, even while learning is paused. Score decay requires at
+least 90 days without use/edit and protects pinned, profile/preference and
+importance 4–5 notes. Explicit validity expiry applies to all notes. Archived
+notes remain in the database with undo history. Forgetting also moves Dream's
+source boundary past existing messages, so old discussions cannot revive a
+paraphrased fact. This conservatively skips unrelated unprocessed backlog;
+new assertions remain eligible.
+
+The owner can download all current and archived notes from
+`GET /api/memory/export` as `iris-memory.md`. A confirmed
+`POST /api/memory/forget-everything` with `{ "confirm": true }` clears learned
+notes, undo history, generated note content and historical memory card/chip
+payloads. It also discards owner CLI sessions and blocks pre-reset turns from
+saving notes. Dream skips old evidence; new assertions remain learnable.
+Chats, persona files, `memory-backup/` import originals and other backups are
+retained; remove backup copies separately if you need them erased.
+The Memory settings UI follows in the UI PR.
 `POST /api/jobs/dream/run` skips the time gate, keeping all privacy, activity,
 enabled and pause checks.
 
@@ -967,3 +985,21 @@ Contributor notes, architecture, and invariants are in
 
 Dual-licensed under either of [Apache License 2.0](../LICENSE-APACHE) or
 [MIT](../LICENSE-MIT), at your option.
+
+
+### Memory evaluation
+
+`cargo test synthetic_memory_eval_five_categories` runs synthetic fixtures in
+`tests/fixtures/memory/eval.json` through a real subprocess running a fake Claude
+CLI, the normal Dream pipeline, SQLite, forgetting and recall. Cases cover
+extraction, evidence spanning sessions, temporal expiry, corrections and
+abstention. Fixed CLI proposals test host behavior, not model intelligence;
+this is a reproducible regression suite, not a LongMemEval benchmark score.
+
+For an optional real model smoke test, sign in using the official Claude CLI,
+then run `scripts/e2e/memory/real-cli.sh` (or set `IRIS_MEMORY_EVAL_CLI` to its
+binary path). It makes five small subscription-backed CLI turns with tools
+and project context disabled and temporary app data only. No live Iris data
+or CLI credentials are read or modified by Iris. The ignored test checks
+relevant recall, absence of outdated/invented facts, provenance and progress;
+results may vary with the CLI/model. It is not run by CI.

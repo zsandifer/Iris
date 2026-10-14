@@ -280,7 +280,7 @@ pub fn save(
             batch,
         )?;
     } else {
-        c.execute("INSERT INTO memory_items(id, kind, topic, text, importance, pinned, created_at, observed_at, mentioned_at, valid_to, source, content_hash, updated_at) VALUES ((SELECT MAX(id) + 1 FROM (SELECT COALESCE(MAX(id), 0) AS id FROM memory_items UNION ALL SELECT COALESCE(MAX(item_id), 0) FROM memory_history)), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?11, ?8, ?9, ?10, ?6)",
+        c.execute("INSERT INTO memory_items(id, kind, topic, text, importance, pinned, created_at, observed_at, mentioned_at, valid_to, source, content_hash, updated_at) VALUES ((SELECT MAX(id) + 1 FROM (SELECT COALESCE(MAX(id), 0) AS id FROM memory_items UNION ALL SELECT COALESCE(MAX(item_id), 0) FROM memory_history UNION ALL SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'memory.item_highwater')), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?11, ?8, ?9, ?10, ?6)",
             params![kind, topic.name(), text, importance, edit.pinned.or(before.as_ref().map(|i| i.pinned)).unwrap_or(false), now, edit.observed_at.unwrap_or_else(|| before.as_ref().and_then(|i| i.observed_at)), edit.valid_to.unwrap_or_else(|| before.as_ref().and_then(|i| i.valid_to)), source.to_string(), hash, if actor == Actor::Dream { source["asserted_at"].as_i64().unwrap_or(now) } else { now }])?;
         saved_id = c.last_insert_rowid();
         let after = get(c, saved_id)?.unwrap();

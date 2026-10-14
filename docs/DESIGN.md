@@ -176,6 +176,16 @@ own personality. It is not a clone.
   no browser yet, the screen offers to set one up. Pause Iris stops what it
   is doing and holds chats and check-ins until turned back on.
   Trusted people manages recipients who can receive messages without another approval.
+- **Memory** (dedicated screen and card rendering arrive in the UI PR):
+  search notes by You, People, Projects or Routines; pinned notes first. Each
+  note has its source, changes with Undo, Edit, Pin ("always in mind"), and Forget.
+  Old incidental notes are quietly set aside, with history retained for Undo.
+  Pinned and identity notes stay until edited or their explicit validity ends.
+  Settings → Memory has Pause learning and Morning note on/off, a Markdown
+  download, and Forget everything. Forget everything needs a confirmation
+  explaining that learned notes and undo history disappear, while chats and
+  backup copies remain. Pause learning stops new agent notes and overnight
+  learning; recall, manual edits and automatic expiry remain available.
 - **System files:** the persona markdown files and memory/workspace folders,
   each with a plain-language label. Files open as rendered Markdown with an
   Edit button for the plain text (empty files open straight in the editor).

@@ -823,7 +823,7 @@ async fn run_locked(
                 &acc,
                 input.user_message.created_at,
                 &persona_hash,
-                ctx.membership_version,
+                (ctx.membership_version, input.user_message.created_at),
             )
             .await;
             break;
@@ -847,7 +847,7 @@ async fn run_locked(
                     &acc,
                     synced,
                     &persona_hash,
-                    ctx.membership_version,
+                    (ctx.membership_version, input.user_message.created_at),
                 )
                 .await;
                 outcome = Outcome::Complete;
@@ -1458,8 +1458,9 @@ async fn remember_session(
     acc: &Acc,
     synced_at: i64,
     persona_hash: &str,
-    membership_version: i64,
+    continuity: (i64, i64),
 ) {
+    let (membership_version, started_at) = continuity;
     let Some(session_id) = acc.session.clone() else {
         return;
     };
@@ -1475,7 +1476,9 @@ async fn remember_session(
             db::write_tx(db, |db| {
                 // A running CLI must not restore a session invalidated by a
                 // concurrent join or removal. Compare and save atomically.
-                if db::conversation_membership_version(db, &c)? == membership_version {
+                if db::conversation_membership_version(db, &c)? == membership_version
+                    && crate::memory::lifecycle::write_allowed(db, started_at).is_ok()
+                {
                     db::set_harness_session(db, &c, &h, &s)?;
                 }
                 Ok(())
@@ -2100,6 +2103,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_reset_discards_sessions_and_rejects_inflight_session_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::browser::tools::tests::test_state(tmp.path());
+        let conv = state
+            .db
+            .with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                db::ensure_main_conversation(c, &owner)
+            })
+            .unwrap();
+        let ctx = load_ctx(&state, &conv).await;
+        let acc = Acc {
+            session: Some("synthetic-session".into()),
+            ..Default::default()
+        };
+        remember_session(
+            &state,
+            &conv,
+            "claude",
+            &acc,
+            0,
+            "persona",
+            (ctx.membership_version, 0),
+        )
+        .await;
+        assert!(
+            state
+                .db
+                .with(|c| db::get_harness_session(c, &conv, "claude"))
+                .unwrap()
+                .is_some()
+        );
+        state
+            .db
+            .with(|c| crate::memory::lifecycle::forget_everything(c, &state.paths))
+            .unwrap();
+        remember_session(
+            &state,
+            &conv,
+            "claude",
+            &acc,
+            i64::MAX,
+            "persona",
+            (ctx.membership_version, 0),
+        )
+        .await;
+        assert!(
+            state
+                .db
+                .with(|c| db::get_harness_session(c, &conv, "claude"))
+                .unwrap()
+                .is_none()
+        );
+        let after = state
+            .db
+            .with(|c| {
+                Ok(db::get_setting(c, crate::memory::lifecycle::RESET_AFTER)?
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap())
+            })
+            .unwrap();
+        remember_session(
+            &state,
+            &conv,
+            "claude",
+            &acc,
+            i64::MAX,
+            "persona",
+            (ctx.membership_version, after + 1),
+        )
+        .await;
+        assert!(
+            state
+                .db
+                .with(|c| db::get_harness_session(c, &conv, "claude"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn memory_noted_is_persisted_and_sent_only_to_owner() {
         let tmp = tempfile::tempdir().unwrap();
         let state = crate::browser::tools::tests::test_state(tmp.path());
@@ -2549,7 +2634,7 @@ printf '%s\n' '{"type":"init","session_id":"pre-join-session"}' \
                 &acc,
                 0,
                 "private",
-                private_ctx.membership_version,
+                (private_ctx.membership_version, 0),
             )
             .await;
         }
@@ -2598,7 +2683,7 @@ printf '%s\n' '{"type":"init","session_id":"pre-join-session"}' \
             &acc,
             0,
             "private",
-            private_ctx.membership_version,
+            (private_ctx.membership_version, 0),
         )
         .await;
         for harness in crate::config::SUPPORTED_HARNESSES {
@@ -2649,7 +2734,7 @@ printf '%s\n' '{"type":"init","session_id":"pre-join-session"}' \
             &acc,
             0,
             "shared",
-            first_ctx.membership_version,
+            (first_ctx.membership_version, 0),
         )
         .await;
         assert!(
@@ -2667,7 +2752,7 @@ printf '%s\n' '{"type":"init","session_id":"pre-join-session"}' \
                 &acc,
                 0,
                 "shared",
-                ctx.membership_version,
+                (ctx.membership_version, 0),
             )
             .await;
             assert!(
@@ -2696,7 +2781,7 @@ printf '%s\n' '{"type":"init","session_id":"pre-join-session"}' \
             &acc,
             0,
             "shared",
-            ctx.membership_version,
+            (ctx.membership_version, 0),
         )
         .await;
         assert!(
@@ -2731,7 +2816,7 @@ printf '%s\n' '{"type":"init","session_id":"pre-join-session"}' \
             &acc,
             0,
             "shared",
-            before_rejoin.membership_version,
+            (before_rejoin.membership_version, 0),
         )
         .await;
         assert!(

@@ -698,3 +698,103 @@ fn removal_boundary_rolls_back_with_history_and_preserves_returned_history_id() 
     })
     .unwrap();
 }
+
+#[path = "eval.rs"]
+mod eval;
+
+#[tokio::test]
+async fn reset_blocks_inflight_dream_and_old_backlog_but_new_assertions_learn() {
+    let (state, tmp, owner, main) = setup().await;
+    add_messages(&state, &owner, &main, 4);
+    let input = state.db.with(|c| prepare(c, 4)).unwrap().unwrap();
+    state
+        .db
+        .with(|c| {
+            crate::memory::lifecycle::forget_everything(c, &state.paths)?;
+            assert!(
+                apply(
+                    c,
+                    &input,
+                    parse(&json!({"ops":[add_op("Old orchard note")]}).to_string())?,
+                    &owner,
+                    "stale-dream"
+                )
+                .is_err()
+            );
+            assert!(prepare(c, 4)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    add_messages(&state, &owner, &main, 4);
+    reply(&tmp, json!({"ops":[add_op("New orchard note")]}));
+    run(&state, &owner, true).await.unwrap();
+    assert_eq!(
+        state.db.with(super::super::live).unwrap()[0].text,
+        "New orchard note"
+    );
+}
+
+#[tokio::test]
+async fn deterministic_forgetting_blocks_pre_expiry_backlog_even_for_pinned_notes() {
+    let (state, tmp, owner, main) = setup().await;
+    for pinned in [false, true] {
+        state.db.with(|c| {
+            let id=note(c,if pinned {"Pinned orchard note"} else {"Ordinary orchard note"})?;
+            c.execute("UPDATE memory_items SET created_at=1000,mentioned_at=1000,valid_to=3000,pinned=?2 WHERE id=?1",params![id,pinned])?;
+            c.execute("UPDATE memory_history SET at=1000 WHERE item_id=?1",[id])?;
+            Ok(())
+        }).unwrap();
+    }
+    add_messages(&state, &owner, &main, 4);
+    let old_input = state
+        .db
+        .with(|c| {
+            let mut ids: Vec<String> = c
+                .prepare("SELECT id FROM messages WHERE role='user' ORDER BY created_at")?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (n, id) in ids.drain(..).enumerate() {
+                c.execute(
+                    "UPDATE messages SET created_at=?2 WHERE id=?1",
+                    params![id, 2000 + n as i64],
+                )?;
+            }
+            let input = prepare(c, 4)?.unwrap();
+            assert_eq!(
+                crate::memory::lifecycle::maintain(c, &state.paths, now_ms())?,
+                2
+            );
+            Ok(input)
+        })
+        .unwrap();
+    state
+        .db
+        .with(|c| {
+            for text in [
+                "Ordinary orchard note",
+                "An orchard fact phrased differently",
+                "Pinned orchard note",
+                "Pinned information reworded",
+            ] {
+                let proposal = parse(&json!({"ops":[add_op(text)]}).to_string())?;
+                assert!(apply(c, &old_input, proposal, &owner, "old-expiry").is_err());
+            }
+            assert!(
+                prepare(c, 4)?.is_none(),
+                "old evidence must never reach a later CLI run"
+            );
+            Ok(())
+        })
+        .unwrap();
+    run(&state, &owner, true).await.unwrap();
+    assert!(state.db.with(super::super::live).unwrap().is_empty());
+    assert!(cards(&state).is_empty());
+    // A new assertion after forgetting is allowed to establish new validity.
+    add_messages(&state, &owner, &main, 4);
+    reply(&tmp, json!({"ops":[add_op("Ordinary orchard note")]}));
+    run(&state, &owner, true).await.unwrap();
+    assert_eq!(
+        state.db.with(super::super::live).unwrap()[0].text,
+        "Ordinary orchard note"
+    );
+}

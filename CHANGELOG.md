@@ -7,6 +7,14 @@ All notable changes to Iris are documented here, following
 
 ### Added
 
+- Memory backend: bounded deterministic expiry and low-score archiving with
+  undo, protected pinned/identity notes, confirmed owner-only Forget everything
+  with stale-turn/Dream protection and non-reused IDs, and a complete Markdown
+  download. Existing pause-learning and morning-note settings remain available.
+  Reset keeps chats and backup copies. A five-category synthetic fake-CLI memory
+  evaluation runs in `cargo test`, with an optional real-CLI smoke script.
+  Memory UI remains a separate PR.
+
 - Nightly memory tidying through the owner's Background engine: bounded private
   chat input, strict validated decisions, history snapshots and undo, a guard
   against setting aside too many notes, and a success-only progress cursor.

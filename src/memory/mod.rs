@@ -15,6 +15,7 @@
 pub mod dream;
 pub mod files;
 pub mod gate;
+pub mod lifecycle;
 pub mod markdown;
 pub mod packing;
 pub mod recall;
@@ -284,8 +285,8 @@ fn record(
         dream::exclude_prior(conn)?;
     }
     conn.execute(
-        "INSERT INTO memory_history (item_id, op, before, after, actor, batch_id, at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO memory_history (id, item_id, op, before, after, actor, batch_id, at)
+         VALUES ((SELECT CAST(value AS INTEGER) + 1 FROM settings WHERE key = 'memory.history_highwater'), ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             item_id,
             op,
@@ -316,7 +317,7 @@ pub fn add(conn: &Connection, new: &NewItem, actor: Actor, batch: &str) -> rusql
     conn.execute(
         "INSERT INTO memory_items
              (id, kind, topic, text, importance, created_at, source, content_hash, updated_at)
-         VALUES ((SELECT MAX(id) + 1 FROM (SELECT COALESCE(MAX(id), 0) AS id FROM memory_items UNION ALL SELECT COALESCE(MAX(item_id), 0) FROM memory_history)), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?5)",
+         VALUES ((SELECT MAX(id) + 1 FROM (SELECT COALESCE(MAX(id), 0) AS id FROM memory_items UNION ALL SELECT COALESCE(MAX(item_id), 0) FROM memory_history UNION ALL SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'memory.item_highwater')), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?5)",
         params![
             new.kind,
             new.topic.name(),
