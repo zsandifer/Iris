@@ -179,6 +179,42 @@ pub fn tool_definitions() -> Vec<Value> {
             &["name"],
         ),
         tool(
+            "search_memory",
+            "Recall compact memory hits. Use get_memory for full notes and history.",
+            json!({"query": s("Search words"), "topic": s("you|people|projects|routines"), "since": {"type":"integer"}}),
+            &["query"],
+        ),
+        tool(
+            "get_memory",
+            "Read up to 20 current notes with sources and history.",
+            json!({"ids": {"type":"array", "items":{"type":"integer"}, "maxItems":20}}),
+            &["ids"],
+        ),
+        tool(
+            "remember",
+            "Save a note, excluding secrets and private spans. Similar notes are hints only; update instead of merging automatically.",
+            json!({"text":s("Note"), "kind":s("profile|preference|fact|event|person|project|routine"), "importance":{"type":"integer","minimum":1,"maximum":5}, "observed_at":{"type":"integer"}}),
+            &["text", "kind"],
+        ),
+        tool(
+            "update_memory",
+            "Correct a note by ID; changed text supersedes its prior version with undo history.",
+            json!({"id":{"type":"integer"}, "text":s("Corrected note"), "kind":s("Memory kind"), "importance":{"type":"integer","minimum":1,"maximum":5}, "observed_at":{"type":"integer"}, "valid_to":{"type":"integer"}}),
+            &["id"],
+        ),
+        tool(
+            "forget",
+            "Forget a note by ID, preserving an undo tombstone.",
+            json!({"id":{"type":"integer"}}),
+            &["id"],
+        ),
+        tool(
+            "search_conversations",
+            "Search the owner's past private chats for compact source excerpts.",
+            json!({"query":s("Search words")}),
+            &["query"],
+        ),
+        tool(
             "read_memory",
             "Read one of the owner's memory files: MEMORY.md (always in mind) or a topic \
              file (you.md, people.md, projects.md, routines.md).",
@@ -337,8 +373,9 @@ impl Bridge {
                         (!crate::awareness::TOOLS.contains(&name)
                             || (self.status_token.is_some() && self.private_status_context()))
                             && (!self.shared || SHARED_TOOLS.contains(&name))
-                            && (!matches!(name, "read_memory" | "write_memory")
-                                || self.owner_context())
+                            && (!(matches!(name, "read_memory" | "write_memory")
+                                || crate::memory::recall::TOOLS.contains(&name))
+                                || self.private_status_context())
                     })
                     .collect();
                 json!({"tools": tools})
@@ -372,12 +409,17 @@ impl Bridge {
     /// memory folder are reachable.
     fn owner_context(&self) -> bool {
         !self.shared
-            && self
-                .db
-                .with(crate::db::owner_user_id)
-                .ok()
-                .flatten()
-                .is_some_and(|o| o == self.user_id)
+            && self.conversation_id.as_deref().is_some_and(|conv| {
+                self.db
+                    .with(|c| {
+                        Ok(
+                            crate::db::owner_user_id(c)?.as_deref() == Some(self.user_id.as_str())
+                                && crate::db::conversation_member_ids(c, conv)?
+                                    == [self.user_id.clone()],
+                        )
+                    })
+                    .unwrap_or(false)
+            })
     }
 
     /// When this turn began (ms): its message was created then; a bridge
@@ -405,13 +447,6 @@ impl Bridge {
 
     fn private_status_context(&self) -> bool {
         self.owner_context()
-            && self.conversation_id.as_ref().is_some_and(|conv| {
-                self.db
-                    .with(|c| {
-                        Ok(crate::db::conversation_member_ids(c, conv)? == [self.user_id.clone()])
-                    })
-                    .unwrap_or(false)
-            })
     }
 
     fn call(&self, name: &str, a: &Value) -> std::result::Result<Value, String> {
@@ -441,6 +476,114 @@ impl Bridge {
                 return Err("this private turn is no longer available".into());
             }
             return Ok(reply["result"].clone());
+        }
+        if crate::memory::recall::TOOLS.contains(&name) {
+            if !self.private_status_context() {
+                return Err("I can only use memory in the owner's private chats.".into());
+            }
+            let source = json!({"type":"conversation", "conversation_id": self.conversation_id, "message_ids": self.message_id.iter().collect::<Vec<_>>()});
+            let batch = self.turn_batch();
+            let out = self.db.with(|c| {
+                crate::db::write_tx(c, |c| {
+                    // Recheck membership while holding the write lock.
+                    if crate::db::conversation_member_ids(
+                        c,
+                        self.conversation_id.as_deref().unwrap(),
+                    )? != [self.user_id.clone()]
+                    {
+                        return Err(crate::memory::recall::invalid(
+                            "I can only use memory in the owner's private chats.",
+                        ));
+                    }
+                    use crate::memory::recall as r;
+                    let id = || {
+                        a["id"]
+                            .as_i64()
+                            .filter(|i| *i > 0)
+                            .ok_or_else(|| r::invalid("Please give me a memory ID."))
+                    };
+                    match name {
+                        "search_memory" => {
+                            if s("query").is_none() {
+                                return Err(r::invalid("Please give me words to search."));
+                            }
+                            let f: r::Filter = serde_json::from_value(a.clone())
+                                .map_err(|_| r::invalid("I couldn't read those search options."))?;
+                            let out = r::list(c, &f, true)?;
+                            crate::memory::files::render_export(c, &self.paths)?;
+                            Ok(out)
+                        }
+                        "search_conversations" => r::conversations(
+                            c,
+                            s("query")
+                                .ok_or_else(|| r::invalid("Please give me words to search."))?,
+                        ),
+                        "get_memory" => {
+                            let ids = a["ids"]
+                                .as_array()
+                                .filter(|ids| !ids.is_empty() && ids.len() <= 20)
+                                .ok_or_else(|| {
+                                    r::invalid("Please choose between 1 and 20 memory IDs.")
+                                })?;
+                            let mut seen = std::collections::HashSet::new();
+                            let mut items = Vec::new();
+                            for id in ids {
+                                let id = id
+                                    .as_i64()
+                                    .filter(|i| *i > 0)
+                                    .ok_or_else(|| r::invalid("Please give me memory IDs."))?;
+                                if seen.insert(id) {
+                                    items.push(r::detail(c, id, true)?);
+                                }
+                            }
+                            crate::memory::files::render_export(c, &self.paths)?;
+                            Ok(json!({"items":items}))
+                        }
+                        "forget" => r::mutate(c, &self.paths, |c| {
+                            r::forget(c, id()?, crate::memory::Actor::Agent, &batch)
+                        }),
+                        _ => {
+                            let mut fields = a.clone();
+                            fields
+                                .as_object_mut()
+                                .ok_or_else(|| r::invalid("Please give me a note."))?
+                                .remove("id");
+                            let edit: r::Edit = serde_json::from_value(fields)
+                                .map_err(|_| r::invalid("I couldn't read those note fields."))?;
+                            if edit.pinned.is_some() {
+                                return Err(r::invalid(
+                                    "Pinning is available to the owner in Memory.",
+                                ));
+                            }
+                            if name == "remember" && (edit.text.is_none() || edit.kind.is_none()) {
+                                return Err(r::invalid("Please give me the note and its kind."));
+                            }
+                            r::mutate(c, &self.paths, |c| {
+                                r::save(
+                                    c,
+                                    &edit,
+                                    if name == "update_memory" {
+                                        Some(id()?)
+                                    } else {
+                                        None
+                                    },
+                                    crate::memory::Actor::Agent,
+                                    &source,
+                                    &batch,
+                                )
+                            })
+                        }
+                    }
+                })
+            });
+            if out.is_err() {
+                // The outer write transaction has rolled back; repair an
+                // export that failed partway through writing.
+                let _ = self.db.with(|c| {
+                    crate::db::write_tx(c, |c| crate::memory::files::render_export(c, &self.paths))
+                });
+            }
+            return out.map_err(db_err);
         }
         match name {
             "read_memory" | "write_memory" => {
@@ -1258,6 +1401,89 @@ mod tests {
             assert_eq!(r["isError"], true, "{name}");
         }
         assert_eq!(b.db.with(crate::memory::live).unwrap().len(), before);
+    }
+
+    #[test]
+    fn recall_tools_write_gate_history_and_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = bridge(tmp.path());
+        let saved = call(
+            &b,
+            "remember",
+            json!({"text":"Likes climbing <private>synthetic-canary</private>","kind":"preference", "importance":4, "observed_at":100}),
+        );
+        assert_eq!(saved["isError"], false, "{saved}");
+        let id = saved["structuredContent"]["item"]["id"].as_i64().unwrap();
+        assert_eq!(saved["structuredContent"]["item"]["observed_at"], 100);
+        let found = call(
+            &b,
+            "search_memory",
+            json!({"query":"climbing", "topic":"you", "since":0}),
+        );
+        assert_eq!(found["structuredContent"]["hits"][0]["id"], id, "{found}");
+        let full = call(&b, "get_memory", json!({"ids":[id,id]}));
+        assert_eq!(
+            full["structuredContent"]["items"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            full["structuredContent"]["items"][0]["item"]["use_count"],
+            2
+        );
+        assert_eq!(
+            full["structuredContent"]["items"][0]["item"]["source"]["message_ids"],
+            json!(["m1"])
+        );
+        assert!(!full.to_string().contains("synthetic-canary"));
+        assert_eq!(
+            call(
+                &b,
+                "remember",
+                json!({"text":"password: synthetic-canary", "kind":"fact"})
+            )["isError"],
+            true
+        );
+        let replaced = call(
+            &b,
+            "update_memory",
+            json!({"id":id,"text":"Likes swimming"}),
+        );
+        assert_eq!(replaced["isError"], false, "{replaced}");
+        let next = replaced["structuredContent"]["item"]["id"]
+            .as_i64()
+            .unwrap();
+        assert_ne!(next, id);
+        assert_eq!(call(&b, "forget", json!({"id":next}))["isError"], false);
+        assert_eq!(
+            call(&b, "get_memory", json!({"ids":[next]}))["isError"],
+            true
+        );
+        b.shared = true;
+        for name in crate::memory::recall::TOOLS {
+            assert_eq!(call(&b, name, json!({}))["isError"], true);
+        }
+        b.shared = false;
+        b.db.with(|c| {
+            c.execute("INSERT INTO users(id,display_name,created_at) VALUES ('guest','Guest',0)", [])?;
+            c.execute("INSERT INTO conversation_members(conversation_id,user_id,joined_at) VALUES (?1,'guest',0)", [b.conversation_id.as_deref().unwrap()])?;
+            Ok(())
+        }).unwrap();
+        // A bridge created before the join must not retain access.
+        for name in crate::memory::recall::TOOLS {
+            assert_eq!(call(&b, name, json!({}))["isError"], true);
+        }
+        let tools = b.handle(&json!({"id":1,"method":"tools/list"})).unwrap();
+        assert!(
+            !tools["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| crate::memory::recall::TOOLS.contains(&t["name"].as_str().unwrap()))
+        );
+        b.user_id = "guest".into();
+        for name in crate::memory::recall::TOOLS {
+            assert_eq!(call(&b, name, json!({}))["isError"], true);
+        }
     }
 
     #[test]

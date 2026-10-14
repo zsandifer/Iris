@@ -481,6 +481,51 @@ ALTER TABLE memory_items ADD COLUMN core_since INTEGER;
 -- Automatic packing must not make same-turn topic writes removable there.
 ALTER TABLE memory_items ADD COLUMN core_written_batch TEXT;
 "#,
+    r#"
+-- Only owner-alone human chats are recallable. Once membership changes,
+-- purge the conversation rather than reclassifying formerly shared text.
+CREATE VIEW memory_private_messages AS
+SELECT m.rowid AS message_rowid, m.id, m.conversation_id, m.role, m.content, m.created_at
+FROM messages m JOIN conversations c ON c.id = m.conversation_id
+JOIN users u ON u.id = c.created_by AND u.is_owner = 1
+WHERE c.kind IN ('main', 'side') AND c.membership_version <= 1
+AND m.kind = 'text' AND m.role IN ('user', 'assistant')
+AND m.status = 'complete'
+AND (m.role = 'assistant' OR m.author_user_id = u.id)
+AND EXISTS (SELECT 1 FROM conversation_members cm WHERE cm.conversation_id = c.id AND cm.user_id = u.id)
+AND NOT EXISTS (SELECT 1 FROM conversation_members cm WHERE cm.conversation_id = c.id AND cm.user_id != u.id);
+CREATE VIRTUAL TABLE conversation_messages_fts USING fts5(
+    message_id UNINDEXED, conversation_id UNINDEXED, text,
+    tokenize = 'porter unicode61 remove_diacritics 2'
+);
+INSERT INTO conversation_messages_fts(rowid, message_id, conversation_id, text)
+SELECT message_rowid, id, conversation_id, content FROM memory_private_messages;
+CREATE TRIGGER conversation_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO conversation_messages_fts(rowid, message_id, conversation_id, text)
+    SELECT message_rowid, id, conversation_id, content FROM memory_private_messages WHERE id = NEW.id;
+END;
+CREATE TRIGGER conversation_fts_update AFTER UPDATE OF content, status, kind, role, author_user_id, conversation_id ON messages BEGIN
+    DELETE FROM conversation_messages_fts WHERE rowid = OLD.rowid;
+    INSERT INTO conversation_messages_fts(rowid, message_id, conversation_id, text)
+    SELECT message_rowid, id, conversation_id, content FROM memory_private_messages WHERE id = NEW.id;
+END;
+CREATE TRIGGER conversation_fts_delete AFTER DELETE ON messages BEGIN
+    DELETE FROM conversation_messages_fts WHERE rowid = OLD.rowid;
+END;
+CREATE TRIGGER conversation_fts_member_added AFTER INSERT ON conversation_members BEGIN
+    DELETE FROM conversation_messages_fts WHERE conversation_id = NEW.conversation_id;
+END;
+CREATE TRIGGER conversation_fts_member_removed AFTER DELETE ON conversation_members BEGIN
+    DELETE FROM conversation_messages_fts WHERE conversation_id = OLD.conversation_id;
+END;
+CREATE TRIGGER conversation_fts_scope_changed AFTER UPDATE OF kind, created_by, membership_version ON conversations BEGIN
+    DELETE FROM conversation_messages_fts WHERE conversation_id = NEW.id;
+END;
+CREATE TRIGGER conversation_fts_owner_changed AFTER UPDATE OF is_owner ON users BEGIN
+    DELETE FROM conversation_messages_fts WHERE conversation_id IN
+        (SELECT id FROM conversations WHERE created_by = NEW.id);
+END;
+"#,
 ];
 
 /// Run `f` in a write transaction taken up front (`BEGIN IMMEDIATE`), so a
@@ -1581,6 +1626,69 @@ mod tests {
             content,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn conversation_recall_migration_backfills_only_owner_private_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for migration in &MIGRATIONS[..10] {
+                c.execute_batch(migration).unwrap();
+            }
+            c.pragma_update(None, "user_version", 10).unwrap();
+            let owner = ensure_owner(&c).unwrap();
+            let private = ensure_main_conversation(&c, &owner).unwrap();
+            let group = create_conversation(&c, &owner, "group", "Practice group", None)
+                .unwrap()
+                .id;
+            c.execute(
+                "INSERT INTO users(id,display_name,created_at) VALUES ('guest','Guest',0)",
+                [],
+            )
+            .unwrap();
+            c.execute("INSERT INTO conversation_members(conversation_id,user_id,joined_at) VALUES (?1,'guest',0)", [&group]).unwrap();
+            let other = create_conversation(&c, "guest", "side", "Guest chat", None)
+                .unwrap()
+                .id;
+            for chat in [&private, &group, &other] {
+                insert_message(
+                    &c,
+                    &NewMessage {
+                        conversation_id: chat,
+                        role: "assistant",
+                        content: "Synthetic orchard",
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+            insert_message(
+                &c,
+                &NewMessage {
+                    conversation_id: &private,
+                    role: "assistant",
+                    kind: "card",
+                    content: "Orchard card",
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            let hits = crate::memory::recall::conversations(c, "orchard")?;
+            assert_eq!(hits["hits"].as_array().unwrap().len(), 1);
+            let count: i64 =
+                c.query_row("SELECT COUNT(*) FROM conversation_messages_fts", [], |r| {
+                    r.get(0)
+                })?;
+            assert_eq!(count, 1);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

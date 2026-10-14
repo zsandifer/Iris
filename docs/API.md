@@ -336,6 +336,12 @@ All paths are under `/api`. "Any" means any authenticated user.
 | POST | `/push/subscriptions` | Any | Subscribe this device |
 | DELETE | `/push/subscriptions/{id}` | Any | Unsubscribe |
 | POST | `/push/test` | Any | Send yourself a test push |
+| GET | `/memory` | **Owner** | List or search live memory notes |
+| POST | `/memory` | **Owner** | Add a note |
+| GET | `/memory/{id}` | **Owner** | Note, sources and change history |
+| PATCH | `/memory/{id}` | **Owner** | Edit or pin a note |
+| DELETE | `/memory/{id}` | **Owner** | Forget a note with undo |
+| POST | `/memory/history/{id}/undo` | **Owner** | Undo the latest change |
 | GET | `/jobs` | **Owner** | Scheduled job status |
 | POST | `/jobs/{name}/run` | **Owner** | Run a job now (`202`) |
 | POST | `/voice/speak` | Any | Placeholder, always `501` |
@@ -2394,6 +2400,47 @@ missing system libraries, `error` says so; the fix needs root once on the
 server (`npx playwright install-deps chromium`, or your distribution's
 Chromium package).
 
+### 3.20 Memory
+
+All Memory routes require the owner (`403` for other paired users).
+IDs are positive integers, stable across owner edits and never reused after Forget.
+
+- `GET /api/memory?query=words&topic=you&since=timestamp&limit=30&offset=0`
+  returns `{items: [MemoryItem], has_more}`. All filters are optional; `topic`
+  is `you|people|projects|routines`, `since` is an inclusive `updated_at` cutoff
+  in milliseconds. Pinned first, then most recently changed, then ID.
+  `limit` is clamped to 1–100; `offset` to 0–100,000. Lists exclude archived,
+  superseded and expired notes. Reading in the app does not count as agent use.
+- `POST /api/memory` takes `{text, kind?, importance?, observed_at?, valid_to?, pinned?}`.
+  `PATCH /api/memory/{id}` accepts the same optional fields; omitted fields
+  retain their values. Times are milliseconds; importance is 1–5 (default 3).
+  Kind determines topic. Owner edits preserve provenance and ID.
+  Both return `{item, changed, history_id, similar_to, hint}`; exact duplicates
+  return the existing `{item, duplicate: true, changed: false}` with no mutation.
+  A similarity hint is advisory and never merges notes.
+- `GET /api/memory/{id}` returns `{item, history}` including full text, source
+  refs and up to the latest 100 change snapshots across its linked earlier
+  versions, newest first. Set-aside notes remain inspectable. A deleted/unknown ID returns `404`.
+- `DELETE /api/memory/{id}` returns `{forgotten: id, history_id}`. Hard deletes
+  the row and keeps its prior snapshot as a history tombstone. Earlier versions
+  stay archived rather than becoming live when a replacement is forgotten.
+- `POST /api/memory/history/{history_id}/undo` takes `{}` and returns
+  `{undone: history_id, item}` (`item: null` when undoing an addition).
+  Restores text, fields and replacement links from history, or restores a
+  forgotten row. Undo must select the latest change to that note; a changed
+  replacement or duplicate live text rejects the entire undo (`400`) without
+  modifying anything. Undo itself records a new change, so it can also be undone.
+
+Writes share the MCP write gate: strip nested/unclosed `<private>` spans,
+PEM private keys, credential assignments/authorization lines and recognized
+API token formats before hashing or recording history. Empty/private-only
+notes and individual REST/recall-tool notes over 16,000 characters are rejected
+(`400`). Invalid kind,
+importance, search, stale undo or unavailable mutation ID also returns `400`.
+Search treats words literally (OR matching, Porter stemming), with a 500-character
+query limit. Exports are regenerated within the write transaction. Changes
+broadcast owner-only `entities.changed` with `kinds: ["memory"]`.
+
 ## 4. WebSocket: `GET /api/ws`
 
 A single WebSocket carries all real-time events for the authenticated user.
@@ -2443,9 +2490,10 @@ was emitted). Events are delivered only to the users listed under
 | `message.delta` | `{"conversation_id", "message_id", "text"}` | Conversation members |
 | `message.activity` | `{"conversation_id", "message_id", "activity": {Activity}}` | Conversation members |
 | `message.completed` | `{"conversation_id", "message": {Message}}` | Conversation members |
+| `memory.noted` | `{"conversation_id", "message_id", "changes": [{"history_id", "item_id", "op", "text"}]}` | Owner only |
 | `turn.status` | `{"conversation_id", "message_id", "status": "queued" \| "running"}` | Conversation members |
 | `conversation.created` | `{"conversation": {Conversation}}` | Conversation members |
-| `entities.changed` | `{"kinds": ["goals" \| "ideas" \| "feed" \| "library", ...]}` | The affected user |
+| `entities.changed` | `{"kinds": ["goals" \| "ideas" \| "feed" \| "library" \| "memory", ...]}` | The affected user |
 | `settings.changed` | `{"settings": {Settings}}` | All users |
 | `harness.status` | `{"harness": {HarnessStatus}}` (`path` always `null`) | All users |
 | `message.updated` | `{"conversation_id", "message": {Message}}` | Conversation members |
@@ -2661,6 +2709,14 @@ of the conversation events (see [Scheduled jobs](#scheduled-jobs)).
 User messages and other stored messages always have status `complete`.
 
 ### The `meta` object
+
+Memory writes made during a private owner turn are saved as `Message.meta.noted`
+and sent as `memory.noted` after `message.completed`, including when the turn
+fails after a successful write. Changes contain history IDs for Undo and current
+note IDs for Edit (corrections group their add/supersede into one entry), with text previews capped at 240 characters (up to 100 changes).
+If conversation privacy is lost before completion, the reply is withheld and
+neither Noted metadata nor its event is exposed. The app can render a Noted chip
+from metadata when reconnecting; the UI is added separately.
 
 On a finished assistant message (`message.completed`):
 
@@ -3256,10 +3312,9 @@ Stored as `meta.routing` (plus `notes`).
 
 ### Memory
 
-The owner's long-term memory is stored as notes in SQLite; it has no REST
-routes yet and is reachable only from the owner's private chats (the
-`read_memory` / `write_memory` bridge tools) and as the read-only export in
-`memory/`.
+The owner's long-term memory is stored as notes in SQLite, available through
+the [owner-only Memory REST routes](#320-memory), recall/write tools in private
+owner chats, and the read-only Markdown export in `memory/`.
 
 `memory_items`, one row per note:
 
@@ -3631,12 +3686,31 @@ a new turn. Resolved cards are explicitly described as resolved in replay histor
 | `create_idea` | `title` (required, max 300), `description?` (max 2,000), `prompt?` (max 4,000; sent when the user taps the idea) | `{"idea": Idea}` (status `open`) |
 | `list_feed_posts` | `limit?: int` (1 to 50, default 10) | `{"posts": [FeedPost]}` |
 | `create_feed_post` | `title` (required, max 300), `body` (required, Markdown, max 50,000), `topic?` (max 100), `source_url?`, `source_name?` (max 100), `image_url?` (http(s), max 2,000), `images?: string[]` (the page's original photos, http(s), max 10), `why?` (max 300) | `{"post": FeedPost}` |
+| `search_memory` | `query` required; `topic?`, `since?` (ms) | `{hits: [{id,text,topic,kind,observed_at,updated_at}], has_more}`; compact text (240 chars), up to 30 hits |
+| `get_memory` | `ids` required (1–20 positive integers; duplicates count once) | `{items: [{item: MemoryItem, history}]}`; full text, sources, latest 100 changes |
+| `remember` | `text`, `kind` required; `importance?` (1–5), `observed_at?` (ms) | `{item, changed, history_id, similar_to, hint}` or `{item, duplicate: true, changed: false}` |
+| `update_memory` | `id` required; `text?`, `kind?`, `importance?`, `observed_at?`, `valid_to?` | Same save result; corrected text supersedes the old note with a linked replacement and undo history |
+| `forget` | `id` required | `{forgotten, history_id}`; hard delete with undo tombstone |
+| `search_conversations` | `query` required | `{hits: [{message_id,conversation_id,role,created_at,text,title}]}`; up to 30 excerpts, text capped at 500 chars |
 | `read_memory` | `path` (required, relative `.md` path, owner private context only): `MEMORY.md` or a topic file (`you.md`, `people.md`, `projects.md`, `routines.md`) | `{"content": string}`; error when the file does not exist |
 | `write_memory` | `path`, `content` (required, Markdown, one note per bullet; max 1,000,000 characters for `MEMORY.md` and topic files, 50,000 otherwise; owner private context only) | `{"written": true, "added": int, "unchanged": int, "removed": [string], "kept_pinned": [string], "kept_recent": [string], "not_restored": [string], "outside_core": [string], "note"?: string}`. For `MEMORY.md` or a topic file, the notes that file shows become exactly the notes written (an empty file removes them all): new ones are added (importance 4 in `MEMORY.md`, with the topic of the heading above them; 3 in a topic file), notes stored elsewhere are moved there, and notes left out are archived everywhere. `MEMORY.md` shows the [packed core](#memory) as last written. Pinned notes are kept (`kept_pinned`), and so are notes another chat saved or changed after this turn began, or that joined `MEMORY.md` after it began without being explicitly included in that turn's earlier core write (`kept_recent`, dated from the turn's message); a note in the content that another chat removed or corrected after the turn began is not saved again (`not_restored`). Changes the same turn made can be changed again. `outside_core` lists notes written to `MEMORY.md` that are saved but did not fit in it (they are in their topic files; empty for other paths). A note under headings that name its subject (`## Alex`, `### Work`) is saved as `Alex — Work: ...`. Any other path only adds notes (prefixed with the file's title), needs at least one, and returns a `note`. |
 | `save_to_library` | `title` (required, max 300), exactly one of `content` or `path`, `mime?`, `kind?: "artifact" \| "media"`, `description?` (max 2,000) | `{"item": LibraryItem}` |
 | `list_library` | `kind?: "artifact" \| "media"` | `{"items": [LibraryItem]}` (max 500) |
 | `create_card` | `type` (required, one of the [card types](#card)), `title` (required), `body?`, `url?`, `image_url?`, `action_label?`, `service?`, `ref_id?` (id of a related goal, idea, or feed post) | `{"card_message_id": "...", "shown": true}` |
 | `list_connectors` | none | `{"connectors": [{"name", "service", "description", "enabled", "signed_in", "paused", "rules"}], "available_to_connect": [{"service", "name", "description"}]}` |
+
+The six recall/write tools above are only offered and callable in owner-alone
+turns, with membership rechecked under the database write lock. Agent get/search
+hits increment `last_used_at` / `use_count` once per note, then refresh core packing.
+Conversation recall uses `conversation_messages_fts` (migration 11) with
+backfill and triggers over completed owner-private main/side text messages.
+Group chats, other people's chats, cards, system notes, jobs and incomplete
+replies are excluded. A membership change purges that conversation's index;
+once membership has changed beyond initial creation, it stays excluded even
+if it later returns to owner-alone. Queries also recheck the private-message
+view. No embeddings, direct model calls or background polling are involved.
+The write gate also applies to legacy Markdown writes/import; private spans and
+PEM blocks are scrubbed across the whole document before it is split into notes.
 
 `create_card` validates with the [Card](#card) rules and inserts a card
 message (`role: "assistant"`) into the current conversation. Clients receive

@@ -1569,7 +1569,9 @@ async fn finish(
         .db
         .call(move |db| {
             let members = db::conversation_member_ids(db, &conv)?;
-            let lost = private_owner.is_some_and(|o| members != [o]);
+            let lost = private_owner
+                .as_ref()
+                .is_some_and(|o| members != [o.clone()]);
             if lost {
                 mt["withheld"] = "people changed during a private reply".into();
                 mt["activity"] = json!([]);
@@ -1579,6 +1581,12 @@ async fn finish(
                     [&conv],
                 )?;
                 return Ok((db::finish_message(db, &m, "", "cancelled", &mt)?, true));
+            }
+            if private_owner.is_some() {
+                let noted = crate::memory::recall::noted(db, &format!("turn-{m}"))?;
+                if !noted.is_empty() {
+                    mt["noted"] = json!(noted);
+                }
             }
             db.execute(
                 "UPDATE messages SET status = 'complete' WHERE conversation_id = ?1
@@ -1615,6 +1623,20 @@ async fn finish(
         &completed_to,
         json!({"type": "message.completed", "conversation_id": conv_id, "message": message}),
     );
+
+    if !withheld && message.meta.get("noted").is_some() {
+        state.hub.send(
+            crate::events::Audience::Owner,
+            json!({
+                "type": "memory.noted", "conversation_id": conv_id,
+                "message_id": msg_id, "changes": message.meta["noted"],
+            }),
+        );
+        state.hub.send(
+            crate::events::Audience::Owner,
+            json!({"type":"entities.changed", "kinds":["memory"]}),
+        );
+    }
 
     // Cards the agent created through the Iris MCP bridge during the turn.
     let (c, after) = (conv_id.clone(), input.assistant_message.created_at);
@@ -2056,6 +2078,86 @@ mod tests {
         assert!(p.contains("Sam: m99"));
         assert!(!p.contains("Sam: m10\n"));
         assert_eq!(p.matches("Sam: m").count(), MAX_REPLAY_MESSAGES);
+    }
+
+    #[tokio::test]
+    async fn memory_noted_is_persisted_and_sent_only_to_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::browser::tools::tests::test_state(tmp.path());
+        let (owner, conv, user_message, assistant_message) = state.db.with(|c| {
+            let owner = db::owner_user_id(c)?.unwrap();
+            let conv = db::ensure_main_conversation(c, &owner)?;
+            let user = db::insert_message(c, &db::NewMessage {conversation_id:&conv,role:"user",author_user_id:Some(&owner),content:"Remember tea",..Default::default()})?;
+            let assistant = db::insert_message(c, &db::NewMessage {conversation_id:&conv,role:"assistant",status:"streaming",..Default::default()})?;
+            crate::memory::recall::mutate(c, &state.paths, |c| crate::memory::recall::save(c, &crate::memory::recall::Edit {text:Some("Likes tea".into()),kind:Some("preference".into()),..Default::default()},None,crate::memory::Actor::Agent,&json!({"type":"conversation","conversation_id":conv,"message_ids":[assistant.id]}),&format!("turn-{}",assistant.id)))?;
+            Ok((owner,conv,user,assistant))
+        }).unwrap();
+        let mut events = state.hub.subscribe();
+        let mut audience = Audience::new(&conv, vec![owner.clone()], 0);
+        audience.private_owner = Some(owner.clone());
+        let input = TurnInput {
+            conversation_id: conv.clone(),
+            user_message,
+            assistant_message: assistant_message.clone(),
+            purpose: Purpose::Chat,
+            slot: Slot::Chat,
+            owner_user_id: owner.clone(),
+            continuity: true,
+        };
+        finish(
+            &state,
+            &input,
+            &mut audience,
+            &Acc::default(),
+            json!(null),
+            Outcome::Complete,
+        )
+        .await;
+        let stored = state
+            .db
+            .with(|c| db::get_message(c, &assistant_message.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.meta["noted"][0]["text"], "Likes tea");
+        let mut saw = false;
+        while let Ok(event) = events.try_recv() {
+            let v: Value = serde_json::from_str(&event.json).unwrap();
+            if v["type"] == "memory.noted" {
+                assert!(event.audience.reaches(&owner, true));
+                assert!(!event.audience.reaches("guest", false));
+                assert_eq!(v["changes"], stored.meta["noted"]);
+                saw = true;
+            }
+        }
+        assert!(saw);
+        // A join before completion must withhold both metadata and event.
+        state.db.with(|c| {
+            c.execute("INSERT INTO users(id,display_name,created_at) VALUES ('guest','Guest',0)", [])?;
+            c.execute("INSERT INTO conversation_members(conversation_id,user_id,joined_at) VALUES (?1,'guest',0)",[&conv])?;
+            Ok(())
+        }).unwrap();
+        finish(
+            &state,
+            &input,
+            &mut audience,
+            &Acc::default(),
+            json!(null),
+            Outcome::Complete,
+        )
+        .await;
+        let stored = state
+            .db
+            .with(|c| db::get_message(c, &assistant_message.id))
+            .unwrap()
+            .unwrap();
+        assert!(stored.meta.get("noted").is_none());
+        assert_eq!(stored.status, "cancelled");
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(
+                serde_json::from_str::<Value>(&event.json).unwrap()["type"],
+                "memory.noted"
+            );
+        }
     }
 
     #[tokio::test]

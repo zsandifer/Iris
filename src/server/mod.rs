@@ -7,6 +7,7 @@ mod browser;
 mod chat;
 mod connect;
 mod content;
+mod memory;
 mod web;
 mod ws;
 
@@ -175,6 +176,7 @@ pub fn router(state: AppState) -> Router {
         .route("/users/{id}/pairing-code", post(user_pairing_code))
         .merge(chat::routes())
         .merge(content::routes())
+        .merge(memory::routes())
         .merge(admin::routes())
         .merge(browser::routes())
         .merge(connect::routes())
@@ -648,6 +650,135 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK, "{body}");
         body["token"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn memory_routes_are_owner_only_and_edits_pin_forget_and_undo_work() {
+        let h = setup();
+        let owner = pair_as(&h, None).await;
+        let guest = h
+            .state
+            .db
+            .with(|c| {
+                c.execute(
+                    "INSERT INTO users(id,display_name,created_at) VALUES ('guest','Guest',0)",
+                    [],
+                )?;
+                Ok("guest".to_string())
+            })
+            .unwrap();
+        let other = pair_as(&h, Some(&guest)).await;
+        let (status, saved) = send(
+            &h.app,
+            "POST",
+            "/api/memory",
+            Some(&owner),
+            Some(json!({"text":"Likes hiking", "kind":"preference"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        let id = saved["item"]["id"].as_i64().unwrap();
+        let path = format!("/api/memory/{id}");
+        let (status, pin) = send(
+            &h.app,
+            "PATCH",
+            &path,
+            Some(&owner),
+            Some(json!({"pinned":true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{pin}");
+        assert_eq!(pin["item"]["pinned"], true);
+        let undo_path = format!("/api/memory/history/{}/undo", pin["history_id"]);
+        for (method, url, body) in [
+            ("GET", "/api/memory", None),
+            ("GET", &path, None),
+            ("POST", "/api/memory", Some(json!({"text":"x"}))),
+            ("PATCH", &path, Some(json!({"pinned":false}))),
+            ("DELETE", &path, None),
+            ("POST", &undo_path, Some(json!({}))),
+        ] {
+            assert_eq!(
+                send(&h.app, method, url, Some(&other), body).await.0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            send(&h.app, "GET", "/api/memory", None, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, detail) = send(&h.app, "GET", &path, Some(&owner), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["history"].as_array().unwrap().len(), 2);
+        assert_eq!(detail["item"]["use_count"], 0);
+        let (status, list) = send(
+            &h.app,
+            "GET",
+            "/api/memory?query=hiking&topic=you&since=0",
+            Some(&owner),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert_eq!(list["items"][0]["id"], id);
+        assert_eq!(
+            send(&h.app, "POST", &undo_path, Some(&owner), Some(json!({})))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let (_, detail) = send(&h.app, "GET", &path, Some(&owner), None).await;
+        assert_eq!(detail["item"]["pinned"], false);
+        assert_eq!(
+            send(&h.app, "POST", &undo_path, Some(&owner), Some(json!({})))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, deleted) = send(&h.app, "DELETE", &path, Some(&owner), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            send(&h.app, "GET", &path, Some(&owner), None).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            send(
+                &h.app,
+                "POST",
+                &format!("/api/memory/history/{}/undo", deleted["history_id"]),
+                Some(&owner),
+                Some(json!({}))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let core = std::fs::read_to_string(h.state.paths.memory_dir().join("MEMORY.md")).unwrap();
+        assert!(core.contains("Likes hiking"));
+        assert_eq!(
+            send(
+                &h.app,
+                "POST",
+                "/api/memory",
+                Some(&owner),
+                Some(json!({"text":"token=synthetic-canary"}))
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            send(
+                &h.app,
+                "GET",
+                "/api/memory?query=%22%2A%22",
+                Some(&owner),
+                None
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]

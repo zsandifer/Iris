@@ -13,16 +13,18 @@
 //! Memory is only ever reachable from the owner's private chats.
 
 pub mod files;
+pub mod gate;
 pub mod markdown;
 pub mod packing;
+pub mod recall;
 
 use crate::util::{now_ms, sha256_hex};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// How notes are grouped in the app and in the export.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Topic {
     You,
@@ -43,7 +45,7 @@ impl Topic {
         }
     }
 
-    fn parse(s: &str) -> Option<Topic> {
+    pub fn parse(s: &str) -> Option<Topic> {
         Topic::ALL.into_iter().find(|t| t.name() == s)
     }
 
@@ -83,6 +85,7 @@ pub enum Actor {
     Agent,
     /// Imported from Markdown notes.
     Import,
+    Owner,
 }
 
 impl Actor {
@@ -90,12 +93,13 @@ impl Actor {
         match self {
             Actor::Agent => "agent",
             Actor::Import => "import",
+            Actor::Owner => "owner",
         }
     }
 }
 
 /// One note.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
     pub id: i64,
     pub kind: String,
@@ -185,7 +189,7 @@ pub enum Added {
     Existing(Box<Item>),
 }
 
-fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Item>> {
+pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Item>> {
     conn.query_row(
         &format!("SELECT {COLUMNS} FROM memory_items WHERE id = ?1"),
         [id],
@@ -194,7 +198,7 @@ fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<Item>> {
     .optional()
 }
 
-fn live_by_hash(conn: &Connection, hash: &str) -> rusqlite::Result<Option<Item>> {
+pub(crate) fn live_by_hash(conn: &Connection, hash: &str) -> rusqlite::Result<Option<Item>> {
     conn.query_row(
         &format!(
             "SELECT {COLUMNS} FROM memory_items
@@ -274,7 +278,12 @@ fn record(
 /// Add a note unless a live note with the same text exists. Call inside a
 /// write transaction.
 pub fn add(conn: &Connection, new: &NewItem, actor: Actor, batch: &str) -> rusqlite::Result<Added> {
-    let text = markdown::normalize(new.text);
+    let text = gate::scrub_document(new.text);
+    if text.is_empty() {
+        return Err(recall::invalid(
+            "I couldn't save a note containing only private or secret information.",
+        ));
+    }
     let hash = content_hash(&text);
     if let Some(existing) = live_by_hash(conn, &hash)? {
         return Ok(Added::Existing(Box::new(existing)));
@@ -282,8 +291,8 @@ pub fn add(conn: &Connection, new: &NewItem, actor: Actor, batch: &str) -> rusql
     let now = now_ms();
     conn.execute(
         "INSERT INTO memory_items
-             (kind, topic, text, importance, created_at, source, content_hash, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?5)",
+             (id, kind, topic, text, importance, created_at, source, content_hash, updated_at)
+         VALUES ((SELECT MAX(id) + 1 FROM (SELECT COALESCE(MAX(id), 0) AS id FROM memory_items UNION ALL SELECT COALESCE(MAX(item_id), 0) FROM memory_history)), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?5)",
         params![
             new.kind,
             new.topic.name(),

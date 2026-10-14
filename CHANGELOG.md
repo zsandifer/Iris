@@ -58,6 +58,11 @@ All notable changes to Iris are documented here, following
   answering is never removed by that chat's out-of-date copy.
   Ordinary notes fill spare capacity too, and resumed Codex chats receive
   current memory after another chat saves or corrects a note.
+- Owner-private memory recall tools and past conversation keyword search, with
+  secret/private-text filtering, duplicate protection, similarity hints,
+  history-backed corrections and Forget/Undo. Owner-only Memory API supports
+  search, topic filters, detail, editing and pinning; private turn writes persist
+  Noted metadata and emit an owner-only event for the later app UI.
 - Optional separation of Iris and its agents into different OS users.
 - Self-awareness of setup and connection status, with sign-in and setup cards.
 - An installable mobile app with keyboard handling and a full-screen photo viewer.
