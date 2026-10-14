@@ -23,6 +23,8 @@ pub struct Bridge {
     pub conversation_id: Option<String>,
     /// The assistant message this turn is writing (memory provenance).
     pub message_id: Option<String>,
+    /// When this bridge started (ms): about when the turn began.
+    pub started_at: i64,
     /// Conversation with more than one person: only cards are offered, so
     /// nothing reads or changes the owner's personal data.
     pub shared: bool,
@@ -36,6 +38,9 @@ pub struct Bridge {
 
 /// Tools available in shared (group) conversations.
 const SHARED_TOOLS: &[&str] = &["create_card"];
+
+/// Largest `write_memory` content for an export file (the whole file).
+const MAX_MEMORY_FILE: usize = 1_000_000;
 
 /// Run the stdio loop until stdin closes.
 pub fn run(bridge: Bridge) -> Result<()> {
@@ -441,26 +446,48 @@ impl Bridge {
                     Ok(json!({"content": text}))
                 } else {
                     let content = s("content").ok_or("content is required")?;
-                    check_text("content", content, MAX_BODY, false)?;
+                    let export = crate::memory::files::is_export_name(path);
+                    // A topic file holds every note of its topic and is
+                    // written back whole.
+                    check_text(
+                        "content",
+                        content,
+                        if export { MAX_MEMORY_FILE } else { MAX_BODY },
+                        false,
+                    )?;
                     let source = json!({
                         "type": "conversation",
                         "conversation_id": self.conversation_id,
                         "message_ids": self.message_id.iter().collect::<Vec<_>>(),
                     });
-                    let w =
-                        crate::memory::files::write(&self.db, &self.paths, path, content, &source)
-                            .map_err(db_err)?;
+                    let w = crate::memory::files::write(
+                        &self.db,
+                        &self.paths,
+                        path,
+                        content,
+                        &source,
+                        self.started_at,
+                    )
+                    .map_err(db_err)?;
                     let mut out = json!({
                         "written": true,
                         "added": w.added,
                         "unchanged": w.unchanged,
                         "removed": w.removed,
                         "kept_pinned": w.kept_pinned,
+                        "kept_recent": w.kept_recent,
                     });
-                    if !crate::memory::files::is_export_name(path) {
+                    if !export {
                         out["note"] = json!(
                             "Saved as notes in the topic files. Next time write MEMORY.md, \
                              you.md, people.md, projects.md or routines.md."
+                        );
+                    }
+                    if !w.kept_recent.is_empty() {
+                        out["note"] = json!(
+                            "The kept_recent notes were saved from another chat after you \
+                             started; read the file again and write it without them to \
+                             remove them."
                         );
                     }
                     if !w.kept_pinned.is_empty() {
@@ -804,6 +831,7 @@ mod tests {
             user_id,
             conversation_id: Some(conv),
             message_id: Some("m1".into()),
+            started_at: 0,
             shared: false,
             workdir: None,
             agent: crate::config::AgentConfig::default(),

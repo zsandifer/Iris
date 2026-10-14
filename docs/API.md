@@ -3298,9 +3298,10 @@ saying Iris generated it.
 **Import.** At `iris serve` and `iris init`, Markdown notes in `memory/` that
 Iris did not generate (the notes kept before memory moved into SQLite, or
 files put there since) are imported: each top-level bullet or paragraph
-becomes a `fact` note (notes from a file other than the export files are
-prefixed with the file's title and heading, and their topic is guessed from
-the path and headings). The originals are copied to
+becomes a `fact` note, prefixed with the title and heading above it when
+they name its subject (`## Alex` → `Alex: ...`; a file without a title is
+named after its file name), with its topic guessed from the path and
+headings. The originals are copied to
 `memory-backup/<UTC time>/` in the data directory first, then removed from
 `memory/`. Importing is idempotent: notes already stored are not added
 again. `iris import openclaw` imports OpenClaw memory files the same way.
@@ -3605,7 +3606,7 @@ a new turn. Resolved cards are explicitly described as resolved in replay histor
 | `list_feed_posts` | `limit?: int` (1 to 50, default 10) | `{"posts": [FeedPost]}` |
 | `create_feed_post` | `title` (required, max 300), `body` (required, Markdown, max 50,000), `topic?` (max 100), `source_url?`, `source_name?` (max 100), `image_url?` (http(s), max 2,000), `images?: string[]` (the page's original photos, http(s), max 10), `why?` (max 300) | `{"post": FeedPost}` |
 | `read_memory` | `path` (required, relative `.md` path, owner private context only): `MEMORY.md` or a topic file (`you.md`, `people.md`, `projects.md`, `routines.md`) | `{"content": string}`; error when the file does not exist |
-| `write_memory` | `path`, `content` (required, Markdown, one note per bullet, max 50,000; owner private context only) | `{"written": true, "added": int, "unchanged": int, "removed": [string], "kept_pinned": [string], "note"?: string}`. For `MEMORY.md` or a topic file, the notes that file shows become exactly the notes written: new ones are added (importance 4 in `MEMORY.md`, with the topic of the heading above them; 3 in a topic file), notes stored elsewhere are moved there, and notes left out are archived everywhere (pinned notes are kept and listed in `kept_pinned`). Any other path only adds notes (prefixed with the file's title) and returns a `note`. Content without any note is refused. |
+| `write_memory` | `path`, `content` (required, Markdown, one note per bullet; max 1,000,000 characters for `MEMORY.md` and topic files, 50,000 otherwise; owner private context only) | `{"written": true, "added": int, "unchanged": int, "removed": [string], "kept_pinned": [string], "kept_recent": [string], "note"?: string}`. For `MEMORY.md` or a topic file, the notes that file shows become exactly the notes written (an empty file removes them all): new ones are added (importance 4 in `MEMORY.md`, with the topic of the heading above them; 3 in a topic file), notes stored elsewhere are moved there, and notes left out are archived everywhere. Pinned notes are kept (`kept_pinned`), and so are notes another chat saved or changed after this turn began (`kept_recent`). A note under a heading that names its subject (`## Alex`) is saved as `Alex: ...`. Any other path only adds notes (prefixed with the file's title), needs at least one, and returns a `note`. |
 | `save_to_library` | `title` (required, max 300), exactly one of `content` or `path`, `mime?`, `kind?: "artifact" \| "media"`, `description?` (max 2,000) | `{"item": LibraryItem}` |
 | `list_library` | `kind?: "artifact" \| "media"` | `{"items": [LibraryItem]}` (max 500) |
 | `create_card` | `type` (required, one of the [card types](#card)), `title` (required), `body?`, `url?`, `image_url?`, `action_label?`, `service?`, `ref_id?` (id of a related goal, idea, or feed post) | `{"card_message_id": "...", "shown": true}` |

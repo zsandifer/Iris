@@ -250,6 +250,9 @@ pub fn import_openclaw(source: &Path, paths: &Paths, opts: &Options) -> Result<V
         }
         if !notes.is_empty() {
             let db = crate::db::Db::open(&paths.db_file())?;
+            // Notes kept as Markdown by an older Iris are imported (and
+            // backed up) before the export is rewritten.
+            crate::memory::files::prepare(&db, paths)?;
             let counts = crate::memory::files::import_notes(&db, paths, &notes)?;
             for (i, c) in note_items.into_iter().zip(counts) {
                 items[i].action = if c.added == 0 {
@@ -410,12 +413,12 @@ mod tests {
         .unwrap();
         assert!(!paths.data_dir.exists());
         let creates = items.iter().filter(|i| i.action == Action::Create).count();
-        assert_eq!(creates, 2, "{items:#?}");
+        assert_eq!(creates, 2);
         let notes = items
             .iter()
             .filter(|i| i.action == Action::Memory(1))
             .count();
-        assert_eq!(notes, 3, "{items:#?}");
+        assert_eq!(notes, 3);
         let text = report(&items, true);
         assert!(text.contains("would copy") && text.contains("dry run"));
         assert!(text.contains("would add to memory") && text.contains("3 memory notes to add"));
@@ -557,6 +560,40 @@ mod tests {
         assert!(read(paths.memory_dir().join("MEMORY.md")).contains("- Remember the garden."));
         assert_eq!(read(paths.persona_dir().join("SOUL.md")), "my own soul");
         assert!(items.iter().any(|i| matches!(i.action, Action::SkipExists)));
+    }
+
+    #[test]
+    fn existing_markdown_memory_is_kept_when_importing_before_first_start() {
+        let (_t, src, paths) = setup();
+        // An install upgraded but not started yet: memory still as Markdown.
+        crate::persona::seed(&paths).unwrap();
+        std::fs::write(paths.memory_dir().join("MEMORY.md"), "- Owner's own fact\n").unwrap();
+        std::fs::write(paths.memory_dir().join("people.md"), "- Neighbour Kim\n").unwrap();
+        import_openclaw(
+            &src,
+            &paths,
+            &Options {
+                dry_run: false,
+                force: false,
+            },
+        )
+        .unwrap();
+        let read = |p: PathBuf| std::fs::read_to_string(p).unwrap();
+        let core = read(paths.memory_dir().join("MEMORY.md"));
+        assert!(core.contains("- Owner's own fact\n") && core.contains("- Remember the garden.\n"));
+        let people = read(paths.memory_dir().join("people.md"));
+        assert!(
+            people.contains("- Neighbour Kim\n") && people.contains("- Alex: Climbs on weekends\n")
+        );
+        let backups: Vec<_> = std::fs::read_dir(crate::memory::files::backup_root(&paths))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            read(backups[0].path().join("people.md")),
+            "- Neighbour Kim\n"
+        );
     }
 
     #[test]

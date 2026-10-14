@@ -248,6 +248,7 @@ fn run(args: Args) -> Result<()> {
                 user_id: user.to_string(),
                 conversation_id: args.value("--conversation").map(String::from),
                 message_id: args.value("--message").map(String::from),
+                started_at: util::now_ms(),
                 shared: args.has("--shared"),
                 workdir: args.value("--workdir").map(PathBuf::from),
                 agent,
