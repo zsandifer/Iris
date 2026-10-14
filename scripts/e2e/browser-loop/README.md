@@ -80,9 +80,11 @@ it to a tailnet address or put it behind `tailscale serve` (tailnet only).
 
 The judge (`--judge codex:gpt-6-luna`, `claude:haiku`, or `none`) gets the
 task, the success criteria, every message, the tools each turn called, the
-browser's final page, check results, warning lines from Iris's log, and the
-live view's picture at the end of each turn (not for the `real` suite, whose
-pages stay on this machine), so a reply that contradicts the page fails. It
+browser's final page, check results, warning lines from Iris's log, the
+tool errors and the last page snapshot the agent read (with a Claude chat
+model), and the live view's picture at the end of each turn (pictures and
+snapshots not for the `real` suite, whose pages stay on this machine), so a
+reply that contradicts the page fails. It
 answers `pass`, `fail`, or `nudge` (a short follow-up a user would send when
 the agent stopped early; at most `--max-nudges`, default 1), and for
 failures a root cause: `site_blocking`, `iris_bug`, `model_behavior`,
