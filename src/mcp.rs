@@ -39,6 +39,14 @@ pub struct Bridge {
 /// Tools available in shared (group) conversations.
 const SHARED_TOOLS: &[&str] = &["create_card"];
 
+/// Routine tools: only in the owner's own conversations.
+const ROUTINE_TOOLS: &[&str] = &[
+    "list_routines",
+    "create_routine",
+    "update_routine",
+    "delete_routine",
+];
+
 /// Largest `write_memory` content for an export file (the whole file).
 const MAX_MEMORY_FILE: usize = 1_000_000;
 
@@ -149,6 +157,56 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
             "additionalProperties": false,
         },
     })
+}
+
+/// Fields of `create_routine` and `update_routine`.
+fn routine_properties(update: bool) -> Value {
+    let s = |d: &str| json!({"type": "string", "description": d});
+    let mut p = json!({
+        "title": s("Short name, e.g. \"Saturday dinner order\""),
+        "emoji": s("One emoji for the routine"),
+        "instructions": s("What to do on every run, written as instructions to yourself"),
+        "schedule_kind": {"type": "string", "enum": ["once", "rule", "cron"],
+            "description": "once: one date and time; rule: repeats; cron: a 5-field cron pattern"},
+        "run_at": s("once: local date and time, e.g. 2026-10-29T08:00"),
+        "rule": {
+            "type": "object",
+            "description": "rule: {freq, time, every?, anchor?, ...}. freq daily | weekly (days: \
+                [0=Sunday..6=Saturday]) | monthly (day 1-31, or nth 1-4 / -1 for last plus \
+                weekday 0-6) | yearly (month 1-12, day). time is local HH:MM. every repeats \
+                every N days/weeks/months/years counted from anchor (YYYY-MM-DD).",
+            "properties": {
+                "freq": {"type": "string", "enum": ["daily", "weekly", "monthly", "yearly"]},
+                "time": s("Local time HH:MM, 24-hour"),
+                "every": {"type": "integer", "minimum": 1},
+                "anchor": s("YYYY-MM-DD the counting for `every` starts from"),
+                "days": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 6}},
+                "day": {"type": "integer", "minimum": 1, "maximum": 31},
+                "nth": {"type": "integer", "enum": [1, 2, 3, 4, -1]},
+                "weekday": {"type": "integer", "minimum": 0, "maximum": 6},
+                "month": {"type": "integer", "minimum": 1, "maximum": 12},
+            },
+            "required": ["freq", "time"],
+        },
+        "cron_expr": s("cron: minute hour day-of-month month day-of-week, e.g. 30 17 * * 6"),
+        "tz": s("IANA time zone, e.g. America/Chicago (default: the owner's)"),
+        "starts_at": s("First date it may run, YYYY-MM-DD"),
+        "end_at": s("Last date it may run, YYYY-MM-DD"),
+        "max_runs": {"type": "integer", "minimum": 1, "description": "Stop after this many runs"},
+        "ask_before_acting": {"type": "boolean",
+            "description": "Prepare, then ask the owner before buying, ordering, booking or sending (default true)"},
+        "notify_when_done": {"type": "boolean", "description": "Push a notification with the result (default true)"},
+        "approval_timeout_mins": {"type": "integer", "minimum": 5, "maximum": 1440,
+            "description": "How long to wait for the owner's OK before skipping the run (default 120)"},
+        "misfire": {"type": "string", "enum": ["skip", "run_latest_in_window"],
+            "description": "If a run was missed while offline: skip it (use for buying or sending), or run it if under an hour late (default)"},
+        "max_retries": {"type": "integer", "minimum": 0, "maximum": 3, "description": "Retries after a failure (default 2)"},
+    });
+    if update {
+        p["id"] = s("Routine id");
+        p["paused"] = json!({"type": "boolean", "description": "true pauses it, false resumes it"});
+    }
+    p
 }
 
 pub fn tool_definitions() -> Vec<Value> {
@@ -339,6 +397,33 @@ pub fn tool_definitions() -> Vec<Value> {
             &["type", "title"],
         ),
         tool(
+            "list_routines",
+            "List the owner's routines (scheduled jobs) with their schedule, state, next \
+             run, last result, and any change still waiting for the owner.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "create_routine",
+            "Propose a routine: a job you run for the owner on a schedule. It only starts \
+             after the owner taps the card this posts in the chat.",
+            routine_properties(false),
+            &["title", "instructions", "schedule_kind"],
+        ),
+        tool(
+            "update_routine",
+            "Propose changing a routine (only the fields you pass), or pausing / resuming \
+             it. Takes effect when the owner taps the card this posts.",
+            routine_properties(true),
+            &["id"],
+        ),
+        tool(
+            "delete_routine",
+            "Propose deleting a routine. Takes effect when the owner taps the card this posts.",
+            json!({"id": s("Routine id")}),
+            &["id"],
+        ),
+        tool(
             "list_connectors",
             "List connected services (MCP connectors), whether they are on and signed in, \
              and the services the user can still connect (`available_to_connect`).",
@@ -376,6 +461,7 @@ impl Bridge {
                             && (!(matches!(name, "read_memory" | "write_memory")
                                 || crate::memory::recall::TOOLS.contains(&name))
                                 || self.private_status_context())
+                            && (!ROUTINE_TOOLS.contains(&name) || self.owner_context())
                     })
                     .collect();
                 json!({"tools": tools})
@@ -791,6 +877,12 @@ impl Bridge {
                     .map_err(db_err)?;
                 Ok(json!({"post": post}))
             }
+            "list_routines" | "create_routine" | "update_routine" | "delete_routine" => {
+                if !self.owner_context() {
+                    return Err("routines are only available in the owner's own chats".into());
+                }
+                self.routine_tool(name, a)
+            }
             "save_to_library" => self.save_to_library(a),
             "list_library" => {
                 let items = self
@@ -851,6 +943,71 @@ impl Bridge {
             }
             other => Err(format!("unknown tool {other}")),
         }
+    }
+
+    fn routine_tool(&self, name: &str, a: &Value) -> std::result::Result<Value, String> {
+        use crate::routines;
+        let uid = self.user_id.as_str();
+        let now = crate::util::now_ms();
+        if name == "list_routines" {
+            let list = self
+                .db
+                .with(|c| {
+                    routines::list_routines(c, uid)?
+                        .iter()
+                        .map(|r| routines::agent_json(c, r, now))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .map_err(|e| e.to_string())?;
+            return Ok(json!({"routines": list}));
+        }
+        let conv = self
+            .conversation_id
+            .as_deref()
+            .ok_or("no current conversation")?;
+        // Shown with the reply (pending until the turn is saved).
+        let target = routines::CardTarget {
+            conversation_id: conv,
+            status: "pending",
+        };
+        let proposal = self
+            .db
+            .with(|c| {
+                Ok(match name {
+                    "create_routine" => routines::Spec::from_json(a, &routines::default_tz(c))
+                        .and_then(|spec| routines::propose_create(c, uid, spec, &target)),
+                    _ => {
+                        let id = a["id"].as_str().unwrap_or("");
+                        if name == "delete_routine" {
+                            routines::propose_delete(c, uid, id, &target)
+                        } else {
+                            let mut patch = a.clone();
+                            if let Some(o) = patch.as_object_mut() {
+                                o.remove("id");
+                                if let Some(p) = o.remove("paused") {
+                                    let paused = p.as_bool().unwrap_or(false);
+                                    o.insert(
+                                        "state".into(),
+                                        if paused { "paused" } else { "active" }.into(),
+                                    );
+                                }
+                            }
+                            routines::propose_update(c, uid, id, &patch, &target)
+                        }
+                    }
+                })
+            })
+            .map_err(|e| e.to_string())??;
+        let next = proposal.card.card.as_ref().map(|c| c["next"].clone());
+        Ok(json!({
+            "proposed": true,
+            "routine_id": proposal.routine.id,
+            "change": proposal.change.summary,
+            "next_run": next,
+            "card_message_id": proposal.card.id,
+            "note": "The owner sees a card in this chat. Nothing changes until they tap it, \
+                     so do not say it is done; tell them it is ready for their OK.",
+        }))
     }
 
     fn save_to_library(&self, a: &Value) -> std::result::Result<Value, String> {
@@ -1055,6 +1212,76 @@ mod tests {
                           "params": {"name": name, "arguments": args}}))
             .unwrap()["result"]
             .clone()
+    }
+
+    #[test]
+    fn routine_tools_propose_and_only_in_the_owner_s_own_chats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = bridge(tmp.path());
+        let names = |b: &Bridge| -> Vec<String> {
+            b.handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+                .unwrap()["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for t in ROUTINE_TOOLS {
+            assert!(names(&b).contains(&t.to_string()), "{t}");
+        }
+        let r = call(
+            &b,
+            "create_routine",
+            json!({"title": "Rent reminder", "emoji": "💸", "instructions": "Remind me to pay rent.",
+                   "schedule_kind": "rule", "tz": "America/Chicago", "ask_before_acting": false,
+                   "rule": {"freq": "monthly", "day": 1, "time": "09:00"}}),
+        );
+        assert_eq!(r["isError"], false, "{r}");
+        let out = &r["structuredContent"];
+        assert_eq!(out["proposed"], true);
+        let card =
+            b.db.with(|c| db::get_message(c, out["card_message_id"].as_str().unwrap()))
+                .unwrap()
+                .unwrap();
+        // Held back until the turn's reply is kept, like other private cards.
+        assert_eq!(card.status, "pending");
+        assert_eq!(card.card.unwrap()["body"], "Monthly on the 1st · 9:00 AM");
+        let listed = call(&b, "list_routines", json!({}));
+        assert_eq!(
+            listed["structuredContent"]["routines"][0]["state"],
+            "pending_approval"
+        );
+        let bad = call(
+            &b,
+            "create_routine",
+            json!({"title": "x", "instructions": "y", "schedule_kind": "once"}),
+        );
+        assert_eq!(bad["isError"], true);
+        assert!(
+            bad["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("date and time")
+        );
+
+        // Never in a shared conversation, nor in someone else's chat.
+        b.shared = true;
+        assert!(!names(&b).iter().any(|n| n.contains("routine")));
+        assert_eq!(call(&b, "list_routines", json!({}))["isError"], true);
+        b.shared = false;
+        b.user_id = b
+            .db
+            .with(|c| {
+                c.execute(
+                    "INSERT INTO users (id, display_name, is_owner, created_at) VALUES ('u2', 'Sam', 0, 0)",
+                    [],
+                )?;
+                Ok("u2".to_string())
+            })
+            .unwrap();
+        assert!(!names(&b).iter().any(|n| n.contains("routine")));
+        assert_eq!(call(&b, "create_routine", json!({}))["isError"], true);
     }
 
     #[test]
