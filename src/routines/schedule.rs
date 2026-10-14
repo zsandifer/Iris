@@ -284,7 +284,50 @@ pub fn zoned(tz: &TimeZone, at_ms: i64) -> Option<Zoned> {
         .map(|t| t.to_zoned(tz.clone()))
 }
 
+/// The next local time a cron pattern matches after (or at) `civil`.
+fn cron_after(cron: &croner::Cron, civil: DateTime, inclusive: bool) -> Option<DateTime> {
+    let from = civil.to_zoned(TimeZone::UTC).ok()?;
+    cron.find_next_occurrence(&from, inclusive)
+        .ok()
+        .map(|z| z.datetime())
+}
+
+/// A local time the clocks skip (spring forward).
+fn in_gap(tz: &TimeZone, dt: DateTime) -> bool {
+    matches!(
+        tz.to_ambiguous_timestamp(dt).offset(),
+        AmbiguousOffset::Gap { .. }
+    )
+}
+
 impl Plan {
+    /// Whether a cron pattern has a real (not moved) time within
+    /// `MIN_CRON_GAP_MINS` of instant `t`, other than `t` itself.
+    fn cron_runs_near(&self, cron: &croner::Cron, t: i64) -> bool {
+        let gap = MIN_CRON_GAP_MINS * 60_000;
+        let Some(mut civil) = zoned(&self.tz, t - gap).map(|z| z.datetime()) else {
+            return false;
+        };
+        let mut inclusive = true;
+        for _ in 0..200 {
+            let Some(next) = cron_after(cron, civil, inclusive) else {
+                return false;
+            };
+            let Some(at) = resolve(&self.tz, next).map(ms) else {
+                return false;
+            };
+            if at > t + gap && !in_gap(&self.tz, next) {
+                return false;
+            }
+            if !in_gap(&self.tz, next) && at != t && (t - at).abs() <= gap {
+                return true;
+            }
+            civil = next;
+            inclusive = false;
+        }
+        false
+    }
+
     /// The first run strictly after `after_ms` (UTC milliseconds), or None
     /// when the schedule is over.
     pub fn next_after(&self, after_ms: i64) -> Option<i64> {
@@ -326,15 +369,16 @@ impl Plan {
                     inclusive = true;
                 }
                 // Times that resolve to or before `after_ms` (the repeated
-                // hour, or several times in one gap) are passed over.
+                // hour, or several times in one gap) are passed over, and a
+                // time moved to the jump is dropped when the pattern runs
+                // within MIN_CRON_GAP_MINS of it anyway.
                 for _ in 0..1000 {
-                    let from = civil.to_zoned(TimeZone::UTC).ok()?;
-                    let next = cron.find_next_occurrence(&from, inclusive).ok()?.datetime();
+                    let next = cron_after(cron, civil, inclusive)?;
                     if self.ends.is_some_and(|e| next.date() > e) {
                         return None;
                     }
                     let t = ms(resolve(&self.tz, next)?);
-                    if t > after_ms {
+                    if t > after_ms && !(in_gap(&self.tz, next) && self.cron_runs_near(cron, t)) {
                         return Some(t);
                     }
                     civil = next;
@@ -504,6 +548,25 @@ pub fn check_cron_gap(plan: &Plan, expr: &str, from_ms: i64) -> Result<(), Strin
     let runs = plan.upcoming(from_ms, 12, None);
     if runs.windows(2).any(|w| w[1] - w[0] < gap) {
         return Err(too_often());
+    }
+    // Around the next daylight-saving changes, where the clock jumps can
+    // bring two times closer than they look.
+    if let Ok(from) = Timestamp::from_millisecond(from_ms) {
+        for tr in plan.tz.following(from).take(4) {
+            let at = ms(tr.timestamp());
+            if at - from_ms > 400 * 86_400_000 {
+                break;
+            }
+            let day = 86_400_000;
+            let runs: Vec<i64> = plan
+                .upcoming(at - day, 200, None)
+                .into_iter()
+                .take_while(|t| *t <= at + day)
+                .collect();
+            if runs.windows(2).any(|w| w[1] - w[0] < gap) {
+                return Err(too_often());
+            }
+        }
     }
     let mins = day_minutes(expr)?;
     if let (Some(first), Some(last)) = (mins.first(), mins.last())
@@ -865,6 +928,36 @@ mod tests {
                 "2027-03-14 14:30 -05:00",
             ]
         );
+        // Every half hour, off the hour: the 2:15 the clocks skip is not
+        // squeezed in at 3:00, 15 minutes after 1:45 and before 3:15.
+        let halves = "15,45 * * * *";
+        let half_plan = Plan {
+            when: When::Cron(Box::new(parse_cron(halves).unwrap())),
+            ..plan.clone()
+        };
+        assert_eq!(
+            next_n(&half_plan, CHI, "2027-03-14T01:30", 3),
+            [
+                "2027-03-14 01:45 -06:00",
+                "2027-03-14 03:15 -05:00",
+                "2027-03-14 03:45 -05:00",
+            ]
+        );
+        assert!(check_cron_gap(&half_plan, halves, at(CHI, "2026-10-14T12:00")).is_ok());
+        // A pattern only crowded by the jump is refused up front: 1:50 and
+        // 3:05 are 15 minutes apart that night.
+        let jumpy = "5,50 1,3 * * *";
+        let jumpy_plan = Plan {
+            when: When::Cron(Box::new(parse_cron(jumpy).unwrap())),
+            ..plan.clone()
+        };
+        assert!(check_cron_gap(&jumpy_plan, jumpy, at(CHI, "2026-10-14T12:00")).is_err());
+        // Without daylight saving the same pattern is fine.
+        let utc_plan = Plan {
+            tz: tz("UTC"),
+            ..jumpy_plan.clone()
+        };
+        assert!(check_cron_gap(&utc_plan, jumpy, at("UTC", "2026-10-14T12:00")).is_ok());
         assert!(parse_cron("0 30 17 * * 6").is_err(), "no seconds field");
         assert!(parse_cron("nonsense").is_err());
         let often = Plan {

@@ -3117,17 +3117,24 @@ from when a run actually started.
 - **Failures.** A failed run is retried after 1, 5, then 30 minutes, up to
   `max_retries` times (status `failed` with `retry_at` meanwhile). An
   attempt that may have acted is never retried automatically: the acting
-  step after an OK, and a routine without ask before acting whose failed
-  attempt used any tool. A retry that came due while Iris was offline or
+  step after an OK, and an attempt of a routine without ask before acting
+  unless its engine never got to work (no engine, signed out, or Iris could
+  not set the run up) and it used no tool. Some CLIs report a tool only
+  after it finished, so a timeout or crash counts as possibly acted. Such
+  attempts are also never restarted inside the turn (on another engine or
+  with a fresh session). A retry that came due while Iris was offline or
   paused follows the missed-slot rule (at most 5 minutes late for `skip`,
   an hour for `run_latest_in_window`), else the run is recorded as failed.
-  A final failure posts a short note in Main ("I couldn't finish your
-  routine “...”. ...").
+  A paused routine's scheduled retries end as skipped; a Run now on it
+  still gets its retries. A final failure, or a run given up later, posts a
+  short note in Main ("I couldn't finish your routine “...”. ..."), pushed
+  when `notify_when_done`.
 - **Restarts.** Runs that were going when Iris stopped are recovered at
   startup: an ask-first routine's preparing step is retried (if retries are
   left and it is at most an hour late); an interrupted acting step, or an
-  interrupted run of a routine that does not ask first, is recorded as
-  failed ("Check what happened before running it again.").
+  interrupted attempt that started while its routine did not ask first
+  (`may_act`), is recorded as failed ("Check what happened before running
+  it again.") with a note in Main.
 - **Deleting** a routine also stops its running turn at once (its connector
   and browser access end, and any held connector approval is cancelled).
 
@@ -3463,7 +3470,7 @@ routine tools):
 | `schedule_kind` | string | `once`, `rule`, or `cron`. |
 | `run_at` | string or null | `once`: local `YYYY-MM-DDTHH:MM`. |
 | `rule` | object or null | `rule`: `{"freq": "daily" \| "weekly" \| "monthly" \| "yearly", "time": "HH:MM", "every": 1, "anchor"?: "YYYY-MM-DD", ...}`. `weekly` has `days` (0 = Sunday … 6 = Saturday); `monthly` has `day` (1–31; shorter months use their last day) or `nth` (1–4, or -1 for the last) and `weekday` (0–6); `yearly` has `month` and `day` (Feb 29 runs on Feb 28 in other years). `every` counts days, weeks, months, or years from `anchor` (filled in with the start date, or today, when `every` is more than 1); maximums 365, 52, 24, 10. |
-| `cron_expr` | string or null | `cron`: five fields (minute hour day-of-month month day-of-week; `L`, `#`, `W` and names work); may not run more often than every 30 minutes. |
+| `cron_expr` | string or null | `cron`: five fields (minute hour day-of-month month day-of-week; `L`, `#`, `W` and names work); may not run more often than every 30 minutes (checked over a whole day and across the next daylight-saving changes). Matched against local wall-clock time like the other schedules: a time in the repeated fall-back hour runs once; one the clocks skip runs at the jump, unless the pattern runs within 30 minutes of it anyway. |
 | `tz` | string | IANA time zone. |
 | `starts_at`, `end_at` | string or null | Local dates `YYYY-MM-DD`: the first and last day a repeating routine may run. |
 | `max_runs` | int or null | Stop after this many scheduled runs (1 to 1,000). |
