@@ -3702,7 +3702,11 @@ while [ -f "{d}/hold" ]; do sleep 0.02; done
 echo '{{"type":"system","subtype":"init","session_id":"sess-'$n'"}}'
 if [ -f "{d}/fail" ]; then
   grep -q tool "{d}/fail" && printf '%s\n' '{{"type":"assistant","message":{{"id":"m0","content":[{{"type":"tool_use","id":"t1","name":"mcp__notes__send_message","input":{{}}}}]}}}}'
-  printf '%s\n' '{{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}}'
+  if grep -q auth "{d}/fail"; then
+    printf '%s\n' '{{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login"}}'
+  else
+    printf '%s\n' '{{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}}'
+  fi
   exit 1
 fi
 text=ok
@@ -3934,6 +3938,38 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
     }
 
     #[tokio::test]
+    async fn a_signed_out_engine_is_rerouted_only_before_any_tool_use() {
+        let t = turn_setup(|_| {}).await;
+        let main = t.main_of(&t.owner_t).await;
+        let notes = |reply: Value| {
+            let id = reply["id"].as_str().unwrap().to_string();
+            let m =
+                t.h.state
+                    .db
+                    .with(|c| crate::db::get_message(c, &id))
+                    .unwrap()
+                    .unwrap();
+            m.meta["routing"].clone()
+        };
+        // Signed out before doing anything: another engine may take over.
+        std::fs::write(t.dir.join("fail"), "auth").unwrap();
+        let reply = t.chat(&t.owner_t, &main, "hello").await;
+        let r = notes(reply);
+        assert!(
+            r["notes"].to_string().contains("signed out; rerouted"),
+            "{r}"
+        );
+        // Signed out after a tool call: not started again elsewhere (the
+        // call may have sent or bought something).
+        t.h.state.refresh_harnesses().await;
+        std::fs::write(t.dir.join("fail"), "tool auth").unwrap();
+        let reply = t.chat(&t.owner_t, &main, "send it").await;
+        let r = notes(reply);
+        assert!(r["model"].is_string(), "an engine ran: {r}");
+        assert!(!r["notes"].to_string().contains("rerouted"), "{r}");
+    }
+
+    #[tokio::test]
     async fn routine_attempts_that_used_tools_are_never_replayed() {
         let t = turn_setup(|_| {}).await;
         let (h, tok) = (&t.h, t.owner_t.as_str());
@@ -3976,19 +4012,31 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
             "{run}"
         );
         assert_eq!(t.runs(), 1);
-        // Without any tool use it is safe to try again later.
+        // Nor after a crash with no tool reported: some CLIs only report a
+        // tool once it has finished.
         std::fs::write(t.dir.join("fail"), "plain").unwrap();
         run_now(direct.clone()).await;
+        let run = last_run(direct.clone(), "failed").await;
+        assert!(run["retry_at"].is_null(), "{run}");
+        assert_eq!(t.runs(), 2);
+        // Preparing for an ask-first routine cannot act, so it is tried again.
+        let prep = create(
+            json!({"title": "Gift ideas", "instructions": "Find gift ideas.",
+            "schedule_kind": "rule", "max_retries": 2,
+            "rule": {"freq": "yearly", "month": 10, "day": 29, "time": "08:00"}, "tz": "UTC"}),
+        )
+        .await;
+        run_now(prep.clone()).await;
         let mut run = Value::Null;
         for _ in 0..250 {
-            run = last_run(direct.clone(), "failed").await;
+            run = last_run(prep.clone(), "failed").await;
             if run["retry_at"].is_i64() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(run["retry_at"].is_i64(), "{run}");
-        assert_eq!(t.runs(), 2);
+        assert_eq!(t.runs(), 3);
         // The step after the owner's OK resumes the prepared session. If it
         // fails after using a tool, the turn does not start over with a
         // fresh session either (that would repeat the action).
@@ -4000,7 +4048,7 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
         std::fs::write(t.dir.join("reply"), "Cart ready.\\nNEEDS_OK: Order it.").unwrap();
         run_now(asks.clone()).await;
         let run = last_run(asks.clone(), "waiting").await;
-        assert_eq!(t.runs(), 3);
+        assert_eq!(t.runs(), 4);
         std::fs::write(t.dir.join("fail"), "tool").unwrap();
         let card = run["card_message_id"].as_str().unwrap();
         let (s, _) = send(
@@ -4014,8 +4062,8 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
         assert_eq!(s, StatusCode::OK);
         let run = last_run(asks.clone(), "failed").await;
         assert!(run["retry_at"].is_null());
-        assert!(t.read(3, "args").contains("--resume"));
-        assert_eq!(t.runs(), 4, "no fresh-session replay of the acting step");
+        assert!(t.read(4, "args").contains("--resume"));
+        assert_eq!(t.runs(), 5, "no fresh-session replay of the acting step");
     }
 
     #[tokio::test]

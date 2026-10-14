@@ -852,6 +852,7 @@ async fn execute(state: &AppState, run_id: &str, step: Step) -> crate::util::Res
             owner_user_id: owner.clone(),
             continuity: step == Step::Act,
             prepare_only: step == Step::Prepare && ctx.routine.spec.ask_before_acting,
+            may_act: step == Step::Act || !ctx.routine.spec.ask_before_acting,
         },
     )
     .await;
@@ -1028,6 +1029,7 @@ async fn after_turn(
         step,
         r.spec.ask_before_acting,
         used_tools,
+        kind,
         attempts,
         r.spec.max_retries,
     );
@@ -1090,21 +1092,28 @@ pub enum Retry {
     MayHaveActed,
 }
 
+/// Failures where the engine never got to work (none available, signed
+/// out, or Iris could not set the run up), so nothing can have been done.
+const NOTHING_RAN: &[&str] = &["no_engine", "auth_required", "internal"];
+
 /// Whether a failed attempt is tried again. An attempt allowed to act (the
 /// step after the owner's OK, or a routine that does not ask first) is
-/// retried only when it used no tools at all. Preparing for an ask-first
+/// retried only when its engine never got to work and it used no tools:
+/// some CLIs report a tool only after it finished, so a crash or timeout
+/// may follow a send or purchase nobody saw. Preparing for an ask-first
 /// routine cannot act (`TurnInput::prepare_only`), so it is retried.
 pub fn retry_after(
     step: Step,
     ask_first: bool,
     used_tools: bool,
+    error_kind: &str,
     attempts: i64,
     max_retries: i64,
 ) -> Retry {
     if step == Step::Act {
         return Retry::No;
     }
-    if !ask_first && used_tools {
+    if !ask_first && (used_tools || !NOTHING_RAN.contains(&error_kind)) {
         return Retry::MayHaveActed;
     }
     if attempts > max_retries {
@@ -1259,14 +1268,36 @@ mod tests {
     fn attempts_that_may_have_acted_are_not_retried() {
         use Retry::*;
         // Preparing for an ask-first routine cannot act: retried with backoff.
-        assert_eq!(retry_after(Step::Prepare, true, true, 1, 2), After(1));
-        assert_eq!(retry_after(Step::Prepare, true, false, 2, 2), After(5));
-        assert_eq!(retry_after(Step::Prepare, true, true, 3, 2), No);
-        // A routine that acts without asking: only when it used no tools.
-        assert_eq!(retry_after(Step::Prepare, false, false, 1, 2), After(1));
-        assert_eq!(retry_after(Step::Prepare, false, true, 1, 2), MayHaveActed);
+        assert_eq!(
+            retry_after(Step::Prepare, true, true, "timeout", 1, 2),
+            After(1)
+        );
+        assert_eq!(
+            retry_after(Step::Prepare, true, false, "harness_error", 2, 2),
+            After(5)
+        );
+        assert_eq!(retry_after(Step::Prepare, true, true, "timeout", 3, 2), No);
+        // A routine that acts without asking: only when its engine never
+        // got to work.
+        for kind in ["no_engine", "auth_required", "internal"] {
+            assert_eq!(
+                retry_after(Step::Prepare, false, false, kind, 1, 2),
+                After(1)
+            );
+        }
+        assert_eq!(
+            retry_after(Step::Prepare, false, true, "auth_required", 1, 2),
+            MayHaveActed
+        );
+        // A timeout or crash with no tool reported may still have acted.
+        for kind in ["timeout", "harness_error", ""] {
+            assert_eq!(
+                retry_after(Step::Prepare, false, false, kind, 1, 2),
+                MayHaveActed
+            );
+        }
         // The step after the owner's OK: never.
-        assert_eq!(retry_after(Step::Act, true, false, 1, 2), No);
+        assert_eq!(retry_after(Step::Act, true, false, "no_engine", 1, 2), No);
     }
 
     #[test]

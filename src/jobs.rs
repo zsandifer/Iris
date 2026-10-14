@@ -360,6 +360,7 @@ pub async fn run_job(state: &AppState, job: Job, manual: bool) -> crate::util::R
             owner_user_id: owner.clone(),
             continuity: false,
             prepare_only: false,
+            may_act: false,
         },
     )
     .await;

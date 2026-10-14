@@ -51,6 +51,11 @@ pub struct TurnInput {
     /// deleting and calls Iris cannot place, and the browser can only look,
     /// until the owner says yes.
     pub prepare_only: bool,
+    /// A routine attempt allowed to act (buy, send): once its CLI has
+    /// started it is never started again inside this turn (on another
+    /// engine or with a fresh session), since some CLIs report tool use
+    /// only after the tool has finished.
+    pub may_act: bool,
 }
 
 pub struct TurnResult {
@@ -875,7 +880,7 @@ async fn run_locked(
                 };
                 // Rerouted only if this attempt did nothing yet: one that
                 // used tools may have sent or bought something already.
-                if acc.text.is_empty() && acc.activities.is_empty() {
+                if acc.text.is_empty() && acc.activities.is_empty() && !input.may_act {
                     routing_notes.push(format!("{} signed out; rerouted", d.model));
                     excluded.push(harness_name);
                     continue;
@@ -886,6 +891,7 @@ async fn run_locked(
                 if resumed
                     && acc.text.is_empty()
                     && acc.activities.is_empty()
+                    && !input.may_act
                     && !fresh_session =>
             {
                 // Typically a session the CLI no longer has; start fresh and
@@ -2026,6 +2032,7 @@ pub async fn start_chat_turn(
         owner_user_id: owner_user_id.to_string(),
         continuity: true,
         prepare_only: false,
+        may_act: false,
     };
     let st = state.clone();
     tokio::spawn(async move {
@@ -2238,6 +2245,7 @@ mod tests {
             owner_user_id: owner.clone(),
             continuity: true,
             prepare_only: false,
+            may_act: false,
         };
         finish(
             &state,
