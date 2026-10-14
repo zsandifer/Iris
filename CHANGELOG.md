@@ -7,19 +7,28 @@ All notable changes to Iris are documented here, following
 
 ### Added
 
+- Memory in the app: Iris hub → Memory with search, You / People / Projects /
+  Routines, pinned notes first and recent changes marked; a note sheet to edit,
+  see the chat it came from, read its history with Undo, pin it or forget it
+  (with Undo); a "Noted: …" line under replies that saved something; the
+  morning note card with Undo per change, "and N more" and a Memory link; and
+  Settings → Memory (Pause learning, Morning note, Export as Markdown, Forget
+  everything). Morning-note changes now say whether they were new, updated or
+  done. `iris demo-seed` adds sample memory, and its Main chat history is
+  visible again.
+
 - Memory backend: bounded deterministic expiry and low-score archiving with
   undo, protected pinned/identity notes, confirmed owner-only Forget everything
   with stale-turn/Dream protection and non-reused IDs, and a complete Markdown
   download. Existing pause-learning and morning-note settings remain available.
   Reset keeps chats and backup copies. A five-category synthetic fake-CLI memory
   evaluation runs in `cargo test`, with an optional real-CLI smoke script.
-  Memory UI remains a separate PR.
 
 - Nightly memory tidying through the owner's Background engine: bounded private
   chat input, strict validated decisions, history snapshots and undo, a guard
   against setting aside too many notes, and a success-only progress cursor.
   The backend supplies one morning-note card a day with per-change undo and a
-  Memory link; dedicated card UI follows separately. Configure `[dream]` (3am,
+  Memory link. Configure `[dream]` (3am,
   four new messages by default). Pause learning and morning-note preferences
   are owner settings; pausing learning also stops agent memory writes while
   recall and owner edits remain available. Generated Idea prompts stay out of
@@ -84,7 +93,7 @@ All notable changes to Iris are documented here, following
   duplicate protection, similarity hints,
   history-backed corrections and Forget/Undo. Owner-only Memory API supports
   search, topic filters, detail, editing and pinning; private turn writes persist
-  Noted metadata and emit an owner-only event for the later app UI.
+  Noted metadata and emit an owner-only event for the app.
 - Optional separation of Iris and its agents into different OS users.
 - Self-awareness of setup and connection status, with sign-in and setup cards.
 - An installable mobile app with keyboard handling and a full-screen photo viewer.

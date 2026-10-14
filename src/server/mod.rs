@@ -793,6 +793,7 @@ mod tests {
                 .unwrap()
                 .contains("Garden project note")
         );
+        let mut rx = h.state.hub.subscribe();
         let (status, reset) = send(
             &h.app,
             "POST",
@@ -803,6 +804,17 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{reset}");
         assert_eq!(reset, json!({"forgotten":1}));
+        let (_, settings) = send(&h.app, "GET", "/api/settings", Some(&owner), None).await;
+        assert!(settings["memory"]["reset"].is_string(), "{settings}");
+        // Owner apps hear about the reset (and only the owner's).
+        let mut heard = false;
+        while let Ok(env) = rx.try_recv() {
+            if env.json.contains("\"memory.reset\"") {
+                heard = true;
+                assert!(!env.audience.includes("guest"), "{}", env.json);
+            }
+        }
+        assert!(heard);
         assert_eq!(
             send(
                 &h.app,
@@ -900,7 +912,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             settings["memory"],
-            json!({"learning_paused":true,"morning_note":false})
+            json!({"learning_paused":true,"morning_note":false,"reset":null})
         );
         let (_, settings) = send(&h.app, "GET", "/api/settings", Some(&guest), None).await;
         assert_eq!(settings["memory"], Value::Null);

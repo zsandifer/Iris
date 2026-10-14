@@ -117,6 +117,7 @@ export function Settings() {
     <//>
     <${Group} label="You">
       <${Row} icon="user" title="Your name" value=${S.me?.user?.display_name} onClick=${renameMe} />
+      ${isOwner() && html`<${Row} icon="memory" title="Memory" sub="Pause learning, morning note, export" onClick=${() => go('settings/memory')} />`}
       ${isOwner() && html`<${Row} icon="sparkles" title="For you" sub="Sources and daily posts" onClick=${() => go('settings/feed')} />`}
     <//>
     <${Notifications} />

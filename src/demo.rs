@@ -257,6 +257,8 @@ fn seed_all(c: &Connection, paths: &Paths, assets: &Path, vault: &Vault) -> Resu
         &[],
     )?;
 
+    seed_memory(&s, &main, yday)?;
+
     // ------------------------------------------------- Friday dinner chat
     let dinner = s.conversation("side", "Friday dinner", None, now - 41 * MIN)?;
     s.user(
@@ -761,12 +763,263 @@ fn seed_all(c: &Connection, paths: &Paths, assets: &Path, vault: &Vault) -> Resu
         let ct = vault.encrypt(secret.to_string().as_bytes(), &id)?;
         entities::insert_credential(c, &id, &owner, kind, label, &meta, &ct)?;
     }
+    // Main chat was created just now; its backdated messages must still be
+    // visible to the owner (members see messages from when they joined).
+    c.execute(
+        "UPDATE conversation_members SET joined_at = MIN(joined_at,
+             COALESCE((SELECT MIN(created_at) FROM messages WHERE conversation_id = ?1), joined_at))
+         WHERE conversation_id = ?1",
+        params![main],
+    )?;
     // Conversations sort by their newest message.
     c.execute(
         "UPDATE conversations SET updated_at = COALESCE(
              (SELECT MAX(created_at) FROM messages WHERE conversation_id = conversations.id), created_at)",
         [],
     )?;
+    Ok(())
+}
+
+/// Memory notes with history, a reply that noted something, and an
+/// overnight morning note, so the Memory screen, the Noted line and the
+/// morning card all have something to show.
+fn seed_memory(s: &Seeder, main: &str, yday: i64) -> Result<()> {
+    use crate::memory::{self, Actor, recall};
+    let c = s.c;
+    let now = now_ms();
+    // The overnight tidy-up ran at 3am (yesterday's, if it is not 3am yet).
+    let mut last_night = today_midnight() + 3 * HOUR + 4 * MIN;
+    if last_night > now - 30 * MIN {
+        last_night -= 24 * HOUR;
+    }
+    let save = |text: &str,
+                kind: &str,
+                pinned: bool,
+                id: Option<i64>,
+                actor: Actor,
+                source: &Value,
+                batch: &str|
+     -> Result<(i64, i64)> {
+        let edit = recall::Edit {
+            text: Some(text.into()),
+            kind: Some(kind.into()),
+            pinned: pinned.then_some(true),
+            ..Default::default()
+        };
+        let out = recall::save(c, &edit, id, actor, source, batch)?;
+        Ok((
+            out["item"]["id"].as_i64().ok_or("note not saved")?,
+            out["history_id"].as_i64().ok_or("note not saved")?,
+        ))
+    };
+    // Pin a note's dates (and its history) to when it was learned.
+    let date = |id: i64, created: i64, updated: i64| -> Result<()> {
+        c.execute(
+            "UPDATE memory_items SET created_at = ?2, updated_at = ?3, mentioned_at = ?2 WHERE id = ?1",
+            params![id, created, updated],
+        )?;
+        c.execute(
+            "UPDATE memory_history SET at = ?2 WHERE item_id = ?1",
+            params![id, created],
+        )?;
+        Ok(())
+    };
+    let owner_src = json!({"type": "owner"});
+    let chat = || json!({"type": "conversation", "conversation_id": main, "message_ids": []});
+    let days = |n: i64| now - n * 24 * HOUR;
+    // Ordinary notes unused for 90 days are set aside automatically, so the
+    // ones meant to stay are younger than that (or pinned).
+
+    let (id, _) = save(
+        "You prefer short replies, no emoji",
+        "preference",
+        true,
+        None,
+        Actor::Owner,
+        &owner_src,
+        "demo-1",
+    )?;
+    date(id, days(130), days(130))?;
+    let (id, _) = save(
+        "Dr. Okafor is your dentist",
+        "person",
+        false,
+        None,
+        Actor::Agent,
+        &chat(),
+        "demo-2",
+    )?;
+    date(id, days(80), days(80))?;
+    let (id, _) = save(
+        "Sam is your partner",
+        "person",
+        false,
+        None,
+        Actor::Import,
+        &json!({"type": "import", "file": "people.md"}),
+        "demo-3",
+    )?;
+    date(id, days(85), days(85))?;
+    let (id, _) = save(
+        "Japan trip in April: ten days, trains between cities, one slow day in the middle",
+        "project",
+        false,
+        None,
+        Actor::Agent,
+        &chat(),
+        "demo-4",
+    )?;
+    date(id, days(26), days(26))?;
+    let (id, _) = save(
+        "You like woodworking, especially live-edge slab furniture",
+        "preference",
+        false,
+        None,
+        Actor::Agent,
+        &chat(),
+        "demo-5",
+    )?;
+    date(id, days(60), days(60))?;
+    let (id, _) = save(
+        "Your porch gets morning sun only",
+        "fact",
+        false,
+        None,
+        Actor::Agent,
+        &chat(),
+        "demo-6",
+    )?;
+    date(id, days(40), days(40))?;
+    let (running, _) = save(
+        "You run Mon/Wed evenings",
+        "routine",
+        false,
+        None,
+        Actor::Agent,
+        &chat(),
+        "demo-7",
+    )?;
+    date(running, days(134), days(134))?;
+    let (kitchen, _) = save(
+        "The kitchen remodel quote is still open",
+        "project",
+        false,
+        None,
+        Actor::Agent,
+        &chat(),
+        "demo-8",
+    )?;
+    date(kitchen, days(30), days(30))?;
+
+    // A reply in Main chat that noted something.
+    let t = yday + 18 * HOUR + 20 * MIN;
+    s.user(
+        main,
+        t,
+        &s.owner,
+        "remember I'm allergic to cashews when you pick restaurants",
+        &[],
+    )?;
+    let reply = s.msg(
+        t + 6_000,
+        NewMessage {
+            conversation_id: main,
+            role: "assistant",
+            content: "Got it. I'll steer clear of cashews whenever I suggest places to eat.",
+            ..Default::default()
+        },
+    )?;
+    let batch = format!("turn-{}", reply.id);
+    let (cashews, _) = save(
+        "You're allergic to cashews",
+        "fact",
+        false,
+        None,
+        Actor::Agent,
+        &json!({"type": "conversation", "conversation_id": main, "message_ids": [reply.id]}),
+        &batch,
+    )?;
+    date(cashews, t + 6_000, t + 6_000)?;
+    let meta = json!({"routing": null, "purpose": "chat", "activity": [], "duration_ms": 6000,
+        "noted": recall::noted(c, &batch)?});
+    c.execute(
+        "UPDATE messages SET meta = ?2 WHERE id = ?1",
+        params![reply.id, meta.to_string()],
+    )?;
+
+    // Overnight: three changes plus one more, and the morning note.
+    let evidence = json!({"type": "dream", "messages": [{"conversation_id": main, "message_id": reply.id}], "asserted_at": yday + 19 * HOUR});
+    let dream = "dream-demo";
+    let mut changes = Vec::new();
+    let (maya, h) = save(
+        "Maya, your sister. Birthday March 4",
+        "person",
+        false,
+        None,
+        Actor::Dream,
+        &evidence,
+        dream,
+    )?;
+    date(maya, last_night, last_night)?;
+    changes.push(json!({"history_id": h, "item_id": maya, "op": "add", "was": null, "text": "Maya, your sister. Birthday March 4"}));
+    let (_, h) = save(
+        "You run Tue/Thu mornings",
+        "routine",
+        false,
+        Some(running),
+        Actor::Dream,
+        &evidence,
+        dream,
+    )?;
+    c.execute(
+        "UPDATE memory_items SET updated_at = ?2 WHERE id = ?1",
+        params![running, last_night],
+    )?;
+    c.execute(
+        "UPDATE memory_history SET at = ?2 WHERE id = ?1",
+        params![h, last_night],
+    )?;
+    changes.push(json!({"history_id": h, "item_id": running, "op": "update", "was": "You run Mon/Wed evenings", "text": "You run Tue/Thu mornings"}));
+    let old = memory::get(c, kitchen)?.ok_or("demo note missing")?;
+    memory::archive(c, &old, Actor::Dream, dream)?;
+    let h = c.last_insert_rowid();
+    changes.push(json!({"history_id": h, "item_id": kitchen, "op": "supersede", "was": null, "text": "The kitchen remodel quote is still open"}));
+    let (fav, h) = save(
+        "Sam's favorite restaurant is Kindred",
+        "person",
+        false,
+        None,
+        Actor::Dream,
+        &evidence,
+        dream,
+    )?;
+    date(fav, last_night, last_night)?;
+    changes.push(json!({"history_id": h, "item_id": fav, "op": "add", "was": null, "text": "Sam's favorite restaurant is Kindred"}));
+    c.execute(
+        "UPDATE memory_history SET at = ?2 WHERE batch_id = ?1",
+        params![dream, last_night],
+    )?;
+    let total = changes.len();
+    let card = json!({"type": "memory_morning", "owner_only": true, "title": "I tidied my notes overnight",
+        "body": format!("I updated {total} of my notes."), "batch_id": dream, "day": crate::jobs::local_day(now),
+        "changes": changes.iter().take(3).collect::<Vec<_>>(), "all_changes": changes, "preview_limit": 3,
+        "total_changes": total, "more_count": total - 3, "more_label": format!("and {} more ›", total - 3),
+        "memory_url": "/#/iris/memory", "action_label": "See everything I remember ›"});
+    let card_msg = s.msg(
+        now - 55 * MIN,
+        NewMessage {
+            conversation_id: main,
+            role: "assistant",
+            kind: "card",
+            content: "I tidied my notes overnight",
+            card: Some(&card),
+            ..Default::default()
+        },
+    )?;
+    let mut card = card;
+    card["undo_url"] = json!(format!("/api/memory/morning/{}/undo", card_msg.id));
+    db::update_message_card(c, &card_msg.id, &card)?;
+    memory::files::render_export(c, s.paths)?;
     Ok(())
 }
 
@@ -804,6 +1057,46 @@ mod tests {
                     .all(|p| !p.images.is_empty() && p.why.is_some())
         );
         assert_eq!((approvals, people), (1, 2));
+        let (notes, noted, morning) = db
+            .with(|c| {
+                let notes = crate::memory::live(c)?.len();
+                let noted: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE json_array_length(meta, '$.noted') > 0",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let card: String = c.query_row(
+                    "SELECT card FROM messages WHERE json_extract(card, '$.type') = 'memory_morning'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok((notes, noted, serde_json::from_str::<Value>(&card).unwrap()))
+            })
+            .unwrap();
+        assert!(notes >= 8);
+        assert_eq!(noted, 1);
+        assert_eq!(morning["more_count"], 1);
+        assert!(
+            morning["undo_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("/api/memory/morning/")
+        );
+        // The morning note's changes can really be undone.
+        let change = morning["changes"][0]["history_id"].as_i64().unwrap();
+        let card_id = morning["undo_url"]
+            .as_str()
+            .unwrap()
+            .split('/')
+            .nth(4)
+            .unwrap()
+            .to_string();
+        db.with(|c| {
+            crate::memory::recall::mutate(c, &paths, |c| {
+                crate::memory::dream::undo_card(c, &card_id, change, &owner)
+            })
+        })
+        .unwrap();
         let activity = db
             .with(|c| db::recent_activity(c, &owner, true, None, 50))
             .unwrap();

@@ -1,6 +1,6 @@
 // Chat cards: agent cards (link, connect, info, result, idea, goal,
 // feed_post) and server cards (action, engine_signin, engine_setup,
-// connector_reconnect, approval, save_login).
+// connector_reconnect, approval, save_login, memory_morning).
 import { html, useEffect, useState } from './h.js';
 import { api, get, post, put, patch, seg, isId } from './api.js';
 import {
@@ -11,6 +11,7 @@ import { plain } from './md.js';
 import { CATALOG_IDS, ServiceSignIn, ServiceTile, labelOf } from './connect.js';
 
 import { ExternalLink } from './external-link.js';
+import { MorningCard } from './memory.js';
 
 const apiPath = (p) => String(p || '').replace(/^\/api(?=\/)/, '');
 
@@ -390,6 +391,7 @@ const CARDS = {
   connector_reconnect: ConnectorReconnectCard,
   approval: ApprovalCard,
   save_login: SaveLoginCard,
+  memory_morning: MorningCard,
 };
 
 export function Card({ m, inactive = false }) {

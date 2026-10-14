@@ -472,7 +472,10 @@ fn apply(
         {
             continue;
         }
-        let out = match op {
+        // What the morning note shows for this change: New / Updated (with
+        // the text it replaced) / Done.
+        let mut was = None;
+        let (kind_of_change, out) = match op {
             Op::Add {
                 text,
                 kind,
@@ -490,7 +493,8 @@ fn apply(
                 Actor::Dream,
                 &evidence(input, &messages)?,
                 batch,
-            )?,
+            )
+            .map(|out| ("add", out))?,
             Op::Update {
                 alias,
                 text,
@@ -524,7 +528,8 @@ fn apply(
                     ));
                 }
                 changed_existing += 1;
-                out
+                was = Some(truncate_chars(&old.text, 240));
+                ("update", out)
             }
             Op::Supersede {
                 alias,
@@ -544,13 +549,17 @@ fn apply(
                     Actor::Dream,
                     batch,
                 )?;
-                json!({"changed":true, "item": super::get(c, old.id)?, "history_id":c.last_insert_rowid()})
+                (
+                    "supersede",
+                    json!({"changed":true, "item": super::get(c, old.id)?, "history_id":c.last_insert_rowid()}),
+                )
             }
             Op::Noop {} => continue,
             Op::Reject { .. } => unreachable!(),
         };
         if out["changed"] == true {
-            changes.push(json!({"history_id":out["history_id"], "item_id":out["item"]["id"], "text":truncate_chars(out["item"]["text"].as_str().unwrap_or(""),240)}));
+            changes.push(json!({"history_id":out["history_id"], "item_id":out["item"]["id"], "op":kind_of_change, "was":was,
+                "text":truncate_chars(out["item"]["text"].as_str().unwrap_or(""),240)}));
         }
     }
     if removed * 4 > changed_existing {

@@ -38,6 +38,7 @@ export function Hub() {
       <${Row} icon="plug" title="Connections" sub=${nCon == null ? ' ' : nCon ? `${nCon} connected` : 'Nothing connected yet'} onClick=${() => go('iris/connections')} />
       <${Row} icon="lock" title="Logins & wallet" sub=${creds ? `${logins} login${logins === 1 ? '' : 's'} · ${cards} card${cards === 1 ? '' : 's'}` : ' '} onClick=${() => go('iris/logins')} />
       <${Row} icon="monitor" title=${`${agentName()}'s computer`} sub=${computer} onClick=${() => go('iris/computer')} />
+      <${Row} icon="memory" title="Memory" sub="What I remember about you" onClick=${() => go('iris/memory')} />
       <${Row} icon="folder" title="System files" sub="Personality, memory, and notes" onClick=${() => go('iris/files')} />`}
       <${Row} icon="sliders" title="Settings" onClick=${() => go('settings')} />
     <//>
@@ -142,7 +143,11 @@ const FRIENDLY = {
 };
 const AREA = { memory: "{name}'s memory", workspace: "{name}'s working folder", persona: 'Persona files' };
 // Generated from what Iris remembers; changed through chat, not edited here.
-const READ_ONLY_NOTE = 'A copy of what I remember, kept up to date as I learn. Ask me in a chat to remember, change, or forget something.';
+const READ_ONLY_NOTE = 'A copy of what I remember, kept up to date as I learn. To change something, open Memory or ask me in a chat.';
+function ReadOnlyNote() {
+  return html`<div class="lock"><${Icon} name="lock" size=${15} /> ${READ_ONLY_NOTE}
+    <button class="lk-m" onClick=${() => go('iris/memory')}>Open Memory ›</button></div>`;
+}
 const fill = (s) => s.replace(/\{name\}/g, agentName());
 
 export function Files() {
@@ -192,7 +197,7 @@ export function FileEditor({ area, path }) {
     right=${readOnly || text == null ? null : editing
       ? html`<button class="b1 sm" disabled=${busy || (!dirty && !orig.trim())} onClick=${dirty ? save : () => setEditing(false)}>${dirty ? 'Save' : 'Done'}</button>`
       : html`<button class="b2 sm" onClick=${() => setEditing(true)}>Edit</button>`}>
-    ${readOnly && html`<div class="lock"><${Icon} name="lock" size=${15} /> ${READ_ONLY_NOTE}</div>`}
+    ${readOnly && html`<${ReadOnlyNote} />`}
     ${text == null ? html`<${Spinner} />` : editing ? html`<textarea class="editor" value=${text} spellcheck=${false}
       onInput=${(e) => setText(e.target.value)} aria-label=${`Edit ${name}`} />`
       : shown.trim() ? html`<div class="mdview" dangerouslySetInnerHTML=${{ __html: md(shown) }} />`
@@ -206,7 +211,7 @@ export function Folder({ area, path = '' }) {
   const sub = path ? `${area}/${path}` : area;
   const open = (e) => go(`iris/files/${area}/${[path, e.name].filter(Boolean).join('/')}${e.type === 'dir' ? '' : '?edit=1'}`);
   return html`<${Page} title=${path ? path.split('/').pop() : fill(AREA[area] || area)} sub=${sub}>
-    ${area === 'memory' && !path && html`<div class="lock"><${Icon} name="lock" size=${15} /> ${READ_ONLY_NOTE}</div>`}
+    ${area === 'memory' && html`<${ReadOnlyNote} />`}
     ${err ? html`<${Empty} icon="folder" title="Nothing here yet">This folder is empty.<//>`
       : !data ? html`<${Spinner} />` : data.entries.length ? html`<${Group}>
         ${data.entries.map((e) => html`<${Row} icon=${e.type === 'dir' ? 'folder' : 'file'} title=${e.name}

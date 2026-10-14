@@ -12,6 +12,7 @@ import { ChatScreen } from './chat.js';
 import { FeedScreen, StoryViewer, FeedSettings } from './feed.js';
 import { IdeasScreen, GoalsScreen, LibraryScreen } from './lists.js';
 import { Hub, Logins, Files, FileEditor, Folder } from './hub.js';
+import { MemoryScreen, MemorySettings } from './memory.js';
 import { Computer } from './computer.js';
 import { Connections, CatalogGroup, AddService, GoogleHttpsHelp, ConnectorPage, ConnectorForm, TrustedPeople, CATALOG_IDS } from './connect.js';
 import { Settings, AiEngine, Devices, People, ActivityLog } from './settings.js';
@@ -279,6 +280,7 @@ function Screen() {
         return html`<${Connections} />`;
       }
       if (sub === 'logins') return html`<${Logins} />`;
+      if (sub === 'memory') return html`<${MemoryScreen} />`;
       if (sub === 'computer') return html`<${Computer} />`;
       if (sub === 'files') {
         if (!okSeg(a) || (a === 'system' && !okSeg(rest.join('/')))) return html`<${Files} />`;
@@ -295,6 +297,7 @@ function Screen() {
       if (sub === 'people' && owner) return html`<${People} />`;
       if (sub === 'activity') return html`<${ActivityLog} />`;
       if (sub === 'feed') return html`<${FeedSettings} />`;
+      if (sub === 'memory' && owner) return html`<${MemorySettings} />`;
       return html`<${Settings} />`;
     }
     default: return html`<${ChatScreen} cid=${mainId()} key=${mainId()} />`;
@@ -320,14 +323,17 @@ function routeMotion() {
 
 // The toast fades out instead of vanishing.
 function Toast() {
-  const [shown, setShown] = useState(S.toast);
+  const [shown, setShown] = useState(S.toast && { text: S.toast, action: S.toastAction });
   useEffect(() => {
-    if (S.toast) { setShown(S.toast); return undefined; }
+    if (S.toast) { setShown({ text: S.toast, action: S.toastAction }); return undefined; }
     const id = setTimeout(() => setShown(null), 200);
     return () => clearTimeout(id);
-  }, [S.toast]);
+  }, [S.toast, S.toastAction]);
   if (!shown) return null;
-  return html`<div class=${'toast' + (S.toast ? '' : ' leaving')} role="status">${shown}</div>`;
+  const { text, action } = shown;
+  const run = () => { set({ toast: null, toastAction: null }); action.run(); };
+  return html`<div class=${'toast' + (action ? ' has-act' : '') + (S.toast ? '' : ' leaving')} role="status">
+    <span>${text}</span>${action && S.toast && html`<button class="toast-act" onClick=${run}>${action.label}</button>`}</div>`;
 }
 
 function App() {

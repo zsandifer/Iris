@@ -10,6 +10,7 @@ import { statusPhrase, receipt, seconds } from './status.js';
 import { pushState, enablePush } from './push.js';
 import { BrowserPeek } from './computer.js';
 import { focusComposer, prepareComposerFocus } from './viewport.js';
+import { NotedLine } from './memory.js';
 
 const GAP = 30 * 60 * 1000;
 
@@ -90,6 +91,7 @@ function Assistant({ m, list }) {
   return html`<${Receipt} meta=${m.meta} />
     ${content ? html`<div class=${'b' + (failed ? ' b-err' : '')} dangerouslySetInnerHTML=${{ __html: md(content) }} />`
       : m.status === 'cancelled' ? html`<div class="note">Stopped.</div>` : null}
+    <${NotedLine} m=${m} />
     ${peek}
     ${failed && m.meta?.error?.kind !== 'paused' && retryFor(list, m) && html`<button class="retry" onClick=${retry}><${Icon} name="refresh" size=${15} /> Try again</button>`}`;
 }

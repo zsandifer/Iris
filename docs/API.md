@@ -1201,12 +1201,15 @@ Returns the [Settings](#settings) object directly (not wrapped):
   "allow_claude_for_shared": false,
   "feed_prompt": "...",
   "paused": false,
-  "memory": {"learning_paused": false, "morning_note": true},
+  "memory": {"learning_paused": false, "morning_note": true, "reset": null},
   "voice": {"enabled": false, "status": "not_implemented"}
 }
 ```
 
-`memory` is owner-only (`null` for other users).
+`memory` is owner-only (`null` for other users). `memory.reset` is an opaque
+marker (`null` until the first Forget everything) that changes with every
+Forget everything; an app that sees it change (for example in `ready` after
+reconnecting) drops cached Noted lines and morning cards.
 
 `paused` is true while the owner has paused Iris
 ([3.18](#318-safety-pause-disconnect-trusted-people)); change it with
@@ -2479,15 +2482,18 @@ Dream morning cards have `type: "memory_morning"`, `owner_only: true`,
 `total_changes`, `more_count`, `more_label` (`"and N more ›"`),
 `memory_url: "/#/iris/memory"`, `action_label: "See everything I remember ›"`,
 and `undo_url` pointing to the card-specific POST route. Each change contains
-`history_id`, `item_id`, and a scrubbed text preview (up to 240 characters).
+`history_id`, `item_id`, `op` (`add`, `update`, or `supersede`; the app shows
+New, Updated, or Done), `was` (for `update`, the previous text, up to 240
+characters; otherwise `null`), and a scrubbed text preview (up to 240
+characters). Cards made before `op`/`was` existed lack them and show no tags.
 `Message.meta.initiated_by: "idea"` identifies generated Idea starters; new Idea
 conversation seeds also carry `generated_starter: true`. Owner-written follow-ups
 keep ordinary empty metadata and remain eligible for Dream.
 
 One card at most per local day, only after actual changes, only in the owner's
 still-private Main chat. It emits owner-only `message.created`, with no push.
-The card is a historical summary; undo still verifies current history. Dedicated
-card rendering and the Memory screen are delivered separately from this backend.
+The card is a historical summary; undo still verifies current history. The app
+renders it as the morning note and opens the Memory screen (`#/iris/memory`).
 
 Writes share the MCP write gate: strip nested/unclosed `<private>` spans,
 PEM private keys, credential assignments (including AWS secret-access-key labels,
@@ -2555,6 +2561,7 @@ was emitted). Events are delivered only to the users listed under
 | `message.activity` | `{"conversation_id", "message_id", "activity": {Activity}}` | Conversation members |
 | `message.completed` | `{"conversation_id", "message": {Message}}` | Conversation members |
 | `memory.noted` | `{"conversation_id", "message_id", "changes": [{"history_id", "item_id", "op", "text"}]}` | Owner only |
+| `memory.reset` | `{"reset"}` (the new `Settings.memory.reset` marker) after Forget everything: drop cached Noted metadata and morning cards (they now read "I cleared my notes.") and close open memory sheets | Owner only |
 | `turn.status` | `{"conversation_id", "message_id", "status": "queued" \| "running"}` | Conversation members |
 | `conversation.created` | `{"conversation": {Conversation}}` | Conversation members |
 | `entities.changed` | `{"kinds": ["goals" \| "ideas" \| "feed" \| "library" \| "memory", ...]}` | The affected user |
@@ -2779,8 +2786,10 @@ and sent as `memory.noted` after `message.completed`, including when the turn
 fails after a successful write. Changes contain history IDs for Undo and current
 note IDs for Edit (corrections group their add/supersede into one entry), with text previews capped at 240 characters (up to 100 changes).
 If conversation privacy is lost before completion, the reply is withheld and
-neither Noted metadata nor its event is exposed. The app can render a Noted chip
-from metadata when reconnecting; the UI is added separately.
+neither Noted metadata nor its event is exposed. The app shows a "Noted: …"
+line under the reply from this metadata (also after reconnecting) and patches
+it in from `memory.noted`; each change can be undone through
+`POST /api/memory/history/{history_id}/undo` or edited by `item_id`.
 
 On a finished assistant message (`message.completed`):
 

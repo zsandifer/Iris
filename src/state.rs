@@ -750,6 +750,9 @@ impl AppState {
             "memory": if owner { Some(json!({
                 "learning_paused": self.setting(crate::memory::dream::PAUSED).await.as_deref() == Some("true"),
                 "morning_note": self.setting(crate::memory::dream::MORNING).await.as_deref() != Some("false"),
+                // Changes with every Forget everything, so an app that missed
+                // the memory.reset event clears its cached copies on reconnect.
+                "reset": self.setting(crate::memory::lifecycle::RESET_AFTER).await,
             })) } else { None },
         })
     }

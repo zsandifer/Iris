@@ -858,7 +858,9 @@ payloads. It also discards owner CLI sessions and blocks pre-reset turns from
 saving notes. Dream skips old evidence; new assertions remain learnable.
 Chats, persona files, `memory-backup/` import originals and other backups are
 retained; remove backup copies separately if you need them erased.
-The Memory settings UI follows in the UI PR.
+In the app, both live in Settings → Memory (Export as Markdown, Forget
+everything), next to Pause learning and Morning note; Iris hub → Memory
+browses, edits, pins, forgets and undoes individual notes.
 `POST /api/jobs/dream/run` skips the time gate, keeping all privacy, activity,
 enabled and pause checks.
 

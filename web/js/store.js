@@ -2,6 +2,7 @@
 // in sync with the REST API and the WebSocket event stream.
 import { useEffect, useReducer, useRef } from './h.js';
 import { get, post, patch, seg, isId } from './api.js';
+import { undos, withoutMemory } from './memory-text.js';
 
 /** Fresh client state: everything here belongs to the signed-in user. */
 function initialState() {
@@ -22,11 +23,14 @@ function initialState() {
     ideas: null,
     goals: null,
     library: null,
+    memory: null,        // {items, more}: the owner's notes (Memory screen)
+    memoryRev: 0,        // bumped when memory changes (open note sheets refresh)
     route: parseRoute(),
     drawer: false,
     story: null,         // {topic index, story index}
     sheet: null,         // bottom sheet render function
     toast: null,
+    toastAction: null,   // {label, run} shown in the toast (e.g. Undo)
     drafts: {},          // conversation id -> composer text
     browser: null,       // GET /api/browser (owner): Iris's computer
     browsing: {},        // assistant message id -> { cid, until }: while its turn uses the browser (until null), then lingering until `until` (ms)
@@ -62,6 +66,8 @@ export function set(patch) {
 export function resetUserState() {
   connectorsLoading = null;
   connectorsTried = false;
+  seenReset = undefined;
+  undos.clear();
   userGen++;
   const fresh = initialState();
   for (const k of Object.keys(S)) if (!(k in fresh)) delete S[k];
@@ -142,10 +148,11 @@ window.addEventListener('hashchange', () => {
 });
 
 let toastTimer;
-export function toast(text) {
+/** A short message; `action` ({label, run}) adds a button such as Undo. */
+export function toast(text, action = null) {
   clearTimeout(toastTimer);
-  set({ toast: text });
-  toastTimer = setTimeout(() => set({ toast: null }), 3200);
+  set({ toast: text, toastAction: action });
+  toastTimer = setTimeout(() => set({ toast: null, toastAction: null }), action ? 6000 : 3200);
 }
 
 export const isOwner = () => !!S.me?.user?.is_owner;
@@ -247,16 +254,22 @@ function doneLoading(cid, patch) {
   if (again) loadMessages(cid);
 }
 
+// Bumped by Forget everything. Chat pages asked for before it may still
+// carry the Noted lines and morning notes it removed: those are stripped.
+let memoryGen = 0;
+const sinceReset = (gen, msgs) => (gen === memoryGen ? msgs : msgs.map(withoutMemory));
+
 export async function loadMessages(cid) {
   if (S.msgs[cid]?.loading) {
     patchBox(cid, { stale: true });
     return;
   }
   patchBox(cid, { loading: true, stale: false });
+  const gen = memoryGen;
   try {
     const r = await get(`/conversations/${seg(cid)}/messages?limit=60`);
     const cur = S.msgs[cid] || { list: [] };
-    const { list, joined } = mergeSnapshot(cur.list, r.messages);
+    const { list, joined } = mergeSnapshot(cur.list, sinceReset(gen, r.messages));
     const live = { ...S.live };
     for (const m of list) {
       if (m.status !== 'streaming') delete live[m.id];
@@ -277,11 +290,12 @@ export async function loadOlder(cid) {
   const cur = S.msgs[cid];
   if (!cur || !cur.hasMore || cur.loading || !cur.list.length) return;
   patchBox(cid, { loading: true });
+  const gen = memoryGen;
   try {
     const r = await get(`/conversations/${seg(cid)}/messages?limit=60&before=${cur.list[0].created_at}`);
     const now = S.msgs[cid]?.list || [];
     const ids = new Set(now.map((m) => m.id));
-    doneLoading(cid, { list: [...r.messages.filter((m) => !ids.has(m.id)), ...now], hasMore: r.has_more });
+    doneLoading(cid, { list: [...sinceReset(gen, r.messages).filter((m) => !ids.has(m.id)), ...now], hasMore: r.has_more });
   } catch (e) {
     // Release the flag so paging and reconnect refreshes keep working.
     doneLoading(cid, {});
@@ -486,12 +500,86 @@ function setBrowser(b) {
   set({ browser, browsing });
 }
 
+// The Memory screen shows every current note (filtered on the phone), so
+// switching topics is instant and the count is right. Paged by offset;
+// a note that moves between pages while loading is shown once.
+const MEMORY_PAGE = 100;
+const MEMORY_MAX = 2000;
+// A note that changes while pages load can move to a page already read.
+// Changes announced meanwhile restart the load (a few times at most).
+let memoryLoads = 0;
+let memoryChanged = false;
+export async function loadMemory() {
+  if (!isOwner()) return;
+  const apply = refreshOf('memory');
+  memoryLoads++;
+  try {
+    let items;
+    let more;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      memoryChanged = false;
+      items = [];
+      const ids = new Set();
+      more = true;
+      let offset = 0;
+      while (more && offset < MEMORY_MAX) {
+        const r = await get(`/memory?limit=${MEMORY_PAGE}&offset=${offset}`);
+        for (const i of r.items) if (!ids.has(i.id)) { ids.add(i.id); items.push(i); }
+        more = !!r.has_more && r.items.length > 0;
+        offset += r.items.length;
+      }
+      if (!memoryChanged) break;
+    }
+    apply(() => set({ memory: { items, more } }));
+  } finally {
+    memoryLoads--;
+  }
+}
+
+/**
+ * Forget everything happened (here or on another device): cached replies
+ * lose their Noted lines and morning notes read as cleared, as on the server.
+ */
+export function memoryReset() {
+  memoryGen++;
+  undos.clear();
+  const msgs = {};
+  for (const [cid, box] of Object.entries(S.msgs)) msgs[cid] = { ...box, list: box.list.map(withoutMemory) };
+  // Memory sheets (a note, What I noted, Export) show what was forgotten.
+  // A list load still in flight carries notes from before the reset.
+  const sheet = S.sheet?.memory ? null : S.sheet;
+  const reload = !!S.memory || memoryLoads > 0;
+  touchList('memory');
+  if (memoryLoads > 0) memoryChanged = true;
+  set({ msgs, sheet, memory: S.memory ? { items: [], more: false } : null });
+  if (reload) loadMemory().catch(() => {});
+}
+
+// The reset marker last seen in settings: one that changes while this app
+// was away (a missed memory.reset event) clears the cached copies too.
+let seenReset;
+function noteResetMark(settings) {
+  if (!settings?.memory) return;
+  const mark = settings.memory.reset ?? null;
+  if (seenReset !== undefined && mark !== seenReset) memoryReset();
+  seenReset = mark;
+}
+
+/** A memory.noted event: show the Noted line under that reply. */
+export function applyNoted(cid, mid, changes) {
+  const cur = S.msgs[cid];
+  const m = cur?.list.find((x) => x.id === mid);
+  if (!m) return;
+  upsert(cid, { ...m, meta: { ...(m.meta || {}), noted: changes } });
+  set({});
+}
+
 export async function loadEngines() {
   if (!isOwner()) return;
   set({ engines: await get('/engines') });
 }
 
-const loaders = { feed: () => loadFeed(), ideas: loadIdeas, goals: loadGoals, library: loadLibrary };
+const loaders = { feed: () => loadFeed(), ideas: loadIdeas, goals: loadGoals, library: loadLibrary, memory: loadMemory };
 
 // ------------------------------------------------------------------ events
 
@@ -578,6 +666,7 @@ export function applyLoginResponse(harness, login, mark) {
 export function handleEvent(ev) {
   switch (ev.type) {
     case 'ready':
+      noteResetMark(ev.settings);
       set({ settings: ev.settings, harnesses: ev.harnesses, logins: currentLogins(ev.harnesses) });
       refreshAll();
       frames.onReady.forEach((f) => f());
@@ -643,6 +732,13 @@ export function handleEvent(ev) {
       upsert(ev.conversation_id, ev.message);
       set({});
       break;
+    case 'memory.reset':
+      memoryReset();
+      seenReset = ev.reset ?? null;
+      break;
+    case 'memory.noted':
+      applyNoted(ev.conversation_id, ev.message_id, ev.changes || []);
+      break;
     case 'conversation.created':
       for (const seen of convWatch) seen.push(ev.conversation);
       if (S.convs && !S.convs.some((c) => c.id === ev.conversation.id)) {
@@ -650,10 +746,15 @@ export function handleEvent(ev) {
       }
       break;
     case 'entities.changed':
+      if (ev.kinds.includes('memory')) {
+        if (memoryLoads > 0) memoryChanged = true;
+        set({ memoryRev: S.memoryRev + 1 });
+      }
       for (const k of ev.kinds) if (S[k] && loaders[k]) loaders[k]().catch(() => {});
       if (ev.kinds.includes('feed') && S.library) loadLibrary().catch(() => {});
       break;
     case 'settings.changed':
+      noteResetMark(ev.settings);
       set({ settings: ev.settings });
       break;
     case 'harness.status':
@@ -706,6 +807,8 @@ function reconcileLive() {
 
 /** Refetch whatever is loaded (after a reconnect or a resync). */
 export function refreshAll() {
+  // Events may have been missed: open note sheets reload too.
+  set({ memoryRev: S.memoryRev + 1 });
   loadConvs().catch(() => {});
   for (const cid of Object.keys(S.msgs)) loadMessages(cid).catch(() => {});
   reconcileLive();
