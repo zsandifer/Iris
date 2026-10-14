@@ -177,9 +177,10 @@ own personality. It is not a clone.
   is doing and holds chats and check-ins until turned back on.
   Trusted people manages recipients who can receive messages without another approval.
 - **System files:** the persona markdown files and memory/workspace folders,
-  each with a plain-language label, editable. Memory ("What Iris always
-  keeps in mind" and the memory folder) is a read-only copy with a lock note
-  in Iris's voice: you change memory by asking in chat.
+  each with a plain-language label. Files open as rendered Markdown with an
+  Edit button for the plain text (empty files open straight in the editor).
+  Memory ("What Iris always keeps in mind" and the memory folder) is a
+  read-only copy with a lock note in Iris's voice: you change memory by asking in chat.
 - **Settings:**
   - Name, picture, voice replies, notifications, quiet hours.
   - Advanced: **AI engine**, devices, people, activity log (all steps, or
