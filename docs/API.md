@@ -2558,6 +2558,7 @@ was emitted). Events are delivered only to the users listed under
 | `message.activity` | `{"conversation_id", "message_id", "activity": {Activity}}` | Conversation members |
 | `message.completed` | `{"conversation_id", "message": {Message}}` | Conversation members |
 | `memory.noted` | `{"conversation_id", "message_id", "changes": [{"history_id", "item_id", "op", "text"}]}` | Owner only |
+| `memory.reset` | `{}` after Forget everything: drop cached Noted metadata and morning cards (they now read "I cleared my notes.") | Owner only |
 | `turn.status` | `{"conversation_id", "message_id", "status": "queued" \| "running"}` | Conversation members |
 | `conversation.created` | `{"conversation": {Conversation}}` | Conversation members |
 | `entities.changed` | `{"kinds": ["goals" \| "ideas" \| "feed" \| "library" \| "memory", ...]}` | The affected user |

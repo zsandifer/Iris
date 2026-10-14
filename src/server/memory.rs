@@ -207,8 +207,13 @@ async fn forget_everything(
         .call(move |c| crate::memory::lifecycle::forget_everything(c, &paths))
         .await
         .map_err(error)?;
+    // Memory reset also removed historical Noted/card payloads: owner apps
+    // drop their cached copies.
+    state.hub.send(
+        crate::events::Audience::Owner,
+        json!({"type":"memory.reset"}),
+    );
     changed(&state);
-    // Memory reset also removed historical Noted/card payloads.
     ok(out)
 }
 

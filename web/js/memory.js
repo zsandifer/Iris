@@ -4,10 +4,10 @@
 // Settings → Memory. Owner only: memory never shows to anyone else.
 import { html, useEffect, useLayoutEffect, useRef, useState } from './h.js';
 import { api, get, post, patch, put, del, seg } from './api.js';
-import { S, set, useStore, go, toast, isOwner, loadMemory, refreshAll } from './store.js';
+import { S, set, useStore, go, toast, isOwner, loadMemory, memoryReset } from './store.js';
 import { Icon, Row, Group, Page, Empty, Spinner, Toggle, openSheet, closeSheet, confirmSheet } from './ui.js';
 import {
-  TOPICS, TOPIC_TITLE, noteMark, groupNotes, countLabel, historyLines, shortDate, changeTag, notedLine, sourceOf,
+  TOPICS, TOPIC_TITLE, noteMark, groupNotes, countLabel, historyLines, shortDate, changeTag, notedLine, sourceOf, undos,
 } from './memory-text.js';
 
 const apiPath = (p) => String(p || '').replace(/^\/api(?=\/)/, '');
@@ -15,10 +15,6 @@ const num = (n) => seg(String(Number(n)));
 
 // ------------------------------------------------------------ undo / redo
 
-// Changes undone in this session: history id -> the id of the undo itself,
-// so tapping again (Redo) undoes the undo. Shared by the Noted sheet and
-// the morning note, so both agree.
-const undone = new Map();
 const flips = new Set();
 const flipped = () => flips.forEach((f) => f());
 
@@ -31,20 +27,16 @@ function useFlips() {
   }, []);
 }
 
+const undoChange = (id) => post(`/memory/history/${num(id)}/undo`, {});
+
 /**
  * Undo `historyId`, or redo it if it was undone here. `first` makes the
- * first undo (the morning note has its own route); later steps use the
- * general history route.
+ * first undo (the morning note has its own route); later steps undo the
+ * newest change through the general history route.
  */
-async function toggleUndo(historyId, first = (id) => post(`/memory/history/${num(id)}/undo`, {})) {
+async function toggleUndo(historyId, first = undoChange) {
   try {
-    if (undone.has(historyId)) {
-      await post(`/memory/history/${num(undone.get(historyId))}/undo`, {});
-      undone.delete(historyId);
-    } else {
-      const r = await first(historyId);
-      undone.set(historyId, r.history_id);
-    }
+    await undos.toggle(historyId, first, undoChange);
     flipped();
   } catch (e) { toast(e.message); }
 }
@@ -75,8 +67,13 @@ function NoteSheet({ id: first }) {
   const [err, setErr] = useState(null);
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
-  const load = (which = id) => get(`/memory/${num(which)}`)
-    .then((r) => { setData(r); setText(r.item.text); setErr(null); })
+  // `keepDraft`: a refresh (after Pin) must not throw away unsaved text.
+  const load = (which = id, keepDraft = false) => get(`/memory/${num(which)}`)
+    .then((r) => {
+      setData(r);
+      setText((cur) => (keepDraft && cur.trim() && data && cur.trim() !== data.item.text.trim() ? cur : r.item.text));
+      setErr(null);
+    })
     .catch((e) => setErr(e.status === 404 ? "I can't find that note anymore. It may have been forgotten." : e.message));
   useEffect(() => { load(id); }, [id]);
   if (err) return html`<div class="sheet-body"><h3>Memory</h3><p class="mu">${err}</p>
@@ -101,9 +98,16 @@ function NoteSheet({ id: first }) {
   const pin = () => act(async () => {
     await patch(`/memory/${num(item.id)}`, { pinned: !item.pinned });
     toast(item.pinned ? 'Unpinned' : 'Pinned. I’ll always keep this in mind.');
-    await load(item.id);
+    await load(item.id, true);
   });
   const forget = () => act(async () => {
+    const ok = await confirmSheet({
+      title: 'Forget this?',
+      body: 'I’ll stop remembering it and it leaves this list. You can undo right after.',
+      yes: 'Forget',
+      danger: true,
+    });
+    if (!ok) { openNote(item.id); return; }
     const r = await del(`/memory/${num(item.id)}`);
     closeSheet();
     toast('Forgotten', {
@@ -228,7 +232,7 @@ export function MemoryScreen() {
 
 function ChangeRow({ ch, first, edit = false }) {
   useFlips();
-  const off = undone.has(ch.history_id);
+  const off = undos.isOff(ch.history_id);
   const tag = changeTag(ch.op, { noted: edit });
   const gone = ch.op === 'delete' || (off && ch.op === 'add');
   return html`<div class=${'mem-li' + (off ? ' undone' : '')}>
@@ -254,7 +258,7 @@ export function NotedLine({ m }) {
   useFlips();
   const changes = m.meta?.noted;
   if (!isOwner() || !Array.isArray(changes) || !changes.length) return null;
-  const allOff = changes.every((ch) => undone.has(ch.history_id));
+  const allOff = changes.every((ch) => undos.isOff(ch.history_id));
   return html`<button class=${'noted' + (allOff ? ' undone' : '')} onClick=${() => openSheet(() => html`<${NotedSheet} changes=${changes} />`)}>
     <${Icon} name="memory" size=${13} /><span>${notedLine(changes)}</span></button>`;
 }
@@ -315,8 +319,7 @@ export function MemorySettings() {
     try {
       const r = await post('/memory/forget-everything', { confirm: true });
       toast(r.forgotten ? 'Done. I’ve forgotten everything I’d learned.' : 'Done. There was nothing to forget.');
-      refreshAll();
-      loadMemory().catch(() => {});
+      memoryReset();
     } catch (e) { toast(e.message); }
   };
   return html`<${Page} title="Memory" sub="What I remember and how I learn">

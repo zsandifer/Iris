@@ -2,6 +2,7 @@
 // in sync with the REST API and the WebSocket event stream.
 import { useEffect, useReducer, useRef } from './h.js';
 import { get, post, patch, seg, isId } from './api.js';
+import { undos, withoutMemory } from './memory-text.js';
 
 /** Fresh client state: everything here belongs to the signed-in user. */
 function initialState() {
@@ -494,20 +495,47 @@ function setBrowser(b) {
 // a note that moves between pages while loading is shown once.
 const MEMORY_PAGE = 100;
 const MEMORY_MAX = 2000;
+// A note that changes while pages load can move to a page already read.
+// Changes announced meanwhile restart the load (a few times at most).
+let memoryLoads = 0;
+let memoryChanged = false;
 export async function loadMemory() {
   if (!isOwner()) return;
   const apply = refreshOf('memory');
-  const items = [];
-  const ids = new Set();
-  let more = true;
-  let offset = 0;
-  while (more && offset < MEMORY_MAX) {
-    const r = await get(`/memory?limit=${MEMORY_PAGE}&offset=${offset}`);
-    for (const i of r.items) if (!ids.has(i.id)) { ids.add(i.id); items.push(i); }
-    more = !!r.has_more && r.items.length > 0;
-    offset += r.items.length;
+  memoryLoads++;
+  try {
+    let items;
+    let more;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      memoryChanged = false;
+      items = [];
+      const ids = new Set();
+      more = true;
+      let offset = 0;
+      while (more && offset < MEMORY_MAX) {
+        const r = await get(`/memory?limit=${MEMORY_PAGE}&offset=${offset}`);
+        for (const i of r.items) if (!ids.has(i.id)) { ids.add(i.id); items.push(i); }
+        more = !!r.has_more && r.items.length > 0;
+        offset += r.items.length;
+      }
+      if (!memoryChanged) break;
+    }
+    apply(() => set({ memory: { items, more } }));
+  } finally {
+    memoryLoads--;
   }
-  apply(() => set({ memory: { items, more } }));
+}
+
+/**
+ * Forget everything happened (here or on another device): cached replies
+ * lose their Noted lines and morning notes read as cleared, as on the server.
+ */
+export function memoryReset() {
+  undos.clear();
+  const msgs = {};
+  for (const [cid, box] of Object.entries(S.msgs)) msgs[cid] = { ...box, list: box.list.map(withoutMemory) };
+  set({ msgs });
+  if (S.memory) loadMemory().catch(() => {});
 }
 
 /** A memory.noted event: show the Noted line under that reply. */
@@ -676,6 +704,9 @@ export function handleEvent(ev) {
       upsert(ev.conversation_id, ev.message);
       set({});
       break;
+    case 'memory.reset':
+      memoryReset();
+      break;
     case 'memory.noted':
       applyNoted(ev.conversation_id, ev.message_id, ev.changes || []);
       break;
@@ -686,6 +717,7 @@ export function handleEvent(ev) {
       }
       break;
     case 'entities.changed':
+      if (ev.kinds.includes('memory') && memoryLoads > 0) memoryChanged = true;
       for (const k of ev.kinds) if (S[k] && loaders[k]) loaders[k]().catch(() => {});
       if (ev.kinds.includes('feed') && S.library) loadLibrary().catch(() => {});
       break;

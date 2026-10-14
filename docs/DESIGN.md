@@ -185,9 +185,9 @@ own personality. It is not a clone.
   "Where I learned it" (the chat it came from opens with one tap; older notes
   say "From my older notes", the owner's own "You told me here"), History in
   plain words ("Updated overnight from …", "Pinned by you") with Undo on the
-  newest change, Pin / Unpin, and Forget (a toast offers Undo). While learning
-  is paused, the screen says so with Resume learning. The sliders button opens
-  Settings → Memory.
+  newest change, Pin / Unpin, and Forget (after a confirmation; a toast then
+  offers Undo). While learning is paused, the screen says so with Resume
+  learning. The sliders button opens Settings → Memory.
   Old incidental notes are quietly set aside, with history retained for Undo.
   Pinned and identity notes stay until edited or their explicit validity ends.
 - **Noted line:** when Iris saves, changes or forgets something during a
@@ -199,6 +199,8 @@ own personality. It is not a clone.
   our chats yesterday. Tap Undo if I got something wrong.", the first three
   changes tagged New / Updated (with "was: …") / Done, each with Undo (then
   Redo), "and N more ›" to show the rest, and "See everything I remember ›".
+  Forget everything (from any device) clears Noted lines and morning notes
+  in every open app; they read "I cleared my notes."
 - **Settings → Memory:** Pause learning, Morning note on/off, See everything
   I remember, Export as Markdown (a sheet that downloads `iris-memory.md`),
   and Forget everything. Forget everything needs a confirmation explaining

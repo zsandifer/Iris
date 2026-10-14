@@ -1,6 +1,6 @@
 // Plain-language wording for memory: topics, "learned last night" marks,
-// history lines, change tags and the Noted line. No imports, so the tests
-// can load it without a browser.
+// history lines, change tags and the Noted line, plus the Undo/Redo
+// bookkeeping. No imports, so the tests can load it without a browser.
 
 export const TOPICS = [
   ['you', 'You'],
@@ -151,6 +151,38 @@ export function notedLine(changes = []) {
 }
 
 export const verbFor = (op) => VERB[op] || 'Noted';
+
+/**
+ * Undo/Redo of changes shown in Noted sheets and morning notes. Each undo
+ * (and redo) is itself a new change, and only a note's newest change can be
+ * undone, so the next tap always goes to the newest one. `first(id)` makes
+ * the first undo (the morning note has its own route); `again(id)` the rest.
+ */
+export function undoTracker() {
+  const state = new Map(); // original change id -> {off, latest}
+  return {
+    isOff: (id) => !!state.get(id)?.off,
+    async toggle(id, first, again) {
+      const s = state.get(id);
+      const r = s ? await again(s.latest) : await first(id);
+      state.set(id, { off: !s || !s.off, latest: r.history_id });
+    },
+    clear: () => state.clear(),
+  };
+}
+
+/** Shared by every Noted sheet and morning note, so they agree. */
+export const undos = undoTracker();
+
+/** A cached message without what Forget everything removed on the server. */
+export function withoutMemory(m) {
+  if (m.card?.type === 'memory_morning') return { ...m, kind: 'text', card: null, content: 'I cleared my notes.' };
+  if (m.meta && 'noted' in m.meta) {
+    const { noted, ...meta } = m.meta;
+    return { ...m, meta };
+  }
+  return m;
+}
 
 /**
  * Where a note came from: {text, cid?} where cid is a chat to open.

@@ -7,6 +7,7 @@ import { setToken } from '../../web/js/api.js';
 import { S, set, handleEvent, loadMemory, toast, parentRoute } from '../../web/js/store.js';
 import {
   whenWord, noteMark, groupNotes, countLabel, historyLines, historyText, changeTag, notedLine, sourceOf,
+  undoTracker, undos, withoutMemory,
 } from '../../web/js/memory-text.js';
 
 setToken('t');
@@ -137,4 +138,70 @@ test('a toast can carry an action such as Undo', () => {
 test('Memory and its settings go back the expected way', () => {
   assert.equal(parentRoute('#/iris/memory'), 'iris');
   assert.equal(parentRoute('#/settings/memory'), 'settings');
+});
+
+test('Undo, Redo, Undo, Redo always targets the newest change', async () => {
+  // The server only undoes a note's newest change; each undo makes a new one.
+  let newest = 10;
+  const sent = [];
+  const undo = (route) => async (id) => {
+    sent.push([route, id]);
+    if (id !== newest) throw new Error('That note changed again.');
+    newest += 1;
+    return { history_id: newest };
+  };
+  const t = undoTracker();
+  await t.toggle(10, undo('card'), undo('history'));
+  assert.equal(t.isOff(10), true);
+  await t.toggle(10, undo('card'), undo('history'));
+  assert.equal(t.isOff(10), false);
+  await t.toggle(10, undo('card'), undo('history'));
+  assert.equal(t.isOff(10), true);
+  await t.toggle(10, undo('card'), undo('history'));
+  assert.equal(t.isOff(10), false);
+  assert.deepEqual(sent, [['card', 10], ['history', 11], ['history', 12], ['history', 13]],
+    'only the first undo uses the morning-note route');
+  // A failed step leaves the state as it was.
+  newest = 99;
+  await assert.rejects(t.toggle(10, undo('card'), undo('history')));
+  assert.equal(t.isOff(10), false);
+  t.clear();
+  assert.equal(t.isOff(10), false);
+});
+
+test('Forget everything (here or on another device) clears cached Noted lines and morning notes', () => {
+  const card = { id: 'k', conversation_id: CID, role: 'assistant', kind: 'card', content: 'I tidied my notes overnight', card: { type: 'memory_morning', changes: [] }, created_at: 1, updated_at: 1 };
+  const noted = { id: 'n', conversation_id: CID, role: 'assistant', kind: 'text', content: 'Sure', meta: { purpose: 'chat', noted: [{ history_id: 1 }] }, created_at: 2, updated_at: 2 };
+  const other = { id: 'o', conversation_id: CID, role: 'user', kind: 'text', content: 'hi', created_at: 3, updated_at: 3 };
+  assert.deepEqual(withoutMemory(other), other);
+  assert.equal(withoutMemory(card).card, null);
+  assert.equal(withoutMemory(card).content, 'I cleared my notes.');
+  assert.deepEqual(withoutMemory(noted).meta, { purpose: 'chat' });
+  set({ msgs: { [CID]: { list: [card, noted, other], hasMore: true } }, memory: null });
+  handleEvent({ type: 'memory.reset' });
+  const list = S.msgs[CID].list;
+  assert.equal(list[0].card, null);
+  assert.equal(list[1].meta.noted, undefined);
+  assert.deepEqual(list[2], other);
+  assert.equal(S.msgs[CID].hasMore, true, 'paging state stays');
+  assert.equal(undos.isOff(1), false);
+});
+
+test('a note that changes while Memory first loads is not lost', async () => {
+  set({ me: { user: { id: 'o', is_owner: true } }, memory: null });
+  // Page 1 then page 2; a chat updates note 3 (on page 2) after page 1 was
+  // read, moving it to the top, so the first pass misses it.
+  let pass = 0;
+  onFetch((url, opts) => {
+    const off = Number(new URL(url, 'http://iris.test').searchParams.get('offset'));
+    if (off === 0) {
+      pass += 1;
+      const first = pass === 1 ? [note(1), note(2)] : [note(3), note(1)];
+      if (pass === 1) queueMicrotask(() => handleEvent({ type: 'entities.changed', kinds: ['memory'] }));
+      return reply(opts, { body: { items: first, has_more: true } });
+    }
+    return reply(opts, { body: { items: pass === 1 ? [note(4)] : [note(2), note(4)], has_more: false } });
+  });
+  await loadMemory();
+  assert.deepEqual(S.memory.items.map((i) => i.id).sort(), [1, 2, 3, 4]);
 });
