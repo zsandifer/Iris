@@ -8,6 +8,7 @@ mod chat;
 mod connect;
 mod content;
 mod memory;
+mod routines;
 mod web;
 mod ws;
 
@@ -180,6 +181,7 @@ pub fn router(state: AppState) -> Router {
         .merge(admin::routes())
         .merge(browser::routes())
         .merge(connect::routes())
+        .merge(routines::routes())
         .route("/ws", get(ws::handler))
         .layer(DefaultBodyLimit::max(upload_limit));
     Router::new()
@@ -2104,6 +2106,109 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn routine_documents_are_markdown_or_text_and_saved_to_the_library() {
+        let h = setup();
+        let t = pair_as(&h, None).await;
+        let upload = |name: &str, body: Vec<u8>| {
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/routines/docs?name={name}"))
+                .header("authorization", format!("Bearer {t}"))
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let read = |res: axum::response::Response| async move {
+            let status = res.status();
+            let b = axum::body::to_bytes(res.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice::<Value>(&b).unwrap())
+        };
+        let (s, b) = read(
+            h.app
+                .clone()
+                .oneshot(upload(
+                    "Takeout%20SOP.md",
+                    b"# Usual\n- Pad See Ew".to_vec(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let doc = b["doc"]["id"].as_str().unwrap().to_string();
+        assert_eq!(b["doc"]["title"], "Takeout SOP.md");
+        let (s, b) = read(
+            h.app
+                .clone()
+                .oneshot(upload("menu.pdf", b"%PDF-1.7".to_vec()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(
+            b["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Markdown (.md) or plain text (.txt)")
+        );
+        let big = vec![b'a'; h.state.cfg.max_upload_bytes + 1];
+        let (s, _) = read(h.app.clone().oneshot(upload("big.txt", big)).await.unwrap()).await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+        // It is an ordinary Library item.
+        let (s, _) = send(
+            &h.app,
+            "GET",
+            &format!("/api/library/{doc}"),
+            Some(&t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            "/api/routines",
+            Some(&t),
+            Some(
+                json!({"title": "Dinner", "instructions": "Order dinner.", "schedule_kind": "once",
+                        "run_at": "2030-01-05T18:00", "tz": "UTC", "doc_ids": [doc]}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["routine"]["docs"][0]["title"], "Takeout SOP.md");
+        let id = b["routine"]["id"].as_str().unwrap();
+        let (s, b) = send(
+            &h.app,
+            "DELETE",
+            &format!("/api/routines/{id}/docs/{doc}"),
+            Some(&t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["routine"]["docs"], json!([]));
+        // Bad schedules come back as a friendly sentence.
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            "/api/routines/preview",
+            Some(&t),
+            Some(json!({"schedule_kind": "cron", "cron_expr": "*/5 * * * *", "tz": "UTC"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(
+            b["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("runs too often")
+        );
+    }
+
     /// A stand-in for `claude` that implements `--version`, `auth status`
     /// and `auth login` the way the real CLI behaves headless.
     fn fake_claude(dir: &std::path::Path) -> std::path::PathBuf {
@@ -3574,8 +3679,10 @@ cat > "$r/stdin"
 touch "$r/started"
 while [ -f "{d}/hold" ]; do sleep 0.02; done
 echo '{{"type":"system","subtype":"init","session_id":"sess-'$n'"}}'
-echo '{{"type":"assistant","message":{{"id":"m1","content":[{{"type":"text","text":"ok"}}]}}}}'
-echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
+text=ok
+[ -f "{d}/reply" ] && text=$(cat "{d}/reply")
+printf '%s\n' '{{"type":"assistant","message":{{"id":"m1","content":[{{"type":"text","text":"'"$text"'"}}]}}}}'
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"'"$text"'"}}'
 "#,
                 d = dir.display()
             ),
@@ -3740,6 +3847,170 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             guest_id,
             guest_t,
         }
+    }
+
+    #[tokio::test]
+    async fn a_routine_prepares_asks_and_acts_after_the_owner_s_ok() {
+        let t = turn_setup(|_| {}).await;
+        let h = &t.h;
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            "/api/routines",
+            Some(&t.owner_t),
+            Some(json!({"title": "Saturday dinner order", "emoji": "🍜",
+                        "instructions": "Build my usual Thai order.", "schedule_kind": "rule",
+                        "rule": {"freq": "weekly", "days": [6], "time": "17:30"}, "tz": "UTC"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let id = b["routine"]["id"].as_str().unwrap().to_string();
+        // Guests never see routines.
+        let (s, _) = send(&h.app, "GET", "/api/routines", Some(&t.guest_t), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        std::fs::write(
+            t.dir.join("reply"),
+            "Thai Orchid is open. Cart: Pad See Ew.\\nNEEDS_OK: Order Pad See Ew for $31.",
+        )
+        .unwrap();
+        let path = format!("/api/routines/{id}");
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            &format!("{path}/run"),
+            Some(&t.owner_t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("{path}/run"),
+            Some(&t.owner_t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT, "never two runs at once");
+        let run_status = || async {
+            let (_, b) = send(&h.app, "GET", &path, Some(&t.owner_t), None).await;
+            b["routine"]["runs"][0].clone()
+        };
+        let mut run = Value::Null;
+        for _ in 0..250 {
+            run = run_status().await;
+            if run["status"] == "waiting" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(run["status"], "waiting", "{run}");
+        assert_eq!(run["summary"], "Order Pad See Ew for $31.");
+        // The run was a scheduled job with the routine's instructions.
+        let prompt = t.read(0, "stdin");
+        assert!(prompt.contains("Build my usual Thai order.") && prompt.contains("NEEDS_OK:"));
+        assert!(t.read(0, "system.md").contains("scheduled background job"));
+        // Main chat: what Iris prepared, then the approval card.
+        let main = t.main_of(&t.owner_t).await;
+        let (_, msgs) = send(
+            &h.app,
+            "GET",
+            &format!("/api/conversations/{main}/messages"),
+            Some(&t.owner_t),
+            None,
+        )
+        .await;
+        let msgs = msgs["messages"].as_array().unwrap().clone();
+        assert!(
+            msgs.iter()
+                .any(|m| m["content"] == "Thai Orchid is open. Cart: Pad See Ew.")
+        );
+        let card = msgs
+            .iter()
+            .find(|m| m["card"]["routine_run_id"] == run["id"])
+            .expect("approval card")
+            .clone();
+        assert_eq!(card["card"]["type"], "approval");
+        assert_eq!(card["card"]["preview"]["body"], "Order Pad See Ew for $31.");
+        // The owner says yes: the same conversation continues and acts.
+        std::fs::write(t.dir.join("reply"), "Ordered. It arrives at 6:15.").unwrap();
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            &format!("/api/messages/{}/decision", card["id"].as_str().unwrap()),
+            Some(&t.owner_t),
+            Some(json!({"approve": true})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        for _ in 0..250 {
+            run = run_status().await;
+            if run["status"] == "ok" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(run["status"], "ok", "{run}");
+        assert_eq!(run["summary"], "Ordered. It arrives at 6:15.");
+        assert!(run["approved_at"].is_i64());
+        assert!(t.read(1, "stdin").contains("The owner approved"));
+        assert!(
+            t.read(1, "args").contains("--resume"),
+            "continues the prepared session"
+        );
+
+        // Next time the owner says no: the run is skipped, nothing acts.
+        std::fs::write(t.dir.join("reply"), "Cart ready.\\nNEEDS_OK: Order again.").unwrap();
+        send(
+            &h.app,
+            "POST",
+            &format!("{path}/run"),
+            Some(&t.owner_t),
+            None,
+        )
+        .await;
+        for _ in 0..250 {
+            run = run_status().await;
+            if run["status"] == "waiting" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let card_id = run["card_message_id"].as_str().unwrap().to_string();
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/messages/{card_id}/decision"),
+            Some(&t.owner_t),
+            Some(json!({"approve": false})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let run = run_status().await;
+        assert_eq!(run["status"], "skipped");
+        assert_eq!(run["reason"], "You said no, so I didn't do it.");
+        assert_eq!(t.runs(), 3, "no acting step after a no");
+        // Paused: run now is refused politely.
+        h.state
+            .db
+            .call(|c| crate::db::set_setting(c, "paused", "1"))
+            .await
+            .unwrap();
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            &format!("{path}/run"),
+            Some(&t.owner_t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert!(
+            b["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("I'm paused")
+        );
     }
 
     #[tokio::test]
