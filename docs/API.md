@@ -2870,7 +2870,13 @@ the last start. Manual runs (`POST /api/jobs/{name}/run`,
   decisions, no unknown fields, prose, fences or trailing junk. Changes must
   cite supplied message aliases; pinned candidates and overlapping edits are
   rejected. Old evidence cannot undo an existing Forget/correction: normalized
-  tombstone matches and changes to more recent notes become host NOOPs, allowing
+  owner/agent Forget/text correction atomically moves `memory.dream.evidence_after`
+  past every existing message. Earlier sources become ineligible regardless of
+  proposed wording, preventing paraphrased re-learning. This deliberately skips
+  unrelated unprocessed history too. On upgrade, prior removal/correction history
+  without that boundary conservatively excludes the current backlog once.
+  New messages remain eligible. Normalized tombstone matches and changes to more
+  recent Dream notes become host NOOPs, allowing
   the watermark to progress. Newer assertions can teach the fact again. Candidate
   recency is included in the prompt; Dream tracks cited assertion time separately
   from execution time so bounded backlog batches remain chronological.
@@ -2883,7 +2889,10 @@ the last start. Manual runs (`POST /api/jobs/{name}/run`,
   History actor is `dream`, batch IDs are `dream-<id>`, and sources are
   `{type: "dream", messages: [{conversation_id, message_id}], asserted_at}`.
   Settings: `job.dream.last_run` (attempt ms), `memory.dream.watermark` (success
-  cursor), `memory.dream.card_day` (last published local date). No new tables or
+  cursor), `memory.dream.card_day` (last published local date), and
+  `memory.dream.evidence_after` (durable source boundary after owner/agent removals/corrections).
+  Future Forget-everything implementations must preserve/advance that boundary
+  before clearing history. No new tables or
   MCP tools. Morning-card data and undo are described in [Memory](#320-memory).
 
 - **heartbeat**: the agent works through `HEARTBEAT.md`. If it replies

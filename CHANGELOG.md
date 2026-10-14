@@ -16,7 +16,9 @@ All notable changes to Iris are documented here, following
   are owner settings; pausing learning also stops agent memory writes while
   recall and owner edits remain available. Generated Idea prompts stay out of
   Dream evidence, and historical chats cannot reverse newer corrections or
-  resurrect forgotten text; newer owner assertions remain learnable.
+  resurrect forgotten facts through paraphrases. A Forget or text correction
+  excludes all older unprocessed chat evidence; newer owner assertions remain
+  learnable. Existing removal history initializes that source boundary on upgrade.
 
 - Personal and shared chat with photos, streaming replies and saved history.
 - Claude Code, Codex, Gemini and OpenCode engines, with installation and sign-in

@@ -272,6 +272,17 @@ fn record(
     actor: Actor,
     batch: &str,
 ) -> rusqlite::Result<()> {
+    if matches!(actor, Actor::Owner | Actor::Agent)
+        && before.is_some_and(|old| {
+            after.is_none_or(|new| {
+                old.content_hash != new.content_hash
+                    || (!old.archived && new.archived)
+                    || (old.superseded_by.is_none() && new.superseded_by.is_some())
+            })
+        })
+    {
+        dream::exclude_prior(conn)?;
+    }
     conn.execute(
         "INSERT INTO memory_history (item_id, op, before, after, actor, batch_id, at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",

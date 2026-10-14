@@ -13,6 +13,7 @@ use std::time::Duration;
 
 pub const PAUSED: &str = "memory.learning_paused";
 pub const MORNING: &str = "memory.morning_note";
+pub const EVIDENCE_AFTER: &str = "memory.dream.evidence_after";
 const WATERMARK: &str = "memory.dream.watermark";
 const LAST_RUN: &str = "job.dream.last_run";
 const CARD_DAY: &str = "memory.dream.card_day";
@@ -72,12 +73,45 @@ struct Input {
     candidates: Vec<Item>,
 }
 
-fn watermark(c: &Connection) -> rusqlite::Result<i64> {
-    let value = db::get_setting(c, WATERMARK)?;
-    value.map_or(Ok(0), |v| {
+fn cursor(c: &Connection, key: &str) -> rusqlite::Result<i64> {
+    db::get_setting(c, key)?.map_or(Ok(0), |v| {
         v.parse()
             .map_err(|_| recall::invalid("I couldn't read my learning progress."))
     })
+}
+
+fn watermark(c: &Connection) -> rusqlite::Result<i64> {
+    cursor(c, WATERMARK)
+}
+
+/// Forget/correction means old evidence must not teach the same information
+/// again under different wording. A global source boundary avoids semantic
+/// guessing: unrelated unprocessed history is conservatively skipped too.
+pub fn exclude_prior(c: &Connection) -> rusqlite::Result<()> {
+    let latest: i64 = c.query_row(
+        "SELECT COALESCE(MAX(created_at),0) FROM messages",
+        [],
+        |r| r.get(0),
+    )?;
+    let after = latest.max(now_ms()).max(cursor(c, EVIDENCE_AFTER)?);
+    db::set_setting(c, EVIDENCE_AFTER, &after.to_string())
+}
+
+fn evidence_after(c: &Connection) -> rusqlite::Result<i64> {
+    if db::get_setting(c, EVIDENCE_AFTER)?.is_some() {
+        return cursor(c, EVIDENCE_AFTER);
+    }
+    // Older versions have no source boundary. With incomplete provenance,
+    // conservatively exclude the current backlog once rather than re-learning
+    // deliberately removed information. Future assertions remain eligible.
+    if c.prepare_cached("SELECT 1 FROM memory_history WHERE actor IN ('owner','agent')
+        AND before IS NOT NULL AND (after IS NULL
+            OR json_extract(before,'$.content_hash') != json_extract(after,'$.content_hash')
+            OR (json_extract(before,'$.archived') = 0 AND json_extract(after,'$.archived') = 1)
+            OR (json_extract(before,'$.superseded_by') IS NULL AND json_extract(after,'$.superseded_by') IS NOT NULL))")?.exists([])? {
+        exclude_prior(c)?;
+    }
+    cursor(c, EVIDENCE_AFTER)
 }
 
 fn revision(c: &Connection) -> rusqlite::Result<i64> {
@@ -89,11 +123,12 @@ fn revision(c: &Connection) -> rusqlite::Result<i64> {
 fn prepare(c: &Connection, minimum: usize) -> rusqlite::Result<Option<Input>> {
     learning_allowed(c)?;
     let previous = watermark(c)?;
+    let after = evidence_after(c)?.max(previous);
     let revision = revision(c)?;
     let sql = format!("{ELIGIBLE} AND p.created_at > ?1 ORDER BY p.created_at LIMIT ?2");
     let raw: Vec<(String, String, String, i64)> = c
         .prepare(&sql)?
-        .query_map(params![previous, MAX_MESSAGES as i64], |r| {
+        .query_map(params![after, MAX_MESSAGES as i64], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -341,17 +376,20 @@ fn apply(
             "My notes changed while I was tidying. I'll try again later.",
         ));
     }
+    let after = evidence_after(c)?;
     // Recheck membership, taint, and message text under the write lock.
     let sql = format!(
         "{ELIGIBLE} AND p.id = ?1 AND p.conversation_id = ?2 AND p.content = ?3 AND p.created_at = ?4"
     );
     for source in &input.sources {
-        if !c.prepare(&sql)?.exists(params![
-            source.id,
-            source.conversation,
-            source.original,
-            source.at
-        ])? {
+        if source.at <= after
+            || !c.prepare(&sql)?.exists(params![
+                source.id,
+                source.conversation,
+                source.original,
+                source.at
+            ])?
+        {
             return Err(recall::invalid(
                 "That conversation changed while I was tidying. I'll try again later.",
             ));

@@ -511,18 +511,16 @@ async fn forget_and_owner_corrections_override_older_evidence_but_allow_new_asse
             Ok((forgotten, corrected))
         })
         .unwrap();
-    let input = state.db.with(|c| prepare(c, 4)).unwrap().unwrap();
-    let alias = input
-        .candidates
-        .iter()
-        .position(|i| i.id == corrected)
-        .unwrap()
-        + 1;
+    // Every old source is excluded independently of proposed wording, so a
+    // paraphrased ADD cannot resurrect the forgotten fact or correction.
+    assert!(state.db.with(|c| prepare(c, 4)).unwrap().is_none());
     reply(
         &tmp,
-        json!({"ops":[add_op("Orchard apples are a favorite"),{"op":"UPDATE","alias":alias,"text":"Orchard apples grow in the east garden","kind":"fact","importance":3,"messages":[1]}]}),
+        json!({"ops":[add_op("My favorite fruit is orchard apples"),{"op":"UPDATE","alias":1,"text":"My orchard apple trees are in the east","kind":"fact","importance":3,"messages":[1]}]}),
     );
     run(&state, &owner, true).await.unwrap();
+    assert!(!tmp.path().join("calls").exists());
+    assert_eq!(progress(&state), 0);
     state
         .db
         .with(|c| {
@@ -534,35 +532,9 @@ async fn forget_and_owner_corrections_override_older_evidence_but_allow_new_asse
             Ok(())
         })
         .unwrap();
-    assert!(progress(&state) > 0);
     assert!(cards(&state).is_empty());
-    // A stale SUPERSEDE must also be a NOOP, rather than undoing a correction.
-    state
-        .db
-        .with(|c| {
-            let p = parse(
-                &json!({"ops":[{"op":"SUPERSEDE","alias":alias,"valid_to":0,"messages":[1]}]})
-                    .to_string(),
-            )?;
-            // Replay the same evidence in an isolated validation transaction.
-            db::set_setting(c, WATERMARK, "0")?;
-            recall::mutate(c, &state.paths, |c| {
-                apply(c, &input, p, &owner, "stale-supersede")?;
-                Ok(Value::Null)
-            })?;
-            assert!(!super::super::get(c, corrected)?.unwrap().archived);
-            Ok(())
-        })
-        .unwrap();
     // New statements after the owner's decision can teach the fact again.
-    let boundary = state
-        .db
-        .with(|c| {
-            c.query_row("SELECT MAX(at) FROM memory_history", [], |r| {
-                r.get::<_, i64>(0)
-            })
-        })
-        .unwrap();
+    let boundary = state.db.with(|c| cursor(c, EVIDENCE_AFTER)).unwrap();
     add_messages(&state, &owner, &main, 4);
     state
         .db
@@ -576,7 +548,7 @@ async fn forget_and_owner_corrections_override_older_evidence_but_allow_new_asse
         .unwrap();
     reply(
         &tmp,
-        json!({"ops":[add_op("Orchard apples are a favorite"),{"op":"UPDATE","alias":alias,"text":"Orchard apples now grow in the north garden","kind":"fact","importance":3,"messages":[1]}]}),
+        json!({"ops":[add_op("Orchard apples are a favorite"),{"op":"UPDATE","alias":1,"text":"Orchard apples now grow in the north garden","kind":"fact","importance":3,"messages":[1]}]}),
     );
     run(&state, &owner, true).await.unwrap();
     state
@@ -660,4 +632,69 @@ async fn legacy_idea_starters_are_excluded_and_owner_followups_remain_eligible()
             Ok(())
         })
         .unwrap();
+}
+
+#[tokio::test]
+async fn legacy_removals_without_provenance_exclude_backlog_once_and_allow_new_evidence() {
+    let (state, tmp, owner, main) = setup().await;
+    add_messages(&state, &owner, &main, 4);
+    state
+        .db
+        .with(|c| {
+            let id = note(c, "Prefers orchard apples")?;
+            recall::forget(c, id, Actor::Owner, "legacy-forget")?;
+            // Simulate a pre-Dream database: history exists but no source boundary.
+            db::delete_setting(c, EVIDENCE_AFTER)?;
+            assert!(prepare(c, 4)?.is_none());
+            let after = cursor(c, EVIDENCE_AFTER)?;
+            let latest: i64 =
+                c.query_row("SELECT MAX(created_at) FROM messages", [], |r| r.get(0))?;
+            assert!(after >= latest);
+            Ok(())
+        })
+        .unwrap();
+    reply(
+        &tmp,
+        json!({"ops":[add_op("The favorite fruit is orchard apples")]}),
+    );
+    run(&state, &owner, true).await.unwrap();
+    assert!(!tmp.path().join("calls").exists());
+    // A source created after the durable boundary is new evidence.
+    add_messages(&state, &owner, &main, 4);
+    state
+        .db
+        .with(|c| {
+            let after = cursor(c, EVIDENCE_AFTER)?;
+            c.execute(
+                "UPDATE messages SET created_at=?1+rowid WHERE created_at>?1",
+                [after],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    run(&state, &owner, true).await.unwrap();
+    assert_eq!(state.db.with(super::super::live).unwrap().len(), 1);
+}
+
+#[test]
+fn removal_boundary_rolls_back_with_history_and_preserves_returned_history_id() {
+    let db = Db::open_in_memory().unwrap();
+    db.with(|c| {
+        let id = note(c, "Prefers orchard apples")?;
+        let original = revision(c)?;
+        let failed: rusqlite::Result<()> = db::write_tx(c, |c| {
+            recall::forget(c, id, Actor::Owner, "rolled-back-forget")?;
+            assert!(cursor(c, EVIDENCE_AFTER)? > 0);
+            Err(recall::invalid("Synthetic failure"))
+        });
+        assert!(failed.is_err());
+        assert!(super::super::get(c, id)?.is_some());
+        assert_eq!(revision(c)?, original);
+        assert!(db::get_setting(c, EVIDENCE_AFTER)?.is_none());
+        let forgotten = db::write_tx(c, |c| recall::forget(c, id, Actor::Owner, "forget"))?;
+        assert_eq!(forgotten["history_id"], revision(c)?);
+        assert!(cursor(c, EVIDENCE_AFTER)? > 0);
+        Ok(())
+    })
+    .unwrap();
 }
