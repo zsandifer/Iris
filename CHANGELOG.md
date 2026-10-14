@@ -14,7 +14,9 @@ All notable changes to Iris are documented here, following
   Memory link; dedicated card UI follows separately. Configure `[dream]` (3am,
   four new messages by default). Pause learning and morning-note preferences
   are owner settings; pausing learning also stops agent memory writes while
-  recall and owner edits remain available.
+  recall and owner edits remain available. Generated Idea prompts stay out of
+  Dream evidence, and historical chats cannot reverse newer corrections or
+  resurrect forgotten text; newer owner assertions remain learnable.
 
 - Personal and shared chat with photos, streaming replies and saved history.
 - Claude Code, Codex, Gemini and OpenCode engines, with installation and sign-in

@@ -310,7 +310,7 @@ async fn send_message(
         &state,
         &conv.id,
         Some(user.id()),
-        &body.text,
+        turn::ChatPrompt::Owner(&body.text),
         &body.attachments,
         Purpose::Chat,
         &owner,

@@ -1923,17 +1923,28 @@ fn browser_allowed(state: &AppState) -> bool {
     state.browser.enabled() && !state.browser.is_paused() && state.browser.available()
 }
 
+/// Whether the request text was written by the human or generated for an Idea.
+/// Both can start a chat; only human-authored text is evidence for Dream.
+pub enum ChatPrompt<'a> {
+    Owner(&'a str),
+    Idea(&'a str),
+}
+
 /// Store a user message and an assistant placeholder, broadcast both, and
 /// run the turn in the background. Returns the two stored messages.
 pub async fn start_chat_turn(
     state: &AppState,
     conversation_id: &str,
     author: Option<&str>,
-    text: &str,
+    prompt: ChatPrompt<'_>,
     attachments: &[String],
     purpose: Purpose,
     owner_user_id: &str,
 ) -> crate::util::Result<(Message, Message)> {
+    let (text, meta) = match prompt {
+        ChatPrompt::Owner(text) => (text, json!({})),
+        ChatPrompt::Idea(text) => (text, json!({"initiated_by":"idea"})),
+    };
     let (conv, author_s, text_s, att) = (
         conversation_id.to_string(),
         author.map(String::from),
@@ -1951,6 +1962,7 @@ pub async fn start_chat_turn(
                     author_user_id: author_s.as_deref(),
                     content: &text_s,
                     attachments: &att,
+                    meta: Some(&meta),
                     ..Default::default()
                 },
             )?;
@@ -2275,7 +2287,7 @@ printf '%s\n' '{"type":"thread.started","thread_id":"synthetic-session"}' \
                 &state,
                 &conv,
                 Some(&owner),
-                "Check memory",
+                ChatPrompt::Owner("Check memory"),
                 &[],
                 Purpose::Chat,
                 &owner,
@@ -2397,7 +2409,7 @@ printf '%s\n' '{"type":"init","session_id":"pre-join-session"}' \
                 &state,
                 &conv,
                 Some(&owner),
-                "private queued message",
+                ChatPrompt::Owner("private queued message"),
                 &[],
                 Purpose::Chat,
                 &owner,

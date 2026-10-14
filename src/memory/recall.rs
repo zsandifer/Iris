@@ -269,7 +269,7 @@ pub fn save(
     if let Some(old) = before.as_ref().filter(|_| !replace) {
         saved_id = old.id;
         c.execute("UPDATE memory_items SET kind = ?2, topic = ?3, text = ?4, importance = ?5, pinned = ?6, observed_at = ?7, valid_to = ?8, content_hash = ?9, updated_at = ?10, source = ?11, mentioned_at = ?12 WHERE id = ?1",
-            params![old.id, kind, topic.name(), text, importance, edit.pinned.unwrap_or(old.pinned), edit.observed_at.unwrap_or(old.observed_at), edit.valid_to.unwrap_or(old.valid_to), hash, now, if actor == Actor::Dream { source } else { &old.source }.to_string(), if actor == Actor::Dream { Some(now) } else { old.mentioned_at }])?;
+            params![old.id, kind, topic.name(), text, importance, edit.pinned.unwrap_or(old.pinned), edit.observed_at.unwrap_or(old.observed_at), edit.valid_to.unwrap_or(old.valid_to), hash, now, if actor == Actor::Dream { source } else { &old.source }.to_string(), if actor == Actor::Dream { source["asserted_at"].as_i64().or(Some(now)) } else { old.mentioned_at }])?;
         record(
             c,
             old.id,
@@ -280,8 +280,8 @@ pub fn save(
             batch,
         )?;
     } else {
-        c.execute("INSERT INTO memory_items(id, kind, topic, text, importance, pinned, created_at, observed_at, mentioned_at, valid_to, source, content_hash, updated_at) VALUES ((SELECT MAX(id) + 1 FROM (SELECT COALESCE(MAX(id), 0) AS id FROM memory_items UNION ALL SELECT COALESCE(MAX(item_id), 0) FROM memory_history)), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?6, ?8, ?9, ?10, ?6)",
-            params![kind, topic.name(), text, importance, edit.pinned.or(before.as_ref().map(|i| i.pinned)).unwrap_or(false), now, edit.observed_at.unwrap_or_else(|| before.as_ref().and_then(|i| i.observed_at)), edit.valid_to.unwrap_or_else(|| before.as_ref().and_then(|i| i.valid_to)), source.to_string(), hash])?;
+        c.execute("INSERT INTO memory_items(id, kind, topic, text, importance, pinned, created_at, observed_at, mentioned_at, valid_to, source, content_hash, updated_at) VALUES ((SELECT MAX(id) + 1 FROM (SELECT COALESCE(MAX(id), 0) AS id FROM memory_items UNION ALL SELECT COALESCE(MAX(item_id), 0) FROM memory_history)), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?11, ?8, ?9, ?10, ?6)",
+            params![kind, topic.name(), text, importance, edit.pinned.or(before.as_ref().map(|i| i.pinned)).unwrap_or(false), now, edit.observed_at.unwrap_or_else(|| before.as_ref().and_then(|i| i.observed_at)), edit.valid_to.unwrap_or_else(|| before.as_ref().and_then(|i| i.valid_to)), source.to_string(), hash, if actor == Actor::Dream { source["asserted_at"].as_i64().unwrap_or(now) } else { now }])?;
         saved_id = c.last_insert_rowid();
         let after = get(c, saved_id)?.unwrap();
         record(c, saved_id, "add", None, Some(&after), actor, batch)?;

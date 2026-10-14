@@ -2457,6 +2457,10 @@ Dream morning cards have `type: "memory_morning"`, `owner_only: true`,
 `memory_url: "/#/iris/memory"`, `action_label: "See everything I remember ›"`,
 and `undo_url` pointing to the card-specific POST route. Each change contains
 `history_id`, `item_id`, and a scrubbed text preview (up to 240 characters).
+`Message.meta.initiated_by: "idea"` identifies generated Idea starters; new Idea
+conversation seeds also carry `generated_starter: true`. Owner-written follow-ups
+keep ordinary empty metadata and remain eligible for Dream.
+
 One card at most per local day, only after actual changes, only in the owner's
 still-private Main chat. It emits owner-only `message.created`, with no push.
 The card is a historical summary; undo still verifies current history. Dedicated
@@ -2854,7 +2858,8 @@ the last start. Manual runs (`POST /api/jobs/{name}/run`,
   new runs and rejects in-flight results at commit.
   Input is new, completed, owner-authored plain text from never-shared sole-owner
   main/side chats, after `memory.dream.watermark` (message creation timestamp).
-  Assistant replies, jobs/heartbeat/feed, cards, attachments, all metadata-bearing
+  Assistant replies, generated Idea starters (including legacy Idea seeds),
+  jobs/heartbeat/feed, cards, attachments, all metadata-bearing
   messages (including untrusted/browser/connector records), and messages over
   4,000 characters are excluded structurally. Private spans and secrets are
   scrubbed before the prompt. A batch reads at most 80 messages / 24,000 scrubbed
@@ -2864,14 +2869,19 @@ the last start. Manual runs (`POST /api/jobs/{name}/run`,
   Strict JSON `{ops: [...]}` accepts 1–40 ADD/UPDATE/SUPERSEDE/NOOP/REJECT
   decisions, no unknown fields, prose, fences or trailing junk. Changes must
   cite supplied message aliases; pinned candidates and overlapping edits are
-  rejected. UPDATE preserves ID and stores new Dream source refs; SUPERSEDE
+  rejected. Old evidence cannot undo an existing Forget/correction: normalized
+  tombstone matches and changes to more recent notes become host NOOPs, allowing
+  the watermark to progress. Newer assertions can teach the fact again. Candidate
+  recency is included in the prompt; Dream tracks cited assertion time separately
+  from execution time so bounded backlog batches remain chronological.
+  UPDATE preserves ID and stores new Dream source refs; SUPERSEDE
   archives with a non-future `valid_to`, never deletes. The whole batch fails
   if more than 25% of changed existing notes would be set aside (new additions
   and unchanged updates do not dilute the guard). Parse, evidence, mutation or
   export failure rolls back notes/history/watermark/card together. Sources and
   history revision are rechecked at commit against concurrent edits/sharing.
   History actor is `dream`, batch IDs are `dream-<id>`, and sources are
-  `{type: "dream", messages: [{conversation_id, message_id}]}`.
+  `{type: "dream", messages: [{conversation_id, message_id}], asserted_at}`.
   Settings: `job.dream.last_run` (attempt ms), `memory.dream.watermark` (success
   cursor), `memory.dream.card_day` (last published local date). No new tables or
   MCP tools. Morning-card data and undo are described in [Memory](#320-memory).

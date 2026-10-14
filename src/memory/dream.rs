@@ -41,7 +41,14 @@ pub fn due(cfg: &DreamConfig, last: Option<i64>, now: i64, minutes: u32) -> bool
 const ELIGIBLE: &str = "SELECT p.id, p.conversation_id, p.content, p.created_at
     FROM memory_private_messages p JOIN messages m ON m.id = p.id
     WHERE p.role = 'user' AND m.meta = '{}' AND m.attachments = '[]'
-    AND length(p.content) BETWEEN 1 AND 4000";
+    AND length(p.content) BETWEEN 1 AND 4000
+    AND NOT EXISTS (
+        SELECT 1 FROM conversations origin WHERE origin.id = p.conversation_id
+        AND json_extract(origin.seed, '$.type') = 'idea'
+        AND json_extract(origin.seed, '$.generated_starter') IS NULL
+        AND p.id = (SELECT id FROM messages first WHERE first.conversation_id = p.conversation_id
+                    ORDER BY first.created_at LIMIT 1)
+    )";
 
 #[derive(Clone, Debug, Serialize)]
 struct Source {
@@ -221,6 +228,7 @@ fn prompt(input: &Input) -> String {
             json!({
                 "alias": n + 1, "text": gate::scrub_document(&i.text), "kind": i.kind,
                 "importance": i.importance, "pinned": i.pinned, "observed_at": i.observed_at,
+                "updated_at":i.updated_at, "mentioned_at":i.mentioned_at,
             })
         })
         .collect();
@@ -230,7 +238,7 @@ Use only the aliases supplied. Each change must cite at least one supporting mes
 Never change pinned notes. UPDATE corrects a candidate, retaining its identity and history. \
 SUPERSEDE sets a candidate aside as no longer true, with valid_to in Unix milliseconds (not in the future). \
 At most 25% of distinct existing candidates addressed by UPDATE/SUPERSEDE may be set aside; otherwise use NOOP. \
-Do not use ADD to evade this guard. Skip duplicated facts. Use REJECT for an unsafe batch, NOOP for nothing durable. \
+Do not use ADD to evade this guard. Older evidence must not override newer corrections. Skip duplicated facts. Use REJECT for an unsafe batch, NOOP for nothing durable. \
 Kinds: profile, preference, fact, event, person, project, routine. Importance: integer 1–5. \
 Output: {{\"ops\":[...]}} (1–40 ops). Allowed exact shapes:\n\
 {{\"op\":\"ADD\",\"text\":\"...\",\"kind\":\"fact\",\"importance\":3,\"messages\":[1]}}\n\
@@ -261,7 +269,52 @@ fn evidence(input: &Input, aliases: &[usize]) -> rusqlite::Result<Value> {
             refs.push(json!({"conversation_id":source.conversation,"message_id":source.id}));
         }
     }
-    Ok(json!({"type":"dream", "messages": refs}))
+    Ok(json!({"type":"dream", "messages": refs, "asserted_at": asserted_at(input, aliases)}))
+}
+
+fn asserted_at(input: &Input, aliases: &[usize]) -> i64 {
+    // Aliases have already passed evidence validation before any mutation.
+    aliases
+        .iter()
+        .filter_map(|a| input.sources.get(a.wrapping_sub(1)))
+        .map(|s| s.at)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Respect removal/correction history even when it predates this run. A stale
+/// proposed fact is a host NOOP, so one forgotten fact cannot block the backlog.
+fn fresh_text(
+    c: &Connection,
+    input: &Input,
+    text: &str,
+    aliases: &[usize],
+    batch: &str,
+) -> rusqlite::Result<bool> {
+    let text = gate::scrub(text).map_err(recall::invalid)?;
+    let blocked = c.prepare_cached("SELECT 1 FROM memory_history
+        WHERE json_extract(before, '$.content_hash') = ?1 AND COALESCE(batch_id, '') != ?3
+        AND (after IS NULL OR json_extract(after, '$.content_hash') != ?1
+             OR json_extract(after, '$.archived') = 1 OR json_extract(after, '$.superseded_by') IS NOT NULL)
+        AND CASE WHEN actor = 'dream' THEN COALESCE(json_extract(after, '$.mentioned_at'), at) ELSE at END >= ?2")?
+        .exists(params![super::content_hash(&text), asserted_at(input, aliases), batch])?;
+    Ok(!blocked)
+}
+
+fn newer_than(c: &Connection, item: &Item, at: i64) -> rusqlite::Result<bool> {
+    let (actor, changed): (String, i64) = c.query_row(
+        "SELECT actor, at FROM memory_history WHERE item_id = ?1 ORDER BY id DESC LIMIT 1",
+        [item.id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    // A delayed Dream run records the time of its cited assertion, rather
+    // than its execution time, so bounded backlog batches remain chronological.
+    let boundary = if actor == "dream" {
+        item.mentioned_at.unwrap_or(changed)
+    } else {
+        changed
+    };
+    Ok(at > boundary)
 }
 
 fn candidate(input: &Input, alias: usize) -> rusqlite::Result<&Item> {
@@ -305,7 +358,7 @@ fn apply(
         }
     }
     let mut touched = HashSet::new();
-    let mut removed = 0;
+
     for op in &proposal.ops {
         let (alias, messages) = match op {
             Op::Add { messages, .. } => (None, Some(messages)),
@@ -322,7 +375,6 @@ fn apply(
                         "I couldn't verify when that note stopped being true.",
                     ));
                 }
-                removed += 1;
                 (Some(*alias), Some(messages))
             }
             Op::Reject { reason } => {
@@ -345,9 +397,39 @@ fn apply(
             evidence(input, messages)?;
         }
     }
+    let mut removed = 0;
     let mut changed_existing = 0;
     let mut changes = Vec::new();
     for op in proposal.ops {
+        let (target, supporting) = match &op {
+            Op::Add { text, messages, .. } => {
+                if !fresh_text(c, input, text, messages, batch)? {
+                    continue;
+                }
+                (None, messages.as_slice())
+            }
+            Op::Update {
+                alias,
+                text,
+                messages,
+                ..
+            } => {
+                if !fresh_text(c, input, text, messages, batch)? {
+                    continue;
+                }
+                (Some(*alias), messages.as_slice())
+            }
+            Op::Supersede {
+                alias, messages, ..
+            } => (Some(*alias), messages.as_slice()),
+            Op::Noop {} => continue,
+            Op::Reject { .. } => unreachable!(),
+        };
+        if let Some(alias) = target
+            && !newer_than(c, candidate(input, alias)?, asserted_at(input, supporting))?
+        {
+            continue;
+        }
         let out = match op {
             Op::Add {
                 text,
@@ -409,7 +491,8 @@ fn apply(
             } => {
                 let old = candidate(input, alias)?;
                 changed_existing += 1;
-                c.execute("UPDATE memory_items SET archived = 1, valid_to = ?2, updated_at = ?3, source = ?4, mentioned_at = ?3 WHERE id = ?1", params![old.id, valid_to, now_ms(), evidence(input, &messages)?.to_string()])?;
+                removed += 1;
+                c.execute("UPDATE memory_items SET archived = 1, valid_to = ?2, updated_at = ?3, source = ?4, mentioned_at = ?5 WHERE id = ?1", params![old.id, valid_to, now_ms(), evidence(input, &messages)?.to_string(), asserted_at(input, &messages)])?;
                 super::record(
                     c,
                     old.id,

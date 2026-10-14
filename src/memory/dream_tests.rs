@@ -237,7 +237,7 @@ async fn invalid_batches_roll_back_everything_and_retain_watermark() {
 #[tokio::test]
 async fn loss_guard_aliases_pins_updates_and_snapshot_undo() {
     let (state, tmp, owner, main) = setup().await;
-    add_messages(&state, &owner, &main, 4);
+
     state
         .db
         .with(|c| {
@@ -247,6 +247,15 @@ async fn loss_guard_aliases_pins_updates_and_snapshot_undo() {
             Ok(())
         })
         .unwrap();
+    state
+        .db
+        .with(|c| {
+            c.execute("UPDATE memory_items SET updated_at=1000", [])?;
+            c.execute("UPDATE memory_history SET at=1000", [])?;
+            Ok(())
+        })
+        .unwrap();
+    add_messages(&state, &owner, &main, 4);
     let input = state.db.with(|c| prepare(c, 4)).unwrap().unwrap();
     assert_eq!(input.candidates.len(), 4);
     reply(
@@ -468,6 +477,186 @@ async fn long_sources_still_retrieve_candidates_with_bounded_prompt_data() {
                     .sum::<usize>()
                     <= 16_000
             );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn forget_and_owner_corrections_override_older_evidence_but_allow_new_assertions() {
+    let (state, tmp, owner, main) = setup().await;
+    add_messages(&state, &owner, &main, 4);
+    let (forgotten, corrected) = state
+        .db
+        .with(|c| {
+            // These chat statements predate the owner's removal/correction.
+            c.execute(
+                "UPDATE messages SET created_at=1000+rowid, updated_at=1000+rowid",
+                [],
+            )?;
+            let forgotten = note(c, "Orchard apples are a favorite")?;
+            recall::forget(c, forgotten, Actor::Owner, "forget-before-dream")?;
+            let corrected = note(c, "Orchard apples grow in the east garden")?;
+            recall::save(
+                c,
+                &recall::Edit {
+                    text: Some("Orchard apples grow in the west garden".into()),
+                    ..Default::default()
+                },
+                Some(corrected),
+                Actor::Owner,
+                &json!({}),
+                "correction-before-dream",
+            )?;
+            Ok((forgotten, corrected))
+        })
+        .unwrap();
+    let input = state.db.with(|c| prepare(c, 4)).unwrap().unwrap();
+    let alias = input
+        .candidates
+        .iter()
+        .position(|i| i.id == corrected)
+        .unwrap()
+        + 1;
+    reply(
+        &tmp,
+        json!({"ops":[add_op("Orchard apples are a favorite"),{"op":"UPDATE","alias":alias,"text":"Orchard apples grow in the east garden","kind":"fact","importance":3,"messages":[1]}]}),
+    );
+    run(&state, &owner, true).await.unwrap();
+    state
+        .db
+        .with(|c| {
+            assert!(super::super::get(c, forgotten)?.is_none());
+            assert_eq!(
+                super::super::get(c, corrected)?.unwrap().text,
+                "Orchard apples grow in the west garden"
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(progress(&state) > 0);
+    assert!(cards(&state).is_empty());
+    // A stale SUPERSEDE must also be a NOOP, rather than undoing a correction.
+    state
+        .db
+        .with(|c| {
+            let p = parse(
+                &json!({"ops":[{"op":"SUPERSEDE","alias":alias,"valid_to":0,"messages":[1]}]})
+                    .to_string(),
+            )?;
+            // Replay the same evidence in an isolated validation transaction.
+            db::set_setting(c, WATERMARK, "0")?;
+            recall::mutate(c, &state.paths, |c| {
+                apply(c, &input, p, &owner, "stale-supersede")?;
+                Ok(Value::Null)
+            })?;
+            assert!(!super::super::get(c, corrected)?.unwrap().archived);
+            Ok(())
+        })
+        .unwrap();
+    // New statements after the owner's decision can teach the fact again.
+    let boundary = state
+        .db
+        .with(|c| {
+            c.query_row("SELECT MAX(at) FROM memory_history", [], |r| {
+                r.get::<_, i64>(0)
+            })
+        })
+        .unwrap();
+    add_messages(&state, &owner, &main, 4);
+    state
+        .db
+        .with(|c| {
+            c.execute(
+                "UPDATE messages SET created_at=?1+rowid WHERE created_at>10000",
+                [boundary + 10],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    reply(
+        &tmp,
+        json!({"ops":[add_op("Orchard apples are a favorite"),{"op":"UPDATE","alias":alias,"text":"Orchard apples now grow in the north garden","kind":"fact","importance":3,"messages":[1]}]}),
+    );
+    run(&state, &owner, true).await.unwrap();
+    state
+        .db
+        .with(|c| {
+            assert_eq!(super::super::live(c)?.len(), 2);
+            assert_eq!(
+                super::super::get(c, corrected)?.unwrap().text,
+                "Orchard apples now grow in the north garden"
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn dream_backlog_uses_assertion_time_instead_of_execution_time() {
+    let (state, tmp, owner, main) = setup().await;
+    for (batch, text) in [
+        (1, "Orchard apples grow in the east garden"),
+        (2, "Orchard apples grow in the west garden"),
+        (3, "Orchard apples grow in the east garden"),
+    ] {
+        add_messages(&state, &owner, &main, 4);
+        state.db.with(|c| {c.execute("UPDATE messages SET created_at=?1+rowid WHERE role='user' AND created_at>100000",[batch*1000])?;Ok(())}).unwrap();
+        let op = if batch == 1 {
+            add_op(text)
+        } else {
+            json!({"op":"UPDATE","alias":1,"text":text,"kind":"fact","importance":3,"messages":[1]})
+        };
+        reply(&tmp, json!({"ops":[op]}));
+        run(&state, &owner, true).await.unwrap();
+        let item = state
+            .db
+            .with(|c| Ok(super::super::live(c)?.remove(0)))
+            .unwrap();
+        assert_eq!(item.text, text);
+        assert!(item.mentioned_at.unwrap() < 10000);
+        assert_eq!(item.source["asserted_at"], item.mentioned_at.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn legacy_idea_starters_are_excluded_and_owner_followups_remain_eligible() {
+    let (state, _tmp, owner, _main) = setup().await;
+    state
+        .db
+        .with(|c| {
+            let legacy = db::create_conversation(
+                c,
+                &owner,
+                "side",
+                "Idea",
+                Some(&json!({"type":"idea","id":"synthetic-idea"})),
+            )?
+            .id;
+            let starter = db::insert_message(
+                c,
+                &NewMessage {
+                    conversation_id: &legacy,
+                    role: "user",
+                    author_user_id: Some(&owner),
+                    content: "TAINTED generated orchard claim",
+                    ..Default::default()
+                },
+            )?;
+            let followup = db::insert_message(
+                c,
+                &NewMessage {
+                    conversation_id: &legacy,
+                    role: "user",
+                    author_user_id: Some(&owner),
+                    content: "Owner's orchard follow-up",
+                    ..Default::default()
+                },
+            )?;
+            let input = prepare(c, 1)?.unwrap();
+            assert_eq!(input.sources.len(), 1);
+            assert_eq!(input.sources[0].id, followup.id);
+            assert!(!prompt(&input).contains(&starter.content));
             Ok(())
         })
         .unwrap();

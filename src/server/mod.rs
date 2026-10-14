@@ -653,6 +653,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idea_start_marks_generated_text_before_publishing_or_learning() {
+        let h = setup();
+        let token = pair_as(&h, None).await;
+        let idea = h
+            .state
+            .db
+            .with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                crate::entities::create_idea(
+                    c,
+                    &owner,
+                    "Plan a garden",
+                    "A generated suggestion",
+                    Some("As a pear grower, plan my garden"),
+                )
+            })
+            .unwrap();
+        let (status, body) = send(
+            &h.app,
+            "POST",
+            &format!("/api/ideas/{}/start", idea.id),
+            Some(&token),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["user_message"]["meta"]["initiated_by"], "idea");
+        assert_eq!(body["conversation"]["seed"]["generated_starter"], true);
+        let initial = body["user_message"]["id"].as_str().unwrap();
+        let stored = h
+            .state
+            .db
+            .with(|c| db::get_message(c, initial))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.meta["initiated_by"], "idea");
+        let conv = stored.conversation_id;
+        let (status, followup) = send(
+            &h.app,
+            "POST",
+            &format!("/api/conversations/{conv}/messages"),
+            Some(&token),
+            Some(json!({"text":"I actually grow apples"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{followup}");
+        assert_eq!(followup["user_message"]["meta"], json!({}));
+    }
+
+    #[tokio::test]
     async fn morning_undo_and_learning_settings_are_owner_only() {
         let h = setup();
         let owner_token = pair_as(&h, None).await;
