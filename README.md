@@ -4,7 +4,7 @@
   <b>Your own personal AI agent, on your own machine.</b><br>
   An assistant as easy to use as the big consumer apps. It runs on hardware you
   control, works with whichever AI models you already have, and keeps your
-  data and memory as plain files you own.
+  data and memory on your machine, in files you own.
 </p>
 
 <p align="center">
@@ -21,10 +21,10 @@ assistant knows about you.
 
 Iris gives you that experience without the trade:
 
-- **You own everything.** Iris runs on your computer. Its personality, memory
-  and everything it knows about you are plain markdown files you can read and
-  edit, from the app or on disk. There's no telemetry: we never see your
-  chats.
+- **You own everything.** Iris runs on your computer. Its personality is
+  plain markdown files you can read and edit, from the app or on disk, and
+  everything it remembers about you stays on your machine too, with a
+  readable markdown copy. There's no telemetry: we never see your chats.
 - **No lock-in.** Iris works with the AI tools you already have: **Claude
   Code**, **Codex**, **Gemini CLI**, or **OpenCode** with open-source models
   running entirely on your own hardware. Use one, or mix them.

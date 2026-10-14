@@ -21,6 +21,10 @@ pub struct Bridge {
     pub paths: Paths,
     pub user_id: String,
     pub conversation_id: Option<String>,
+    /// The assistant message this turn is writing (memory provenance).
+    pub message_id: Option<String>,
+    /// When this bridge started (ms): about when the turn began.
+    pub started_at: i64,
     /// Conversation with more than one person: only cards are offered, so
     /// nothing reads or changes the owner's personal data.
     pub shared: bool,
@@ -34,6 +38,9 @@ pub struct Bridge {
 
 /// Tools available in shared (group) conversations.
 const SHARED_TOOLS: &[&str] = &["create_card"];
+
+/// Largest `write_memory` content for an export file (the whole file).
+const MAX_MEMORY_FILE: usize = 1_000_000;
 
 /// Run the stdio loop until stdin closes.
 pub fn run(bridge: Bridge) -> Result<()> {
@@ -173,14 +180,18 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "read_memory",
-            "Read an owner memory Markdown file through Iris.",
-            json!({"path": s("Relative Markdown path")}),
+            "Read one of the owner's memory files: MEMORY.md (always in mind) or a topic \
+             file (you.md, people.md, projects.md, routines.md).",
+            json!({"path": s("MEMORY.md or a topic file such as people.md")}),
             &["path"],
         ),
         tool(
             "write_memory",
-            "Write an owner memory Markdown file through Iris.",
-            json!({"path": s("Relative Markdown path"), "content": s("Markdown content")}),
+            "Save the owner's memory. Write MEMORY.md (short, always-relevant facts) or a \
+             topic file (you.md, people.md, projects.md, routines.md) with its full new \
+             content, one note per bullet: new bullets are saved and bullets you leave out \
+             are removed everywhere they appear. Any other path only adds notes.",
+            json!({"path": s("MEMORY.md or a topic file such as people.md"), "content": s("Markdown, one note per bullet")}),
             &["path", "content"],
         ),
         tool(
@@ -369,6 +380,29 @@ impl Bridge {
                 .is_some_and(|o| o == self.user_id)
     }
 
+    /// When this turn began (ms): its message was created then; a bridge
+    /// started later (or restarted mid-turn) still dates changes from it.
+    fn turn_started(&self) -> i64 {
+        self.message_id
+            .as_deref()
+            .and_then(|id| {
+                self.db
+                    .with(|c| crate::db::get_message(c, id))
+                    .ok()
+                    .flatten()
+            })
+            .map_or(self.started_at, |m| m.created_at.min(self.started_at))
+    }
+
+    /// One memory batch per turn, so the turn's changes undo together and
+    /// later writes in the turn can change them again.
+    fn turn_batch(&self) -> String {
+        match &self.message_id {
+            Some(id) => format!("turn-{id}"),
+            None => format!("bridge-{}-{}", std::process::id(), self.started_at),
+        }
+    }
+
     fn private_status_context(&self) -> bool {
         self.owner_context()
             && self.conversation_id.as_ref().is_some_and(|conv| {
@@ -425,31 +459,74 @@ impl Bridge {
                 {
                     return Err("memory path must be a relative Markdown path".into());
                 }
-                let root = self.paths.memory_dir();
                 if name == "read_memory" {
-                    let bytes = crate::agent::read_scoped_file(&root, path).map_err(db_err)?;
+                    let bytes = crate::agent::read_scoped_file(&self.paths.memory_dir(), path)
+                        .map_err(|_| {
+                            "there is no such memory file; memory is in MEMORY.md and the topic \
+                             files listed in your instructions"
+                        })?;
                     let text = String::from_utf8(bytes).map_err(|_| "memory must be UTF-8")?;
                     Ok(json!({"content": text}))
                 } else {
                     let content = s("content").ok_or("content is required")?;
-                    check_text("content", content, MAX_BODY, false)?;
-                    let dest = root.join(relative);
-                    let parent = dest.parent().ok_or("invalid memory path")?;
-                    // Only Iris writes the memory tree; never follow a planted symlink.
-                    let mut dir = root.clone();
-                    for component in relative.parent().unwrap_or(Path::new("")).components() {
-                        dir.push(component);
-                        if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink())
-                        {
-                            return Err("memory path cannot contain symlinks".into());
-                        }
-                        ensure_private_dir(&dir).map_err(db_err)?;
+                    let export = crate::memory::files::is_export_name(path);
+                    // A topic file holds every note of its topic and is
+                    // written back whole.
+                    check_text(
+                        "content",
+                        content,
+                        if export { MAX_MEMORY_FILE } else { MAX_BODY },
+                        false,
+                    )?;
+                    let source = json!({
+                        "type": "conversation",
+                        "conversation_id": self.conversation_id,
+                        "message_ids": self.message_id.iter().collect::<Vec<_>>(),
+                    });
+                    let w = crate::memory::files::write(
+                        &self.db,
+                        &self.paths,
+                        path,
+                        content,
+                        &source,
+                        self.turn_started(),
+                        &self.turn_batch(),
+                    )
+                    .map_err(db_err)?;
+                    let mut out = json!({
+                        "written": true,
+                        "added": w.added,
+                        "unchanged": w.unchanged,
+                        "removed": w.removed,
+                        "kept_pinned": w.kept_pinned,
+                        "kept_recent": w.kept_recent,
+                        "not_restored": w.not_restored,
+                    });
+                    if !export {
+                        out["note"] = json!(
+                            "Saved as notes in the topic files. Next time write MEMORY.md, \
+                             you.md, people.md, projects.md or routines.md."
+                        );
                     }
-                    if parent.canonicalize().map_err(|_| "invalid memory folder")? != parent {
-                        return Err("invalid memory folder".into());
+                    if !w.kept_recent.is_empty() {
+                        out["note"] = json!(
+                            "The kept_recent notes were saved or changed from another chat \
+                             during this turn, so they were kept. They can be removed in a \
+                             later turn if they are wrong."
+                        );
                     }
-                    write_private_file(&dest, content.as_bytes()).map_err(db_err)?;
-                    Ok(json!({"written": true}))
+                    if !w.not_restored.is_empty() {
+                        out["note"] = json!(
+                            "The not_restored notes were removed or corrected from another \
+                             chat after you started, so they were not saved again."
+                        );
+                    }
+                    if !w.kept_pinned.is_empty() {
+                        out["note"] = json!(
+                            "The owner pinned the kept_pinned notes; only they can remove them."
+                        );
+                    }
+                    Ok(out)
                 }
             }
             "list_goals" => {
@@ -784,6 +861,8 @@ mod tests {
             paths,
             user_id,
             conversation_id: Some(conv),
+            message_id: Some("m1".into()),
+            started_at: 0,
             shared: false,
             workdir: None,
             agent: crate::config::AgentConfig::default(),
@@ -1074,28 +1153,72 @@ mod tests {
     fn memory_tools_are_owner_only_and_reject_path_traversal() {
         let tmp = tempfile::tempdir().unwrap();
         let mut b = bridge(tmp.path());
+        // The export file view: read, add a bullet, write back.
+        let r = call(&b, "read_memory", json!({"path": "MEMORY.md"}));
+        let core = r["structuredContent"]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let r = call(
             &b,
             "write_memory",
-            json!({"path": "notes/preferences.md", "content": "Prefers mornings."}),
+            json!({"path": "MEMORY.md", "content": format!("{core}\n- Prefers mornings.\n")}),
         );
         assert_eq!(r["isError"], false, "{r}");
+        assert_eq!(r["structuredContent"]["added"], 1);
+        assert!(r["structuredContent"].get("note").is_none());
+        let r = call(&b, "read_memory", json!({"path": "MEMORY.md"}));
+        assert!(
+            r["structuredContent"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("- Prefers mornings.")
+        );
+        let item = b.db.with(crate::memory::live).unwrap().pop().unwrap();
+        assert_eq!(item.source["conversation_id"], json!(b.conversation_id));
+        assert_eq!(item.source["message_ids"], json!(["m1"]));
+        // Old-style note paths add notes; nothing is written there.
+        let r = call(
+            &b,
+            "write_memory",
+            json!({"path": "notes/preferences.md", "content": "Likes tea."}),
+        );
+        assert_eq!(r["isError"], false, "{r}");
+        assert!(r["structuredContent"]["note"].is_string());
+        assert!(!b.paths.memory_dir().join("notes").exists());
+        let r = call(&b, "read_memory", json!({"path": "you.md"}));
+        assert!(
+            r["structuredContent"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("- Preferences: Likes tea.")
+        );
         let r = call(&b, "read_memory", json!({"path": "notes/preferences.md"}));
-        assert_eq!(r["structuredContent"]["content"], "Prefers mornings.");
-        for path in ["../iris.db", "/etc/example.md", "../outside.md", "file.txt"] {
-            let r = call(&b, "write_memory", json!({"path": path, "content": "x"}));
+        assert_eq!(r["isError"], true);
+        for path in [
+            "../iris.db",
+            "/etc/example.md",
+            "../outside.md",
+            "file.txt",
+            "./MEMORY.md",
+        ] {
+            let r = call(&b, "write_memory", json!({"path": path, "content": "- x"}));
             assert_eq!(r["isError"], true, "{path}");
         }
         std::os::unix::fs::symlink(tmp.path(), b.paths.memory_dir().join("link")).unwrap();
+        std::fs::write(tmp.path().join("note.md"), "outside").unwrap();
+        let r = call(&b, "read_memory", json!({"path": "link/note.md"}));
+        assert_eq!(r["isError"], true);
         let r = call(
             &b,
             "write_memory",
-            json!({"path": "link/outside.md", "content": "x"}),
+            json!({"path": "link/outside.md", "content": "- x"}),
         );
-        assert_eq!(r["isError"], true);
+        assert_eq!(r["isError"], false, "a note, never a file: {r}");
+        assert!(!tmp.path().join("outside.md").exists());
         b.shared = true;
         for name in ["read_memory", "write_memory"] {
-            let r = call(&b, name, json!({"path": "MEMORY.md", "content": "x"}));
+            let r = call(&b, name, json!({"path": "MEMORY.md", "content": "- x"}));
             assert_eq!(r["isError"], true);
         }
         let listed = b.handle(&json!({"id": 1, "method": "tools/list"})).unwrap();
@@ -1106,6 +1229,61 @@ mod tests {
                 .iter()
                 .any(|t| t["name"] == "read_memory" || t["name"] == "write_memory")
         );
+        // Another person's own chat cannot reach memory either.
+        b.shared = false;
+        b.db.with(|c| {
+            c.execute(
+                "INSERT INTO users (id, display_name, is_owner, created_at) VALUES ('g1', 'Guest', 0, 0)",
+                [],
+            )
+        })
+        .unwrap();
+        b.user_id = "g1".into();
+        let before = b.db.with(crate::memory::live).unwrap().len();
+        for name in ["read_memory", "write_memory"] {
+            let r = call(
+                &b,
+                name,
+                json!({"path": "MEMORY.md", "content": "- guest fact"}),
+            );
+            assert_eq!(r["isError"], true, "{name}");
+        }
+        assert_eq!(b.db.with(crate::memory::live).unwrap().len(), before);
+    }
+
+    #[test]
+    fn memory_changes_date_from_the_turn_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = bridge(tmp.path());
+        let conv = b.conversation_id.clone().unwrap();
+        let msg =
+            b.db.with(|c| {
+                db::insert_message(
+                    c,
+                    &db::NewMessage {
+                        conversation_id: &conv,
+                        role: "assistant",
+                        author_user_id: None,
+                        kind: "text",
+                        content: "",
+                        attachments: &[],
+                        card: None,
+                        status: "streaming",
+                        harness: None,
+                        model: None,
+                        effort: None,
+                        meta: None,
+                    },
+                )
+            })
+            .unwrap();
+        // The bridge started (or restarted) well after the turn began.
+        b.message_id = Some(msg.id.clone());
+        b.started_at = msg.created_at + 60_000;
+        assert_eq!(b.turn_started(), msg.created_at);
+        assert_eq!(b.turn_batch(), format!("turn-{}", msg.id));
+        b.message_id = Some("missing".into());
+        assert_eq!(b.turn_started(), b.started_at);
     }
 
     #[test]

@@ -483,8 +483,8 @@ policy keeps Claude out unless the owner opts in
 act on the creator's data.
 
 The Iris owner's **private context** (`USER.md`, `TOOLS.md`,
-`PROACTIVE_PREFERENCES.md`, `MEMORY.md` and the memory notes, write access
-to `memory/`, and connectors; only the agent's character in `IDENTITY.md`
+`PROACTIVE_PREFERENCES.md`, `MEMORY.md` and the memory notes, the
+`read_memory` / `write_memory` tools, and connectors; only the agent's character in `IDENTITY.md`
 and `SOUL.md` is shared) is only given to turns in
 a conversation whose single member is the Iris owner, and to scheduled jobs.
 Other people's own chats and all shared conversations get none of it, and
@@ -1078,7 +1078,9 @@ Deletes the item and its file. `{"ok": true}`. Emits `entities.changed`
 
 All routes in this section are **owner-only**.
 
-System files are the persona and memory markdown files the agent reads:
+System files are the persona and memory markdown files the agent reads.
+The memory files are a generated, **read-only** copy of the memory notes
+(see [Memory](#memory)):
 
 | Name | Folder | In chat system prompt | Description |
 |---|---|---|---|
@@ -1088,7 +1090,7 @@ System files are the persona and memory markdown files the agent reads:
 | `TOOLS.md` | persona | yes | Notes about tools, accounts and connectors |
 | `PROACTIVE_PREFERENCES.md` | persona | yes | When and how the agent acts on its own |
 | `HEARTBEAT.md` | persona | no (read by the heartbeat job) | Checklist for scheduled check-ins |
-| `MEMORY.md` | memory | `in_prompt: false` (included separately as memory) | Curated long-term memory (always in context) |
+| `MEMORY.md` | memory | `in_prompt: false` (included separately as memory) | What the agent always keeps in mind (a read-only copy of its memory) |
 
 #### `GET /api/files`
 
@@ -1096,15 +1098,19 @@ System files are the persona and memory markdown files the agent reads:
 {
   "system_files": [
     {"name": "IDENTITY.md", "description": "...", "in_prompt": true,
-     "exists": true, "size": 1234, "updated_at": 1760000000000}
+     "read_only": false, "exists": true, "size": 1234, "updated_at": 1760000000000}
   ],
   "folders": [
-    {"area": "memory", "description": "Long-term memory notes"},
-    {"area": "workspace", "description": "The agent's working folder"},
-    {"area": "persona", "description": "Persona files"}
+    {"area": "memory", "description": "A read-only copy of the agent's memory", "read_only": true},
+    {"area": "workspace", "description": "The agent's working folder", "read_only": false},
+    {"area": "persona", "description": "Persona files", "read_only": false}
   ]
 }
 ```
+
+`read_only` is `true` for `MEMORY.md` and the `memory` folder: Iris writes
+them from the memory notes, and writes to them are refused with `409`
+(below).
 
 `size` (bytes) and `updated_at` (file mtime) are `null` when the file does
 not exist.
@@ -1124,7 +1130,9 @@ not exist.
 | `content` | string | Required, max 1 MiB (bytes). |
 
 Response `{"ok": true, "name": "SOUL.md"}`. Persona changes apply on the next
-turn.
+turn. `MEMORY.md` is read-only: `409` with code `read_only` and a message in
+the agent's voice ("This is a read-only copy of my memory. Ask me in a chat
+to remember, change or forget something.").
 
 #### Folder routes
 
@@ -1162,12 +1170,14 @@ Directories first, then by name. Hidden entries and symlinks are omitted.
 ##### `PUT /api/files/content/{area}?path=<file>`
 
 Body `{"content": "..."}` (max 1 MiB). `path` is required. Parent folders
-are created. Response `{"ok": true}`.
+are created. Response `{"ok": true}`. `409 read_only` for the `memory`
+area.
 
 ##### `DELETE /api/files/content/{area}?path=<file or dir>`
 
 Deletes a file, or an empty folder (`400 folder is not empty` otherwise).
-`path` is required. Response `{"ok": true}`.
+`path` is required. Response `{"ok": true}`. `409 read_only` for the
+`memory` area.
 
 ### 3.10 Settings and avatar
 
@@ -3244,6 +3254,62 @@ Stored as `meta.routing` (plus `notes`).
 | `summary` | string | Short one-line summary (path, command, query); may be empty. |
 | `auth_error` | bool | Only present (as `true`) on a failed MCP tool call whose error looks like a rejected or expired sign-in. |
 
+### Memory
+
+The owner's long-term memory is stored as notes in SQLite; it has no REST
+routes yet and is reachable only from the owner's private chats (the
+`read_memory` / `write_memory` bridge tools) and as the read-only export in
+`memory/`.
+
+`memory_items`, one row per note:
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | int | Row id (also the FTS5 rowid). |
+| `kind` | string | `profile`, `preference`, `fact`, `event`, `person`, `project`, or `routine`. Notes from Markdown are `fact`. |
+| `topic` | string | Grouping in the app and the export: `you`, `people`, `projects`, `routines`. |
+| `text` | string | The note (Markdown; may span lines). |
+| `importance` | int | 1 to 5 (default 3; 4 for notes kept in `MEMORY.md`). |
+| `pinned` | bool | Always in mind; only the owner can remove a pinned note. |
+| `created_at`, `updated_at` | int | ms. |
+| `observed_at` | int or null | When it happened or became true. |
+| `mentioned_at` | int or null | When it was said. |
+| `valid_to` | int or null | When it stops being true. |
+| `superseded_by` | int or null | The note that replaced it. |
+| `source` | JSON | `{"type": "conversation", "conversation_id", "message_ids"}`, `{"type": "import", "file"}`, or `{"type": "owner"}`. |
+| `last_used_at`, `use_count` | int or null, int | Recall statistics. |
+| `content_hash` | string | SHA-256 of the lowercased, whitespace-collapsed text without a final full stop; unique among live notes (not archived, not superseded). |
+| `archived` | bool | Set aside; kept for undo. |
+
+`memory_history` records every change: `item_id`, `op` (`add`, `update`,
+`supersede`, `archive`, `restore`, `delete`), `before` / `after` (JSON
+snapshots of the note, null for none), `actor` (`agent`, `dream`, `owner`,
+`import`), `batch_id` (changes made together: one per agent turn, `turn-<message
+id>`, or per import), and `at`. `memory_items_fts`
+is an FTS5 index over `text` (Porter stemming), kept in sync by triggers.
+
+**Export.** After every change, in the same transaction, Iris rewrites
+`memory/`: `MEMORY.md` holds the notes always in the system prompt (pinned,
+profile and preference notes, then importance 4 and up, oldest first, whole
+notes within about 11,000 characters), and `you.md`, `people.md`,
+`projects.md`, `routines.md` list every live note of their topic (a file is
+removed when its topic is empty). Each file starts with an HTML comment
+saying Iris generated it.
+
+**Import.** At `iris serve` and `iris init`, Markdown notes in `memory/` that
+Iris did not generate (the notes kept before memory moved into SQLite, or
+files put there since) are imported: each top-level bullet or paragraph
+becomes a `fact` note, prefixed with the title and heading above it when
+they name its subject (`## Alex` / `### Work` → `Alex — Work: ...`; a file
+without a title is
+named after its file name), with its topic guessed from the path and
+headings. The originals are copied to
+`memory-backup/<UTC time>/` in the data directory first, then removed from
+`memory/`. The notes are stored before any file is replaced, so an
+interrupted import finishes on the next start; importing is idempotent
+(notes already stored are not added again). A file the export replaces
+that is too large (over 2 MiB) or not text is kept only in the backup. `iris import openclaw` imports OpenClaw memory files the same way.
+
 ### Settings
 
 | Field | Type | Notes |
@@ -3366,8 +3432,8 @@ Shared conversations are also isolated from the owner's data: their turns
 get no connectors, a cards-only bridge (see
 [section 8](#8-the-iris-mcp-bridge)), a system prompt with only `IDENTITY.md`
 and `SOUL.md` of the persona files (no `USER.md`, `TOOLS.md`,
-`PROACTIVE_PREFERENCES.md`, `MEMORY.md`, or memory index), and no write
-access to the memory folder.
+`PROACTIVE_PREFERENCES.md`, `MEMORY.md`, or memory index), and no memory
+tools.
 The CLI's own read tools are governed by its permission settings, so treat
 group chat as a preview until it gets its own access model.
 
@@ -3420,13 +3486,15 @@ for the proxies so a call can wait for the owner's approval (Claude Code
 `timeout`).
 
 ```
-<path to iris binary> mcp --data-dir <DATA_DIR> --user <USER_ID> --conversation <CONVERSATION_ID> [--shared] [--workdir <DIR>]
+<path to iris binary> mcp --data-dir <DATA_DIR> --user <USER_ID> --conversation <CONVERSATION_ID> --message <MESSAGE_ID> [--shared] [--workdir <DIR>]
 ```
 
 - `--user` is whose data the tools operate on: the conversation's creator for
   chat turns (so in a group conversation, its creator), the owner for jobs.
 - `--conversation` is the conversation of the turn (cards are posted there,
   library items are linked to it). Without it, `create_card` fails.
+- `--message` is the assistant message of the turn; notes saved during the
+  turn record it as their source.
 - `--shared` is added for conversations with more than one member. In shared
   mode `tools/list` returns only `create_card`, and calling any other tool
   returns `isError: true` with `Error: <tool> is not available in shared
@@ -3436,8 +3504,10 @@ for the proxies so a call can wait for the owner's approval (Claude Code
   `save_to_library` paths resolve there; a different directory is refused.
   Neither another conversation nor the memory tree is a library file root.
 - `list_connectors` returns an empty list unless this is the owner's private
-  context. `read_memory` / `write_memory` are also owner-only and unavailable
-  in shared chats; paths must be relative Markdown paths inside Iris memory.
+  context. `read_memory` / `write_memory` are also owner-only (the owner's
+  private chats and jobs) and unavailable in shared chats; paths must be
+  relative Markdown paths. `write_memory` never writes a file: it changes
+  memory notes and Iris rewrites the export.
 - In split mode the CLI starts `iris mcp-relay SOCKET` with an expiring token
   supplied through per-turn config/environment. Iris runs the real bridge
   as its service user; the agent never opens its database.
@@ -3539,8 +3609,8 @@ a new turn. Resolved cards are explicitly described as resolved in replay histor
 | `create_idea` | `title` (required, max 300), `description?` (max 2,000), `prompt?` (max 4,000; sent when the user taps the idea) | `{"idea": Idea}` (status `open`) |
 | `list_feed_posts` | `limit?: int` (1 to 50, default 10) | `{"posts": [FeedPost]}` |
 | `create_feed_post` | `title` (required, max 300), `body` (required, Markdown, max 50,000), `topic?` (max 100), `source_url?`, `source_name?` (max 100), `image_url?` (http(s), max 2,000), `images?: string[]` (the page's original photos, http(s), max 10), `why?` (max 300) | `{"post": FeedPost}` |
-| `read_memory` | `path` (required, relative `.md` path, owner private context only) | `{"content": string}` |
-| `write_memory` | `path`, `content` (required, Markdown, owner private context only) | `{"written": true}` |
+| `read_memory` | `path` (required, relative `.md` path, owner private context only): `MEMORY.md` or a topic file (`you.md`, `people.md`, `projects.md`, `routines.md`) | `{"content": string}`; error when the file does not exist |
+| `write_memory` | `path`, `content` (required, Markdown, one note per bullet; max 1,000,000 characters for `MEMORY.md` and topic files, 50,000 otherwise; owner private context only) | `{"written": true, "added": int, "unchanged": int, "removed": [string], "kept_pinned": [string], "kept_recent": [string], "not_restored": [string], "note"?: string}`. For `MEMORY.md` or a topic file, the notes that file shows become exactly the notes written (an empty file removes them all): new ones are added (importance 4 in `MEMORY.md`, with the topic of the heading above them; 3 in a topic file), notes stored elsewhere are moved there, and notes left out are archived everywhere. Pinned notes are kept (`kept_pinned`), and so are notes another chat saved or changed after this turn began (`kept_recent`, dated from the turn's message); a note in the content that another chat removed or corrected after the turn began is not saved again (`not_restored`). Changes the same turn made can be changed again. A note under headings that name its subject (`## Alex`, `### Work`) is saved as `Alex — Work: ...`. Any other path only adds notes (prefixed with the file's title), needs at least one, and returns a `note`. |
 | `save_to_library` | `title` (required, max 300), exactly one of `content` or `path`, `mime?`, `kind?: "artifact" \| "media"`, `description?` (max 2,000) | `{"item": LibraryItem}` |
 | `list_library` | `kind?: "artifact" \| "media"` | `{"items": [LibraryItem]}` (max 500) |
 | `create_card` | `type` (required, one of the [card types](#card)), `title` (required), `body?`, `url?`, `image_url?`, `action_label?`, `service?`, `ref_id?` (id of a related goal, idea, or feed post) | `{"card_message_id": "...", "shown": true}` |

@@ -789,6 +789,7 @@ async fn list_files(State(state): State<AppState>, user: AuthUser) -> ApiResult 
                 "name": f.name,
                 "description": f.description,
                 "in_prompt": f.in_prompt,
+                "read_only": f.read_only(),
                 "exists": meta.is_some(),
                 "size": meta.as_ref().map(|m| m.len()),
                 "updated_at": meta.as_ref().and_then(modified_ms),
@@ -798,9 +799,9 @@ async fn list_files(State(state): State<AppState>, user: AuthUser) -> ApiResult 
     ok(json!({
         "system_files": files,
         "folders": [
-            {"area": "memory", "description": "Long-term memory notes"},
-            {"area": "workspace", "description": "The agent's working folder"},
-            {"area": "persona", "description": "Persona files"},
+            {"area": "memory", "description": "A read-only copy of the agent's memory", "read_only": true},
+            {"area": "workspace", "description": "The agent's working folder", "read_only": false},
+            {"area": "persona", "description": "Persona files", "read_only": false},
         ],
     }))
 }
@@ -831,11 +832,24 @@ async fn write_system_file(
 ) -> ApiResult {
     user.require_owner()?;
     let f = system_file(&name).ok_or_else(|| ApiError::not_found("system file"))?;
+    if f.read_only() {
+        return Err(memory_read_only());
+    }
     if body.content.len() > MAX_TEXT_FILE {
         return Err(ApiError::bad_request("file is too large"));
     }
     crate::config::write_private_file(&system_file_path(&state.paths, f), body.content.as_bytes())?;
     ok(json!({"ok": true, "name": f.name}))
+}
+
+/// The memory folder is generated from the memory notes.
+fn memory_read_only() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "read_only",
+        "This is a read-only copy of my memory. Ask me in a chat to remember, change or \
+         forget something.",
+    )
 }
 
 fn area_root(state: &AppState, area: &str) -> Result<PathBuf, ApiError> {
@@ -947,6 +961,9 @@ async fn write_file(
     JsonBody(body): JsonBody<FileContent>,
 ) -> ApiResult {
     user.require_owner()?;
+    if area == "memory" {
+        return Err(memory_read_only());
+    }
     if q.path.trim().is_empty() {
         return Err(ApiError::bad_request("path is required"));
     }
@@ -968,6 +985,9 @@ async fn delete_file(
     Query(q): Query<PathQuery>,
 ) -> ApiResult {
     user.require_owner()?;
+    if area == "memory" {
+        return Err(memory_read_only());
+    }
     if q.path.trim().is_empty() {
         return Err(ApiError::bad_request("path is required"));
     }

@@ -1,9 +1,11 @@
-//! `iris import openclaw <workspace>`: copy persona and memory Markdown from
-//! an OpenClaw workspace into the Iris data directory.
+//! `iris import openclaw <workspace>`: copy persona Markdown from an
+//! OpenClaw workspace into the Iris data directory, and import its memory
+//! Markdown as memory notes.
 //!
-//! The source is only ever read. Existing destination files are never
+//! The source is only ever read. Existing persona files are never
 //! overwritten unless `--force` is given; identical files are left alone.
-//! Symlinks, hidden files, non-text files, and very large files are skipped.
+//! Memory notes Iris already has are not added again. Symlinks, hidden
+//! files, non-text files, and very large files are skipped.
 
 use crate::config::{Paths, ensure_private_dir, write_private_file};
 use crate::persona::is_text_note;
@@ -31,6 +33,9 @@ pub enum Action {
     /// Destination exists with different content and `--force` was not set.
     SkipExists,
     Skip(&'static str),
+    /// Imported as memory notes: how many (found in a dry run, new ones
+    /// otherwise).
+    Memory(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -54,8 +59,6 @@ fn destination(paths: &Paths, rel: &Path) -> Option<PathBuf> {
     match comps.as_slice() {
         [name] if PERSONA_FILES.contains(&name.as_str()) => Some(paths.persona_dir().join(name)),
         [name] if name == "MEMORY.md" => Some(paths.memory_dir().join("MEMORY.md")),
-        // OpenClaw's operating manual is kept as a reference note.
-        [name] if name == "AGENTS.md" => Some(paths.memory_dir().join("imported/AGENTS.md")),
         [first, rest @ ..] if first == "memory" && !rest.is_empty() => {
             let mut p = paths.memory_dir();
             for r in rest {
@@ -152,6 +155,15 @@ pub fn import_openclaw(source: &Path, paths: &Paths, opts: &Options) -> Result<V
             });
             continue;
         }
+        if rel == Path::new("AGENTS.md") {
+            // Iris never loads project instructions (AGENTS.md invariant 9).
+            items.push(Item {
+                src,
+                dest: None,
+                action: Action::Skip("OpenClaw's own operating instructions"),
+            });
+            continue;
+        }
         let Some(dest) = destination(paths, &rel) else {
             items.push(Item {
                 src,
@@ -184,6 +196,21 @@ pub fn import_openclaw(source: &Path, paths: &Paths, opts: &Options) -> Result<V
             });
             continue;
         }
+        if dest.starts_with(paths.memory_dir()) {
+            let notes = std::fs::read_to_string(&src)
+                .map(|c| crate::memory::markdown::parse(&c).notes.len())
+                .unwrap_or(0);
+            items.push(Item {
+                src,
+                dest: Some(dest),
+                action: if notes == 0 {
+                    Action::Skip("no notes in it")
+                } else {
+                    Action::Memory(notes)
+                },
+            });
+            continue;
+        }
         let action = match std::fs::symlink_metadata(&dest) {
             Err(_) => Action::Create,
             Ok(m) if m.file_type().is_symlink() || !m.is_file() => {
@@ -208,6 +235,33 @@ pub fn import_openclaw(source: &Path, paths: &Paths, opts: &Options) -> Result<V
     }
     if !opts.dry_run {
         crate::persona::seed(paths)?;
+        let memory_dir = paths.memory_dir();
+        let mut notes = Vec::new();
+        let mut note_items = Vec::new();
+        for (i, it) in items.iter().enumerate() {
+            if let (Action::Memory(_), Some(dest)) = (&it.action, &it.dest) {
+                let rel = dest.strip_prefix(&memory_dir).unwrap_or(dest);
+                notes.push((
+                    rel.to_string_lossy().into_owned(),
+                    std::fs::read_to_string(&it.src)?,
+                ));
+                note_items.push(i);
+            }
+        }
+        if !notes.is_empty() {
+            let db = crate::db::Db::open(&paths.db_file())?;
+            // Notes kept as Markdown by an older Iris are imported (and
+            // backed up) before the export is rewritten.
+            crate::memory::files::prepare(&db, paths)?;
+            let counts = crate::memory::files::import_notes(&db, paths, &notes)?;
+            for (i, c) in note_items.into_iter().zip(counts) {
+                items[i].action = if c.added == 0 {
+                    Action::Unchanged
+                } else {
+                    Action::Memory(c.added)
+                };
+            }
+        }
         for it in &items {
             if let (Action::Create | Action::Overwrite, Some(dest)) = (&it.action, &it.dest) {
                 if let Some(parent) = dest.parent() {
@@ -242,17 +296,25 @@ pub fn report(items: &[Item], dry_run: bool) -> String {
         Action::Unchanged => "unchanged",
         Action::SkipExists => "exists (use --force)",
         Action::Skip(_) => "skipped",
+        Action::Memory(_) => {
+            if dry_run {
+                "would add to memory"
+            } else {
+                "added to memory"
+            }
+        }
     };
     for it in items {
         let reason = match &it.action {
             Action::Skip(r) => format!(" ({r})"),
+            Action::Memory(n) => format!(" ({n} notes)"),
             _ => String::new(),
         };
-        let dest = it
-            .dest
-            .as_ref()
-            .map(|d| format!(" -> {}", d.display()))
-            .unwrap_or_default();
+        let dest = match (&it.action, &it.dest) {
+            (Action::Memory(_), _) => String::new(),
+            (_, Some(d)) => format!(" -> {}", d.display()),
+            (_, None) => String::new(),
+        };
         out.push_str(&format!(
             "{:<22} {}{dest}{reason}\n",
             verb(&it.action),
@@ -265,10 +327,18 @@ pub fn report(items: &[Item], dry_run: bool) -> String {
     } else {
         ("copied", "overwritten")
     };
+    let notes: usize = items
+        .iter()
+        .map(|i| match i.action {
+            Action::Memory(n) => n,
+            _ => 0,
+        })
+        .sum();
     out.push_str(&format!(
-        "\n{} {copy}, {} {overwrite}, {} unchanged, {} existing kept, {} skipped{}\n",
+        "\n{} {copy}, {} {overwrite}, {notes} memory notes {}, {} unchanged, {} existing kept, {} skipped{}\n",
         count(|a| *a == Action::Create),
         count(|a| *a == Action::Overwrite),
+        if dry_run { "to add" } else { "added" },
         count(|a| *a == Action::Unchanged),
         count(|a| *a == Action::SkipExists),
         count(|a| matches!(a, Action::Skip(_))),
@@ -296,7 +366,11 @@ mod tests {
         std::fs::write(src.join("AGENTS.md"), "# Agents").unwrap();
         std::fs::write(src.join("BOOTSTRAP.md"), "bootstrap").unwrap();
         std::fs::write(src.join("memory/2026-01-01.md"), "Daily note").unwrap();
-        std::fs::write(src.join("memory/people/alex.md"), "# Alex").unwrap();
+        std::fs::write(
+            src.join("memory/people/alex.md"),
+            "# Alex\n- Climbs on weekends",
+        )
+        .unwrap();
         std::fs::write(src.join("memory/photo.jpg"), [0u8; 3]).unwrap();
         std::fs::write(src.join("skills/x/SKILL.md"), "skill").unwrap();
         std::fs::write(src.join(".env"), "SECRET=1").unwrap();
@@ -339,9 +413,15 @@ mod tests {
         .unwrap();
         assert!(!paths.data_dir.exists());
         let creates = items.iter().filter(|i| i.action == Action::Create).count();
-        assert_eq!(creates, 6, "{items:#?}");
+        assert_eq!(creates, 2);
+        let notes = items
+            .iter()
+            .filter(|i| i.action == Action::Memory(1))
+            .count();
+        assert_eq!(notes, 3);
         let text = report(&items, true);
         assert!(text.contains("would copy") && text.contains("dry run"));
+        assert!(text.contains("would add to memory") && text.contains("3 memory notes to add"));
     }
 
     #[test]
@@ -364,15 +444,19 @@ mod tests {
             read(paths.persona_dir().join("USER.md")),
             "# User\nLikes tea."
         );
-        assert_eq!(
-            read(paths.memory_dir().join("MEMORY.md")),
-            "Remember the garden."
+        // Memory files became notes, shown in the generated export.
+        assert!(read(paths.memory_dir().join("MEMORY.md")).contains("- Remember the garden.\n"));
+        assert!(
+            read(paths.memory_dir().join("people.md")).contains("- Alex: Climbs on weekends\n")
         );
-        assert_eq!(read(paths.memory_dir().join("people/alex.md")), "# Alex");
-        assert_eq!(
-            read(paths.memory_dir().join("imported/AGENTS.md")),
-            "# Agents"
+        assert!(read(paths.memory_dir().join("you.md")).contains("- 2026 01 01: Daily note\n"));
+        assert!(!paths.memory_dir().join("people").exists());
+        assert!(
+            items
+                .iter()
+                .any(|i| i.src.ends_with("AGENTS.md") && matches!(i.action, Action::Skip(_)))
         );
+        assert!(!paths.memory_dir().join("imported").exists());
         assert!(!paths.memory_dir().join("link.md").exists());
         assert!(!paths.memory_dir().join("photo.jpg").exists());
         assert!(!paths.data_dir.join("skills").exists());
@@ -443,15 +527,13 @@ mod tests {
             .filter(|i| i.dest.as_ref() == Some(&dest))
             .collect();
         assert_eq!(to_dest.len(), 2);
-        assert!(matches!(to_dest[0].action, Action::Create));
+        assert_eq!(to_dest[0].action, Action::Memory(1));
         assert!(
             to_dest[0].src.ends_with("MEMORY.md") && !to_dest[0].src.ends_with("memory/MEMORY.md")
         );
         assert!(matches!(to_dest[1].action, Action::Skip(_)));
-        assert_eq!(
-            std::fs::read_to_string(dest).unwrap(),
-            "Remember the garden."
-        );
+        let core = std::fs::read_to_string(dest).unwrap();
+        assert!(core.contains("Remember the garden.") && !core.contains("Older memory copy"));
         assert!(report(&items, false).contains("same place"));
     }
 
@@ -475,12 +557,43 @@ mod tests {
             read(paths.persona_dir().join("USER.md")),
             "# User\nLikes tea."
         );
-        assert_eq!(
-            read(paths.memory_dir().join("MEMORY.md")),
-            "Remember the garden."
-        );
+        assert!(read(paths.memory_dir().join("MEMORY.md")).contains("- Remember the garden."));
         assert_eq!(read(paths.persona_dir().join("SOUL.md")), "my own soul");
         assert!(items.iter().any(|i| matches!(i.action, Action::SkipExists)));
+    }
+
+    #[test]
+    fn existing_markdown_memory_is_kept_when_importing_before_first_start() {
+        let (_t, src, paths) = setup();
+        // An install upgraded but not started yet: memory still as Markdown.
+        crate::persona::seed(&paths).unwrap();
+        std::fs::write(paths.memory_dir().join("MEMORY.md"), "- Owner's own fact\n").unwrap();
+        std::fs::write(paths.memory_dir().join("people.md"), "- Neighbour Kim\n").unwrap();
+        import_openclaw(
+            &src,
+            &paths,
+            &Options {
+                dry_run: false,
+                force: false,
+            },
+        )
+        .unwrap();
+        let read = |p: PathBuf| std::fs::read_to_string(p).unwrap();
+        let core = read(paths.memory_dir().join("MEMORY.md"));
+        assert!(core.contains("- Owner's own fact\n") && core.contains("- Remember the garden.\n"));
+        let people = read(paths.memory_dir().join("people.md"));
+        assert!(
+            people.contains("- Neighbour Kim\n") && people.contains("- Alex: Climbs on weekends\n")
+        );
+        let backups: Vec<_> = std::fs::read_dir(crate::memory::files::backup_root(&paths))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            read(backups[0].path().join("people.md")),
+            "- Neighbour Kim\n"
+        );
     }
 
     #[test]

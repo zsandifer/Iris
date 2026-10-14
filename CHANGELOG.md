@@ -42,6 +42,14 @@ All notable changes to Iris are documented here, following
   (Ubuntu 23.10+); when the sandbox cannot start, the app shows the exact
   command for that server.
 - A personal For you feed, Ideas, Goals, Library and push notifications.
+- Memory is kept as notes in Iris’s database, with a history of every change
+  (so changes can be undone) and keyword search. The memory folder under
+  System files is now a read-only Markdown copy (`MEMORY.md`, what the agent
+  always keeps in mind, plus one file per topic) that Iris rewrites after
+  every change. Existing memory files are imported once on upgrade, with the
+  originals kept in `memory-backup/`; `iris import openclaw` imports memory
+  the same way. The agent's `read_memory` / `write_memory` tools keep
+  working on the new files.
 - Optional separation of Iris and its agents into different OS users.
 - Self-awareness of setup and connection status, with sign-in and setup cards.
 - An installable mobile app with keyboard handling and a full-screen photo viewer.
