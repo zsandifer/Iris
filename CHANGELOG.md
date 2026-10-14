@@ -37,6 +37,12 @@ All notable changes to Iris are documented here, following
   excludes all older unprocessed chat evidence; newer owner assertions remain
   learnable. Existing removal history initializes that source boundary on upgrade.
 
+- Routines: jobs Iris runs on a schedule (once, daily / weekly / monthly /
+  yearly rules, or cron), with time zones and daylight-saving handling,
+  end dates and run limits, missed-run and retry rules, Markdown and text
+  reference documents, and an approval step before buying or sending. Iris
+  proposes routines in chat; they start only after your tap.
+
 - Personal and shared chat with photos, streaming replies and saved history.
 - Claude Code, Codex, Gemini and OpenCode engines, with installation and sign-in
   from the app, automatic model ranking and effort selection.

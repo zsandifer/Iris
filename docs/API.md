@@ -26,6 +26,7 @@ if the two ever disagree, the code wins and this file has a bug.
    - [3.13 Credentials](#313-credentials)
    - [3.14 Push](#314-push)
    - [3.15 Jobs](#315-jobs)
+   - [3.15a Routines](#315a-routines)
    - [3.16 Voice](#316-voice)
    - [3.17 Engines (install and update)](#317-engines-install-and-update)
    - [3.18 Safety: pause, disconnect, trusted people](#318-safety-pause-disconnect-trusted-people)
@@ -346,6 +347,19 @@ All paths are under `/api`. "Any" means any authenticated user.
 | POST | `/memory/history/{id}/undo` | **Owner** | Undo the latest change |
 | GET | `/jobs` | **Owner** | Scheduled job status |
 | POST | `/jobs/{name}/run` | **Owner** | Run a job now (`202`) |
+| GET | `/routines` | **Owner** | List routines |
+| POST | `/routines` | **Owner** | Create a routine |
+| GET | `/routines/{id}` | **Owner** | One routine with its run history |
+| PATCH | `/routines/{id}` | **Owner** | Change a routine (applies at once) |
+| DELETE | `/routines/{id}` | **Owner** | Delete a routine |
+| POST | `/routines/{id}/pause` | **Owner** | Pause a routine |
+| POST | `/routines/{id}/resume` | **Owner** | Resume a routine |
+| POST | `/routines/{id}/run` | **Owner** | Run a routine now |
+| POST | `/routines/docs` | **Owner** | Upload a reference document (raw body, `?name=`) |
+| DELETE | `/routines/{id}/docs/{doc_id}` | **Owner** | Detach a document |
+| POST | `/routines/preview` | **Owner** | Next runs of a draft schedule |
+| POST | `/routines/changes/{id}/approve` | **Owner** | Apply a change Iris proposed |
+| POST | `/routines/changes/{id}/decline` | **Owner** | Discard a change Iris proposed |
 | POST | `/voice/speak` | Any | Placeholder, always `501` |
 | GET | `/ws` | token | WebSocket event stream |
 
@@ -1036,7 +1050,9 @@ the message is not an approval card. Sets the card's `state` to `approved`
 or `denied` and `decided_at`, releases the connector call the gateway is
 holding for it (approved: it runs exactly as previewed; denied: it never
 runs and the agent is told), broadcasts `message.updated`, and returns
-`{"message": {Message}}`.
+`{"message": {Message}}`. For a routine's card (`routine_run_id`) the
+decision continues the waiting run (approved) or records it as skipped
+(denied).
 
 Owner setup request cards (`requested_by: "system_request"`) also accept
 `{"approve": false}` here to decline once (`state: "declined"`). Setup approval
@@ -2170,6 +2186,106 @@ now. Heartbeat/feed manual runs bypass enabled/active-hour checks. Dream manual 
 only the hour and once-a-day check; enabled, activity, pause and privacy gates still apply. Response **`202`**:
 `{"started": true}`, or `false` if it was already running.
 
+### 3.15a Routines
+
+Routines are scheduled jobs the owner sets up ("order dinner every
+Saturday", "rent reminder on the 1st", "gift ideas on Oct 29 at 8"),
+separate from the built-in `heartbeat`, `feed` and `dream` jobs. Every route is
+**owner-only** (`403` otherwise). Changes the owner makes here apply at
+once; changes Iris proposes through the [bridge](#tools) wait for
+`/api/routines/changes/{id}/approve`. Every change emits `entities.changed`
+`["routines"]` to the owner. See [Routine](#routine) for the fields and
+[Scheduled jobs](#scheduled-jobs) for how runs work.
+
+Validation errors are `400` with a friendly sentence in `error.message`
+(for example "Pick at least one day of the week." or "That custom schedule
+runs too often. Routines can run at most every 30 minutes.").
+
+#### `GET /api/routines`
+
+`{"routines": [Routine], "default_tz": "America/Chicago", "max_doc_bytes":
+10485760}`, oldest first. `default_tz` is the time zone the owner last saved
+a routine in, else the server's, else `UTC`.
+
+#### `POST /api/routines`
+
+Body: the [Routine](#routine) spec fields (`title`, `instructions`, and
+`schedule_kind` are required), plus optional `doc_ids` (uploaded
+documents to attach) and `state: "paused"` to create it paused. A missing
+`tz` uses `default_tz`. Returns `{"routine": Routine}` (with `runs`).
+
+#### `GET /api/routines/{id}`
+
+`{"routine": Routine}` with `runs`: its last 50 [runs](#routinerun), newest
+first. `404` for an unknown id.
+
+#### `PATCH /api/routines/{id}`
+
+Any spec fields (`null` clears an optional one), `doc_ids` (the full new
+list of documents), and `state: "active" | "paused"`. The next run is worked
+out again from now. A routine still waiting for its first OK
+(`pending_approval`) keeps that state. Returns `{"routine": Routine}`.
+
+#### `DELETE /api/routines/{id}`
+
+Deletes the routine, its run history and hidden run conversations, and
+cancels an approval card still waiting on one of its runs. Its documents
+stay in the Library. `{"deleted": true}`.
+
+#### `POST /api/routines/{id}/pause`, `POST /api/routines/{id}/resume`
+
+Shorthand for `PATCH` with `state`. Resuming works out the next run from
+now (runs missed while paused are not made up).
+
+#### `POST /api/routines/{id}/run`
+
+Run now, in addition to the schedule (manual runs do not count toward
+`max_runs`). `409 conflict` with "It's already running." while a run of
+this routine is going or waiting for the owner's OK, "Set it up first, then
+I can run it." for a routine still waiting for its first OK, and
+`409 paused` while Iris is paused. Returns `{"run": RoutineRun}`.
+
+#### `POST /api/routines/docs?name={file name}`
+
+Upload a reference document as the raw request body. Only Markdown (`.md`,
+`.markdown`) and plain text (`.txt`, `.text`) files are read for now,
+chosen by the file name's extension; anything else is `415
+unsupported_media_type` ("I can only read Markdown (.md) or plain text
+(.txt) files for routines right now. ..."). Text must be UTF-8 (a byte order
+mark is dropped). Over `max_upload_bytes` is `413 too_large`. The file is
+saved as an ordinary [Library item](#libraryitem) (`kind: "artifact"`,
+title = the file name) with its text extracted once, and emits
+`entities.changed` `["library"]`. Returns `{"doc": {"id", "title", "mime",
+"size", "chars"}}`; attach it with `doc_ids`.
+
+#### `DELETE /api/routines/{id}/docs/{doc_id}`
+
+Detach a document (it stays in the Library). Returns `{"routine": Routine}`;
+`404` when it was not attached.
+
+#### `POST /api/routines/preview`
+
+The editor's live preview. Body: draft schedule fields (`schedule_kind`,
+`run_at`, `rule`, `cron_expr`, `tz`, `starts_at`, `end_at`, `max_runs`;
+other spec fields are optional) and `count` (1 to 10, default 3). Returns
+`{"runs": [{"at": ms, "text": "Sat Oct 17, 5:30 PM"}], "schedule_text",
+"cron_text" (cron only, e.g. "At 17:30, on Saturday."), "tz"}`, or `400`
+with the reason the schedule is not valid.
+
+#### `POST /api/routines/changes/{id}/approve`, `POST /api/routines/changes/{id}/decline`
+
+Decide a change Iris proposed (the `change_id` of a [`routine`
+card](#server-cards), or a routine's `pending_change.id`). Approving a new
+routine makes it `active` and schedules it; the optional body
+`{"routine": {spec fields, "doc_ids"?}}` sets it up with the owner's edits
+instead. Approving an update applies only the fields Iris changed (edits the
+owner made meanwhile are kept); approving a delete deletes it. Declining
+discards the change, and a declined new routine is removed. The change's
+cards turn `approved` or `declined` (`message.updated`). `409 conflict` when
+it was already decided or replaced by a newer proposal. Approve returns
+`{"routine": Routine}` (`null` with `"deleted": true` after a delete);
+decline returns `{"declined": true}`.
+
 ### 3.16 Voice
 
 #### `POST /api/voice/speak`
@@ -2564,7 +2680,7 @@ was emitted). Events are delivered only to the users listed under
 | `memory.reset` | `{"reset"}` (the new `Settings.memory.reset` marker) after Forget everything: drop cached Noted metadata and morning cards (they now read "I cleared my notes.") and close open memory sheets | Owner only |
 | `turn.status` | `{"conversation_id", "message_id", "status": "queued" \| "running"}` | Conversation members |
 | `conversation.created` | `{"conversation": {Conversation}}` | Conversation members |
-| `entities.changed` | `{"kinds": ["goals" \| "ideas" \| "feed" \| "library" \| "memory", ...]}` | The affected user |
+| `entities.changed` | `{"kinds": ["goals" \| "ideas" \| "feed" \| "library" \| "memory" \| "routines", ...]}` | The affected user |
 | `settings.changed` | `{"settings": {Settings}}` | All users |
 | `harness.status` | `{"harness": {HarnessStatus}}` (`path` always `null`) | All users |
 | `message.updated` | `{"conversation_id", "message": {Message}}` | Conversation members |
@@ -2608,8 +2724,9 @@ Event details:
 - **`entities.changed`**: refetch the listed collections. Sent after REST
   changes (to the caller), after a turn in which the agent successfully
   changed data through the bridge (to the conversation creator; see
-  [section 8](#8-the-iris-mcp-bridge)), and when a feed pipeline run
-  publishes or finishes (`["feed"]`).
+  [section 8](#8-the-iris-mcp-bridge)), when a feed pipeline run
+  publishes or finishes (`["feed"]`), and when a routine run starts,
+  waits, or finishes (`["routines"]`).
 - **`conversation.created`**: sent by `POST /api/conversations`,
   `POST /api/feed/{id}/discuss` (only when a new discussion is created),
   `POST /api/ideas/{id}/start`, and to the added user by
@@ -2942,6 +3059,57 @@ the last start. Manual runs (`POST /api/jobs/{name}/run`,
 
 Failed job turns are only logged.
 
+#### Routines
+
+[Routines](#315a-routines) are checked on the same minute tick (not while
+Iris is paused). Their times are wall-clock times in the routine's IANA time
+zone; a time that does not exist (clocks spring forward) runs at the moment
+the clocks jump, and a time that happens twice (clocks fall back) runs only
+the first time. The next run is worked out from the scheduled slot, never
+from when a run actually started.
+
+- **Claiming.** Each slot gets one [run](#routinerun) row (unique per
+  routine and slot), created in the same database step that moves
+  `next_run_at` on, so a slot never runs twice. A routine never runs twice
+  at once: a slot that comes while its last run is still going or waiting
+  for the owner is recorded as skipped. `once` routines and routines that
+  reach `end_at` or `max_runs` become `done`.
+- **Missed slots.** A slot up to 5 minutes late runs normally. When Iris was
+  offline or paused longer, only the latest missed slot counts:
+  `run_latest_in_window` runs it if it is at most an hour late, `skip`
+  records it as skipped ("I was offline or paused at the time, so I skipped
+  it (and 2 earlier times)."). Routines that buy or send things should use
+  `skip`.
+- **A run** is a turn with `purpose: "scheduled"` on the `chat` slot in a
+  fresh hidden job conversation titled `Routine: <title>` with only the owner
+  in it, so it never involves a shared conversation (any signed-in engine may
+  run it). The prompt is the routine's instructions plus each attached
+  document's text as a labelled `<document title="...">` section (at most
+  40,000 characters in all, cut with a note saying so). The reply goes to the
+  owner's Main chat (`meta.initiated_by: "routine"`), pushed when
+  `notify_when_done` (quiet hours respected), and cards the run made move to
+  Main like the heartbeat's. The last 10 runs' conversations are kept.
+- **Ask before acting** (`ask_before_acting`, default on) runs in two
+  steps. The run prepares the work without buying, ordering, booking,
+  paying, sending, posting, or deleting anything, and, when an action is
+  needed, ends its reply with a line `NEEDS_OK: <what it will do>`. Iris
+  posts the rest of the reply to Main, then an [`approval`
+  card](#server-cards) with `routine_id` and `routine_run_id` (pushed as
+  `approval`); the run is `waiting` until `expires_at`
+  (`approval_timeout_mins`). On the owner's OK the same conversation
+  continues (resumed) and does exactly that; connected services still ask
+  for their own approvals. Deny makes the run skipped ("You said no, so I
+  didn't do it."); no answer in time expires the card and skips the run
+  ("You didn't answer within 2 hours, so I didn't do it."). Nothing is held
+  open while waiting, so a waiting run survives a restart.
+- **Failures.** A failed run is retried after 1, 5, then 30 minutes, up to
+  `max_retries` times (status `failed` with `retry_at` meanwhile). The acting
+  step after an OK is never retried automatically. A final failure posts a
+  short note in Main ("I couldn't finish your routine “...”. ...").
+- **Restarts.** Runs that were going when Iris stopped are recovered at
+  startup: the preparing step is retried (if retries are left and it is at
+  most an hour late), an interrupted acting step is recorded as failed.
+
 ### For you pipeline
 
 Deterministic code does nearly everything. The model is used at most twice
@@ -3173,7 +3341,7 @@ Discuss feed-post card is built by the server instead: it always includes
 
 #### Server cards
 
-Iris itself posts these (the agent cannot create them). All but `approval`
+Iris itself posts these (the agent cannot create them). All but `approval` and `routine`
 carry `owner_only: true`: only the owner can act on them. Cards whose `state`
 changes are re-sent as `message.updated`.
 
@@ -3184,7 +3352,8 @@ changes are re-sent as `message.updated`.
 | `engine_signin` | `harness`, `flow` (`code_paste`, `device_code`, `manual`), `state` (`needs_reconnect`, `starting`, `waiting_for_code`, `waiting_for_approval`, `verifying`, `done`, `failed`, `cancelled`), `url`, `user_code`, `error`, `instructions` (manual flow), `login_id` | Start with `POST /api/harnesses/{harness}/login`. For `waiting_for_code`, show `url` and a code field (`/login/code`); for `waiting_for_approval`, show `url` and `user_code`; for `manual`, show `instructions` and a "Check again" button (the same `POST`). |
 | `engine_setup` | `state` (`needs_setup`, `done`), `options: [{"harness", "label", "installed", "requires", "action": {"method", "path"}}]` | Each option installs that engine (`POST /api/engines/{name}/install`). |
 | `connector_reconnect` | `connector_id`, `service`, `auth` (`oauth` or `secrets`), `state` (`needs_reconnect`, `done`) | `oauth`: sign in again (`POST /api/connectors/{id}/oauth/start`). `secrets`: open the connector's settings so the owner can update its credentials (`PATCH /api/connectors/{id}`). The card turns `done` (✓) after a successful connection. |
-| `approval` | `service`, `preview: {"to", "subject", "body", "fields": [{"label", "value"}]}`, `details` (the complete arguments, pretty JSON; requests too large to show in full are refused), `reason` (why it asks, e.g. "Sends a message to someone new: sam@example.com"), `tool`, `category`, `connector_id`, `turn_message_id` (the reply of the turn that asked; absent for scheduled jobs), `action_label` (`Send`, `Pay`, `Delete`, or `Allow`), `approver_user_id`, `owner_only: false`, `state` (`pending`, `approved`, `denied`, `expired`, `cancelled`), `expires_at`, `decided_at` | Show the preview exactly as given with Deny / `action_label`; decide with [`POST /api/messages/{id}/decision`](#post-apimessagesiddecision). Built by the gateway from the real arguments of the held call, never from agent text; characters that could hide or reorder text are shown as `[U+XXXX]`, and a body over 4,000 characters is cut with a note (the full text is in `details`). |
+| `routine` | `change_id`, `routine_id`, `action` (`create`, `update`, `delete`), `emoji`, `body` (what changes, e.g. "Time 5:30 PM → 6:00 PM, adds Sundays"), `schedule`, `next`, `asks_first`, `approver_user_id`, `state` (`pending`, `approved`, `declined`, `superseded`, `cancelled`), `decided_at` | A routine Iris proposed. Nothing changes until the owner decides with [`POST /api/routines/changes/{change_id}/approve` or `/decline`](#315a-routines). Built by the server from the stored proposal; posted in the turn's chat and shown with the reply, like agent cards. A newer proposal for the same routine supersedes it. |
+| `approval` | `service`, `preview: {"to", "subject", "body", "fields": [{"label", "value"}]}`, `details` (the complete arguments, pretty JSON; requests too large to show in full are refused), `reason` (why it asks, e.g. "Sends a message to someone new: sam@example.com"), `tool`, `category`, `connector_id`, `turn_message_id` (the reply of the turn that asked; absent for scheduled jobs), `action_label` (`Send`, `Pay`, `Delete`, or `Allow`), `approver_user_id`, `owner_only: false`, `state` (`pending`, `approved`, `denied`, `expired`, `cancelled`), `expires_at`, `decided_at` | Show the preview exactly as given with Deny / `action_label`; decide with [`POST /api/messages/{id}/decision`](#post-apimessagesiddecision). Built by the gateway from the real arguments of the held call, never from agent text; characters that could hide or reorder text are shown as `[U+XXXX]`, and a body over 4,000 characters is cut with a note (the full text is in `details`). A routine waiting for the owner's OK posts one too (`service: "routine"`, `routine_id`, `routine_run_id`, `deny_label`, the plan Iris prepared as `preview.body`, `action_label: "Go ahead"`); it survives restarts and its decision continues or skips the run. |
 
 
 ### Attachment
@@ -3258,6 +3427,57 @@ changes are re-sent as `message.updated`.
 | `conversation_id` | string or null | Conversation the agent saved it from. |
 | `created_at`, `updated_at` | int | |
 | `file_name` | | (not in JSON) |
+| `extracted_text` | | (not in JSON) Text of a routine document, extracted once at upload. |
+
+### Routine
+
+The spec fields (set by `POST`/`PATCH /api/routines` and the bridge's
+routine tools):
+
+| Field | Type | Notes |
+|---|---|---|
+| `title` | string | Required, max 120. |
+| `emoji` | string | One emoji (max 8 characters), may be empty. |
+| `instructions` | string | Required, max 10,000: what Iris does on every run. |
+| `schedule_kind` | string | `once`, `rule`, or `cron`. |
+| `run_at` | string or null | `once`: local `YYYY-MM-DDTHH:MM`. |
+| `rule` | object or null | `rule`: `{"freq": "daily" \| "weekly" \| "monthly" \| "yearly", "time": "HH:MM", "every": 1, "anchor"?: "YYYY-MM-DD", ...}`. `weekly` has `days` (0 = Sunday … 6 = Saturday); `monthly` has `day` (1–31; shorter months use their last day) or `nth` (1–4, or -1 for the last) and `weekday` (0–6); `yearly` has `month` and `day` (Feb 29 runs on Feb 28 in other years). `every` counts days, weeks, months, or years from `anchor` (filled in with the start date, or today, when `every` is more than 1); maximums 365, 52, 24, 10. |
+| `cron_expr` | string or null | `cron`: five fields (minute hour day-of-month month day-of-week; `L`, `#`, `W` and names work); may not run more often than every 30 minutes. |
+| `tz` | string | IANA time zone. |
+| `starts_at`, `end_at` | string or null | Local dates `YYYY-MM-DD`: the first and last day a repeating routine may run. |
+| `max_runs` | int or null | Stop after this many scheduled runs (1 to 1,000). |
+| `ask_before_acting` | bool | Default true: prepare, then ask before buying or sending. |
+| `notify_when_done` | bool | Default true: push the result. |
+| `approval_timeout_mins` | int | Default 120 (5 to 1,440): how long a prepared run waits for the owner's OK. |
+| `misfire` | string | `run_latest_in_window` (default) or `skip`. |
+| `max_retries` | int | Default 2 (0 to 3). |
+
+Plus, read-only: `id`, `state` (`pending_approval`: proposed by Iris and
+waiting for the owner's first OK; `active`; `paused`; `done`),
+`next_run_at` (UTC ms or null), `next_run_text` (e.g. "Sat Oct 17, 5:30
+PM", in the routine's time zone), `upcoming` (up to 3 `{"at", "text"}`),
+`schedule_text` (e.g. "Every Sat · 5:30 PM", "Monthly on the last Friday ·
+9:00 AM"), `run_count`, `created_by` (`owner` or `iris`), `created_at`,
+`updated_at`, `docs` (`[{"id", "title", "mime", "size", "chars"}]`),
+`last_run` (`{"status", "reason", "summary", "scheduled_for",
+"finished_at"}` of the last finished run, or null), `open_run` (`{"id",
+"status", "card_message_id", "expires_at"}` of a run going or waiting, or
+null), and `pending_change` (`{"id", "action", "summary", "created_at"}` of
+a proposal from Iris waiting for the owner, or null).
+
+### RoutineRun
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string | |
+| `scheduled_for` | int | The slot (UTC ms); for a manual run, when it was asked for. Unique per routine. |
+| `manual` | bool | Run now. |
+| `status` | string | `running`, `waiting` (for the owner's OK), `ok`, `skipped`, or `failed` (with `retry_at` while a retry is due). |
+| `reason` | string | Plain-language why, for skipped and failed runs. |
+| `summary` | string | First line of the result (`ok`), or the planned action (`waiting`). |
+| `attempts` | int | Attempts started. |
+| `retry_at`, `expires_at`, `approved_at`, `started_at`, `finished_at` | int or null | |
+| `card_message_id` | string or null | The approval card of a run that asked. |
 
 ### Connector
 
@@ -3839,6 +4059,10 @@ a new turn. Resolved cards are explicitly described as resolved in replay histor
 | `list_library` | `kind?: "artifact" \| "media"` | `{"items": [LibraryItem]}` (max 500) |
 | `create_card` | `type` (required, one of the [card types](#card)), `title` (required), `body?`, `url?`, `image_url?`, `action_label?`, `service?`, `ref_id?` (id of a related goal, idea, or feed post) | `{"card_message_id": "...", "shown": true}` |
 | `list_connectors` | none | `{"connectors": [{"name", "service", "description", "enabled", "signed_in", "paused", "rules"}], "available_to_connect": [{"service", "name", "description"}]}` |
+| `list_routines` | none; owner private context only | `{"routines": [{"id", "title", "emoji", "state", "schedule", "next_run", "instructions" (first 600 characters), "fields" (the spec), "documents" (titles), "last_run", "pending_change"}]}` |
+| `create_routine` | The [Routine](#routine) spec fields (`title`, `instructions`, `schedule_kind` required); owner private context only | Proposes it: `{"proposed": true, "routine_id", "change", "next_run", "card_message_id", "note"}`. The routine is stored as `pending_approval` and a [`routine` card](#server-cards) is posted; nothing runs until the owner taps Set it up. |
+| `update_routine` | `id` (required), any spec fields, `paused?: bool`; owner private context only | Proposes the change with a one-line diff (`change`), same result shape. Error "That wouldn't change anything." when nothing differs. |
+| `delete_routine` | `id` (required); owner private context only | Proposes deleting it, same result shape. |
 
 The six recall/write tools above are only offered and callable in owner-alone
 turns, with membership rechecked under the database write lock. Agent get/search
@@ -3858,6 +4082,12 @@ PEM blocks are scrubbed across the whole document before it is split into notes.
 `create_card` validates with the [Card](#card) rules and inserts a card
 message (`role: "assistant"`) into the current conversation. Clients receive
 it as `message.created` right after the turn's `message.completed`.
+
+The routine tools are only listed and only work in the owner's own private
+conversations (never shared chats, nor other people's). Their proposals are
+stored in SQLite (`routine_changes`), so they survive restarts, and their
+cards are published with the turn's reply like `create_card` cards. The
+system prompt tells Iris when to propose a routine.
 
 ### The browser tools
 
@@ -4044,8 +4274,8 @@ The bridge runs in a separate process and does not emit events itself. When
 the turn ends, Iris looks at the turn's `mcp` activities named
 `iris/<tool>` with status `completed`, skips the read-only `list_*` tools,
 and emits one `entities.changed` to the turn's `--user` with `goals`,
-`ideas`, `feed`, and/or `library` for tool names containing `goal`, `idea`,
-`feed`, or `library`. This also happens for job turns, which emit no other
+`ideas`, `feed`, `library`, and/or `routines` for tool names containing
+`goal`, `idea`, `feed`, `library`, or `routine`. This also happens for job turns, which emit no other
 conversation events.
 
 ---
@@ -4072,6 +4302,8 @@ use.
 | Trigger | Recipients | `kind` |
 |---|---|---|
 | Heartbeat job posts a message in the Main chat | The owner, always (online or not) | `heartbeat` |
+| A routine run posts its result (or a final failure) in the Main chat and the routine has `notify_when_done` | The owner | `routine` |
+| A routine prepared its work and waits for the owner's OK | The owner | `approval` |
 | A chat turn completes successfully (`status: "complete"`) and `push.notify_replies_when_offline` is true (default) | Conversation members with **no connected WebSocket** at that moment | `reply` |
 | A chat turn fails (`status: "error"`), same setting | Same | `stuck` (body "I got stuck on that. Tap to try again.") |
 | A CLI the owner used went signed out (reconnect card posted) | The owner | `engine_signin` |
@@ -4170,6 +4402,16 @@ The app only uses the routes and events in this document. It stores its
 device token in `localStorage` and fetches binary routes with the
 `Authorization` header (object URLs). End users never see model names,
 efforts, or tokens outside Settings, AI engine.
+
+Routines (`#/iris/routines`, owner only, from the hub) lists routines in
+Waiting for you (Iris's proposals, changes, and runs waiting for an OK),
+Repeating, and Once, each with an on/off toggle and next-run and last-result
+pills; a tap opens a summary sheet (Edit, Run now, Pause). The box at the
+top sends the request to Iris in the Main chat ("Set up a routine: ..."), so
+she proposes a card; the app parses no dates itself. The editor
+(`#/iris/routines/new`, `#/iris/routines/{id}`) has What (name, icon,
+instructions, documents with Upload), When (Repeats / Once / Custom, with
+the next three runs from `POST /api/routines/preview`), Rules, and History.
 
 Iris's computer (`#/iris/computer`, owner only) shows the live browser,
 Watch (full screen) and Take over (taps, drags as scrolling, an address bar,
