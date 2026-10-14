@@ -4064,6 +4064,76 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
         assert!(run["retry_at"].is_null());
         assert!(t.read(4, "args").contains("--resume"));
         assert_eq!(t.runs(), 5, "no fresh-session replay of the acting step");
+        // Nor when it fails without reporting any tool (some CLIs only
+        // report a tool once it has finished).
+        std::fs::remove_file(t.dir.join("fail")).unwrap();
+        let quiet = create(json!({"title": "Lunch", "instructions": "Order lunch.",
+            "schedule_kind": "rule",
+            "rule": {"freq": "weekly", "days": [5], "time": "12:00"}, "tz": "UTC"}))
+        .await;
+        run_now(quiet.clone()).await;
+        let run = last_run(quiet.clone(), "waiting").await;
+        assert_eq!(t.runs(), 6);
+        std::fs::write(t.dir.join("fail"), "plain").unwrap();
+        let card = run["card_message_id"].as_str().unwrap();
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/messages/{card}/decision"),
+            Some(tok),
+            Some(json!({"approve": true})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let run = last_run(quiet.clone(), "failed").await;
+        assert!(run["retry_at"].is_null());
+        assert!(t.read(6, "args").contains("--resume"));
+        assert_eq!(t.runs(), 7, "no fresh-session replay without a tool report");
+        // An acting step whose engine says it is signed out is not handed to
+        // another engine either.
+        std::fs::remove_file(t.dir.join("fail")).unwrap();
+        let coffee = create(
+            json!({"title": "Coffee", "instructions": "Order coffee beans.",
+            "schedule_kind": "rule",
+            "rule": {"freq": "weekly", "days": [1], "time": "08:00"}, "tz": "UTC"}),
+        )
+        .await;
+        run_now(coffee.clone()).await;
+        let run = last_run(coffee.clone(), "waiting").await;
+        std::fs::write(t.dir.join("fail"), "auth").unwrap();
+        let card = run["card_message_id"].as_str().unwrap();
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/messages/{card}/decision"),
+            Some(tok),
+            Some(json!({"approve": true})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        last_run(coffee.clone(), "failed").await;
+        let run_id = run["id"].as_str().unwrap().to_string();
+        let routing = h
+            .state
+            .db
+            .call(move |c| {
+                let r = crate::routines::run::get_run(c, &run_id)?.unwrap();
+                let msgs = crate::db::list_messages(c, &r.conversation_id.unwrap(), None, 10)?;
+                Ok(msgs
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "assistant")
+                    .unwrap()
+                    .meta["routing"]
+                    .clone())
+            })
+            .await
+            .unwrap();
+        assert!(routing["model"].is_string(), "{routing}");
+        assert!(
+            !routing["notes"].to_string().contains("rerouted"),
+            "{routing}"
+        );
     }
 
     #[tokio::test]

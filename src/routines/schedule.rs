@@ -301,8 +301,8 @@ fn in_gap(tz: &TimeZone, dt: DateTime) -> bool {
 }
 
 impl Plan {
-    /// Whether a cron pattern has a real (not moved) time within
-    /// `MIN_CRON_GAP_MINS` of instant `t`, other than `t` itself.
+    /// Whether a cron pattern has a real (not moved) time less than
+    /// `MIN_CRON_GAP_MINS` from instant `t`, other than `t` itself.
     fn cron_runs_near(&self, cron: &croner::Cron, t: i64) -> bool {
         let gap = MIN_CRON_GAP_MINS * 60_000;
         let Some(mut civil) = zoned(&self.tz, t - gap).map(|z| z.datetime()) else {
@@ -319,7 +319,7 @@ impl Plan {
             if at > t + gap && !in_gap(&self.tz, next) {
                 return false;
             }
-            if !in_gap(&self.tz, next) && at != t && (t - at).abs() <= gap {
+            if !in_gap(&self.tz, next) && at != t && (t - at).abs() < gap {
                 return true;
             }
             civil = next;
@@ -944,6 +944,20 @@ mod tests {
             ]
         );
         assert!(check_cron_gap(&half_plan, halves, at(CHI, "2026-10-14T12:00")).is_ok());
+        // Exactly 30 minutes away is allowed: the skipped 2:30 runs at 3:00,
+        // between 1:30 and 3:30.
+        let hourly = Plan {
+            when: When::Cron(Box::new(parse_cron("30 * * * *").unwrap())),
+            ..plan.clone()
+        };
+        assert_eq!(
+            next_n(&hourly, CHI, "2027-03-14T01:00", 3),
+            [
+                "2027-03-14 01:30 -06:00",
+                "2027-03-14 03:00 -05:00",
+                "2027-03-14 03:30 -05:00",
+            ]
+        );
         // A pattern only crowded by the jump is refused up front: 1:50 and
         // 3:05 are 15 minutes apart that night.
         let jumpy = "5,50 1,3 * * *";
