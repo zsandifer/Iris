@@ -220,44 +220,78 @@ fn insert_run(
 /// Start due retries and claim due slots; returns the runs to start.
 #[cfg(test)]
 pub fn claim_due(conn: &Connection, now: i64) -> rusqlite::Result<Vec<String>> {
-    claim_due_changes(conn, now).map(|(runs, _)| runs)
+    claim_due_changes(conn, now).map(|c| c.start)
 }
 
-/// [`claim_due`], and whether anything changed (slots skipped, retries
-/// given up, routines finished) even when nothing starts.
-pub fn claim_due_changes(conn: &Connection, now: i64) -> rusqlite::Result<(Vec<String>, bool)> {
+/// A note for the owner's Main chat: (owner, text, push).
+pub type Notice = (String, String, bool);
+
+/// What a scheduler minute did.
+#[derive(Debug, Default, PartialEq)]
+pub struct Claimed {
+    /// Runs to start.
+    pub start: Vec<String>,
+    /// Anything changed (slots skipped, retries given up, routines
+    /// finished), even when nothing starts.
+    pub changed: bool,
+    /// Runs given up for good, to tell the owner about.
+    pub notices: Vec<Notice>,
+}
+
+fn gave_up(r: &Routine, why: &str) -> Notice {
+    (
+        r.owner.clone(),
+        format!("I couldn't finish your routine “{}”. {why}", r.spec.title),
+        r.spec.notify_when_done,
+    )
+}
+
+/// [`claim_due`], with what else changed.
+pub fn claim_due_changes(conn: &Connection, now: i64) -> rusqlite::Result<Claimed> {
     db::write_tx(conn, |c| {
         let mut out = Vec::new();
         let mut changed = false;
-        let retries: Vec<(String, String, i64, String)> = c
+        let mut notices = Vec::new();
+        let retries: Vec<(String, String, i64, bool)> = c
             .prepare(
-                "SELECT r.id, r.routine_id, r.retry_at, t.misfire
+                "SELECT r.id, r.routine_id, r.retry_at, r.manual
                  FROM routine_runs r JOIN routines t ON t.id = r.routine_id
                  WHERE r.status = 'failed' AND r.retry_at IS NOT NULL AND r.retry_at <= ?1
-                   AND t.state IN ('active', 'done')
+                   AND t.state IN ('active', 'done', 'paused')
                  ORDER BY r.retry_at",
             )?
             .query_map([now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<_>>()?;
         changed |= !retries.is_empty();
-        for (run, routine, retry_at, misfire) in retries {
+        for (run, routine, retry_at, manual) in retries {
+            let Some(r) = get_routine_any(c, &routine)? else {
+                continue;
+            };
+            // Paused: its schedule's retries stop with it; a "Run now"
+            // still finishes.
+            if r.state == State::Paused && !manual {
+                finish_run(
+                    c,
+                    &run,
+                    "skipped",
+                    "You paused this routine, so I didn't try again.",
+                    None,
+                    now,
+                )?;
+                continue;
+            }
             // A retry missed while Iris was offline or paused follows the
             // routine's missed-run rule, like a missed slot.
             let late = now - retry_at;
-            let window = if misfire == Misfire::RunLatestInWindow.name() {
+            let window = if r.spec.misfire == Misfire::RunLatestInWindow {
                 MISFIRE_WINDOW_MS
             } else {
                 GRACE_MS
             };
             if late > window {
-                finish_run(
-                    c,
-                    &run,
-                    "failed",
-                    "I was offline or paused when I meant to try again, so I stopped.",
-                    None,
-                    now,
-                )?;
+                let why = "I was offline or paused when I meant to try again, so I stopped.";
+                finish_run(c, &run, "failed", why, None, now)?;
+                notices.push(gave_up(&r, why));
                 continue;
             }
             if open_run(c, &routine)? {
@@ -321,7 +355,11 @@ pub fn claim_due_changes(conn: &Connection, now: i64) -> rusqlite::Result<(Vec<S
                 params![r.id, run_count, state.name(), next, now],
             )?;
         }
-        Ok((out, changed))
+        Ok(Claimed {
+            start: out,
+            changed,
+            notices,
+        })
     })
 }
 
@@ -434,9 +472,8 @@ fn finish_run(
 pub struct Recovered {
     /// Runs that were going.
     pub interrupted: usize,
-    /// Notes for the owner's Main chat: (owner, text, push), for runs that
-    /// may have acted and were stopped.
-    pub notices: Vec<(String, String, bool)>,
+    /// Notes for the owner's Main chat about runs given up for good.
+    pub notices: Vec<Notice>,
 }
 
 /// After a restart: runs that were going cannot be finished. Retry them
@@ -495,14 +532,20 @@ pub fn recover(conn: &Connection, now: i64) -> rusqlite::Result<Recovered> {
                     None,
                     now,
                 )?;
+                if let Some(r) = &routine {
+                    out.notices.push(gave_up(
+                        r,
+                        "I was restarted partway through and it was too late to try again.",
+                    ));
+                }
             }
         }
         Ok(out)
     })
 }
 
-/// Post startup recovery's notes to the owners' Main chats.
-pub async fn post_recovery_notices(state: &AppState, notices: &[(String, String, bool)]) {
+/// Post notes about runs given up for good to the owners' Main chats.
+pub async fn post_notices(state: &AppState, notices: &[Notice]) {
     for (owner, text, push) in notices {
         if let Err(e) =
             crate::jobs::post_note_to_main(state, owner, text, None, "routine", *push).await
@@ -717,12 +760,15 @@ pub async fn tick(state: &AppState) {
         Err(e) => crate::warn!("routines: expiring approvals failed: {e}"),
     }
     match state.db.call(move |c| claim_due_changes(c, now)).await {
-        Ok((claimed, any)) => {
+        Ok(claimed) => {
             // Skipped slots and finished routines change the list too.
-            if any && let Ok(Some(owner)) = state.db.call(db::owner_user_id).await {
+            if claimed.changed
+                && let Ok(Some(owner)) = state.db.call(db::owner_user_id).await
+            {
                 changed(state, &owner);
             }
-            for id in claimed {
+            post_notices(state, &claimed.notices).await;
+            for id in claimed.start {
                 spawn_run(state, id, Step::Prepare);
             }
         }

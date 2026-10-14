@@ -423,7 +423,7 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
                 recovered.interrupted
             );
         }
-        routines::run::post_recovery_notices(&state, &recovered.notices).await;
+        routines::run::post_notices(&state, &recovered.notices).await;
         gateway::listen(state.clone())?;
         let probe = state.clone();
         tokio::spawn(async move {

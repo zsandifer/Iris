@@ -689,12 +689,16 @@ fn interrupted_runs_are_recovered() {
     .unwrap();
     let rec = db.with(|c| run::recover(c, now)).unwrap();
     assert_eq!(rec.interrupted, 4);
-    // The owner hears about both runs that may have acted.
-    assert_eq!(rec.notices.len(), 2, "{:?}", rec.notices);
-    assert!(
+    // The owner hears about both runs that may have acted, and the one
+    // that was too late to try again.
+    assert_eq!(rec.notices.len(), 3, "{:?}", rec.notices);
+    assert!(rec.notices.iter().all(|(o, _, _)| o == &owner));
+    assert_eq!(
         rec.notices
             .iter()
-            .all(|(o, text, _)| o == &owner && text.contains("check"))
+            .filter(|(_, text, _)| text.contains("check before running it again"))
+            .count(),
+        2
     );
     assert!(
         rec.notices
@@ -759,14 +763,57 @@ fn retries_missed_while_offline_follow_the_missed_run_rule() {
     let stale = mk(&skip.id, "2026-10-10T17:30", now - 20 * 60_000);
     let fine = mk(&window.id, "2026-10-10T17:30", now - 20 * 60_000);
     let too_old = mk(&window.id, "2026-10-03T17:30", now - 3 * 3_600_000);
-    let (claimed, changed) = db.with(|c| run::claim_due_changes(c, now)).unwrap();
-    assert_eq!(claimed, std::slice::from_ref(&fine));
-    assert!(changed);
+    let claimed = db.with(|c| run::claim_due_changes(c, now)).unwrap();
+    assert_eq!(claimed.start, std::slice::from_ref(&fine));
+    assert!(claimed.changed);
+    // The owner is told about both runs given up.
+    assert_eq!(claimed.notices.len(), 2, "{:?}", claimed.notices);
+    assert!(
+        claimed.notices[0]
+            .1
+            .starts_with("I couldn't finish your routine")
+    );
     // A quiet minute changes nothing.
     assert_eq!(
         db.with(|c| run::claim_due_changes(c, now + 60_000))
             .unwrap(),
-        (Vec::new(), false)
+        run::Claimed::default()
+    );
+    // A paused routine: a "Run now" still gets its retry, the schedule's
+    // retries stop with it.
+    let mut held = saturday_dinner();
+    held.title = "Paused one".into();
+    let held = active(&db, &owner, held, at("2026-10-13T12:00"));
+    db.with(|c| {
+        c.execute(
+            "UPDATE routines SET state = 'paused', next_run_at = NULL WHERE id = ?1",
+            [&held.id],
+        )
+    })
+    .unwrap();
+    let mk_paused = |slot: &str, manual: bool| {
+        let id = new_id();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO routine_runs (id, routine_id, scheduled_for, manual, status,
+                     attempts, retry_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'failed', 1, ?5, 0, 0)",
+                params![id, held.id, at(slot), manual, now + 60_000],
+            )
+        })
+        .unwrap();
+        id
+    };
+    let by_hand = mk_paused("2026-10-17T16:58", true);
+    let scheduled = mk_paused("2026-10-10T17:30", false);
+    let claimed = db
+        .with(|c| run::claim_due_changes(c, now + 2 * 60_000))
+        .unwrap();
+    assert_eq!(claimed.start, std::slice::from_ref(&by_hand));
+    let r = db.with(|c| run::get_run(c, &scheduled)).unwrap().unwrap();
+    assert_eq!(
+        (r.status.as_str(), r.reason.as_str()),
+        ("skipped", "You paused this routine, so I didn't try again.")
     );
     let get = |id: &str| db.with(|c| run::get_run(c, id)).unwrap().unwrap();
     for id in [&stale, &too_old] {

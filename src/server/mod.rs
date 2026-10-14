@@ -4105,6 +4105,16 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
             .unwrap()
             .to_string();
         assert!(h.state.gateway.grant(&token).is_some());
+        // The attempt recorded that it may act (it does not ask first), so a
+        // restart now would not run it again.
+        let rid = path.rsplit('/').next().unwrap().to_string();
+        let runs = h
+            .state
+            .db
+            .call(move |c| crate::routines::run::list_runs(c, &rid, 1))
+            .await
+            .unwrap();
+        assert!(runs[0].may_act, "{:?}", runs[0]);
         let (s, _) = send(&h.app, "DELETE", &path, Some(&t.owner_t), None).await;
         assert_eq!(s, StatusCode::OK);
         // The CLI is stopped (while still told to hold) and its connector
