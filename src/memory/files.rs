@@ -114,13 +114,17 @@ pub fn core_for_prompt(paths: &Paths) -> Option<String> {
 }
 
 /// The topic a note from `rel` most likely belongs to: from the file's
-/// path, then the heading above the note, then the file title.
-fn infer_topic(rel: &str, heading: Option<&str>, title: Option<&str>) -> Topic {
+/// path, then the headings above the note (nearest first), then the file
+/// title.
+fn infer_topic(rel: &str, headings: &[String], title: Option<&str>) -> Topic {
     let lowered = rel.to_lowercase();
     let file = lowered
         .trim_end_matches(".md")
         .trim_end_matches(".markdown");
-    for hint in [Some(file), heading, title].into_iter().flatten() {
+    let hints = std::iter::once(file)
+        .chain(headings.iter().rev().map(String::as_str))
+        .chain(title);
+    for hint in hints {
         let hint = hint.trim().to_lowercase();
         // The export's own headings.
         if let Some(t) = Topic::ALL
@@ -214,17 +218,16 @@ fn candidates(rel: &str, content: &str) -> Vec<Candidate> {
         .iter()
         .filter(|n| !(rel == CORE_FILE && is_legacy_template_block(&n.text)))
         .map(|n| {
-            let mut context = title.clone();
-            if let Some(h) = n
-                .heading
-                .as_deref()
-                .filter(|h| !generic_heading(h) && *h != title)
-            {
-                if !context.is_empty() {
-                    context.push_str(" — ");
-                }
-                context.push_str(h);
-            }
+            let context = std::iter::once(title.as_str())
+                .chain(
+                    n.headings
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|h| !generic_heading(h) && *h != title),
+                )
+                .filter(|c| !c.is_empty())
+                .collect::<Vec<_>>()
+                .join(" — ");
             let text = if context.is_empty()
                 || n.text.to_lowercase().starts_with(&context.to_lowercase())
             {
@@ -235,7 +238,7 @@ fn candidates(rel: &str, content: &str) -> Vec<Candidate> {
             let topic = fixed_topic.unwrap_or_else(|| {
                 infer_topic(
                     if own_file { rel } else { "" },
-                    n.heading.as_deref(),
+                    &n.headings,
                     parsed.title.as_deref().filter(|_| own_file),
                 )
             });
@@ -414,7 +417,7 @@ pub fn prepare(db: &Db, paths: &Paths) -> Result<Prepared> {
         }
         report.backup = Some(dest);
     }
-    db.with(|c| {
+    let imported = db.with(|c| {
         write_tx(c, |tx| {
             let batch = new_id();
             for f in &notes {
@@ -425,7 +428,18 @@ pub fn prepare(db: &Db, paths: &Paths) -> Result<Prepared> {
             }
             render_export(tx, paths)
         })
-    })?;
+    });
+    if let Err(e) = imported {
+        // Nothing was stored: put back any original the export replaced, so
+        // the next start imports it again.
+        for f in &notes {
+            let path = root.join(&f.rel);
+            if std::fs::read_to_string(&path).is_ok_and(|c| is_generated(&c)) {
+                let _ = write_private_file(&path, f.content.as_bytes());
+            }
+        }
+        return Err(e);
+    }
     report.files = notes.len();
     // The originals are in the backup and their notes in the database.
     for f in &found {
@@ -465,6 +479,9 @@ pub struct Written {
     /// Notes another chat saved or changed after this turn began: left
     /// out of the content, but kept, since this turn may not have seen them.
     pub kept_recent: Vec<String>,
+    /// Notes in the content that were removed or corrected after this
+    /// turn began: not saved again.
+    pub not_restored: Vec<String>,
 }
 
 /// `write_memory` for the owner's private chat: make the file at `rel`
@@ -492,19 +509,17 @@ pub fn write(
     with_export(db, paths, |tx| {
         let batch = new_id();
         let mut out = Written::default();
-        if !export {
-            let counts = ingest(tx, rel, content, Actor::Agent, source, &batch)?;
-            out.added = counts.added;
-            out.unchanged = counts.existing;
-            return Ok(out);
-        }
         let live = super::live(tx)?;
         let fixed_topic = Topic::ALL.into_iter().find(|t| t.file() == rel);
-        let view: Vec<&Item> = match fixed_topic {
-            Some(topic) => live.iter().filter(|i| i.topic == topic).collect(),
-            None => core_items(&live),
+        // The notes this file shows; other paths only add.
+        let view: Vec<&Item> = match (export, fixed_topic) {
+            (false, _) => Vec::new(),
+            (true, Some(topic)) => live.iter().filter(|i| i.topic == topic).collect(),
+            (true, None) => core_items(&live),
         };
-        let importance = if fixed_topic.is_none() {
+        let shown: std::collections::HashSet<&str> =
+            view.iter().map(|i| i.content_hash.as_str()).collect();
+        let importance = if rel == CORE_FILE {
             CORE_IMPORTANCE
         } else {
             DEFAULT_IMPORTANCE
@@ -515,8 +530,14 @@ pub fn write(
             if !wanted.insert(hash.clone()) {
                 continue;
             }
-            if view.iter().any(|i| i.content_hash == hash) {
+            if shown.contains(hash.as_str()) {
                 out.unchanged += 1;
+                continue;
+            }
+            // Removed or corrected elsewhere after this turn began: the
+            // turn is writing back what it read before that.
+            if super::set_aside_since(tx, &hash, turn_started)? {
+                out.not_restored.push(c.text.clone());
                 continue;
             }
             let new = NewItem {
@@ -889,7 +910,8 @@ mod tests {
         let mem = paths.memory_dir();
         std::fs::write(
             mem.join("people.md"),
-            "# People\n\n## Alex\n- Birthday in March\n\n## Sam\n- Birthday in March\n",
+            "# People\n\n## Alex\n- Birthday in March\n### Work\n- Teaches chemistry\n\n\
+             ## Sam\n- Birthday in March\n### Work\n- Teaches chemistry\n",
         )
         .unwrap();
         std::fs::write(
@@ -904,9 +926,66 @@ mod tests {
             [
                 "Health: Allergic to peanuts",
                 "Alex: Birthday in March",
-                "Sam: Birthday in March"
+                "Alex — Work: Teaches chemistry",
+                "Sam: Birthday in March",
+                "Sam — Work: Teaches chemistry",
             ]
         );
+    }
+
+    #[test]
+    fn a_failed_first_import_leaves_the_originals_to_import_again() {
+        let (_t, paths, db) = setup();
+        let mem = paths.memory_dir();
+        let original = "# Memory\n\n## Routines\n- Run at 7\n";
+        std::fs::write(mem.join(CORE_FILE), original).unwrap();
+        // routines.md cannot be written; MEMORY.md is written first.
+        std::fs::create_dir(mem.join("routines.md")).unwrap();
+        assert!(prepare(&db, &paths).is_err());
+        assert_eq!(read(&paths, CORE_FILE), original);
+        assert!(live_texts(&db).is_empty());
+        std::fs::remove_dir(mem.join("routines.md")).unwrap();
+        prepare(&db, &paths).unwrap();
+        assert_eq!(
+            live_texts(&db),
+            [("Run at 7".to_string(), Topic::Routines, 4)]
+        );
+    }
+
+    #[test]
+    fn a_stale_write_does_not_bring_back_what_another_chat_removed() {
+        let (_t, paths, db) = setup();
+        let a = json!({"type": "conversation", "conversation_id": "a", "message_ids": ["ma"]});
+        let b = json!({"type": "conversation", "conversation_id": "b", "message_ids": ["mb"]});
+        write(&db, &paths, "people.md", "- Alex lives in Boston\n", &b, 0).unwrap();
+        let started = crate::util::now_ms() + 1;
+        while crate::util::now_ms() < started {}
+        // Chat A reads people.md; chat B then corrects the note.
+        let seen = read(&paths, "people.md");
+        write(
+            &db,
+            &paths,
+            "people.md",
+            "- Alex lives in Seattle\n",
+            &b,
+            started,
+        )
+        .unwrap();
+        // A writes its stale copy with an unrelated addition.
+        let w = write(
+            &db,
+            &paths,
+            "people.md",
+            &format!("{seen}- Sam bakes bread\n"),
+            &a,
+            started,
+        )
+        .unwrap();
+        assert_eq!(w.added, 1);
+        assert_eq!(w.not_restored, ["Alex lives in Boston"]);
+        assert_eq!(w.kept_recent, ["Alex lives in Seattle"]);
+        let people = read(&paths, "people.md");
+        assert!(people.contains("Seattle") && !people.contains("Boston"));
     }
 
     #[test]

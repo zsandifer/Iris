@@ -380,6 +380,20 @@ impl Bridge {
                 .is_some_and(|o| o == self.user_id)
     }
 
+    /// When this turn began (ms): its message was created then; a bridge
+    /// started later (or restarted mid-turn) still dates changes from it.
+    fn turn_started(&self) -> i64 {
+        self.message_id
+            .as_deref()
+            .and_then(|id| {
+                self.db
+                    .with(|c| crate::db::get_message(c, id))
+                    .ok()
+                    .flatten()
+            })
+            .map_or(self.started_at, |m| m.created_at.min(self.started_at))
+    }
+
     fn private_status_context(&self) -> bool {
         self.owner_context()
             && self.conversation_id.as_ref().is_some_and(|conv| {
@@ -466,7 +480,7 @@ impl Bridge {
                         path,
                         content,
                         &source,
-                        self.started_at,
+                        self.turn_started(),
                     )
                     .map_err(db_err)?;
                     let mut out = json!({
@@ -476,6 +490,7 @@ impl Bridge {
                         "removed": w.removed,
                         "kept_pinned": w.kept_pinned,
                         "kept_recent": w.kept_recent,
+                        "not_restored": w.not_restored,
                     });
                     if !export {
                         out["note"] = json!(
@@ -488,6 +503,12 @@ impl Bridge {
                             "The kept_recent notes were saved from another chat after you \
                              started; read the file again and write it without them to \
                              remove them."
+                        );
+                    }
+                    if !w.not_restored.is_empty() {
+                        out["note"] = json!(
+                            "The not_restored notes were removed or corrected from another \
+                             chat after you started, so they were not saved again."
                         );
                     }
                     if !w.kept_pinned.is_empty() {

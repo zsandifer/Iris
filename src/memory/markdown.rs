@@ -16,8 +16,9 @@ pub const HEADER: &str =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Note {
     pub text: String,
-    /// The nearest heading above it (below the title), if any.
-    pub heading: Option<String>,
+    /// The headings it sits under (below the title), outermost first:
+    /// `## Alex` then `### Work`.
+    pub headings: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -34,14 +35,17 @@ struct Block {
     /// Columns to strip from continuation lines.
     indent: usize,
     blank_pending: bool,
-    heading: Option<String>,
+    headings: Vec<String>,
 }
 
 /// Split Markdown into notes. Front matter and HTML comments are dropped.
 pub fn parse(content: &str) -> Parsed {
     let text = strip_comments(&strip_front_matter(&content.replace("\r\n", "\n")));
     let mut out = Parsed::default();
-    let mut heading: Option<String> = None;
+    // Open sections: (level, text).
+    let mut sections: Vec<(usize, String)> = Vec::new();
+    let headings =
+        |sections: &[(usize, String)]| sections.iter().map(|(_, h)| h.clone()).collect::<Vec<_>>();
     let mut block: Option<Block> = None;
     let mut fence: Option<&str> = None;
     let flush = |block: &mut Option<Block>, out: &mut Parsed| {
@@ -50,15 +54,17 @@ pub fn parse(content: &str) -> Parsed {
             if !text.is_empty() {
                 out.notes.push(Note {
                     text,
-                    heading: b.heading,
+                    headings: b.headings,
                 });
             }
         }
     };
     for raw in text.lines() {
         let line = expand_tabs(raw.trim_end());
-        let indent = line.len() - line.trim_start().len();
-        let trimmed = line.trim_start();
+        // Only ASCII spaces indent (tabs are expanded); other whitespace
+        // is text, so slicing by `indent` never splits a character.
+        let indent = line.bytes().take_while(|&b| b == b' ').count();
+        let trimmed = &line[indent..];
         if let Some(marker) = fence {
             if let Some(b) = block.as_mut() {
                 b.lines.push(line.clone());
@@ -68,7 +74,7 @@ pub fn parse(content: &str) -> Parsed {
             }
             continue;
         }
-        if trimmed.is_empty() {
+        if trimmed.trim().is_empty() {
             if let Some(b) = block.as_mut() {
                 b.blank_pending = true;
             }
@@ -94,7 +100,7 @@ pub fn parse(content: &str) -> Parsed {
                 Some(b) => b.lines.push(trimmed.to_string()),
                 None => {
                     flush(&mut block, &mut out);
-                    block = Some(paragraph(trimmed, &heading));
+                    block = Some(paragraph(trimmed, headings(&sections)));
                 }
             }
             continue;
@@ -105,9 +111,10 @@ pub fn parse(content: &str) -> Parsed {
             flush(&mut block, &mut out);
             if level == 1 && out.title.is_none() {
                 out.title = Some(title);
-                heading = None;
+                sections.clear();
             } else {
-                heading = Some(title);
+                sections.retain(|(l, _)| *l < level);
+                sections.push((level, title));
             }
             continue;
         }
@@ -124,7 +131,7 @@ pub fn parse(content: &str) -> Parsed {
                 bullet: true,
                 indent: indent + width,
                 blank_pending: false,
-                heading: heading.clone(),
+                headings: headings(&sections),
             });
             continue;
         }
@@ -133,7 +140,7 @@ pub fn parse(content: &str) -> Parsed {
             Some(b) => b.lines.push(trimmed.to_string()),
             None => {
                 flush(&mut block, &mut out);
-                block = Some(paragraph(trimmed, &heading));
+                block = Some(paragraph(trimmed, headings(&sections)));
             }
         }
     }
@@ -141,13 +148,13 @@ pub fn parse(content: &str) -> Parsed {
     out
 }
 
-fn paragraph(line: &str, heading: &Option<String>) -> Block {
+fn paragraph(line: &str, headings: Vec<String>) -> Block {
     Block {
         lines: vec![line.to_string()],
         bullet: false,
         indent: 0,
         blank_pending: false,
-        heading: heading.clone(),
+        headings,
     }
 }
 
@@ -323,9 +330,16 @@ mod tests {
                 "Last paragraph",
             ]
         );
-        assert_eq!(p.notes[0].heading, None);
-        assert_eq!(p.notes[1].heading.as_deref(), Some("Likes"));
-        assert_eq!(p.notes[6].heading.as_deref(), Some("Likes"));
+        assert!(p.notes[0].headings.is_empty());
+        assert_eq!(p.notes[1].headings, ["Likes"]);
+        assert_eq!(p.notes[6].headings, ["Likes"]);
+        let nested =
+            parse("# People\n## Alex\n### Work\n- Teaches\n## Sam\n- Bakes\n#### Deep\n- x\n");
+        let chains: Vec<Vec<String>> = nested.notes.into_iter().map(|n| n.headings).collect();
+        assert_eq!(
+            chains,
+            [vec!["Alex", "Work"], vec!["Sam"], vec!["Sam", "Deep"]]
+        );
     }
 
     #[test]
@@ -338,6 +352,11 @@ mod tests {
             ]
         );
         assert_eq!(texts("<!-- open\n- x\n"), Vec::<String>::new());
+        // Non-ASCII whitespace is text, never indentation.
+        assert_eq!(
+            texts("- Fact\n\u{3000}continued\n  \u{3000}nested\n\u{3000}\n- Next"),
+            ["Fact\n\u{3000}continued\n\u{3000}nested", "Next"]
+        );
         assert_eq!(texts("- \n\n# Title only\n"), Vec::<String>::new());
     }
 

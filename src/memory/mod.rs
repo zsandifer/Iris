@@ -199,6 +199,16 @@ fn live_by_hash(conn: &Connection, hash: &str) -> rusqlite::Result<Option<Item>>
     .optional()
 }
 
+/// Whether a note with this text was archived or superseded at or after
+/// `since` (ms).
+pub fn set_aside_since(conn: &Connection, hash: &str, since: i64) -> rusqlite::Result<bool> {
+    conn.prepare_cached(
+        "SELECT 1 FROM memory_items WHERE content_hash = ?1
+         AND (archived = 1 OR superseded_by IS NOT NULL) AND updated_at >= ?2",
+    )?
+    .exists(params![hash, since])
+}
+
 /// Every live note (not archived, not superseded), oldest first.
 pub fn live(conn: &Connection) -> rusqlite::Result<Vec<Item>> {
     let mut stmt = conn.prepare(&format!(
