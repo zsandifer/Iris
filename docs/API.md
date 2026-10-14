@@ -2426,20 +2426,25 @@ IDs are positive integers, stable across owner edits and never reused after Forg
   the row and keeps its prior snapshot as a history tombstone. Earlier versions
   stay archived rather than becoming live when a replacement is forgotten.
 - `POST /api/memory/history/{history_id}/undo` takes `{}` and returns
-  `{undone: history_id, item}` (`item: null` when undoing an addition).
+  `{undone: history_id, history_id: new_change_id, item}` (`item: null` when undoing an addition).
   Restores text, fields and replacement links from history, or restores a
   forgotten row. Undo must select the latest change to that note; a changed
   replacement or duplicate live text rejects the entire undo (`400`) without
-  modifying anything. Undo itself records a new change, so it can also be undone.
+  modifying anything. Undo returns the new change ID so it can also be undone even when its
+  item was deleted and detail returns `404`.
 
 Writes share the MCP write gate: strip nested/unclosed `<private>` spans,
 PEM private keys, credential assignments (including JSON/Markdown formatting
 and repeated labels), authorization lines and recognized
-API token formats before hashing or recording history. Empty/private-only
+API token formats before hashing or recording history. Ambiguous/multiline
+credential assignments reject the entire write conservatively; imports skip
+such documents (originals stay in the backup). Empty/private-only
 notes and individual REST/recall-tool notes over 16,000 characters are rejected
 (`400`). Invalid kind,
 importance, search, stale undo or unavailable mutation ID also returns `400`.
-Search treats words literally (OR matching, Porter stemming), with a 500-character
+Owner-private turns refresh packing before persona identity/prompt assembly,
+so expired notes cannot remain in a cached core until the next write.
+Automatic archiving is separate. Search treats words literally (OR matching, Porter stemming), with a 500-character
 query limit. Exports are regenerated within the write transaction. Changes
 broadcast owner-only `entities.changed` with `kinds: ["memory"]`.
 

@@ -1555,6 +1555,46 @@ mod tests {
     }
 
     #[test]
+    fn multiline_credentials_reject_writes_and_are_skipped_by_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = bridge(tmp.path());
+        call(
+            &b,
+            "remember",
+            json!({"text":"Public existing note","kind":"fact"}),
+        );
+        let before = b.db.with(crate::memory::live).unwrap();
+        for text in [
+            "{\"password\":\n  \"synthetic-canary\"}",
+            "password: |\n  synthetic-canary",
+            "password: |- # comment\n  synthetic-canary",
+            "password: first\n  synthetic-canary",
+            "{\"password\": [\n\"synthetic-canary\"]}",
+        ] {
+            assert_eq!(
+                call(&b, "remember", json!({"text":text,"kind":"fact"}))["isError"],
+                true
+            );
+            assert_eq!(
+                call(&b, "write_memory", json!({"path":"you.md","content":text}))["isError"],
+                true
+            );
+            let imported = crate::memory::files::import_notes(
+                &b.db,
+                &b.paths,
+                &[("you.md".into(), text.into())],
+            )
+            .unwrap();
+            assert_eq!(imported[0].added, 0);
+        }
+        let after = b.db.with(crate::memory::live).unwrap();
+        assert_eq!(json!(after), json!(before));
+        let export = std::fs::read_to_string(b.paths.memory_dir().join("MEMORY.md")).unwrap();
+        assert!(export.contains("Public existing note"));
+        assert!(!export.contains("synthetic-canary"));
+    }
+
+    #[test]
     fn memory_changes_date_from_the_turn_message() {
         let tmp = tempfile::tempdir().unwrap();
         let mut b = bridge(tmp.path());

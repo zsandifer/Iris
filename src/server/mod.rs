@@ -845,6 +845,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_addition_undo_returns_a_discoverable_reversal() {
+        let h = setup();
+        let owner = pair_as(&h, None).await;
+        let (_, added) = send(
+            &h.app,
+            "POST",
+            "/api/memory",
+            Some(&owner),
+            Some(json!({"text":"Likes tea"})),
+        )
+        .await;
+        let id = added["item"]["id"].as_i64().unwrap();
+        let (status, undone) = send(
+            &h.app,
+            "POST",
+            &format!("/api/memory/history/{}/undo", added["history_id"]),
+            Some(&owner),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{undone}");
+        assert!(undone["item"].is_null());
+        assert_eq!(
+            send(
+                &h.app,
+                "GET",
+                &format!("/api/memory/{id}"),
+                Some(&owner),
+                None
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        let (status, redone) = send(
+            &h.app,
+            "POST",
+            &format!("/api/memory/history/{}/undo", undone["history_id"]),
+            Some(&owner),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{redone}");
+        assert_eq!(redone["item"]["id"], id);
+        assert_eq!(redone["item"]["text"], "Likes tea");
+        assert!(redone["history_id"].as_i64().unwrap() > undone["history_id"].as_i64().unwrap());
+        assert_eq!(
+            send(
+                &h.app,
+                "POST",
+                "/api/memory",
+                Some(&owner),
+                Some(json!({"text":"password: |\n  synthetic-canary"}))
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
     async fn connector_credentials_require_https_except_on_loopback() {
         let h = setup();
         let token = pair_as(&h, None).await;
@@ -3299,6 +3360,9 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         std::fs::write(paths.persona_dir().join("USER.md"), "owner-user-fact").unwrap();
         std::fs::write(paths.memory_dir().join("MEMORY.md"), "owner-memory-fact").unwrap();
         let db = crate::db::Db::open(&paths.db_file()).unwrap();
+        // Match startup: import the synthetic legacy memory into the database
+        // before private turns repack the generated export.
+        crate::memory::files::prepare(&db, &paths).unwrap();
         let mut cfg = Config::default();
         for h in cfg.harness.values_mut() {
             h.enabled = false;

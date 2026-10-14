@@ -37,7 +37,8 @@ pub fn scrub_document(text: &str) -> String {
     let public = strip_private(text);
     let mut key = false;
     let mut lines = Vec::new();
-    for line in public.lines() {
+    let source_lines: Vec<&str> = public.lines().collect();
+    for (index, line) in source_lines.iter().enumerate() {
         let low = line.to_ascii_lowercase();
         if low.contains("-----begin") && low.contains("private key-----") {
             key = true;
@@ -48,7 +49,8 @@ pub fn scrub_document(text: &str) -> String {
             }
             continue;
         }
-        let credential = [
+        let mut credential = low.contains("bearer ");
+        for label in [
             "password",
             "passwd",
             "api_key",
@@ -60,17 +62,39 @@ pub fn scrub_document(text: &str) -> String {
             "secret",
             "token",
             "authorization",
-        ]
-        .iter()
-        .any(|label| {
-            low.match_indices(label).any(|(at, _)| {
-                low[at + label.len()..]
-                    .trim_start_matches(|c: char| {
-                        c.is_whitespace() || matches!(c, '\'' | '"' | '`' | '*' | '_')
-                    })
-                    .starts_with([':', '='])
-            })
-        }) || low.contains("bearer ");
+        ] {
+            for (at, _) in low.match_indices(label) {
+                let tail = low[at + label.len()..].trim_start_matches(|c: char| {
+                    c.is_whitespace() || matches!(c, '\'' | '"' | '`' | '*' | '_')
+                });
+                if tail.starts_with([':', '=']) {
+                    credential = true;
+                    let value = tail[1..].trim();
+                    // Arbitrary multiline values cannot be delimited safely
+                    // as prose. Reject the document, including JSON and YAML
+                    // blocks, rather than keep a credential's continuation.
+                    let continued = source_lines[index + 1..]
+                        .iter()
+                        .find(|next| !next.trim().is_empty() && !next.trim_start().starts_with('#'))
+                        .is_some_and(|next| {
+                            next.len() - next.trim_start().len()
+                                > line.len() - line.trim_start().len()
+                        });
+                    let open_quote = value.starts_with('"')
+                        && serde_json::Deserializer::from_str(value)
+                            .into_iter::<serde_json::Value>()
+                            .next()
+                            .is_none_or(|v| v.is_err());
+                    if value.is_empty()
+                        || value.starts_with(['|', '>', '[', '{', '\''])
+                        || open_quote
+                        || continued
+                    {
+                        return String::new();
+                    }
+                }
+            }
+        }
         if credential {
             continue;
         }
@@ -113,7 +137,10 @@ pub fn scrub_document(text: &str) -> String {
 pub fn scrub(text: &str) -> Result<String, String> {
     let out = scrub_document(text);
     if out.is_empty() {
-        return Err("I couldn't save a note containing only private or secret information.".into());
+        return Err(
+            "I couldn't save this note safely. Please leave out private text and credentials."
+                .into(),
+        );
     }
     if out.chars().count() > 16_000 {
         return Err("I can save notes up to 16,000 characters. Please shorten this one.".into());

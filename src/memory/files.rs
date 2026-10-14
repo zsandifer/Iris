@@ -74,7 +74,10 @@ pub fn render_export(conn: &Connection, paths: &Paths) -> rusqlite::Result<CoreH
     )
     .map_err(io_err)?;
     for topic in Topic::ALL {
-        let mut of: Vec<&Item> = live.iter().filter(|i| i.topic == topic).collect();
+        let mut of: Vec<&Item> = live
+            .iter()
+            .filter(|i| i.topic == topic && i.valid_to.is_none_or(|t| t > now))
+            .collect();
         of.sort_by_key(|i| (!i.pinned, i.created_at, i.id));
         let path = dir.join(topic.file());
         if !of.is_empty() {
@@ -514,7 +517,10 @@ pub fn write(
 ) -> Result<Written> {
     let export = is_export_name(rel);
     if !markdown::parse(content).notes.is_empty() && candidates(rel, content).is_empty() {
-        return Err("I couldn't save notes containing only private or secret information.".into());
+        return Err(
+            "I couldn't save this file safely. Please leave out private text and credentials."
+                .into(),
+        );
     }
     if !export && markdown::parse(content).notes.is_empty() {
         return Err("write at least one note (one per bullet)".into());

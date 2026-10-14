@@ -474,9 +474,16 @@ async fn run_locked(
             // Only the pinned and profile part of the memory core counts, so
             // routine notes do not restart sessions.
             let memory_identity = if scope == Scope::Private {
+                let paths = state.paths.clone();
                 state
                     .db
-                    .call(crate::memory::packing::identity)
+                    .call(move |c| {
+                        // Deadlines can pass between turns without a write or
+                        // recall. Pack current rows before hashing or reading
+                        // the prompt; automatic archiving is a separate job.
+                        crate::memory::recall::mutate(c, &paths, |_| Ok(Value::Null))?;
+                        crate::memory::packing::identity(c)
+                    })
                     .await
                     .unwrap_or_default()
             } else {
@@ -2215,6 +2222,41 @@ printf '%s\n' '{"type":"thread.started","thread_id":"synthetic-session"}' \
         )
         .unwrap();
 
+        let timed = state
+            .db
+            .with(|c| {
+                crate::memory::recall::mutate(c, &state.paths, |c| {
+                    crate::memory::recall::save(
+                        c,
+                        &crate::memory::recall::Edit {
+                            text: Some("Temporary synthetic fact".into()),
+                            valid_to: Some(i64::MAX),
+                            ..Default::default()
+                        },
+                        None,
+                        crate::memory::Actor::Owner,
+                        &json!({}),
+                        "timed",
+                    )
+                })
+            })
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(state.paths.memory_dir().join("MEMORY.md"))
+                .unwrap()
+                .contains("Temporary synthetic fact")
+        );
+        // Simulate its deadline passing without any operation rerendering the
+        // cached export. The next real turn must refresh it before assembly.
+        state
+            .db
+            .with(|c| {
+                c.execute(
+                    "UPDATE memory_items SET valid_to = 0 WHERE id = ?1",
+                    [timed["item"]["id"].as_i64().unwrap()],
+                )
+            })
+            .unwrap();
         let mut events = state.hub.subscribe();
         for turn in 0..2 {
             if turn == 1 {
@@ -2256,6 +2298,12 @@ printf '%s\n' '{"type":"thread.started","thread_id":"synthetic-session"}' \
             .unwrap();
             let args = std::fs::read_to_string(tmp.path().join("args")).unwrap();
             let prompt = std::fs::read_to_string(tmp.path().join("prompt")).unwrap();
+            assert!(!prompt.contains("Temporary synthetic fact"), "{prompt}");
+            assert!(
+                !std::fs::read_to_string(state.paths.memory_dir().join("you.md"))
+                    .unwrap()
+                    .contains("Temporary synthetic fact")
+            );
             assert_eq!(args.lines().any(|a| a == "resume"), turn == 1, "{args}");
             if turn == 0 {
                 assert!(prompt.contains("Prefers mornings"));

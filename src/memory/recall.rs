@@ -451,7 +451,7 @@ pub fn undo(c: &Connection, history_id: i64, batch: &str) -> rusqlite::Result<Va
     } else {
         forget(c, id, Actor::Owner, batch)?;
     }
-    Ok(json!({"undone": history_id, "item": get(c, id)?}))
+    Ok(json!({"undone": history_id, "history_id": c.last_insert_rowid(), "item": get(c, id)?}))
 }
 
 /// Run a mutation and render its export under the same database lock/transaction.
