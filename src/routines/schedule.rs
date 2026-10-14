@@ -313,20 +313,34 @@ impl Plan {
                 None
             }
             When::Cron(cron) => {
-                let mut from = zoned(&self.tz, after_ms)?;
+                // Match the pattern against local wall-clock times (each
+                // happens once), then place them like the other schedules:
+                // a time inside a fall-back hour runs the first time only,
+                // one in a spring-forward gap runs when the clocks jump.
+                let mut civil = zoned(&self.tz, after_ms)?.datetime();
                 let mut inclusive = false;
                 if let Some(s) = self.starts
-                    && s > from.date()
+                    && s > civil.date()
                 {
-                    from = resolve(&self.tz, s.to_datetime(Time::midnight()))?
-                        .to_zoned(self.tz.clone());
+                    civil = s.to_datetime(Time::midnight());
                     inclusive = true;
                 }
-                let next = cron.find_next_occurrence(&from, inclusive).ok()?;
-                if self.ends.is_some_and(|e| next.date() > e) {
-                    return None;
+                // Times that resolve to or before `after_ms` (the repeated
+                // hour, or several times in one gap) are passed over.
+                for _ in 0..1000 {
+                    let from = civil.to_zoned(TimeZone::UTC).ok()?;
+                    let next = cron.find_next_occurrence(&from, inclusive).ok()?.datetime();
+                    if self.ends.is_some_and(|e| next.date() > e) {
+                        return None;
+                    }
+                    let t = ms(resolve(&self.tz, next)?);
+                    if t > after_ms {
+                        return Some(t);
+                    }
+                    civil = next;
+                    inclusive = false;
                 }
-                Some(ms(next.timestamp()))
+                None
             }
         }
     }
@@ -792,6 +806,38 @@ mod tests {
             ends: None,
         };
         assert_eq!(cron.upcoming(at(CHI, "2026-10-31T12:00"), 3, None), runs);
+        // Several times a day, and every half hour within the repeated hour:
+        // each local time still runs once.
+        let multi = Plan {
+            when: When::Cron(Box::new(parse_cron("0 1,13 * * *").unwrap())),
+            ..cron.clone()
+        };
+        assert_eq!(
+            next_n(&multi, CHI, "2026-10-31T12:00", 3),
+            [
+                "2026-10-31 13:00 -05:00",
+                "2026-11-01 01:00 -05:00",
+                "2026-11-01 13:00 -06:00",
+            ]
+        );
+        let half = Plan {
+            when: When::Cron(Box::new(parse_cron("*/30 1 * * *").unwrap())),
+            ..cron.clone()
+        };
+        assert_eq!(
+            next_n(&half, CHI, "2026-11-01T00:00", 3),
+            [
+                "2026-11-01 01:00 -05:00",
+                "2026-11-01 01:30 -05:00",
+                "2026-11-02 01:00 -06:00",
+            ]
+        );
+        // Asked from inside the repeated hour: never the second 1:30.
+        let second_one = at(CHI, "2026-11-01T01:00") + 3_600_000 + 60_000;
+        assert_eq!(
+            local(CHI, half.next_after(second_one).unwrap()),
+            "2026-11-02 01:00 -06:00"
+        );
     }
 
     #[test]
@@ -805,6 +851,19 @@ mod tests {
         assert_eq!(
             next_n(&plan, CHI, "2027-03-13T12:00", 1),
             ["2027-03-14 03:00 -05:00"]
+        );
+        // With several times a day the missing 2:30 still runs at 3:00.
+        let multi = Plan {
+            when: When::Cron(Box::new(parse_cron("30 2,14 * * *").unwrap())),
+            ..plan.clone()
+        };
+        assert_eq!(
+            next_n(&multi, CHI, "2027-03-13T12:00", 3),
+            [
+                "2027-03-13 14:30 -06:00",
+                "2027-03-14 03:00 -05:00",
+                "2027-03-14 14:30 -05:00",
+            ]
         );
         assert!(parse_cron("0 30 17 * * 6").is_err(), "no seconds field");
         assert!(parse_cron("nonsense").is_err());
