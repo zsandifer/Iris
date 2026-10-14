@@ -250,12 +250,29 @@ fn bullet_width(line: &str) -> Option<usize> {
     }
 }
 
+/// The section heading `heading` adds to a file.
+fn heading_line(heading: &str) -> String {
+    format!("\n## {heading}\n\n")
+}
+
+/// Characters a section heading takes in `MEMORY.md`.
+pub fn heading_chars(heading: &str) -> usize {
+    heading_line(heading).chars().count()
+}
+
+/// Characters a note takes as a bullet.
+pub fn bullet_chars(text: &str) -> usize {
+    let mut out = String::new();
+    bullet(&mut out, text);
+    out.chars().count()
+}
+
 /// Write `items` as bullets under `heading` (skipped when empty).
 fn section(out: &mut String, heading: &str, items: &[&Item]) {
     if items.is_empty() {
         return;
     }
-    out.push_str(&format!("\n## {heading}\n\n"));
+    out.push_str(&heading_line(heading));
     for item in items {
         bullet(out, &item.text);
     }
@@ -273,15 +290,42 @@ fn bullet(out: &mut String, text: &str) {
     }
 }
 
-/// `MEMORY.md`: pinned notes, then the rest of the core by topic.
-pub fn render_core(items: &[&Item]) -> String {
+/// Heading of the pinned notes in `MEMORY.md`.
+pub const PINNED_HEADING: &str = "Always in mind";
+
+/// The section of `MEMORY.md` a note is listed under.
+pub fn core_heading(item: &Item) -> &'static str {
+    if item.pinned {
+        PINNED_HEADING
+    } else {
+        item.topic.title()
+    }
+}
+
+/// Notes the core has no room for (see [`super::packing`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LeftOut {
+    /// Pinned notes that did not fit.
+    pub pinned: usize,
+    /// Other live notes, listed only in their topic files.
+    pub other: usize,
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// `MEMORY.md`: pinned notes, then the rest of the core by topic, in the
+/// order given. Notes left out are counted in comments, which the agent
+/// sees in its prompt and which never read back as notes.
+pub fn render_core(items: &[&Item], left_out: LeftOut) -> String {
     let mut out = format!("{HEADER}\n# Memory\n");
-    if items.is_empty() {
+    if items.is_empty() && left_out == LeftOut::default() {
         out.push_str("\n<!-- Nothing here yet. -->\n");
         return out;
     }
     let pinned: Vec<&Item> = items.iter().copied().filter(|i| i.pinned).collect();
-    section(&mut out, "Always in mind", &pinned);
+    section(&mut out, PINNED_HEADING, &pinned);
     for topic in Topic::ALL {
         let of: Vec<&Item> = items
             .iter()
@@ -289,6 +333,18 @@ pub fn render_core(items: &[&Item]) -> String {
             .filter(|i| !i.pinned && i.topic == topic)
             .collect();
         section(&mut out, topic.title(), &of);
+    }
+    if left_out.pinned > 0 {
+        out.push_str(&format!(
+            "\n<!-- {} did not fit here; read them in the topic files. -->\n",
+            plural(left_out.pinned, "pinned note", "pinned notes")
+        ));
+    }
+    if left_out.other > 0 {
+        out.push_str(&format!(
+            "\n<!-- {} only in the topic files. -->\n",
+            plural(left_out.other, "more note is", "more notes are")
+        ));
     }
     out
 }
@@ -375,12 +431,37 @@ mod tests {
         .map(|(i, t)| super::super::tests::item(i as i64 + 1, t, Topic::People))
         .collect();
         let refs: Vec<&Item> = items.iter().collect();
-        for md in [render_topic(Topic::People, &refs), render_core(&refs)] {
+        for md in [
+            render_topic(Topic::People, &refs),
+            render_core(&refs, LeftOut::default()),
+        ] {
             assert!(md.starts_with(HEADER));
             let back = texts(&md);
             let want: Vec<String> = items.iter().map(|i| i.text.clone()).collect();
             assert_eq!(back, want, "{md}");
         }
-        assert_eq!(texts(&render_core(&[])), Vec::<String>::new());
+        assert_eq!(
+            texts(&render_core(&[], LeftOut::default())),
+            Vec::<String>::new()
+        );
+        // Counts of notes left out are comments, never notes.
+        let left = render_core(
+            &refs[..1],
+            LeftOut {
+                pinned: 2,
+                other: 1,
+            },
+        );
+        assert!(left.contains("2 pinned notes did not fit") && left.contains("1 more note is"));
+        assert_eq!(texts(&left), ["Plain fact"]);
+        // A note's cost is exactly what it adds to the file.
+        for item in &items {
+            let mut one = String::new();
+            section(&mut one, "People", &[item]);
+            assert_eq!(
+                one.chars().count(),
+                heading_chars("People") + bullet_chars(&item.text)
+            );
+        }
     }
 }

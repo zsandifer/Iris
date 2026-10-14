@@ -501,6 +501,7 @@ impl Bridge {
                         "kept_pinned": w.kept_pinned,
                         "kept_recent": w.kept_recent,
                         "not_restored": w.not_restored,
+                        "outside_core": w.outside_core,
                     });
                     if !export {
                         out["note"] = json!(
@@ -508,11 +509,17 @@ impl Bridge {
                              you.md, people.md, projects.md or routines.md."
                         );
                     }
+                    if !w.outside_core.is_empty() {
+                        out["note"] = json!(
+                            "MEMORY.md is full, so the outside_core notes are saved in their \
+                             topic files only. Read them there when they come up."
+                        );
+                    }
                     if !w.kept_recent.is_empty() {
                         out["note"] = json!(
-                            "The kept_recent notes were saved or changed from another chat \
-                             during this turn, so they were kept. They can be removed in a \
-                             later turn if they are wrong."
+                            "The kept_recent notes were saved, changed or moved into this \
+                             file from another chat during this turn, so they were kept. \
+                             They can be removed in a later turn if they are wrong."
                         );
                     }
                     if !w.not_restored.is_empty() {
@@ -1166,6 +1173,7 @@ mod tests {
         );
         assert_eq!(r["isError"], false, "{r}");
         assert_eq!(r["structuredContent"]["added"], 1);
+        assert_eq!(r["structuredContent"]["outside_core"], json!([]));
         assert!(r["structuredContent"].get("note").is_none());
         let r = call(&b, "read_memory", json!({"path": "MEMORY.md"}));
         assert!(

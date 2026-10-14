@@ -473,6 +473,11 @@ CREATE TRIGGER memory_items_fts_update AFTER UPDATE OF text ON memory_items BEGI
     INSERT INTO memory_items_fts (rowid, text) VALUES (NEW.id, NEW.text);
 END;
 "#,
+    r#"
+-- When the note last joined the always-in-prompt core (MEMORY.md); null
+-- while it is not in it. Set when the export is written (memory/packing.rs).
+ALTER TABLE memory_items ADD COLUMN core_since INTEGER;
+"#,
 ];
 
 /// Run `f` in a write transaction taken up front (`BEGIN IMMEDIATE`), so a
@@ -1748,6 +1753,9 @@ mod tests {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )?;
             assert_eq!((importance, pinned, use_count, archived, source.as_str()), (3, false, 0, false, "{}"));
+            let core_since: Option<i64> =
+                c.query_row("SELECT core_since FROM memory_items WHERE id = ?1", [id], |r| r.get(0))?;
+            assert_eq!(core_since, None, "not in the core until the export is written");
             let found: i64 = c.query_row(
                 "SELECT rowid FROM memory_items_fts WHERE memory_items_fts MATCH 'plant'",
                 [],

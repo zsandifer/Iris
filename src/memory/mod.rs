@@ -8,11 +8,13 @@
 //!
 //! The Markdown in `memory/` is generated from the rows after every change
 //! (see [`files`]) and is read-only for the owner: `MEMORY.md` holds the
-//! notes that are always in the prompt, and one file per topic lists the
-//! rest. Memory is only ever reachable from the owner's private chats.
+//! notes that are always in the prompt, packed under a budget (see
+//! [`packing`]), and one file per topic lists every note of that topic.
+//! Memory is only ever reachable from the owner's private chats.
 
 pub mod files;
 pub mod markdown;
+pub mod packing;
 
 use crate::util::{now_ms, sha256_hex};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -69,8 +71,9 @@ impl Topic {
 /// person, project and routine; notes from Markdown are facts.
 pub const KIND_FACT: &str = "fact";
 
-/// Kinds that belong in the always-in-prompt core.
-const CORE_KINDS: &[&str] = &["profile", "preference"];
+/// Kinds that say who the owner is: packed into the core right after
+/// pinned notes, and part of the persona hash.
+pub const CORE_KINDS: &[&str] = &["profile", "preference"];
 
 /// Who made a change (`memory_history.actor`). The schema also allows
 /// `dream` (the nightly tidy-up) and `owner` (edits in the app).
@@ -117,11 +120,16 @@ pub struct Item {
     pub content_hash: String,
     pub archived: bool,
     pub updated_at: i64,
+    /// When the note last joined the always-in-prompt core; None while it
+    /// is not in it. Derived from the other fields when the export is
+    /// written, so it is not part of history snapshots.
+    #[serde(skip)]
+    pub core_since: Option<i64>,
 }
 
 const COLUMNS: &str = "id, kind, topic, text, importance, pinned, created_at, observed_at, \
     mentioned_at, valid_to, superseded_by, source, last_used_at, use_count, content_hash, \
-    archived, updated_at";
+    archived, updated_at, core_since";
 
 fn from_row(r: &rusqlite::Row) -> rusqlite::Result<Item> {
     let topic: String = r.get(2)?;
@@ -144,14 +152,8 @@ fn from_row(r: &rusqlite::Row) -> rusqlite::Result<Item> {
         content_hash: r.get(14)?,
         archived: r.get(15)?,
         updated_at: r.get(16)?,
+        core_since: r.get(17)?,
     })
-}
-
-impl Item {
-    /// Notes that belong in the always-in-prompt core when they fit.
-    fn core_candidate(&self) -> bool {
-        self.pinned || self.importance >= 4 || CORE_KINDS.contains(&self.kind.as_str())
-    }
 }
 
 /// Identity of a note's text: case, spacing and a final full stop do not
@@ -367,6 +369,7 @@ pub(crate) mod tests {
             content_hash: content_hash(text),
             archived: false,
             updated_at: id,
+            core_since: None,
         }
     }
 

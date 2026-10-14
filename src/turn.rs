@@ -471,10 +471,23 @@ async fn run_locked(
         // Session continuity and replay of unseen messages.
         let agent_name = state.agent_name().await;
         let persona_hash = {
+            // Only the pinned and profile part of the memory core counts, so
+            // routine notes do not restart sessions.
+            let memory_identity = if scope == Scope::Private {
+                state
+                    .db
+                    .call(crate::memory::packing::identity)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             let (paths, name, kind) = (state.paths.clone(), agent_name.clone(), ctx.kind.clone());
-            tokio::task::spawn_blocking(move || persona::persona_hash(&paths, &name, &kind, scope))
-                .await
-                .unwrap_or_default()
+            tokio::task::spawn_blocking(move || {
+                persona::persona_hash(&paths, &name, &kind, scope, &memory_identity)
+            })
+            .await
+            .unwrap_or_default()
         };
         let mut session = if fresh_session {
             None
@@ -2112,6 +2125,7 @@ printf '%s\n' '{"type":"init","session_id":"pre-join-session"}' \
                                     "Iris",
                                     "group",
                                     Scope::Shared,
+                                    "",
                                 ),
                             },
                         )?;
