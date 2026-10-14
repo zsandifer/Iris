@@ -906,6 +906,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_edits_retain_omitted_timestamps_and_clear_explicit_nulls() {
+        let h = setup();
+        let owner = pair_as(&h, None).await;
+        let (_, a) = send(
+            &h.app,
+            "POST",
+            "/api/memory",
+            Some(&owner),
+            Some(json!({"text":"Likes tea","valid_to":i64::MAX,"observed_at":100})),
+        )
+        .await;
+        let id = a["item"]["id"].as_i64().unwrap();
+        let path = format!("/api/memory/{id}");
+        let (status, b) = send(
+            &h.app,
+            "PATCH",
+            &path,
+            Some(&owner),
+            Some(json!({"importance":4})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{b}");
+        assert_eq!(b["item"]["valid_to"], i64::MAX);
+        assert_eq!(b["item"]["observed_at"], 100);
+        let (status, c) = send(
+            &h.app,
+            "PATCH",
+            &path,
+            Some(&owner),
+            Some(json!({"valid_to":null,"observed_at":null})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{c}");
+        assert_eq!(c["item"]["id"], id);
+        assert!(c["item"]["valid_to"].is_null());
+        assert!(c["item"]["observed_at"].is_null());
+        let (_, d) = send(&h.app, "GET", &path, Some(&owner), None).await;
+        assert!(d["history"][0]["after"]["valid_to"].is_null());
+        assert_eq!(d["history"][0]["before"]["valid_to"], i64::MAX);
+    }
+
+    #[tokio::test]
     async fn connector_credentials_require_https_except_on_loopback() {
         let h = setup();
         let token = pair_as(&h, None).await;

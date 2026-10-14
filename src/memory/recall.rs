@@ -159,9 +159,16 @@ pub struct Edit {
     pub text: Option<String>,
     pub kind: Option<String>,
     pub importance: Option<i64>,
-    pub observed_at: Option<i64>,
-    pub valid_to: Option<i64>,
+    #[serde(default, deserialize_with = "nullable_time")]
+    pub observed_at: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "nullable_time")]
+    pub valid_to: Option<Option<i64>>,
     pub pinned: Option<bool>,
+}
+
+// Missing retains the timestamp; an explicit null clears it.
+fn nullable_time<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<i64>>, D::Error> {
+    Option::<i64>::deserialize(d).map(Some)
 }
 
 fn fields(edit: &Edit, before: Option<&Item>) -> rusqlite::Result<(String, String, Topic, i64)> {
@@ -257,7 +264,7 @@ pub fn save(
     if let Some(old) = before.as_ref().filter(|_| !replace) {
         saved_id = old.id;
         c.execute("UPDATE memory_items SET kind = ?2, topic = ?3, text = ?4, importance = ?5, pinned = ?6, observed_at = ?7, valid_to = ?8, content_hash = ?9, updated_at = ?10 WHERE id = ?1",
-            params![old.id, kind, topic.name(), text, importance, edit.pinned.unwrap_or(old.pinned), edit.observed_at.or(old.observed_at), edit.valid_to.or(old.valid_to), hash, now])?;
+            params![old.id, kind, topic.name(), text, importance, edit.pinned.unwrap_or(old.pinned), edit.observed_at.unwrap_or(old.observed_at), edit.valid_to.unwrap_or(old.valid_to), hash, now])?;
         record(
             c,
             old.id,
@@ -269,7 +276,7 @@ pub fn save(
         )?;
     } else {
         c.execute("INSERT INTO memory_items(id, kind, topic, text, importance, pinned, created_at, observed_at, mentioned_at, valid_to, source, content_hash, updated_at) VALUES ((SELECT MAX(id) + 1 FROM (SELECT COALESCE(MAX(id), 0) AS id FROM memory_items UNION ALL SELECT COALESCE(MAX(item_id), 0) FROM memory_history)), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?6, ?8, ?9, ?10, ?6)",
-            params![kind, topic.name(), text, importance, edit.pinned.or(before.as_ref().map(|i| i.pinned)).unwrap_or(false), now, edit.observed_at.or(before.as_ref().and_then(|i| i.observed_at)), edit.valid_to.or(before.as_ref().and_then(|i| i.valid_to)), source.to_string(), hash])?;
+            params![kind, topic.name(), text, importance, edit.pinned.or(before.as_ref().map(|i| i.pinned)).unwrap_or(false), now, edit.observed_at.unwrap_or_else(|| before.as_ref().and_then(|i| i.observed_at)), edit.valid_to.unwrap_or_else(|| before.as_ref().and_then(|i| i.valid_to)), source.to_string(), hash])?;
         saved_id = c.last_insert_rowid();
         let after = get(c, saved_id)?.unwrap();
         record(c, saved_id, "add", None, Some(&after), actor, batch)?;
@@ -587,7 +594,7 @@ mod tests {
                     c,
                     &Edit {
                         text: Some("Likes tea".into()),
-                        valid_to: Some(0),
+                        valid_to: Some(Some(0)),
                         ..Default::default()
                     },
                     None,
@@ -938,7 +945,7 @@ mod tests {
                 &Edit {
                     text: Some("Visits the park".into()),
                     kind: Some("routine".into()),
-                    valid_to: Some(0),
+                    valid_to: Some(Some(0)),
                     ..Default::default()
                 },
                 None,

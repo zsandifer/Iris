@@ -193,13 +193,13 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "remember",
             "Save a note, excluding secrets and private spans. Similar notes are hints only; update instead of merging automatically.",
-            json!({"text":s("Note"), "kind":s("profile|preference|fact|event|person|project|routine"), "importance":{"type":"integer","minimum":1,"maximum":5}, "observed_at":{"type":"integer"}}),
+            json!({"text":s("Note"), "kind":s("profile|preference|fact|event|person|project|routine"), "importance":{"type":"integer","minimum":1,"maximum":5}, "observed_at":{"type":["integer","null"]}}),
             &["text", "kind"],
         ),
         tool(
             "update_memory",
             "Correct a note by ID; changed text supersedes its prior version with undo history.",
-            json!({"id":{"type":"integer"}, "text":s("Corrected note"), "kind":s("Memory kind"), "importance":{"type":"integer","minimum":1,"maximum":5}, "observed_at":{"type":"integer"}, "valid_to":{"type":"integer"}}),
+            json!({"id":{"type":"integer"}, "text":s("Corrected note"), "kind":s("Memory kind"), "importance":{"type":"integer","minimum":1,"maximum":5}, "observed_at":{"type":["integer","null"]}, "valid_to":{"type":["integer","null"]}}),
             &["id"],
         ),
         tool(
@@ -1526,6 +1526,10 @@ mod tests {
             "**password**: synthetic-canary",
             "Uses a password manager; password: synthetic-canary",
             r#"{"value":"sk-synthetic0000000000000000"}"#,
+            r#"{"apiKey":"synthetic-canary"}"#,
+            r#"{"accessToken":"synthetic-canary"}"#,
+            r#"{"refreshToken":"synthetic-canary"}"#,
+            r#"{"clientSecret":"synthetic-canary"}"#,
         ] {
             let text = format!("Likes tea\n{secret}");
             assert_eq!(
@@ -1592,6 +1596,46 @@ mod tests {
         let export = std::fs::read_to_string(b.paths.memory_dir().join("MEMORY.md")).unwrap();
         assert!(export.contains("Public existing note"));
         assert!(!export.contains("synthetic-canary"));
+    }
+
+    #[test]
+    fn agent_edits_can_clear_timestamps_in_place_and_on_replacements() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = bridge(tmp.path());
+        let a = call(
+            &b,
+            "remember",
+            json!({"text":"Likes tea","kind":"fact","observed_at":100}),
+        );
+        let id = a["structuredContent"]["item"]["id"].as_i64().unwrap();
+        let b1 = call(&b, "update_memory", json!({"id":id,"valid_to":i64::MAX}));
+        assert_eq!(b1["isError"], false, "{b1}");
+        assert_eq!(b1["structuredContent"]["item"]["observed_at"], 100);
+        let b2 = call(
+            &b,
+            "update_memory",
+            json!({"id":id,"text":"Likes coffee","valid_to":null,"observed_at":null}),
+        );
+        assert_eq!(b2["isError"], false, "{b2}");
+        assert!(b2["structuredContent"]["item"]["valid_to"].is_null());
+        assert!(b2["structuredContent"]["item"]["observed_at"].is_null());
+        assert_ne!(b2["structuredContent"]["item"]["id"], id);
+        let next = b2["structuredContent"]["item"]["id"].as_i64().unwrap();
+        let b3 = call(
+            &b,
+            "update_memory",
+            json!({"id":next,"observed_at":200,"valid_to":i64::MAX}),
+        );
+        assert_eq!(b3["isError"], false);
+        let b4 = call(
+            &b,
+            "update_memory",
+            json!({"id":next,"valid_to":null,"observed_at":null}),
+        );
+        assert_eq!(b4["isError"], false);
+        assert_eq!(b4["structuredContent"]["item"]["id"], next);
+        assert!(b4["structuredContent"]["item"]["valid_to"].is_null());
+        assert!(b4["structuredContent"]["item"]["observed_at"].is_null());
     }
 
     #[test]

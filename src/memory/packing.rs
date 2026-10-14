@@ -108,7 +108,8 @@ pub fn pack(live: &[Item], now: i64) -> Packed<'_> {
             left_out.pinned += 1;
         }
     }
-    left_out.other = live.len() - items.len() - left_out.pinned;
+    left_out.other =
+        live.iter().filter(|i| current(i, now)).count() - items.len() - left_out.pinned;
     Packed { items, left_out }
 }
 
@@ -337,13 +338,7 @@ mod tests {
         live[1].kind = "preference".into();
         let p = pack(&live, NOW);
         assert_eq!(ids(&p), [2]);
-        assert_eq!(
-            p.left_out,
-            LeftOut {
-                pinned: 0,
-                other: 1
-            }
-        );
+        assert_eq!(p.left_out, LeftOut::default());
         assert_eq!(ids(&pack(&live, NOW - 1)), [1, 2]);
     }
 }

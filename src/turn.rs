@@ -2230,7 +2230,7 @@ printf '%s\n' '{"type":"thread.started","thread_id":"synthetic-session"}' \
                         c,
                         &crate::memory::recall::Edit {
                             text: Some("Temporary synthetic fact".into()),
-                            valid_to: Some(i64::MAX),
+                            valid_to: Some(Some(i64::MAX)),
                             ..Default::default()
                         },
                         None,

@@ -2413,7 +2413,8 @@ IDs are positive integers, stable across owner edits and never reused after Forg
   superseded and expired notes. Reading in the app does not count as agent use.
 - `POST /api/memory` takes `{text, kind?, importance?, observed_at?, valid_to?, pinned?}`.
   `PATCH /api/memory/{id}` accepts the same optional fields; omitted fields
-  retain their values. Times are milliseconds; importance is 1–5 (default 3).
+  retain their values; explicit `null` clears `observed_at` or `valid_to`.
+  Times are milliseconds; importance is 1–5 (default 3).
   Kind determines topic. Owner edits preserve provenance and ID.
   Both return `{item, changed, history_id, similar_to, hint}`; exact duplicates
   return the existing `{item, duplicate: true, changed: false}` with no mutation.
@@ -2434,7 +2435,7 @@ IDs are positive integers, stable across owner edits and never reused after Forg
   item was deleted and detail returns `404`.
 
 Writes share the MCP write gate: strip nested/unclosed `<private>` spans,
-PEM private keys, credential assignments (including JSON/Markdown formatting
+PEM private keys, credential assignments (including camelCase labels and JSON/Markdown formatting
 and repeated labels), authorization lines and recognized
 API token formats before hashing or recording history. Ambiguous/multiline
 credential assignments reject the entire write conservatively; imports skip
