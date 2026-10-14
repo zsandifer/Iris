@@ -8,6 +8,7 @@ import {
   agentName, ago, since, confirmSheet,
 } from './ui.js';
 import { describe, visible } from './status.js';
+import { md } from './md.js';
 
 function useData(path, deps = []) {
   const [data, setData] = useState(null);
@@ -166,13 +167,16 @@ export function FileEditor({ area, path }) {
   const [text, setText] = useState(null);
   const [orig, setOrig] = useState('');
   const [busy, setBusy] = useState(false);
+  // Files open as rendered Markdown; Edit switches to the plain text.
+  const [editing, setEditing] = useState(false);
   useEffect(() => {
-    get(url).then((r) => { setText(r.content); setOrig(r.content); }).catch((e) => toast(e.message));
+    get(url).then((r) => { setText(r.content); setOrig(r.content); if (!readOnly && !r.content.trim()) setEditing(true); })
+      .catch((e) => toast(e.message));
   }, [url]);
   const dirty = text != null && text !== orig;
   const save = async () => {
     setBusy(true);
-    try { await put(url, { content: text }); setOrig(text); toast('Saved. I’ll use it from my next reply.'); } catch (e) { toast(e.message); }
+    try { await put(url, { content: text }); setOrig(text); setEditing(false); toast('Saved. I’ll use it from my next reply.'); } catch (e) { toast(e.message); }
     setBusy(false);
   };
   const remove = async () => {
@@ -180,11 +184,17 @@ export function FileEditor({ area, path }) {
     try { await del(url); back(); } catch (e) { toast(e.message); }
   };
   const name = path.split('/').pop();
+  // HTML comments are notes for whoever edits the file; the view hides them.
+  const shown = (text || '').replace(/<!--[\s\S]*?-->/g, '');
   return html`<${Page} title=${system ? fill(FRIENDLY[path] || path) : name} sub=${system ? path : `${area}/${path}`}
-    right=${readOnly ? null : html`<button class="b1 sm" disabled=${!dirty || busy} onClick=${save}>Save</button>`}>
+    right=${readOnly || text == null ? null : editing
+      ? html`<button class="b1 sm" disabled=${busy || (!dirty && !orig.trim())} onClick=${dirty ? save : () => setEditing(false)}>${dirty ? 'Save' : 'Done'}</button>`
+      : html`<button class="b2 sm" onClick=${() => setEditing(true)}>Edit</button>`}>
     ${readOnly && html`<div class="lock"><${Icon} name="lock" size=${15} /> ${READ_ONLY_NOTE}</div>`}
-    ${text == null ? html`<${Spinner} />` : html`<textarea class="editor" value=${text} spellcheck=${false} readOnly=${readOnly}
-      onInput=${(e) => setText(e.target.value)} aria-label=${readOnly ? name : `Edit ${name}`} />`}
+    ${text == null ? html`<${Spinner} />` : editing ? html`<textarea class="editor" value=${text} spellcheck=${false}
+      onInput=${(e) => setText(e.target.value)} aria-label=${`Edit ${name}`} />`
+      : shown.trim() ? html`<div class="mdview" dangerouslySetInnerHTML=${{ __html: md(shown) }} />`
+      : html`<${Empty} icon="file" title="Empty file">Nothing in here yet.<//>`}
     ${!system && !readOnly && html`<${Group}><${Row} title="Delete file" danger chevron=${false} onClick=${remove} /><//>`}
   <//>`;
 }

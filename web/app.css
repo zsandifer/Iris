@@ -372,6 +372,17 @@ span.fav { display: inline-block; overflow: hidden; }
 .big2 .p { background: var(--ac); color: #fff; }
 .editor { width: 100%; min-height: 62dvh; font: 16px/1.5 var(--mono); background: var(--sf); color: var(--ink); border: 1px solid var(--ln);
   border-radius: 14px; padding: 12px; resize: vertical; outline: none; margin-bottom: 14px; }
+.mdview { background: var(--sf); border: 1px solid var(--ln); border-radius: 14px; padding: 12px 14px; margin-bottom: 14px;
+  font-size: 15px; line-height: 1.55; overflow-wrap: anywhere; }
+.mdview > :first-child { margin-top: 0; } .mdview > :last-child { margin-bottom: 0; }
+.mdview p { margin: 0 0 .7em; } .mdview ul, .mdview ol { margin: .2em 0 .7em; padding-left: 1.3em; } .mdview li { margin: .15em 0; }
+.mdview h3 { font-size: 1.2em; margin: .9em 0 .4em; } .mdview h4, .mdview h5, .mdview h6 { font-size: 1.05em; margin: .8em 0 .3em; }
+.mdview pre { background: var(--sf2); border-radius: 10px; padding: 8px 10px; overflow-x: auto; font-size: 13px; }
+.mdview pre code { background: none; padding: 0; }
+.mdview blockquote { margin: .4em 0; padding-left: 10px; border-left: 3px solid var(--ln); color: var(--mu); }
+.mdview hr { border: 0; border-top: 1px solid var(--ln); }
+.mdview .tbl { overflow-x: auto; } .mdview table { border-collapse: collapse; font-size: 13.5px; margin: .4em 0; }
+.mdview th, .mdview td { border: 1px solid var(--ln); padding: 4px 7px; text-align: left; }
 .foot { text-align: center; font-size: 12px; margin: 22px 0 8px; }
 
 /* ------------------------------------------------------------ forms */
