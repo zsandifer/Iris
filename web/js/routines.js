@@ -210,12 +210,30 @@ function blankDraft(tz) {
 const SPEC_KEYS = ['title', 'emoji', 'instructions', 'schedule_kind', 'run_at', 'rule', 'cron_expr', 'tz', 'starts_at',
   'end_at', 'max_runs', 'ask_before_acting', 'notify_when_done', 'approval_timeout_mins', 'misfire', 'max_retries'];
 const pick = (r) => Object.fromEntries(SPEC_KEYS.map((k) => [k, r[k] ?? null]));
+const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+/** Bring an open draft up to date with the routine as saved now (`fresh`),
+ * given what the editor last loaded (`base`): fields the owner has not
+ * touched take the new value, their own edits stay. */
+export function mergeDraft(draft, base, fresh) {
+  const next = { ...draft };
+  for (const k of SPEC_KEYS) if (same(draft[k], base[k])) next[k] = fresh[k];
+  return { draft: next, base: { ...fresh } };
+}
+
+/** Only the fields the owner changed, so saving never undoes changes made
+ * elsewhere meanwhile. */
+export function draftChanges(draft, base) {
+  return Object.fromEntries(SPEC_KEYS.filter((k) => !same(draft[k], base[k])).map((k) => [k, draft[k]]));
+}
 
 export function RoutineEditor({ id }) {
   useStore();
   const fresh = id === 'new';
   const [routine, setRoutine] = useState(null);
   const [draft, setDraft] = useState(null);
+  // The routine's fields as last loaded or saved (what the draft started from).
+  const base = useRef(null);
   const [docs, setDocs] = useState([]);
   // The latest documents, for an upload that finishes after a tab change.
   const docsRef = useRef(docs);
@@ -234,7 +252,15 @@ export function RoutineEditor({ id }) {
     try {
       const { routine: r } = await get(`/routines/${seg(id)}`);
       setRoutine(r);
-      setDraft((d) => d || pick(r));
+      setDraft((d) => {
+        if (d && base.current) {
+          const m = mergeDraft(d, base.current, pick(r));
+          base.current = m.base;
+          return m.draft;
+        }
+        base.current = pick(r);
+        return d || pick(r);
+      });
       setDocs(r.docs || []);
     } catch (e) { setErr(e.message); }
   };
@@ -248,7 +274,18 @@ export function RoutineEditor({ id }) {
     if (first.current) { first.current = false; return; }
     if (fresh) return;
     let live = true;
-    get(`/routines/${seg(id)}`).then(({ routine: r }) => { if (live) setRoutine(r); }).catch(() => {});
+    get(`/routines/${seg(id)}`).then(({ routine: r }) => {
+      if (!live) return;
+      setRoutine(r);
+      setDraft((d) => {
+        if (!d || !base.current) return d;
+        const m = mergeDraft(d, base.current, pick(r));
+        base.current = m.base;
+        return m.draft;
+      });
+      // Saved routines keep documents on the server as they change.
+      if (r.state !== 'pending_approval') setDocs(r.docs || []);
+    }).catch(() => {});
     return () => { live = false; };
   }, [S.routines]);
   if (err) return html`<${Page} title="Routine"><${Empty} icon="repeat" title="I couldn't open this routine">${err}<//><//>`;
@@ -274,8 +311,11 @@ export function RoutineEditor({ id }) {
         setDraft(null);
         setTimeout(load, 0);
       } else {
-        const r = await patch(`/routines/${seg(id)}`, body);
+        // Documents of a saved routine are already saved as they change.
+        const changes = draftChanges(draft, base.current || pick(routine));
+        const r = Object.keys(changes).length ? await patch(`/routines/${seg(id)}`, changes) : { routine };
         setRoutine(r.routine);
+        base.current = pick(r.routine);
         setDraft(pick(r.routine));
         toast('Saved');
         loadRoutines().catch(() => {});

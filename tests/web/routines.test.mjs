@@ -3,7 +3,7 @@ import { onFetch, reply } from './env.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-const { runStatus, routinesSub, onActivate } = await import('../../web/js/routines.js');
+const { runStatus, routinesSub, onActivate, mergeDraft, draftChanges } = await import('../../web/js/routines.js');
 const { S, set, loadRoutines } = await import('../../web/js/store.js');
 
 test('every run status reads as words, not just a colour', () => {
@@ -30,6 +30,21 @@ test('Enter and Space open a focused row, not keys meant for a control inside it
   assert.equal(key('Tab'), false);
   assert.equal(key('Enter', { toggle: true }), false);
   assert.equal(opened, 2);
+});
+
+test("an open editor takes newer saved settings but keeps the owner's own edits", () => {
+  const base = { title: 'Dinner', ask_before_acting: false, max_runs: null, rule: { freq: 'weekly', days: [6] } };
+  // The owner renamed it here; another device turned "ask first" on.
+  const draft = { ...base, title: 'Saturday dinner' };
+  const fresh = { ...base, ask_before_acting: true };
+  const m = mergeDraft(draft, base, fresh);
+  assert.equal(m.draft.title, 'Saturday dinner');
+  assert.equal(m.draft.ask_before_acting, true);
+  // Saving sends only the rename, never the stale "ask first: off".
+  assert.deepEqual(draftChanges(m.draft, m.base), { title: 'Saturday dinner' });
+  assert.deepEqual(draftChanges(m.base, m.base), {});
+  // Nested values compare by content.
+  assert.deepEqual(draftChanges({ ...base, rule: { freq: 'weekly', days: [6, 0] } }, base), { rule: { freq: 'weekly', days: [6, 0] } });
 });
 
 test('the hub line counts active routines and what waits for the owner', async () => {
