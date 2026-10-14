@@ -162,6 +162,9 @@ async fn fake_cli_applies_history_and_card_undo_and_only_one_card_a_day() {
     assert_eq!(card["changes"].as_array().unwrap().len(), 3);
     assert_eq!(card["all_changes"].as_array().unwrap().len(), 4);
     assert_eq!(card["more_count"], 1);
+    // The morning note labels each change (New / Updated / Done).
+    assert_eq!(card["changes"][0]["op"], "add");
+    assert!(card["changes"][0]["was"].is_null());
     let change = card["changes"][0]["history_id"].as_i64().unwrap();
     state
         .db
@@ -281,6 +284,11 @@ async fn loss_guard_aliases_pins_updates_and_snapshot_undo() {
     reply(&tmp, json!({"ops":ops}));
     run(&state, &owner, true).await.unwrap();
     let card = cards(&state).remove(0);
+    let shown = &card.card.as_ref().unwrap()["all_changes"];
+    assert_eq!(shown[0]["op"], "supersede");
+    assert_eq!(shown[1]["op"], "update");
+    assert_eq!(shown[1]["was"], "Orchard apples garden fact 2");
+    assert_eq!(shown[1]["text"], "Orchard apples garden corrected fact 2");
     state
         .db
         .with(|c| {
