@@ -261,6 +261,8 @@ fn iris_proposals_wait_for_the_owner() {
     assert_eq!(card["type"], "routine");
     assert_eq!(card["action"], "create");
     assert_eq!(card["body"], "Every Sat · 5:30 PM · asks before acting");
+    // The owner can read what Iris will do before tapping.
+    assert_eq!(card["instructions"], saturday_dinner().instructions);
     assert!(
         db.with(|c| run::claim_due(c, now + 30 * 86_400_000))
             .unwrap()
@@ -301,6 +303,8 @@ fn iris_proposals_wait_for_the_owner() {
         .unwrap()
         .unwrap();
     assert_eq!(u.change.summary, "Time 5:30 PM → 6:00 PM, adds Sundays");
+    // Instructions unchanged: nothing extra to read.
+    assert!(u.card.card.as_ref().unwrap()["instructions"].is_null());
     let unchanged = db.with(|c| get_routine(c, &owner, &r.id)).unwrap().unwrap();
     assert_eq!(unchanged.spec.rule, r.spec.rule);
     // The owner edits something else meanwhile; approving keeps that edit.
@@ -316,6 +320,29 @@ fn iris_proposals_wait_for_the_owner() {
     assert_eq!(r.spec.title, "Dinner");
     assert_eq!(r.spec.schedule_text(), "Every Sun, Sat · 6:00 PM");
     assert_eq!(r.next_run_at, Some(at("2026-10-17T18:00")));
+
+    // New instructions are shown in full on the card and the waiting row.
+    let new_text = "Order the green curry instead, and add spring rolls.";
+    let ins = db
+        .with(|c| {
+            Ok(propose_update(
+                c,
+                &owner,
+                &r.id,
+                &json!({"instructions": new_text}),
+                &target,
+            ))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(ins.card.card.as_ref().unwrap()["instructions"], new_text);
+    let listed = db
+        .with(|c| routine_json(c, &get_routine(c, &owner, &r.id)?.unwrap(), now))
+        .unwrap();
+    assert_eq!(listed["pending_change"]["instructions"], new_text);
+    db.with(|c| Ok(decline_change(c, &owner, &ins.change.id)))
+        .unwrap()
+        .unwrap();
 
     // Pause through update; a newer proposal replaces an older one.
     let first = db

@@ -895,9 +895,15 @@ fn change_card(routine: &Routine, spec: &Spec, change: &Change, owner: &str, now
                 .map(|t| p.local_text(*t))
         })
         .unwrap_or_default();
+    // The owner reads what Iris will do before tapping: the instructions of
+    // a new routine, or the new ones when a change rewrites them.
+    let instructions = (change.action == "create"
+        || (change.action == "update" && routine.spec.instructions != spec.instructions))
+        .then(|| spec.instructions.clone());
     json!({
         "type": "routine",
         "change_id": change.id,
+        "instructions": instructions,
         "routine_id": routine.id,
         "action": change.action,
         "title": spec.title,
@@ -1291,7 +1297,8 @@ pub fn routine_json(conn: &Connection, r: &Routine, now: i64) -> rusqlite::Resul
         )
         .optional()?;
     let pending = pending_change(conn, &r.id)?.map(|c| {
-        json!({"id": c.id, "action": c.action, "summary": c.summary, "created_at": c.created_at})
+        json!({"id": c.id, "action": c.action, "summary": c.summary, "created_at": c.created_at,
+               "instructions": c.patch.get("instructions")})
     });
     v["id"] = r.id.clone().into();
     v["state"] = r.state.name().into();

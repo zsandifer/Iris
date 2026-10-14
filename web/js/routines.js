@@ -105,6 +105,7 @@ function WaitingRow({ r }) {
     return html`<div class="rtn-row proposed">
       <div class="rtn-line"><${Ico} r=${r} /><div class="grow"><b>${r.title}</b>
         <small>${c.action === 'create' ? r.schedule_text : c.action === 'delete' ? 'I suggested deleting this' : c.summary}</small></div></div>
+      ${c.instructions && html`<${NewInstructions} text=${c.instructions} label="The new instructions" />`}
       <div class="rtn-act">
         ${c.action === 'create' && html`<button class="b2 sm" onClick=${() => go(`iris/routines/${r.id}`)}>Edit</button>`}
         <button class="b2 sm" disabled=${busy} onClick=${() => act(false)}>${no}</button>
@@ -486,6 +487,11 @@ function HistoryTab({ routine, reload }) {
 
 // ------------------------------------------------------------- chat card
 
+/** Instructions Iris proposed, readable before the owner taps. */
+function NewInstructions({ text, label }) {
+  return html`<details class="rtn-instr-new"><summary>${label}</summary><p class="mu">${text}</p></details>`;
+}
+
 const DONE = { create: 'Set up. It runs on schedule now.', update: 'Updated.', delete: 'Deleted.' };
 
 /** A routine Iris proposed (or a change to one): nothing happens until the
@@ -507,6 +513,7 @@ export function RoutineCard({ c }) {
     ${c.action !== 'delete' && html`<div class="rtn-pills">${c.asks_first && html`<span class="rpill a">Asks before acting</span>`}
       ${c.next && c.action === 'create' && html`<span class="rpill">Next: ${c.next}</span>`}</div>`}
     ${c.action === 'delete' && html`<p>${c.body}</p>`}
+    ${c.instructions && html`<${NewInstructions} text=${c.instructions} label=${c.action === 'create' ? 'What I will do' : 'The new instructions'} />`}
     ${c.state === 'approved' ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> ${DONE[c.action]}</div>`
       : c.state === 'superseded' ? html`<div class="mu small">Replaced by a newer suggestion.</div>`
       : c.state === 'cancelled' ? html`<div class="mu small">No longer needed.</div>`
