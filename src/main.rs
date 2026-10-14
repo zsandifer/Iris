@@ -23,6 +23,7 @@ mod jobs;
 mod keys;
 mod login;
 mod mcp;
+mod memory;
 mod notify;
 mod oauth;
 mod persona;
@@ -93,6 +94,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--assets",
     "--connector",
     "--workdir",
+    "--message",
 ];
 
 impl Args {
@@ -225,7 +227,13 @@ fn run(args: Args) -> Result<()> {
             mcp::serve_stdio(|req| bridge.handle(req))
         }
         ["mcp"] => {
-            args.check_flags(&["--user", "--conversation", "--shared", "--workdir"])?;
+            args.check_flags(&[
+                "--user",
+                "--conversation",
+                "--message",
+                "--shared",
+                "--workdir",
+            ])?;
             let user = args.value("--user").ok_or("--user is required")?;
             // The harness launches this with the server's data dir; never
             // create a new data dir from here.
@@ -239,6 +247,7 @@ fn run(args: Args) -> Result<()> {
                 paths,
                 user_id: user.to_string(),
                 conversation_id: args.value("--conversation").map(String::from),
+                message_id: args.value("--message").map(String::from),
                 shared: args.has("--shared"),
                 workdir: args.value("--workdir").map(PathBuf::from),
                 agent,
@@ -326,7 +335,8 @@ fn init(paths: &Paths) -> Result<()> {
         println!("config:   {} (created)", paths.config_file.display());
     }
     let created = persona::seed(paths)?;
-    db::Db::open(&paths.db_file())?;
+    let db = db::Db::open(&paths.db_file())?;
+    prepare_memory(&db, paths)?;
     secrets::Vault::open(&paths.vault_key_file())?;
     push::VapidKeys::load_or_create(&paths.vapid_key_file())?;
     println!("data:     {}", paths.data_dir.display());
@@ -388,6 +398,7 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
         }
     }
     let db = db::Db::open(&paths.db_file())?;
+    prepare_memory(&db, &paths)?;
     let interrupted = db.with(db::mark_interrupted)?;
     if interrupted > 0 {
         warn!("{interrupted} turn(s) were interrupted by the last shutdown");
@@ -418,6 +429,25 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
         });
         server::serve(state).await
     })
+}
+
+/// Import Markdown notes Iris did not generate and rewrite the memory export.
+fn prepare_memory(db: &db::Db, paths: &Paths) -> Result<()> {
+    let report = memory::files::prepare(db, paths)?;
+    if report.files > 0 {
+        info!(
+            "memory: imported {} new notes ({} already known) from {} files; originals in {}",
+            report.counts.added,
+            report.counts.existing,
+            report.files,
+            report
+                .backup
+                .as_deref()
+                .unwrap_or(paths.data_dir.as_path())
+                .display()
+        );
+    }
+    Ok(())
 }
 
 fn pair(paths: &Paths, user: Option<&str>) -> Result<()> {

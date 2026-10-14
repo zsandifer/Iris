@@ -1796,6 +1796,8 @@ async fn mcp_servers(
         user_id.into(),
         "--conversation".into(),
         conv_id.into(),
+        "--message".into(),
+        message_id.into(),
     ];
     args.extend([
         "--workdir".into(),

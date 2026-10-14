@@ -76,10 +76,17 @@ pub const SYSTEM_FILES: &[SystemFile] = &[
         name: "MEMORY.md",
         area: Area::Memory,
         template: include_str!("../templates/MEMORY.md"),
-        description: "Curated long-term memory (always in context)",
+        description: "What the agent always keeps in mind (a read-only copy of its memory)",
         in_prompt: false,
     },
 ];
+
+impl SystemFile {
+    /// Memory files are generated from the memory notes; only Iris writes them.
+    pub fn read_only(&self) -> bool {
+        self.area == Area::Memory
+    }
+}
 
 pub fn system_file(name: &str) -> Option<&'static SystemFile> {
     SYSTEM_FILES.iter().find(|f| f.name == name)
@@ -254,10 +261,14 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
         entries.retain(|(rel, _, _)| rel != "MEMORY.md");
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         out.push_str(
-            "\n## Memory\n\nLong-term memory is stored by Iris as Markdown files. \
-             Use the Iris read_memory tool to read a file when its topic comes up. \
-             Use write_memory to update durable facts (MEMORY.md for short, \
-             always-relevant facts). These tools are only available in the owner's private chats.\n",
+            "\n## Memory\n\nIris keeps the owner's long-term memory as notes. MEMORY.md \
+             (below) holds the notes always in mind; every note is also listed in its \
+             topic file (you.md, people.md, projects.md, routines.md; the ones with notes \
+             are listed below). Read a topic file with the Iris read_memory tool when its \
+             topic comes up. To save, correct or remove notes, use write_memory with the \
+             file's full new content, one note per bullet (MEMORY.md for short, \
+             always-relevant facts); bullets you leave out are removed everywhere. These \
+             tools are only available in the owner's private chats.\n",
         );
         if entries.is_empty() {
             out.push_str("\n(No other memory files yet.)\n");
@@ -274,14 +285,11 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
                 ));
             }
         }
-        if let Ok(body) = std::fs::read_to_string(memory_dir.join("MEMORY.md")) {
-            let body = body.trim();
-            if !body.is_empty() {
-                out.push_str(&format!(
-                    "\n<memory file=\"MEMORY.md\">\n{}\n</memory>\n",
-                    truncate_chars(body, MAX_MEMORY_INLINE_CHARS)
-                ));
-            }
+        if let Some(core) = crate::memory::files::core_for_prompt(paths) {
+            out.push_str(&format!(
+                "\n<memory file=\"MEMORY.md\">\n{}\n</memory>\n",
+                truncate_chars(&core, MAX_MEMORY_INLINE_CHARS)
+            ));
         }
     }
 

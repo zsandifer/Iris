@@ -413,6 +413,64 @@ CREATE INDEX messages_created ON messages(created_at);
 CREATE INDEX messages_pending_approvals ON messages(conversation_id, created_at)
 WHERE kind = 'card' AND json_extract(card, '$.type') = 'approval' AND json_extract(card, '$.state') = 'pending';
 "#,
+    r#"
+-- The owner's long-term memory: one row per note (see memory/mod.rs).
+-- Markdown in memory/ is a generated, read-only view of these rows.
+CREATE TABLE memory_items (
+    id            INTEGER PRIMARY KEY,
+    kind          TEXT NOT NULL CHECK (kind IN ('profile', 'preference', 'fact', 'event', 'person', 'project', 'routine')),
+    topic         TEXT NOT NULL CHECK (topic IN ('you', 'people', 'projects', 'routines')),
+    text          TEXT NOT NULL,
+    importance    INTEGER NOT NULL DEFAULT 3 CHECK (importance BETWEEN 1 AND 5),
+    pinned        INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL,
+    observed_at   INTEGER,
+    mentioned_at  INTEGER,
+    valid_to      INTEGER,
+    superseded_by INTEGER REFERENCES memory_items(id) ON DELETE SET NULL,
+    source        TEXT NOT NULL DEFAULT '{}',
+    last_used_at  INTEGER,
+    use_count     INTEGER NOT NULL DEFAULT 0,
+    content_hash  TEXT NOT NULL,
+    archived      INTEGER NOT NULL DEFAULT 0,
+    updated_at    INTEGER NOT NULL
+);
+-- A note is stored once among live rows; archived and superseded rows keep their text.
+CREATE UNIQUE INDEX memory_items_live_hash ON memory_items(content_hash)
+WHERE archived = 0 AND superseded_by IS NULL;
+CREATE INDEX memory_items_live_topic ON memory_items(topic, created_at)
+WHERE archived = 0 AND superseded_by IS NULL;
+
+-- Every change, so any change can be undone. No foreign key: a tombstone
+-- outlives the row it describes.
+CREATE TABLE memory_history (
+    id       INTEGER PRIMARY KEY,
+    item_id  INTEGER NOT NULL,
+    op       TEXT NOT NULL CHECK (op IN ('add', 'update', 'supersede', 'archive', 'restore', 'delete')),
+    before   TEXT,
+    after    TEXT,
+    actor    TEXT NOT NULL CHECK (actor IN ('agent', 'dream', 'owner', 'import')),
+    batch_id TEXT,
+    at       INTEGER NOT NULL
+);
+CREATE INDEX memory_history_item ON memory_history(item_id, at);
+CREATE INDEX memory_history_batch ON memory_history(batch_id) WHERE batch_id IS NOT NULL;
+
+-- Keyword search over notes (external content: the text lives in memory_items).
+CREATE VIRTUAL TABLE memory_items_fts USING fts5(
+    text, content = 'memory_items', content_rowid = 'id', tokenize = 'porter unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER memory_items_fts_insert AFTER INSERT ON memory_items BEGIN
+    INSERT INTO memory_items_fts (rowid, text) VALUES (NEW.id, NEW.text);
+END;
+CREATE TRIGGER memory_items_fts_delete AFTER DELETE ON memory_items BEGIN
+    INSERT INTO memory_items_fts (memory_items_fts, rowid, text) VALUES ('delete', OLD.id, OLD.text);
+END;
+CREATE TRIGGER memory_items_fts_update AFTER UPDATE OF text ON memory_items BEGIN
+    INSERT INTO memory_items_fts (memory_items_fts, rowid, text) VALUES ('delete', OLD.id, OLD.text);
+    INSERT INTO memory_items_fts (rowid, text) VALUES (NEW.id, NEW.text);
+END;
+"#,
 ];
 
 /// Run `f` in a write transaction taken up front (`BEGIN IMMEDIATE`), so a
@@ -1633,11 +1691,10 @@ mod tests {
         let path = tmp.path().join("iris.db");
         let (conv, text_id, card_id) = {
             let c = Connection::open(&path).unwrap();
-            for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            for sql in &MIGRATIONS[..7] {
                 c.execute_batch(sql).unwrap();
             }
-            c.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
-                .unwrap();
+            c.pragma_update(None, "user_version", 7).unwrap();
             let owner = ensure_owner(&c).unwrap();
             let conv = ensure_main_conversation(&c, &owner).unwrap();
             let message = insert_message(&c, &text(&conv, &owner, "Existing history")).unwrap();
@@ -1657,16 +1714,88 @@ mod tests {
     }
 
     #[test]
+    fn memory_migration_adds_notes_history_and_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iris.db");
+        let (conv, message) = {
+            let c = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..8] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.pragma_update(None, "user_version", 8).unwrap();
+            let owner = ensure_owner(&c).unwrap();
+            let conv = ensure_main_conversation(&c, &owner).unwrap();
+            let m = insert_message(&c, &text(&conv, &owner, "Before memory rows")).unwrap();
+            (conv, m.id)
+        };
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            let v: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            assert_eq!(v as usize, MIGRATIONS.len());
+            assert_eq!(get_message(c, &message)?.unwrap().conversation_id, conv);
+            c.execute(
+                "INSERT INTO memory_items (kind, topic, text, created_at, content_hash, updated_at)
+                 VALUES ('person', 'people', 'Neighbour waters the plants', 1, 'h1', 1)",
+                [],
+            )?;
+            let id = c.last_insert_rowid();
+            let (importance, pinned, use_count, archived, source): (i64, bool, i64, bool, String) =
+                c.query_row(
+                    "SELECT importance, pinned, use_count, archived, source FROM memory_items WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )?;
+            assert_eq!((importance, pinned, use_count, archived, source.as_str()), (3, false, 0, false, "{}"));
+            let found: i64 = c.query_row(
+                "SELECT rowid FROM memory_items_fts WHERE memory_items_fts MATCH 'plant'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(found, id);
+            // Kinds, topics, importance, ops and actors are checked.
+            for bad in [
+                "INSERT INTO memory_items (kind, topic, text, created_at, content_hash, updated_at) VALUES ('secret', 'you', 'x', 1, 'h2', 1)",
+                "INSERT INTO memory_items (kind, topic, text, created_at, content_hash, updated_at) VALUES ('fact', 'work', 'x', 1, 'h2', 1)",
+                "INSERT INTO memory_items (kind, topic, text, importance, created_at, content_hash, updated_at) VALUES ('fact', 'you', 'x', 6, 1, 'h2', 1)",
+                "INSERT INTO memory_history (item_id, op, actor, at) VALUES (1, 'merge', 'agent', 1)",
+                "INSERT INTO memory_history (item_id, op, actor, at) VALUES (1, 'add', 'guest', 1)",
+            ] {
+                assert!(c.execute(bad, []).is_err(), "{bad}");
+            }
+            for actor in ["agent", "dream", "owner", "import"] {
+                c.execute(
+                    "INSERT INTO memory_history (item_id, op, actor, at) VALUES (?1, 'add', ?2, 1)",
+                    params![id, actor],
+                )?;
+            }
+            // A superseded or archived note frees its text for a new live note.
+            c.execute(
+                "INSERT INTO memory_items (kind, topic, text, created_at, content_hash, updated_at)
+                 VALUES ('fact', 'you', 'Neighbour waters the plants', 2, 'h1', 2)",
+                [],
+            )
+            .unwrap_err();
+            c.execute("UPDATE memory_items SET archived = 1 WHERE id = ?1", [id])?;
+            c.execute(
+                "INSERT INTO memory_items (kind, topic, text, created_at, content_hash, updated_at)
+                 VALUES ('fact', 'you', 'Neighbour waters the plants', 2, 'h1', 2)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn membership_migration_discards_existing_shared_sessions_only() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("iris.db");
         let (private, shared) = {
             let c = Connection::open(&path).unwrap();
-            for sql in &MIGRATIONS[..MIGRATIONS.len() - 2] {
+            for sql in &MIGRATIONS[..6] {
                 c.execute_batch(sql).unwrap();
             }
-            c.pragma_update(None, "user_version", (MIGRATIONS.len() - 2) as i64)
-                .unwrap();
+            c.pragma_update(None, "user_version", 6).unwrap();
             let owner = ensure_owner(&c).unwrap();
             let private = create_conversation(&c, &owner, "side", "Private", None)
                 .unwrap()
