@@ -4082,7 +4082,7 @@ a new turn. Resolved cards are explicitly described as resolved in replay histor
 | `list_connectors` | none | `{"connectors": [{"name", "service", "description", "enabled", "signed_in", "paused", "rules"}], "available_to_connect": [{"service", "name", "description"}]}` |
 | `list_routines` | none; owner private context only | `{"routines": [{"id", "title", "emoji", "state", "schedule", "next_run", "instructions" (first 600 characters), "fields" (the spec), "documents" (titles), "last_run", "pending_change"}]}` |
 | `create_routine` | The [Routine](#routine) spec fields (`title`, `instructions`, `schedule_kind` required); owner private context only | Proposes it: `{"proposed": true, "routine_id", "change", "next_run", "card_message_id", "note"}`. The routine is stored as `pending_approval` and a [`routine` card](#server-cards) is posted; nothing runs until the owner taps Set it up. |
-| `update_routine` | `id` (required), any spec fields, `paused?: bool`; owner private context only | Proposes the change with a one-line diff (`change`), same result shape. Error "That wouldn't change anything." when nothing differs. |
+| `update_routine` | `id` (required), any spec fields, `paused?: bool`, `clear?: ["starts_at" \| "end_at" \| "max_runs" \| "emoji"]` (fields to remove); owner private context only | Proposes the change with a one-line diff (`change`), same result shape. Error "That wouldn't change anything." when nothing differs. |
 | `delete_routine` | `id` (required); owner private context only | Proposes deleting it, same result shape. |
 
 The six recall/write tools above are only offered and callable in owner-alone

@@ -205,6 +205,9 @@ fn routine_properties(update: bool) -> Value {
     if update {
         p["id"] = s("Routine id");
         p["paused"] = json!({"type": "boolean", "description": "true pauses it, false resumes it"});
+        p["clear"] = json!({"type": "array",
+            "items": {"type": "string", "enum": ["starts_at", "end_at", "max_runs", "emoji"]},
+            "description": "Optional fields to remove, e.g. [\"max_runs\"] so it keeps running"});
     }
     p
 }
@@ -984,6 +987,24 @@ impl Bridge {
                             let mut patch = a.clone();
                             if let Some(o) = patch.as_object_mut() {
                                 o.remove("id");
+                                if let Some(clear) = o.remove("clear") {
+                                    for k in clear.as_array().into_iter().flatten() {
+                                        match k.as_str() {
+                                            Some(f @ ("starts_at" | "end_at" | "max_runs")) => {
+                                                o.insert(f.into(), Value::Null);
+                                            }
+                                            Some("emoji") => {
+                                                o.insert("emoji".into(), "".into());
+                                            }
+                                            _ => {
+                                                return Ok(Err(format!(
+                                                    "I can't clear {k}; only starts_at, end_at, \
+                                                     max_runs or emoji."
+                                                )));
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Some(p) = o.remove("paused") {
                                     let paused = p.as_bool().unwrap_or(false);
                                     o.insert(
@@ -1264,6 +1285,46 @@ mod tests {
                 .unwrap()
                 .contains("date and time")
         );
+
+        // A run limit can be removed ("keep it going"), after the owner's tap.
+        let limited = call(
+            &b,
+            "create_routine",
+            json!({"title": "Plant check", "instructions": "Ask about the plants.",
+                   "schedule_kind": "rule", "tz": "UTC", "max_runs": 3,
+                   "rule": {"freq": "weekly", "days": [1], "time": "09:00"}}),
+        );
+        let rid = limited["structuredContent"]["routine_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // The owner taps the routine's pending proposal.
+        let approve = || {
+            let owner = b.user_id.clone();
+            b.db.with(|c| {
+                let pending = crate::routines::pending_change(c, &rid)?.unwrap();
+                Ok(crate::routines::approve_change(
+                    c,
+                    &owner,
+                    &pending.id,
+                    None,
+                    crate::util::now_ms(),
+                ))
+            })
+            .unwrap()
+            .unwrap()
+        };
+        approve();
+        let cleared = call(
+            &b,
+            "update_routine",
+            json!({"id": rid, "clear": ["max_runs"]}),
+        );
+        assert_eq!(cleared["isError"], false, "{cleared}");
+        let r = approve().routine.unwrap();
+        assert_eq!(r.spec.max_runs, None);
+        let bad = call(&b, "update_routine", json!({"id": rid, "clear": ["title"]}));
+        assert_eq!(bad["isError"], true);
 
         // Never in a shared conversation, nor in someone else's chat.
         b.shared = true;
