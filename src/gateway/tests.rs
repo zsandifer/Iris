@@ -94,9 +94,10 @@ fn setup(tune: impl FnOnce(&mut Config)) -> T {
 
 impl T {
     async fn grant(&self) -> (String, GrantGuard, Vec<McpServer>) {
-        let (servers, guard) = grant_for_turn(&self.state, &self.owner, &self.main, "main", "m1")
-            .await
-            .expect("owner turn gets connectors");
+        let (servers, guard) =
+            grant_for_turn(&self.state, &self.owner, &self.main, "main", "m1", false)
+                .await
+                .expect("owner turn gets connectors");
         let McpTransport::Stdio { env, .. } = &servers[0].transport;
         (env[TOKEN_ENV].clone(), guard, servers)
     }
@@ -575,7 +576,7 @@ async fn trusted_recipients_skip_approval_and_the_send_tripwire_pauses() {
     assert!(last.reason.contains("paused"), "{}", last.reason);
     // The next turn can check Iris status, but has no permission for the paused connector.
     drop(_guard);
-    let (servers, _guard) = grant_for_turn(&t.state, &t.owner, &t.main, "main", "m2")
+    let (servers, _guard) = grant_for_turn(&t.state, &t.owner, &t.main, "main", "m2", false)
         .await
         .unwrap();
     assert!(servers.is_empty());
@@ -682,7 +683,7 @@ async fn pause_and_disconnect_everything() {
     let r = t.call(&token, "search_messages", json!({})).await;
     assert!(text(&r).contains("paused"));
     assert!(
-        grant_for_turn(&t.state, &t.owner, &t.main, "main", "m2")
+        grant_for_turn(&t.state, &t.owner, &t.main, "main", "m2", false)
             .await
             .is_none()
     );
@@ -2450,4 +2451,66 @@ async fn owner_request(t: &T, method: &str, path: &str, body: Value) {
         "{method} {path}: {}",
         response.status()
     );
+}
+
+#[tokio::test]
+async fn preparing_an_ask_first_routine_refuses_actions_even_when_rules_allow_them() {
+    let t = setup(|_| {});
+    t.state
+        .db
+        .with(|c| db::set_setting(c, "safety.trusted_recipients", r#"["sam@example.com"]"#))
+        .unwrap();
+    let mut p = policy::Policy::default();
+    p.tools
+        .insert("delete_message".into(), policy::ToolRule::Allow);
+    let id = t.connector_id.clone();
+    t.state
+        .db
+        .with(|c| {
+            entities::set_connector_state(
+                c,
+                &id,
+                &ConnectorState {
+                    policy: Some(&p),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    let (servers, guard) = grant_for_turn(&t.state, &t.owner, &t.main, "job", "m1", true)
+        .await
+        .unwrap();
+    let McpTransport::Stdio { env, .. } = &servers[0].transport;
+    let token = env[TOKEN_ENV].clone();
+    // Looking things up is preparing.
+    let r = t.call(&token, "search_messages", json!({})).await;
+    assert_eq!(text(&r), "ok search_messages secret=[hidden]");
+    // A send to a trusted person and a delete the rules allow both wait
+    // for the routine's own approval: refused, never held or run.
+    for (tool, args) in [
+        (
+            "send_message",
+            json!({"to": "sam@example.com", "text": "rent is due"}),
+        ),
+        ("delete_message", json!({"id": "m-1"})),
+    ] {
+        let r = t.call(&token, tool, args).await;
+        assert_eq!(r["isError"], true, "{r}");
+        assert_eq!(text(&r), PREPARE_ONLY);
+        assert!(!t.calls_log().contains(tool), "{tool} must not run");
+        let rec = t.calls().into_iter().find(|c| c.tool == tool).unwrap();
+        assert_eq!(rec.decision, "blocked");
+    }
+    assert_eq!(t.state.gateway.pending_count(), 0, "no approval card");
+    // After the owner's OK the acting step's grant follows the usual rules.
+    drop(guard);
+    let (token, _guard, _) = t.grant().await;
+    let r = t
+        .call(
+            &token,
+            "send_message",
+            json!({"to": "sam@example.com", "text": "rent is due"}),
+        )
+        .await;
+    assert_eq!(text(&r), "ok send_message secret=[hidden]");
 }

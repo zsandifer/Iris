@@ -15,8 +15,10 @@ aes-gcm = "0.11"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "ws", "tokio", "query"] }
 base64 = "0.23"
 chacha20poly1305 = "0.11"
+croner = { version = "4.0.1", default-features = false, features = ["jiff"] }
 getrandom = "0.4.3"
 hkdf = "0.13"
+jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 libc = "0.2.190"
 p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }

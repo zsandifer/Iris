@@ -14,6 +14,7 @@ import { IdeasScreen, GoalsScreen, LibraryScreen } from './lists.js';
 import { Hub, Logins, Files, FileEditor, Folder } from './hub.js';
 import { MemoryScreen, MemorySettings } from './memory.js';
 import { Computer } from './computer.js';
+import { RoutinesScreen, RoutineEditor } from './routines.js';
 import { Connections, CatalogGroup, AddService, GoogleHttpsHelp, ConnectorPage, ConnectorForm, TrustedPeople, CATALOG_IDS } from './connect.js';
 import { Settings, AiEngine, Devices, People, ActivityLog } from './settings.js';
 import { isIOS, standalone, syncPush, resetPush } from './push.js';
@@ -281,6 +282,10 @@ function Screen() {
       }
       if (sub === 'logins') return html`<${Logins} />`;
       if (sub === 'memory') return html`<${MemoryScreen} />`;
+      if (sub === 'routines') {
+        if (a === 'new' || isId(a)) return html`<${RoutineEditor} id=${a} key=${a} />`;
+        return html`<${RoutinesScreen} />`;
+      }
       if (sub === 'computer') return html`<${Computer} />`;
       if (sub === 'files') {
         if (!okSeg(a) || (a === 'system' && !okSeg(rest.join('/')))) return html`<${Files} />`;

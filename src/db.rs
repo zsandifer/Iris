@@ -548,6 +548,95 @@ CREATE INDEX memory_supersession ON memory_items(superseded_by);
 CREATE INDEX memory_expiry ON memory_items(valid_to, id)
 WHERE archived = 0 AND superseded_by IS NULL AND valid_to IS NOT NULL;
 "#,
+    r#"
+-- Routines: scheduled jobs the owner (or Iris, with the owner's tap) set up
+-- (routines/mod.rs). Times in `run_at`, `starts_at` and `end_at` are local
+-- to `tz`; `next_run_at` is UTC milliseconds.
+CREATE TABLE routines (
+    id                    TEXT PRIMARY KEY,
+    owner                 TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title                 TEXT NOT NULL,
+    emoji                 TEXT NOT NULL DEFAULT '',
+    instructions          TEXT NOT NULL,
+    schedule_kind         TEXT NOT NULL CHECK (schedule_kind IN ('once', 'rule', 'cron')),
+    run_at                TEXT,
+    rule                  TEXT,
+    cron_expr             TEXT,
+    tz                    TEXT NOT NULL,
+    starts_at             TEXT,
+    end_at                TEXT,
+    max_runs              INTEGER,
+    run_count             INTEGER NOT NULL DEFAULT 0,
+    state                 TEXT NOT NULL CHECK (state IN ('pending_approval', 'active', 'paused', 'done')),
+    next_run_at           INTEGER,
+    ask_before_acting     INTEGER NOT NULL DEFAULT 1,
+    notify_when_done      INTEGER NOT NULL DEFAULT 1,
+    approval_timeout_mins INTEGER NOT NULL DEFAULT 120,
+    misfire               TEXT NOT NULL DEFAULT 'run_latest_in_window'
+                          CHECK (misfire IN ('skip', 'run_latest_in_window')),
+    max_retries           INTEGER NOT NULL DEFAULT 2,
+    created_by            TEXT NOT NULL DEFAULT 'owner' CHECK (created_by IN ('owner', 'iris')),
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL
+);
+CREATE INDEX routines_due ON routines(next_run_at) WHERE state = 'active';
+
+-- One row per scheduled slot (or manual run). `waiting`: prepared, waiting
+-- for the owner's OK on an approval card until `expires_at`. A failed run
+-- with `retry_at` is tried again then.
+CREATE TABLE routine_runs (
+    id              TEXT PRIMARY KEY,
+    routine_id      TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
+    scheduled_for   INTEGER NOT NULL,
+    manual          INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL CHECK (status IN ('running', 'waiting', 'ok', 'skipped', 'failed')),
+    reason          TEXT NOT NULL DEFAULT '',
+    summary         TEXT NOT NULL DEFAULT '',
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    -- The current attempt was allowed to act (a routine that does not ask
+    -- first, as it was when the attempt started).
+    may_act         INTEGER NOT NULL DEFAULT 0,
+    retry_at        INTEGER,
+    conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+    card_message_id TEXT,
+    expires_at      INTEGER,
+    approved_at     INTEGER,
+    started_at      INTEGER,
+    finished_at     INTEGER,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    UNIQUE (routine_id, scheduled_for)
+);
+CREATE INDEX routine_runs_recent ON routine_runs(routine_id, scheduled_for);
+CREATE INDEX routine_runs_open ON routine_runs(status) WHERE status IN ('running', 'waiting');
+CREATE INDEX routine_runs_retry ON routine_runs(retry_at) WHERE retry_at IS NOT NULL;
+
+-- Reference documents: Library items whose text goes into every run.
+CREATE TABLE routine_docs (
+    routine_id      TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
+    library_item_id TEXT NOT NULL REFERENCES library_items(id) ON DELETE CASCADE,
+    created_at      INTEGER NOT NULL,
+    PRIMARY KEY (routine_id, library_item_id)
+);
+
+-- Changes Iris proposed (create, update, delete). They wait for the
+-- owner's tap on their chat card; `patch` holds the proposed fields.
+CREATE TABLE routine_changes (
+    id              TEXT PRIMARY KEY,
+    routine_id      TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
+    action          TEXT NOT NULL CHECK (action IN ('create', 'update', 'delete')),
+    patch           TEXT NOT NULL DEFAULT '{}',
+    summary         TEXT NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (state IN ('pending', 'approved', 'declined', 'superseded')),
+    created_at      INTEGER NOT NULL,
+    decided_at      INTEGER
+);
+CREATE INDEX routine_changes_pending ON routine_changes(routine_id) WHERE state = 'pending';
+
+-- Text extracted once when a document is uploaded (routine documents).
+ALTER TABLE library_items ADD COLUMN extracted_text TEXT;
+"#,
 ];
 
 /// Run `f` in a write transaction taken up front (`BEGIN IMMEDIATE`), so a

@@ -240,6 +240,9 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
         out.push_str("Google uses one owner-created login key and one sign-in for Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, Contacts and YouTube read-only. `request_connector_setup(\"google\")` opens the saved wizard; if `google_setup.more_access` is true, Google still works but was signed in before Docs, Sheets, Slides, Forms, Tasks and Contacts, and the card asks them to turn on the new APIs and sign in again. Coach only the current `google_setup` step: 1 create project (set the name to Iris even if Google prefills My Project; either name works), then copy the Project ID under its name into Iris, 2 enable all ten APIs (one link turns them all on), 3 Branding (required App name Iris, User support email chosen from their Gmail, Developer contact information with their Gmail at the very bottom; add `google_setup.authorized_domain` under Authorized domains, domain only with no scheme, port or path; leave logo, App domain links, home page and privacy policy empty to avoid triggering verification; Save at the bottom) and Audience (External, their own account as test user), 4 Web application key with the exact HTTPS callback shown by Iris, 5 publish on Audience to avoid the seven-day testing sign-out (if Publish app is greyed out, return to step 3, fill all three Branding fields and the Authorized domains entry, then Save), 6 paste the downloaded JSON or ID and secret together in the app, then sign in. Google uses the Project ID, not the display name. In steps 2–5, tell them to look for `google_setup.project_id` on Google’s page; if another project is shown, use the top project picker to choose that ID. They can change the saved ID in the wizard. Never ask for or accept the key in chat. The unverified-app warning is expected for their own private app: Advanced → Go to Iris. Sign-in and Google Console pages belong in the owner's real browser, never Iris's managed browser. Use reported error steps to help them fix setup; never claim Google Console steps were verified just because they tapped Done.\n");
         out.push_str("Services with a hosted server connect with one tap (for example Notion, Todoist, Airtable, Linear, Sentry, Supabase, Stripe; `request_connector_setup` lists the exact names): it posts a Connect card, and they approve access on the service's own page. These start asking before any change; money services (Stripe, Mercury) ask before everything. The owner chooses Allow, Ask or Off per action on each service's page in Connections (for Google, per service: Gmail, Calendar, Drive and the rest), and can turn a Google service off entirely; actions they turned off are not offered to you.\n");
     }
+    if ctx.app_tools && private {
+        out.push_str(ROUTINES_GUIDE);
+    }
     if let Some(server) = ctx.browser.filter(|_| ctx.scope == Scope::Private) {
         out.push_str(&crate::browser::tools::guide(server));
     }
@@ -277,6 +280,26 @@ const SHARED_TOOLS_GUIDE: &str = "
 
 In this shared conversation the `iris` MCP server only offers `create_card`,
 which shows a structured card (for example a `link` card) in the chat.
+";
+
+const ROUTINES_GUIDE: &str = "
+## Routines
+
+Routines are jobs you run for the owner on a schedule (\"order dinner every
+Saturday\", \"rent reminder on the 1st\", \"gift ideas on Oct 29 at 8\").
+When the owner asks for something to happen later, regularly, or as a
+reminder, or a request would clearly be easier as a routine, propose one with
+`create_routine`. Check `list_routines` first and change an existing one with
+`update_routine` (also to pause or resume it) or `delete_routine` rather than
+making a duplicate. Every proposal posts a card and does nothing until the
+owner taps it, so pick sensible defaults instead of asking many questions, say
+in one line what you picked, and never claim a routine is set up before they
+approve it. Times are the owner's local wall-clock times; one-off reminders
+use `schedule_kind` once with `run_at`. Write `instructions` as what you will
+do on each run. Keep `ask_before_acting` on, and set `misfire` to skip, for
+routines that buy, order, book, pay, or send anything. Reminders and
+look-ups need neither. (The routines.md memory topic is for notes about the
+owner's habits; it does not schedule anything.)
 ";
 
 const APP_TOOLS_GUIDE: &str = "

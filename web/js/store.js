@@ -25,6 +25,8 @@ function initialState() {
     library: null,
     memory: null,        // {items, more}: the owner's notes (Memory screen)
     memoryRev: 0,        // bumped when memory changes (open note sheets refresh)
+    routines: null,      // GET /api/routines (owner)
+    routinesInfo: null,  // {default_tz, max_doc_bytes}
     route: parseRoute(),
     drawer: false,
     story: null,         // {topic index, story index}
@@ -579,7 +581,14 @@ export async function loadEngines() {
   set({ engines: await get('/engines') });
 }
 
-const loaders = { feed: () => loadFeed(), ideas: loadIdeas, goals: loadGoals, library: loadLibrary, memory: loadMemory };
+export async function loadRoutines() {
+  if (!isOwner()) return;
+  const apply = refreshOf('routines');
+  const r = await get('/routines');
+  apply(() => set({ routines: r.routines, routinesInfo: { default_tz: r.default_tz, max_doc_bytes: r.max_doc_bytes } }));
+}
+
+const loaders = { feed: () => loadFeed(), ideas: loadIdeas, goals: loadGoals, library: loadLibrary, memory: loadMemory, routines: loadRoutines };
 
 // ------------------------------------------------------------------ events
 

@@ -33,6 +33,17 @@ pub enum Category {
     Unclear,
 }
 
+/// Whether a call of this kind acts on the owner's behalf in a way an
+/// ask-first routine must not before the owner's OK: sending, buying,
+/// deleting, or a call Iris cannot place. Reading, drafting, other changes
+/// (filling a cart, saving a draft) and exports prepare.
+pub fn acts(category: Category) -> bool {
+    matches!(
+        category,
+        Category::Send | Category::Purchase | Category::Delete | Category::Unclear
+    )
+}
+
 impl Category {
     pub fn name(self) -> &'static str {
         match self {

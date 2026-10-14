@@ -8,6 +8,7 @@ mod chat;
 mod connect;
 mod content;
 mod memory;
+mod routines;
 mod web;
 mod ws;
 
@@ -180,6 +181,7 @@ pub fn router(state: AppState) -> Router {
         .merge(admin::routes())
         .merge(browser::routes())
         .merge(connect::routes())
+        .merge(routines::routes())
         .route("/ws", get(ws::handler))
         .layer(DefaultBodyLimit::max(upload_limit));
     Router::new()
@@ -2104,6 +2106,130 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn routine_documents_are_markdown_or_text_and_saved_to_the_library() {
+        let h = setup();
+        let t = pair_as(&h, None).await;
+        let upload = |name: &str, body: Vec<u8>| {
+            HttpRequest::builder()
+                .method("POST")
+                .uri(format!("/api/routines/docs?name={name}"))
+                .header("authorization", format!("Bearer {t}"))
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let read = |res: axum::response::Response| async move {
+            let status = res.status();
+            let b = axum::body::to_bytes(res.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice::<Value>(&b).unwrap())
+        };
+        let (s, b) = read(
+            h.app
+                .clone()
+                .oneshot(upload(
+                    "Takeout%20SOP.md",
+                    b"# Usual\n- Pad See Ew".to_vec(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let doc = b["doc"]["id"].as_str().unwrap().to_string();
+        assert_eq!(b["doc"]["title"], "Takeout SOP.md");
+        let (s, b) = read(
+            h.app
+                .clone()
+                .oneshot(upload("menu.pdf", b"%PDF-1.7".to_vec()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(
+            b["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Markdown (.md) or plain text (.txt)")
+        );
+        let big = vec![b'a'; h.state.cfg.max_upload_bytes + 1];
+        let (s, _) = read(h.app.clone().oneshot(upload("big.txt", big)).await.unwrap()).await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+        // It is an ordinary Library item.
+        let (s, _) = send(
+            &h.app,
+            "GET",
+            &format!("/api/library/{doc}"),
+            Some(&t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            "/api/routines",
+            Some(&t),
+            Some(
+                json!({"title": "Dinner", "instructions": "Order dinner.", "schedule_kind": "once",
+                        "run_at": "2030-01-05T18:00", "tz": "UTC", "doc_ids": [doc]}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["routine"]["docs"][0]["title"], "Takeout SOP.md");
+        let id = b["routine"]["id"].as_str().unwrap();
+        let (s, b) = send(
+            &h.app,
+            "DELETE",
+            &format!("/api/routines/{id}/docs/{doc}"),
+            Some(&t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["routine"]["docs"], json!([]));
+        // Bad schedules come back as a friendly sentence.
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            "/api/routines/preview",
+            Some(&t),
+            Some(json!({"schedule_kind": "cron", "cron_expr": "*/5 * * * *", "tz": "UTC"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(
+            b["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("runs too often")
+        );
+        // Runs already done count toward "after N runs".
+        let limited = json!({"schedule_kind": "rule", "tz": "UTC", "max_runs": 5,
+                             "rule": {"freq": "daily", "time": "09:00"}});
+        for (done, left) in [(0, 3), (4, 1), (5, 0)] {
+            let mut body = limited.clone();
+            body["done"] = json!(done);
+            let (s, b) = send(
+                &h.app,
+                "POST",
+                "/api/routines/preview",
+                Some(&t),
+                Some(body),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+            assert_eq!(
+                b["runs"].as_array().unwrap().len(),
+                left,
+                "after {done} runs"
+            );
+        }
+    }
+
     /// A stand-in for `claude` that implements `--version`, `auth status`
     /// and `auth login` the way the real CLI behaves headless.
     fn fake_claude(dir: &std::path::Path) -> std::path::PathBuf {
@@ -3574,8 +3700,19 @@ cat > "$r/stdin"
 touch "$r/started"
 while [ -f "{d}/hold" ]; do sleep 0.02; done
 echo '{{"type":"system","subtype":"init","session_id":"sess-'$n'"}}'
-echo '{{"type":"assistant","message":{{"id":"m1","content":[{{"type":"text","text":"ok"}}]}}}}'
-echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
+if [ -f "{d}/fail" ]; then
+  grep -q tool "{d}/fail" && printf '%s\n' '{{"type":"assistant","message":{{"id":"m0","content":[{{"type":"tool_use","id":"t1","name":"mcp__notes__send_message","input":{{}}}}]}}}}'
+  if grep -q auth "{d}/fail"; then
+    printf '%s\n' '{{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login"}}'
+  else
+    printf '%s\n' '{{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}}'
+  fi
+  exit 1
+fi
+text=ok
+[ -f "{d}/reply" ] && text=$(cat "{d}/reply")
+printf '%s\n' '{{"type":"assistant","message":{{"id":"m1","content":[{{"type":"text","text":"'"$text"'"}}]}}}}'
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"'"$text"'"}}'
 "#,
                 d = dir.display()
             ),
@@ -3606,6 +3743,24 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
 
         fn read(&self, n: usize, file: &str) -> String {
             std::fs::read_to_string(self.run_dir(n).join(file)).unwrap_or_default()
+        }
+
+        /// Whether run `n`'s connector access (still running) only prepares.
+        fn prepare_only(&self, n: usize) -> bool {
+            let cfg: Value = serde_json::from_str(&self.read(n, "mcp.json")).unwrap();
+            let token = cfg["mcpServers"]
+                .as_object()
+                .unwrap()
+                .values()
+                .find_map(|s| s["env"][crate::gateway::TOKEN_ENV].as_str())
+                .expect("a connector for this turn")
+                .to_string();
+            self.h
+                .state
+                .gateway
+                .grant(&token)
+                .expect("the turn's grant")
+                .is_prepare_only()
         }
 
         async fn wait_for(&self, what: &str, mut f: impl FnMut() -> bool) {
@@ -3740,6 +3895,537 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             guest_id,
             guest_t,
         }
+    }
+
+    #[tokio::test]
+    async fn setting_up_a_proposal_with_a_missing_document_changes_nothing() {
+        let t = turn_setup(|_| {}).await;
+        let h = &t.h;
+        let main = t.main_of(&t.owner_t).await;
+        let p = h
+            .state
+            .db
+            .call(move |c| {
+                let owner = crate::db::owner_user_id(c)?.unwrap();
+                let spec = crate::routines::Spec::from_json(
+                    &json!({"title": "Dinner", "instructions": "Order my usual.",
+                            "schedule_kind": "rule", "tz": "UTC",
+                            "rule": {"freq": "weekly", "days": [6], "time": "17:30"}}),
+                    "UTC",
+                )
+                .unwrap();
+                let target = crate::routines::CardTarget {
+                    conversation_id: &main,
+                    status: "complete",
+                };
+                Ok(crate::routines::propose_create(c, &owner, spec, &target).unwrap())
+            })
+            .await
+            .unwrap();
+        let approve = format!("/api/routines/changes/{}/approve", p.change.id);
+        let edited = json!({"routine": {"title": "Dinner", "instructions": "Order my usual.",
+            "schedule_kind": "rule", "tz": "UTC", "doc_ids": ["deleted-doc"],
+            "rule": {"freq": "weekly", "days": [6], "time": "17:30"}}});
+        let (s, b) = send(&h.app, "POST", &approve, Some(&t.owner_t), Some(edited)).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{b}");
+        // Still a proposal: not scheduled, and the owner can try again.
+        let path = format!("/api/routines/{}", p.routine.id);
+        let (_, b) = send(&h.app, "GET", &path, Some(&t.owner_t), None).await;
+        assert_eq!(b["routine"]["state"], "pending_approval", "{b}");
+        let (s, b) = send(&h.app, "POST", &approve, Some(&t.owner_t), None).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["routine"]["state"], "active");
+    }
+
+    #[tokio::test]
+    async fn a_signed_out_engine_is_rerouted_only_before_any_tool_use() {
+        let t = turn_setup(|_| {}).await;
+        let main = t.main_of(&t.owner_t).await;
+        let notes = |reply: Value| {
+            let id = reply["id"].as_str().unwrap().to_string();
+            let m =
+                t.h.state
+                    .db
+                    .with(|c| crate::db::get_message(c, &id))
+                    .unwrap()
+                    .unwrap();
+            m.meta["routing"].clone()
+        };
+        // Signed out before doing anything: another engine may take over.
+        std::fs::write(t.dir.join("fail"), "auth").unwrap();
+        let reply = t.chat(&t.owner_t, &main, "hello").await;
+        let r = notes(reply);
+        assert!(
+            r["notes"].to_string().contains("signed out; rerouted"),
+            "{r}"
+        );
+        // Signed out after a tool call: not started again elsewhere (the
+        // call may have sent or bought something).
+        t.h.state.refresh_harnesses().await;
+        std::fs::write(t.dir.join("fail"), "tool auth").unwrap();
+        let reply = t.chat(&t.owner_t, &main, "send it").await;
+        let r = notes(reply);
+        assert!(r["model"].is_string(), "an engine ran: {r}");
+        assert!(!r["notes"].to_string().contains("rerouted"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn routine_attempts_that_used_tools_are_never_replayed() {
+        let t = turn_setup(|_| {}).await;
+        let (h, tok) = (&t.h, t.owner_t.as_str());
+        let create = |body: Value| async move {
+            let (s, b) = send(&h.app, "POST", "/api/routines", Some(tok), Some(body)).await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+            format!("/api/routines/{}", b["routine"]["id"].as_str().unwrap())
+        };
+        let last_run = |path: String, want: &'static str| async move {
+            let mut run = Value::Null;
+            for _ in 0..250 {
+                let (_, b) = send(&h.app, "GET", &path, Some(tok), None).await;
+                run = b["routine"]["runs"][0].clone();
+                if run["status"] == want {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(run["status"], want, "{run}");
+            run
+        };
+        let run_now = |path: String| async move {
+            let (s, b) = send(&h.app, "POST", &format!("{path}/run"), Some(tok), None).await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+        };
+        // Acts without asking: an attempt that failed after using a tool is
+        // not tried again (it may have sent the message).
+        let direct = create(
+            json!({"title": "Rent reminder", "instructions": "Text Sam.",
+            "schedule_kind": "rule", "ask_before_acting": false, "max_retries": 2,
+            "rule": {"freq": "monthly", "day": 1, "time": "09:00"}, "tz": "UTC"}),
+        )
+        .await;
+        std::fs::write(t.dir.join("fail"), "tool").unwrap();
+        run_now(direct.clone()).await;
+        let run = last_run(direct.clone(), "failed").await;
+        assert!(run["retry_at"].is_null(), "{run}");
+        assert!(
+            run["reason"].as_str().unwrap().contains("didn't try again"),
+            "{run}"
+        );
+        assert_eq!(t.runs(), 1);
+        // Nor after a crash with no tool reported: some CLIs only report a
+        // tool once it has finished.
+        std::fs::write(t.dir.join("fail"), "plain").unwrap();
+        run_now(direct.clone()).await;
+        let run = last_run(direct.clone(), "failed").await;
+        assert!(run["retry_at"].is_null(), "{run}");
+        assert_eq!(t.runs(), 2);
+        // Preparing for an ask-first routine cannot act, so it is tried again.
+        let prep = create(
+            json!({"title": "Gift ideas", "instructions": "Find gift ideas.",
+            "schedule_kind": "rule", "max_retries": 2,
+            "rule": {"freq": "yearly", "month": 10, "day": 29, "time": "08:00"}, "tz": "UTC"}),
+        )
+        .await;
+        run_now(prep.clone()).await;
+        let mut run = Value::Null;
+        for _ in 0..250 {
+            run = last_run(prep.clone(), "failed").await;
+            if run["retry_at"].is_i64() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(run["retry_at"].is_i64(), "{run}");
+        assert_eq!(t.runs(), 3);
+        // The step after the owner's OK resumes the prepared session. If it
+        // fails after using a tool, the turn does not start over with a
+        // fresh session either (that would repeat the action).
+        std::fs::remove_file(t.dir.join("fail")).unwrap();
+        let asks = create(json!({"title": "Dinner", "instructions": "Order my usual.",
+            "schedule_kind": "rule",
+            "rule": {"freq": "weekly", "days": [6], "time": "17:30"}, "tz": "UTC"}))
+        .await;
+        std::fs::write(t.dir.join("reply"), "Cart ready.\\nNEEDS_OK: Order it.").unwrap();
+        run_now(asks.clone()).await;
+        let run = last_run(asks.clone(), "waiting").await;
+        assert_eq!(t.runs(), 4);
+        std::fs::write(t.dir.join("fail"), "tool").unwrap();
+        let card = run["card_message_id"].as_str().unwrap();
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/messages/{card}/decision"),
+            Some(tok),
+            Some(json!({"approve": true})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let run = last_run(asks.clone(), "failed").await;
+        assert!(run["retry_at"].is_null());
+        assert!(t.read(4, "args").contains("--resume"));
+        assert_eq!(t.runs(), 5, "no fresh-session replay of the acting step");
+        // Nor when it fails without reporting any tool (some CLIs only
+        // report a tool once it has finished).
+        std::fs::remove_file(t.dir.join("fail")).unwrap();
+        let quiet = create(json!({"title": "Lunch", "instructions": "Order lunch.",
+            "schedule_kind": "rule",
+            "rule": {"freq": "weekly", "days": [5], "time": "12:00"}, "tz": "UTC"}))
+        .await;
+        run_now(quiet.clone()).await;
+        let run = last_run(quiet.clone(), "waiting").await;
+        assert_eq!(t.runs(), 6);
+        std::fs::write(t.dir.join("fail"), "plain").unwrap();
+        let card = run["card_message_id"].as_str().unwrap();
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/messages/{card}/decision"),
+            Some(tok),
+            Some(json!({"approve": true})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let run = last_run(quiet.clone(), "failed").await;
+        assert!(run["retry_at"].is_null());
+        assert!(t.read(6, "args").contains("--resume"));
+        assert_eq!(t.runs(), 7, "no fresh-session replay without a tool report");
+        // An acting step whose engine says it is signed out is not handed to
+        // another engine either.
+        std::fs::remove_file(t.dir.join("fail")).unwrap();
+        let coffee = create(
+            json!({"title": "Coffee", "instructions": "Order coffee beans.",
+            "schedule_kind": "rule",
+            "rule": {"freq": "weekly", "days": [1], "time": "08:00"}, "tz": "UTC"}),
+        )
+        .await;
+        run_now(coffee.clone()).await;
+        let run = last_run(coffee.clone(), "waiting").await;
+        std::fs::write(t.dir.join("fail"), "auth").unwrap();
+        let card = run["card_message_id"].as_str().unwrap();
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/messages/{card}/decision"),
+            Some(tok),
+            Some(json!({"approve": true})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        last_run(coffee.clone(), "failed").await;
+        let run_id = run["id"].as_str().unwrap().to_string();
+        let routing = h
+            .state
+            .db
+            .call(move |c| {
+                let r = crate::routines::run::get_run(c, &run_id)?.unwrap();
+                let msgs = crate::db::list_messages(c, &r.conversation_id.unwrap(), None, 10)?;
+                Ok(msgs
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "assistant")
+                    .unwrap()
+                    .meta["routing"]
+                    .clone())
+            })
+            .await
+            .unwrap();
+        assert!(routing["model"].is_string(), "{routing}");
+        assert!(
+            !routing["notes"].to_string().contains("rerouted"),
+            "{routing}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_routine_stops_its_running_turn_and_connector_access() {
+        let t = turn_setup(|_| {}).await;
+        let h = &t.h;
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            "/api/routines",
+            Some(&t.owner_t),
+            Some(
+                json!({"title": "Rent reminder", "instructions": "Text Sam about rent.",
+                        "schedule_kind": "rule", "ask_before_acting": false,
+                        "rule": {"freq": "monthly", "day": 1, "time": "09:00"}, "tz": "UTC"}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let path = format!("/api/routines/{}", b["routine"]["id"].as_str().unwrap());
+        std::fs::write(t.dir.join("hold"), "").unwrap();
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            &format!("{path}/run"),
+            Some(&t.owner_t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let started = t.run_dir(0).join("started");
+        t.wait_for("run", || started.exists()).await;
+        let cfg: Value = serde_json::from_str(&t.read(0, "mcp.json")).unwrap();
+        let token = cfg["mcpServers"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find_map(|s| s["env"][crate::gateway::TOKEN_ENV].as_str())
+            .unwrap()
+            .to_string();
+        assert!(h.state.gateway.grant(&token).is_some());
+        // The attempt recorded that it may act (it does not ask first), so a
+        // restart now would not run it again.
+        let rid = path.rsplit('/').next().unwrap().to_string();
+        let runs = h
+            .state
+            .db
+            .call(move |c| crate::routines::run::list_runs(c, &rid, 1))
+            .await
+            .unwrap();
+        assert!(runs[0].may_act, "{:?}", runs[0]);
+        let (s, _) = send(&h.app, "DELETE", &path, Some(&t.owner_t), None).await;
+        assert_eq!(s, StatusCode::OK);
+        // The CLI is stopped (while still told to hold) and its connector
+        // access is gone.
+        t.wait_for("the turn to stop", || {
+            h.state.running.lock().unwrap().is_empty() && h.state.gateway.grant(&token).is_none()
+        })
+        .await;
+        std::fs::remove_file(t.dir.join("hold")).unwrap();
+        assert_eq!(t.runs(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_routine_prepares_asks_and_acts_after_the_owner_s_ok() {
+        let t = turn_setup(|_| {}).await;
+        let h = &t.h;
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            "/api/routines",
+            Some(&t.owner_t),
+            Some(json!({"title": "Saturday dinner order", "emoji": "🍜",
+                        "instructions": "Build my usual Thai order.", "schedule_kind": "rule",
+                        "rule": {"freq": "weekly", "days": [6], "time": "17:30"}, "tz": "UTC"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let id = b["routine"]["id"].as_str().unwrap().to_string();
+        // Guests never see routines.
+        let (s, _) = send(&h.app, "GET", "/api/routines", Some(&t.guest_t), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        std::fs::write(
+            t.dir.join("reply"),
+            "Thai Orchid is open. Cart: Pad See Ew.\\nNEEDS_OK: Order Pad See Ew for $31.",
+        )
+        .unwrap();
+        let path = format!("/api/routines/{id}");
+        std::fs::write(t.dir.join("hold"), "").unwrap();
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            &format!("{path}/run"),
+            Some(&t.owner_t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("{path}/run"),
+            Some(&t.owner_t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT, "never two runs at once");
+        // Preparing: its connectors refuse to act until the owner says yes.
+        let started = t.run_dir(0).join("started");
+        t.wait_for("preparing run", || started.exists()).await;
+        assert!(t.prepare_only(0));
+        std::fs::remove_file(t.dir.join("hold")).unwrap();
+        let run_status = || async {
+            let (_, b) = send(&h.app, "GET", &path, Some(&t.owner_t), None).await;
+            b["routine"]["runs"][0].clone()
+        };
+        let mut run = Value::Null;
+        for _ in 0..250 {
+            run = run_status().await;
+            if run["status"] == "waiting" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(run["status"], "waiting", "{run}");
+        assert_eq!(run["summary"], "Order Pad See Ew for $31.");
+        // The run was a scheduled job with the routine's instructions.
+        let prompt = t.read(0, "stdin");
+        assert!(prompt.contains("Build my usual Thai order.") && prompt.contains("NEEDS_OK:"));
+        assert!(t.read(0, "system.md").contains("scheduled background job"));
+        // Main chat: what Iris prepared, then the approval card.
+        let main = t.main_of(&t.owner_t).await;
+        let (_, msgs) = send(
+            &h.app,
+            "GET",
+            &format!("/api/conversations/{main}/messages"),
+            Some(&t.owner_t),
+            None,
+        )
+        .await;
+        let msgs = msgs["messages"].as_array().unwrap().clone();
+        assert!(
+            msgs.iter()
+                .any(|m| m["content"] == "Thai Orchid is open. Cart: Pad See Ew.")
+        );
+        let card = msgs
+            .iter()
+            .find(|m| m["card"]["routine_run_id"] == run["id"])
+            .expect("approval card")
+            .clone();
+        assert_eq!(card["card"]["type"], "approval");
+        assert_eq!(card["card"]["preview"]["body"], "Order Pad See Ew for $31.");
+        // The owner says yes: the same conversation continues and acts.
+        std::fs::write(t.dir.join("reply"), "Ordered. It arrives at 6:15.").unwrap();
+        std::fs::write(t.dir.join("hold"), "").unwrap();
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            &format!("/api/messages/{}/decision", card["id"].as_str().unwrap()),
+            Some(&t.owner_t),
+            Some(json!({"approve": true})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        // Acting: the usual connector rules apply.
+        let started = t.run_dir(1).join("started");
+        t.wait_for("acting run", || started.exists()).await;
+        assert!(!t.prepare_only(1));
+        std::fs::remove_file(t.dir.join("hold")).unwrap();
+        for _ in 0..250 {
+            run = run_status().await;
+            if run["status"] == "ok" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(run["status"], "ok", "{run}");
+        assert_eq!(run["summary"], "Ordered. It arrives at 6:15.");
+        assert!(run["approved_at"].is_i64());
+        assert!(t.read(1, "stdin").contains("The owner approved"));
+        assert!(
+            t.read(1, "args").contains("--resume"),
+            "continues the prepared session"
+        );
+
+        // Next time the owner says no: the run is skipped, nothing acts.
+        std::fs::write(t.dir.join("reply"), "Cart ready.\\nNEEDS_OK: Order again.").unwrap();
+        send(
+            &h.app,
+            "POST",
+            &format!("{path}/run"),
+            Some(&t.owner_t),
+            None,
+        )
+        .await;
+        for _ in 0..250 {
+            run = run_status().await;
+            if run["status"] == "waiting" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let card_id = run["card_message_id"].as_str().unwrap().to_string();
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/messages/{card_id}/decision"),
+            Some(&t.owner_t),
+            Some(json!({"approve": false})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let run = run_status().await;
+        assert_eq!(run["status"], "skipped");
+        assert_eq!(run["reason"], "You said no, so I didn't do it.");
+        assert_eq!(t.runs(), 3, "no acting step after a no");
+
+        // A tap after the deadline (before the minute tick closed the card)
+        // is too late: the card closes, the run is skipped, nothing acts.
+        std::fs::write(t.dir.join("reply"), "Cart ready.\\nNEEDS_OK: Order again.").unwrap();
+        send(
+            &h.app,
+            "POST",
+            &format!("{path}/run"),
+            Some(&t.owner_t),
+            None,
+        )
+        .await;
+        let mut run = Value::Null;
+        for _ in 0..250 {
+            run = run_status().await;
+            if run["status"] == "waiting" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(run["status"], "waiting", "{run}");
+        let late_run = run["id"].as_str().unwrap().to_string();
+        h.state
+            .db
+            .call(move |c| {
+                c.execute(
+                    "UPDATE routine_runs SET expires_at = 1 WHERE id = ?1",
+                    [late_run],
+                )
+            })
+            .await
+            .unwrap();
+        let card_id = run["card_message_id"].as_str().unwrap().to_string();
+        let (s, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/messages/{card_id}/decision"),
+            Some(&t.owner_t),
+            Some(json!({"approve": true})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        let run = run_status().await;
+        assert_eq!(run["status"], "skipped", "{run}");
+        assert!(run["approved_at"].is_null());
+        let card = h
+            .state
+            .db
+            .call(move |c| crate::db::get_message(c, &card_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(card.card.unwrap()["state"], "expired");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(t.runs(), 4, "no acting step after the deadline");
+        // Paused: run now is refused politely.
+        h.state
+            .db
+            .call(|c| crate::db::set_setting(c, "paused", "1"))
+            .await
+            .unwrap();
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            &format!("{path}/run"),
+            Some(&t.owner_t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert!(
+            b["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("I'm paused")
+        );
     }
 
     #[tokio::test]
