@@ -3715,6 +3715,24 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
             std::fs::read_to_string(self.run_dir(n).join(file)).unwrap_or_default()
         }
 
+        /// Whether run `n`'s connector access (still running) only prepares.
+        fn prepare_only(&self, n: usize) -> bool {
+            let cfg: Value = serde_json::from_str(&self.read(n, "mcp.json")).unwrap();
+            let token = cfg["mcpServers"]
+                .as_object()
+                .unwrap()
+                .values()
+                .find_map(|s| s["env"][crate::gateway::TOKEN_ENV].as_str())
+                .expect("a connector for this turn")
+                .to_string();
+            self.h
+                .state
+                .gateway
+                .grant(&token)
+                .expect("the turn's grant")
+                .is_prepare_only()
+        }
+
         async fn wait_for(&self, what: &str, mut f: impl FnMut() -> bool) {
             for _ in 0..250 {
                 if f() {
@@ -3850,6 +3868,57 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
     }
 
     #[tokio::test]
+    async fn deleting_a_routine_stops_its_running_turn_and_connector_access() {
+        let t = turn_setup(|_| {}).await;
+        let h = &t.h;
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            "/api/routines",
+            Some(&t.owner_t),
+            Some(
+                json!({"title": "Rent reminder", "instructions": "Text Sam about rent.",
+                        "schedule_kind": "rule", "ask_before_acting": false,
+                        "rule": {"freq": "monthly", "day": 1, "time": "09:00"}, "tz": "UTC"}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let path = format!("/api/routines/{}", b["routine"]["id"].as_str().unwrap());
+        std::fs::write(t.dir.join("hold"), "").unwrap();
+        let (s, b) = send(
+            &h.app,
+            "POST",
+            &format!("{path}/run"),
+            Some(&t.owner_t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let started = t.run_dir(0).join("started");
+        t.wait_for("run", || started.exists()).await;
+        let cfg: Value = serde_json::from_str(&t.read(0, "mcp.json")).unwrap();
+        let token = cfg["mcpServers"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find_map(|s| s["env"][crate::gateway::TOKEN_ENV].as_str())
+            .unwrap()
+            .to_string();
+        assert!(h.state.gateway.grant(&token).is_some());
+        let (s, _) = send(&h.app, "DELETE", &path, Some(&t.owner_t), None).await;
+        assert_eq!(s, StatusCode::OK);
+        // The CLI is stopped (while still told to hold) and its connector
+        // access is gone.
+        t.wait_for("the turn to stop", || {
+            h.state.running.lock().unwrap().is_empty() && h.state.gateway.grant(&token).is_none()
+        })
+        .await;
+        std::fs::remove_file(t.dir.join("hold")).unwrap();
+        assert_eq!(t.runs(), 1);
+    }
+
+    #[tokio::test]
     async fn a_routine_prepares_asks_and_acts_after_the_owner_s_ok() {
         let t = turn_setup(|_| {}).await;
         let h = &t.h;
@@ -3874,6 +3943,7 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
         )
         .unwrap();
         let path = format!("/api/routines/{id}");
+        std::fs::write(t.dir.join("hold"), "").unwrap();
         let (s, b) = send(
             &h.app,
             "POST",
@@ -3892,6 +3962,11 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
         )
         .await;
         assert_eq!(s, StatusCode::CONFLICT, "never two runs at once");
+        // Preparing: its connectors refuse to act until the owner says yes.
+        let started = t.run_dir(0).join("started");
+        t.wait_for("preparing run", || started.exists()).await;
+        assert!(t.prepare_only(0));
+        std::fs::remove_file(t.dir.join("hold")).unwrap();
         let run_status = || async {
             let (_, b) = send(&h.app, "GET", &path, Some(&t.owner_t), None).await;
             b["routine"]["runs"][0].clone()
@@ -3934,6 +4009,7 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
         assert_eq!(card["card"]["preview"]["body"], "Order Pad See Ew for $31.");
         // The owner says yes: the same conversation continues and acts.
         std::fs::write(t.dir.join("reply"), "Ordered. It arrives at 6:15.").unwrap();
+        std::fs::write(t.dir.join("hold"), "").unwrap();
         let (s, b) = send(
             &h.app,
             "POST",
@@ -3943,6 +4019,11 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{b}");
+        // Acting: the usual connector rules apply.
+        let started = t.run_dir(1).join("started");
+        t.wait_for("acting run", || started.exists()).await;
+        assert!(!t.prepare_only(1));
+        std::fs::remove_file(t.dir.join("hold")).unwrap();
         for _ in 0..250 {
             run = run_status().await;
             if run["status"] == "ok" {

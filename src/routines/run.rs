@@ -525,7 +525,9 @@ pub fn build_prompt(
         out.push_str(&format!(
             "This routine checks with the owner before acting. In this run, prepare \
              everything (look things up, fill a cart, draft the message) but do not buy, \
-             order, book, pay, send, post, delete, or submit anything that does. If the task \
+             order, book, pay, send, post, delete, or submit anything. Connected services \
+             refuse those actions in this step, and the browser can only open, read and \
+             scroll pages (no clicking or typing) until the owner says yes. If the task \
              needs one of those actions, end your reply with a last line that starts with \
              `{NEEDS_OK}` followed by one short sentence saying exactly what you will do once \
              they say yes, for example `{NEEDS_OK} Order Pad See Ew from Thai Orchid for $31 \
@@ -638,6 +640,15 @@ fn changed(state: &AppState, owner: &str) {
 async fn broadcast_cards(state: &AppState, cards: &[Message]) {
     for m in cards {
         crate::login::broadcast_updated(state, m).await;
+    }
+}
+
+/// Stop the turns still going in a deleted routine's run conversations:
+/// their connector and browser access ends at once (held approvals are
+/// cancelled) and the CLI is stopped.
+pub fn stop_turns(state: &AppState, conversations: &[String]) {
+    for conv in conversations {
+        crate::turn::cancel(state, conv);
     }
 }
 
@@ -789,6 +800,7 @@ async fn execute(state: &AppState, run_id: &str, step: Step) -> crate::util::Res
             slot: crate::ranking::Slot::Chat,
             owner_user_id: owner.clone(),
             continuity: step == Step::Act,
+            prepare_only: step == Step::Prepare && ctx.routine.spec.ask_before_acting,
         },
     )
     .await;

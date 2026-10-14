@@ -167,6 +167,9 @@ pub struct TurnCtx {
     pub conversation_id: String,
     pub message_id: String,
     pub audience: Vec<String>,
+    /// Preparing an ask-first routine: only tools that look (open pages,
+    /// read, scroll) until the owner says yes.
+    pub look_only: bool,
     used: AtomicBool,
     /// Set when the turn ends; tool calls still in flight stop at their
     /// next check (waits end at once).
@@ -862,12 +865,26 @@ impl Browser {
     // ------------------------------------------------------------- turns
 
     /// Register a turn that is offered the browser tools.
+    #[cfg(test)]
     pub fn begin_turn(
         &self,
         user_id: &str,
         conversation_id: &str,
         message_id: &str,
         audience: &[String],
+    ) -> TurnGuard {
+        self.begin_turn_with(user_id, conversation_id, message_id, audience, false)
+    }
+
+    /// [`Self::begin_turn`], optionally look-only (preparing an ask-first
+    /// routine).
+    pub fn begin_turn_with(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        audience: &[String],
+        look_only: bool,
     ) -> TurnGuard {
         let token = format!("{}{}", new_id(), new_id());
         lock(&self.turns).insert(
@@ -877,6 +894,7 @@ impl Browser {
                 conversation_id: conversation_id.into(),
                 message_id: message_id.into(),
                 audience: audience.to_vec(),
+                look_only,
                 used: AtomicBool::new(false),
                 ended: watch::Sender::new(false),
             }),

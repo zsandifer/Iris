@@ -755,11 +755,17 @@ fn deleting_a_routine_closes_its_open_approval() {
         )
     })
     .unwrap();
-    let cards = db
+    let (conv, _, _) = db
+        .with(|c| run::start_conversation(c, "r1", &owner, &r.spec.title, "prepare"))
+        .unwrap();
+    let deleted = db
         .with(|c| delete_routine(c, &owner, &r.id))
         .unwrap()
         .unwrap();
-    assert_eq!(cards.len(), 1);
+    assert_eq!(deleted.cards.len(), 1);
     assert_eq!(card_state(&db, &m.id), "cancelled");
     assert!(db.with(|c| run::get_run(c, "r1")).unwrap().is_none());
+    // Its run's conversation is handed back so a turn still going there
+    // is stopped.
+    assert_eq!(deleted.stop, [conv]);
 }

@@ -3092,7 +3092,15 @@ from when a run actually started.
 - **Ask before acting** (`ask_before_acting`, default on) runs in two
   steps. The run prepares the work without buying, ordering, booking,
   paying, sending, posting, or deleting anything, and, when an action is
-  needed, ends its reply with a line `NEEDS_OK: <what it will do>`. Iris
+  needed, ends its reply with a line `NEEDS_OK: <what it will do>`. This is
+  enforced, not just asked: during the preparing step the
+  [gateway](#connectors) refuses (never holds or runs) connector calls
+  classified as send, purchase, delete, or unclear, whatever the
+  connection's rules or trusted people say (reads, drafts, other changes
+  such as filling a cart, and exports follow the usual rules), and Iris's
+  browser can only open, read, and scroll pages (no clicking, typing,
+  filling, or dialogs). The refusal tells the agent to finish preparing and
+  ask with `NEEDS_OK:`. Iris
   posts the rest of the reply to Main, then an [`approval`
   card](#server-cards) with `routine_id` and `routine_run_id` (pushed as
   `approval`); the run is `waiting` until `expires_at`
@@ -3100,15 +3108,27 @@ from when a run actually started.
   continues (resumed) and does exactly that; connected services still ask
   for their own approvals. Deny makes the run skipped ("You said no, so I
   didn't do it."); no answer in time expires the card and skips the run
-  ("You didn't answer within 2 hours, so I didn't do it."). Nothing is held
-  open while waiting, so a waiting run survives a restart.
+  ("You didn't answer within 2 hours, so I didn't do it."). The decision
+  and the run's next state are saved together, and a tap after
+  `expires_at` (before the minute tick closed the card) gets `409` and
+  closes the card as expired without acting. Nothing is held open while
+  waiting, so a waiting run survives a restart.
 - **Failures.** A failed run is retried after 1, 5, then 30 minutes, up to
-  `max_retries` times (status `failed` with `retry_at` meanwhile). The acting
-  step after an OK is never retried automatically. A final failure posts a
-  short note in Main ("I couldn't finish your routine “...”. ...").
+  `max_retries` times (status `failed` with `retry_at` meanwhile). An
+  attempt that may have acted is never retried automatically: the acting
+  step after an OK, and a routine without ask before acting whose failed
+  attempt used any tool. A retry that came due while Iris was offline or
+  paused follows the missed-slot rule (at most 5 minutes late for `skip`,
+  an hour for `run_latest_in_window`), else the run is recorded as failed.
+  A final failure posts a short note in Main ("I couldn't finish your
+  routine “...”. ...").
 - **Restarts.** Runs that were going when Iris stopped are recovered at
-  startup: the preparing step is retried (if retries are left and it is at
-  most an hour late), an interrupted acting step is recorded as failed.
+  startup: an ask-first routine's preparing step is retried (if retries are
+  left and it is at most an hour late); an interrupted acting step, or an
+  interrupted run of a routine that does not ask first, is recorded as
+  failed ("Check what happened before running it again.").
+- **Deleting** a routine also stops its running turn at once (its connector
+  and browser access end, and any held connector approval is cancelled).
 
 ### For you pipeline
 

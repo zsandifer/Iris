@@ -359,6 +359,7 @@ pub async fn run_job(state: &AppState, job: Job, manual: bool) -> crate::util::R
             slot: crate::ranking::Slot::Background,
             owner_user_id: owner.clone(),
             continuity: false,
+            prepare_only: false,
         },
     )
     .await;

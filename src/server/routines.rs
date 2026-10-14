@@ -233,12 +233,13 @@ async fn remove(
 ) -> ApiResult {
     user.require_owner()?;
     let (o, i) = (user.id().to_string(), id.clone());
-    let cards = state
+    let deleted = state
         .db
         .call(move |c| routines::delete_routine(c, &o, &i))
         .await?
         .ok_or_else(|| ApiError::not_found("routine"))?;
-    broadcast(&state, &cards).await;
+    routines::run::stop_turns(&state, &deleted.stop);
+    broadcast(&state, &deleted.cards).await;
     changed(&state, user.id());
     ok(json!({"deleted": true}))
 }
@@ -471,6 +472,7 @@ async fn approve(
         })
         .await?
         .map_err(|e| ApiError::new(StatusCode::CONFLICT, "conflict", e))?;
+    routines::run::stop_turns(&state, &decided.stop);
     broadcast(&state, &decided.cards).await;
     changed(&state, user.id());
     match decided.routine {

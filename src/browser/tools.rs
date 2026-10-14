@@ -54,6 +54,28 @@ pub const ALLOWED: &[&str] = &[
     "browser_mouse_wheel",
 ];
 
+/// What a turn preparing an ask-first routine may use: open, read, and
+/// scroll pages. Clicking, typing, filling and dialogs wait for the
+/// owner's OK (a click can place an order).
+const LOOK: &[&str] = &[
+    "browser_navigate",
+    "browser_navigate_back",
+    "browser_tabs",
+    "browser_snapshot",
+    "browser_find",
+    "browser_take_screenshot",
+    "browser_wait_for",
+    "browser_hover",
+    "browser_mouse_move_xy",
+    "browser_mouse_wheel",
+    super::own::RESTART,
+];
+
+const LOOK_ONLY: &str = "Not done: this routine checks with the owner before acting, and this \
+     step only prepares, so the browser can only open, read and scroll pages right now. Note \
+     what you would click or type, then end your reply with a NEEDS_OK: line saying exactly what \
+     you will do; you can do it once the owner says yes.";
+
 /// Tools that only change which page is open (or answer a dialog), so
 /// they stay usable while the current page holds the owner's private
 /// details.
@@ -385,6 +407,9 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     let own = super::own::TOOLS.contains(&name);
     if !ALLOWED.contains(&name) && !fill && !own {
         return error(format!("unknown tool {name}"));
+    }
+    if ctx.look_only && !LOOK.contains(&name) {
+        return error(LOOK_ONLY);
     }
     let args = if args.is_null() {
         json!({})
@@ -1046,5 +1071,46 @@ pub(crate) mod tests {
                 .is_empty()
         );
         assert_eq!(list(&state, "bogus").await, json!({"tools": []}));
+    }
+
+    #[tokio::test]
+    async fn preparing_an_ask_first_routine_can_only_look() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let b = &state.browser;
+        let turn = b.begin_turn_with("owner", "conv", "m", &[], true);
+        // Clicking, typing, filling and dialogs wait for the owner's OK.
+        for (name, args) in [
+            (
+                "browser_click",
+                json!({"ref": "e9", "element": "Place order"}),
+            ),
+            ("browser_type", json!({"ref": "e2", "text": "hi"})),
+            ("browser_press_key", json!({"key": "Enter"})),
+            ("browser_handle_dialog", json!({"accept": true})),
+            ("browser_mouse_click_xy", json!({"x": 1, "y": 2})),
+            ("fill_saved_card", json!({})),
+        ] {
+            let out = call(&state, turn.token(), name, &args).await;
+            assert_eq!(out["isError"], true, "{name}");
+            assert_eq!(
+                out["content"][0]["text"].as_str(),
+                Some(LOOK_ONLY),
+                "{name}"
+            );
+        }
+        // Looking is not refused for that reason.
+        let out = call(&state, turn.token(), "browser_snapshot", &json!({})).await;
+        assert_ne!(out["content"][0]["text"].as_str(), Some(LOOK_ONLY));
+        // An ordinary turn may click.
+        let normal = b.begin_turn("owner", "conv2", "m2", &[]);
+        let out = call(
+            &state,
+            normal.token(),
+            "browser_click",
+            &json!({"ref": "e9"}),
+        )
+        .await;
+        assert_ne!(out["content"][0]["text"].as_str(), Some(LOOK_ONLY));
     }
 }

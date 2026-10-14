@@ -47,6 +47,10 @@ pub struct TurnInput {
     /// Resume the harness session and replay unseen messages. Jobs run
     /// fresh every time.
     pub continuity: bool,
+    /// Preparing an ask-first routine: connectors refuse sending, buying,
+    /// deleting and calls Iris cannot place, and the browser can only look,
+    /// until the owner says yes.
+    pub prepare_only: bool,
 }
 
 pub struct TurnResult {
@@ -400,11 +404,13 @@ async fn run_locked(
     // holds the owner's sign-ins). Dropping the guard ends the browser peek.
     let browser_turn = if scope == Scope::Private && browser_allowed(state) {
         let users = audience.current(state).await.to_vec();
-        Some(
-            state
-                .browser
-                .begin_turn(&input.owner_user_id, conv_id, msg_id, &users),
-        )
+        Some(state.browser.begin_turn_with(
+            &input.owner_user_id,
+            conv_id,
+            msg_id,
+            &users,
+            input.prepare_only,
+        ))
     } else {
         None
     };
@@ -561,6 +567,7 @@ async fn run_locked(
                 msg_id,
                 scope,
                 browser_token,
+                input.prepare_only,
             )
             .await
         } else {
@@ -1837,6 +1844,7 @@ async fn load_images(state: &AppState, m: &Message) -> Vec<ImageInput> {
 /// conversations (more than one person) the bridge also only offers cards,
 /// so other members cannot reach the owner's goals, feed, or library
 /// through the agent.
+#[allow(clippy::too_many_arguments)]
 async fn mcp_servers(
     state: &AppState,
     user_id: &str,
@@ -1845,6 +1853,7 @@ async fn mcp_servers(
     message_id: &str,
     scope: Scope,
     browser_token: Option<&str>,
+    prepare_only: bool,
 ) -> (
     Vec<McpServer>,
     Option<crate::gateway::GrantGuard>,
@@ -1914,7 +1923,16 @@ async fn mcp_servers(
             timeout_secs: Some(state.cfg.approval_timeout_secs() + 300),
         });
     }
-    match crate::gateway::grant_for_turn(state, user_id, conv_id, conv_kind, message_id).await {
+    match crate::gateway::grant_for_turn(
+        state,
+        user_id,
+        conv_id,
+        conv_kind,
+        message_id,
+        prepare_only,
+    )
+    .await
+    {
         Some((connectors, guard)) => {
             servers.extend(connectors);
             (servers, Some(guard), browser_name.map(String::from))
@@ -1999,6 +2017,7 @@ pub async fn start_chat_turn(
         slot: Slot::Chat,
         owner_user_id: owner_user_id.to_string(),
         continuity: true,
+        prepare_only: false,
     };
     let st = state.clone();
     tokio::spawn(async move {
@@ -2210,6 +2229,7 @@ mod tests {
             slot: Slot::Chat,
             owner_user_id: owner.clone(),
             continuity: true,
+            prepare_only: false,
         };
         finish(
             &state,
@@ -2872,21 +2892,40 @@ printf '%s\n' '{"type":"init","session_id":"pre-join-session"}' \
             "m",
             Scope::Private,
             Some("t"),
+            false,
         )
         .await;
         assert_eq!(b.as_deref(), Some("browser"));
         assert_eq!(names(&s), ["iris", "browser"]);
         // Shared chats and turns without a token never get it.
         assert_eq!(
-            mcp_servers(&state, &owner, &conv, "main", "m", Scope::Shared, Some("t"))
-                .await
-                .2,
+            mcp_servers(
+                &state,
+                &owner,
+                &conv,
+                "main",
+                "m",
+                Scope::Shared,
+                Some("t"),
+                false
+            )
+            .await
+            .2,
             None
         );
         assert_eq!(
-            mcp_servers(&state, &owner, &conv, "main", "m", Scope::Private, None)
-                .await
-                .2,
+            mcp_servers(
+                &state,
+                &owner,
+                &conv,
+                "main",
+                "m",
+                Scope::Private,
+                None,
+                false
+            )
+            .await
+            .2,
             None
         );
         // An older connector named "browser" (even switched off) keeps it.
@@ -2899,6 +2938,7 @@ printf '%s\n' '{"type":"init","session_id":"pre-join-session"}' \
             "m",
             Scope::Private,
             Some("t"),
+            false,
         )
         .await;
         assert_eq!(b.as_deref(), Some("iris_browser"));
@@ -2912,6 +2952,7 @@ printf '%s\n' '{"type":"init","session_id":"pre-join-session"}' \
             "m",
             Scope::Private,
             Some("t"),
+            false,
         )
         .await;
         assert_eq!(b, None);

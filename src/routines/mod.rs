@@ -521,13 +521,23 @@ pub fn save_routine(
     Ok(())
 }
 
+/// What deleting a routine leaves to do.
+#[derive(Debug, Default)]
+pub struct Deleted {
+    /// Cards it closed, to broadcast.
+    pub cards: Vec<Message>,
+    /// Its runs' conversations: a turn still going in one must stop now
+    /// (`run::stop_turns`).
+    pub stop: Vec<String>,
+}
+
 /// Delete a routine, its runs' hidden conversations, and close any
-/// approval card still waiting on one of its runs. Returns updated cards.
+/// approval card still waiting on one of its runs.
 pub fn delete_routine(
     conn: &Connection,
     owner: &str,
     id: &str,
-) -> rusqlite::Result<Option<Vec<Message>>> {
+) -> rusqlite::Result<Option<Deleted>> {
     db::write_tx(conn, |c| {
         if get_routine(c, owner, id)?.is_none() {
             return Ok(None);
@@ -548,13 +558,20 @@ pub fn delete_routine(
         for m in set_change_cards(c, id, None, "cancelled")? {
             cards.push(m);
         }
+        let stop: Vec<String> = c
+            .prepare(
+                "SELECT conversation_id FROM routine_runs
+                 WHERE routine_id = ?1 AND conversation_id IS NOT NULL",
+            )?
+            .query_map([id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         c.execute(
             "DELETE FROM conversations WHERE kind = 'job' AND id IN (
                  SELECT conversation_id FROM routine_runs WHERE routine_id = ?1)",
             [id],
         )?;
         c.execute("DELETE FROM routines WHERE id = ?1", [id])?;
-        Ok(Some(cards))
+        Ok(Some(Deleted { cards, stop }))
     })
 }
 
@@ -1105,6 +1122,8 @@ fn find(conn: &Connection, owner: &str, id: &str) -> Result<Routine, String> {
 pub struct Decided {
     pub routine: Option<Routine>,
     pub cards: Vec<Message>,
+    /// Conversations whose turns must stop (a deleted routine's runs).
+    pub stop: Vec<String>,
 }
 
 /// The owner approves a proposed change. `edited` replaces a proposed new
@@ -1141,10 +1160,12 @@ pub fn approve_change(
         let cards = set_cards(c, &change_card_ids(c, &change.id)?, "approved")?;
         if change.action == "delete" {
             let mut cards = cards;
-            cards.extend(delete_routine(c, owner, &routine.id)?.unwrap_or_default());
+            let deleted = delete_routine(c, owner, &routine.id)?.unwrap_or_default();
+            cards.extend(deleted.cards);
             return Ok(Decided {
                 routine: None,
                 cards,
+                stop: deleted.stop,
             });
         }
         let target = match (change.action.as_str(), state, routine.state) {
@@ -1157,6 +1178,7 @@ pub fn approve_change(
         Ok(Decided {
             routine: get_routine(c, owner, &routine.id)?,
             cards,
+            stop: Vec::new(),
         })
     })
     .map_err(fail)
@@ -1183,11 +1205,13 @@ pub fn decline_change(conn: &Connection, owner: &str, change_id: &str) -> Result
             return Ok(Decided {
                 routine: None,
                 cards,
+                stop: Vec::new(),
             });
         }
         Ok(Decided {
             routine: Some(routine.clone()),
             cards,
+            stop: Vec::new(),
         })
     })
     .map_err(fail)

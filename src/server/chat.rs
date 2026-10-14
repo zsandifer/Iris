@@ -679,7 +679,7 @@ enum Decided {
     Done(Box<(db::Message, db::Message, Option<String>)>),
     /// A routine run's card whose deadline passed (closed now, if it was
     /// still open).
-    Expired(Option<db::Message>),
+    Expired(Option<Box<db::Message>>),
     Conflict,
 }
 
@@ -754,7 +754,7 @@ async fn decide_approval(
                             // Past its deadline, or the run is gone: the
                             // card closes and nothing happens.
                             let closed = crate::routines::run::close_card(c, &mid, "expired")?;
-                            return Ok(Decided::Expired(closed));
+                            return Ok(Decided::Expired(closed.map(Box::new)));
                         }
                     }
                 }

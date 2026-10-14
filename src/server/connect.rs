@@ -1471,9 +1471,10 @@ mod tests {
             .db
             .with(|c| crate::db::ensure_main_conversation(c, &owner))
             .unwrap();
-        let (servers, _guard) = crate::gateway::grant_for_turn(&state, &owner, &main, "main", "m1")
-            .await
-            .unwrap();
+        let (servers, _guard) =
+            crate::gateway::grant_for_turn(&state, &owner, &main, "main", "m1", false)
+                .await
+                .unwrap();
         let crate::harness::McpTransport::Stdio { env, .. } = &servers[0].transport;
         let r = crate::gateway::handle(
             &state,

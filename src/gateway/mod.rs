@@ -43,6 +43,13 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, watch};
 use upstream::{Launch, Upstream, UpstreamError};
 
+/// Told to the agent when it tries to act while preparing an ask-first
+/// routine.
+pub const PREPARE_ONLY: &str = "Not done: this routine checks with the owner before acting, and \
+     this step only prepares. Do not send, buy, order, book, pay, delete or submit anything now. \
+     Finish preparing, then end your reply with a NEEDS_OK: line saying exactly what you will do; \
+     you can do it once the owner says yes.";
+
 /// Environment variable carrying the per-turn gateway token to the proxy.
 pub const TOKEN_ENV: &str = "IRIS_GATEWAY_TOKEN";
 /// Largest request a proxy may send (tool arguments).
@@ -67,8 +74,19 @@ pub struct Grant {
     private_conversation: Option<String>,
     /// Connector names this turn may use.
     pub connectors: Vec<String>,
+    /// Preparing an ask-first routine: calls that act (send, buy, delete,
+    /// or that Iris cannot place) are refused until the owner says yes.
+    prepare_only: bool,
     cancel: watch::Sender<bool>,
     current_turn: Mutex<(String, String)>,
+}
+
+impl Grant {
+    /// Whether this turn only prepares an ask-first routine.
+    #[cfg(test)]
+    pub(crate) fn is_prepare_only(&self) -> bool {
+        self.prepare_only
+    }
 }
 
 /// Removes the grant (and cancels its pending approvals) when the turn
@@ -228,6 +246,7 @@ pub async fn grant_for_turn(
     conversation_id: &str,
     conversation_kind: &str,
     message_id: &str,
+    prepare_only: bool,
 ) -> Option<(Vec<McpServer>, GrantGuard)> {
     if state.is_paused().await {
         return None;
@@ -277,6 +296,7 @@ pub async fn grant_for_turn(
                 private_conversation: (conversation_kind != "job")
                     .then(|| conversation_id.to_string()),
                 connectors: names.clone(),
+                prepare_only,
                 current_turn: Mutex::default(),
                 cancel,
             }),
@@ -1349,6 +1369,14 @@ pub async fn call_tool(
         ..ConnectorCall::default()
     };
 
+    if grant.prepare_only && policy::acts(category) {
+        // Refused, not held: the routine's own approval card comes first,
+        // and the acting step runs this call through the usual rules.
+        call.decision = "blocked".into();
+        call.reason = "the routine was only preparing; it asks the owner before acting".into();
+        record(state, &call).await;
+        return tool_error(PREPARE_ONLY);
+    }
     if let Verdict::Block(reason) = &verdict {
         call.decision = "blocked".into();
         call.reason = reason.clone();
@@ -1991,6 +2019,7 @@ pub(crate) async fn approve_browser_card(
         message_id: ctx.message_id.clone(),
         private_conversation: Some(ctx.conversation_id.clone()),
         connectors: Vec::new(),
+        prepare_only: ctx.look_only,
         cancel: ctx.cancellation(),
         current_turn: Mutex::default(),
     };

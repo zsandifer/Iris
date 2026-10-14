@@ -939,9 +939,10 @@ mod tests {
     #[tokio::test]
     async fn turn_token_expires_and_a_join_revokes_status_and_requests() {
         let (_tmp, state, owner, conv) = fixture();
-        let (_, guard) = crate::gateway::grant_for_turn(&state, &owner, &conv, "main", "turn")
-            .await
-            .unwrap();
+        let (_, guard) =
+            crate::gateway::grant_for_turn(&state, &owner, &conv, "main", "turn", false)
+                .await
+                .unwrap();
         let token = guard.status_token("codex", "test-model");
         let envelope = |tool: &str| json!({"token": token, "awareness": true, "request": {"id": 1, "method": "tools/call", "params": {"name": tool, "arguments": {"engine": "codex"}}}});
         let value = crate::gateway::handle(&state, &envelope("system_status")).await;
