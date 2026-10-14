@@ -30,6 +30,7 @@ mod persona;
 mod push;
 mod ranking;
 mod router;
+mod routines;
 mod secrets;
 mod server;
 mod setup;
