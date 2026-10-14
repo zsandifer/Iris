@@ -184,8 +184,10 @@ export function FileEditor({ area, path }) {
     try { await del(url); back(); } catch (e) { toast(e.message); }
   };
   const name = path.split('/').pop();
-  // HTML comments are notes for whoever edits the file; the view hides them.
-  const shown = (text || '').replace(/<!--[\s\S]*?-->/g, '');
+  // HTML comments are notes for whoever edits the file; the view hides them
+  // (md() still escapes whatever is left).
+  let shown = text || '';
+  for (let prev; prev !== shown;) { prev = shown; shown = shown.replace(/<!--[\s\S]*?-->/g, ''); }
   return html`<${Page} title=${system ? fill(FRIENDLY[path] || path) : name} sub=${system ? path : `${area}/${path}`}
     right=${readOnly || text == null ? null : editing
       ? html`<button class="b1 sm" disabled=${busy || (!dirty && !orig.trim())} onClick=${dirty ? save : () => setEditing(false)}>${dirty ? 'Save' : 'Done'}</button>`
