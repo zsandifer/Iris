@@ -475,19 +475,57 @@ pub fn describe_once(dt: DateTime) -> String {
 }
 
 /// Check a cron pattern does not run more often than every
-/// `MIN_CRON_GAP_MINS` (each run starts an AI engine).
-pub fn check_cron_gap(plan: &Plan, from_ms: i64) -> Result<(), String> {
-    let runs = plan.upcoming(from_ms, 12, None);
-    if runs
-        .windows(2)
-        .any(|w| w[1] - w[0] < MIN_CRON_GAP_MINS * 60_000)
-    {
-        return Err(format!(
+/// `MIN_CRON_GAP_MINS` (each run starts an AI engine): over a whole day of
+/// its minute and hour fields (any two of its times of day, including the
+/// step from the last time of one day to the first of the next), and over
+/// its next runs (which also covers daylight-saving jumps).
+pub fn check_cron_gap(plan: &Plan, expr: &str, from_ms: i64) -> Result<(), String> {
+    let too_often = || {
+        format!(
             "That custom schedule runs too often. Routines can run at most every \
              {MIN_CRON_GAP_MINS} minutes."
-        ));
+        )
+    };
+    let gap = MIN_CRON_GAP_MINS * 60_000;
+    let runs = plan.upcoming(from_ms, 12, None);
+    if runs.windows(2).any(|w| w[1] - w[0] < gap) {
+        return Err(too_often());
+    }
+    let mins = day_minutes(expr)?;
+    if let (Some(first), Some(last)) = (mins.first(), mins.last())
+        && (mins.windows(2).any(|w| w[1] - w[0] < MIN_CRON_GAP_MINS)
+            || first + 24 * 60 - last < MIN_CRON_GAP_MINS)
+    {
+        return Err(too_often());
     }
     Ok(())
+}
+
+/// The minutes of the day (0..1440) a cron pattern's minute and hour
+/// fields allow, in order. Shorthands (`@daily`) run at most hourly.
+fn day_minutes(expr: &str) -> Result<Vec<i64>, String> {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 5 {
+        return Ok(Vec::new());
+    }
+    let daily = parse_cron(&format!("{} {} * * *", fields[0], fields[1]))?;
+    let tz = TimeZone::UTC;
+    let start = DateTime::constant(2024, 1, 1, 0, 0, 0, 0)
+        .to_zoned(tz.clone())
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    let mut from = start.clone();
+    let mut inclusive = true;
+    while let Ok(next) = daily.find_next_occurrence(&from, inclusive) {
+        let mins = (next.timestamp().as_second() - start.timestamp().as_second()) / 60;
+        if mins >= 24 * 60 {
+            break;
+        }
+        out.push(mins);
+        from = next;
+        inclusive = false;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -774,8 +812,25 @@ mod tests {
             when: When::Cron(Box::new(parse_cron("*/5 * * * *").unwrap())),
             ..plan.clone()
         };
-        assert!(check_cron_gap(&often, 0).is_err());
-        assert!(check_cron_gap(&plan, 0).is_ok());
+        assert!(check_cron_gap(&often, "*/5 * * * *", 0).is_err());
+        assert!(check_cron_gap(&plan, "0 3 * * *", 0).is_ok());
+        // A short gap late in the day, past the first dozen runs, still
+        // counts: 20:40 and 21:00 are 20 minutes apart.
+        let late = "0,40 8-20/2,21 * * *";
+        let late_plan = Plan {
+            when: When::Cron(Box::new(parse_cron(late).unwrap())),
+            ..plan.clone()
+        };
+        assert!(check_cron_gap(&late_plan, late, 0).is_err());
+        // And so does the step from one day's last run to the next day's first.
+        let wrap = "10,50 0,23 * * *";
+        let wrap_plan = Plan {
+            when: When::Cron(Box::new(parse_cron(wrap).unwrap())),
+            ..plan.clone()
+        };
+        assert!(check_cron_gap(&wrap_plan, wrap, 0).is_err());
+        assert_eq!(day_minutes("15 9,17 * * 1-5").unwrap(), [555, 1035]);
+        assert!(day_minutes("@daily").unwrap().is_empty());
     }
 
     #[test]

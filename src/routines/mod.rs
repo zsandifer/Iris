@@ -264,7 +264,7 @@ impl Spec {
             return Err("The end date is before the start date.".into());
         }
         if matches!(plan.when, When::Cron(_)) {
-            schedule::check_cron_gap(&plan, now)?;
+            schedule::check_cron_gap(&plan, self.cron_expr.as_deref().unwrap_or(""), now)?;
         }
         Ok(plan)
     }
