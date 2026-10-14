@@ -21,6 +21,7 @@ pub fn resolved(card: &Value) -> bool {
                 | "expired"
                 | "cancelled"
                 | "saved"
+                | "superseded"
         )
     )
 }

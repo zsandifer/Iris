@@ -1655,11 +1655,13 @@ async fn finish(
         .call(move |db| db::messages_between(db, &c, after, i64::MAX))
         .await
     {
-        // Agent cards only: server cards (approvals, notices) were sent
-        // live when they were posted.
+        // Agent cards (and routine proposals made through the bridge)
+        // only: server cards (approvals, notices) were sent live when they
+        // were posted.
         let agent_card = |m: &Message| {
             m.card.as_ref().is_some_and(|c| {
-                crate::entities::CARD_TYPES.contains(&c["type"].as_str().unwrap_or(""))
+                let ty = c["type"].as_str().unwrap_or("");
+                crate::entities::CARD_TYPES.contains(&ty) || ty == "routine"
             })
         };
         for m in new
@@ -1737,6 +1739,7 @@ fn changed_entity_kinds(activities: &[Activity]) -> Vec<&'static str> {
             t if t.contains("idea") => "ideas",
             t if t.contains("feed") => "feed",
             t if t.contains("library") => "library",
+            t if t.contains("routine") => "routines",
             _ => continue,
         };
         if !kinds.contains(&kind) {

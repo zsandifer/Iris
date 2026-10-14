@@ -413,6 +413,13 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
             .init_allow_no_sandbox(state.setting(server::ALLOW_NO_SANDBOX).await.is_some());
         state.set_serving();
         gateway::expire_stale_approvals(&state).await;
+        let recovered = state
+            .db
+            .call(|c| routines::run::recover(c, util::now_ms()))
+            .await?;
+        if recovered > 0 {
+            warn!("{recovered} routine run(s) were interrupted by the last shutdown");
+        }
         gateway::listen(state.clone())?;
         let probe = state.clone();
         tokio::spawn(async move {

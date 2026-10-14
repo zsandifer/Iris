@@ -8,6 +8,8 @@
 //!   helper, with history and morning-card data.
 //! - feed: the For you pipeline (`crate::feed`): mostly code, plus at most
 //!   two small model calls a day. Publishes one batch per local day.
+//! - routines: the owner's own scheduled jobs (`crate::routines`), checked
+//!   on the same minute tick.
 
 use crate::config::{JobConfig, parse_hhmm};
 use crate::db::{self, NewMessage};
@@ -250,6 +252,7 @@ pub fn spawn_scheduler(state: AppState) {
             }
             // Notifications held during quiet hours go out once they end.
             crate::notify::spawn_flush_quiet(&state);
+            crate::routines::run::tick(&state).await;
             for job in Job::ALL {
                 let last = state
                     .setting(job.last_run_key())
@@ -424,6 +427,18 @@ pub async fn post_to_main(
     source: &db::Message,
     initiated_by: &str,
 ) -> crate::util::Result<()> {
+    post_to_main_opts(state, user_id, text, source, initiated_by, true).await
+}
+
+/// [`post_to_main`], pushing a notification only when `push` is set.
+pub async fn post_to_main_opts(
+    state: &AppState,
+    user_id: &str,
+    text: &str,
+    source: &db::Message,
+    initiated_by: &str,
+    push: bool,
+) -> crate::util::Result<()> {
     let (uid, text_s) = (user_id.to_string(), text.to_string());
     let meta = json!({"initiated_by": initiated_by, "routing": source.meta.get("routing")});
     let (harness, model, effort) = (
@@ -454,6 +469,9 @@ pub async fn post_to_main(
         &[user_id.to_string()],
         json!({"type": "message.created", "conversation_id": msg.conversation_id, "message": msg}),
     );
+    if !push {
+        return Ok(());
+    }
     let title = state.agent_name().await;
     crate::notify::push_users(
         state,

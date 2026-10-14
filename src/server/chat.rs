@@ -757,6 +757,14 @@ async fn decide_approval(
     // Release the held connector call, if one is waiting.
     crate::gateway::decided(&state, &id, body.approve);
     crate::login::broadcast_updated(&state, &updated).await;
+    // A routine waiting for this OK continues (or is skipped).
+    if let Some(run) = updated
+        .card
+        .as_ref()
+        .and_then(|c| c["routine_run_id"].as_str())
+    {
+        crate::routines::run::decided(&state, run, body.approve).await;
+    }
     ok(json!({"message": updated}))
 }
 

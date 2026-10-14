@@ -2074,6 +2074,7 @@ pub fn cancel_approvals(state: &AppState, connector_id: Option<&str>) {
 }
 
 /// After a restart nothing waits for old approval cards: close them.
+/// Routine approvals hold nothing open and keep waiting (`routines::run`).
 pub async fn expire_stale_approvals(state: &AppState) {
     let closed = state
         .db
@@ -2081,7 +2082,8 @@ pub async fn expire_stale_approvals(state: &AppState) {
             let mut stmt = c.prepare(
                 "SELECT id FROM messages WHERE kind = 'card'
                    AND json_extract(card, '$.type') = 'approval'
-                   AND json_extract(card, '$.state') = 'pending'",
+                   AND json_extract(card, '$.state') = 'pending'
+                   AND json_extract(card, '$.routine_run_id') IS NULL",
             )?;
             let ids: Vec<String> = stmt
                 .query_map([], |r| r.get(0))?
