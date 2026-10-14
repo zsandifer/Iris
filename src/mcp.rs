@@ -1458,31 +1458,99 @@ mod tests {
             call(&b, "get_memory", json!({"ids":[next]}))["isError"],
             true
         );
+        let note = call(
+            &b,
+            "remember",
+            json!({"text":"Likes hiking", "kind":"fact"}),
+        );
+        let live_id = note["structuredContent"]["item"]["id"].as_i64().unwrap();
+        let args = [
+            ("search_memory", json!({"query":"hiking"})),
+            ("get_memory", json!({"ids":[live_id]})),
+            (
+                "remember",
+                json!({"text":"Another safe note", "kind":"fact"}),
+            ),
+            ("update_memory", json!({"id":live_id,"importance":5})),
+            ("forget", json!({"id":live_id})),
+            ("search_conversations", json!({"query":"practice"})),
+        ];
+        let snapshot = |b: &Bridge| {
+            b.db.with(|c| Ok(json!({"notes":crate::memory::live(c)?,"history":c.query_row("SELECT COUNT(*) FROM memory_history",[],|r| r.get::<_,i64>(0))?}))).unwrap()
+        };
+        let before = snapshot(&b);
+        let denied = |b: &Bridge| {
+            for (name, args) in &args {
+                let reply = call(b, name, args.clone());
+                assert_eq!(reply["isError"], true, "{name}: {reply}");
+                let error = reply["content"][0]["text"].as_str().unwrap();
+                assert!(
+                    error.contains("shared conversations")
+                        || error.contains("owner's private chats"),
+                    "{name}: {error}"
+                );
+            }
+            assert_eq!(snapshot(b), before);
+            let tools = b.handle(&json!({"id":1,"method":"tools/list"})).unwrap();
+            assert!(
+                !tools["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| crate::memory::recall::TOOLS.contains(&t["name"].as_str().unwrap()))
+            );
+        };
         b.shared = true;
-        for name in crate::memory::recall::TOOLS {
-            assert_eq!(call(&b, name, json!({}))["isError"], true);
-        }
+        denied(&b);
         b.shared = false;
         b.db.with(|c| {
             c.execute("INSERT INTO users(id,display_name,created_at) VALUES ('guest','Guest',0)", [])?;
             c.execute("INSERT INTO conversation_members(conversation_id,user_id,joined_at) VALUES (?1,'guest',0)", [b.conversation_id.as_deref().unwrap()])?;
             Ok(())
         }).unwrap();
-        // A bridge created before the join must not retain access.
-        for name in crate::memory::recall::TOOLS {
-            assert_eq!(call(&b, name, json!({}))["isError"], true);
-        }
-        let tools = b.handle(&json!({"id":1,"method":"tools/list"})).unwrap();
-        assert!(
-            !tools["result"]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|t| crate::memory::recall::TOOLS.contains(&t["name"].as_str().unwrap()))
-        );
+        denied(&b); // A bridge created before the join must not retain access.
+        let guest_chat =
+            b.db.with(|c| crate::db::create_conversation(c, "guest", "side", "Guest chat", None))
+                .unwrap();
         b.user_id = "guest".into();
-        for name in crate::memory::recall::TOOLS {
-            assert_eq!(call(&b, name, json!({}))["isError"], true);
+        b.conversation_id = Some(guest_chat.id);
+        denied(&b); // A guest's own sole-member conversation is also denied.
+    }
+
+    #[test]
+    fn credential_formats_are_scrubbed_by_tools_and_legacy_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = bridge(tmp.path());
+        for secret in [
+            r#"{"password":"synthetic-canary"}"#,
+            "**password**: synthetic-canary",
+            "Uses a password manager; password: synthetic-canary",
+            r#"{"value":"sk-synthetic0000000000000000"}"#,
+        ] {
+            let text = format!("Likes tea\n{secret}");
+            assert_eq!(
+                call(&b, "remember", json!({"text":text,"kind":"fact"}))["isError"],
+                false
+            );
+            assert_eq!(
+                call(
+                    &b,
+                    "write_memory",
+                    json!({"path":"you.md","content":format!("- {text}")})
+                )["isError"],
+                false
+            );
+            crate::memory::files::import_notes(&b.db, &b.paths, &[("you.md".into(), text)])
+                .unwrap();
+        }
+        let notes = b.db.with(crate::memory::live).unwrap();
+        let history =
+            b.db.with(|c| crate::memory::recall::history(c, notes[0].id))
+                .unwrap();
+        let export = std::fs::read_to_string(b.paths.memory_dir().join("MEMORY.md")).unwrap();
+        for content in [json!(notes).to_string(), json!(history).to_string(), export] {
+            assert!(!content.contains("synthetic-canary"));
+            assert!(!content.contains("sk-synthetic"));
         }
     }
 

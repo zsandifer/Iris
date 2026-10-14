@@ -482,6 +482,8 @@ ALTER TABLE memory_items ADD COLUMN core_since INTEGER;
 ALTER TABLE memory_items ADD COLUMN core_written_batch TEXT;
 "#,
     r#"
+-- Supports the legacy file writer's stale hash checks after edits/deletes.
+CREATE INDEX memory_history_before_hash_at ON memory_history(json_extract(before, '$.content_hash'), at);
 -- Only owner-alone human chats are recallable. Once membership changes,
 -- purge the conversation rather than reclassifying formerly shared text.
 CREATE VIEW memory_private_messages AS

@@ -63,36 +63,46 @@ pub fn scrub_document(text: &str) -> String {
         ]
         .iter()
         .any(|label| {
-            low.find(label)
-                .is_some_and(|at| low[at + label.len()..].trim_start().starts_with([':', '=']))
+            low.match_indices(label).any(|(at, _)| {
+                low[at + label.len()..]
+                    .trim_start_matches(|c: char| {
+                        c.is_whitespace() || matches!(c, '\'' | '"' | '`' | '*' | '_')
+                    })
+                    .starts_with([':', '='])
+            })
         }) || low.contains("bearer ");
         if credential {
             continue;
         }
+        let mut spans = Vec::new();
+        for prefix in [
+            "sk-",
+            "ghp_",
+            "github_pat_",
+            "gho_",
+            "xoxb-",
+            "xoxp-",
+            "AIza",
+            "AKIA",
+        ] {
+            for (at, _) in line.match_indices(prefix) {
+                let length = line[at..]
+                    .bytes()
+                    .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+                    .count();
+                if length >= 16 {
+                    spans.push((at, at + length));
+                }
+            }
+        }
+        spans.sort_unstable();
         let mut kept = String::new();
         let mut start = 0;
-        for (at, word) in line.split_whitespace().scan(0, |offset, word| {
-            let at = line[*offset..].find(word).unwrap() + *offset;
-            *offset = at + word.len();
-            Some((at, word))
-        }) {
-            let w = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
-            if [
-                "sk-",
-                "ghp_",
-                "github_pat_",
-                "gho_",
-                "xoxb-",
-                "xoxp-",
-                "AIza",
-                "AKIA",
-            ]
-            .iter()
-            .any(|p| w.starts_with(p) && w.len() >= 16)
-            {
+        for (at, end) in spans {
+            if at >= start {
                 kept.push_str(&line[start..at]);
-                start = at + word.len();
             }
+            start = start.max(end);
         }
         kept.push_str(&line[start..]);
         lines.push(kept);

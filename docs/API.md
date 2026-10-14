@@ -2417,7 +2417,8 @@ IDs are positive integers, stable across owner edits and never reused after Forg
   Kind determines topic. Owner edits preserve provenance and ID.
   Both return `{item, changed, history_id, similar_to, hint}`; exact duplicates
   return the existing `{item, duplicate: true, changed: false}` with no mutation.
-  A similarity hint is advisory and never merges notes.
+  A similarity hint is advisory and never merges notes. Expired exact matches
+  are archived with history so remembering the same fact again creates a current note.
 - `GET /api/memory/{id}` returns `{item, history}` including full text, source
   refs and up to the latest 100 change snapshots across its linked earlier
   versions, newest first. Set-aside notes remain inspectable. A deleted/unknown ID returns `404`.
@@ -2432,7 +2433,8 @@ IDs are positive integers, stable across owner edits and never reused after Forg
   modifying anything. Undo itself records a new change, so it can also be undone.
 
 Writes share the MCP write gate: strip nested/unclosed `<private>` spans,
-PEM private keys, credential assignments/authorization lines and recognized
+PEM private keys, credential assignments (including JSON/Markdown formatting
+and repeated labels), authorization lines and recognized
 API token formats before hashing or recording history. Empty/private-only
 notes and individual REST/recall-tool notes over 16,000 characters are rejected
 (`400`). Invalid kind,
@@ -3690,7 +3692,7 @@ a new turn. Resolved cards are explicitly described as resolved in replay histor
 | `get_memory` | `ids` required (1–20 positive integers; duplicates count once) | `{items: [{item: MemoryItem, history}]}`; full text, sources, latest 100 changes |
 | `remember` | `text`, `kind` required; `importance?` (1–5), `observed_at?` (ms) | `{item, changed, history_id, similar_to, hint}` or `{item, duplicate: true, changed: false}` |
 | `update_memory` | `id` required; `text?`, `kind?`, `importance?`, `observed_at?`, `valid_to?` | Same save result; corrected text supersedes the old note with a linked replacement and undo history |
-| `forget` | `id` required | `{forgotten, history_id}`; hard delete with undo tombstone |
+| `forget` | `id` required | `{forgotten, history_id}`; hard delete with undo tombstone; pinned notes require owner deletion in Memory |
 | `search_conversations` | `query` required | `{hits: [{message_id,conversation_id,role,created_at,text,title}]}`; up to 30 excerpts, text capped at 500 chars |
 | `read_memory` | `path` (required, relative `.md` path, owner private context only): `MEMORY.md` or a topic file (`you.md`, `people.md`, `projects.md`, `routines.md`) | `{"content": string}`; error when the file does not exist |
 | `write_memory` | `path`, `content` (required, Markdown, one note per bullet; max 1,000,000 characters for `MEMORY.md` and topic files, 50,000 otherwise; owner private context only) | `{"written": true, "added": int, "unchanged": int, "removed": [string], "kept_pinned": [string], "kept_recent": [string], "not_restored": [string], "outside_core": [string], "note"?: string}`. For `MEMORY.md` or a topic file, the notes that file shows become exactly the notes written (an empty file removes them all): new ones are added (importance 4 in `MEMORY.md`, with the topic of the heading above them; 3 in a topic file), notes stored elsewhere are moved there, and notes left out are archived everywhere. `MEMORY.md` shows the [packed core](#memory) as last written. Pinned notes are kept (`kept_pinned`), and so are notes another chat saved or changed after this turn began, or that joined `MEMORY.md` after it began without being explicitly included in that turn's earlier core write (`kept_recent`, dated from the turn's message); a note in the content that another chat removed or corrected after the turn began is not saved again (`not_restored`). Changes the same turn made can be changed again. `outside_core` lists notes written to `MEMORY.md` that are saved but did not fit in it (they are in their topic files; empty for other paths). A note under headings that name its subject (`## Alex`, `### Work`) is saved as `Alex — Work: ...`. Any other path only adds notes (prefixed with the file's title), needs at least one, and returns a `note`. |
@@ -3709,6 +3711,8 @@ replies are excluded. A membership change purges that conversation's index;
 once membership has changed beyond initial creation, it stays excluded even
 if it later returns to owner-alone. Queries also recheck the private-message
 view. No embeddings, direct model calls or background polling are involved.
+Stale Markdown writes also check history before-snapshot hashes after owner
+edits or Forget, backed by `memory_history_before_hash_at`.
 The write gate also applies to legacy Markdown writes/import; private spans and
 PEM blocks are scrubbed across the whole document before it is split into notes.
 

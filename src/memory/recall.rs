@@ -46,6 +46,31 @@ pub struct Filter {
     pub limit: Option<usize>,
 }
 
+fn list_sql(search: bool, used: bool) -> String {
+    let columns = COLUMNS
+        .split(',')
+        .map(|c| format!("m.{}", c.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT {columns} FROM {} WHERE m.archived = 0 AND m.superseded_by IS NULL
+        AND (m.valid_to IS NULL OR m.valid_to > ?1) AND (?2 IS NULL OR m.topic = ?2)
+        AND (?3 IS NULL OR m.updated_at >= ?3) AND ?4 >= 0 AND {}
+        ORDER BY m.pinned DESC, {} m.updated_at DESC, m.id DESC LIMIT ?6 OFFSET ?4",
+        if search {
+            "memory_items_fts JOIN memory_items m ON m.id = memory_items_fts.rowid"
+        } else {
+            "memory_items m"
+        },
+        if search {
+            "memory_items_fts MATCH ?5"
+        } else {
+            "?5 IS NULL"
+        },
+        if search && used { "rank," } else { "" }
+    )
+}
+
 pub fn list(c: &Connection, f: &Filter, used: bool) -> rusqlite::Result<Value> {
     if f.topic
         .as_deref()
@@ -55,22 +80,7 @@ pub fn list(c: &Connection, f: &Filter, used: bool) -> rusqlite::Result<Value> {
     }
     let q = f.query.as_deref().map(query).transpose()?;
     let limit = f.limit.unwrap_or(30).clamp(1, 100);
-    let sql = format!(
-        "SELECT {COLUMNS} FROM memory_items WHERE archived = 0 AND superseded_by IS NULL
-        AND (valid_to IS NULL OR valid_to > ?1) AND (?2 IS NULL OR topic = ?2)
-        AND (?3 IS NULL OR updated_at >= ?3) AND ?4 >= 0
-        {} ORDER BY pinned DESC, {} updated_at DESC, id DESC LIMIT ?6 OFFSET ?4",
-        if q.is_some() {
-            "AND id IN (SELECT rowid FROM memory_items_fts WHERE memory_items_fts MATCH ?5)"
-        } else {
-            "AND ?5 IS NULL"
-        },
-        if used && q.is_some() {
-            "(SELECT rank FROM memory_items_fts WHERE rowid = memory_items.id AND memory_items_fts MATCH ?5),"
-        } else {
-            ""
-        }
-    );
+    let sql = list_sql(q.is_some(), used);
     let mut items: Vec<Item> = c
         .prepare(&sql)?
         .query_map(
@@ -200,7 +210,7 @@ fn similar(c: &Connection, text: &str, except: i64) -> rusqlite::Result<Option<i
     if a.len() < 3 {
         return Ok(None);
     }
-    let q = query(&truncate_chars(text, 500))?;
+    let q = query(&text.chars().take(500).collect::<String>())?;
     let candidates: Vec<(i64, String)> = c.prepare("SELECT m.id, m.text FROM memory_items_fts f JOIN memory_items m ON m.id = f.rowid WHERE memory_items_fts MATCH ?1 AND m.archived = 0 AND m.superseded_by IS NULL AND m.id != ?2 AND (m.valid_to IS NULL OR m.valid_to > ?3) ORDER BY rank LIMIT 20")?.query_map(params![q, except, now_ms()], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     Ok(candidates.into_iter().find_map(|(id, t)| {
         let b = words(&t);
@@ -232,7 +242,11 @@ pub fn save(
     if let Some(duplicate) = super::live_by_hash(c, &hash)?
         && Some(duplicate.id) != id
     {
-        return Ok(json!({"item": duplicate, "duplicate": true, "changed": false}));
+        if duplicate.valid_to.is_some_and(|t| t <= now_ms()) {
+            super::archive(c, &duplicate, actor, batch)?;
+        } else {
+            return Ok(json!({"item": duplicate, "duplicate": true, "changed": false}));
+        }
     }
     let hint = similar(c, &text, id.unwrap_or(0))?;
     let now = now_ms();
@@ -280,6 +294,11 @@ pub fn save(
 
 pub fn forget(c: &Connection, id: i64, actor: Actor, batch: &str) -> rusqlite::Result<Value> {
     let old = get(c, id)?.ok_or_else(|| invalid("I couldn't find that memory."))?;
+    if actor == Actor::Agent && old.pinned {
+        return Err(invalid(
+            "I keep pinned notes always in mind. You can forget this one in Memory.",
+        ));
+    }
     // Do not silently unlink a superseded row's replacement chain.
     if old.superseded_by.is_some() {
         return Err(invalid(
@@ -309,10 +328,26 @@ pub fn forget(c: &Connection, id: i64, actor: Actor, batch: &str) -> rusqlite::R
     Ok(json!({"forgotten": id, "history_id": c.last_insert_rowid()}))
 }
 
+fn restore_snapshot(c: &Connection, old: &Item) -> rusqlite::Result<()> {
+    if !old.archived
+        && old.superseded_by.is_none()
+        && super::live_by_hash(c, &old.content_hash)?.is_some_and(|i| i.id != old.id)
+    {
+        return Err(invalid(
+            "Another note has this text. Please edit it instead.",
+        ));
+    }
+    c.execute("INSERT INTO memory_items(id,kind,topic,text,importance,pinned,created_at,observed_at,mentioned_at,valid_to,superseded_by,source,last_used_at,use_count,content_hash,archived,updated_at)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+        ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,topic=excluded.topic,text=excluded.text,importance=excluded.importance,pinned=excluded.pinned,observed_at=excluded.observed_at,mentioned_at=excluded.mentioned_at,valid_to=excluded.valid_to,superseded_by=excluded.superseded_by,source=excluded.source,content_hash=excluded.content_hash,archived=excluded.archived,updated_at=excluded.updated_at",
+            params![old.id,old.kind,old.topic.name(),old.text,old.importance,old.pinned,old.created_at,old.observed_at,old.mentioned_at,old.valid_to,old.superseded_by,old.source.to_string(),old.last_used_at,old.use_count,old.content_hash,old.archived,now_ms()])?;
+    Ok(())
+}
+
 pub fn undo(c: &Connection, history_id: i64, batch: &str) -> rusqlite::Result<Value> {
     type UndoRow = (i64, String, Option<String>, Option<String>, String);
     let row: Option<UndoRow> = c.query_row("SELECT item_id, op, before, after, COALESCE(batch_id, '') FROM memory_history WHERE id = ?1", [history_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?;
-    let (id, op, before, after, prior_batch) =
+    let (id, op, before, _after, prior_batch) =
         row.ok_or_else(|| invalid("I couldn't find that change."))?;
     let latest: i64 = c.query_row(
         "SELECT MAX(id) FROM memory_history WHERE item_id = ?1",
@@ -333,32 +368,49 @@ pub fn undo(c: &Connection, history_id: i64, batch: &str) -> rusqlite::Result<Va
         ));
     }
     let current = get(c, id)?;
-    if op == "supersede" {
-        let a: Item = serde_json::from_str(after.as_deref().unwrap_or("null"))
-            .map_err(|_| invalid("I couldn't restore that change."))?;
-        let replacement = a
-            .superseded_by
-            .ok_or_else(|| invalid("I couldn't find the replacement."))?;
-        let newest: Option<(String, String)> = c.query_row("SELECT op, COALESCE(batch_id, '') FROM memory_history WHERE item_id = ?1 ORDER BY id DESC LIMIT 1", [replacement], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
-        if newest.is_none_or(|(op, batch)| op != "add" || batch != prior_batch) {
-            return Err(invalid(
-                "The replacement changed again. Please undo its newest change first.",
-            ));
-        }
-        forget(c, replacement, Actor::Owner, batch)?;
-    }
     if let Some(snapshot) = before {
         let old: Item = serde_json::from_str(&snapshot)
             .map_err(|_| invalid("I couldn't restore that change."))?;
-        if super::live_by_hash(c, &old.content_hash)?.is_some_and(|i| i.id != id) {
-            return Err(invalid(
-                "Another note has this text. Please edit it instead.",
-            ));
+        // Reverse the associated replacement as well as its predecessor.
+        if let Some(replacement) = current.as_ref().and_then(|i| i.superseded_by)
+            && Some(replacement) != old.superseded_by
+        {
+            let newest: Option<(String, String)> = c.query_row("SELECT op, COALESCE(batch_id, '') FROM memory_history WHERE item_id = ?1 ORDER BY id DESC LIMIT 1", [replacement], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+            if newest.is_none_or(|(op, batch)| {
+                !matches!(op.as_str(), "add" | "restore") || batch != prior_batch
+            }) {
+                return Err(invalid(
+                    "The replacement changed again. Please undo its newest change first.",
+                ));
+            }
+            forget(c, replacement, Actor::Owner, batch)?;
         }
-        c.execute("INSERT INTO memory_items(id,kind,topic,text,importance,pinned,created_at,observed_at,mentioned_at,valid_to,superseded_by,source,last_used_at,use_count,content_hash,archived,updated_at)
-        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
-        ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,topic=excluded.topic,text=excluded.text,importance=excluded.importance,pinned=excluded.pinned,observed_at=excluded.observed_at,mentioned_at=excluded.mentioned_at,valid_to=excluded.valid_to,superseded_by=excluded.superseded_by,source=excluded.source,content_hash=excluded.content_hash,archived=excluded.archived,updated_at=excluded.updated_at",
-            params![old.id,old.kind,old.topic.name(),old.text,old.importance,old.pinned,old.created_at,old.observed_at,old.mentioned_at,old.valid_to,old.superseded_by,old.source.to_string(),old.last_used_at,old.use_count,old.content_hash,old.archived,now_ms()])?;
+        if let Some(replacement) = old.superseded_by
+            && get(c, replacement)?.is_none()
+        {
+            let deleted: Option<(String, String, Option<String>)> = c.query_row("SELECT op, COALESCE(batch_id, ''), before FROM memory_history WHERE item_id = ?1 ORDER BY id DESC LIMIT 1", [replacement], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+            let Some((op, prior, Some(snapshot))) = deleted else {
+                return Err(invalid("I couldn't restore the replacement."));
+            };
+            if op != "delete" || prior != prior_batch {
+                return Err(invalid(
+                    "The replacement changed again. Please undo its newest change first.",
+                ));
+            }
+            let item: Item = serde_json::from_str(&snapshot)
+                .map_err(|_| invalid("I couldn't restore the replacement."))?;
+            restore_snapshot(c, &item)?;
+            record(
+                c,
+                replacement,
+                "restore",
+                None,
+                get(c, replacement)?.as_ref(),
+                Actor::Owner,
+                batch,
+            )?;
+        }
+        restore_snapshot(c, &old)?;
         if op == "delete" {
             let predecessors: Vec<(i64, i64, String)> = c.prepare("SELECT id, item_id, before FROM memory_history WHERE batch_id = ?1 AND op = 'archive' AND json_extract(before, '$.superseded_by') = ?2")?.query_map(params![prior_batch, id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
             for (change, predecessor, snap) in predecessors {
@@ -521,6 +573,164 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn long_notes_and_expired_duplicates_can_be_remembered() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            write_tx(c, |c| {
+                let text = "Practice long note paragraph ".repeat(50);
+                let long = save_note(c, &text, "long")?;
+                assert_eq!(long["changed"], true);
+                let expired = save(
+                    c,
+                    &Edit {
+                        text: Some("Likes tea".into()),
+                        valid_to: Some(0),
+                        ..Default::default()
+                    },
+                    None,
+                    Actor::Owner,
+                    &json!({}),
+                    "expired",
+                )?;
+                let new = save_note(c, "Likes tea", "again")?;
+                assert_eq!(new["changed"], true);
+                assert_ne!(new["item"]["id"], expired["item"]["id"]);
+                assert_eq!(
+                    detail(c, new["item"]["id"].as_i64().unwrap(), true)?["item"]["text"],
+                    "Likes tea"
+                );
+                assert!(
+                    get(c, expired["item"]["id"].as_i64().unwrap())?
+                        .unwrap()
+                        .archived
+                );
+                Ok(())
+            })
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn pinned_notes_require_owner_forget_and_search_has_one_fts_cursor() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            let note = save(
+                c,
+                &Edit {
+                    text: Some("Likes tea".into()),
+                    pinned: Some(true),
+                    ..Default::default()
+                },
+                None,
+                Actor::Owner,
+                &json!({}),
+                "pinned",
+            )?;
+            let id = note["item"]["id"].as_i64().unwrap();
+            assert!(forget(c, id, Actor::Agent, "agent").is_err());
+            assert!(get(c, id)?.is_some());
+            let plan: Vec<String> = c
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", list_sql(true, true)))?
+                .query_map(
+                    params![
+                        now_ms(),
+                        Option::<String>::None,
+                        Option::<i64>::None,
+                        0,
+                        "tea",
+                        30
+                    ],
+                    |r| r.get(3),
+                )?
+                .collect::<rusqlite::Result<_>>()?;
+            assert!(!plan.iter().any(|p| p.contains("CORRELATED")), "{plan:?}");
+            forget(c, id, Actor::Owner, "owner")?;
+            assert!(get(c, id)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn duplicate_correction_undo_rolls_back_notes_history_links_and_export() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let db = Db::open(&paths.db_file()).unwrap();
+        db.with(|c| {
+            let original = mutate(c,&paths,|c| save_note(c,"Likes tea","a"))?["item"]["id"].as_i64().unwrap();
+            let correction = mutate(c,&paths,|c| save(c,&edit("Likes coffee"),Some(original),Actor::Agent,&json!({}),"b"))?;
+            mutate(c,&paths,|c| save_note(c,"Likes tea","duplicate"))?;
+            let before = json!({"notes":super::super::live(c)?,"old":get(c,original)?,"history":history(c,original)?});
+            let export = std::fs::read_to_string(paths.memory_dir().join("MEMORY.md")).unwrap();
+            assert!(mutate(c,&paths,|c| undo(c,correction["history_id"].as_i64().unwrap(),"undo")).is_err());
+            assert_eq!(json!({"notes":super::super::live(c)?,"old":get(c,original)?,"history":history(c,original)?}),before);
+            assert_eq!(std::fs::read_to_string(paths.memory_dir().join("MEMORY.md")).unwrap(),export);
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn stale_core_and_topic_writes_do_not_resurrect_forget_or_owner_edits() {
+        for path in ["MEMORY.md", "you.md"] {
+            for edit_owner in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let paths = Paths {
+                    config_file: tmp.path().join("config.toml"),
+                    data_dir: tmp.path().join("data"),
+                };
+                crate::persona::seed(&paths).unwrap();
+                let db = Db::open(&paths.db_file()).unwrap();
+                let id = db
+                    .with(|c| mutate(c, &paths, |c| save_note(c, "Likes tea", "a")))
+                    .unwrap()["item"]["id"]
+                    .as_i64()
+                    .unwrap();
+                let stale = std::fs::read_to_string(paths.memory_dir().join(path)).unwrap();
+                let started = now_ms();
+                db.with(|c| {
+                    mutate(c, &paths, |c| {
+                        if edit_owner {
+                            save(
+                                c,
+                                &edit("Likes coffee"),
+                                Some(id),
+                                Actor::Owner,
+                                &json!({}),
+                                "owner-edit",
+                            )
+                        } else {
+                            forget(c, id, Actor::Owner, "owner-forget")
+                        }
+                    })
+                })
+                .unwrap();
+                let written = super::super::files::write(
+                    &db,
+                    &paths,
+                    path,
+                    &stale,
+                    &json!({"type":"owner"}),
+                    started,
+                    "stale-turn",
+                )
+                .unwrap();
+                assert_eq!(
+                    written.not_restored,
+                    ["Likes tea"],
+                    "{path} edit={edit_owner}"
+                );
+                let notes = db.with(super::super::live).unwrap();
+                assert!(notes.iter().all(|n| n.text != "Likes tea"));
+                assert_eq!(notes.len(), usize::from(edit_owner));
+            }
+        }
     }
 
     #[test]
@@ -790,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_edit_blocks_undo_and_duplicate_restore_rolls_back() {
+    fn replacement_edit_blocks_undo() {
         let db = Db::open_in_memory().unwrap();
         db.with(|c| {
             let id = save_note(c, "Old preference", "a")?["item"]["id"]

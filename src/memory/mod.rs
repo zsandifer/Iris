@@ -228,13 +228,23 @@ pub fn set_aside_since(
     since: i64,
     batch: &str,
 ) -> rusqlite::Result<bool> {
-    conn.prepare_cached(
-        "SELECT 1 FROM memory_items m WHERE m.content_hash = ?1
+    let set_aside = conn
+        .prepare_cached(
+            "SELECT 1 FROM memory_items m WHERE m.content_hash = ?1
          AND (m.archived = 1 OR m.superseded_by IS NOT NULL) AND m.updated_at >= ?2
          AND COALESCE((SELECT h.batch_id FROM memory_history h WHERE h.item_id = m.id
                        ORDER BY h.id DESC LIMIT 1), '') != ?3",
-    )?
-    .exists(params![hash, since, batch])
+        )?
+        .exists(params![hash, since, batch])?;
+    if set_aside {
+        return Ok(true);
+    }
+    // Hard deletes and owner edits no longer leave the old hash in rows.
+    conn.prepare_cached("SELECT 1 FROM memory_history WHERE json_extract(before, '$.content_hash') = ?1
+        AND at >= ?2 AND COALESCE(batch_id, '') != ?3
+        AND (after IS NULL OR json_extract(after, '$.content_hash') != ?1
+             OR json_extract(after, '$.archived') = 1 OR json_extract(after, '$.superseded_by') IS NOT NULL)")?
+        .exists(params![hash, since, batch])
 }
 
 /// Every live note (not archived, not superseded), oldest first.

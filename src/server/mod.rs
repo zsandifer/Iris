@@ -782,6 +782,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_correction_undo_can_be_undone_repeatedly_through_rest() {
+        let h = setup();
+        let owner = pair_as(&h, None).await;
+        let (id, mut change) = h
+            .state
+            .db
+            .with(|c| {
+                crate::memory::recall::mutate(c, &h.state.paths, |c| {
+                    use crate::memory::recall::{Edit, save};
+                    let a = save(
+                        c,
+                        &Edit {
+                            text: Some("Likes tea".into()),
+                            ..Default::default()
+                        },
+                        None,
+                        crate::memory::Actor::Owner,
+                        &json!({}),
+                        "a",
+                    )?;
+                    let id = a["item"]["id"].as_i64().unwrap();
+                    let b = save(
+                        c,
+                        &Edit {
+                            text: Some("Likes coffee".into()),
+                            ..Default::default()
+                        },
+                        Some(id),
+                        crate::memory::Actor::Agent,
+                        &json!({}),
+                        "b",
+                    )?;
+                    Ok(json!({"id":id,"history_id":b["history_id"]}))
+                })
+            })
+            .map(|v| (v["id"].as_i64().unwrap(), v["history_id"].as_i64().unwrap()))
+            .unwrap();
+        for text in ["Likes tea", "Likes coffee", "Likes tea", "Likes coffee"] {
+            let (status, response) = send(
+                &h.app,
+                "POST",
+                &format!("/api/memory/history/{change}/undo"),
+                Some(&owner),
+                Some(json!({})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            let (_, notes) = send(&h.app, "GET", "/api/memory", Some(&owner), None).await;
+            assert_eq!(notes["items"].as_array().unwrap().len(), 1, "{notes}");
+            assert_eq!(notes["items"][0]["text"], text);
+            let (_, detail) = send(
+                &h.app,
+                "GET",
+                &format!("/api/memory/{id}"),
+                Some(&owner),
+                None,
+            )
+            .await;
+            change = detail["history"][0]["id"].as_i64().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn connector_credentials_require_https_except_on_loopback() {
         let h = setup();
         let token = pair_as(&h, None).await;
