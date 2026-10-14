@@ -17,8 +17,11 @@
 //!   `approval_timeout_mins` makes the run skipped. Nothing is held open
 //!   meanwhile, so waiting survives restarts.
 //! - Failed runs are retried after 1, 5, then 30 minutes (up to
-//!   `max_retries`). The acting step is never retried automatically.
-//! - A run that was going when Iris stopped is recovered at startup.
+//!   `max_retries`), within the missed-run rule. An attempt that may have
+//!   acted (the acting step, or a routine that does not ask first and used
+//!   tools) is never retried automatically.
+//! - A run that was going when Iris stopped is recovered at startup: retried
+//!   if it was only preparing, otherwise recorded as failed.
 
 use super::schedule::Plan;
 use super::{Misfire, Routine, State, docs, get_routine_any, schedule_next};
@@ -215,16 +218,36 @@ fn insert_run(
 pub fn claim_due(conn: &Connection, now: i64) -> rusqlite::Result<Vec<String>> {
     db::write_tx(conn, |c| {
         let mut out = Vec::new();
-        let retries: Vec<(String, String)> = c
+        let retries: Vec<(String, String, i64, String)> = c
             .prepare(
-                "SELECT r.id, r.routine_id FROM routine_runs r JOIN routines t ON t.id = r.routine_id
+                "SELECT r.id, r.routine_id, r.retry_at, t.misfire
+                 FROM routine_runs r JOIN routines t ON t.id = r.routine_id
                  WHERE r.status = 'failed' AND r.retry_at IS NOT NULL AND r.retry_at <= ?1
                    AND t.state IN ('active', 'done')
                  ORDER BY r.retry_at",
             )?
-            .query_map([now], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map([now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        for (run, routine) in retries {
+        for (run, routine, retry_at, misfire) in retries {
+            // A retry missed while Iris was offline or paused follows the
+            // routine's missed-run rule, like a missed slot.
+            let late = now - retry_at;
+            let window = if misfire == Misfire::RunLatestInWindow.name() {
+                MISFIRE_WINDOW_MS
+            } else {
+                GRACE_MS
+            };
+            if late > window {
+                finish_run(
+                    c,
+                    &run,
+                    "failed",
+                    "I was offline or paused when I meant to try again, so I stopped.",
+                    None,
+                    now,
+                )?;
+                continue;
+            }
             if open_run(c, &routine)? {
                 continue;
             }
@@ -402,8 +425,14 @@ pub fn recover(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
             .query_map([], run_from_row)?
             .collect::<rusqlite::Result<_>>()?;
         for run in &running {
-            let retries = get_routine_any(c, &run.routine_id)?.map_or(0, |r| r.spec.max_retries);
-            if run.approved_at.is_some() {
+            let routine = get_routine_any(c, &run.routine_id)?;
+            let retries = routine.as_ref().map_or(0, |r| r.spec.max_retries);
+            // An attempt allowed to act (the step after the owner's OK, or a
+            // routine that does not ask first) may have bought or sent
+            // something before the restart: never do it again on its own.
+            let may_have_acted = run.approved_at.is_some()
+                || routine.as_ref().is_none_or(|r| !r.spec.ask_before_acting);
+            if may_have_acted {
                 finish_run(
                     c,
                     &run.id,
@@ -931,8 +960,16 @@ async fn after_turn(
     }
     let why = failure_reason(m);
     let attempts = ctx.run.attempts;
-    if step == Step::Prepare && attempts <= r.spec.max_retries {
-        let wait = BACKOFF_MINS[(attempts.max(1) as usize - 1).min(BACKOFF_MINS.len() - 1)];
+    let used_tools = m.meta["activity"].as_array().is_some_and(|a| !a.is_empty());
+    let retry = retry_after(
+        step,
+        r.spec.ask_before_acting,
+        used_tools,
+        attempts,
+        r.spec.max_retries,
+    );
+    let unsafe_to_retry = retry == Retry::MayHaveActed;
+    if let Retry::After(wait) = retry {
         let reason = format!(
             "{why}. I'll try again in {wait} minute{}.",
             if wait == 1 { "" } else { "s" }
@@ -952,6 +989,9 @@ async fn after_turn(
     }
     let reason = match step {
         Step::Act => format!("{why} after you said yes."),
+        Step::Prepare if unsafe_to_retry => format!(
+            "{why} partway through, so I didn't try again in case part of it was already done."
+        ),
         Step::Prepare if attempts > 1 => format!("{why}; I tried {attempts} times."),
         Step::Prepare => format!("{why}."),
     };
@@ -965,6 +1005,8 @@ async fn after_turn(
         r.spec.title,
         match (step, r.spec.schedule_kind) {
             (Step::Act, _) => " Nothing else will happen until its next run; check what got done.",
+            _ if unsafe_to_retry =>
+                " Check what got done; I'll run it again at its next scheduled time.",
             (_, super::Kind::Once) => "",
             _ => " I'll try again at its next scheduled time.",
         }
@@ -972,6 +1014,40 @@ async fn after_turn(
     crate::jobs::post_to_main_opts(state, &owner, &text, m, "routine", r.spec.notify_when_done)
         .await?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retry {
+    /// Try again after this many minutes.
+    After(i64),
+    /// Out of retries (or the acting step, which is never retried).
+    No,
+    /// It was allowed to act and used tools: it may have bought or sent
+    /// something already, so it is not done again on its own.
+    MayHaveActed,
+}
+
+/// Whether a failed attempt is tried again. An attempt allowed to act (the
+/// step after the owner's OK, or a routine that does not ask first) is
+/// retried only when it used no tools at all. Preparing for an ask-first
+/// routine cannot act (`TurnInput::prepare_only`), so it is retried.
+pub fn retry_after(
+    step: Step,
+    ask_first: bool,
+    used_tools: bool,
+    attempts: i64,
+    max_retries: i64,
+) -> Retry {
+    if step == Step::Act {
+        return Retry::No;
+    }
+    if !ask_first && used_tools {
+        return Retry::MayHaveActed;
+    }
+    if attempts > max_retries {
+        return Retry::No;
+    }
+    Retry::After(BACKOFF_MINS[(attempts.max(1) as usize - 1).min(BACKOFF_MINS.len() - 1)])
 }
 
 /// What deciding a run's approval card does to the run.
@@ -1114,6 +1190,20 @@ mod tests {
         );
         let Due::Skip(why) = d.due else { panic!() };
         assert!(why.contains("3 earlier times"), "{why}");
+    }
+
+    #[test]
+    fn attempts_that_may_have_acted_are_not_retried() {
+        use Retry::*;
+        // Preparing for an ask-first routine cannot act: retried with backoff.
+        assert_eq!(retry_after(Step::Prepare, true, true, 1, 2), After(1));
+        assert_eq!(retry_after(Step::Prepare, true, false, 2, 2), After(5));
+        assert_eq!(retry_after(Step::Prepare, true, true, 3, 2), No);
+        // A routine that acts without asking: only when it used no tools.
+        assert_eq!(retry_after(Step::Prepare, false, false, 1, 2), After(1));
+        assert_eq!(retry_after(Step::Prepare, false, true, 1, 2), MayHaveActed);
+        // The step after the owner's OK: never.
+        assert_eq!(retry_after(Step::Act, true, false, 1, 2), No);
     }
 
     #[test]

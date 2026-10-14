@@ -642,9 +642,25 @@ fn interrupted_runs_are_recovered() {
         id
     };
     let fresh = mk("2026-10-17T17:30", 1, None);
-    let acting = mk("2026-10-10T17:30", 1, Some(1));
+    // Inside the retry window with retries left: only its approval stops it.
+    let acting = mk("2026-10-17T17:20", 1, Some(1));
     let old = mk("2026-10-03T17:30", 1, None);
-    assert_eq!(db.with(|c| run::recover(c, now)).unwrap(), 3);
+    // A routine that acts without asking first: its run may have acted.
+    let mut direct = saturday_dinner();
+    direct.title = "Rent reminder".into();
+    direct.ask_before_acting = false;
+    let d = active(&db, &owner, direct, at("2026-10-13T12:00"));
+    let direct_run = new_id();
+    db.with(|c| {
+        c.execute(
+            "INSERT INTO routine_runs (id, routine_id, scheduled_for, status, attempts,
+                 created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'running', 1, 0, 0)",
+            params![direct_run, d.id, at("2026-10-17T17:30")],
+        )
+    })
+    .unwrap();
+    assert_eq!(db.with(|c| run::recover(c, now)).unwrap(), 4);
     let get = |id: &str| db.with(|c| run::get_run(c, id)).unwrap().unwrap();
     let f = get(&fresh);
     assert_eq!(
@@ -664,6 +680,56 @@ fn interrupted_runs_are_recovered() {
         "never redo an approved action"
     );
     assert_eq!(get(&old).retry_at, None, "too late to retry");
+    let dr = get(&direct_run);
+    assert_eq!(
+        (dr.status.as_str(), dr.retry_at),
+        ("failed", None),
+        "never redo a run that may have acted"
+    );
+    // Nothing else is claimed later.
+    assert!(
+        db.with(|c| run::claim_due(c, now + 2 * 60_000))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn retries_missed_while_offline_follow_the_missed_run_rule() {
+    let (db, owner, _) = setup();
+    let skip = active(&db, &owner, saturday_dinner(), at("2026-10-13T12:00"));
+    let mut late_ok = saturday_dinner();
+    late_ok.title = "Late is fine".into();
+    late_ok.misfire = Misfire::RunLatestInWindow;
+    let window = active(&db, &owner, late_ok, at("2026-10-13T12:00"));
+    let now = at("2026-10-17T17:00");
+    let mk = |routine: &str, slot: &str, retry_at: i64| {
+        let id = new_id();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO routine_runs (id, routine_id, scheduled_for, status, attempts,
+                     retry_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'failed', 1, ?4, 0, 0)",
+                params![id, routine, at(slot), retry_at],
+            )
+        })
+        .unwrap();
+        id
+    };
+    let stale = mk(&skip.id, "2026-10-10T17:30", now - 20 * 60_000);
+    let fine = mk(&window.id, "2026-10-10T17:30", now - 20 * 60_000);
+    let too_old = mk(&window.id, "2026-10-03T17:30", now - 3 * 3_600_000);
+    let claimed = db.with(|c| run::claim_due(c, now)).unwrap();
+    assert_eq!(claimed, std::slice::from_ref(&fine));
+    let get = |id: &str| db.with(|c| run::get_run(c, id)).unwrap().unwrap();
+    for id in [&stale, &too_old] {
+        let r = get(id);
+        assert_eq!((r.status.as_str(), r.retry_at), ("failed", None));
+        assert_eq!(
+            r.reason,
+            "I was offline or paused when I meant to try again, so I stopped."
+        );
+    }
 }
 
 #[test]
