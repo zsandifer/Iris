@@ -261,8 +261,14 @@ fn iris_proposals_wait_for_the_owner() {
     assert_eq!(card["type"], "routine");
     assert_eq!(card["action"], "create");
     assert_eq!(card["body"], "Every Sat · 5:30 PM · asks before acting");
-    // The owner can read what Iris will do before tapping.
+    // The owner can read what Iris will do before tapping, on the card and
+    // on the routine's waiting row.
     assert_eq!(card["instructions"], saturday_dinner().instructions);
+    let listed = db.with(|c| routine_json(c, &p.routine, now)).unwrap();
+    assert_eq!(
+        listed["pending_change"]["instructions"],
+        saturday_dinner().instructions
+    );
     assert!(
         db.with(|c| run::claim_due(c, now + 30 * 86_400_000))
             .unwrap()

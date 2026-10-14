@@ -1297,8 +1297,15 @@ pub fn routine_json(conn: &Connection, r: &Routine, now: i64) -> rusqlite::Resul
         )
         .optional()?;
     let pending = pending_change(conn, &r.id)?.map(|c| {
+        // What the owner reads before tapping: a new routine's
+        // instructions, or the new ones a change proposes.
+        let instructions = if c.action == "create" {
+            Some(json!(r.spec.instructions))
+        } else {
+            c.patch.get("instructions").cloned()
+        };
         json!({"id": c.id, "action": c.action, "summary": c.summary, "created_at": c.created_at,
-               "instructions": c.patch.get("instructions")})
+               "instructions": instructions})
     });
     v["id"] = r.id.clone().into();
     v["state"] = r.state.name().into();

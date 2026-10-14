@@ -105,7 +105,8 @@ function WaitingRow({ r }) {
     return html`<div class="rtn-row proposed">
       <div class="rtn-line"><${Ico} r=${r} /><div class="grow"><b>${r.title}</b>
         <small>${c.action === 'create' ? r.schedule_text : c.action === 'delete' ? 'I suggested deleting this' : c.summary}</small></div></div>
-      ${c.instructions && html`<${NewInstructions} text=${c.instructions} label="The new instructions" />`}
+      ${c.action === 'create' && html`<div class="rtn-pills"><span class="rpill a">${r.ask_before_acting ? 'Asks before acting' : 'Acts without asking'}</span></div>`}
+      ${c.instructions && html`<${NewInstructions} text=${c.instructions} label=${c.action === 'create' ? 'What I will do' : 'The new instructions'} />`}
       <div class="rtn-act">
         ${c.action === 'create' && html`<button class="b2 sm" onClick=${() => go(`iris/routines/${r.id}`)}>Edit</button>`}
         <button class="b2 sm" disabled=${busy} onClick=${() => act(false)}>${no}</button>
@@ -341,10 +342,11 @@ export function RoutineEditor({ id }) {
 
 function WhatTab({ draft, up, docs, setDocs, routineId, latestDocs, uploading, setUploading }) {
   const file = useRef();
+  const [removing, setRemoving] = useState(false);
   const upload = async (e) => {
     const f = e.target.files?.[0];
     e.target.value = '';
-    if (!f) return;
+    if (!f || removing) return;
     setUploading(true);
     try {
       const { doc } = await api('POST', `/routines/docs?name=${encodeURIComponent(f.name)}`, f);
@@ -355,11 +357,16 @@ function WhatTab({ draft, up, docs, setDocs, routineId, latestDocs, uploading, s
     } catch (err) { toast(err.message); }
     setUploading(false);
   };
+  // One document change at a time: an upload finishing after a removal
+  // started would attach the removed document again.
   const remove = async (d) => {
+    if (uploading || removing) return;
+    setRemoving(true);
     try {
       if (routineId) await del(`/routines/${seg(routineId)}/docs/${seg(d.id)}`);
-      setDocs(docs.filter((x) => x.id !== d.id));
+      setDocs(latestDocs().filter((x) => x.id !== d.id));
     } catch (err) { toast(err.message); }
+    setRemoving(false);
   };
   return html`<div class="form">
     <div class="rtn-name"><div><label class="lbl" for="rt-emoji">Icon</label>
@@ -374,9 +381,9 @@ function WhatTab({ draft, up, docs, setDocs, routineId, latestDocs, uploading, s
     ${docs.length > 0 && html`<div class="grp">${docs.map((d) => html`<div class="r" key=${d.id}>
       <div class="ri"><${Icon} name="file" size=${17} /></div>
       <div class="rt">${d.title}<small>${d.chars < 1000 ? `${d.chars} characters` : `${Math.round(d.chars / 1000)}k characters`} · in your Library · read every run</small></div>
-      <button class="icon-btn" aria-label=${`Remove ${d.title}`} onClick=${() => remove(d)}><${Icon} name="x" size=${16} /></button></div>`)}</div>`}
+      <button class="icon-btn" aria-label=${`Remove ${d.title}`} disabled=${uploading || removing} onClick=${() => remove(d)}><${Icon} name="x" size=${16} /></button></div>`)}</div>`}
     <input ref=${file} type="file" hidden accept=".md,.markdown,.txt,text/markdown,text/plain" onChange=${upload} />
-    <button class="b2 wide" disabled=${uploading} onClick=${() => file.current?.click()}><${Icon} name="upload" size=${17} /> ${uploading ? 'Uploading…' : 'Upload'}</button>
+    <button class="b2 wide" disabled=${uploading || removing} onClick=${() => file.current?.click()}><${Icon} name="upload" size=${17} /> ${uploading ? 'Uploading…' : 'Upload'}</button>
     <div class="gnote">Markdown or text files, up to ${Math.round((S.routinesInfo?.max_doc_bytes || 10485760) / 1048576)} MB. Saved to your Library. I read them on every run.</div>
   </div>`;
 }
