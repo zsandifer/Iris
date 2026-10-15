@@ -47,6 +47,15 @@ own personality. It is not a clone.
 - One persistent **Main chat**, plus side chats (from the drawer, from Ideas,
   and from "Talk about it" on feed posts).
 - Input: ＋ (photos) · text · 🎙 (voice input).
+- **Times:** a centered day separator between days ("Today", "Yesterday",
+  the weekday within the last week, else the date), and a small time
+  ("3:42 PM", in the phone's own format) under the last message of each run
+  from the same sender, or mid-run after a pause of more than 10 minutes.
+  Holding or hovering a time shows the full date.
+- **Jump to latest:** scrolled up more than a few hundred pixels, a round ⌄
+  button floats above the input; tapping it glides to the newest message.
+  New messages from others while scrolled up never move the conversation;
+  they show as a count on the button instead.
 - **While Iris works:** a short, specific shimmering status phrase such as
   "Checking your calendar…" or "Reading your email…". There are no "…" dots
   and no quick-reply chips.

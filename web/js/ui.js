@@ -55,6 +55,7 @@ const P = {
   memory: 'M7 3.5h10a1 1 0 0 1 1 1V20l-6-4-6 4V4.5a1 1 0 0 1 1-1z',
   repeat: 'M17 3l3 3-3 3M4 12v-1a5 5 0 0 1 5-5h11M7 21l-3-3 3-3M20 12v1a5 5 0 0 1-5 5H4',
   upload: 'M12 16V5M7 9.5l5-5 5 5M5 20h14',
+  down: 'M6 9.5l6 6 6-6',
 };
 
 export function Icon({ name, size = 22, fill = false, cls = '' }) {

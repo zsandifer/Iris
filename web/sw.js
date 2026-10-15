@@ -18,6 +18,7 @@ const SHELL = [
   '/js/cards.js',
   '/js/catalog.js',
   '/js/chat.js',
+  '/js/chat-time.js',
   '/js/computer.js',
   '/js/connect.js',
   '/js/external.js',
