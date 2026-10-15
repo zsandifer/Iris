@@ -55,7 +55,11 @@ impl Job {
     }
     async fn effective_cfg(self, state: &AppState) -> JobConfig {
         match self {
-            Job::Heartbeat => state.cfg.heartbeat.clone(),
+            Job::Heartbeat => {
+                let mut cfg = state.cfg.heartbeat.clone();
+                cfg.enabled = state.heartbeat_enabled().await;
+                cfg
+            }
             Job::Feed => {
                 let mut cfg = state.cfg.feed.clone();
                 cfg.enabled = crate::feed::enabled(state).await;
@@ -205,6 +209,21 @@ fn due(cfg: &JobConfig, last_run: Option<i64>, now: i64, local_minutes: u32) -> 
         && last_run.is_none_or(|l| now - l >= cfg.interval_mins as i64 * 60_000)
 }
 
+/// Whether the scheduler should start `job` now. Reads the effective
+/// settings on every tick, so app toggles apply without a restart.
+async fn job_due(state: &AppState, job: Job, now: i64, local_minutes: u32) -> bool {
+    let last = state
+        .setting(job.last_run_key())
+        .await
+        .and_then(|s| s.parse::<i64>().ok());
+    let cfg = job.effective_cfg(state).await;
+    if job == Job::Dream {
+        crate::memory::dream::due(&state.cfg.dream, last, now, local_minutes) && cfg.enabled
+    } else {
+        due(&cfg, last, now, local_minutes)
+    }
+}
+
 /// A periodic engine probe is running.
 static PROBING: AtomicBool = AtomicBool::new(false);
 
@@ -254,18 +273,7 @@ pub fn spawn_scheduler(state: AppState) {
             crate::notify::spawn_flush_quiet(&state);
             crate::routines::run::tick(&state).await;
             for job in Job::ALL {
-                let last = state
-                    .setting(job.last_run_key())
-                    .await
-                    .and_then(|s| s.parse::<i64>().ok());
-                let cfg = job.effective_cfg(&state).await;
-                let ready = if job == Job::Dream {
-                    crate::memory::dream::due(&state.cfg.dream, last, now_ms(), local_minutes_now())
-                        && cfg.enabled
-                } else {
-                    due(&cfg, last, now_ms(), local_minutes_now())
-                };
-                if ready {
+                if job_due(&state, job, now_ms(), local_minutes_now()).await {
                     trigger(&state, job, false);
                 }
             }
@@ -526,6 +534,84 @@ mod tests {
         assert!(!due(&cfg, Some(now - 59 * 60_000), now, noon));
         assert!(due(&cfg, Some(now - 60 * 60_000), now, noon));
         assert!(!due(&cfg, None, now, 3 * 60), "outside active hours");
+    }
+
+    fn test_state(heartbeat_on: bool) -> (AppState, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let db = db::Db::open(&paths.db_file()).unwrap();
+        let mut cfg = crate::config::Config::default();
+        for h in cfg.harness.values_mut() {
+            h.enabled = false;
+        }
+        cfg.heartbeat.enabled = heartbeat_on;
+        // Always inside active hours, so only `enabled` decides.
+        cfg.heartbeat.active_start = "00:00".into();
+        cfg.heartbeat.active_end = "00:00".into();
+        (AppState::new(cfg, paths, db).unwrap(), tmp)
+    }
+
+    async fn set_heartbeat(state: &AppState, value: Option<&'static str>) {
+        state
+            .db
+            .call(move |c| match value {
+                Some(v) => db::set_setting(c, crate::state::HEARTBEAT_ENABLED, v),
+                None => db::delete_setting(c, crate::state::HEARTBEAT_ENABLED),
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn heartbeat_listed_enabled(state: &AppState) -> bool {
+        status(state)
+            .await
+            .iter()
+            .find(|j| j["name"] == "heartbeat")
+            .unwrap()["enabled"]
+            .as_bool()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn heartbeat_app_setting_overrides_config_without_restart() {
+        let noon = 12 * 60;
+        let now = 10_000_000_000;
+        for config_on in [false, true] {
+            let (state, _tmp) = test_state(config_on);
+            // Unset: the config value is the default.
+            assert_eq!(state.heartbeat_enabled().await, config_on);
+            assert_eq!(job_due(&state, Job::Heartbeat, now, noon).await, config_on);
+            assert_eq!(heartbeat_listed_enabled(&state).await, config_on);
+            // The app setting wins in both directions on the next tick.
+            for (value, on) in [("true", true), ("false", false)] {
+                set_heartbeat(&state, Some(value)).await;
+                assert_eq!(state.heartbeat_enabled().await, on);
+                assert_eq!(job_due(&state, Job::Heartbeat, now, noon).await, on);
+                assert_eq!(heartbeat_listed_enabled(&state).await, on);
+            }
+            // Cleared again: back to config.
+            set_heartbeat(&state, None).await;
+            assert_eq!(job_due(&state, Job::Heartbeat, now, noon).await, config_on);
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_heartbeat_still_waits_for_its_interval() {
+        let (state, _tmp) = test_state(false);
+        set_heartbeat(&state, Some("true")).await;
+        let now = 10_000_000_000;
+        let recent = (now - 5 * 60_000).to_string();
+        state
+            .db
+            .call(move |c| db::set_setting(c, "job.heartbeat.last_run", &recent))
+            .await
+            .unwrap();
+        assert!(!job_due(&state, Job::Heartbeat, now, 12 * 60).await);
+        assert!(job_due(&state, Job::Heartbeat, now + 60 * 60_000, 12 * 60).await);
     }
 
     #[test]

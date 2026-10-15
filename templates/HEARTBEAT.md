@@ -1,7 +1,7 @@
 # Heartbeat
 
-Checklist for scheduled check-ins. When the heartbeat job is enabled
-(`[heartbeat]` in config.toml), the agent reads this file on a schedule and
+Checklist for scheduled check-ins. When check-ins are on (Settings, "Check
+in on its own", or `[heartbeat]` in config.toml), the agent reads this file on a schedule and
 messages you in Main chat only when something needs attention.
 
 ## Checks

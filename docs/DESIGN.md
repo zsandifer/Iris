@@ -223,7 +223,9 @@ own personality. It is not a clone.
   read-only copy with a lock note in Iris's voice and an "Open Memory ›"
   link: you change memory in Memory or by asking in chat.
 - **Settings:**
-  - Name, picture, voice replies, notifications, quiet hours.
+  - Name, picture, voice replies, "Check in on its own" (owner only: the
+    agent looks over things on a schedule and messages you only when
+    something needs your attention), notifications, quiet hours.
   - Advanced: **AI engine**, devices, people, activity log (all steps, or
     just connected services with whether each ran on its own or you
     approved it).

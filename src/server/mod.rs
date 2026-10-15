@@ -944,6 +944,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_toggle_is_owner_only_and_applies_right_away() {
+        let h = setup();
+        assert!(!h.state.cfg.heartbeat.enabled, "config default is off");
+        let owner = pair_as(&h, None).await;
+        h.state
+            .db
+            .with(|c| {
+                c.execute(
+                    "INSERT INTO users(id,display_name,created_at) VALUES ('guest','Guest',0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let guest = pair_as(&h, Some("guest")).await;
+        let listed = |jobs: &Value| {
+            jobs["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|j| j["name"] == "heartbeat")
+                .unwrap()["enabled"]
+                .clone()
+        };
+        let (_, settings) = send(&h.app, "GET", "/api/settings", Some(&owner), None).await;
+        assert_eq!(settings["heartbeat_enabled"], false);
+        let (_, settings) = send(&h.app, "GET", "/api/settings", Some(&guest), None).await;
+        assert_eq!(settings["heartbeat_enabled"], Value::Null);
+        let on = json!({"heartbeat_enabled": true});
+        let (status, _) = send(
+            &h.app,
+            "PUT",
+            "/api/settings",
+            Some(&guest),
+            Some(on.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(!h.state.heartbeat_enabled().await);
+
+        let (status, settings) = send(&h.app, "PUT", "/api/settings", Some(&owner), Some(on)).await;
+        assert_eq!(status, StatusCode::OK, "{settings}");
+        assert_eq!(settings["heartbeat_enabled"], true);
+        let (_, jobs) = send(&h.app, "GET", "/api/jobs", Some(&owner), None).await;
+        assert_eq!(listed(&jobs), true);
+        // Other settings writes leave the choice alone.
+        send(
+            &h.app,
+            "PUT",
+            "/api/settings",
+            Some(&owner),
+            Some(json!({"agent_name": "Iris"})),
+        )
+        .await;
+        assert!(h.state.heartbeat_enabled().await);
+        // The choice survives a restart.
+        let reloaded = AppState::new(
+            h.state.cfg.clone(),
+            h.state.paths.clone(),
+            crate::db::Db::open(&h.state.paths.db_file()).unwrap(),
+        )
+        .unwrap();
+        assert!(reloaded.heartbeat_enabled().await);
+
+        let (_, settings) = send(
+            &h.app,
+            "PUT",
+            "/api/settings",
+            Some(&owner),
+            Some(json!({"heartbeat_enabled": false})),
+        )
+        .await;
+        assert_eq!(settings["heartbeat_enabled"], false);
+        let (_, jobs) = send(&h.app, "GET", "/api/jobs", Some(&owner), None).await;
+        assert_eq!(listed(&jobs), false);
+    }
+
+    #[tokio::test]
     async fn memory_routes_are_owner_only_and_edits_pin_forget_and_undo_work() {
         let h = setup();
         let owner = pair_as(&h, None).await;

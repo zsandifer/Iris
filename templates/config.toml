@@ -137,7 +137,8 @@ hour = 3
 min_messages = 4
 
 # Proactive check-in: reads persona/HEARTBEAT.md and messages you in Main chat
-# only when something needs attention. Uses the `background` slot.
+# only when something needs attention. Uses the `background` slot. The app's
+# Settings toggle ("Check in on its own") overrides `enabled` once used.
 [heartbeat]
 enabled = false
 interval_mins = 60

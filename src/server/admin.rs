@@ -82,6 +82,8 @@ struct SettingsBody {
     agent_name: Option<String>,
     feed_prompt: Option<String>,
     allow_claude_for_shared: Option<bool>,
+    /// Turn the heartbeat (check-ins) on or off; overrides config.
+    heartbeat_enabled: Option<bool>,
     /// "Pause Iris": stop what it is doing and start nothing new.
     paused: Option<bool>,
     memory_learning_paused: Option<bool>,
@@ -98,6 +100,7 @@ async fn put_settings(
     for (key, value) in [
         (crate::memory::dream::PAUSED, body.memory_learning_paused),
         (crate::memory::dream::MORNING, body.memory_morning_note),
+        (crate::state::HEARTBEAT_ENABLED, body.heartbeat_enabled),
     ] {
         if let Some(value) = value {
             writes.push((key, Some(value.to_string())));

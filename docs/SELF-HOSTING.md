@@ -191,7 +191,7 @@ Iris to the open internet.
 | `[router]` | | Shared-chat opt-in, rankings override, optional model classifier (below). |
 | `[engines]` | | Engines directory, privileged install helper, daily auto-update. |
 | `[agent]` | `user = ""`, `launcher = "/usr/local/bin/iris"` | Optional OS isolation for CLI turns, status probes and sign-in. |
-| `[heartbeat]` | disabled | Proactive check-in with active hours. |
+| `[heartbeat]` | disabled | Proactive check-in with active hours. The app's Settings toggle "Check in on its own" overrides `enabled`. |
 | `[dream]` | enabled, 3am, 4 messages | Nightly private memory tidying (`hour` 0–23 local, `min_messages` 1–80). |
 | `[feed]` | enabled | The For you pipeline: checks hourly between 06:00 and 22:00, publishes one batch a day. |
 | `[push]` | enabled | Web Push (VAPID). Needs `vapid_subject` (a `mailto:` URL) unless `public_url` is `https:`. |
@@ -864,7 +864,11 @@ browses, edits, pins, forgets and undoes individual notes.
 `POST /api/jobs/dream/run` skips the time gate, keeping all privacy, activity,
 enabled and pause checks.
 
-The heartbeat is off by default. Both jobs respect active hours and can be
+The heartbeat is off by default. Turn it on or off in the app (Settings,
+"Check in on its own", owner only); that choice is saved in the database,
+applies within a minute without a restart, and overrides `[heartbeat]
+enabled` from then on. Until you use the toggle, the config value applies.
+Interval and active hours stay in config. Both jobs respect active hours and can be
 triggered manually (`POST /api/jobs/{heartbeat|feed}/run`, or "Find
 something now" in the app).
 
