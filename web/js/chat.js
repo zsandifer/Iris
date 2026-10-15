@@ -207,13 +207,14 @@ export function ChatScreen({ cid }) {
     } else setMembers(null);
   }, [cid, conv?.member_count]);
 
-  // Keep the newest message in view unless the user scrolled up.
+  // Keep the newest message in view unless the user scrolled up (or a
+  // jump is gliding there: setting scrollTop would cut it short).
   useLayoutEffect(() => {
     const el = scr.current;
     if (!el) return;
     if (prevHeight.current && el.scrollTop < 80 && el.scrollHeight > prevHeight.current && !stick.current) {
       el.scrollTop += el.scrollHeight - prevHeight.current;
-    } else if (stick.current) {
+    } else if (stick.current && !jumping.current) {
       el.scrollTop = el.scrollHeight;
     }
     prevHeight.current = el.scrollHeight;
@@ -224,7 +225,7 @@ export function ChatScreen({ cid }) {
   useLayoutEffect(() => {
     const el = scr.current;
     const observer = new ResizeObserver(() => {
-      if (stick.current) el.scrollTop = el.scrollHeight;
+      if (stick.current && !jumping.current) el.scrollTop = el.scrollHeight;
     });
     observer.observe(el);
     return () => observer.disconnect();
@@ -264,19 +265,27 @@ export function ChatScreen({ cid }) {
   const dismissOnDrag = () => typing()?.blur();
   // Touching, wheeling, or keys in the conversation stop following a jump.
   const interrupt = () => { jumping.current = false; };
+  // A jump that has not arrived in time (content kept growing, or the
+  // browser never reported the end) finishes at the bottom.
+  const settle = () => {
+    const el = scr.current;
+    if (!jumping.current || !el) return;
+    jumping.current = false;
+    if (stick.current) el.scrollTop = el.scrollHeight;
+  };
 
   const jump = () => {
     const el = scr.current;
     if (!el) return;
+    const smooth = !matchMedia('(prefers-reduced-motion: reduce)').matches;
     stick.current = true;
-    jumping.current = true;
+    jumping.current = smooth;
     seen.current = list.at(-1)?.id ?? null;
     setPos('bottom');
-    const smooth = !matchMedia('(prefers-reduced-motion: reduce)').matches;
     el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
     // Not every browser reports the end of a smooth scroll.
     clearTimeout(jumpTimer.current);
-    jumpTimer.current = setTimeout(interrupt, smooth ? 1500 : 0);
+    if (smooth) jumpTimer.current = setTimeout(settle, 1500);
   };
 
   const running = list.some((m) => m.status === 'streaming');
