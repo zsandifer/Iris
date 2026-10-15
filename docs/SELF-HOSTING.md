@@ -191,7 +191,6 @@ Iris to the open internet.
 | `[router]` | | Shared-chat opt-in, rankings override, optional model classifier (below). |
 | `[engines]` | | Engines directory, privileged install helper, daily auto-update. |
 | `[agent]` | `user = ""`, `launcher = "/usr/local/bin/iris"` | Optional OS isolation for CLI turns, status probes and sign-in. |
-| `[heartbeat]` | disabled | Proactive check-in with active hours. The app's Settings toggle "Check in on its own" overrides `enabled`. |
 | `[dream]` | enabled, 3am, 4 messages | Nightly private memory tidying (`hour` 0–23 local, `min_messages` 1–80). |
 | `[feed]` | enabled | The For you pipeline: checks hourly between 06:00 and 22:00, publishes one batch a day. |
 | `[push]` | enabled | Web Push (VAPID). Needs `vapid_subject` (a `mailto:` URL) unless `public_url` is `https:`. |
@@ -803,7 +802,7 @@ Python 3).
 
 ## Proactive jobs
 
-- **Heartbeat** (`[heartbeat]`): on a schedule, the agent works through
+- **Heartbeat** (Settings, "Check in on its own"): on a schedule, the agent works through
   `HEARTBEAT.md`. If something needs your attention it posts in your Main
   chat and sends a push notification; otherwise it stays silent.
 - **For you** (`[feed]`, on by default): once a day Iris reads your
@@ -864,11 +863,17 @@ browses, edits, pins, forgets and undoes individual notes.
 `POST /api/jobs/dream/run` skips the time gate, keeping all privacy, activity,
 enabled and pause checks.
 
-The heartbeat is off by default. Turn it on or off in the app (Settings,
-"Check in on its own", owner only); that choice is saved in the database,
-applies within a minute without a restart, and overrides `[heartbeat]
-enabled` from then on. Until you use the toggle, the config value applies.
-Interval and active hours stay in config. Both jobs respect active hours and can be
+The heartbeat is off by default and is set only in the app (Settings,
+"Check in on its own", owner only): on or off, how often (every 15 minutes
+to once a day; the app offers every 30 minutes, hour, 2 hours, 4 hours, or
+once a day) and between which hours (default every hour, 08:00 to 22:00).
+Changes are saved in the database and apply within a minute, no restart.
+config.toml no longer has a `[heartbeat]` section. An older config that
+still has one keeps loading: on startup its values are imported once, only
+if none of these app settings is saved yet (an interval outside 15 minutes
+to a day is clamped, an unreadable time keeps its default), and from then
+on the section is ignored with a one-line notice in the log; delete it
+whenever you like. Both jobs respect active hours and can be
 triggered manually (`POST /api/jobs/{heartbeat|feed}/run`, or "Find
 something now" in the app).
 

@@ -84,6 +84,11 @@ struct SettingsBody {
     allow_claude_for_shared: Option<bool>,
     /// Turn the heartbeat (check-ins) on or off; overrides config.
     heartbeat_enabled: Option<bool>,
+    /// How often the heartbeat runs, in minutes; overrides config.
+    heartbeat_interval_mins: Option<u64>,
+    /// Local "HH:MM" window the heartbeat runs in; overrides config.
+    heartbeat_active_start: Option<String>,
+    heartbeat_active_end: Option<String>,
     /// "Pause Iris": stop what it is doing and start nothing new.
     paused: Option<bool>,
     memory_learning_paused: Option<bool>,
@@ -104,6 +109,26 @@ async fn put_settings(
     ] {
         if let Some(value) = value {
             writes.push((key, Some(value.to_string())));
+        }
+    }
+    if let Some(n) = body.heartbeat_interval_mins {
+        use crate::state::{HEARTBEAT_MAX_INTERVAL, HEARTBEAT_MIN_INTERVAL};
+        if !(HEARTBEAT_MIN_INTERVAL..=HEARTBEAT_MAX_INTERVAL).contains(&n) {
+            return Err(ApiError::bad_request(
+                "I can check in as often as every 15 minutes or as rarely as once a day.",
+            ));
+        }
+        writes.push((crate::state::HEARTBEAT_INTERVAL, Some(n.to_string())));
+    }
+    for (key, value) in [
+        (crate::state::HEARTBEAT_START, &body.heartbeat_active_start),
+        (crate::state::HEARTBEAT_END, &body.heartbeat_active_end),
+    ] {
+        if let Some(value) = value {
+            let time = crate::state::normalize_hhmm(value).ok_or_else(|| {
+                ApiError::bad_request("That time doesn't look right. Use a time like 08:00.")
+            })?;
+            writes.push((key, Some(time)));
         }
     }
     if let Some(name) = &body.agent_name {

@@ -30,7 +30,12 @@ pub struct Config {
     pub max_upload_bytes: usize,
     pub harness: BTreeMap<String, HarnessConfig>,
     pub router: RouterConfig,
-    pub heartbeat: JobConfig,
+    /// Legacy `[heartbeat]` section. Check-ins are app settings now; on
+    /// startup a present section is imported once into a database that has
+    /// no check-in settings yet (`state::import_legacy_heartbeat`), then
+    /// ignored. Parsed so older configs still load.
+    #[serde(rename = "heartbeat", skip_serializing_if = "Option::is_none")]
+    pub legacy_heartbeat: Option<JobConfig>,
     pub feed: JobConfig,
     pub dream: DreamConfig,
     pub push: PushConfig,
@@ -380,7 +385,7 @@ impl Default for Config {
             max_upload_bytes: 10 * 1024 * 1024,
             harness,
             router: RouterConfig::default(),
-            heartbeat: JobConfig::default(),
+            legacy_heartbeat: None,
             feed: JobConfig::feed_default(),
             dream: DreamConfig::default(),
             push: PushConfig::default(),
@@ -510,13 +515,14 @@ impl Config {
         if !self.router.rankings_file.trim().is_empty() {
             crate::ranking::Rankings::load(Some(Path::new(self.router.rankings_file.trim())))?;
         }
-        for (name, job) in [("heartbeat", &self.heartbeat), ("feed", &self.feed)] {
-            if job.interval_mins == 0 {
-                return Err(format!("{name}.interval_mins must be at least 1").into());
-            }
-            if parse_hhmm(&job.active_start).is_none() || parse_hhmm(&job.active_end).is_none() {
-                return Err(format!("{name}.active_start/active_end must be HH:MM").into());
-            }
+        // The legacy `[heartbeat]` section is not checked: it is only
+        // imported once (bad values fall back to the defaults) and ignored.
+        let feed = &self.feed;
+        if feed.interval_mins == 0 {
+            return Err("feed.interval_mins must be at least 1".into());
+        }
+        if parse_hhmm(&feed.active_start).is_none() || parse_hhmm(&feed.active_end).is_none() {
+            return Err("feed.active_start/active_end must be HH:MM".into());
         }
         Ok(())
     }
@@ -749,11 +755,24 @@ mod tests {
     }
 
     #[test]
+    fn legacy_heartbeat_section_still_loads() {
+        assert_eq!(Config::default().legacy_heartbeat, None);
+        let cfg = Config::parse("[heartbeat]\nenabled = true\ninterval_mins = 30\n").unwrap();
+        let legacy = cfg.legacy_heartbeat.unwrap();
+        assert!(legacy.enabled);
+        assert_eq!(legacy.interval_mins, 30);
+        assert_eq!(legacy.active_start, "08:00");
+        // Ignored after the one-time import, so a bad value never blocks startup.
+        assert!(Config::parse("[heartbeat]\nactive_start = \"25:00\"").is_ok());
+        assert!(Config::parse("[heartbeat]\nnope = 1").is_err());
+    }
+
+    #[test]
     fn rejects_bad_values() {
         assert!(Config::parse("bnid = \"x\"").is_err());
         assert!(Config::parse("[harness.nope]\ncommand = \"nope\"").is_err());
         assert!(Config::parse("max_concurrent_turns = 0").is_err());
-        assert!(Config::parse("[heartbeat]\nactive_start = \"25:00\"").is_err());
+        assert!(Config::parse("[feed]\nactive_start = \"25:00\"").is_err());
         assert!(Config::parse("agent_name = \" \"").is_err());
     }
 

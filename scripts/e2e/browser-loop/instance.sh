@@ -58,7 +58,6 @@ path, bind, public_url, engines = sys.argv[1:]
 want = {
     "": {"bind": json.dumps(bind), "public_url": json.dumps(public_url),
          "max_concurrent_turns": "1", "turn_timeout_secs": "600"},
-    "heartbeat": {"enabled": "false"},
     "feed": {"enabled": "false"},
     "push": {"enabled": "false", "notify_replies_when_offline": "false"},
     "engines": {"helper": "[]", "auto_update": "false"},

@@ -401,6 +401,15 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
     }
     let db = db::Db::open(&paths.db_file())?;
     prepare_memory(&db, &paths)?;
+    if let Some(legacy) = &cfg.legacy_heartbeat {
+        if db.with(|c| state::import_legacy_heartbeat(c, legacy))? {
+            info!(
+                "imported [heartbeat] from config.toml; check-ins are set in the app now and the section is ignored"
+            );
+        } else {
+            info!("[heartbeat] in config.toml is ignored; check-ins are set in the app (Settings)");
+        }
+    }
     let interrupted = db.with(db::mark_interrupted)?;
     if interrupted > 0 {
         warn!("{interrupted} turn(s) were interrupted by the last shutdown");

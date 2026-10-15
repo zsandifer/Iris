@@ -7,6 +7,13 @@ All notable changes to Iris are documented here, following
 
 ### Added
 
+- Check-ins set in the app: Settings → "Check in on its own" turns the
+  heartbeat on or off, with "How often" (every 30 minutes to once a day) and
+  "Between" (its hours) while on. These app settings are the only place the
+  heartbeat is configured now; changes apply within a minute. config.toml's
+  `[heartbeat]` section is gone: an existing one is imported once on startup
+  (only if nothing is set in the app yet) and ignored after that.
+
 - Chat times and a jump-to-latest button: day separators ("Today",
   "Yesterday", the weekday, or the date), a small time in the phone's own
   format under the last message of each run from the same sender (or after a
