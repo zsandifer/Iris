@@ -218,6 +218,10 @@ export function ChatScreen({ cid }) {
       el.scrollTop = el.scrollHeight;
     }
     prevHeight.current = el.scrollHeight;
+    // A growing reply moves the bottom away without a scroll event.
+    if (!stick.current && !jumping.current) {
+      setPos(el.scrollHeight - el.scrollTop - el.clientHeight >= JUMP_AWAY ? 'far' : 'near');
+    }
   });
 
   // Resizing the viewport or a growing composer does not render this
