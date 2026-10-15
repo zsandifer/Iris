@@ -49,7 +49,7 @@ test("an open editor takes newer saved settings but keeps the owner's own edits"
 
 test('the hub line counts active routines and what waits for the owner', async () => {
   set({ me: { user: { id: 'o', is_owner: true } }, routines: null });
-  assert.equal(routinesSub(), ' ');
+  assert.equal(routinesSub(), '\u00a0'); // holds the row's height while loading
   onFetch((url, opts) => {
     assert.equal(url, '/api/routines');
     return reply(opts, {
