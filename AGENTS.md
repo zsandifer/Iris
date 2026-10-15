@@ -71,6 +71,16 @@ only run a call unchanged, hold it for approval, or refuse it.
    working directory. Project docs/context files never load, including in
    owner chats, jobs, resumed turns, classifiers and key checks. Do not
    restore a shared cwd or silently weaken a CLI's context restrictions.
+10. **UI first.** The owner can set up, configure, use and debug Iris
+    entirely from the app, without the file system, a terminal or a coding
+    agent. Owner-facing settings live only in app settings, never in
+    `config.toml` with a database override on top; `config.toml` holds only
+    what the server needs before the app can run (bind address, paths,
+    engine locations), and legacy keys are imported once. Failures show up
+    in the app with a way to fix or retry, never just "check the logs".
+    This never weakens security: these controls are owner-only and
+    authenticated, secrets are never shown, and the other invariants still
+    apply.
 
 ## Layout
 
