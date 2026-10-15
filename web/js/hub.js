@@ -1,7 +1,7 @@
 // The Iris hub: Routines (routines.js), Connections, Logins & wallet, System files (Iris's computer
 // lives in computer.js).
 import { html, useEffect, useState } from './h.js';
-import { get, post, patch, put, del, seg } from './api.js';
+import { get, post, patch, put, del, seg, sessionGen } from './api.js';
 import { S, set, useStore, go, back, toast, isOwner, loadRoutines } from './store.js';
 import {
   Icon, Avatar, Row, Group, Page, Empty, Spinner, Toggle, LetterTile,
@@ -12,12 +12,21 @@ import { md } from './md.js';
 import { routinesSub } from './routines.js';
 
 // The last answer per path, so a screen you come back to shows it at once
-// instead of an empty state that reflows when the request returns.
-const seen = new Map();
+// instead of an empty state that reflows when the request returns. Keyed by
+// session so a new sign-in never sees the previous one's answers.
+let seen = new Map();
+let seenGen = sessionGen();
+function remembered() {
+  if (seenGen !== sessionGen()) { seen = new Map(); seenGen = sessionGen(); }
+  return seen;
+}
 function useData(path, deps = []) {
-  const [data, setData] = useState(() => seen.get(path) ?? null);
+  const [data, setData] = useState(() => remembered().get(path) ?? null);
   const [err, setErr] = useState(null);
-  const reload = () => get(path).then((d) => { seen.set(path, d); setData(d); }).catch((e) => setErr(e.message));
+  const reload = () => {
+    const gen = sessionGen();
+    return get(path).then((d) => { if (gen === sessionGen()) remembered().set(path, d); setData(d); }).catch((e) => setErr(e.message));
+  };
   useEffect(() => { reload(); }, deps);
   return [data, reload, err];
 }
