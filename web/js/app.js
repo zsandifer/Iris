@@ -311,7 +311,9 @@ function Screen() {
 
 // Each screen slides in: deeper from the right, back up from the left,
 // and a tab switch fades.
-const routeKey = () => (S.route.tab === 'chat' ? `chat/${currentChat()}` : S.route.parts.join('/') + (S.route.query.get('edit') ? '?edit' : ''));
+// Settings opens from the Iris hub, so it moves like one of the hub's pages.
+const routeKey = () => (S.route.tab === 'chat' ? `chat/${currentChat()}`
+  : (S.route.tab === 'settings' ? 'iris/' : '') + S.route.parts.join('/') + (S.route.query.get('edit') ? '?edit' : ''));
 let lastRoute = null;
 let lastMotion = '';
 function routeMotion() {

@@ -11,10 +11,13 @@ import { describe, visible } from './status.js';
 import { md } from './md.js';
 import { routinesSub } from './routines.js';
 
+// The last answer per path, so a screen you come back to shows it at once
+// instead of an empty state that reflows when the request returns.
+const seen = new Map();
 function useData(path, deps = []) {
-  const [data, setData] = useState(null);
+  const [data, setData] = useState(() => seen.get(path) ?? null);
   const [err, setErr] = useState(null);
-  const reload = () => get(path).then(setData).catch((e) => setErr(e.message));
+  const reload = () => get(path).then((d) => { seen.set(path, d); setData(d); }).catch((e) => setErr(e.message));
   useEffect(() => { reload(); }, deps);
   return [data, reload, err];
 }
@@ -38,8 +41,8 @@ export function Hub() {
     <${Group}>
       ${owner && html`
       <${Row} icon="repeat" title="Routines" sub=${routinesSub()} onClick=${() => go('iris/routines')} />
-      <${Row} icon="plug" title="Connections" sub=${nCon == null ? ' ' : nCon ? `${nCon} connected` : 'Nothing connected yet'} onClick=${() => go('iris/connections')} />
-      <${Row} icon="lock" title="Logins & wallet" sub=${creds ? `${logins} login${logins === 1 ? '' : 's'} · ${cards} card${cards === 1 ? '' : 's'}` : ' '} onClick=${() => go('iris/logins')} />
+      <${Row} icon="plug" title="Connections" sub=${nCon == null ? '\u00a0' : nCon ? `${nCon} connected` : 'Nothing connected yet'} onClick=${() => go('iris/connections')} />
+      <${Row} icon="lock" title="Logins & wallet" sub=${creds ? `${logins} login${logins === 1 ? '' : 's'} · ${cards} card${cards === 1 ? '' : 's'}` : '\u00a0'} onClick=${() => go('iris/logins')} />
       <${Row} icon="monitor" title=${`${agentName()}'s computer`} sub=${computer} onClick=${() => go('iris/computer')} />
       <${Row} icon="memory" title="Memory" sub="What I remember about you" onClick=${() => go('iris/memory')} />
       <${Row} icon="folder" title="System files" sub="Personality, memory, and notes" onClick=${() => go('iris/files')} />`}

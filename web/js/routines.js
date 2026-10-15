@@ -575,7 +575,7 @@ export function RoutineCard({ c }) {
 
 export function routinesSub() {
   const list = S.routines;
-  if (!list) return ' ';
+  if (!list) return '\u00a0'; // keeps the line's height while loading
   const on = list.filter((r) => r.state === 'active').length;
   const waiting = list.filter((r) => r.state === 'pending_approval' || r.pending_change || r.open_run?.status === 'waiting').length;
   if (waiting) return `${waiting} waiting for you`;
