@@ -1,7 +1,7 @@
 // The Iris hub: Routines (routines.js), Connections, Logins & wallet, System files (Iris's computer
 // lives in computer.js).
 import { html, useEffect, useState } from './h.js';
-import { get, post, patch, put, del, seg } from './api.js';
+import { get, post, patch, put, del, seg, sessionGen } from './api.js';
 import { S, set, useStore, go, back, toast, isOwner, loadRoutines } from './store.js';
 import {
   Icon, Avatar, Row, Group, Page, Empty, Spinner, Toggle, LetterTile,
@@ -11,10 +11,22 @@ import { describe, visible } from './status.js';
 import { md } from './md.js';
 import { routinesSub } from './routines.js';
 
+// The last answer per path, so a screen you come back to shows it at once
+// instead of an empty state that reflows when the request returns. Keyed by
+// session so a new sign-in never sees the previous one's answers.
+let seen = new Map();
+let seenGen = sessionGen();
+function remembered() {
+  if (seenGen !== sessionGen()) { seen = new Map(); seenGen = sessionGen(); }
+  return seen;
+}
 function useData(path, deps = []) {
-  const [data, setData] = useState(null);
+  const [data, setData] = useState(() => remembered().get(path) ?? null);
   const [err, setErr] = useState(null);
-  const reload = () => get(path).then(setData).catch((e) => setErr(e.message));
+  const reload = () => {
+    const gen = sessionGen();
+    return get(path).then((d) => { if (gen === sessionGen()) remembered().set(path, d); setData(d); }).catch((e) => setErr(e.message));
+  };
   useEffect(() => { reload(); }, deps);
   return [data, reload, err];
 }
@@ -38,8 +50,8 @@ export function Hub() {
     <${Group}>
       ${owner && html`
       <${Row} icon="repeat" title="Routines" sub=${routinesSub()} onClick=${() => go('iris/routines')} />
-      <${Row} icon="plug" title="Connections" sub=${nCon == null ? ' ' : nCon ? `${nCon} connected` : 'Nothing connected yet'} onClick=${() => go('iris/connections')} />
-      <${Row} icon="lock" title="Logins & wallet" sub=${creds ? `${logins} login${logins === 1 ? '' : 's'} · ${cards} card${cards === 1 ? '' : 's'}` : ' '} onClick=${() => go('iris/logins')} />
+      <${Row} icon="plug" title="Connections" sub=${nCon == null ? '\u00a0' : nCon ? `${nCon} connected` : 'Nothing connected yet'} onClick=${() => go('iris/connections')} />
+      <${Row} icon="lock" title="Logins & wallet" sub=${creds ? `${logins} login${logins === 1 ? '' : 's'} · ${cards} card${cards === 1 ? '' : 's'}` : '\u00a0'} onClick=${() => go('iris/logins')} />
       <${Row} icon="monitor" title=${`${agentName()}'s computer`} sub=${computer} onClick=${() => go('iris/computer')} />
       <${Row} icon="memory" title="Memory" sub="What I remember about you" onClick=${() => go('iris/memory')} />
       <${Row} icon="folder" title="System files" sub="Personality, memory, and notes" onClick=${() => go('iris/files')} />`}
