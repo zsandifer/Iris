@@ -161,6 +161,10 @@ impl std::ops::Deref for AppState {
     }
 }
 
+/// App setting that turns the heartbeat on or off ("true" / "false"),
+/// overriding `[heartbeat] enabled` from config.
+pub const HEARTBEAT_ENABLED: &str = "heartbeat.enabled";
+
 pub const DEFAULT_FEED_PROMPT: &str = "News, ideas, and finds that fit what I care about (see \
 USER.md and PROACTIVE_PREFERENCES.md). Prefer original reporting and creators over aggregators.";
 
@@ -730,7 +734,17 @@ impl AppState {
             .unwrap_or_else(|| DEFAULT_FEED_PROMPT.to_string())
     }
 
-    /// Settings as exposed to clients.
+    /// Whether the heartbeat (proactive check-ins) runs. The owner's app
+    /// setting wins in both directions; unset, `[heartbeat] enabled` from
+    /// config is the default.
+    pub async fn heartbeat_enabled(&self) -> bool {
+        match self.setting(HEARTBEAT_ENABLED).await.as_deref() {
+            Some("true") => true,
+            Some("false") => false,
+            _ => self.cfg.heartbeat.enabled,
+        }
+    }
+
     /// App settings as the API shows them. The feed instructions describe
     /// the owner's interests, so only the owner sees them.
     pub async fn settings_json(&self, owner: bool) -> Value {
@@ -745,6 +759,7 @@ impl AppState {
             "avatar_custom": avatar.is_some(),
             "allow_claude_for_shared": self.allow_claude_for_shared().await,
             "feed_prompt": if owner { Some(self.feed_prompt().await) } else { None },
+            "heartbeat_enabled": if owner { Some(self.heartbeat_enabled().await) } else { None },
             "voice": {"enabled": false, "status": "not_implemented"},
             "paused": self.is_paused().await,
             "memory": if owner { Some(json!({

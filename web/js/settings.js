@@ -99,6 +99,9 @@ export function Settings() {
     if (!f) return;
     try { set({ settings: await api('PUT', '/settings/avatar', f) }); toast('Picture updated'); } catch (err) { toast(err.message); }
   };
+  const checkIns = async (on) => {
+    try { set({ settings: await put('/settings', { heartbeat_enabled: on }) }); } catch (e) { toast(e.message); }
+  };
   const chat = S.slots?.find((s) => s.slot === 'chat');
   const engineSub = !S.slots ? ' ' : chat?.selection?.mode === 'pinned' ? `Chat pinned to ${chat.models.find((m) => m.id === chat.effective)?.label || 'a model'}` : 'Automatic';
   const signOut = async () => {
@@ -114,6 +117,8 @@ export function Settings() {
       <${Row} icon="user" title="Picture" value=${S.settings?.avatar_custom ? 'Custom' : 'Default'} onClick=${owner ? picture : undefined} chevron=${owner} />
       <${Row} icon="volume" title="Voice replies" sub="Coming soon: replies as voice notes plus text"
         right=${html`<${Toggle} on=${false} disabled onChange=${() => {}} label="Voice replies" />`} />
+      ${owner && html`<${Row} icon="chat" title="Check in on its own" sub="Messages you when something needs your attention"
+        right=${html`<${Toggle} on=${!!S.settings?.heartbeat_enabled} onChange=${checkIns} label="Check in on its own" />`} />`}
     <//>
     <${Group} label="You">
       <${Row} icon="user" title="Your name" value=${S.me?.user?.display_name} onClick=${renameMe} />
