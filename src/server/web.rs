@@ -60,6 +60,7 @@ pub static ASSETS: &[Asset] = assets![
     "js/photo-math.js" => JS,
     "js/push.js" => JS,
     "js/routines.js" => JS,
+    "js/schedule-text.js" => JS,
     "js/settings.js" => JS,
     "js/status.js" => JS,
     "js/store.js" => JS,

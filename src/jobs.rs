@@ -55,11 +55,7 @@ impl Job {
     }
     async fn effective_cfg(self, state: &AppState) -> JobConfig {
         match self {
-            Job::Heartbeat => {
-                let mut cfg = state.cfg.heartbeat.clone();
-                cfg.enabled = state.heartbeat_enabled().await;
-                cfg
-            }
+            Job::Heartbeat => state.heartbeat_config().await,
             Job::Feed => {
                 let mut cfg = state.cfg.feed.clone();
                 cfg.enabled = crate::feed::enabled(state).await;
@@ -536,7 +532,7 @@ mod tests {
         assert!(!due(&cfg, None, now, 3 * 60), "outside active hours");
     }
 
-    fn test_state(heartbeat_on: bool) -> (AppState, tempfile::TempDir) {
+    fn test_state() -> (AppState, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let paths = crate::config::Paths {
             config_file: tmp.path().join("config.toml"),
@@ -548,70 +544,141 @@ mod tests {
         for h in cfg.harness.values_mut() {
             h.enabled = false;
         }
-        cfg.heartbeat.enabled = heartbeat_on;
-        // Always inside active hours, so only `enabled` decides.
-        cfg.heartbeat.active_start = "00:00".into();
-        cfg.heartbeat.active_end = "00:00".into();
         (AppState::new(cfg, paths, db).unwrap(), tmp)
     }
 
-    async fn set_heartbeat(state: &AppState, value: Option<&'static str>) {
+    async fn set(state: &AppState, key: &'static str, value: Option<&'static str>) {
         state
             .db
             .call(move |c| match value {
-                Some(v) => db::set_setting(c, crate::state::HEARTBEAT_ENABLED, v),
-                None => db::delete_setting(c, crate::state::HEARTBEAT_ENABLED),
+                Some(v) => db::set_setting(c, key, v),
+                None => db::delete_setting(c, key),
             })
             .await
             .unwrap();
     }
 
-    async fn heartbeat_listed_enabled(state: &AppState) -> bool {
+    async fn listed_heartbeat(state: &AppState) -> Value {
         status(state)
             .await
-            .iter()
+            .into_iter()
             .find(|j| j["name"] == "heartbeat")
-            .unwrap()["enabled"]
-            .as_bool()
             .unwrap()
     }
 
     #[tokio::test]
-    async fn heartbeat_app_setting_overrides_config_without_restart() {
-        let noon = 12 * 60;
-        let now = 10_000_000_000;
-        for config_on in [false, true] {
-            let (state, _tmp) = test_state(config_on);
-            // Unset: the config value is the default.
-            assert_eq!(state.heartbeat_enabled().await, config_on);
-            assert_eq!(job_due(&state, Job::Heartbeat, now, noon).await, config_on);
-            assert_eq!(heartbeat_listed_enabled(&state).await, config_on);
-            // The app setting wins in both directions on the next tick.
-            for (value, on) in [("true", true), ("false", false)] {
-                set_heartbeat(&state, Some(value)).await;
-                assert_eq!(state.heartbeat_enabled().await, on);
-                assert_eq!(job_due(&state, Job::Heartbeat, now, noon).await, on);
-                assert_eq!(heartbeat_listed_enabled(&state).await, on);
-            }
-            // Cleared again: back to config.
-            set_heartbeat(&state, None).await;
-            assert_eq!(job_due(&state, Job::Heartbeat, now, noon).await, config_on);
-        }
+    async fn heartbeat_follows_app_settings_without_restart() {
+        use crate::state::{HEARTBEAT_ENABLED, HEARTBEAT_END, HEARTBEAT_INTERVAL, HEARTBEAT_START};
+        let (state, _tmp) = test_state();
+        let (now, noon) = (10_000_000_000, 12 * 60);
+        // Nothing saved: off, hourly, 08:00 to 22:00.
+        assert_eq!(state.heartbeat_config().await, JobConfig::default());
+        assert!(!job_due(&state, Job::Heartbeat, now, noon).await);
+        assert_eq!(listed_heartbeat(&state).await["enabled"], false);
+
+        set(&state, HEARTBEAT_ENABLED, Some("true")).await;
+        assert!(job_due(&state, Job::Heartbeat, now, noon).await);
+        assert_eq!(listed_heartbeat(&state).await["enabled"], true);
+        assert!(
+            !job_due(&state, Job::Heartbeat, now, 7 * 60).await,
+            "before 08:00"
+        );
+
+        // A new window and interval apply on the next tick.
+        set(&state, HEARTBEAT_START, Some("06:30")).await;
+        set(&state, HEARTBEAT_END, Some("07:30")).await;
+        set(&state, HEARTBEAT_INTERVAL, Some("240")).await;
+        assert!(job_due(&state, Job::Heartbeat, now, 7 * 60).await);
+        assert!(!job_due(&state, Job::Heartbeat, now, noon).await);
+        let listed = listed_heartbeat(&state).await;
+        assert_eq!(
+            (
+                &listed["interval_mins"],
+                &listed["active_start"],
+                &listed["active_end"]
+            ),
+            (&json!(240), &json!("06:30"), &json!("07:30"))
+        );
+        let last = (now - 3 * 60 * 60_000).to_string();
+        state
+            .db
+            .call(move |c| db::set_setting(c, "job.heartbeat.last_run", &last))
+            .await
+            .unwrap();
+        assert!(
+            !job_due(&state, Job::Heartbeat, now, 7 * 60).await,
+            "3 of 4 hours"
+        );
+        assert!(job_due(&state, Job::Heartbeat, now + 60 * 60_000, 7 * 60).await);
+
+        set(&state, HEARTBEAT_ENABLED, Some("false")).await;
+        assert!(!job_due(&state, Job::Heartbeat, now + 60 * 60_000, 7 * 60).await);
     }
 
     #[tokio::test]
-    async fn enabled_heartbeat_still_waits_for_its_interval() {
-        let (state, _tmp) = test_state(false);
-        set_heartbeat(&state, Some("true")).await;
-        let now = 10_000_000_000;
-        let recent = (now - 5 * 60_000).to_string();
+    async fn unreadable_heartbeat_settings_use_defaults() {
+        use crate::state::{HEARTBEAT_END, HEARTBEAT_INTERVAL, HEARTBEAT_START};
+        let (state, _tmp) = test_state();
+        set(&state, HEARTBEAT_INTERVAL, Some("5")).await;
+        set(&state, HEARTBEAT_START, Some("25:00")).await;
+        set(&state, HEARTBEAT_END, Some("9:5")).await;
+        let cfg = state.heartbeat_config().await;
+        assert_eq!(cfg.interval_mins, 60);
+        assert_eq!(cfg.active_start, "08:00");
+        assert_eq!(cfg.active_end, "09:05");
+    }
+
+    #[test]
+    fn legacy_heartbeat_is_imported_once_and_never_overwrites() {
+        use crate::state::{HEARTBEAT_ENABLED, HEARTBEAT_INTERVAL, import_legacy_heartbeat};
+        let (state, _tmp) = test_state();
+        let legacy = JobConfig {
+            enabled: true,
+            interval_mins: 5,
+            active_start: "7:00".into(),
+            active_end: "nope".into(),
+        };
+        let got = |k| state.db.with(|c| db::get_setting(c, k)).unwrap();
+        assert!(
+            state
+                .db
+                .with(|c| import_legacy_heartbeat(c, &legacy))
+                .unwrap()
+        );
+        assert_eq!(got(HEARTBEAT_ENABLED).as_deref(), Some("true"));
+        // Clamped to the app's bounds; bad times keep their defaults.
+        assert_eq!(got(HEARTBEAT_INTERVAL).as_deref(), Some("15"));
+        assert_eq!(got(crate::state::HEARTBEAT_START).as_deref(), Some("07:00"));
+        assert_eq!(got(crate::state::HEARTBEAT_END).as_deref(), Some("22:00"));
+        // Changed in the app afterwards: a restart does not import again.
         state
             .db
-            .call(move |c| db::set_setting(c, "job.heartbeat.last_run", &recent))
-            .await
+            .with(|c| db::set_setting(c, HEARTBEAT_ENABLED, "false"))
             .unwrap();
-        assert!(!job_due(&state, Job::Heartbeat, now, 12 * 60).await);
-        assert!(job_due(&state, Job::Heartbeat, now + 60 * 60_000, 12 * 60).await);
+        assert!(
+            !state
+                .db
+                .with(|c| import_legacy_heartbeat(c, &legacy))
+                .unwrap()
+        );
+        assert_eq!(got(HEARTBEAT_ENABLED).as_deref(), Some("false"));
+
+        // Any check-in setting already saved (say, the toggle from an
+        // earlier version) blocks the import entirely.
+        let (state, _tmp) = test_state();
+        state
+            .db
+            .with(|c| db::set_setting(c, HEARTBEAT_ENABLED, "false"))
+            .unwrap();
+        assert!(
+            !state
+                .db
+                .with(|c| import_legacy_heartbeat(c, &legacy))
+                .unwrap()
+        );
+        let got = |k| state.db.with(|c| db::get_setting(c, k)).unwrap();
+        assert_eq!(got(HEARTBEAT_ENABLED).as_deref(), Some("false"));
+        assert_eq!(got(HEARTBEAT_INTERVAL), None);
     }
 
     #[test]

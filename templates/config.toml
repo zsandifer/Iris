@@ -136,15 +136,10 @@ enabled = true
 hour = 3
 min_messages = 4
 
-# Proactive check-in: reads persona/HEARTBEAT.md and messages you in Main chat
-# only when something needs attention. Uses the `background` slot. The app's
-# Settings toggle ("Check in on its own") overrides `enabled` once used.
-[heartbeat]
-enabled = false
-interval_mins = 60
-# Local time window in which the job may run.
-active_start = "08:00"
-active_end = "22:00"
+# Proactive check-ins (reading persona/HEARTBEAT.md, on the `background` slot)
+# are set in the app: Settings, "Check in on its own", how often and between
+# which hours. An older `[heartbeat]` section here is imported once into the
+# app's settings on startup and ignored after that.
 
 # The For you feed: fetches your sources (RSS, YouTube, Reddit, Hacker News,
 # Bluesky, Mastodon), ranks them by rules, and publishes about 10 posts once a

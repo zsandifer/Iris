@@ -35,6 +35,7 @@ const SHELL = [
   '/js/photo-math.js',
   '/js/push.js',
   '/js/routines.js',
+  '/js/schedule-text.js',
   '/js/settings.js',
   '/js/status.js',
   '/js/store.js',

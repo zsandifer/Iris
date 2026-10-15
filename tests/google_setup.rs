@@ -33,7 +33,7 @@ fn google_pastes_and_malformed_requests_never_leak_to_responses_or_logs() {
     for (_, harness) in cfg["harness"].as_table_mut().unwrap().iter_mut() {
         harness["enabled"] = false.into();
     }
-    for section in ["engines", "heartbeat", "feed", "push"] {
+    for section in ["engines", "feed", "push"] {
         cfg[section][if section == "engines" {
             "auto_update"
         } else {

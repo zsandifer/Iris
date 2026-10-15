@@ -11,12 +11,7 @@ import { SignIn, ApiKeyForm } from './cards.js';
 import { ServiceActivity } from './connect.js';
 import { pushState, enablePush, disablePush, isIOS } from './push.js';
 import { activityTitle, placeLabel } from './hub.js';
-
-const fmt12 = (hhmm) => {
-  const [h, m] = String(hhmm || '').split(':').map(Number);
-  if (Number.isNaN(h)) return hhmm;
-  return `${h % 12 || 12}${m ? ':' + String(m).padStart(2, '0') : ''} ${h < 12 ? 'AM' : 'PM'}`;
-};
+import { fmt12, everyLabel, everyChoices, betweenLabel } from './schedule-text.js';
 
 function QuietHours() {
   const q = S.me?.quiet_hours;
@@ -38,6 +33,33 @@ function QuietHours() {
       <button class="b1" onClick=${() => save({ start, end })}>Save</button></div></div>`;
   };
   return html`<${Row} icon="moon" title="Quiet hours" value=${q ? `${fmt12(q.start)}–${fmt12(q.end)}` : 'Off'} onClick=${() => openSheet(() => html`<${Body} />`)} />`;
+}
+
+// Check-ins: on/off, how often, and between which hours (owner only).
+function CheckIns() {
+  const st = S.settings;
+  const save = async (body) => {
+    try { set({ settings: await put('/settings', body) }); return true; } catch (e) { toast(e.message); return false; }
+  };
+  const often = () => openSheet(() => html`<div class="sheet-body"><h3>How often</h3>
+    <p class="mu">I look in this often and only message you when something needs your attention.</p>
+    <div class="grp">${everyChoices(S.settings?.heartbeat_interval_mins).map((m) => html`<div class="r tap"
+      onClick=${async () => { if (await save({ heartbeat_interval_mins: m })) closeSheet(); }}>
+      <div class="rt">${everyLabel(m)}</div><div class=${'rad' + (S.settings?.heartbeat_interval_mins === m ? ' on' : '')} /></div>`)}</div></div>`);
+  const Between = () => {
+    const [start, setStart] = useState(S.settings?.heartbeat_active_start || '08:00');
+    const [end, setEnd] = useState(S.settings?.heartbeat_active_end || '22:00');
+    return html`<div class="sheet-body"><h3>Between</h3>
+      <p class="mu">I only check in during these hours. Pick the same time twice to check in around the clock.</p>
+      <div class="two"><div><label class="lbl">From</label><input class="field" type="time" value=${start} onInput=${(e) => setStart(e.target.value)} /></div>
+      <div><label class="lbl">Until</label><input class="field" type="time" value=${end} onInput=${(e) => setEnd(e.target.value)} /></div></div>
+      <div class="btns"><button class="b1" disabled=${!start || !end}
+        onClick=${async () => { if (await save({ heartbeat_active_start: start, heartbeat_active_end: end })) closeSheet(); }}>Save</button></div></div>`;
+  };
+  return html`<${Row} icon="chat" title="Check in on its own" sub="Messages you when something needs your attention"
+      right=${html`<${Toggle} on=${!!st?.heartbeat_enabled} onChange=${(on) => save({ heartbeat_enabled: on })} label="Check in on its own" />`} />
+    ${st?.heartbeat_enabled && html`<${Row} icon="repeat" title="How often" value=${everyLabel(st.heartbeat_interval_mins)} onClick=${often} />
+      <${Row} icon="clock" title="Between" value=${betweenLabel(st.heartbeat_active_start, st.heartbeat_active_end)} onClick=${() => openSheet(() => html`<${Between} />`)} />`}`;
 }
 
 function Notifications() {
@@ -99,9 +121,6 @@ export function Settings() {
     if (!f) return;
     try { set({ settings: await api('PUT', '/settings/avatar', f) }); toast('Picture updated'); } catch (err) { toast(err.message); }
   };
-  const checkIns = async (on) => {
-    try { set({ settings: await put('/settings', { heartbeat_enabled: on }) }); } catch (e) { toast(e.message); }
-  };
   const chat = S.slots?.find((s) => s.slot === 'chat');
   const engineSub = !S.slots ? ' ' : chat?.selection?.mode === 'pinned' ? `Chat pinned to ${chat.models.find((m) => m.id === chat.effective)?.label || 'a model'}` : 'Automatic';
   const signOut = async () => {
@@ -117,8 +136,7 @@ export function Settings() {
       <${Row} icon="user" title="Picture" value=${S.settings?.avatar_custom ? 'Custom' : 'Default'} onClick=${owner ? picture : undefined} chevron=${owner} />
       <${Row} icon="volume" title="Voice replies" sub="Coming soon: replies as voice notes plus text"
         right=${html`<${Toggle} on=${false} disabled onChange=${() => {}} label="Voice replies" />`} />
-      ${owner && html`<${Row} icon="chat" title="Check in on its own" sub="Messages you when something needs your attention"
-        right=${html`<${Toggle} on=${!!S.settings?.heartbeat_enabled} onChange=${checkIns} label="Check in on its own" />`} />`}
+      ${owner && html`<${CheckIns} />`}
     <//>
     <${Group} label="You">
       <${Row} icon="user" title="Your name" value=${S.me?.user?.display_name} onClick=${renameMe} />

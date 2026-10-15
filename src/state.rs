@@ -161,9 +161,57 @@ impl std::ops::Deref for AppState {
     }
 }
 
-/// App setting that turns the heartbeat on or off ("true" / "false"),
-/// overriding `[heartbeat] enabled` from config.
+/// Check-in (heartbeat) app settings, the only source of truth for the
+/// heartbeat: "true"/"false", minutes, and a local "HH:MM" window. Unset,
+/// each takes its default from `JobConfig::default()` (off, every 60
+/// minutes, 08:00 to 22:00).
 pub const HEARTBEAT_ENABLED: &str = "heartbeat.enabled";
+pub const HEARTBEAT_INTERVAL: &str = "heartbeat.interval_mins";
+pub const HEARTBEAT_START: &str = "heartbeat.active_start";
+pub const HEARTBEAT_END: &str = "heartbeat.active_end";
+const HEARTBEAT_KEYS: [&str; 4] = [
+    HEARTBEAT_ENABLED,
+    HEARTBEAT_INTERVAL,
+    HEARTBEAT_START,
+    HEARTBEAT_END,
+];
+/// How often check-ins may run: every 15 minutes up to once a day.
+pub const HEARTBEAT_MIN_INTERVAL: u64 = 15;
+pub const HEARTBEAT_MAX_INTERVAL: u64 = 1440;
+
+/// Parse a "HH:MM" time and write it back zero-padded ("8:5" -> "08:05").
+pub fn normalize_hhmm(s: &str) -> Option<String> {
+    crate::config::parse_hhmm(s).map(|m| format!("{:02}:{:02}", m / 60, m % 60))
+}
+
+/// Import a legacy `[heartbeat]` config section into the check-in
+/// settings, once: only when none of them is stored yet, so it never
+/// overwrites what the owner chose in the app. An interval outside the
+/// app's bounds is clamped; an unreadable time keeps its default. Returns
+/// whether it imported.
+pub fn import_legacy_heartbeat(
+    c: &rusqlite::Connection,
+    legacy: &crate::config::JobConfig,
+) -> rusqlite::Result<bool> {
+    for key in HEARTBEAT_KEYS {
+        if db::get_setting(c, key)?.is_some() {
+            return Ok(false);
+        }
+    }
+    let default = crate::config::JobConfig::default();
+    let interval = legacy
+        .interval_mins
+        .clamp(HEARTBEAT_MIN_INTERVAL, HEARTBEAT_MAX_INTERVAL);
+    let start = normalize_hhmm(&legacy.active_start).unwrap_or(default.active_start);
+    let end = normalize_hhmm(&legacy.active_end).unwrap_or(default.active_end);
+    let tx = c.unchecked_transaction()?;
+    db::set_setting(&tx, HEARTBEAT_ENABLED, &legacy.enabled.to_string())?;
+    db::set_setting(&tx, HEARTBEAT_INTERVAL, &interval.to_string())?;
+    db::set_setting(&tx, HEARTBEAT_START, &start)?;
+    db::set_setting(&tx, HEARTBEAT_END, &end)?;
+    tx.commit()?;
+    Ok(true)
+}
 
 pub const DEFAULT_FEED_PROMPT: &str = "News, ideas, and finds that fit what I care about (see \
 USER.md and PROACTIVE_PREFERENCES.md). Prefer original reporting and creators over aggregators.";
@@ -734,15 +782,38 @@ impl AppState {
             .unwrap_or_else(|| DEFAULT_FEED_PROMPT.to_string())
     }
 
-    /// Whether the heartbeat (proactive check-ins) runs. The owner's app
-    /// setting wins in both directions; unset, `[heartbeat] enabled` from
-    /// config is the default.
-    pub async fn heartbeat_enabled(&self) -> bool {
-        match self.setting(HEARTBEAT_ENABLED).await.as_deref() {
-            Some("true") => true,
-            Some("false") => false,
-            _ => self.cfg.heartbeat.enabled,
+    /// The heartbeat's settings: what the owner saved in the app, each
+    /// unset or unreadable value at its default.
+    pub async fn heartbeat_config(&self) -> crate::config::JobConfig {
+        let mut cfg = crate::config::JobConfig {
+            enabled: self.setting(HEARTBEAT_ENABLED).await.as_deref() == Some("true"),
+            ..Default::default()
+        };
+        if let Some(n) = self
+            .setting(HEARTBEAT_INTERVAL)
+            .await
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| (HEARTBEAT_MIN_INTERVAL..=HEARTBEAT_MAX_INTERVAL).contains(n))
+        {
+            cfg.interval_mins = n;
         }
+        if let Some(t) = self
+            .setting(HEARTBEAT_START)
+            .await
+            .as_deref()
+            .and_then(normalize_hhmm)
+        {
+            cfg.active_start = t;
+        }
+        if let Some(t) = self
+            .setting(HEARTBEAT_END)
+            .await
+            .as_deref()
+            .and_then(normalize_hhmm)
+        {
+            cfg.active_end = t;
+        }
+        cfg
     }
 
     /// App settings as the API shows them. The feed instructions describe
@@ -753,13 +824,21 @@ impl AppState {
             .setting("agent_avatar_updated")
             .await
             .unwrap_or_default();
+        let heartbeat = if owner {
+            Some(self.heartbeat_config().await)
+        } else {
+            None
+        };
         json!({
             "agent_name": self.agent_name().await,
             "avatar_url": format!("/api/avatar?v={}", if avatar.is_some() { updated } else { "default".into() }),
             "avatar_custom": avatar.is_some(),
             "allow_claude_for_shared": self.allow_claude_for_shared().await,
             "feed_prompt": if owner { Some(self.feed_prompt().await) } else { None },
-            "heartbeat_enabled": if owner { Some(self.heartbeat_enabled().await) } else { None },
+            "heartbeat_enabled": heartbeat.as_ref().map(|h| h.enabled),
+            "heartbeat_interval_mins": heartbeat.as_ref().map(|h| h.interval_mins),
+            "heartbeat_active_start": heartbeat.as_ref().map(|h| h.active_start.clone()),
+            "heartbeat_active_end": heartbeat.as_ref().map(|h| h.active_end.clone()),
             "voice": {"enabled": false, "status": "not_implemented"},
             "paused": self.is_paused().await,
             "memory": if owner { Some(json!({

@@ -225,7 +225,9 @@ own personality. It is not a clone.
 - **Settings:**
   - Name, picture, voice replies, "Check in on its own" (owner only: the
     agent looks over things on a schedule and messages you only when
-    something needs your attention), notifications, quiet hours.
+    something needs your attention; while on, "How often" offers every 30
+    minutes, hour, 2 hours, 4 hours or once a day, and "Between" sets the
+    hours, like Quiet hours), notifications, quiet hours.
   - Advanced: **AI engine**, devices, people, activity log (all steps, or
     just connected services with whether each ran on its own or you
     approved it).

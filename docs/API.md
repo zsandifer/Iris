@@ -1217,13 +1217,16 @@ Returns the [Settings](#settings) object directly (not wrapped):
   "allow_claude_for_shared": false,
   "feed_prompt": "...",
   "heartbeat_enabled": false,
+  "heartbeat_interval_mins": 60,
+  "heartbeat_active_start": "08:00",
+  "heartbeat_active_end": "22:00",
   "paused": false,
   "memory": {"learning_paused": false, "morning_note": true, "reset": null},
   "voice": {"enabled": false, "status": "not_implemented"}
 }
 ```
 
-`memory` and `heartbeat_enabled` are owner-only (`null` for other users).
+`memory` and the `heartbeat_*` fields are owner-only (`null` for other users).
 `memory.reset` is an opaque
 marker (`null` until the first Forget everything) that changes with every
 Forget everything; an app that sees it change (for example in `ready` after
@@ -1242,7 +1245,17 @@ All fields optional; only supplied fields change.
 | `agent_name` | string | Non-blank, max 40, must not contain newline, carriage return, `<`, `>`, or a backtick. Trimmed. |
 | `allow_claude_for_shared` | bool | Owner opt-in to let Claude answer in conversations with more than one person ([individual-use policy](#individual-use-policy)). `false` clears the app setting (the config value still applies). |
 | `feed_prompt` | string | Max 4,000. Blank resets to the default. |
-| `heartbeat_enabled` | bool | Turns the [heartbeat](#scheduled-jobs) (the agent checking in on its own) on or off. Overrides `[heartbeat] enabled` from config in both directions; while it has never been set, the config value applies. The scheduler picks it up on its next minute tick, no restart. Stored as `heartbeat.enabled`. |
+| `heartbeat_enabled` | bool | Turns the [heartbeat](#scheduled-jobs) (the agent checking in on its own) on or off. Default false. Stored as `heartbeat.enabled`. |
+| `heartbeat_interval_mins` | integer | How often the heartbeat runs, 15 to 1440 (once a day). Default 60. Stored as `heartbeat.interval_mins`. |
+| `heartbeat_active_start`, `heartbeat_active_end` | string | Local `HH:MM` window the heartbeat runs in (`H:MM` is accepted and saved zero-padded; may wrap past midnight; equal means all day). Defaults `08:00` and `22:00`. Stored as `heartbeat.active_start` / `heartbeat.active_end`. |
+
+The `heartbeat_*` settings are the only place the heartbeat is configured
+(config.toml has no `[heartbeat]` section; an older one is imported once at
+startup, see [Scheduled jobs](#scheduled-jobs)). The scheduler reads them on
+its next minute tick, no restart. An interval out of range or a malformed
+time is `400 bad_request` with a plain message ("I can check in as often as
+every 15 minutes or as rarely as once a day.", "That time doesn't look
+right. Use a time like 08:00."), and then nothing in that request is saved.
 | `memory_learning_paused` | bool | Stops Dream and agent memory writes (including legacy `write_memory`). Recall and owner edits/undo stay available. Default false; stored as `memory.learning_paused`. |
 | `memory_morning_note` | bool | Show a morning note after Dream changes notes. Default true; stored as `memory.morning_note`. |
 | `paused` | bool | "Pause Iris". `true` stops every running turn (its CLI process group is killed), closes the browser, and until it is turned off again: chat turns end at once with a short first-person note (error kind `paused`, no push), scheduled jobs do not run, and the browser tools are refused. Saved in the database, so it survives restarts. |
@@ -2177,10 +2190,10 @@ Both routes are **owner-only**. Jobs: `heartbeat`, `feed`, and `dream` (see
 }
 ```
 
-`enabled`, `interval_mins`, `active_start`, `active_end` come from config
-(values above are the defaults). The heartbeat's `enabled` is the effective
-value: the owner's `heartbeat_enabled` app setting
-([`PUT /api/settings`](#put-apisettings-owner)) when set, else config. `last_run_at` is when the last run
+`enabled`, `interval_mins`, `active_start`, `active_end` are the values in
+effect (above: the defaults). The heartbeat's come from the owner's
+`heartbeat_*` app settings ([`PUT /api/settings`](#put-apisettings-owner));
+the feed's from config. `last_run_at` is when the last run
 **started**. Dream uses a local calendar day rather than an elapsed 24 hours;
 its effective enabled flag also reflects Pause learning.
 
@@ -2997,12 +3010,21 @@ run starts a fresh CLI session (no resume, no replay), and each job
 conversation is trimmed to its last 20 messages before every run. Job turns
 are not streamed: no `turn.status`, `message.*`, or card events are sent for
 them. The scheduler
-checks every minute and runs a job when it is enabled (re-read every tick,
-so the heartbeat's app toggle applies without a restart), the local time is
+checks every minute and runs a job when it is enabled (settings are re-read
+every tick, so the heartbeat's app settings apply without a restart), the local time is
 inside `[active_start, active_end)` (windows may wrap past midnight; equal
 start and end means all day), and at least `interval_mins` have passed since
 the last start. Manual runs (`POST /api/jobs/{name}/run`,
 `POST /api/feed/refresh`) skip those checks.
+
+The heartbeat's on/off, interval and window are owner app settings
+(`heartbeat_*` in [`PUT /api/settings`](#put-apisettings-owner)); the
+defaults are off, 60 minutes, 08:00 to 22:00. A legacy `[heartbeat]` section
+in config.toml still parses. At `iris serve` startup it is imported once into
+those settings, only when none of them is stored yet (so it never overwrites
+the owner's choices, including a toggle saved by an earlier version); the
+interval is clamped to 15 to 1440 and an unreadable time keeps its default.
+Afterwards the section is ignored and startup logs a one-line notice.
 
 - **dream**: nightly memory consolidation through an isolated, session-less,
   tool-free official CLI on the `background` slot. `[dream]` config defaults:
@@ -3791,7 +3813,9 @@ that is too large (over 2 MiB) or not text is kept only in the backup. `iris imp
 | `avatar_custom` | bool | A custom avatar is set. |
 | `allow_claude_for_shared` | bool | Effective opt-in (config or app setting) for Claude in shared conversations. |
 | `feed_prompt` | string \| null | Effective feed prompt (default if unset); `null` for everyone but the owner, who also gets it in `settings.changed` events. |
-| `heartbeat_enabled` | bool \| null | Whether the heartbeat runs: the app setting, else `[heartbeat] enabled` from config. `null` for everyone but the owner. |
+| `heartbeat_enabled` | bool \| null | Whether the heartbeat runs (default false). `null` for everyone but the owner. |
+| `heartbeat_interval_mins` | integer \| null | How often it runs, in minutes (default 60). Owner only. |
+| `heartbeat_active_start`, `heartbeat_active_end` | string \| null | Its local `HH:MM` window (default `08:00` to `22:00`). Owner only. |
 | `paused` | bool | "Pause Iris" is on (see [`PUT /api/settings`](#put-apisettings-owner)). |
 | `voice` | object | Always `{"enabled": false, "status": "not_implemented"}`. |
 | `paused` | bool | The owner paused Iris. |

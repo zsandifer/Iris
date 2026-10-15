@@ -946,7 +946,6 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_toggle_is_owner_only_and_applies_right_away() {
         let h = setup();
-        assert!(!h.state.cfg.heartbeat.enabled, "config default is off");
         let owner = pair_as(&h, None).await;
         h.state
             .db
@@ -982,7 +981,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert!(!h.state.heartbeat_enabled().await);
+        assert!(!h.state.heartbeat_config().await.enabled);
 
         let (status, settings) = send(&h.app, "PUT", "/api/settings", Some(&owner), Some(on)).await;
         assert_eq!(status, StatusCode::OK, "{settings}");
@@ -998,7 +997,7 @@ mod tests {
             Some(json!({"agent_name": "Iris"})),
         )
         .await;
-        assert!(h.state.heartbeat_enabled().await);
+        assert!(h.state.heartbeat_config().await.enabled);
         // The choice survives a restart.
         let reloaded = AppState::new(
             h.state.cfg.clone(),
@@ -1006,7 +1005,7 @@ mod tests {
             crate::db::Db::open(&h.state.paths.db_file()).unwrap(),
         )
         .unwrap();
-        assert!(reloaded.heartbeat_enabled().await);
+        assert!(reloaded.heartbeat_config().await.enabled);
 
         let (_, settings) = send(
             &h.app,
@@ -1019,6 +1018,103 @@ mod tests {
         assert_eq!(settings["heartbeat_enabled"], false);
         let (_, jobs) = send(&h.app, "GET", "/api/jobs", Some(&owner), None).await;
         assert_eq!(listed(&jobs), false);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_schedule_is_validated_owner_only_and_listed() {
+        let h = setup();
+        let owner = pair_as(&h, None).await;
+        h.state
+            .db
+            .with(|c| {
+                c.execute(
+                    "INSERT INTO users(id,display_name,created_at) VALUES ('guest','Guest',0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let guest = pair_as(&h, Some("guest")).await;
+        let fields = |s: &Value| {
+            (
+                s["heartbeat_interval_mins"].clone(),
+                s["heartbeat_active_start"].clone(),
+                s["heartbeat_active_end"].clone(),
+            )
+        };
+        let (_, s) = send(&h.app, "GET", "/api/settings", Some(&owner), None).await;
+        assert_eq!(fields(&s), (json!(60), json!("08:00"), json!("22:00")));
+        let (_, s) = send(&h.app, "GET", "/api/settings", Some(&guest), None).await;
+        assert_eq!(fields(&s), (Value::Null, Value::Null, Value::Null));
+
+        let schedule = json!({"heartbeat_interval_mins": 120,
+            "heartbeat_active_start": "7:30", "heartbeat_active_end": "21:00"});
+        let (status, _) = send(
+            &h.app,
+            "PUT",
+            "/api/settings",
+            Some(&guest),
+            Some(schedule.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, s) = send(&h.app, "PUT", "/api/settings", Some(&owner), Some(schedule)).await;
+        assert_eq!(status, StatusCode::OK, "{s}");
+        assert_eq!(fields(&s), (json!(120), json!("07:30"), json!("21:00")));
+        let (_, jobs) = send(&h.app, "GET", "/api/jobs", Some(&owner), None).await;
+        let hb = jobs["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|j| j["name"] == "heartbeat")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            (&hb["interval_mins"], &hb["active_start"], &hb["active_end"]),
+            (&json!(120), &json!("07:30"), &json!("21:00"))
+        );
+
+        // Out of bounds or malformed: 400 with a plain message, and nothing
+        // in the request is saved.
+        for bad in [
+            json!({"heartbeat_interval_mins": 14}),
+            json!({"heartbeat_interval_mins": 1441}),
+            json!({"heartbeat_interval_mins": 30, "heartbeat_active_start": "25:00"}),
+            json!({"heartbeat_active_end": "soon", "agent_name": "Other"}),
+            json!({"heartbeat_active_start": ""}),
+        ] {
+            let (status, body) = send(
+                &h.app,
+                "PUT",
+                "/api/settings",
+                Some(&owner),
+                Some(bad.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+            let msg = body["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                !msg.is_empty() && !msg.contains("HH:MM") && !msg.contains("interval"),
+                "{msg}"
+            );
+        }
+        let (_, s) = send(&h.app, "GET", "/api/settings", Some(&owner), None).await;
+        assert_eq!(fields(&s), (json!(120), json!("07:30"), json!("21:00")));
+        assert_eq!(s["agent_name"], "Iris");
+        for ok in [15, 1440] {
+            let (status, s) = send(
+                &h.app,
+                "PUT",
+                "/api/settings",
+                Some(&owner),
+                Some(json!({"heartbeat_interval_mins": ok})),
+            )
+            .await;
+            assert_eq!(
+                (status, s["heartbeat_interval_mins"].clone()),
+                (StatusCode::OK, json!(ok))
+            );
+        }
     }
 
     #[tokio::test]
