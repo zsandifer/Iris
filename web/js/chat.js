@@ -2,7 +2,8 @@
 import { html, useEffect, useLayoutEffect, useRef, useState } from './h.js';
 import { post, put, api, seg, isId } from './api.js';
 import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId, isOwner, convFor, lookUpConv, peekShown } from './store.js';
-import { Icon, Img, Avatar, agentName, stamp, Spinner } from './ui.js';
+import { Icon, Img, Avatar, agentName, Spinner } from './ui.js';
+import { timeline, timeLabel, fullLabel, newSince, badge, JUMP_AWAY, NEAR_BOTTOM } from './chat-time.js';
 import { openPhoto } from './photo.js';
 import { md } from './md.js';
 import { Card } from './cards.js';
@@ -11,8 +12,6 @@ import { pushState, enablePush } from './push.js';
 import { BrowserPeek } from './computer.js';
 import { focusComposer, prepareComposerFocus } from './viewport.js';
 import { NotedLine } from './memory.js';
-
-const GAP = 30 * 60 * 1000;
 
 export function StatusLine({ live }) {
   return html`<div class="status shimmer" aria-live="polite">${statusPhrase(live)}</div>`;
@@ -112,6 +111,25 @@ function Message({ m, list, members, composing }) {
   return html`<div class="note">${m.content}</div>`;
 }
 
+/** Who sent a message, for runs of message times (null: system notes,
+ * which have no time of their own). */
+const sender = (m) => (m.kind === 'system_note' ? null : m.role === 'user' ? `u:${m.author_user_id}` : 'a');
+
+function Time({ m }) {
+  const mine = m.role === 'user' && m.author_user_id === S.me?.user?.id;
+  return html`<time class=${'mt' + (mine ? ' mine' : '')} datetime=${new Date(m.created_at).toISOString()}
+    title=${fullLabel(m.created_at)}>${timeLabel(m.created_at)}</time>`;
+}
+
+/** Round button above the composer that scrolls to the newest message,
+ * with a count of messages that arrived while scrolled up. */
+function JumpButton({ count, onJump }) {
+  const label = count ? `Jump to latest, ${count} new message${count === 1 ? '' : 's'}` : 'Jump to latest';
+  return html`<button class="jump" aria-label=${label} onClick=${onJump}>
+    <${Icon} name="down" size=${20} />${count > 0 && html`<span class="jump-n" aria-hidden="true">${badge(count)}</span>`}
+  </button>`;
+}
+
 function NotifyPrompt() {
   const [st, setSt] = useState(null);
   useEffect(() => { pushState().then(setSt); }, []);
@@ -153,6 +171,15 @@ export function ChatScreen({ cid }) {
   const scr = useRef();
   const stick = useRef(true);
   const prevHeight = useRef(0);
+  // Where the reader is: 'bottom' (following new messages), 'near', or
+  // 'far' (JUMP_AWAY or more up: the jump button shows).
+  const [pos, setPos] = useState('bottom');
+  // The newest message the reader had in view, for the new-message count.
+  const seen = useRef(null);
+  // A tap on the jump button is smooth-scrolling down.
+  const jumping = useRef(false);
+  const jumpTimer = useRef(0);
+  useEffect(() => () => clearTimeout(jumpTimer.current), []);
   const conv = convFor(cid);
   const box = S.msgs[cid];
   const list = box?.list || [];
@@ -161,6 +188,8 @@ export function ChatScreen({ cid }) {
 
   useEffect(() => {
     stick.current = true;
+    jumping.current = false;
+    setPos('bottom');
     if (!isId(cid)) return;
     if (!S.msgs[cid]) loadMessages(cid);
     post(`/conversations/${seg(cid)}/read`).catch(() => {});
@@ -178,16 +207,21 @@ export function ChatScreen({ cid }) {
     } else setMembers(null);
   }, [cid, conv?.member_count]);
 
-  // Keep the newest message in view unless the user scrolled up.
+  // Keep the newest message in view unless the user scrolled up (or a
+  // jump is gliding there: setting scrollTop would cut it short).
   useLayoutEffect(() => {
     const el = scr.current;
     if (!el) return;
     if (prevHeight.current && el.scrollTop < 80 && el.scrollHeight > prevHeight.current && !stick.current) {
       el.scrollTop += el.scrollHeight - prevHeight.current;
-    } else if (stick.current) {
+    } else if (stick.current && !jumping.current) {
       el.scrollTop = el.scrollHeight;
     }
     prevHeight.current = el.scrollHeight;
+    // A growing reply moves the bottom away without a scroll event.
+    if (!stick.current && !jumping.current) {
+      setPos(el.scrollHeight - el.scrollTop - el.clientHeight >= JUMP_AWAY ? 'far' : 'near');
+    }
   });
 
   // Resizing the viewport or a growing composer does not render this
@@ -195,7 +229,7 @@ export function ChatScreen({ cid }) {
   useLayoutEffect(() => {
     const el = scr.current;
     const observer = new ResizeObserver(() => {
-      if (stick.current) el.scrollTop = el.scrollHeight;
+      if (stick.current && !jumping.current) el.scrollTop = el.scrollHeight;
     });
     observer.observe(el);
     return () => observer.disconnect();
@@ -208,7 +242,15 @@ export function ChatScreen({ cid }) {
 
   const onScroll = (e) => {
     const el = e.currentTarget;
-    stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 90;
+    const away = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (jumping.current) {
+      // Keep following the bottom until the smooth scroll gets there.
+      if (away >= NEAR_BOTTOM) return;
+      jumping.current = false;
+    }
+    stick.current = away < NEAR_BOTTOM;
+    if (stick.current) seen.current = list.at(-1)?.id ?? null;
+    setPos(stick.current ? 'bottom' : away >= JUMP_AWAY ? 'far' : 'near');
     if (el.scrollTop < 60 && box?.hasMore && !box.loading) {
       prevHeight.current = el.scrollHeight;
       loadOlder(cid).catch(() => {});
@@ -225,6 +267,30 @@ export function ChatScreen({ cid }) {
     if (!e.target.closest?.('a, button, input, textarea, select, [role="button"]')) typing()?.blur();
   };
   const dismissOnDrag = () => typing()?.blur();
+  // Touching, wheeling, or keys in the conversation stop following a jump.
+  const interrupt = () => { jumping.current = false; };
+  // A jump that has not arrived in time (content kept growing, or the
+  // browser never reported the end) finishes at the bottom.
+  const settle = () => {
+    const el = scr.current;
+    if (!jumping.current || !el) return;
+    jumping.current = false;
+    if (stick.current) el.scrollTop = el.scrollHeight;
+  };
+
+  const jump = () => {
+    const el = scr.current;
+    if (!el) return;
+    const smooth = !matchMedia('(prefers-reduced-motion: reduce)').matches;
+    stick.current = true;
+    jumping.current = smooth;
+    seen.current = list.at(-1)?.id ?? null;
+    setPos('bottom');
+    el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+    // Not every browser reports the end of a smooth scroll.
+    clearTimeout(jumpTimer.current);
+    if (smooth) jumpTimer.current = setTimeout(settle, 1500);
+  };
 
   const running = list.some((m) => m.status === 'streaming');
   // Approval cards belong before the reply of the turn that asked.
@@ -234,25 +300,36 @@ export function ChatScreen({ cid }) {
     if (t && list.some((x) => x.id === t)) (asks[t] ||= []).push(m);
   }
   const held = new Set(Object.values(asks).flat().map((m) => m.id));
-  let prev = 0;
-  const rows = [];
+  const shown = [];
   for (const m of list) {
     if (held.has(m.id)) continue;
-    if (!prev || m.created_at - prev > GAP) rows.push(html`<div class="ts" key=${'t' + m.id}>${stamp(m.created_at)}</div>`);
-    prev = m.created_at;
-    for (const a of asks[m.id] || []) rows.push(html`<div class="row" key=${a.id}><${Message} m=${a} list=${list} members=${members} composing=${composing} /></div>`);
-    rows.push(html`<div class="row" key=${m.id}><${Message} m=${m} list=${list} members=${members} composing=${composing} /></div>`);
+    shown.push(...(asks[m.id] || []), m);
   }
+  const marks = timeline(shown.map((m) => ({ at: m.created_at, who: sender(m) })));
+  const rows = [];
+  shown.forEach((m, i) => {
+    const { day, time } = marks[i];
+    if (day) rows.push(html`<div class="day" role="separator" aria-label=${day} key=${'d' + m.id}><span>${day}</span></div>`);
+    rows.push(html`<div class="row" key=${m.id}><${Message} m=${m} list=${list} members=${members} composing=${composing} />
+      ${time && html`<${Time} m=${m} />`}</div>`);
+  });
+
+  // New messages from others while scrolled up: count them on the button.
+  if (stick.current) seen.current = lastId ?? null;
+  const fresh = stick.current ? 0 : newSince(list, seen.current, S.me?.user?.id);
+  const showJump = !stick.current && (pos === 'far' || fresh > 0);
   const isMain = cid === mainId();
   return html`<div class=${'chat' + (S.settings?.paused ? ' paused' : '')}>
     <${PausedBanner} />
-    <div class="scr" ref=${scr} onScroll=${onScroll} onClick=${dismissOnTap} onTouchMove=${dismissOnDrag}>
+    <div class="scr" ref=${scr} onScroll=${onScroll} onClick=${dismissOnTap} onTouchMove=${dismissOnDrag}
+      onPointerDown=${interrupt} onTouchStart=${interrupt} onWheel=${interrupt} onKeyDown=${interrupt}>
       ${box?.loading && box?.hasMore && html`<${Spinner} />`}
       ${!box ? html`<${Spinner} />` : !list.length && isMain ? html`<${Welcome} />` : null}
       ${isMain && box && !box.hasMore && html`<${NotifyPrompt} />`}
       ${rows}
     </div>
-    <${Composer} cid=${cid} running=${running} onFocus=${() => { stick.current = true; setComposing(true); }} onBlur=${() => setComposing(false)} />
+    <${Composer} cid=${cid} running=${running}
+      jump=${showJump && html`<${JumpButton} count=${fresh} onJump=${jump} />`} onFocus=${() => { stick.current = true; setComposing(true); }} onBlur=${() => setComposing(false)} />
   </div>`;
 }
 
@@ -280,7 +357,7 @@ async function shrink(file) {
 const MAX_PHOTOS = 4; // per message (server limit)
 const unpreview = (list) => list.forEach((a) => a.preview && URL.revokeObjectURL(a.preview));
 
-function Composer({ cid, running, onFocus, onBlur }) {
+function Composer({ cid, running, jump, onFocus, onBlur }) {
   const [text, setText] = useState('');
   const [atts, setAtts] = useState([]);
   const [rec, setRec] = useState(null);
@@ -413,6 +490,7 @@ function Composer({ cid, running, onFocus, onBlur }) {
   };
 
   return html`<div class="composer">
+    ${jump}
     ${unsent.map((u) => html`<button class="note" onClick=${() => retry(u)}>Not sent, tap to retry: ${u.t || 'photo'}</button>`)}
     ${atts.length > 0 && html`<div class="att-row">${atts.map((a) => html`<div class="att" key=${a.key}>
       <${Img} src=${a.preview} alt="Photo to send" />${a.uploading && html`<div class="att-busy"><${Spinner} /></div>`}

@@ -17,6 +17,7 @@ js/
 ├── store.js          state, loaders, WebSocket event handling
 ├── api.js            REST client, authed image URLs, WebSocket
 ├── chat.js           chat, status phrases, receipts, composer (photos, voice input)
+├── chat-time.js      pure chat timeline: day separators, message times, new-message count
 ├── cards.js          chat cards (result, connect, sign-in, API keys, approval, ...)
 ├── status.js         tool activity to plain-language phrases
 ├── feed.js           For you: story cards, posts, full-screen stories

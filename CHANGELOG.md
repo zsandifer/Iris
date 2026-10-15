@@ -7,6 +7,13 @@ All notable changes to Iris are documented here, following
 
 ### Added
 
+- Chat times and a jump-to-latest button: day separators ("Today",
+  "Yesterday", the weekday, or the date), a small time in the phone's own
+  format under the last message of each run from the same sender (or after a
+  pause of more than 10 minutes), and a round button above the input once
+  scrolled up that glides back to the newest message and counts new messages
+  that arrived meanwhile, without moving the conversation.
+
 - Memory in the app: Iris hub → Memory with search, You / People / Projects /
   Routines, pinned notes first and recent changes marked; a note sheet to edit,
   see the chat it came from, read its history with Undo, pin it or forget it

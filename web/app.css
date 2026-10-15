@@ -90,7 +90,9 @@ code { font-family: var(--mono); font-size: .88em; background: var(--sf2); borde
 
 /* ------------------------------------------------------------ messages */
 .row { display: flow-root; }
-.ts { text-align: center; color: var(--mu); font-size: 11.5px; margin: 14px 0 4px; }
+.day { text-align: center; color: var(--mu); font-size: 12px; font-weight: 600; margin: 16px 0 4px; }
+.mt { display: block; color: var(--mu); font-size: 11px; margin: -2px 6px 8px; font-variant-numeric: tabular-nums; }
+.mt.mine { text-align: right; }
 .b { max-width: 84%; width: fit-content; padding: 9px 13px; border-radius: 20px 20px 20px 6px; margin: 6px 0; background: var(--sf);
   border: 1px solid var(--ln); overflow-wrap: anywhere; }
 .b p { margin: 0 0 .55em; } .b p:last-child, .b > :last-child { margin-bottom: 0; }
@@ -154,6 +156,11 @@ code { font-family: var(--mono); font-size: .88em; background: var(--sf2); borde
 .att img { width: 100%; height: 100%; object-fit: cover; }
 .att-busy { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,.25); }
 .att-busy .spin { margin: 0; width: 20px; height: 20px; }
+.jump { position: absolute; bottom: calc(100% + 10px); left: 0; right: 0; margin: 0 auto; width: 40px; height: 40px; border-radius: 50%;
+  border: 1px solid var(--ln); background: var(--sf); color: var(--ink); display: grid; place-items: center; padding: 0;
+  box-shadow: 0 4px 14px var(--shade); animation: appear .18s ease-out; }
+.jump-n { position: absolute; top: -6px; right: -8px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+  background: var(--ac); color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; box-shadow: 0 0 0 2px var(--bg); }
 .att-x { position: absolute; top: 4px; right: 4px; width: 20px; height: 20px; border-radius: 50%; border: 0; background: rgba(0,0,0,.6); color: #fff; display: grid; place-items: center; padding: 0; }
 
 /* ------------------------------------------------------------ cards */
@@ -666,7 +673,8 @@ details.alt::details-content { opacity: 0; transition: opacity .22s, content-vis
 details.alt[open]::details-content { opacity: 1; }
 @media (prefers-reduced-motion: reduce) {
   .route, .sheet-wrap, .sheet, .toast, .story-viewer, .viewer-topic, .viewer-story, .viewer-tx, .viewer, .warn, .warn-box, .feed-note, .feed-run, .rail, .empty, .rcpt-steps, .peek, .retry,
-  .notify-card, .paused-bar, .att, .note, .ap-raw, .effort, .vw-bar, .live-line, .photo-error, .screen, .status:not(.shimmer), .gnote, .post-b, .md, .photo-layer img {
+  .notify-card, .paused-bar, .att, .note, .ap-raw, .effort, .vw-bar, .live-line, .photo-error, .screen, .status:not(.shimmer), .gnote, .post-b, .md, .photo-layer img,
+  .jump {
     animation: none !important; }
   .viewer-heart { display: none; }
 }
