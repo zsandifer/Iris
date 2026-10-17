@@ -59,3 +59,40 @@ test('a wake while the socket is closing leaves exactly one live socket', async 
   fire('online');
   assert.equal(sockets.length, 2, 'wake listeners removed');
 });
+
+test('the socket says away in the background and present when back', async (t) => {
+  sockets.length = 0;
+  document.visibilityState = 'visible';
+  const conn = connectEvents(() => {}, () => {});
+  t.after(() => { conn.close(); document.visibilityState = 'visible'; });
+  const said = (s) => s.sent.map((m) => JSON.parse(m).type);
+  const first = sockets[0];
+  document.visibilityState = 'hidden';
+  fire('visibilitychange'); // before the socket opens: nothing to tell
+  first.opened();
+  assert.deepEqual(said(first), ['auth'], 'nothing goes before auth');
+  first.deliver({ type: 'ready' });
+  assert.deepEqual(said(first), ['auth', 'away'], 'a socket opened in the background says so');
+  document.visibilityState = 'visible';
+  fire('visibilitychange');
+  document.visibilityState = 'hidden';
+  fire('visibilitychange');
+  fire('pagehide');
+  assert.deepEqual(said(first), ['auth', 'away', 'present', 'away', 'away']);
+  document.visibilityState = 'visible';
+  fire('pageshow');
+  assert.equal(said(first).at(-1), 'present');
+  // The phone dropped the socket while away; back on screen it reconnects
+  // and reports present after ready.
+  first.closed();
+  fire('visibilitychange');
+  const second = sockets[1];
+  assert.ok(second, 'reconnected on wake');
+  second.opened();
+  second.deliver({ type: 'ready' });
+  assert.deepEqual(said(second), ['auth', 'present']);
+  conn.close();
+  fire('pagehide');
+  fire('visibilitychange');
+  assert.deepEqual(said(second), ['auth', 'present'], 'listeners removed on close');
+});
