@@ -11,6 +11,12 @@
 //! wide), and while the owner has taken over,
 //! `{"type":"browser.input",...}` sends taps, scrolls, keys, text, and
 //! fills of saved logins and cards.
+//!
+//! `{"type":"away"}` says the app went to the background (hidden or
+//! closing); the socket then stops counting toward the user being online,
+//! so replies are pushed. `{"type":"present"}` says it is back. iOS
+//! suspends a backgrounded app without closing its socket, so without
+//! `away` the user would look online until the silence limit drops it.
 
 use super::{AuthUser, auth_from_token};
 use crate::auth;
@@ -172,14 +178,14 @@ async fn run(state: AppState, mut socket: WebSocket, pre: Option<AuthUser>) {
     if *device_revoked.borrow() || !device_active(&state, &user.device.id).await {
         return;
     }
-    let _online = state.hub.connect(&uid);
+    let mut online = state.hub.connect(&uid);
     let mut input_worker: Option<tokio::task::JoinHandle<()>> = None;
     // Cancellation wraps the whole connection, including slow sends and
     // database reads, so revocation never waits for the ping or send timeout.
     let revoked = tokio::select! {
         biased;
         _ = device_revoked.changed() => true,
-        revoked = pump(&state, &mut socket, &user, &mut input_worker) => revoked,
+        revoked = pump(&state, &mut socket, &user, &mut online, &mut input_worker) => revoked,
     };
     if let Some(w) = input_worker {
         w.abort();
@@ -196,6 +202,7 @@ async fn pump(
     state: &AppState,
     socket: &mut WebSocket,
     user: &AuthUser,
+    online: &mut crate::events::OnlineGuard,
     input_worker: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> bool {
     let uid = user.id().to_string();
@@ -232,6 +239,17 @@ async fn pump(
                         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                         let reply = match v["type"].as_str().unwrap_or("") {
                             "ping" => Some(json!({"type": "pong"})),
+                            // Only these two change presence. Other frames
+                            // (pings above all) keep coming from hidden
+                            // desktop tabs, so they must not undo `away`.
+                            "away" => {
+                                online.set_present(false);
+                                None
+                            }
+                            "present" => {
+                                online.set_present(true);
+                                None
+                            }
                             "browser.watch" | "browser.input" if !is_owner => Some(json!({
                                 "type": "error", "code": "forbidden",
                                 "message": "only the owner can use Iris's computer"})),
@@ -352,21 +370,32 @@ async fn pump(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn revocation_closes_a_live_websocket_without_waiting_for_a_ping() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let tmp = tempfile::tempdir().unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_state(tmp: &tempfile::TempDir) -> AppState {
         let paths = crate::config::Paths {
             config_file: tmp.path().join("config.toml"),
             data_dir: tmp.path().join("data"),
         };
         crate::persona::seed(&paths).unwrap();
-        let state = AppState::new(
+        AppState::new(
             crate::config::Config::default(),
             paths,
             crate::db::Db::open_in_memory().unwrap(),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// Pair an owner device, serve the app, and open an authenticated
+    /// WebSocket that has received `ready`.
+    async fn live_socket(
+        state: &AppState,
+    ) -> (
+        tokio::net::TcpStream,
+        String,
+        crate::db::Device,
+        tokio::task::JoinHandle<()>,
+    ) {
         let token = auth::generate_token();
         let device = state
             .db
@@ -392,25 +421,45 @@ mod tests {
                 .unwrap()
                 .starts_with("HTTP/1.1 101")
         );
-        async fn frame(stream: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
-            let opcode = stream.read_u8().await.unwrap() & 15;
-            let mut len = (stream.read_u8().await.unwrap() & 127) as usize;
-            if len == 126 {
-                len = stream.read_u16().await.unwrap() as usize;
-            } else if len == 127 {
-                len = stream.read_u64().await.unwrap() as usize;
-            }
-            assert!(len <= 64 * 1024);
-            let mut body = vec![0; len];
-            stream.read_exact(&mut body).await.unwrap();
-            (opcode, body)
-        }
         let (opcode, ready) = frame(&mut stream).await;
         assert_eq!(opcode, 1);
         assert_eq!(
             serde_json::from_slice::<Value>(&ready).unwrap()["type"],
             "ready"
         );
+        (stream, token, device, server)
+    }
+
+    /// Read one server frame: (opcode, payload).
+    async fn frame(stream: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+        let opcode = stream.read_u8().await.unwrap() & 15;
+        let mut len = (stream.read_u8().await.unwrap() & 127) as usize;
+        if len == 126 {
+            len = stream.read_u16().await.unwrap() as usize;
+        } else if len == 127 {
+            len = stream.read_u64().await.unwrap() as usize;
+        }
+        assert!(len <= 64 * 1024);
+        let mut body = vec![0; len];
+        stream.read_exact(&mut body).await.unwrap();
+        (opcode, body)
+    }
+
+    /// Send a short client text frame (masked, as clients must).
+    async fn send_text(stream: &mut tokio::net::TcpStream, text: &str) {
+        let mask = [0x5a, 0x17, 0xc3, 0x08];
+        assert!(text.len() < 126);
+        let mut out = vec![0x81, 0x80 | text.len() as u8];
+        out.extend_from_slice(&mask);
+        out.extend(text.bytes().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        stream.write_all(&out).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn revocation_closes_a_live_websocket_without_waiting_for_a_ping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let (mut stream, token, device, server) = live_socket(&state).await;
         let user = auth_from_token(&state, &token).await.unwrap();
         let _ =
             super::super::revoke_device(State(state.clone()), user, axum::extract::Path(device.id))
@@ -424,19 +473,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_away_socket_does_not_count_as_online() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let (mut stream, _token, device, server) = live_socket(&state).await;
+        let uid = device.user_id.clone();
+        assert!(state.hub.is_online(&uid), "new sockets count as present");
+        // Frames are handled in order, so a ping's pong means every frame
+        // before it has been handled.
+        async fn settle(stream: &mut tokio::net::TcpStream) {
+            send_text(stream, r#"{"type":"ping"}"#).await;
+            loop {
+                let (opcode, body) = frame(stream).await;
+                if opcode == 1 && serde_json::from_slice::<Value>(&body).unwrap()["type"] == "pong"
+                {
+                    break;
+                }
+            }
+        }
+        send_text(&mut stream, r#"{"type":"away"}"#).await;
+        send_text(&mut stream, r#"{"type":"away"}"#).await;
+        settle(&mut stream).await;
+        assert!(!state.hub.is_online(&uid), "away, and pings do not undo it");
+        send_text(&mut stream, r#"{"type":"present"}"#).await;
+        settle(&mut stream).await;
+        assert!(state.hub.is_online(&uid));
+        // Another device stays online when this away socket closes.
+        let other = state.hub.connect(&uid);
+        send_text(&mut stream, r#"{"type":"away"}"#).await;
+        settle(&mut stream).await;
+        assert!(state.hub.is_online(&uid));
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            state.hub.is_online(&uid),
+            "closing an away socket uncounts nothing more"
+        );
+        drop(other);
+        assert!(!state.hub.is_online(&uid));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn every_browser_input_revalidates_its_device() {
         let tmp = tempfile::tempdir().unwrap();
-        let paths = crate::config::Paths {
-            config_file: tmp.path().join("config.toml"),
-            data_dir: tmp.path().join("data"),
-        };
-        crate::persona::seed(&paths).unwrap();
-        let state = AppState::new(
-            crate::config::Config::default(),
-            paths,
-            crate::db::Db::open_in_memory().unwrap(),
-        )
-        .unwrap();
+        let state = test_state(&tmp);
         let device = state
             .db
             .with(|c| {

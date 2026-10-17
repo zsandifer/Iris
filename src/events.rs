@@ -103,17 +103,14 @@ impl Hub {
         self.send(Audience::Users(users.to_vec()), event);
     }
 
-    /// Register a live connection; the guard unregisters on drop.
+    /// Register a live connection, counted as present; the guard
+    /// unregisters on drop.
     pub fn connect(&self, user_id: &str) -> OnlineGuard {
-        *self
-            .online
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .entry(user_id.to_string())
-            .or_default() += 1;
+        adjust(&self.online, user_id, true);
         OnlineGuard {
             online: self.online.clone(),
             user_id: user_id.to_string(),
+            present: true,
         }
     }
 
@@ -126,20 +123,43 @@ impl Hub {
     }
 }
 
+/// Add (`up`) or remove one connection from a user's online count.
+fn adjust(online: &Mutex<HashMap<String, usize>>, user_id: &str, up: bool) {
+    let mut map = online.lock().unwrap_or_else(|p| p.into_inner());
+    if up {
+        *map.entry(user_id.to_string()).or_default() += 1;
+    } else if let Some(n) = map.get_mut(user_id) {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            map.remove(user_id);
+        }
+    }
+}
+
+/// One connection's share of its user's online count. While the
+/// connection is away (the app is in the background) it does not count,
+/// so replies are pushed even though the socket is still open.
 pub struct OnlineGuard {
     online: Arc<Mutex<HashMap<String, usize>>>,
     user_id: String,
+    present: bool,
+}
+
+impl OnlineGuard {
+    /// Mark this connection present or away. Repeating the current state
+    /// changes nothing, so a double `away` never double-counts.
+    pub fn set_present(&mut self, present: bool) {
+        if self.present != present {
+            self.present = present;
+            adjust(&self.online, &self.user_id, present);
+        }
+    }
 }
 
 impl Drop for OnlineGuard {
     fn drop(&mut self) {
-        let mut map = self.online.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(n) = map.get_mut(&self.user_id) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                map.remove(&self.user_id);
-            }
-        }
+        // An away connection was already uncounted.
+        self.set_present(false);
     }
 }
 
@@ -180,5 +200,45 @@ mod tests {
         assert!(hub.is_online("a"));
         drop(g2);
         assert!(!hub.is_online("a"));
+    }
+
+    #[test]
+    fn away_connections_do_not_count_as_online() {
+        let hub = Hub::new();
+        let mut phone = hub.connect("a");
+        assert!(phone.present && hub.is_online("a"));
+        phone.set_present(false);
+        assert!(!hub.is_online("a"), "an away socket is not online");
+        phone.set_present(false);
+        assert!(!hub.is_online("a"));
+        phone.set_present(true);
+        phone.set_present(true);
+        assert!(hub.is_online("a"));
+        // A second socket keeps the user online while the first is away,
+        // and a double away on one never uncounts the other.
+        let desk = hub.connect("a");
+        phone.set_present(false);
+        phone.set_present(false);
+        assert!(hub.is_online("a"));
+        drop(desk);
+        assert!(!hub.is_online("a"));
+        // Dropping an away socket does not decrement again.
+        let other = hub.connect("a");
+        drop(phone);
+        assert!(
+            hub.is_online("a"),
+            "the away socket's drop left the other alone"
+        );
+        drop(other);
+        assert!(!hub.is_online("a"));
+        assert!(hub.online.lock().unwrap().is_empty(), "no stale entries");
+        // Users are counted separately.
+        let _b = hub.connect("b");
+        let mut a = hub.connect("a");
+        a.set_present(false);
+        assert!(hub.is_online("b") && !hub.is_online("a"));
+        a.set_present(true);
+        drop(a);
+        assert!(!hub.is_online("a") && hub.is_online("b"));
     }
 }
