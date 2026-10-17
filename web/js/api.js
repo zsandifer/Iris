@@ -189,7 +189,15 @@ export function wsSend(obj) {
   if (live && live.readyState === 1) live.send(JSON.stringify(obj));
 }
 
-/** Open the event stream; reconnects with backoff until `close()`. */
+/**
+ * Open the event stream; reconnects with backoff until `close()`.
+ *
+ * The socket also reports whether the app is on screen: `away` when it goes
+ * to the background or the page is closing, `present` when it is back, and
+ * the current state after every (re)connect. iOS suspends a backgrounded
+ * PWA without closing its socket, so without `away` the server would think
+ * the owner is still looking and skip the reply notification.
+ */
 export function connectEvents(onEvent, onStatus) {
   let ws;
   let retry;
@@ -219,6 +227,7 @@ export function connectEvents(onEvent, onStatus) {
       try { m = JSON.parse(e.data); } catch { return; }
       if (m.type === 'ready') {
         backoff = 1000;
+        report();
         onStatus(true);
       }
       if (m.type === 'error' && m.code === 'unauthorized') {
@@ -238,13 +247,25 @@ export function connectEvents(onEvent, onStatus) {
     };
     ping = setInterval(() => sock.readyState === 1 && sock.send('{"type":"ping"}'), 25000);
   };
+  // Open sockets only; the auth frame (sent on open) always goes first.
+  const say = (type) => {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type }));
+  };
+  const report = () => say(document.visibilityState === 'visible' ? 'present' : 'away');
   const wake = () => {
     if (document.visibilityState === 'visible' && !stopped && ws && ws.readyState > 1) {
       backoff = 1000;
       open();
     }
   };
-  document.addEventListener('visibilitychange', wake);
+  const visibility = () => {
+    report();
+    wake();
+  };
+  const leaving = () => say('away');
+  document.addEventListener('visibilitychange', visibility);
+  window.addEventListener('pagehide', leaving);
+  window.addEventListener('pageshow', report);
   window.addEventListener('online', wake);
   open();
   return {
@@ -253,7 +274,9 @@ export function connectEvents(onEvent, onStatus) {
       stopped = true;
       clearInterval(ping);
       clearTimeout(retry);
-      document.removeEventListener('visibilitychange', wake);
+      document.removeEventListener('visibilitychange', visibility);
+      window.removeEventListener('pagehide', leaving);
+      window.removeEventListener('pageshow', report);
       window.removeEventListener('online', wake);
       drop(ws);
       ws = null;

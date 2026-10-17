@@ -2773,6 +2773,8 @@ Main chat, and `entities.changed` for data it changed.
 |---|---|
 | `{"type": "auth", "token": "..."}` | Only meaningful as the first frame. |
 | `{"type": "ping"}` | Server replies `{"type": "pong"}`. |
+| `{"type": "away"}` | The app went to the background or is closing. This socket stops counting toward the user being online (see [Presence](#keepalive-presence-and-revocation)). No reply. |
+| `{"type": "present"}` | The app is on screen again. This socket counts as online again. No reply. |
 | `{"type": "browser.watch", "mode": "peek" \| "full" \| "off", "width": 1000}` | Owner only. Start (or change, or stop) the live view of Iris's browser on this socket. `width` (optional): how many device pixels wide the app shows the picture (its CSS width times `devicePixelRatio`). |
 | `{"type": "browser.input", "kind": ...}` | Owner only, while this device has [taken over](#post-apibrowsertakeover-owner). See below. |
 
@@ -2839,15 +2841,26 @@ input step re-checks that this device still has control; input still
 queued when the socket closes is dropped, and a revoked device loses
 control at once. Typed text and filled values are never logged.
 
-### Keepalive and revocation
+### Keepalive, presence, and revocation
 
-The server sends a WebSocket Ping control frame every 30 seconds. Every
+The server sends a WebSocket Ping control frame every 30 seconds. A client
+that sends nothing (no pong or other frame) for 75 seconds is dropped. Every
 second ping (about once a minute) it checks whether the device was revoked;
 if so it sends `{"type": "error", "code": "unauthorized", "message":
 "device revoked"}` and closes.
 
-An open WebSocket also marks the user as online, which suppresses reply push
-notifications (see [section 9](#9-push-notifications)).
+A user is **online** while at least one of their sockets is present, which
+suppresses reply push notifications (see [section 9](#9-push-notifications)).
+A new socket starts present. `{"type": "away"}` makes it stop counting until
+`{"type": "present"}`; repeating either changes nothing, and closing an away
+socket leaves the user's other sockets counted as they were. Only `present`
+undoes `away`: pings and other frames do not, because a hidden browser tab
+keeps sending its timer pings. The app sends `away` when its page becomes
+hidden or is closing (`visibilitychange`, `pagehide`), `present` when it is
+visible again, and its current state after every `ready`. This matters most
+on iOS, which suspends a backgrounded app without closing its socket; the
+75-second silence limit remains the fallback for a client that disappears
+without saying `away`.
 
 ---
 
@@ -4363,7 +4376,7 @@ use.
 | Heartbeat job posts a message in the Main chat | The owner, always (online or not) | `heartbeat` |
 | A routine run posts its result (or a final failure) in the Main chat and the routine has `notify_when_done` | The owner | `routine` |
 | A routine prepared its work and waits for the owner's OK | The owner | `approval` |
-| A chat turn completes successfully (`status: "complete"`) and `push.notify_replies_when_offline` is true (default) | Conversation members with **no connected WebSocket** at that moment | `reply` |
+| A chat turn completes successfully (`status: "complete"`) and `push.notify_replies_when_offline` is true (default) | Conversation members with **no present WebSocket** at that moment (none open, or all [away](#keepalive-presence-and-revocation)) | `reply` |
 | A chat turn fails (`status: "error"`), same setting | Same | `stuck` (body "I got stuck on that. Tap to try again.") |
 | A CLI the owner used went signed out (reconnect card posted) | The owner | `engine_signin` |
 | A connector refused its sign-in (reconnect card posted) | The owner | `connector_reconnect` |
