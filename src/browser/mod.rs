@@ -302,8 +302,13 @@ struct Private {
     /// for the generation it was read at, so typing again needs a new read.
     typed_gen: u64,
     /// Some of that typing went into another site's frame, where the field
-    /// could not be told apart: every field of such frames is read back.
+    /// could not be told apart: every field of such frames is read back,
+    /// for the rest of the session (a later edit by arrow keys or a page's
+    /// button cannot be told apart either).
     typed_in_frame: bool,
+    /// A document was marked private this session: its markers are checked
+    /// even once its addresses are forgotten.
+    ever_marked: bool,
 }
 
 /// Whether the agent may use the current page.
@@ -658,37 +663,53 @@ const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
       continue;
     }
     if (secrets.length) {
-      // Text holding a secret, node by node (compared here, never in the
-      // page): its element is masked whole, also when a child element
-      // holds another match (which the text search below would pick alone).
+      // Text holding a secret, node by node. The page lists every text
+      // node with the smallest element that shows all of it (also text
+      // overflowing its own element), worked out the same way for every
+      // node; the comparison happens here and the masks are placed by
+      // Playwright, so nothing in the page depends on the secrets (a page
+      // could otherwise plant guesses and watch which ones get marked).
       const low = secrets.map((s) => s.toLowerCase());
       const texts = await f.evaluate(() => {
         const out = [];
+        const up = (e) => e.parentElement || (e.parentNode && e.parentNode.host) || null;
+        const inside = (b, r) => b.left <= r.left + 1 && b.top <= r.top + 1 && b.right >= r.right - 1 && b.bottom >= r.bottom - 1;
+        const xpath = (el) => {
+          // An element inside a shadow root is named by its outermost host.
+          let e = el;
+          for (let r = e.getRootNode(); r && r.host; r = e.getRootNode()) e = r.host;
+          const steps = [];
+          for (; e && e.nodeType === 1; e = e.parentElement) {
+            let i = 1;
+            for (let s = e.previousElementSibling; s; s = s.previousElementSibling) i++;
+            steps.unshift('*[' + i + ']');
+          }
+          return '/' + steps.join('/');
+        };
         const walk = (root) => {
           const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-          for (let n = w.nextNode(); n; n = w.nextNode()) out.push(n.data);
+          for (let n = w.nextNode(); n; n = w.nextNode()) {
+            if (n.data.trim().length < 3) continue;
+            const range = document.createRange();
+            range.selectNodeContents(n);
+            const r = range.getBoundingClientRect();
+            let e = n.parentElement || (n.parentNode && n.parentNode.host) || null;
+            while (e && e !== document.documentElement && !inside(e.getBoundingClientRect(), r)) e = up(e);
+            out.push([n.data, xpath(e || document.documentElement)]);
+          }
           for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
         };
         walk(document);
         return out;
       }).catch(() => null);
       if (texts === null) throw new Error('the page could not be checked for private details');
-      const hits = [];
-      texts.forEach((t, i) => { const l = t.toLowerCase(); if (low.some((s) => l.includes(s))) hits.push(i); });
-      if (hits.length) {
-        await f.evaluate(([attr, hits]) => {
-          const want = new Set(hits);
-          let i = 0;
-          const walk = (root) => {
-            const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-            for (let n = w.nextNode(); n; n = w.nextNode()) {
-              if (want.has(i) && n.parentElement) n.parentElement.setAttribute(attr, '');
-              i++;
-            }
-            for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
-          };
-          walk(document);
-        }, [attr, hits]);
+      const seen = new Set();
+      for (const [t, x] of texts) {
+        const l = String(t).toLowerCase();
+        if (!seen.has(x) && low.some((s) => l.includes(s))) {
+          seen.add(x);
+          masks.push(f.locator('xpath=' + x));
+        }
       }
     }
     masks.push(f.locator('[' + attr + ']'));
@@ -1683,9 +1704,13 @@ impl Browser {
                 p.pages.retain(|(_, d)| d != doc);
             }
         }
+        // Read again next time while a private document could not be read
+        // back (a frame that failed may answer later; the page may change).
+        let all_read = tabs
+            .iter()
+            .all(|t| t["marked"] != true || t["i"].as_u64().is_some_and(|i| marked.contains(&i)));
         if p.typed_gen == generation {
-            p.typed_dirty = false;
-            p.typed_in_frame = false;
+            p.typed_dirty = !all_read;
         }
         Ok(())
     }
@@ -1836,6 +1861,7 @@ impl Browser {
             doc: v["doc"].as_str().unwrap_or("").into(),
         };
         if mark && field.private {
+            lock(&self.private).ever_marked = true;
             self.remember_private_in(&field.url, &field.doc);
             self.note_private_input(field.frame);
         }
@@ -1850,6 +1876,7 @@ impl Browser {
     /// Keep the agent off this address, typed into in document `doc`.
     fn remember_private_in(&self, url: &str, doc: &str) {
         let mut p = lock(&self.private);
+        p.ever_marked = true;
         let entry = (page_key(url).to_string(), doc.to_string());
         if !p.pages.contains(&entry) {
             if p.pages.len() >= PRIVATE_PAGES_MAX {
@@ -2454,7 +2481,7 @@ impl Browser {
         }
         let (typed, filled) = {
             let p = lock(&self.private);
-            (!p.pages.is_empty(), p.filled)
+            (p.ever_marked || !p.pages.is_empty(), p.filled)
         };
         if typed {
             let (url, marked, captured, closed) = self.page_state(run).await?;

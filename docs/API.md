@@ -2858,7 +2858,11 @@ only then is a tab read completely marked as read back for that generation
 secret Iris filled (below), also after its address changes within the
 document, and every address typed into in that document (a single-page
 site may have moved since) is forgotten. Typing again starts a new
-generation, so an earlier read no longer counts. A
+generation, so an earlier read no longer counts. A document marked private
+keeps being checked after its addresses are forgotten, values are read
+again on each call until every such document is read back, and once the
+owner typed in another site's frame every field of such frames is read
+back for the rest of the session. A
 document that could not be read back (a shorter value, a frame that
 failed) stays closed: its browser tools other than `browser_navigate`,
 `browser_navigate_back`, `browser_tabs`, `browser_handle_dialog`, and the
@@ -4352,12 +4356,18 @@ element where it is when the picture is taken. Masked are every private
 field (as above, also `select`s such as an expiry month) in every frame,
 every field whose value contains a secret, every element whose text
 contains one (Playwright's own text search, which runs apart from the
-page's scripts, plus the element around each text node holding one, so a
-secret beside a child element holding another is covered too; text is
-compared on Iris's side and secrets never go into the page), and any frame Iris cannot
+page's scripts; and, for each text node holding one, the smallest element
+showing all of that text, also text running past its own box), and any
+frame Iris cannot
 look into, whole. Secrets are looked for in every written form text
 redaction knows (encodings, card numbers written in groups), in a few
-batched text searches per frame. Its own arguments (`type`, `fullPage`, `target` as a
+batched text searches per frame. Nothing in the page depends on the
+secrets: the page lists every text node with the element that shows it,
+the same way for all of them; the comparison happens on Iris's side and
+Playwright places the masks (in an overlay the page's scripts cannot read),
+so a page planting guesses cannot see which ones matched. Known limit: a
+page using Chrome's occlusion reporting (IntersectionObserver with
+`trackVisibility`) on planted text could notice the overlay covering it. Its own arguments (`type`, `fullPage`, `target` as a
 snapshot ref, `scale`) are honored; the answer is `Screenshot of the
 viewport. Passwords, card details and codes are blacked out.` plus the
 image. Text rendered as pictures (a canvas, an image) is not recognized.

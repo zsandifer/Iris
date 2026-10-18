@@ -456,6 +456,16 @@ async fn agent_calls_pass_through_and_private_pages_stay_closed() {
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(!r.to_string().contains("pw-typed-7"), "{r}");
+    // Changed without typing (a page's button, an arrow key) and not read
+    // back: closed, although the last read forgot its addresses.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    b.hand_back();
+    f.set("capturefail", "");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE, "{r}");
+    std::fs::remove_file(f.file("capturefail")).unwrap();
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
     // A fragment, another address in the same document, the page moving
     // on, or coming back to its address: all open, with the value hidden.
     for url in [
@@ -2042,6 +2052,50 @@ async fn a_field_that_keeps_something_else_is_hidden_or_closed() {
     b.close().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typing_in_another_sites_frame_reads_its_fields_for_the_session() {
+    let f = Fake::new();
+    let b = f.browser();
+    let g = b.begin_turn(&f.owner, &f.conv, "m", &[]);
+    let token = g.token().to_string();
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://site.test/pay"}),
+    )
+    .await;
+    let last_capture = |f: &Fake| {
+        f.calls()
+            .into_iter()
+            .rev()
+            .find(|(t, a)| {
+                t == "browser_run_code_unsafe" && a["code"].to_string().contains("iris:capture")
+            })
+            .map(|(_, a)| a["code"].as_str().unwrap().to_string())
+            .unwrap()
+    };
+    // Typed into another site's frame: every field there is read back.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    f.set("frame", "true");
+    f.set("typed", "frame-typed-1");
+    b.user_input("dev", &json!({"kind": "text", "text": "x"}))
+        .await
+        .unwrap();
+    b.hand_back();
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(last_capture(&f).contains("other && true"));
+    // A later takeover without typing (arrow keys, a page's button): still.
+    std::fs::remove_file(f.file("frame")).unwrap();
+    b.take_over(&f.owner, "dev").await.unwrap();
+    b.hand_back();
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(last_capture(&f).contains("other && true"));
+    drop(g);
+    b.close().await;
+}
+
 /// The masked screenshot's code itself, run by node against a stand-in
 /// page: a frame Iris cannot look into is blacked out whole, and a page it
 /// cannot look into at all gives no picture. Skipped without node.
@@ -2059,15 +2113,19 @@ fn the_screenshot_masks_a_frame_it_cannot_look_into() {
     let harness = format!(
         r#"const shot = {code};
 const marked = [];
+const inPage = [];
 let taken = null;
+// Everything that goes into the page: the functions run there and their
+// arguments.
+const sent = (fn, arg) => inPage.push(String(fn) + ' ' + JSON.stringify(arg === undefined ? null : arg));
 const frame = (name, fail, top) => ({{
   name,
-  evaluate: async () => {{ if (fail) throw new Error('gone'); return []; }},
+  evaluate: async (fn, arg) => {{ sent(fn, arg); if (fail) throw new Error('gone'); return []; }},
   isDetached: () => false,
   frameElement: async () => top ? null : {{
-    evaluate: async (fn, a) => fn({{ setAttribute: (k) => marked.push([name, k]) }}, a),
+    evaluate: async (fn, a) => {{ sent(fn, a); return fn({{ setAttribute: (k) => marked.push([name, k]) }}, a); }},
   }},
-  locator: (sel) => ({{ sel, frame: name, evaluateAll: async () => [] }}),
+  locator: (sel) => ({{ sel, frame: name, evaluateAll: async (fn, arg) => {{ sent(fn, arg); return []; }} }}),
   getByText: (re) => ({{ sel: String(re), frame: name }}),
 }});
 const page = (frames) => ({{
@@ -2081,7 +2139,7 @@ const page = (frames) => ({{
   let refused = '';
   taken = null;
   try {{ await shot(page([frame('main', true, true)])); }} catch (e) {{ refused = e.message; }}
-  console.log(JSON.stringify({{ r, marked, masks, refused, taken }}));
+  console.log(JSON.stringify({{ r, marked, masks, refused, taken, inPage }}));
 }})();"#
     );
     let dir = tempfile::tempdir().unwrap();
@@ -2118,6 +2176,19 @@ const page = (frames) => ({{
         "{v}"
     );
     assert!(v["taken"].is_null(), "{v}");
+    // No secret (in any written form) goes into the page, neither in the
+    // code run there nor in its arguments; the check itself catches one.
+    let forms = super::mask_forms(&["Pw-5678".to_string()]);
+    let leaks = |sent: &[Value]| {
+        sent.iter().any(|c| {
+            let c = c.as_str().unwrap_or("").to_lowercase();
+            forms.iter().any(|f| c.contains(&f.to_lowercase()))
+        })
+    };
+    let sent = v["inPage"].as_array().unwrap();
+    assert!(!sent.is_empty());
+    assert!(!leaks(sent), "a secret went into the page: {sent:?}");
+    assert!(leaks(&[json!("(s) => true [\"Pw-5678\"]")]));
 }
 
 /// End to end with the real Playwright MCP and Chromium, installed by
@@ -2272,6 +2343,18 @@ async fn real_playwright() {
                      <button onclick=\"document.querySelector('input').type = 'text'\" \
                      style='{big};top:400px'>Show</button></body></html>"
                 )
+            } else if req.starts_with("GET /guess") {
+                // A page that plants guesses and watches for any change to
+                // its elements, and a known secret running past its box.
+                "<html><body style='margin:0'>\
+                 <p id=a style='font-size:20px;width:480px;margin:20px 0'>wrong-guess-1</p>\
+                 <p id=b style='font-size:20px;width:480px;margin:20px 0'>Real-Pw-42</p>\
+                 <div id=wrap style='width:480px;margin-top:20px'>\
+                 <div id=o style='width:60px;white-space:nowrap;font-size:20px'>Real-Pw-42 and more text past its box</div></div>\
+                 <script>window.__seen = []; new MutationObserver((m) => m.forEach((r) => {\
+                 if (r.type === 'attributes' && r.target.id) window.__seen.push(r.target.id + ':' + r.attributeName); }))\
+                 .observe(document.body, { attributes: true, subtree: true });</script></body></html>"
+                    .to_string()
             } else if req.starts_with("GET /numcode") {
                 // A code in a number field, and a button that steps it up (as
                 // a number field's arrows do on a desktop browser).
@@ -2407,6 +2490,9 @@ async fn real_playwright() {
         "full frame: {} base64 bytes",
         frame["data"].as_str().unwrap().len()
     );
+    // (The live view's own pictures change the scale of a picture taken at
+    // the same moment; the pixel checks below need the page's own scale.)
+    drop(watching);
 
     // The owner signs in: tap the password field, type.
     b.take_over(&f.owner, "dev").await.unwrap();
@@ -3262,6 +3348,46 @@ async fn real_playwright() {
         !pixel(&shot, x, y).await.contains("\"0,0,0\""),
         "plain text is masked"
     );
+    // A page planting guesses learns nothing from a picture: no element is
+    // changed (which ones hold a secret is worked out on Iris's side), the
+    // matching one is blacked out, and so is a secret running past its box.
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/guess")}),
+    )
+    .await;
+    let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    assert!(text(&shot).contains("blacked out"), "{shot}");
+    let seen = b
+        .tool(
+            &run,
+            "browser_evaluate",
+            &json!({"function": "() => JSON.stringify(window.__seen)"}),
+            QUICK,
+        )
+        .await
+        .unwrap();
+    assert!(
+        text_of(&seen).contains("[]"),
+        "the page saw changes: {seen}"
+    );
+    let (x, y) = spot("#b", 0.97).await;
+    assert!(
+        pixel(&shot, x, y).await.contains("\"0,0,0\""),
+        "the planted match is not masked"
+    );
+    let (x, y) = spot("#a", 0.97).await;
+    assert!(
+        !pixel(&shot, x, y).await.contains("\"0,0,0\""),
+        "a wrong guess is masked"
+    );
+    let (x, y) = spot("#o", 3.0).await;
+    assert!(
+        pixel(&shot, x, y).await.contains("\"0,0,0\""),
+        "text past its box is not masked"
+    );
+
     // A secret whose element also holds another one in a child: both are
     // blacked out (the parent whole).
     f.agent(
@@ -3421,6 +3547,8 @@ async fn real_playwright() {
     );
     b.hand_back();
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(text(&r).contains("[hidden]"), "{r}");
     assert!(
         !r.to_string().contains("12345"),
         "the owner's changed code reached the agent"
@@ -3444,6 +3572,8 @@ async fn real_playwright() {
     assert!(text_of(&kind).contains("text 15"), "{kind}");
     b.hand_back();
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(text(&r).contains("[hidden]"), "{r}");
     assert!(
         !r.to_string().contains("reveal-typed"),
         "the shown password reached the agent"
@@ -3508,7 +3638,6 @@ async fn real_playwright() {
     assert!(text(&f.agent(&token, "browser_snapshot", json!({})).await).contains("Welcome home"));
     drop(chat);
 
-    drop(watching);
     drop(g);
     b.close().await;
     assert!(b.running().is_none());
