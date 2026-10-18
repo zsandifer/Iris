@@ -594,6 +594,10 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
                 Ok(super::own::ask_to_save_login(state, &ctx, &run, &args).await)
             }
             ("browser_take_screenshot", _) if masked => b.masked_screenshot(&run, &args).await,
+            ("browser_take_screenshot", _) => {
+                let _one = b.capture_lock.lock().await;
+                b.tool(&run, name, &args, super::CALL_TIMEOUT).await
+            }
             _ => b.tool(&run, name, &args, super::CALL_TIMEOUT).await,
         }
     };

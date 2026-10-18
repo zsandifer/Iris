@@ -369,6 +369,10 @@ pub struct Shared {
     last_input: AtomicI64,
     /// Serializes actions on the page (tool calls and the owner's input).
     pub(crate) op_lock: tokio::sync::Mutex<()>,
+    /// One picture at a time: a live-view picture taken at the same moment
+    /// as the agent's changes its scale (and the agent's masks are painted
+    /// for the scale Iris asked for).
+    pub(crate) capture_lock: tokio::sync::Mutex<()>,
     /// "Pause Iris" in the app: no turns, jobs, or browsing until resumed.
     paused: AtomicBool,
     /// Disconnect everything disables browser tools until the owner reopens it.
@@ -623,133 +627,218 @@ pub(crate) fn shot_code(forms: &[String], opts: &Value) -> Result<String> {
     Ok(SHOT_CODE
         .replace("SECRETS", &serde_json::to_string(forms)?)
         .replace("OPTS", &opts.to_string())
-        .replace("NONCE", &new_id())
         .replace("SENSITIVE", SENSITIVE_FN))
+}
+
+/// Paint `rects` (x, y, width, height in CSS pixels of an area `css_w` by
+/// `css_h`) black on a PNG picture of that area, a pixel wider on every
+/// side. The picture's scale is its size over the area's; one that does
+/// not match on both sides is refused rather than masked in the wrong place.
+pub(crate) fn paint_masks(
+    png_bytes: &[u8],
+    css_w: f64,
+    css_h: f64,
+    rects: &[[f64; 4]],
+) -> Result<Vec<u8>> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info()?;
+    let mut pixels = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .ok_or("the picture is too large")?
+    ];
+    let info = reader.next_frame(&mut pixels)?;
+    let (w, h) = (info.width as usize, info.height as usize);
+    let channels = info.color_type.samples();
+    if css_w <= 0.0 || css_h <= 0.0 {
+        return Err("the picture has no size".into());
+    }
+    let (sx, sy) = (w as f64 / css_w, h as f64 / css_h);
+    if (sx - sy).abs() > 0.02 * sx.max(sy) {
+        return Err("the picture does not have the page's shape".into());
+    }
+    let stride = info.line_size;
+    for &[x, y, rw, rh] in rects {
+        if !(x.is_finite() && y.is_finite() && rw.is_finite() && rh.is_finite()) {
+            return Err("a private area has no position".into());
+        }
+        let clamp = |v: f64, max: usize| v.max(0.0).min(max as f64) as usize;
+        let (x0, x1) = (
+            clamp((x * sx).floor() - 1.0, w),
+            clamp(((x + rw) * sx).ceil() + 1.0, w),
+        );
+        let (y0, y1) = (
+            clamp((y * sy).floor() - 1.0, h),
+            clamp(((y + rh) * sy).ceil() + 1.0, h),
+        );
+        for row in y0..y1 {
+            let line = &mut pixels[row * stride..row * stride + w * channels];
+            for px in line[x0 * channels..x1 * channels].chunks_mut(channels) {
+                // Black, fully opaque.
+                match channels {
+                    2 | 4 => {
+                        let a = channels - 1;
+                        px[..a].fill(0);
+                        px[a] = 255;
+                    }
+                    _ => px.fill(0),
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, info.width, info.height);
+        encoder.set_color(info.color_type);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header()?;
+        let rows: Vec<u8> = pixels
+            .chunks(stride)
+            .take(h)
+            .flat_map(|l| l[..w * channels].iter().copied())
+            .collect();
+        writer.write_image_data(&rows)?;
+    }
+    Ok(out)
 }
 
 /// What `FIELDS_CODE` found: per frame, (value, private) of each field.
 pub(crate) type Fields = Vec<Option<Vec<(String, bool)>>>;
 
-/// A screenshot for the agent with private details blacked out: every
-/// private field (as `SENSITIVE_FN` sees them) and every field or text
-/// holding one of `SECRETS` (every written form `hide_secrets` knows, see
-/// `mask_forms`) in each frame, and any frame Iris cannot look
-/// into as a whole (Playwright's own `mask`, placed where each element is
-/// when the picture is taken). The secrets only go to Playwright's own
-/// text search, never into the page's scripts. `OPTS`: `type` (png or
-/// jpeg), `fullPage`, `target` (a snapshot ref), `scale`.
+/// The agent's picture of the page, and where its private details are:
+/// every private field (as `SENSITIVE_FN` sees them, or typed into by the
+/// owner), every field or text holding one of `SECRETS` (every written
+/// form `hide_secrets` knows, see `mask_forms`) in each frame, and any
+/// frame Iris cannot look into, whole, as rectangles in the picture's
+/// pixels. Iris paints them black itself (`paint_masks`): nothing is drawn
+/// in the page, and nothing there depends on the secrets (the page lists
+/// its fields and text nodes the same way for every page; matching happens
+/// here, positions come from Playwright). The picture is taken with Chrome's
+/// own capture at a fixed scale, between two measurements that must agree
+/// (a page moving meanwhile is measured again). `OPTS`: `fullPage`,
+/// `target` (a snapshot ref).
 const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
   const secrets = SECRETS;
   const opts = OPTS;
-  const attr = 'data-iris-mask-NONCE';
-  const masks = [];
-  for (const f of page.frames()) {
-    const ok = await f.evaluate((attr) => {
-      const sensitive = SENSITIVE;
-      const walk = (root) => {
-        for (const e of root.querySelectorAll('input, textarea, select, [contenteditable]')) {
-          if (e.type === 'password' || sensitive(e)) e.setAttribute(attr, '');
-        }
-        for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
-      };
-      walk(document);
-      return true;
-    }, attr).catch(() => null);
-    if (ok === null) {
-      if (f.isDetached()) continue;
-      const el = await f.frameElement().catch(() => null);
-      if (!el) throw new Error('the page could not be checked for private details');
-      await el.evaluate((e, a) => e.setAttribute(a, ''), attr);
-      continue;
-    }
-    if (secrets.length) {
-      // Text holding a secret, node by node. The page lists every text
-      // node with the smallest element that shows all of it (also text
-      // overflowing its own element), worked out the same way for every
-      // node; the comparison happens here and the masks are placed by
-      // Playwright, so nothing in the page depends on the secrets (a page
-      // could otherwise plant guesses and watch which ones get marked).
-      const low = secrets.map((s) => s.toLowerCase());
-      const texts = await f.evaluate(() => {
-        const out = [];
-        const up = (e) => e.parentElement || (e.parentNode && e.parentNode.host) || null;
-        const inside = (b, r) => b.left <= r.left + 1 && b.top <= r.top + 1 && b.right >= r.right - 1 && b.bottom >= r.bottom - 1;
-        const xpath = (el) => {
-          // An element inside a shadow root is named by its outermost host.
-          let e = el;
-          for (let r = e.getRootNode(); r && r.host; r = e.getRootNode()) e = r.host;
-          const steps = [];
-          for (; e && e.nodeType === 1; e = e.parentElement) {
-            let i = 1;
-            for (let s = e.previousElementSibling; s; s = s.previousElementSibling) i++;
-            steps.unshift('*[' + i + ']');
-          }
-          return '/' + steps.join('/');
-        };
-        const walk = (root) => {
-          const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-          for (let n = w.nextNode(); n; n = w.nextNode()) {
-            if (n.data.trim().length < 3) continue;
-            const range = document.createRange();
-            range.selectNodeContents(n);
-            const r = range.getBoundingClientRect();
-            let e = n.parentElement || (n.parentNode && n.parentNode.host) || null;
-            while (e && e !== document.documentElement && !inside(e.getBoundingClientRect(), r)) e = up(e);
-            out.push([n.data, xpath(e || document.documentElement)]);
-          }
-          for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
-        };
-        walk(document);
-        return out;
-      }).catch(() => null);
-      if (texts === null) throw new Error('the page could not be checked for private details');
+  const low = secrets.map((s) => s.toLowerCase());
+  const scanPage = () => {
+    const sensitive = SENSITIVE;
+    const xpath = (el) => {
+      // An element inside a shadow root is named by its outermost host.
+      let e = el;
+      for (let r = e.getRootNode(); r && r.host; r = e.getRootNode()) e = r.host;
+      const steps = [];
+      for (; e && e.nodeType === 1; e = e.parentElement) {
+        let i = 1;
+        for (let s = e.previousElementSibling; s; s = s.previousElementSibling) i++;
+        steps.unshift('*[' + i + ']');
+      }
+      return '/' + steps.join('/');
+    };
+    const up = (e) => e.parentElement || (e.parentNode && e.parentNode.host) || null;
+    const inside = (b, r) => b.left <= r.left + 1 && b.top <= r.top + 1 && b.right >= r.right - 1 && b.bottom >= r.bottom - 1;
+    const fields = [];
+    const texts = [];
+    const walk = (root) => {
+      for (const e of root.querySelectorAll('input, textarea, select, [contenteditable]')) {
+        if (e.type === 'password' || e.__irisTyped === true || sensitive(e)) fields.push(xpath(e));
+      }
+      const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      for (let n = w.nextNode(); n; n = w.nextNode()) {
+        if (n.data.trim().length < 3) continue;
+        const range = document.createRange();
+        range.selectNodeContents(n);
+        const r = range.getBoundingClientRect();
+        let e = n.parentElement || (n.parentNode && n.parentNode.host) || null;
+        while (e && e !== document.documentElement && !inside(e.getBoundingClientRect(), r)) e = up(e);
+        texts.push([n.data, xpath(e || document.documentElement)]);
+      }
+      for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
+    };
+    walk(document);
+    return { fields, texts };
+  };
+  // Every rectangle to black out, in CSS pixels of the viewport.
+  const measure = async () => {
+    const targets = [];
+    for (const f of page.frames()) {
+      const scan = await f.evaluate(scanPage).catch(() => null);
+      if (scan === null) {
+        if (f.isDetached()) continue;
+        // Cannot look inside: the whole frame.
+        const el = await f.frameElement().catch(() => null);
+        if (!el) throw new Error('the page could not be checked for private details');
+        targets.push(el);
+        continue;
+      }
+      for (const x of scan.fields) targets.push(f.locator('xpath=' + x));
+      if (!secrets.length) continue;
       const seen = new Set();
-      for (const [t, x] of texts) {
+      for (const [t, x] of scan.texts) {
         const l = String(t).toLowerCase();
         if (!seen.has(x) && low.some((s) => l.includes(s))) {
           seen.add(x);
-          masks.push(f.locator('xpath=' + x));
+          targets.push(f.locator('xpath=' + x));
         }
       }
-    }
-    masks.push(f.locator('[' + attr + ']'));
-    if (secrets.length) {
       const fields = f.locator('input, textarea');
       const values = await fields.evaluateAll((els) => els.map((e) => String(e.value))).catch(() => null);
       if (values === null) throw new Error('the page could not be checked for private details');
       values.forEach((v, i) => {
-        const low = v.toLowerCase();
-        if (secrets.some((s) => low.includes(s.toLowerCase()))) masks.push(fields.nth(i));
+        const l = v.toLowerCase();
+        if (low.some((s) => l.includes(s))) targets.push(fields.nth(i));
       });
-      // Text masks in a few batched searches (Playwright's own, apart from
-      // the page's scripts), not one per form.
+      // Text split over several elements: Playwright's own text search,
+      // in a few batches.
       for (let k = 0; k < secrets.length; k += 40) {
         const part = secrets.slice(k, k + 40).map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-        masks.push(f.getByText(new RegExp(part.join('|'), 'i')));
+        targets.push(f.getByText(new RegExp(part.join('|'), 'i')));
       }
     }
-  }
-  for (const f of page.frames()) masks.push(f.locator('iframe[' + attr + '], frame[' + attr + ']'));
-  const type = opts.type === 'jpeg' ? 'jpeg' : 'png';
-  const shot = { type, mask: masks, maskColor: '#000000', scale: opts.scale === 'device' ? 'device' : 'css', timeout: 20000 };
-  if (type === 'jpeg') shot.quality = 90;
-  let data;
-  try {
-    data = opts.target
-      ? await page.locator('aria-ref=' + opts.target).screenshot(shot)
-      : await page.screenshot({ ...shot, fullPage: !!opts.fullPage });
-  } finally {
-    for (const f of page.frames()) {
-      await f.evaluate((a) => {
-        const clean = (root) => {
-          for (const e of root.querySelectorAll('[' + a + ']')) e.removeAttribute(a);
-          for (const e of root.querySelectorAll('*')) if (e.shadowRoot) clean(e.shadowRoot);
-        };
-        clean(document);
-      }, attr).catch(() => {});
+    const rects = [];
+    for (const t of targets) {
+      const each = typeof t.all === 'function' ? await t.all() : [t];
+      for (const h of each) {
+        const b = await h.boundingBox({ timeout: 2000 }).catch(() => undefined);
+        if (b === undefined) throw new Error('the page could not be checked for private details');
+        if (b && b.width > 0 && b.height > 0) rects.push([b.x, b.y, b.width, b.height]);
+      }
     }
+    return rects;
+  };
+  const same = (a, b) => a.length === b.length && a.every((r, i) => r.every((v, k) => Math.abs(v - b[i][k]) < 1));
+  const s = await page.context().newCDPSession(page);
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const before = await measure();
+      const m = await s.send('Page.getLayoutMetrics');
+      const vv = m.cssVisualViewport;
+      let clip, ox, oy;
+      if (opts.target) {
+        const b = await page.locator('aria-ref=' + opts.target).boundingBox({ timeout: 5000 });
+        if (!b) throw new Error('that element is not on the page');
+        clip = { x: vv.pageX + b.x, y: vv.pageY + b.y, width: b.width, height: b.height };
+        [ox, oy] = [b.x, b.y];
+      } else if (opts.fullPage) {
+        const c = m.cssContentSize;
+        clip = { x: 0, y: 0, width: c.width, height: c.height };
+        [ox, oy] = [-vv.pageX, -vv.pageY];
+      } else {
+        clip = { x: vv.pageX, y: vv.pageY, width: vv.clientWidth, height: vv.clientHeight };
+        [ox, oy] = [0, 0];
+      }
+      const shot = await s.send('Page.captureScreenshot', { format: 'png', clip: { ...clip, scale: 1 }, captureBeyondViewport: !!opts.fullPage });
+      const after = await measure();
+      if (!same(before, after)) continue;
+      const rects = before.concat(after).map(([x, y, w, h]) => [x - ox, y - oy, w, h]);
+      return { data: shot.data, width: clip.width, height: clip.height, rects };
+    }
+    throw new Error('the page kept moving');
+  } finally {
+    s.detach().catch(() => {});
   }
-  return { data: data.toString('base64'), type };
 }"#;
 
 /// The focused field, followed into shadow roots and same-origin frames:
@@ -1059,6 +1148,7 @@ impl Browser {
             last_used: AtomicI64::new(0),
             last_input: AtomicI64::new(0),
             op_lock: tokio::sync::Mutex::new(()),
+            capture_lock: tokio::sync::Mutex::new(()),
             paused: AtomicBool::new(false),
             disconnected: AtomicBool::new(false),
             allow_no_sandbox: AtomicBool::new(false),
@@ -1813,23 +1903,27 @@ impl Browser {
     /// A picture of the page for the agent, with private details blacked
     /// out (`SHOT_CODE`), as a tool result.
     pub(crate) async fn masked_screenshot(&self, run: &Running, args: &Value) -> Result<Value> {
-        let opts = json!({
-            "type": args["type"].as_str().unwrap_or("png"),
-            "fullPage": args["fullPage"] == true,
-            "target": args["target"].as_str().or_else(|| args["ref"].as_str()),
-            "scale": args["scale"].as_str().unwrap_or("css"),
-        });
-        if let Some(t) = opts["target"].as_str()
+        use base64::Engine as _;
+        let target = args["target"].as_str().or_else(|| args["ref"].as_str());
+        if let Some(t) = target
             && !tools::is_ref(t)
         {
             return Err("Use a snapshot ref (like e12) as `target` here.".into());
         }
+        let opts = json!({"fullPage": args["fullPage"] == true, "target": target});
         let code = shot_code(&mask_forms(&self.filled_secrets()), &opts)?;
-        let v = self.run_code_within(run, &code, CALL_TIMEOUT).await?;
-        let data = v["data"].as_str().ok_or("the browser gave no picture")?;
-        let what = if opts["target"].is_string() {
+        let v = {
+            let _one = self.capture_lock.lock().await;
+            self.run_code_within(run, &code, CALL_TIMEOUT).await?
+        };
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let raw = b64.decode(v["data"].as_str().ok_or("the browser gave no picture")?)?;
+        let rects: Vec<[f64; 4]> = serde_json::from_value(v["rects"].clone())?;
+        let size = |k: &str| v[k].as_f64().ok_or("the browser gave no picture size");
+        let painted = paint_masks(&raw, size("width")?, size("height")?, &rects)?;
+        let what = if target.is_some() {
             "element"
-        } else if opts["fullPage"] == true {
+        } else if args["fullPage"] == true {
             "full page"
         } else {
             "viewport"
@@ -1837,8 +1931,7 @@ impl Browser {
         Ok(json!({"content": [
             {"type": "text", "text": format!("### Result\nScreenshot of the {what}. \
                 Passwords, card details and codes are blacked out.")},
-            {"type": "image", "data": data,
-             "mimeType": if v["type"] == "jpeg" { "image/jpeg" } else { "image/png" }},
+            {"type": "image", "data": b64.encode(painted), "mimeType": "image/png"},
         ]}))
     }
 
@@ -2097,9 +2190,11 @@ impl Browser {
                     let _ = self.follow_new_tab(run).await;
                 }
             }
-            let shot = self
-                .run_code_within(run, &frame_code(width, mode.quality()), FRAME_TIMEOUT)
-                .await;
+            let shot = {
+                let _one = self.capture_lock.lock().await;
+                self.run_code_within(run, &frame_code(width, mode.quality()), FRAME_TIMEOUT)
+                    .await
+            };
             // Failures are logged (the first, then every 50th; no page
             // content), so a live view that stays blank can be explained.
             match &shot {
@@ -2549,6 +2644,60 @@ mod tests {
         };
         let b = Browser::new(BrowserConfig::default(), &paths, Hub::new());
         (tmp, b)
+    }
+
+    fn png_of(w: u32, h: u32, color: png::ColorType, fill: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut e = png::Encoder::new(&mut out, w, h);
+        e.set_color(color);
+        e.set_depth(png::BitDepth::Eight);
+        let mut wr = e.write_header().unwrap();
+        let n = (w * h) as usize * color.samples();
+        wr.write_image_data(&vec![fill; n]).unwrap();
+        drop(wr);
+        out
+    }
+
+    fn pixels_of(png_bytes: &[u8]) -> (u32, u32, usize, Vec<u8>) {
+        let mut d = png::Decoder::new(std::io::Cursor::new(png_bytes))
+            .read_info()
+            .unwrap();
+        let mut buf = vec![0; d.output_buffer_size().unwrap()];
+        let info = d.next_frame(&mut buf).unwrap();
+        (info.width, info.height, info.color_type.samples(), buf)
+    }
+
+    #[test]
+    fn masks_are_painted_black_where_the_page_shows_private_details() {
+        // A white 10x10 picture of a 10x10 area; one private box at (3,3).
+        let white = png_of(10, 10, png::ColorType::Rgba, 255);
+        let out = paint_masks(&white, 10.0, 10.0, &[[3.0, 3.0, 2.0, 2.0]]).unwrap();
+        let (w, h, c, px) = pixels_of(&out);
+        assert_eq!((w, h, c), (10, 10, 4));
+        let at = |x: usize, y: usize| &px[(y * 10 + x) * 4..(y * 10 + x) * 4 + 4];
+        // The box and a pixel around it are black and opaque; the rest is not.
+        for (x, y) in [(2, 2), (3, 3), (4, 4), (5, 5)] {
+            assert_eq!(at(x, y), [0, 0, 0, 255], "({x},{y})");
+        }
+        for (x, y) in [(1, 1), (6, 6), (0, 9), (9, 0)] {
+            assert_eq!(at(x, y), [255, 255, 255, 255], "({x},{y})");
+        }
+        // A picture at twice the area's size: the box is scaled with it.
+        let big = png_of(20, 20, png::ColorType::Rgb, 255);
+        let out = paint_masks(&big, 10.0, 10.0, &[[3.0, 3.0, 2.0, 2.0]]).unwrap();
+        let (_, _, c, px) = pixels_of(&out);
+        assert_eq!(c, 3);
+        let at = |x: usize, y: usize| &px[(y * 20 + x) * 3..(y * 20 + x) * 3 + 3];
+        // (6..10 doubled, a pixel wider: 5..11.)
+        assert_eq!(at(5, 5), [0, 0, 0]);
+        assert_eq!(at(10, 10), [0, 0, 0]);
+        assert_eq!(at(4, 4), [255, 255, 255]);
+        assert_eq!(at(11, 11), [255, 255, 255]);
+        // Off the picture, clamped; a picture not the area's shape, refused.
+        assert!(paint_masks(&white, 10.0, 10.0, &[[-5.0, -5.0, 100.0, 1.0]]).is_ok());
+        assert!(paint_masks(&white, 10.0, 20.0, &[]).is_err());
+        assert!(paint_masks(&white, 10.0, 10.0, &[[f64::NAN, 0.0, 1.0, 1.0]]).is_err());
+        assert!(paint_masks(b"not a png", 10.0, 10.0, &[]).is_err());
     }
 
     #[tokio::test]

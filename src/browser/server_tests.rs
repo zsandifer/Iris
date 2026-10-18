@@ -83,7 +83,11 @@ while IFS= read -r line; do
               [ -f privfields_after ] && mv privfields_after privfields
               reply "### Result\n$t" '' '' ;;
             *iris:shot*)
-              reply '### Result\n{\"data\":\"TUFTSw==\",\"type\":\"png\"}' '' '' ;;
+              # `shotjson`: the picture and its private areas (JSON, quotes
+              # escaped); default a 1x1 picture with none.
+              if [ -f shotjson ]; then t=$(cat shotjson)
+              else t='{\"data\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=\",\"width\":1,\"height\":1,\"rects\":[]}'; fi
+              reply "### Result\n$t" '' '' ;;
             *aria-ref=*|*hasFocus*)
               # Iris's fills: `fieldframe` is the field's frame address
               # (default: the page's), `noref` hides the field, `kinds`
@@ -250,6 +254,16 @@ fn text(v: &Value) -> String {
     v["content"][0]["text"].as_str().unwrap_or("").to_string()
 }
 
+/// Iris's own picture (private details painted out), not Playwright's.
+fn masked(v: &Value) -> bool {
+    text(v).contains("blacked out")
+        && v["content"][1]["type"] == "image"
+        && v["content"][1]["mimeType"] == "image/png"
+        && v["content"][1]["data"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("iVBOR"))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_calls_pass_through_and_private_pages_stay_closed() {
     let f = Fake::new();
@@ -403,7 +417,7 @@ async fn agent_calls_pass_through_and_private_pages_stay_closed() {
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(text(&r).contains("blacked out"), "{r}");
-    assert_eq!(r["content"][1]["data"], "TUFTSw==");
+    assert!(masked(&r), "{r}");
     assert_eq!(f.called("browser_take_screenshot"), shots);
     let shot = f
         .calls()
@@ -736,7 +750,7 @@ async fn owner_fills_saved_logins_only_on_their_site() {
     assert_eq!(f.called("browser_press_key"), 0);
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
-    assert!(!r.to_string().contains("QUJD") && r.to_string().contains("TUFTSw=="));
+    assert!(!r.to_string().contains("QUJD") && masked(&r), "{r}");
     let r = f
         .agent(&token, "browser_find", json!({"text": "Pw-1"}))
         .await;
@@ -974,7 +988,7 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
         "{r}"
     );
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
-    assert_eq!(r["content"][1]["data"], "TUFTSw==", "{r}");
+    assert!(masked(&r), "{r}");
     let r = f
         .agent(&token, "browser_click", json!({"target": "e3"}))
         .await;
@@ -1004,7 +1018,7 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
     f.set("pagetext", "You searched for Pw-5678");
     let shots = f.called("browser_take_screenshot");
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
-    assert_eq!(r["content"][1]["data"], "TUFTSw==", "{r}");
+    assert!(masked(&r), "{r}");
     assert_eq!(f.called("browser_take_screenshot"), shots);
     // No searching it (a match or not would tell what is hidden), or
     // naming elements by text; other actions go on.
@@ -1086,7 +1100,7 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
     assert!(!r.to_string().contains("Pw-5678"), "{r}");
     f.set("pagetext", "Your password is Pw-5678");
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
-    assert_eq!(r["content"][1]["data"], "TUFTSw==", "{r}");
+    assert!(masked(&r), "{r}");
     drop(g);
     b.close().await;
 }
@@ -1301,7 +1315,7 @@ async fn the_agent_fills_a_card_only_after_the_owner_approves() {
     assert!(!f.file("marked").exists());
     f.set("fields", "4111111111111111 04 2031 737 S Doe");
     let r = f.agent(&token, "browser_take_screenshot", json!({})).await;
-    assert_eq!(r["content"][1]["data"], "TUFTSw==", "{r}");
+    assert!(masked(&r), "{r}");
     let r = f
         .agent(&token, "browser_click", json!({"target": "e9"}))
         .await;
@@ -2109,37 +2123,47 @@ fn the_screenshot_masks_a_frame_it_cannot_look_into() {
         eprintln!("node not found; skipped");
         return;
     }
-    let code = super::shot_code(&["Pw-5678".to_string()], &json!({"type": "png"})).unwrap();
+    let code = super::shot_code(&super::mask_forms(&["Pw-5678".to_string()]), &json!({})).unwrap();
     let harness = format!(
         r#"const shot = {code};
-const marked = [];
 const inPage = [];
-let taken = null;
+let captured = 0;
 // Everything that goes into the page: the functions run there and their
 // arguments.
 const sent = (fn, arg) => inPage.push(String(fn) + ' ' + JSON.stringify(arg === undefined ? null : arg));
+const located = (name, box) => ({{
+  name,
+  all: async () => [located(name, box)],
+  boundingBox: async () => box,
+  evaluateAll: async (fn, arg) => {{ sent(fn, arg); return []; }},
+  nth: () => located(name, box),
+}});
 const frame = (name, fail, top) => ({{
   name,
-  evaluate: async (fn, arg) => {{ sent(fn, arg); if (fail) throw new Error('gone'); return []; }},
+  evaluate: async (fn, arg) => {{ sent(fn, arg); if (fail) throw new Error('gone'); return {{ fields: [], texts: [] }}; }},
   isDetached: () => false,
-  frameElement: async () => top ? null : {{
-    evaluate: async (fn, a) => {{ sent(fn, a); return fn({{ setAttribute: (k) => marked.push([name, k]) }}, a); }},
-  }},
-  locator: (sel) => ({{ sel, frame: name, evaluateAll: async (fn, arg) => {{ sent(fn, arg); return []; }} }}),
-  getByText: (re) => ({{ sel: String(re), frame: name }}),
+  frameElement: async () => top ? null : {{ boundingBox: async () => ({{ x: 0, y: 400, width: 300, height: 200 }}) }},
+  locator: () => located(name, null),
+  getByText: () => ({{ all: async () => [] }}),
 }});
 const page = (frames) => ({{
   frames: () => frames,
-  screenshot: async (o) => {{ taken = o; return Buffer.from('PNG'); }},
-  locator: () => ({{ screenshot: async (o) => {{ taken = o; return Buffer.from('PNG'); }} }}),
+  context: () => ({{ newCDPSession: async () => ({{
+    send: async (m) => {{
+      if (m === 'Page.getLayoutMetrics') return {{ cssVisualViewport: {{ pageX: 0, pageY: 0, clientWidth: 500, clientHeight: 1000 }}, cssContentSize: {{ width: 500, height: 1000 }} }};
+      captured++;
+      return {{ data: 'UE5H' }};
+    }},
+    detach: async () => {{}},
+  }}) }}),
+  locator: () => located('main', null),
 }});
 (async () => {{
   const r = await shot(page([frame('main', false, true), frame('box', true, false)]));
-  const masks = taken.mask.map((m) => m.frame + ' ' + m.sel);
   let refused = '';
-  taken = null;
+  const before = captured;
   try {{ await shot(page([frame('main', true, true)])); }} catch (e) {{ refused = e.message; }}
-  console.log(JSON.stringify({{ r, marked, masks, refused, taken, inPage }}));
+  console.log(JSON.stringify({{ r, refused, again: captured - before, inPage }}));
 }})();"#
     );
     let dir = tempfile::tempdir().unwrap();
@@ -2155,19 +2179,20 @@ const page = (frames) => ({{
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    // The picture, its size, and the frame Iris could not look into, whole.
     assert_eq!(v["r"]["data"], "UE5H");
-    // The frame's own element is marked in its parent and masked there.
-    let attr = v["marked"][0][1].as_str().unwrap().to_string();
-    assert_eq!(v["marked"][0][0], "box");
-    assert!(attr.starts_with("data-iris-mask-"), "{v}");
+    assert_eq!(
+        (v["r"]["width"].as_f64(), v["r"]["height"].as_f64()),
+        (Some(500.0), Some(1000.0))
+    );
     assert!(
-        v["masks"]
+        v["r"]["rects"]
             .as_array()
             .unwrap()
-            .iter()
-            .any(|m| m == &json!(format!("main iframe[{attr}], frame[{attr}]"))),
+            .contains(&json!([0, 400, 300, 200])),
         "{v}"
     );
+    // A page it cannot look into at all: no picture.
     assert!(
         v["refused"]
             .as_str()
@@ -2175,7 +2200,7 @@ const page = (frames) => ({{
             .contains("could not be checked"),
         "{v}"
     );
-    assert!(v["taken"].is_null(), "{v}");
+    assert_eq!(v["again"], 0);
     // No secret (in any written form) goes into the page, neither in the
     // code run there nor in its arguments; the check itself catches one.
     let forms = super::mask_forms(&["Pw-5678".to_string()]);
@@ -2353,7 +2378,10 @@ async fn real_playwright() {
                  <div id=o style='width:60px;white-space:nowrap;font-size:20px'>Real-Pw-42 and more text past its box</div></div>\
                  <script>window.__seen = []; new MutationObserver((m) => m.forEach((r) => {\
                  if (r.type === 'attributes' && r.target.id) window.__seen.push(r.target.id + ':' + r.attributeName); }))\
-                 .observe(document.body, { attributes: true, subtree: true });</script></body></html>"
+                 .observe(document.body, { attributes: true, subtree: true });\
+                 new MutationObserver((m) => m.forEach((r) => r.addedNodes.forEach((n) => {\
+                 if (n.nodeType === 1 && n.tagName !== 'SCRIPT') window.__seen.push('added:' + n.nodeName); })))\
+                 .observe(document.documentElement, { childList: true, subtree: true });</script></body></html>"
                     .to_string()
             } else if req.starts_with("GET /numcode") {
                 // A code in a number field, and a button that steps it up (as
@@ -2490,9 +2518,8 @@ async fn real_playwright() {
         "full frame: {} base64 bytes",
         frame["data"].as_str().unwrap().len()
     );
-    // (The live view's own pictures change the scale of a picture taken at
-    // the same moment; the pixel checks below need the page's own scale.)
-    drop(watching);
+    // (The live view keeps taking pictures from here on: the agent's are
+    // taken one at a time with them, at the page's own scale.)
 
     // The owner signs in: tap the password field, type.
     b.take_over(&f.owner, "dev").await.unwrap();
@@ -3638,6 +3665,7 @@ async fn real_playwright() {
     assert!(text(&f.agent(&token, "browser_snapshot", json!({})).await).contains("Welcome home"));
     drop(chat);
 
+    drop(watching);
     drop(g);
     b.close().await;
     assert!(b.running().is_none());

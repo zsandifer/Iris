@@ -4350,29 +4350,31 @@ outcome would tell what is hidden).
 **Masked screenshots.** While the browser knows any secret (the owner's
 saved passwords and card numbers count from the start, so in practice
 always once one is saved), `browser_take_screenshot` is answered by Iris
-instead of passed through: Iris takes the picture through Playwright's own
-`screenshot` with `mask`, which paints a solid black box over each masked
-element where it is when the picture is taken. Masked are every private
-field (as above, also `select`s such as an expiry month) in every frame,
-every field whose value contains a secret, every element whose text
-contains one (Playwright's own text search, which runs apart from the
-page's scripts; and, for each text node holding one, the smallest element
-showing all of that text, also text running past its own box), and any
-frame Iris cannot
-look into, whole. Secrets are looked for in every written form text
-redaction knows (encodings, card numbers written in groups), in a few
-batched text searches per frame. Nothing in the page depends on the
-secrets: the page lists every text node with the element that shows it,
-the same way for all of them; the comparison happens on Iris's side and
-Playwright places the masks (in an overlay the page's scripts cannot read),
-so a page planting guesses cannot see which ones matched. Known limit: a
-page using Chrome's occlusion reporting (IntersectionObserver with
-`trackVisibility`) on planted text could notice the overlay covering it. Its own arguments (`type`, `fullPage`, `target` as a
-snapshot ref, `scale`) are honored; the answer is `Screenshot of the
-viewport. Passwords, card details and codes are blacked out.` plus the
-image. Text rendered as pictures (a canvas, an image) is not recognized.
-A screenshot is checked again once taken and dropped if the page closed
-meanwhile (or, for one passed through, if a secret became known). Expiry dates
+instead of passed through. Iris works out what to black out: every
+private field (as above, also `select`s such as an expiry month, and any
+field the owner typed private details into) in every frame, every field
+whose value contains a secret, every element whose text contains one
+(Playwright's own text search; and, for each text node holding one, the
+smallest element showing all of that text, also text running past its own
+box), and any frame Iris cannot look into, whole. Secrets are looked for in
+every written form text redaction knows (encodings, card numbers written in
+groups). It takes the picture with Chrome's own capture (`Page.captureScreenshot`,
+at the page's CSS scale, one picture at a time with the live view's), between
+two measurements of those areas that must agree (a page moving meanwhile is
+measured again, three times at most, else no picture), and paints the areas
+black itself, a pixel wider on every side (`paint_masks`, with the `png`
+crate), refusing a picture whose size does not match what it asked for.
+Nothing is drawn in the page and nothing there depends on the secrets: the
+page lists its private fields and every text node with the element that
+shows it, the same way for every page; matching happens on Iris's side and
+positions come from Playwright (`boundingBox`), so a page planting guesses
+cannot tell which ones matched. `fullPage` and `target` (a snapshot ref) are
+honored; the picture is always a PNG at the page's scale (`type` and `scale`
+are ignored). The answer is `Screenshot of the viewport. Passwords, card
+details and codes are blacked out.` plus the image. Text rendered as
+pictures (a canvas, an image) is not recognized. A screenshot is checked
+again once taken and dropped if the page closed meanwhile (or, for one
+passed through, if a secret became known). Expiry dates
 and names are not hidden. Playwright writes no
 page snapshots to files (`snapshot.mode: none`); `browser_snapshot`
 answers inline, and Playwright's output folder (screenshot files, its

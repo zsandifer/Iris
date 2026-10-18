@@ -21,6 +21,9 @@ hkdf = "0.13"
 jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 libc = "0.2.190"
 p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
+# Blacks out private details in the agent's screenshots on Iris's side
+# (decode, paint, encode), never inside the page.
+png = "0.18.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.152"
