@@ -543,6 +543,7 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     // went through, or tick a check box); typing, keys and dragging (which
     // could cut a secret into parts no longer recognized) and searching its
     // text are not.
+    let mut guarded: Option<super::Fields> = None;
     if !NAVIGATION.contains(&name) && !fill && !own {
         match b.page_access(&run).await {
             Ok(Access::Open) => {}
@@ -552,6 +553,14 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
                 }
                 if name != "browser_take_screenshot" && probes_page(name, &args) {
                     return error(SEARCH_SECRET);
+                }
+                // An allowed action may still change a field (a number
+                // field's arrows): what the fields hold is compared after.
+                if !READS.contains(&name) {
+                    match b.private_fields(&run).await {
+                        Ok(f) => guarded = Some(f),
+                        Err(e) => return error(e.to_string()),
+                    }
                 }
             }
             Ok(Access::Typed) => return error(super::PRIVATE_PAGE),
@@ -588,7 +597,12 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
             _ => b.tool(&run, name, &args, super::CALL_TIMEOUT).await,
         }
     };
-    let result = while_agent(b, &ctx, drain, work).await;
+    let mut result = while_agent(b, &ctx, drain, work).await;
+    if let Some(before) = &guarded
+        && b.hide_changed(&run, before).await
+    {
+        result = Ok(error(super::PRIVATE_PAGE));
+    }
     b.set_busy(false);
     if result.is_err() {
         // An abandoned call may still write its file (a screenshot) after

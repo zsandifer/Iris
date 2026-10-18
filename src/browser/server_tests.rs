@@ -15,8 +15,9 @@ use crate::state::AppState;
 /// or file picker line, `nosandbox` makes a sandboxed start fail,
 /// `pagetext` the page's text, `fields` what its fields hold (snapshots
 /// show it), `typed` what the owner typed into a private field (Iris reads
-/// it back; `capturefail` makes that fail, `captured` exists once it
-/// worked for the current document), `calls.log` records calls.
+/// it back; `capturefail` makes that fail; `captured_N` exists once it was
+/// marked read back for typing generation N in the current document),
+/// `privfields` what Iris's field check sees, `calls.log` records calls.
 const FAKE: &str = r####"#!/bin/sh
 cfg="$2"
 reply() { printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}%s]%s}}\n' "$id" "$1" "$2" "$3"; }
@@ -56,7 +57,7 @@ while IFS= read -r line; do
         browser_navigate)
           to=$(printf '%s' "$line" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')
           printf '%s' "$to" > url
-          rm -f marked captured
+          rm -f marked captured_*
           reply "### Page\\n- Page URL: $to\\n- Page Title: Sign in\\n### Snapshot\\n- [Snapshot](out/page-2.yml)" '' '' ;;
         browser_run_code_unsafe)
           case "$line" in
@@ -66,8 +67,18 @@ while IFS= read -r line; do
               v=$(cat typed 2>/dev/null)
               [ -n "$v" ] && [ "${#v}" -lt 4 ] && { c=false; v=''; }
               vals=''; [ -n "$v" ] && vals="\\\"$v\\\""
-              [ "$c" = true ] && : > captured
-              reply "### Result\n[{\\\"url\\\":\\\"$url\\\",\\\"captured\\\":$c,\\\"marked\\\":$m,\\\"values\\\":[$vals]}]" '' '' ;;
+              reply "### Result\n[{\\\"i\\\":0,\\\"url\\\":\\\"$url\\\",\\\"doc\\\":\\\"d1\\\",\\\"captured\\\":$c,\\\"marked\\\":$m,\\\"values\\\":[$vals]}]" '' '' ;;
+            *iris:markcaptured*)
+              g=$(printf '%s' "$line" | sed -n 's/.*__irisCaptured_\([0-9]*\).*/\1/p')
+              : > "captured_$g"
+              reply "### Result\n[0]" '' '' ;;
+            *iris:fields*)
+              # `privfields`: what the fields hold (JSON, quotes escaped);
+              # `privfields_after` replaces it after one read (an action
+              # changed them).
+              t=$(cat privfields 2>/dev/null || printf '[[]]')
+              [ -f privfields_after ] && mv privfields_after privfields
+              reply "### Result\n$t" '' '' ;;
             *iris:shot*)
               reply '### Result\n{\"data\":\"TUFTSw==\",\"type\":\"png\"}' '' '' ;;
             *aria-ref=*|*hasFocus*)
@@ -114,11 +125,12 @@ while IFS= read -r line; do
               p=$(cat field 2>/dev/null || echo true)
               fr=$(cat frame 2>/dev/null || echo false)
               case "$line" in *'priv = true ||'*) p=true ;; esac
-              case "$line" in *'if (true && priv)'*) [ "$p" = true ] && { : > marked; rm -f captured; } ;; esac
-              reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"private\\\":$p,\\\"frame\\\":$fr}" '' '' ;;
+              case "$line" in *'if (true && priv)'*) [ "$p" = true ] && : > marked ;; esac
+              reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"private\\\":$p,\\\"frame\\\":$fr,\\\"doc\\\":\\\"d1\\\"}" '' '' ;;
             *)
               m=false; [ -f marked ] && m=true
-              c=false; [ -f captured ] && c=true
+              g=$(printf '%s' "$line" | sed -n 's/.*__irisCaptured_\([0-9]*\).*/\1/p')
+              c=false; [ -n "$g" ] && [ -f "captured_$g" ] && c=true
               reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"title\\\":\\\"Sign in\\\",\\\"private\\\":$m,\\\"captured\\\":$c}" '' '' ;;
           esac ;;
         browser_snapshot)
@@ -189,7 +201,15 @@ impl Fake {
     fn load(&self, url: &str) {
         self.set("url", url);
         let _ = std::fs::remove_file(self.file("marked"));
-        let _ = std::fs::remove_file(self.file("captured"));
+        for e in std::fs::read_dir(self.browser().work_dir.clone())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if e.file_name().to_string_lossy().starts_with("captured_") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
     }
 
     /// Every call the server got: (tool, arguments).
@@ -414,6 +434,18 @@ async fn agent_calls_pass_through_and_private_pages_stay_closed() {
     b.hand_back();
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
+    // Deleting a character (no other typing) is read back too: what is
+    // left is hidden as well.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    f.set("typed", "pw-typed-7");
+    b.user_input("dev", &json!({"kind": "key", "key": "Backspace"}))
+        .await
+        .unwrap();
+    b.hand_back();
+    f.set("fields", "sam pw-typed-7");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(!r.to_string().contains("pw-typed-7"), "{r}");
     // A fragment, another address in the same document, the page moving
     // on, or coming back to its address: all open, with the value hidden.
     for url in [
@@ -432,6 +464,38 @@ async fn agent_calls_pass_through_and_private_pages_stay_closed() {
     assert!(!r.to_string().contains("pw-typed-77"), "{r}");
     assert_ne!(r["isError"], true, "{r}");
 
+    // An allowed click that changes a private field (a number field's
+    // arrows): the new value is hidden before the result comes back; one
+    // too short to hide closes the page.
+    f.set("fields", "sam pw-typed-7");
+    f.set("privfields", r#"[[[\"sam\",false],[\"pw-typed-7\",true]]]"#);
+    f.set(
+        "privfields_after",
+        r#"[[[\"sam\",false],[\"pw-typed-8\",true]]]"#,
+    );
+    let r = f
+        .agent(
+            &token,
+            "browser_mouse_click_xy",
+            json!({"x": 490, "y": 120}),
+        )
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(b.filled_secrets().contains(&"pw-typed-8".to_string()));
+    f.set("privfields_after", r#"[[[\"sam\",false],[\"p8\",true]]]"#);
+    // (Reading back the page then finds the short value too.)
+    f.set("typed", "p8");
+    let r = f
+        .agent(
+            &token,
+            "browser_mouse_click_xy",
+            json!({"x": 490, "y": 120}),
+        )
+        .await;
+    assert_eq!(text(&r), PRIVATE_PAGE, "{r}");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE, "{r}");
+    let _ = std::fs::remove_file(f.file("privfields"));
     // What cannot be read back keeps the page closed, as before: the
     // document, another address in it, and its address after it is gone
     // (history may restore what was typed).
@@ -707,6 +771,8 @@ async fn owner_fills_saved_logins_only_on_their_site() {
         .unwrap();
     b.hand_back();
     assert!(f.file("marked").exists());
+    // (Reading the page back finds it too short to look for.)
+    f.set("typed", "a1!");
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_eq!(text(&r), PRIVATE_PAGE);
     drop(g);
@@ -2025,6 +2091,15 @@ async fn real_playwright() {
                     "<html><body style='margin:0'><div contenteditable aria-label='One-time code' \
                      style='{big};top:100px;border:1px solid #888'></div></body></html>"
                 )
+            } else if req.starts_with("GET /numcode") {
+                // A code in a number field, and a button that steps it up (as
+                // a number field's arrows do on a desktop browser).
+                format!(
+                    "<html><body style='margin:0'><input type=number aria-label='Security code' \
+                     autocomplete=one-time-code style='{big};top:100px;font-size:40px'>\
+                     <button onclick=\"var c = document.querySelector('input'); c.value = String(Number(c.value) + 1)\" \
+                     style='{big};top:400px'>Step up</button></body></html>"
+                )
             } else if req.starts_with("GET /grouped") {
                 // A card number shown in groups, outside any field.
                 "<html><body style='margin:0'>\
@@ -2183,6 +2258,10 @@ async fn real_playwright() {
         text(&r).contains("[hidden]") && !r.to_string().contains("hunter2"),
         "the typed password reached the agent"
     );
+    // The color of the picture at page point (x, y) in CSS pixels of the
+    // page's layout (as boundingBox gives them): a page without a mobile
+    // viewport tag is laid out wider and shown scaled down, so the point is
+    // scaled like the page. A point outside the picture is an error.
     let pixel = |shot: &Value, x: u32, y: u32| {
         let data = shot["content"]
             .as_array()
@@ -2199,7 +2278,10 @@ async fn real_playwright() {
                 "async () => {{ const img = new Image(); img.src = 'data:image/png;base64,{data}'; \
                  await img.decode(); const c = document.createElement('canvas'); \
                  c.width = img.width; c.height = img.height; const g = c.getContext('2d'); \
-                 g.drawImage(img, 0, 0); return Array.from(g.getImageData({x}, {y}, 1, 1).data.slice(0, 3)).join(','); }}"
+                 g.drawImage(img, 0, 0); const s = img.width / window.innerWidth; \
+                 const px = Math.round({x} * s), py = Math.round({y} * s); \
+                 if (px < 0 || py < 0 || px >= img.width || py >= img.height) return 'outside the picture'; \
+                 return Array.from(g.getImageData(px, py, 1, 1).data.slice(0, 3)).join(','); }}"
             );
             text_of(
                 &b.tool(&run, "browser_evaluate", &json!({"function": code}), QUICK)
@@ -2218,6 +2300,17 @@ async fn real_playwright() {
     assert!(
         pixel(&shot, 250, 50).await.contains("\"255,255,255\""),
         "the page is masked"
+    );
+    // Deleting its last character (no other typing) is read back too.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    b.user_input("dev", &json!({"kind": "key", "key": "Backspace"}))
+        .await
+        .unwrap();
+    b.hand_back();
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert!(
+        !r.to_string().contains("hunter2"),
+        "the shortened password reached the agent"
     );
     // The page changes its address without a new document (a single-page
     // app's route): still usable, what was typed still hidden.
@@ -2240,7 +2333,7 @@ async fn real_playwright() {
         .await
         .unwrap();
     assert!(
-        text_of(&still).contains("/account/next") && text_of(&still).contains("14"),
+        text_of(&still).contains("/account/next") && text_of(&still).contains("13"),
         "the field was not kept"
     );
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
@@ -2628,7 +2721,9 @@ async fn real_playwright() {
     // The picture: the text holding it is black, the button next to it is
     // not.
     let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
-    let center = |sel: &str| {
+    // A point inside an element's box (a fraction `fx` of its width from
+    // the left), away from its letters, so a black pixel means a mask.
+    let spot = |sel: &str, fx: f64| {
         let b = b.clone();
         let run = run.clone();
         let code = format!(
@@ -2638,17 +2733,17 @@ async fn real_playwright() {
         async move {
             let bx = b.run_code(&run, &code).await.unwrap();
             (
-                (bx["x"].as_f64().unwrap() + bx["width"].as_f64().unwrap() / 2.0) as u32,
+                (bx["x"].as_f64().unwrap() + bx["width"].as_f64().unwrap() * fx) as u32,
                 (bx["y"].as_f64().unwrap() + bx["height"].as_f64().unwrap() / 2.0) as u32,
             )
         }
     };
-    let (x, y) = center("#out").await;
+    let (x, y) = spot("#out", 0.97).await;
     assert!(
         pixel(&shot, x, y).await.contains("\"0,0,0\""),
         "the echoed text is not masked"
     );
-    let (x, y) = center("button").await;
+    let (x, y) = spot("button", 0.08).await;
     assert!(
         !pixel(&shot, x, y).await.contains("\"0,0,0\""),
         "the button is masked"
@@ -2931,12 +3026,12 @@ async fn real_playwright() {
         "the card number reached the agent"
     );
     let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
-    let (x, y) = center("#g").await;
+    let (x, y) = spot("#g", 0.97).await;
     assert!(
         pixel(&shot, x, y).await.contains("\"0,0,0\""),
         "the grouped number is not masked"
     );
-    let (x, y) = center("#n").await;
+    let (x, y) = spot("#n", 0.97).await;
     assert!(
         !pixel(&shot, x, y).await.contains("\"0,0,0\""),
         "plain text is masked"
@@ -2989,11 +3084,75 @@ async fn real_playwright() {
         text_of(&there).contains("ce-typed-456"),
         "the code was not typed"
     );
+    // The single-page site moves to another address before the hand-back.
+    b.tool(
+        &run,
+        "browser_evaluate",
+        &json!({"function": "() => history.pushState({}, '', '/editable/next')"}),
+        QUICK,
+    )
+    .await
+    .unwrap();
     b.hand_back();
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert!(
         !r.to_string().contains("ce-typed"),
         "the typed code reached the agent"
+    );
+    // Read back, so its first address is no longer kept from the agent.
+    let r = f
+        .agent(
+            &token,
+            "browser_navigate",
+            json!({"url": format!("http://127.0.0.1:{port}/editable")}),
+        )
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+
+    // A code in a number field, changed by something a click (allowed
+    // while it is there) sets off: the new value is hidden before anything
+    // comes back.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    input(json!({"kind": "navigate", "url": format!("http://127.0.0.1:{port}/numcode")})).await;
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.15})).await;
+    input(json!({"kind": "text", "text": "123456"})).await;
+    b.hand_back();
+    let snap = text(&f.agent(&token, "browser_snapshot", json!({})).await);
+    assert!(!snap.contains("123456"), "the code reached the agent");
+    let step = {
+        let line = snap
+            .lines()
+            .find(|l| l.contains("button \"Step up\""))
+            .unwrap_or_else(|| panic!("button in {snap}"));
+        let at = line.find("[ref=").unwrap() + 5;
+        line[at..line[at..].find(']').unwrap() + at].to_string()
+    };
+    let r = f
+        .agent(&token, "browser_click", json!({"target": step}))
+        .await;
+    assert!(
+        !r.to_string().contains("123457"),
+        "the changed code reached the agent"
+    );
+    let now = b
+        .tool(
+            &run,
+            "browser_evaluate",
+            &json!({"function": "() => document.querySelector('input').value"}),
+            QUICK,
+        )
+        .await
+        .unwrap();
+    assert!(
+        text_of(&now).contains("123457"),
+        "the button did not change it"
+    );
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert!(
+        !r.to_string().contains("12345"),
+        "the changed code reached the agent"
     );
     b.take_over(&f.owner, "dev").await.unwrap();
 

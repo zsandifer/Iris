@@ -2839,18 +2839,20 @@ image:
 Typing into a private field (a password, card, or one-time-code field, by
 its type, autocomplete, name, or label, or a field in another site's
 frame; checked before the first `text` input, again after any other input,
-and at least every 3 seconds of typing) marks that document and its address
-before anything is typed, and starts a new typing generation. Before the
+and at least every 3 seconds of typing; `Backspace` and `Delete` count as
+typing) marks that document and its address before anything is typed, and
+starts a new typing generation. Before the
 agent's next browser tool call that reads or acts on a page, Iris reads
 back, on its own side, the values of every private field and private
 editable area in every tab and frame (in another site's frame, where the
 field cannot be told apart, every field and editable area that holds
 something once the owner typed in such a frame). Values of 4 or more
 characters (or a 3-digit code) join the secrets hidden from the agent, and
-a tab read completely is marked as read back for that generation: it stays
-usable like a page holding a secret Iris filled (below), also after its
-address changes within the document, and the address is forgotten when
-the typing happened in that document. Typing again starts a new
+only then is a tab read completely marked as read back for that generation
+(a read cut short marks nothing): it stays usable like a page holding a
+secret Iris filled (below), also after its address changes within the
+document, and every address typed into in that document (a single-page
+site may have moved since) is forgotten. Typing again starts a new
 generation, so an earlier read no longer counts. A
 document that could not be read back (a shorter value, a frame that
 failed) stays closed: its browser tools other than `browser_navigate`,
@@ -4311,10 +4313,14 @@ Refused, with an answer saying why: `browser_type`, `browser_fill_form`,
 `browser_press_key`, `browser_drag`, `browser_mouse_drag_xy`,
 `browser_mouse_down`, `browser_mouse_up`, and clicks with another button
 (an edit could cut a secret into a part no longer recognized, or move part
-of it into another field), and searches (below). When a filled field keeps
-something other than the saved value (a length limit cut it, the page
-changed it), that is hidden too, or the page closes when it is too short to
-look for. With `submit`
+of it into another field), and searches (below). Before any other action
+there, Iris reads what every field holds (on its side); afterwards, a
+private field, or one that held a secret, now holding something new that
+is not hidden (a number field's arrows, a page script reacting to the
+click) has that hidden too before the result comes back, or the page closes
+(and the result is withheld) when it is too short to look for. When a
+filled field keeps something other than the saved value (a length limit
+cut it, the page changed it), that is hidden too, or the page closes. With `submit`
 or `submit_ref`, `fill_saved_login` waits up to 5 seconds for the password
 to leave the page and answers `filled and submitted (the password is no
 longer on the page: ...)` or `filled and submitted, but the password is
@@ -4341,7 +4347,8 @@ every field whose value contains a secret, every element whose text
 contains one (Playwright's own text search, which runs apart from the
 page's scripts; secrets never go into the page), and any frame Iris cannot
 look into, whole. Secrets are looked for in every written form text
-redaction knows (encodings, card numbers written in groups). Its own arguments (`type`, `fullPage`, `target` as a
+redaction knows (encodings, card numbers written in groups), in a few
+batched text searches per frame. Its own arguments (`type`, `fullPage`, `target` as a
 snapshot ref, `scale`) are honored; the answer is `Screenshot of the
 viewport. Passwords, card details and codes are blacked out.` plus the
 image. Text rendered as pictures (a canvas, an image) is not recognized.

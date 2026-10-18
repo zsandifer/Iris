@@ -631,7 +631,7 @@ async fn locate_any(state: &AppState, run: &Running, find: Find<'_>) -> Result<O
 /// Whether Iris can tell a filled secret is still on a page (and hide it):
 /// long enough, or a short code of digits, which is matched where it
 /// stands alone.
-fn watchable(v: &str) -> bool {
+pub(crate) fn watchable(v: &str) -> bool {
     v.chars().count() >= MIN_HIDDEN || (v.len() == 3 && v.bytes().all(|b| b.is_ascii_digit()))
 }
 
@@ -658,6 +658,7 @@ async fn put(
     let mark = private && !watched;
     if mark {
         state.browser.remember_private(&at.top);
+        state.browser.note_private_input(false);
     }
     if secret {
         for v in values {
@@ -681,14 +682,7 @@ async fn put(
                 state.browser.remember_secret(k);
                 state.browser.note_filled();
             }
-            _ => {
-                state.browser.remember_private(&at.top);
-                let mark = format!(
-                    "async (page) => {{ await page.evaluate({}); return true; }}",
-                    serde_json::to_string(super::MARK_JS)?
-                );
-                state.browser.run_code(run, &mark).await?;
-            }
+            _ => state.browser.close_current(run).await,
         }
     }
     Ok(v["filled"] == true)
