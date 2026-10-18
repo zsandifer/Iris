@@ -2300,6 +2300,23 @@ async fn what_the_owner_types_stays_hidden_when_the_page_moves_it() {
     f.load("https://site.test/done");
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
+    // Changed with the page's own stepper or keypad (no typing), then
+    // Review: read back again before that tap too.
+    f.load("https://site.test/code");
+    b.take_over(&f.owner, "dev").await.unwrap();
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.2})).await;
+    input(json!({"kind": "text", "text": "123456"})).await;
+    f.set("typed", "123456");
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.4})).await;
+    f.set("typed", "123457");
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.5})).await;
+    f.set("fieldgone", "");
+    let _ = std::fs::remove_file(f.file("typed"));
+    b.hand_back();
+    f.set("fields", "Code 123457, review");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(!text(&r).contains("123457"), "{r}");
     // Control back without the hand-back completing the typing (a last key
     // racing it): the agent taking the page completes it.
     f.load("https://site.test/pay-3");
@@ -2476,9 +2493,29 @@ const page = (frames) => ({{
 /// End to end with the real Playwright MCP and Chromium, installed by
 /// Iris: `iris engines install browser --dir DIR`, then
 /// `IRIS_REAL_BROWSER=DIR cargo test real_playwright -- --ignored`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test]
 #[ignore]
-async fn real_playwright() {
+fn real_playwright() {
+    // One very large async function (unoptimized, its frame outgrows a test
+    // thread's stack): run on a thread with room for it.
+    let run = std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(64 << 20)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(real_playwright_run())
+        })
+        .unwrap();
+    if let Err(e) = run.join() {
+        std::panic::resume_unwind(e);
+    }
+}
+
+async fn real_playwright_run() {
     use std::io::{Read, Write};
     let root = PathBuf::from(std::env::var("IRIS_REAL_BROWSER").expect("IRIS_REAL_BROWSER"));
     // A local site: a sign-in page with a big password field at the top.
@@ -2647,7 +2684,11 @@ async fn real_playwright() {
                     "<html><body style='margin:0'><input type=number aria-label='Security code' \
                      autocomplete=one-time-code style='{big};top:100px;font-size:40px'>\
                      <button onclick=\"var c = document.querySelector('input'); c.value = String(Number(c.value) + 1)\" \
-                     style='{big};top:400px'>Step up</button></body></html>"
+                     style='{big};top:400px'>Step up</button>\
+                     <button onclick=\"var c = document.querySelector('input'); \
+                     document.getElementById('r').textContent = 'Code ' + c.value; c.remove()\" \
+                     style='position:absolute;left:0;width:500px;height:150px;top:650px'>Review</button>\
+                     <p id=r style='position:absolute;top:880px;margin:0;width:480px;font-size:28px'></p></body></html>"
                 )
             } else if req.starts_with("GET /splitcard") {
                 // A card number styled group by group, its code inside the
@@ -2656,6 +2697,15 @@ async fn real_playwright() {
                  <div id=c style='font-size:20px;margin:40px 0;width:480px'><span>4111</span> <span>1111</span> \
                  <span>1111</span> <span>1111</span> <span id=cv>737</span></div>\
                  <p id=n style='font-size:20px;margin:40px 0;width:480px'>Nothing secret here</p></body></html>"
+                    .to_string()
+            } else if req.starts_with("GET /srcopy") {
+                // A card number shown group by group (light gray), with the
+                // whole number in a visually hidden copy for screen readers.
+                "<html><body style='margin:0'>\
+                 <div id=s style='font-size:28px;margin:40px 0;width:480px;color:#999'>\
+                 <span id=g1>4111</span> <span id=g2>1111</span> <span id=g3>1111</span> <span id=g4>1111</span>\
+                 <span style='position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap'>4111111111111111</span></div>\
+                 <p id=n style='font-size:28px;margin:40px 0;width:480px'>Nothing secret here</p></body></html>"
                     .to_string()
             } else if req.starts_with("GET /contents") {
                 // A card number in groups inside a wrapper without a box of
@@ -3746,6 +3796,24 @@ async fn real_playwright() {
     );
     let (x, y) = spot("#n", 0.97).await;
     assert!(pixel(&shot, x, y).await != "0,0,0", "plain text is masked");
+    // Shown group by group next to a hidden whole copy: every group is
+    // blacked out, not just the copy.
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/srcopy")}),
+    )
+    .await;
+    let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    for g in ["#g1", "#g4"] {
+        let (x, y) = spot(g, 0.5).await;
+        assert!(
+            pixel(&shot, x, y).await == "0,0,0",
+            "the group {g} is not masked"
+        );
+    }
+    let (x, y) = spot("#n", 0.97).await;
+    assert!(pixel(&shot, x, y).await != "0,0,0", "plain text is masked");
     // Inside a wrapper without a box of its own: the element around it is
     // blacked out.
     f.agent(
@@ -4035,6 +4103,37 @@ async fn real_playwright() {
     assert!(
         !r.to_string().contains("12345"),
         "the owner's changed code reached the agent"
+    );
+    // Stepped up once more, then Review, which shows it and removes the
+    // field before the hand-back: read back before that tap.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.5})).await;
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.72})).await;
+    let shown = b
+        .tool(
+            &run,
+            "browser_evaluate",
+            &json!({"function": "() => document.getElementById('r').textContent + ' ' + document.querySelectorAll('input').length"}),
+            QUICK,
+        )
+        .await
+        .unwrap();
+    assert!(
+        text_of(&shown).contains("Code 1234") && text_of(&shown).contains(" 0"),
+        "{shown}"
+    );
+    b.hand_back();
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(
+        !r.to_string().contains("1234"),
+        "the stepped code reached the agent: {r}"
+    );
+    let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    let (x, y) = spot("#r", 0.97).await;
+    assert!(
+        pixel(&shot, x, y).await == "0,0,0",
+        "the stepped code is not masked"
     );
     // A password field known only by its type, shown as plain text before
     // the hand-back: still read back, as the field the owner typed into.

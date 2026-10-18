@@ -779,13 +779,13 @@ const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
       }
       const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
       for (let n = w.nextNode(); n; n = w.nextNode()) {
-        if (n.data.trim().length < 3) continue;
+        if (!n.data.trim()) continue;
         const range = document.createRange();
         range.selectNodeContents(n);
         const r = range.getBoundingClientRect();
         let e = n.parentElement || (n.parentNode && n.parentNode.host) || null;
         while (e && e !== document.documentElement && !inside(e.getBoundingClientRect(), r)) e = up(e);
-        texts.push([n.data, xpath(e || document.documentElement)]);
+        texts.push([n.data, xpath(e || document.documentElement), r.width > 0 && r.height > 0]);
       }
       for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
     };
@@ -808,11 +808,39 @@ const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
       for (const x of scan.fields) targets.push(f.locator('xpath=' + x));
       if (!secrets.length) continue;
       const seen = new Set();
-      for (const [t, x] of scan.texts) {
-        const l = norm(t);
-        if (!seen.has(x) && low.some((s) => l.includes(s))) {
+      const cover = (x) => {
+        if (!seen.has(x)) {
           seen.add(x);
           targets.push(f.locator('xpath=' + x));
+        }
+      };
+      for (const [t, x] of scan.texts) {
+        const l = norm(t);
+        if (low.some((s) => l.includes(s))) cover(x);
+      }
+      // Text split over several nodes (a number styled group by group): the
+      // drawn nodes in page order, joined with a space and with nothing;
+      // every node a match spans is blacked out (a hidden copy elsewhere in
+      // the element does not take its place).
+      const drawn = scan.texts.filter((t) => t[2]);
+      for (const sep of [' ', '']) {
+        let stream = '';
+        const owner = [];
+        drawn.forEach(([t], k) => {
+          const piece = norm(t).trim();
+          if (stream && sep) {
+            stream += sep;
+            owner.push(-1);
+          }
+          stream += piece;
+          for (let c = 0; c < piece.length; c++) owner.push(k);
+        });
+        for (const s of low) {
+          if (!s) continue;
+          for (let at = stream.indexOf(s); at !== -1; at = stream.indexOf(s, at + 1)) {
+            const ks = new Set(owner.slice(at, at + s.length).filter((k) => k >= 0));
+            if (ks.size > 1) for (const k of ks) cover(drawn[k][1]);
+          }
         }
       }
       const fields = f.locator('input, textarea');
@@ -2695,6 +2723,12 @@ impl Browser {
                     .await?;
             }
             _ => return Err("unknown input kind".into()),
+        }
+        // A tap or key may change a private value without typing (a page's
+        // keypad or stepper, an arrow key): read back again before the next
+        // one, which may submit it and take its field away.
+        if !matches!(kind, "text" | "scroll") && lock(&self.private).ever_marked {
+            self.note_private_input(false);
         }
         Ok(())
     }
