@@ -130,6 +130,12 @@ const SECRET_EDIT: &str = "A password, card number or code is on this page, so t
 const SEARCH_SECRET: &str = "This page shows saved sign-in or card details, so searching it \
     or naming elements by their text is not available. Use browser_snapshot and its refs.";
 
+/// A snapshot of part of a page holding a secret, or one with positions
+/// between its lines, could show a secret's parts apart (a card number
+/// shown group by group), where they are not recognized.
+const WHOLE_SNAPSHOT: &str = "This page shows saved sign-in or card details, so only a \
+    snapshot of the whole page is available here (without target, depth or boxes).";
+
 /// Calls whose outcome depends on what the page shows, beyond the
 /// redacted text: pictures, searches, waiting for text, and targets
 /// written as selectors instead of snapshot refs.
@@ -554,6 +560,13 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
                 }
                 if name != "browser_take_screenshot" && probes_page(name, &args) {
                     return error(SEARCH_SECRET);
+                }
+                if name == "browser_snapshot"
+                    && ["target", "depth", "boxes"]
+                        .iter()
+                        .any(|k| !args[*k].is_null() && args[*k] != false)
+                {
+                    return error(WHOLE_SNAPSHOT);
                 }
                 // An allowed action may still change a field (a number
                 // field's arrows): what the fields hold is compared after.

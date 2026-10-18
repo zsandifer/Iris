@@ -34,7 +34,7 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"Playwright","version":"0.0.0"}}}\n' "$id" ;;
     *'"method":"tools/list"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"browser_navigate","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}},{"name":"browser_snapshot","inputSchema":{"type":"object","properties":{"filename":{"type":"string"}}}},{"name":"browser_take_screenshot","inputSchema":{"type":"object","properties":{"type":{"type":"string"},"filename":{"type":"string"}}}},{"name":"browser_run_code_unsafe","inputSchema":{"type":"object"}},{"name":"browser_evaluate","inputSchema":{"type":"object"}},{"name":"browser_file_upload","inputSchema":{"type":"object"}},{"name":"browser_tabs","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"browser_navigate","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}},{"name":"browser_snapshot","inputSchema":{"type":"object","properties":{"filename":{"type":"string"},"target":{"type":"string"},"depth":{"type":"number"},"boxes":{"type":"boolean"}}}},{"name":"browser_take_screenshot","inputSchema":{"type":"object","properties":{"type":{"type":"string"},"filename":{"type":"string"}}}},{"name":"browser_run_code_unsafe","inputSchema":{"type":"object"}},{"name":"browser_evaluate","inputSchema":{"type":"object"}},{"name":"browser_file_upload","inputSchema":{"type":"object"}},{"name":"browser_tabs","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
     *'"method":"tools/call"'*)
       printf '%s\n' "$line" >> calls.log
       tool=$(printf '%s' "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
@@ -546,6 +546,25 @@ async fn agent_calls_pass_through_and_private_pages_stay_closed() {
         .await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(b.filled_secrets().contains(&"pw-typed-8".to_string()));
+    // One that starts with a value read before (a code stepped past an
+    // earlier read of its first characters) is new too: hidden whole.
+    f.set(
+        "privfields",
+        r#"[[[\"sam\",false],[\"pw-typed-77\",true]]]"#,
+    );
+    f.set(
+        "privfields_after",
+        r#"[[[\"sam\",false],[\"pw-typed-778\",true]]]"#,
+    );
+    let r = f
+        .agent(
+            &token,
+            "browser_mouse_click_xy",
+            json!({"x": 490, "y": 120}),
+        )
+        .await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(b.filled_secrets().contains(&"pw-typed-778".to_string()));
     f.set("privfields_after", r#"[[[\"sam\",false],[\"p8\",true]]]"#);
     // (Reading back the page then finds the short value too.)
     f.set("typed", "p8");
@@ -1069,6 +1088,20 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
     let r = f.agent(&token, "browser_click", click.clone()).await;
     assert_ne!(r["isError"], true, "{r}");
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    // Only whole snapshots (a part, or positions between its lines, could
+    // show a secret's parts apart).
+    for args in [
+        json!({"target": "e3"}),
+        json!({"depth": 2}),
+        json!({"boxes": true}),
+    ] {
+        let r = f.agent(&token, "browser_snapshot", args.clone()).await;
+        assert!(text(&r).contains("whole page"), "{args}: {r}");
+    }
+    let r = f
+        .agent(&token, "browser_snapshot", json!({"boxes": false}))
+        .await;
     assert_ne!(r["isError"], true, "{r}");
     // Once it is gone, searching works again.
     f.set("pagetext", "Welcome back");
@@ -2722,7 +2755,17 @@ async fn real_playwright_run() {
                 // The same card form in a payment provider's frame.
                 format!(
                     "<html><body style='margin:0'><iframe src='http://127.0.0.1:{other_port}/checkout' \
-                     style='position:absolute;left:0;top:0;width:500px;height:700px;border:0'></iframe></body></html>"
+                     style='position:absolute;left:0;top:0;width:500px;height:860px;border:0'></iframe></body></html>"
+                )
+            } else if req.starts_with("GET /otpboxes") {
+                // A one-time code field that shows the code digit by digit
+                // in boxes.
+                format!(
+                    "<html><body style='margin:0'><input aria-label='One-time code' autocomplete=one-time-code \
+                     oninput=\"var v = this.value; document.querySelectorAll('.d').forEach(function (s, i) {{ s.textContent = v[i] || ''; }})\" \
+                     style='{big};top:100px;font-size:30px'>\
+                     <div style='position:absolute;top:400px;font-size:28px'>{}</div></body></html>",
+                    "<span class=d style='display:inline-block;width:60px'></span>".repeat(6)
                 )
             } else if req.starts_with("GET /preview") {
                 // A card form that previews the number group by group.
@@ -2744,11 +2787,12 @@ async fn real_playwright_run() {
                     )
                 };
                 format!(
-                    "<html><body style='margin:0'>{}{}{}{}</body></html>",
+                    "<html><body style='margin:0'>{}{}{}{}{}</body></html>",
                     field(0, "aria-label='Card number' autocomplete=cc-number"),
                     field(170, "aria-label='Expiry month' autocomplete=cc-exp-month"),
                     field(340, "aria-label='Expiry year' autocomplete=cc-exp-year"),
                     field(510, "aria-label='Security code' autocomplete=cc-csc"),
+                    field(680, "aria-label='Expiry (MM/YY)' autocomplete=cc-exp"),
                 )
             } else if req.starts_with("GET /autoclear") {
                 // A card form that, once the number is complete, shows it
@@ -4345,6 +4389,8 @@ async fn real_playwright_run() {
         json!({"kind": "text", "text": "26"}),
         json!({"kind": "tap", "x": 0.5, "y": 0.585}),
         json!({"kind": "text", "text": "818"}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.755}),
+        json!({"kind": "text", "text": "12/26"}),
     ] {
         input(ev).await;
     }
@@ -4354,6 +4400,39 @@ async fn real_playwright_run() {
     assert!(
         !r.to_string().contains("5555") && !r.to_string().contains("818"),
         "card details reached the agent: {r}"
+    );
+    // (The expiry is not hidden.)
+    assert!(
+        !b.filled_secrets().contains(&"12/26".to_string()) && r.to_string().contains("12/26"),
+        "{r}"
+    );
+    // A code shown digit by digit in boxes as it is typed: no digit reaches
+    // the agent.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    for ev in [
+        json!({"kind": "navigate", "url": format!("http://127.0.0.1:{port}/otpboxes")}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.2}),
+        json!({"kind": "text", "text": "482913"}),
+    ] {
+        input(ev).await;
+    }
+    b.hand_back();
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    let snap = text(&r);
+    let shown: Vec<&str> = snap
+        .lines()
+        .filter(|l| {
+            let l = l.trim_end().trim_end_matches('"');
+            l.len() > 1 && l.as_bytes()[l.len() - 1].is_ascii_digit() && {
+                let before = l.as_bytes()[l.len() - 2];
+                before == b' ' || before == b'"'
+            }
+        })
+        .collect();
+    assert!(
+        shown.is_empty(),
+        "digits of the code reached the agent: {shown:?}"
     );
     // A new number previewed group by group as it is typed: no group
     // reaches the agent.

@@ -1043,15 +1043,15 @@ pub(crate) const CLOSE_JS: &str = "(() => { try { Object.defineProperty(window, 
 /// In another site's frame (Playwright evaluates there; the page cannot):
 /// the focused field of the innermost focused document, tagged as typed
 /// into and with edit id `EDIT` (`empty`: it held nothing; an expiry-only
-/// field is not tagged, `edit: false`). `null` when this frame does not
-/// hold the focus.
+/// field is not tagged and not private, `expiry`). `null` when this frame
+/// does not hold the focus.
 const FRAME_FIELD_FN: &str = r#"() => {
   if (!document.hasFocus()) return null;
   let e = document.activeElement;
   while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
   if (!e || e.tagName === 'IFRAME' || e.tagName === 'FRAME' || e === document.body || e === document.documentElement) return null;
   // An expiry month or year is not private (`SECRET_FIELD_FN`).
-  if ((EXPIRY)(e)) return { edit: false, empty: false };
+  if ((EXPIRY)(e)) return { expiry: true };
   try { Object.defineProperty(e, '__irisTyped', { value: true }); } catch (_) {}
   e.__irisEdits = (Array.isArray(e.__irisEdits) ? e.__irisEdits : []).concat([EDIT]);
   const held = String(e.isContentEditable ? e.textContent || '' : e.value || '').trim();
@@ -1075,7 +1075,8 @@ fn field_code(mark: bool, force: bool, edit: u64) -> String {
          if ({mark} && r.private && r.frame) {{ r.edit = 'unknown'; \
          for (const f of page.frames()) {{ if (f === page.mainFrame()) continue; \
          const t = await f.evaluate({}).catch(() => null); \
-         if (t) {{ r.edit = t.edit; r.empty = t.empty; break; }} }} }} \
+         if (t) {{ if (t.expiry) {{ r.private = false; r.edit = false; }} \
+         else {{ r.edit = true; r.empty = t.empty; }} break; }} }} }} \
          return {{ url: page.url(), ...r }}; }}",
         serde_json::to_string(&format!("({f})()")).unwrap_or_default(),
         serde_json::to_string(&format!("({tag})()")).unwrap_or_default(),
@@ -1258,7 +1259,8 @@ pub(crate) fn mask_form_groups(secrets: &[String]) -> Vec<Vec<String>> {
 /// (the value and its common encodings), the forms pages and Playwright
 /// write values in (`written_forms`, any length), and what pages do with
 /// card details: numbers split into groups by spaces or dashes (also one
-/// known only in groups, and groups shown apart, `hide_split_cards`), and
+/// known only in groups, and groups shown apart, `hide_split_cards`, as
+/// codes shown digit by digit), and
 /// short security codes (only where they stand alone, not inside longer
 /// numbers).
 pub(crate) fn hide_secrets(text: &str, secrets: &[String]) -> String {
@@ -1302,15 +1304,16 @@ pub(crate) fn hide_secrets(text: &str, secrets: &[String]) -> String {
     hide_split_cards(&out, secrets)
 }
 
-/// Card numbers shown group by group in separate parts of a page (a card
-/// preview: a snapshot lists each group as its own entry): runs of digits
-/// standing apart (not part of a name such as `e12`), close together, that
-/// make up at least eight digits of a known card number in order are
-/// hidden, each run.
+/// Card numbers and codes shown in parts in separate parts of a page (a
+/// card preview, a code shown digit by digit in boxes: a snapshot lists
+/// each part as its own entry): runs of digits standing apart (not part of
+/// a name such as `e12`), close together, that make up at least eight
+/// digits of a known card number in order, or a whole known code of 4 to
+/// 11 digits, are hidden, each run.
 fn hide_split_cards(text: &str, secrets: &[String]) -> String {
     let cards: Vec<&String> = secrets
         .iter()
-        .filter(|s| (12..=19).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()))
+        .filter(|s| (4..=19).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()))
         .collect();
     if cards.is_empty() {
         return text.to_string();
@@ -1346,7 +1349,14 @@ fn hide_split_cards(text: &str, secrets: &[String]) -> String {
             if digits.len() > 19 || !cards.iter().any(|c| c.contains(&digits)) {
                 break;
             }
-            if last > first && digits.len() >= 8 {
+            let enough = cards.iter().any(|c| {
+                if c.len() >= 12 {
+                    digits.len() >= 8
+                } else {
+                    **c == digits
+                }
+            });
+            if last > first && enough {
                 hide[first..=last].iter_mut().for_each(|h| *h = true);
             }
         }
@@ -2131,6 +2141,9 @@ impl Browser {
         };
         let secrets = self.filled_secrets();
         let holds = |v: &str| !v.is_empty() && hide_secrets(v, &secrets) != v;
+        // Known in full (a value only partly matching one, such as a code
+        // stepped up past an earlier read of its first digits, is new).
+        let known = |v: &str| secrets.iter().any(|s| s == v.trim());
         let mut changed: Vec<String> = Vec::new();
         let mut unknown = false;
         for (i, a) in after.iter().enumerate() {
@@ -2142,7 +2155,7 @@ impl Browser {
             match b {
                 Some(b) if b.len() == a.len() => {
                     for ((v, private), (old, _)) in a.iter().zip(b) {
-                        if v != old && !v.trim().is_empty() && !holds(v) && (*private || holds(old))
+                        if v != old && !v.trim().is_empty() && !known(v) && (*private || holds(old))
                         {
                             changed.push(v.clone());
                         }
@@ -2151,7 +2164,7 @@ impl Browser {
                 _ => {
                     let olds: Vec<&String> = b.into_iter().flatten().map(|(v, _)| v).collect();
                     for (v, private) in a {
-                        if *private && !v.trim().is_empty() && !holds(v) && !olds.contains(&v) {
+                        if *private && !v.trim().is_empty() && !known(v) && !olds.contains(&v) {
                             changed.push(v.clone());
                         }
                     }
@@ -3337,6 +3350,13 @@ mod tests {
         let apart = format!("5555 {} 4444", "x".repeat(100));
         assert_eq!(hide_secrets(&apart, &grouped), apart);
         assert_eq!(hide_secrets("1111 3333 4444", &grouped), "1111 3333 4444");
+        // A code shown digit by digit in boxes: hidden whole; a part of it,
+        // or other digits, stay.
+        let code = ["482913".to_string()];
+        let boxes = "- generic [ref=e3]: \"4\"\n- generic [ref=e4]: \"8\"\n- generic [ref=e5]: \"2\"\n- generic [ref=e6]: \"9\"\n- generic [ref=e7]: \"1\"\n- generic [ref=e8]: \"3\"";
+        let t = hide_secrets(boxes, &code);
+        assert_eq!(t.matches("[hidden]").count(), 6, "{t}");
+        assert_eq!(hide_secrets("Step 4 of 8", &code), "Step 4 of 8");
         // Not a card number: left as it is.
         assert_eq!(card_digits("12 34"), None);
         assert_eq!(card_digits("5555444433331111"), None);

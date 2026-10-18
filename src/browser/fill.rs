@@ -373,9 +373,9 @@ pub fn definitions() -> Vec<Value> {
             "description": "Fill the payment form with a card from the user's wallet. The user \
                 approves every use first (a card in the chat; tell them you are waiting for \
                 their OK). Give the refs (from browser_snapshot) of the fields the form has; \
-                Iris types the card in itself and you never see it. After filling you cannot \
-                read the page until it moves on. Answers `filled`, `denied`, `not filled \
-                (...)`, or `not found (...)`.",
+                Iris types the card in itself and you never see it. The page stays usable \
+                afterwards: screenshots black the card details out and snapshots show [hidden]. \
+                Answers `filled`, `denied`, `not filled (...)`, or `not found (...)`.",
             "inputSchema": {"type": "object", "properties": {
                 "number_ref": r("Ref of the card number field"),
                 "exp_ref": r("Ref of a single expiry field (MM/YY)"),
