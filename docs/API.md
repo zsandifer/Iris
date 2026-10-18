@@ -2851,7 +2851,15 @@ site's frame, where the field cannot be told apart, every field and
 editable area that holds something once the owner typed in such a frame.
 Every hand-back starts a new generation too (the owner may have changed a
 value with a page's buttons or arrow keys), so values are read again before
-the agent's next call. Values of 4 or more
+the agent's next call. What the owner types into a private field is also
+kept as Iris passes it on (`Backspace` takes back the last character; a
+tap, another key, typing into an ordinary field or another document, or
+handing back completes it): 4 or more characters (or a 3-digit code) join
+the secrets hidden from the agent right away, so a page moving the value
+out of its field before it is read back (a review step showing the number)
+still cannot show it, and anything shorter keeps the document it was typed
+into from being marked read back unless it is inside a value read back or
+known. Values of 4 or more
 characters (or a 3-digit code) join the secrets hidden from the agent, and
 only then is a tab read completely marked as read back for that generation
 (a read cut short marks nothing): it stays usable like a page holding a
@@ -4354,12 +4362,19 @@ instead of passed through. Iris works out what to black out: every
 private field (as above, also `select`s such as an expiry month, and any
 field the owner typed private details into) in every frame, every field
 whose value contains a secret, every element whose text contains one
-(Playwright's own text search; and, for each text node holding one, the
-smallest element showing all of that text, also text running past its own
-box), and any frame Iris cannot look into, whole. Secrets are looked for in
-every written form text redaction knows (encodings, card numbers written in
-groups). It takes the picture with Chrome's own capture (`Page.captureScreenshot`,
-at the page's CSS scale, one picture at a time with the live view's), between
+(Playwright's own text search, in its isolated world, one search per
+secret so an element holding another secret inside it is still found; and,
+for each text node holding one, the smallest element showing all of that
+text, also text running past its own box), and any frame Iris cannot look
+into, whole. Secrets are looked for in every written form text redaction
+knows (encodings, card numbers written in groups), whatever the case and
+the kind of white space (a non-breaking space matches a space). Only what
+is on screen is pictured (capturing beyond it can lay the page out again):
+a `target` (a snapshot ref) is scrolled into view first and its part on
+screen pictured, and `fullPage` gives the viewport, saying so. It takes the
+picture with Chrome's own capture (`Page.captureScreenshot`, in CSS pixels
+like Playwright's own, or device pixels with `scale: "device"`, one picture
+at a time with the live view's), between
 two measurements of those areas that must agree (a page moving meanwhile is
 measured again, three times at most, else no picture), and paints the areas
 black itself, a pixel wider on every side (`paint_masks`, with the `png`
@@ -4368,10 +4383,10 @@ Nothing is drawn in the page and nothing there depends on the secrets: the
 page lists its private fields and every text node with the element that
 shows it, the same way for every page; matching happens on Iris's side and
 positions come from Playwright (`boundingBox`), so a page planting guesses
-cannot tell which ones matched. `fullPage` and `target` (a snapshot ref) are
-honored; the picture is always a PNG at the page's scale (`type` and `scale`
-are ignored). The answer is `Screenshot of the viewport. Passwords, card
-details and codes are blacked out.` plus the image. Text rendered as
+cannot tell which ones matched. The picture is always a PNG (`type` is
+ignored). The answer is `Screenshot of the viewport. Passwords, card
+details and codes are blacked out.` (or of the element, its part on
+screen, or of the screen when the full page was asked for) plus the image. Text rendered as
 pictures (a canvas, an image) is not recognized. A screenshot is checked
 again once taken and dropped if the page closed meanwhile (or, for one
 passed through, if a secret became known). Expiry dates

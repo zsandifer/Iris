@@ -1993,6 +1993,24 @@ fn color_of(result: &str, x: u32, y: u32) -> String {
     rgb
 }
 
+/// The size of the PNG picture in a screenshot answer.
+fn png_size(shot: &Value) -> (u32, u32) {
+    use base64::Engine as _;
+    let data = shot["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["type"] == "image")
+        .and_then(|p| p["data"].as_str())
+        .expect("a picture");
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .unwrap();
+    assert_eq!(&raw[..8], b"\x89PNG\r\n\x1a\n");
+    let n = |i: usize| u32::from_be_bytes(raw[i..i + 4].try_into().unwrap());
+    (n(16), n(20))
+}
+
 fn jpeg_size(b64: &str) -> (u32, u32) {
     use base64::Engine as _;
     let b = base64::engine::general_purpose::STANDARD
@@ -2208,6 +2226,20 @@ async fn what_the_owner_types_stays_hidden_when_the_page_moves_it() {
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(!text(&r).contains("Pw-9a8b7c"), "{r}");
+    // Control back without the hand-back completing the typing (a last key
+    // racing it): the agent taking the page completes it.
+    f.load("https://site.test/pay-3");
+    f.set("doc", "d4");
+    let _ = std::fs::remove_file(f.file("typed"));
+    b.take_over(&f.owner, "dev").await.unwrap();
+    b.user_input("dev", &json!({"kind": "text", "text": "Code-31415"}))
+        .await
+        .unwrap();
+    b.control.send_replace(Control::Agent);
+    f.set("fields", "Code-31415");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(!text(&r).contains("Code-31415"), "{r}");
     drop(g);
     b.close().await;
 }
@@ -2762,6 +2794,8 @@ async fn real_playwright() {
     let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
     assert_ne!(shot["isError"], true, "{shot}");
     assert!(text(&shot).contains("blacked out"), "{shot}");
+    // In CSS pixels, like Playwright's own pictures.
+    assert_eq!(png_size(&shot), (VIEW_W, VIEW_H), "{}", text(&shot));
     assert!(
         pixel(&shot, 250, 150).await == "0,0,0",
         "the field is not masked"

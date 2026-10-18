@@ -504,6 +504,7 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
             break guard;
         }
     };
+    b.owner_typing_done();
     if let Err(e) = b.check_agent(&ctx) {
         return error(e.to_string());
     }

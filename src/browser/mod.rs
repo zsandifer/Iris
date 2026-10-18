@@ -2634,6 +2634,12 @@ impl Browser {
         Ok(())
     }
 
+    /// The agent holds the page again: what the owner typed is complete
+    /// (also when their last key raced handing back).
+    pub(crate) fn owner_typing_done(&self) {
+        flush_typed(&mut lock(&self.private));
+    }
+
     /// The focused field must be checked again before the owner's typing.
     pub(crate) fn forget_field_check(&self) {
         lock(&self.private).field_checked = None;
