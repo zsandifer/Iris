@@ -309,6 +309,19 @@ struct Private {
     /// A document was marked private this session: its markers are checked
     /// even once its addresses are forgotten.
     ever_marked: bool,
+    /// Whether the field the owner types into takes private details (as
+    /// last checked), and the document it is in.
+    typing_private: bool,
+    typing_doc: String,
+    /// What the owner typed into it so far, from the keys Iris passed on:
+    /// hidden too, in case the page moves it out of the field before it is
+    /// read back (`flush_typed`).
+    typed_text: String,
+    /// What the owner typed that is too short to look for, and the
+    /// document it was typed into: unless reading the fields back finds it
+    /// inside something hidden, that document is not read back (stays
+    /// closed).
+    short_typed: Vec<(String, String)>,
 }
 
 /// Whether the agent may use the current page.
@@ -623,9 +636,9 @@ const FIELDS_CODE: &str = r#"async (page) => { /* iris:fields */
 }"#;
 
 /// `SHOT_CODE` for these secret forms and screenshot options.
-pub(crate) fn shot_code(forms: &[String], opts: &Value) -> Result<String> {
+pub(crate) fn shot_code(groups: &[Vec<String>], opts: &Value) -> Result<String> {
     Ok(SHOT_CODE
-        .replace("SECRETS", &serde_json::to_string(forms)?)
+        .replace("SECRETS", &serde_json::to_string(groups)?)
         .replace("OPTS", &opts.to_string())
         .replace("SENSITIVE", SENSITIVE_FN))
 }
@@ -710,19 +723,25 @@ pub(crate) type Fields = Vec<Option<Vec<(String, bool)>>>;
 /// The agent's picture of the page, and where its private details are:
 /// every private field (as `SENSITIVE_FN` sees them, or typed into by the
 /// owner), every field or text holding one of `SECRETS` (every written
-/// form `hide_secrets` knows, see `mask_forms`) in each frame, and any
+/// form `hide_secrets` knows, see `mask_form_groups`) in each frame, and any
 /// frame Iris cannot look into, whole, as rectangles in the picture's
 /// pixels. Iris paints them black itself (`paint_masks`): nothing is drawn
 /// in the page, and nothing there depends on the secrets (the page lists
 /// its fields and text nodes the same way for every page; matching happens
 /// here, positions come from Playwright). The picture is taken with Chrome's
 /// own capture at a fixed scale, between two measurements that must agree
-/// (a page moving meanwhile is measured again). `OPTS`: `fullPage`,
-/// `target` (a snapshot ref).
+/// (a page moving meanwhile is measured again). Only what is on screen is
+/// pictured. `OPTS`: `target` (a snapshot ref; its part on screen),
+/// `scale` (`css`, the default, or `device`).
 const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
-  const secrets = SECRETS;
+  // Every written form of each secret, one group per secret.
+  const groups = SECRETS;
+  const secrets = groups.flat();
   const opts = OPTS;
-  const low = secrets.map((s) => s.toLowerCase());
+  // Compared without regard to case or the kind of white space (a card
+  // number may be grouped with non-breaking spaces).
+  const norm = (x) => String(x).toLowerCase().replace(/\s+/g, ' ');
+  const low = secrets.map(norm);
   const scanPage = () => {
     const sensitive = SENSITIVE;
     const xpath = (el) => {
@@ -777,7 +796,7 @@ const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
       if (!secrets.length) continue;
       const seen = new Set();
       for (const [t, x] of scan.texts) {
-        const l = String(t).toLowerCase();
+        const l = norm(t);
         if (!seen.has(x) && low.some((s) => l.includes(s))) {
           seen.add(x);
           targets.push(f.locator('xpath=' + x));
@@ -787,14 +806,16 @@ const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
       const values = await fields.evaluateAll((els) => els.map((e) => String(e.value))).catch(() => null);
       if (values === null) throw new Error('the page could not be checked for private details');
       values.forEach((v, i) => {
-        const l = v.toLowerCase();
+        const l = norm(v);
         if (low.some((s) => l.includes(s))) targets.push(fields.nth(i));
       });
-      // Text split over several elements: Playwright's own text search,
-      // in a few batches.
-      for (let k = 0; k < secrets.length; k += 40) {
-        const part = secrets.slice(k, k + 40).map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-        targets.push(f.getByText(new RegExp(part.join('|'), 'i')));
+      // Text split over several elements: Playwright's own text search (in
+      // its isolated world, out of the page's reach), one per secret (a
+      // child matching another secret must not hide this one's element),
+      // any white space matching any.
+      for (const g of groups) {
+        const alts = g.map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+'));
+        targets.push(f.getByText(new RegExp(alts.join('|'), 'i')));
       }
     }
     const rects = [];
@@ -809,27 +830,32 @@ const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
     return rects;
   };
   const same = (a, b) => a.length === b.length && a.every((r, i) => r.every((v, k) => Math.abs(v - b[i][k]) < 1));
+  // The element asked for, scrolled into view first.
+  const target = opts.target ? page.locator('aria-ref=' + opts.target) : null;
+  if (target) await target.scrollIntoViewIfNeeded({ timeout: 5000 });
   const s = await page.context().newCDPSession(page);
   try {
     for (let attempt = 0; attempt < 3; attempt++) {
       const before = await measure();
       const m = await s.send('Page.getLayoutMetrics');
       const vv = m.cssVisualViewport;
-      let clip, ox, oy;
-      if (opts.target) {
-        const b = await page.locator('aria-ref=' + opts.target).boundingBox({ timeout: 5000 });
+      // Only what is on screen: capturing beyond it can lay the page out
+      // again (and move what was measured). An element: its part on screen.
+      let x0 = 0, y0 = 0, x1 = vv.clientWidth, y1 = vv.clientHeight;
+      if (target) {
+        const b = await target.boundingBox({ timeout: 5000 });
         if (!b) throw new Error('that element is not on the page');
-        clip = { x: vv.pageX + b.x, y: vv.pageY + b.y, width: b.width, height: b.height };
-        [ox, oy] = [b.x, b.y];
-      } else if (opts.fullPage) {
-        const c = m.cssContentSize;
-        clip = { x: 0, y: 0, width: c.width, height: c.height };
-        [ox, oy] = [-vv.pageX, -vv.pageY];
-      } else {
-        clip = { x: vv.pageX, y: vv.pageY, width: vv.clientWidth, height: vv.clientHeight };
-        [ox, oy] = [0, 0];
+        x0 = Math.max(0, b.x); y0 = Math.max(0, b.y);
+        x1 = Math.min(vv.clientWidth, b.x + b.width); y1 = Math.min(vv.clientHeight, b.y + b.height);
+        if (x1 <= x0 || y1 <= y0) throw new Error('that element is not on the screen');
       }
-      const shot = await s.send('Page.captureScreenshot', { format: 'png', clip: { ...clip, scale: 1 }, captureBeyondViewport: !!opts.fullPage });
+      const clip = { x: vv.pageX + x0, y: vv.pageY + y0, width: x1 - x0, height: y1 - y0 };
+      const [ox, oy] = [x0, y0];
+      // In CSS pixels unless device pixels are asked for, as Playwright's
+      // own (the device's pixel ratio from Chrome, not the page).
+      const ratio = m.visualViewport && m.visualViewport.clientWidth > 0 ? m.visualViewport.clientWidth / vv.clientWidth : 1;
+      const scale = opts.scale === 'device' ? 1 : 1 / ratio;
+      const shot = await s.send('Page.captureScreenshot', { format: 'png', clip: { ...clip, scale }, captureBeyondViewport: false });
       const after = await measure();
       if (!same(before, after)) continue;
       const rects = before.concat(after).map(([x, y, w, h]) => [x - ox, y - oy, w, h]);
@@ -994,12 +1020,36 @@ fn written_forms(secret: &str) -> Vec<String> {
 /// write values in (`written_forms`, any length), and what pages do with
 /// card details: numbers split into groups by spaces or dashes, and short
 /// security codes (only where they stand alone, not inside longer numbers).
+/// What the owner typed into a private field, as Iris passed it on: hidden
+/// like a secret (the page may move it out of the field, where reading the
+/// field back would miss it), or, too short to look for, checked against
+/// what is read back from its document (`short_typed`).
+fn flush_typed(p: &mut Private) {
+    let typed = std::mem::take(&mut p.typed_text);
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return;
+    }
+    if fill::watchable(typed) {
+        if !p.secrets.iter().any(|s| s == typed) {
+            p.secrets.push(typed.to_string());
+        }
+        p.filled = true;
+    } else {
+        let short = (typed.to_string(), p.typing_doc.clone());
+        if !p.short_typed.contains(&short) {
+            p.short_typed.push(short);
+        }
+    }
+}
+
 /// Every written form of `secrets` that `hide_secrets` hides, to mask in
 /// pictures: each secret, its encodings, and card numbers written in
 /// groups.
-pub(crate) fn mask_forms(secrets: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+pub(crate) fn mask_form_groups(secrets: &[String]) -> Vec<Vec<String>> {
+    let mut groups: Vec<Vec<String>> = Vec::new();
     for s in secrets {
+        let mut out: Vec<String> = Vec::new();
         let n = s.chars().count();
         let mut forms = vec![s.clone()];
         if n >= 4 {
@@ -1034,8 +1084,11 @@ pub(crate) fn mask_forms(secrets: &[String]) -> Vec<String> {
                 out.push(f);
             }
         }
+        if !out.is_empty() {
+            groups.push(out);
+        }
     }
-    out
+    groups
 }
 
 pub(crate) fn hide_secrets(text: &str, secrets: &[String]) -> String {
@@ -1763,9 +1816,21 @@ impl Browser {
                 return Ok(());
             }
         }
+        // A document where the owner typed something too short to look for,
+        // not found inside what was read back (the page may have moved it
+        // out of the field), is not read back.
+        let unseen: Vec<String> = {
+            let p = lock(&self.private);
+            p.short_typed
+                .iter()
+                .filter(|(t, _)| !p.secrets.iter().any(|s| s.contains(t.as_str())))
+                .map(|(_, d)| d.clone())
+                .collect()
+        };
         let want: Vec<Value> = tabs
             .iter()
             .filter(|t| t["captured"] == true)
+            .filter(|t| !unseen.iter().any(|d| t["doc"] == d.as_str()))
             .map(|t| json!({"i": t["i"], "url": t["url"]}))
             .collect();
         let marked: Vec<u64> = if want.is_empty() {
@@ -1910,8 +1975,13 @@ impl Browser {
         {
             return Err("Use a snapshot ref (like e12) as `target` here.".into());
         }
-        let opts = json!({"fullPage": args["fullPage"] == true, "target": target});
-        let code = shot_code(&mask_forms(&self.filled_secrets()), &opts)?;
+        let scale = if args["scale"] == "device" {
+            "device"
+        } else {
+            "css"
+        };
+        let opts = json!({"target": target, "scale": scale});
+        let code = shot_code(&mask_form_groups(&self.filled_secrets()), &opts)?;
         let v = {
             let _one = self.capture_lock.lock().await;
             self.run_code_within(run, &code, CALL_TIMEOUT).await?
@@ -1922,9 +1992,10 @@ impl Browser {
         let size = |k: &str| v[k].as_f64().ok_or("the browser gave no picture size");
         let painted = paint_masks(&raw, size("width")?, size("height")?, &rects)?;
         let what = if target.is_some() {
-            "element"
+            "element (its part on screen)"
         } else if args["fullPage"] == true {
-            "full page"
+            "screen (not the full page while private details are known: scroll and take \
+             another for more)"
         } else {
             "viewport"
         };
@@ -2306,11 +2377,15 @@ impl Browser {
     }
 
     pub fn hand_back(&self) {
+        // Before the agent can act again: what the owner typed is hidden, and
+        // private details they may have changed any way (a page's buttons,
+        // arrow keys) are read back before its turn.
+        if self.control() != Control::Agent {
+            flush_typed(&mut lock(&self.private));
+            self.note_private_input(false);
+        }
         if self.control.send_replace(Control::Agent) != Control::Agent {
             crate::info!("browser: control handed back");
-            // The owner may have changed private details any way (a page's
-            // buttons, arrow keys): read them back before the agent's turn.
-            self.note_private_input(false);
         }
         self.broadcast_state();
     }
@@ -2436,7 +2511,15 @@ impl Browser {
         let kind = ev["kind"].as_str().unwrap_or("");
         if kind != "text" && kind != "scroll" {
             // Focus may move: check the field again before more typing.
-            lock(&self.private).field_checked = None;
+            let mut p = lock(&self.private);
+            p.field_checked = None;
+            // What was typed so far is complete (Backspace edits it).
+            let backspace = kind == "key" && ev["key"] == "Backspace";
+            if backspace && p.typing_private {
+                p.typed_text.pop();
+            } else if !backspace {
+                flush_typed(&mut p);
+            }
         }
         match kind {
             "tap" => {
@@ -2512,8 +2595,20 @@ impl Browser {
             .field_checked
             .is_some_and(|t| t.elapsed() < FIELD_CHECK_FOR);
         if !fresh {
-            self.focused_field(run, true, false).await?;
-            lock(&self.private).field_checked = Some(std::time::Instant::now());
+            let field = self.focused_field(run, true, false).await?;
+            let mut p = lock(&self.private);
+            p.field_checked = Some(std::time::Instant::now());
+            if !field.private || field.doc != p.typing_doc {
+                flush_typed(&mut p);
+            }
+            p.typing_private = field.private;
+            p.typing_doc = field.doc;
+        }
+        {
+            let mut p = lock(&self.private);
+            if p.typing_private {
+                p.typed_text.push_str(text);
+            }
         }
         let mut other = String::new();
         for c in text.chars().chain(std::iter::once('\0')) {

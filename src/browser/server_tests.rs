@@ -17,6 +17,7 @@ use crate::state::AppState;
 /// show it), `typed` what the owner typed into a private field (Iris reads
 /// it back; `capturefail` makes that fail; `captured_N` exists once it was
 /// marked read back for typing generation N in the current document),
+/// `doc` the current document's id (default d1),
 /// `privfields` what Iris's field check sees, `calls.log` records calls.
 const FAKE: &str = r####"#!/bin/sh
 cfg="$2"
@@ -67,7 +68,8 @@ while IFS= read -r line; do
               v=$(cat typed 2>/dev/null)
               [ -n "$v" ] && [ "${#v}" -lt 4 ] && { c=false; v=''; }
               vals=''; [ -n "$v" ] && vals="\\\"$v\\\""
-              reply "### Result\n[{\\\"i\\\":0,\\\"url\\\":\\\"$url\\\",\\\"doc\\\":\\\"d1\\\",\\\"captured\\\":$c,\\\"marked\\\":$m,\\\"values\\\":[$vals]}]" '' '' ;;
+              d=$(cat doc 2>/dev/null || echo d1)
+              reply "### Result\n[{\\\"i\\\":0,\\\"url\\\":\\\"$url\\\",\\\"doc\\\":\\\"$d\\\",\\\"captured\\\":$c,\\\"marked\\\":$m,\\\"values\\\":[$vals]}]" '' '' ;;
             *iris:markcaptured*)
               g=$(printf '%s' "$line" | sed -n 's/.*__irisCaptured_\([0-9]*\).*/\1/p')
               : > "captured_$g"
@@ -138,7 +140,8 @@ while IFS= read -r line; do
               fr=$(cat frame 2>/dev/null || echo false)
               case "$line" in *'priv = true ||'*) p=true ;; esac
               case "$line" in *'if (true && priv)'*) [ "$p" = true ] && : > marked ;; esac
-              reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"private\\\":$p,\\\"frame\\\":$fr,\\\"doc\\\":\\\"d1\\\"}" '' '' ;;
+              d=$(cat doc 2>/dev/null || echo d1)
+              reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"private\\\":$p,\\\"frame\\\":$fr,\\\"doc\\\":\\\"$d\\\"}" '' '' ;;
             *)
               m=false; [ -f marked ] && m=true
               g=$(printf '%s' "$line" | sed -n 's/.*__irisCaptured_\([0-9]*\).*/\1/p')
@@ -452,7 +455,7 @@ async fn agent_calls_pass_through_and_private_pages_stay_closed() {
     }
     b.take_over(&f.owner, "dev").await.unwrap();
     f.set("typed", "pw-typed-77");
-    b.user_input("dev", &json!({"kind": "text", "text": "z"}))
+    b.user_input("dev", &json!({"kind": "text", "text": "7"}))
         .await
         .unwrap();
     b.hand_back();
@@ -1975,6 +1978,21 @@ async fn dialogs_file_pickers_and_new_windows_during_take_over() {
 }
 
 /// A JPEG's width and height (its start-of-frame header).
+/// The "r,g,b" a picture check answered (in a Playwright result); anything
+/// else (a point outside the picture) fails the test.
+fn color_of(result: &str, x: u32, y: u32) -> String {
+    let rgb = result
+        .lines()
+        .find_map(|l| serde_json::from_str::<String>(l.trim()).ok())
+        .unwrap_or_default();
+    let parts: Vec<&str> = rgb.split(',').collect();
+    assert!(
+        parts.len() == 3 && parts.iter().all(|c| c.parse::<u8>().is_ok()),
+        "no color at ({x}, {y}): {result}"
+    );
+    rgb
+}
+
 fn jpeg_size(b64: &str) -> (u32, u32) {
     use base64::Engine as _;
     let b = base64::engine::general_purpose::STANDARD
@@ -2044,7 +2062,7 @@ async fn a_field_that_keeps_something_else_is_hidden_or_closed() {
         f.load("https://site.test/login");
         b.take_over(&f.owner, "dev").await.unwrap();
         f.set("typed", "pw-typed-77");
-        b.user_input("dev", &json!({"kind": "text", "text": "x"}))
+        b.user_input("dev", &json!({"kind": "text", "text": "7"}))
             .await
             .unwrap();
         b.hand_back();
@@ -2092,7 +2110,7 @@ async fn typing_in_another_sites_frame_reads_its_fields_for_the_session() {
     b.take_over(&f.owner, "dev").await.unwrap();
     f.set("frame", "true");
     f.set("typed", "frame-typed-1");
-    b.user_input("dev", &json!({"kind": "text", "text": "x"}))
+    b.user_input("dev", &json!({"kind": "text", "text": "1"}))
         .await
         .unwrap();
     b.hand_back();
@@ -2110,9 +2128,95 @@ async fn typing_in_another_sites_frame_reads_its_fields_for_the_session() {
     b.close().await;
 }
 
+/// What the owner typed into a private field is hidden even when the page
+/// moves it out of the field before Iris reads the fields back (a review
+/// step showing the number); something too short to look for keeps its
+/// document closed unless it is inside what was read back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn what_the_owner_types_stays_hidden_when_the_page_moves_it() {
+    let f = Fake::new();
+    let b = f.browser();
+    let g = b.begin_turn(&f.owner, &f.conv, "m", &[]);
+    let token = g.token().to_string();
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://site.test/pay"}),
+    )
+    .await;
+    // Typed in pieces with one mistake taken back; the page then empties
+    // the field and shows the number in its review text.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    for t in ["4111 1111 1111 11", "19"] {
+        b.user_input("dev", &json!({"kind": "text", "text": t}))
+            .await
+            .unwrap();
+    }
+    b.user_input("dev", &json!({"kind": "key", "key": "Backspace"}))
+        .await
+        .unwrap();
+    b.user_input("dev", &json!({"kind": "text", "text": "1"}))
+        .await
+        .unwrap();
+    b.hand_back();
+    assert!(
+        b.filled_secrets()
+            .contains(&"4111 1111 1111 1111".to_string())
+    );
+    assert!(
+        !b.filled_secrets()
+            .contains(&"4111 1111 1111 1119".to_string())
+    );
+    f.set("fields", "Card 4111 1111 1111 1111, review and pay");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(!text(&r).contains("4111 1111 1111 1111"), "{r}");
+    assert!(text(&r).contains("review and pay"), "{r}");
+    // Too short to look for and gone from the field: the document stays
+    // closed; the next one is open.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    b.user_input("dev", &json!({"kind": "tap", "x": 0.5, "y": 0.5}))
+        .await
+        .unwrap();
+    b.user_input("dev", &json!({"kind": "text", "text": "42"}))
+        .await
+        .unwrap();
+    b.hand_back();
+    f.set("fields", "Code 42, review and pay");
+    for _ in 0..2 {
+        let r = f.agent(&token, "browser_snapshot", json!({})).await;
+        assert_eq!(text(&r), PRIVATE_PAGE, "{r}");
+    }
+    f.load("https://site.test/done");
+    f.set("doc", "d2");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    // Inside what was read back (typed into the middle of a longer
+    // value): open, the value hidden.
+    f.load("https://site.test/pay-2");
+    f.set("doc", "d3");
+    f.set("typed", "Pw-9a8b7c");
+    b.take_over(&f.owner, "dev").await.unwrap();
+    b.user_input("dev", &json!({"kind": "tap", "x": 0.5, "y": 0.5}))
+        .await
+        .unwrap();
+    b.user_input("dev", &json!({"kind": "text", "text": "a8"}))
+        .await
+        .unwrap();
+    b.hand_back();
+    f.set("fields", "Pw-9a8b7c");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(!text(&r).contains("Pw-9a8b7c"), "{r}");
+    drop(g);
+    b.close().await;
+}
+
 /// The masked screenshot's code itself, run by node against a stand-in
-/// page: a frame Iris cannot look into is blacked out whole, and a page it
-/// cannot look into at all gives no picture. Skipped without node.
+/// page: a frame Iris cannot look into is blacked out whole, a page it
+/// cannot look into at all gives no picture, and a picture taken while
+/// the page moved is taken again (or none comes back). Skipped without
+/// node.
 #[test]
 fn the_screenshot_masks_a_frame_it_cannot_look_into() {
     if std::process::Command::new("node")
@@ -2123,7 +2227,11 @@ fn the_screenshot_masks_a_frame_it_cannot_look_into() {
         eprintln!("node not found; skipped");
         return;
     }
-    let code = super::shot_code(&super::mask_forms(&["Pw-5678".to_string()]), &json!({})).unwrap();
+    let code = super::shot_code(
+        &super::mask_form_groups(&["Pw-5678".to_string()]),
+        &json!({}),
+    )
+    .unwrap();
     let harness = format!(
         r#"const shot = {code};
 const inPage = [];
@@ -2138,21 +2246,27 @@ const located = (name, box) => ({{
   evaluateAll: async (fn, arg) => {{ sent(fn, arg); return []; }},
   nth: () => located(name, box),
 }});
-const frame = (name, fail, top) => ({{
-  name,
-  evaluate: async (fn, arg) => {{ sent(fn, arg); if (fail) throw new Error('gone'); return {{ fields: [], texts: [] }}; }},
-  isDetached: () => false,
-  frameElement: async () => top ? null : {{ boundingBox: async () => ({{ x: 0, y: 400, width: 300, height: 200 }}) }},
-  locator: () => located(name, null),
-  getByText: () => ({{ all: async () => [] }}),
-}});
+// `ys`: where the frame is at each measurement (the last one stays).
+const frame = (name, fail, top, ys = [400]) => {{
+  let n = 0;
+  return {{
+    name,
+    evaluate: async (fn, arg) => {{ sent(fn, arg); if (fail) throw new Error('gone'); return {{ fields: [], texts: [] }}; }},
+    isDetached: () => false,
+    frameElement: async () => top ? null : {{
+      boundingBox: async () => ({{ x: 0, y: ys[Math.min(n++, ys.length - 1)], width: 300, height: 200 }}),
+    }},
+    locator: () => located(name, null),
+    getByText: () => ({{ all: async () => [] }}),
+  }};
+}};
 const page = (frames) => ({{
   frames: () => frames,
   context: () => ({{ newCDPSession: async () => ({{
     send: async (m) => {{
       if (m === 'Page.getLayoutMetrics') return {{ cssVisualViewport: {{ pageX: 0, pageY: 0, clientWidth: 500, clientHeight: 1000 }}, cssContentSize: {{ width: 500, height: 1000 }} }};
       captured++;
-      return {{ data: 'UE5H' }};
+      return {{ data: 'shot-' + captured }};
     }},
     detach: async () => {{}},
   }}) }}),
@@ -2163,7 +2277,19 @@ const page = (frames) => ({{
   let refused = '';
   const before = captured;
   try {{ await shot(page([frame('main', true, true)])); }} catch (e) {{ refused = e.message; }}
-  console.log(JSON.stringify({{ r, refused, again: captured - before, inPage }}));
+  const again = captured - before;
+  // Moved during the first picture, then still: the second one.
+  const start = captured;
+  const settled = await shot(page([frame('main', false, true), frame('box', true, false, [400, 450])]));
+  const settledShots = captured - start;
+  // Never still: no picture after three.
+  let moving = '', movingData = null;
+  const start2 = captured;
+  try {{
+    movingData = await shot(page([frame('main', false, true), frame('box', true, false, [400, 410, 420, 430, 440, 450, 460])]));
+  }} catch (e) {{ moving = e.message; }}
+  const movingShots = captured - start2;
+  console.log(JSON.stringify({{ r, refused, again, settled, settledShots, moving, movingData, movingShots, inPage }}));
 }})();"#
     );
     let dir = tempfile::tempdir().unwrap();
@@ -2180,7 +2306,7 @@ const page = (frames) => ({{
     );
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     // The picture, its size, and the frame Iris could not look into, whole.
-    assert_eq!(v["r"]["data"], "UE5H");
+    assert_eq!(v["r"]["data"], "shot-1");
     assert_eq!(
         (v["r"]["width"].as_f64(), v["r"]["height"].as_f64()),
         (Some(500.0), Some(1000.0))
@@ -2201,9 +2327,21 @@ const page = (frames) => ({{
         "{v}"
     );
     assert_eq!(v["again"], 0);
+    // Moved while pictured: that picture is dropped, the next one (taken
+    // while still) comes back, masked where the frame is now.
+    assert_eq!(v["settledShots"], 2, "{v}");
+    let start = v["settled"]["data"].as_str().unwrap();
+    assert_eq!(start, "shot-3", "{v}");
+    let rects = v["settled"]["rects"].as_array().unwrap();
+    assert!(rects.contains(&json!([0, 450, 300, 200])), "{v}");
+    assert!(!rects.contains(&json!([0, 400, 300, 200])), "{v}");
+    // Never still: three tries, then no picture at all.
+    assert_eq!(v["movingShots"], 3, "{v}");
+    assert!(v["moving"].as_str().unwrap().contains("kept moving"), "{v}");
+    assert_eq!(v["movingData"], Value::Null);
     // No secret (in any written form) goes into the page, neither in the
     // code run there nor in its arguments; the check itself catches one.
-    let forms = super::mask_forms(&["Pw-5678".to_string()]);
+    let forms: Vec<String> = super::mask_form_groups(&["Pw-5678".to_string()]).concat();
     let leaks = |sent: &[Value]| {
         sent.iter().any(|c| {
             let c = c.as_str().unwrap_or("").to_lowercase();
@@ -2392,6 +2530,41 @@ async fn real_playwright() {
                      <button onclick=\"var c = document.querySelector('input'); c.value = String(Number(c.value) + 1)\" \
                      style='{big};top:400px'>Step up</button></body></html>"
                 )
+            } else if req.starts_with("GET /splitcard") {
+                // A card number styled group by group, its code inside the
+                // same element.
+                "<html><body style='margin:0'>\
+                 <div id=c style='font-size:20px;margin:40px 0;width:480px'><span>4111</span> <span>1111</span> \
+                 <span>1111</span> <span>1111</span> <span id=cv>737</span></div>\
+                 <p id=n style='font-size:20px;margin:40px 0;width:480px'>Nothing secret here</p></body></html>"
+                    .to_string()
+            } else if req.starts_with("GET /nbsp") {
+                // A card number grouped with non-breaking spaces.
+                "<html><body style='margin:0'>\
+                 <p id=g style='font-size:28px;margin:40px 0'>Card 4111&nbsp;1111&nbsp;1111&nbsp;1111</p>\
+                 <p id=n style='font-size:28px;margin:40px 0'>Nothing secret here</p></body></html>"
+                    .to_string()
+            } else if req.starts_with("GET /tall") {
+                // A card number far below the fold, in a box with plain text.
+                "<html><body style='margin:0'><div style='height:2400px'>Top</div>\
+                 <div id=far role=region aria-label='Payment box' style='width:480px'>\
+                 <p id=fc style='font-size:28px;margin:20px 0'>Card 4111 1111 1111 1111</p>\
+                 <p id=fn style='font-size:28px;margin:20px 0'>Nothing secret here</p></div>\
+                 <div style='height:600px'></div></body></html>"
+                    .to_string()
+            } else if req.starts_with("GET /review") {
+                // A card form whose review step moves the number into its
+                // text and removes the field.
+                format!(
+                    "<html><body style='margin:0'><input aria-label='Card number' autocomplete=cc-number \
+                     style='{big};top:100px;font-size:30px'>\
+                     <button onclick=\"var i = document.querySelector('input'); \
+                     document.getElementById('r').textContent = 'Card ' + i.value; i.remove()\" \
+                     style='{big};top:400px'>Review</button>\
+                     <p id=r style='position:absolute;top:700px;margin:0;width:480px;font-size:28px'></p>\
+                     <p id=n style='position:absolute;top:850px;margin:0;width:480px;font-size:28px'>Nothing secret here</p>\
+                     </body></html>"
+                )
             } else if req.starts_with("GET /grouped") {
                 // A card number shown in groups, outside any field.
                 "<html><body style='margin:0'>\
@@ -2555,7 +2728,8 @@ async fn real_playwright() {
     // The color of the picture at page point (x, y) in CSS pixels of the
     // page's layout (as boundingBox gives them): a page without a mobile
     // viewport tag is laid out wider and shown scaled down, so the point is
-    // scaled like the page. A point outside the picture is an error.
+    // scaled like the page. A point outside the picture, or a picture that
+    // cannot be read, fails the test.
     let pixel = |shot: &Value, x: u32, y: u32| {
         let data = shot["content"]
             .as_array()
@@ -2577,22 +2751,23 @@ async fn real_playwright() {
                  if (px < 0 || py < 0 || px >= img.width || py >= img.height) return 'outside the picture'; \
                  return Array.from(g.getImageData(px, py, 1, 1).data.slice(0, 3)).join(','); }}"
             );
-            text_of(
-                &b.tool(&run, "browser_evaluate", &json!({"function": code}), QUICK)
-                    .await
-                    .unwrap(),
-            )
+            let r = b
+                .tool(&run, "browser_evaluate", &json!({"function": code}), QUICK)
+                .await
+                .unwrap();
+            assert!(!is_error(&r), "could not read the picture: {r}");
+            color_of(&text_of(&r), x, y)
         }
     };
     let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
     assert_ne!(shot["isError"], true, "{shot}");
     assert!(text(&shot).contains("blacked out"), "{shot}");
     assert!(
-        pixel(&shot, 250, 150).await.contains("\"0,0,0\""),
+        pixel(&shot, 250, 150).await == "0,0,0",
         "the field is not masked"
     );
     assert!(
-        pixel(&shot, 250, 50).await.contains("\"255,255,255\""),
+        pixel(&shot, 250, 50).await == "255,255,255",
         "the page is masked"
     );
     // Deleting its last character (no other typing) is read back too.
@@ -3007,7 +3182,7 @@ async fn real_playwright() {
         (bx["y"].as_f64().unwrap() + bx["height"].as_f64().unwrap() / 2.0) as u32,
     );
     assert!(
-        pixel(&shot, x, y).await.contains("\"0,0,0\""),
+        pixel(&shot, x, y).await == "0,0,0",
         "the frame's field is not masked"
     );
 
@@ -3079,14 +3254,11 @@ async fn real_playwright() {
     };
     let (x, y) = spot("#out", 0.97).await;
     assert!(
-        pixel(&shot, x, y).await.contains("\"0,0,0\""),
+        pixel(&shot, x, y).await == "0,0,0",
         "the echoed text is not masked"
     );
     let (x, y) = spot("button", 0.08).await;
-    assert!(
-        !pixel(&shot, x, y).await.contains("\"0,0,0\""),
-        "the button is masked"
-    );
+    assert!(pixel(&shot, x, y).await != "0,0,0", "the button is masked");
     b.run_code(
         &run,
         "async (page) => { await page.evaluate(() => { document.getElementById('out').textContent = 'Done'; }); return true; }",
@@ -3344,7 +3516,7 @@ async fn real_playwright() {
         (bx["y"].as_f64().unwrap() + bx["height"].as_f64().unwrap() / 2.0) as u32,
     );
     assert!(
-        pixel(&shot, x, y).await.contains("\"0,0,0\""),
+        pixel(&shot, x, y).await == "0,0,0",
         "the provider's card field is not masked"
     );
 
@@ -3367,14 +3539,11 @@ async fn real_playwright() {
     let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
     let (x, y) = spot("#g", 0.97).await;
     assert!(
-        pixel(&shot, x, y).await.contains("\"0,0,0\""),
+        pixel(&shot, x, y).await == "0,0,0",
         "the grouped number is not masked"
     );
     let (x, y) = spot("#n", 0.97).await;
-    assert!(
-        !pixel(&shot, x, y).await.contains("\"0,0,0\""),
-        "plain text is masked"
-    );
+    assert!(pixel(&shot, x, y).await != "0,0,0", "plain text is masked");
     // A page planting guesses learns nothing from a picture: no element is
     // changed (which ones hold a secret is worked out on Iris's side), the
     // matching one is blacked out, and so is a secret running past its box.
@@ -3401,17 +3570,17 @@ async fn real_playwright() {
     );
     let (x, y) = spot("#b", 0.97).await;
     assert!(
-        pixel(&shot, x, y).await.contains("\"0,0,0\""),
+        pixel(&shot, x, y).await == "0,0,0",
         "the planted match is not masked"
     );
     let (x, y) = spot("#a", 0.97).await;
     assert!(
-        !pixel(&shot, x, y).await.contains("\"0,0,0\""),
+        pixel(&shot, x, y).await != "0,0,0",
         "a wrong guess is masked"
     );
     let (x, y) = spot("#o", 3.0).await;
     assert!(
-        pixel(&shot, x, y).await.contains("\"0,0,0\""),
+        pixel(&shot, x, y).await == "0,0,0",
         "text past its box is not masked"
     );
 
@@ -3426,14 +3595,152 @@ async fn real_playwright() {
     let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
     let (x, y) = spot("#d", 0.97).await;
     assert!(
-        pixel(&shot, x, y).await.contains("\"0,0,0\""),
+        pixel(&shot, x, y).await == "0,0,0",
         "the outer secret is not masked"
     );
     let (x, y) = spot("#n", 0.97).await;
+    assert!(pixel(&shot, x, y).await != "0,0,0", "plain text is masked");
+
+    // A card number styled group by group with its code inside the same
+    // element: the element is blacked out whole, not just the code.
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/splitcard")}),
+    )
+    .await;
+    let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    let (x, y) = spot("#c", 0.97).await;
     assert!(
-        !pixel(&shot, x, y).await.contains("\"0,0,0\""),
-        "plain text is masked"
+        pixel(&shot, x, y).await == "0,0,0",
+        "the split number is not masked"
     );
+    let (x, y) = spot("#n", 0.97).await;
+    assert!(pixel(&shot, x, y).await != "0,0,0", "plain text is masked");
+    // Grouped with non-breaking spaces: hidden and blacked out as well.
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/nbsp")}),
+    )
+    .await;
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert!(
+        !r.to_string().contains("4111"),
+        "the card number reached the agent: {r}"
+    );
+    let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    let (x, y) = spot("#g", 0.97).await;
+    assert!(
+        pixel(&shot, x, y).await == "0,0,0",
+        "the number grouped with non-breaking spaces is not masked"
+    );
+    let (x, y) = spot("#n", 0.97).await;
+    assert!(pixel(&shot, x, y).await != "0,0,0", "plain text is masked");
+    // An element below the fold: scrolled into view and pictured, its
+    // private part blacked out and the rest shown.
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/tall")}),
+    )
+    .await;
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    let far = text(&r)
+        .lines()
+        .find(|l| l.contains("Payment box"))
+        .and_then(|l| l.split("[ref=").nth(1))
+        .and_then(|l| l.split(']').next())
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("no ref for the box: {r}"));
+    let shot = f
+        .agent(&token, "browser_take_screenshot", json!({"target": far}))
+        .await;
+    assert_ne!(shot["isError"], true, "{shot}");
+    assert!(text(&shot).contains("element"), "{shot}");
+    // A point of the picture: `fx` across an element inside the box,
+    // halfway down it.
+    let in_box = |shot: &Value, sel: &str, fx: f64| {
+        let data = shot["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["type"] == "image")
+            .and_then(|p| p["data"].as_str())
+            .expect("a picture")
+            .to_string();
+        let sel = serde_json::to_string(sel).unwrap();
+        let b = b.clone();
+        let run = run.clone();
+        async move {
+            let code = format!(
+                "async () => {{ const img = new Image(); img.src = 'data:image/png;base64,{data}'; \
+                 await img.decode(); const c = document.createElement('canvas'); \
+                 c.width = img.width; c.height = img.height; const g = c.getContext('2d'); \
+                 g.drawImage(img, 0, 0); const o = document.getElementById('far').getBoundingClientRect(); \
+                 const e = document.querySelector({sel}).getBoundingClientRect(); const s = img.width / o.width; \
+                 if (Math.abs(img.height / o.height - s) > 0.05) return 'not the box: ' + img.width + 'x' + img.height; \
+                 const px = Math.round((e.left - o.left + e.width * {fx}) * s), py = Math.round((e.top - o.top + e.height / 2) * s); \
+                 if (px < 0 || py < 0 || px >= img.width || py >= img.height) return 'outside the picture'; \
+                 return Array.from(g.getImageData(px, py, 1, 1).data.slice(0, 3)).join(','); }}"
+            );
+            let r = b
+                .tool(&run, "browser_evaluate", &json!({"function": code}), QUICK)
+                .await
+                .unwrap();
+            assert!(!is_error(&r), "could not read the picture: {r}");
+            color_of(&text_of(&r), 0, 0)
+        }
+    };
+    assert!(
+        in_box(&shot, "#fc", 0.97).await == "0,0,0",
+        "the number in the element is not masked"
+    );
+    assert!(
+        in_box(&shot, "#fn", 0.97).await == "255,255,255",
+        "the rest of the element is not shown"
+    );
+
+    // The owner types a new card number; the page's review step moves it
+    // into its text and removes the field before they hand back: hidden
+    // and blacked out all the same.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    for ev in [
+        json!({"kind": "navigate", "url": format!("http://127.0.0.1:{port}/review")}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.2}),
+        json!({"kind": "text", "text": "5555 4444 3333 1111"}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.5}),
+    ] {
+        b.user_input("dev", &ev).await.unwrap();
+    }
+    let moved = b
+        .tool(
+            &run,
+            "browser_evaluate",
+            &json!({"function": "() => document.getElementById('r').textContent + ' ' + document.querySelectorAll('input').length"}),
+            QUICK,
+        )
+        .await
+        .unwrap();
+    assert!(
+        text_of(&moved).contains("Card 5555 4444 3333 1111 0"),
+        "{moved}"
+    );
+    b.hand_back();
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(
+        !r.to_string().contains("5555"),
+        "the moved number reached the agent: {r}"
+    );
+    let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    let (x, y) = spot("#r", 0.97).await;
+    assert!(
+        pixel(&shot, x, y).await == "0,0,0",
+        "the moved number is not masked"
+    );
+    let (x, y) = spot("#n", 0.97).await;
+    assert!(pixel(&shot, x, y).await != "0,0,0", "plain text is masked");
 
     // The owner again: a code field known only by its label is private,
     // and a field in another site's frame says so.
