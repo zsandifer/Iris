@@ -23,11 +23,24 @@ export function bareDomain(site) {
   return host.split('.').length === 2;
 }
 
-/** The hosts a save_login card would let a login be used on. */
+/** A website as the owner should see it when approving where a login
+ * goes: its host with any non-default port, and its scheme unless https. */
+export function siteLabel(site) {
+  const s = String(site || '').trim();
+  if (!s) return '';
+  try {
+    const u = new URL(s.includes('://') ? s : `https://${s}`);
+    return u.protocol === 'https:' ? u.host.toLowerCase() : u.origin.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+/** The sites a save_login card would let a login be used on. */
 export function cardHosts(card) {
   const out = [];
   for (const s of [card.site, ...(card.also_sites || [])]) {
-    const h = siteHost(s);
+    const h = siteLabel(s);
     if (h && !out.includes(h)) out.push(h);
   }
   return out;

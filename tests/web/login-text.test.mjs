@@ -24,6 +24,9 @@ test('a card names every site a login would be used on', () => {
   assert.deepEqual(cardHosts({ site: 'https://order.shop.test', also_sites: ['https://auth.test', 'https://order.shop.test:443'] }),
     ['order.shop.test', 'auth.test']);
   assert.deepEqual(cardHosts({ site: 'https://shop.test' }), ['shop.test']);
+  // Another port or scheme is another site, and shows as one.
+  assert.deepEqual(cardHosts({ site: 'https://portal.test', also_sites: ['https://portal.test:8443', 'http://localhost:9000'] }),
+    ['portal.test', 'portal.test:8443', 'http://localhost:9000']);
 });
 
 test("an agent's card opens the add form with what Iris knows, and returns to the chat", () => {
