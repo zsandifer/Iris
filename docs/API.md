@@ -2858,9 +2858,12 @@ after the owner changed something, while the value is still in its field
 once the owner typed anything private this session, every tap or key they
 send counts as a change (a page's stepper or keypad, an arrow key).
 Every field the owner types into or deletes from is tagged with an edit id
-(a plain property on the element), and its document counts as read back
-only once a read finds that very field again with every value long enough
-to look for; a field the page removed or replaced first keeps it closed. A
+(a plain property on the element; in another site's frame, set from that
+frame, and a field Iris cannot find there keeps the page closed until it
+moves on), and its document counts as read back only once a read finds
+that very field again holding a value long enough to look for, every value
+hideable; a field the page removed, replaced or emptied first keeps it
+closed. A
 field the owner typed private details into stays private however it looks
 later. What the owner types into a private field is also kept as Iris
 passes it on (`Backspace` takes back the last character; a tap, another
