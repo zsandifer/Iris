@@ -4368,11 +4368,14 @@ agent gets (addresses, titles, dialogs, page text; also their common
 encodings, card numbers written in groups or, for one known only in
 groups, without them, or shown group by group in separate parts of the
 page such as a card preview (runs of digits close together that make up
-eight or more of its digits in order), and values trimmed and with
-whitespace runs collapsed, as snapshots show them). While the page's text or
-fields (all frames) show one, `browser_find`, `browser_wait_for`, and
-targets written as selectors instead of snapshot refs are refused (their
-outcome would tell what is hidden).
+eight or more of its digits in order; for a code of 4 to 11 digits shown
+digit by digit, all of it), and values trimmed and with whitespace runs
+collapsed, as snapshots show them). While the page's text or fields (all
+frames) show one, `browser_find`, `browser_wait_for`, and targets written
+as selectors instead of snapshot refs are refused (their outcome would tell
+what is hidden), and `browser_snapshot` takes no `target`, `depth` or
+`boxes` (a part of the page, or positions between its lines, could show a
+secret's parts apart, where they are not recognized).
 
 **Masked screenshots.** While the browser knows any secret (the owner's
 saved passwords and card numbers count from the start, so in practice
