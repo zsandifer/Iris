@@ -835,8 +835,9 @@ const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
           stream += piece;
           for (let c = 0; c < piece.length; c++) owner.push(k);
         });
+        // (Not short codes: digits of neighbouring prices would match.)
         for (const s of low) {
-          if (!s) continue;
+          if (s.length < 6) continue;
           for (let at = stream.indexOf(s); at !== -1; at = stream.indexOf(s, at + 1)) {
             const ks = new Set(owner.slice(at, at + s.length).filter((k) => k >= 0));
             if (ks.size > 1) for (const k of ks) cover(drawn[k][1]);

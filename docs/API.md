@@ -2854,7 +2854,9 @@ value with a page's buttons or arrow keys), so values are read again before
 the agent's next call. They are also read right before Iris passes on a
 `tap`, `navigate`, `back`, or a key other than `Backspace` and `Delete`
 after the owner changed something, while the value is still in its field
-(a review step may move it into the page's text and remove the field).
+(a review step may move it into the page's text and remove the field);
+once the owner typed anything private this session, every tap or key they
+send counts as a change (a page's stepper or keypad, an arrow key).
 Every field the owner types into or deletes from is tagged with an edit id
 (a plain property on the element), and its document counts as read back
 only once a read finds that very field again with every value long enough
@@ -4373,8 +4375,12 @@ whose value contains a secret, every element whose text contains one
 (Playwright's own text search, in its isolated world, one search per
 secret so an element holding another secret inside it is still found; and,
 for each text node holding one, the smallest element showing all of that
-text, also text running past its own box; a match shown without a box of
-its own, such as `display: contents`, gives the nearest ancestor with one),
+text, also text running past its own box; for a secret split over several
+drawn text nodes, such as a number styled group by group, every node a
+match spans, found on Iris's side across neighbouring nodes so a hidden
+copy elsewhere in the element does not take its place; a match shown
+without a box of its own, such as `display: contents`, gives the nearest
+ancestor with one),
 and any frame Iris cannot look into, whole. Secrets are looked for in
 every written form text redaction knows (encodings, card numbers written
 in groups, also a number known only in groups written without them),

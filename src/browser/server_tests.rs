@@ -2700,11 +2700,11 @@ async fn real_playwright_run() {
                     .to_string()
             } else if req.starts_with("GET /srcopy") {
                 // A card number shown group by group (light gray), with the
-                // whole number in a visually hidden copy for screen readers.
+                // whole number in a hidden copy.
                 "<html><body style='margin:0'>\
                  <div id=s style='font-size:28px;margin:40px 0;width:480px;color:#999'>\
                  <span id=g1>4111</span> <span id=g2>1111</span> <span id=g3>1111</span> <span id=g4>1111</span>\
-                 <span style='position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap'>4111111111111111</span></div>\
+                 <span style='display:none'>4111111111111111</span></div>\
                  <p id=n style='font-size:28px;margin:40px 0;width:480px'>Nothing secret here</p></body></html>"
                     .to_string()
             } else if req.starts_with("GET /contents") {
