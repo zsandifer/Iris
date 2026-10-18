@@ -2844,7 +2844,10 @@ typing) marks that document and its address before anything is typed, and
 starts a new typing generation. Before the
 agent's next browser tool call that reads or acts on a page, Iris reads
 back, on its own side, the values of every private field and private
-editable area in every tab and frame, and of every field the owner typed
+editable area in every tab and frame (a field that takes only an expiry
+month, year or date does not count: an expiry is not hidden, so typing into
+one neither closes the page nor holds back its read-back; pictures still
+black it out), and of every field the owner typed
 private details into (remembered on the element, so a "show password"
 button turning it into a plain text field does not drop it); in another
 site's frame, where the field cannot be told apart, every field and
