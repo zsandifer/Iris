@@ -20,15 +20,19 @@
 //! - Saved logins and cards: filled only when the owner asks while in
 //!   control (`fill.rs`).
 //!
-//! When the owner types into a private field (a password, card details, a
-//! one-time code), that page is closed to the agent, so the agent never
-//! reads what was typed: the document itself is marked (it stays closed in
-//! any tab, and after the address changes within it), and so is its
-//! address (a page brought back from history may still hold what was
-//! typed), until the browser closes. A saved password or card number Iris
-//! filled is known to Iris, so it closes a page only while it is still on
-//! it (in a field or the text of any frame); meanwhile the agent may still
-//! read the page, with the secret hidden, to see whether a sign-in worked.
+//! The agent never sees a password, card number or code, and still sees
+//! the page around it. A saved secret Iris filled is known to Iris; what
+//! the owner types into a private field (a password, card details, a
+//! one-time code) is read back from Iris's side before the agent next
+//! uses the browser (`capture_typed`). Known secrets are hidden from
+//! everything the agent reads, and its screenshots black out every private
+//! field and anything showing a secret (`masked_screenshot`), so the page
+//! stays usable; only searching its text waits until they are gone. What
+//! cannot be read back (a value too short to look for, a frame that could
+//! not be read) keeps the old rule: the document is marked when the owner
+//! types (it stays closed in any tab, and after the address changes within
+//! it), and so is its address (a page brought back from history may still
+//! hold what was typed), until the browser closes.
 
 pub mod apparmor;
 pub mod fill;
@@ -198,12 +202,8 @@ pub const TAKEN_OVER: &str = "The user has taken over the browser and is still u
     bit and try again, or tell them you are waiting for them to hand it back.";
 pub const TURN_ENDED: &str = "This browser session has ended.";
 pub const PRIVATE_PAGE: &str = "The user typed private details on this page (like a password, \
-    card details, or a code), so you cannot read or use it. Wait until they finish and the page \
-    moves on (for example after signing in), or open another page.";
-pub const FILLED_PAGE: &str = "A saved password or card number is still on this page, so you \
-    can only read it with browser_snapshot (saved details show as [hidden]) until the form is \
-    sent or cleared, or open another page. Use fill_saved_login with submit_ref to send a \
-    sign-in form. If it seems stuck, ask the user to take over.";
+    card details, or a code) that cannot be hidden from you, so you cannot read or use it. Wait \
+    until the page moves on (for example after signing in), or open another page.";
 const NOT_INSTALLED: &str = "no browser is installed; set it up from Iris's computer in the app";
 const DISCONNECTED: &str =
     "The browser is disconnected; the owner can reopen it in Iris’s computer.";
@@ -280,8 +280,9 @@ struct View {
 #[derive(Debug, Default)]
 struct Private {
     /// Addresses (without fragments) of pages where the owner typed or
-    /// filled private details, kept until the browser closes.
-    pages: Vec<String>,
+    /// filled private details, kept until the browser closes, with the id
+    /// of the document they were typed into (empty: unknown).
+    pages: Vec<(String, String)>,
     /// Tabs open when last counted (new ones during take over are followed).
     tabs: usize,
     /// Saved secrets Iris filled this session: hidden from everything the
@@ -291,19 +292,55 @@ struct Private {
     /// When the focused field was last checked for typing (the check is a
     /// round trip with Playwright's settle wait, too slow for every key).
     field_checked: Option<std::time::Instant>,
-    /// Iris filled a saved secret (or an expiry) this session: a page is
-    /// closed to the agent while a saved secret is still on it
-    /// (`page_access`).
+    /// Iris filled a saved secret (or an expiry), or captured what the
+    /// owner typed, this session: pages are checked for those (`page_access`).
     filled: bool,
+    /// The owner typed into a private field since Iris last read what
+    /// they typed (`capture_typed`).
+    typed_dirty: bool,
+    /// Counts the owner's private typing: a document read back is marked
+    /// for the generation it was read at, so typing again needs a new read.
+    typed_gen: u64,
+    /// Some of that typing went into another site's frame, where the field
+    /// could not be told apart: every field of such frames is read back,
+    /// for the rest of the session (a later edit by arrow keys or a page's
+    /// button cannot be told apart either).
+    typed_in_frame: bool,
+    /// A document was marked private this session: its markers are checked
+    /// even once its addresses are forgotten.
+    ever_marked: bool,
+    /// Whether the field the owner types into takes private details (as
+    /// last checked), and the document it is in.
+    typing_private: bool,
+    typing_doc: String,
+    /// What the owner typed into it so far, from the keys Iris passed on:
+    /// hidden too, in case the page moves it out of the field before it is
+    /// read back (`flush_typed`).
+    typed_text: String,
+    /// Fields the owner changed (typed into, deleted from), as (document,
+    /// edit id): Iris tags the field with the id (`FIELD_FN`), and that
+    /// document only counts as read back once a read finds the field again
+    /// with every value hideable (the page may have moved or removed it).
+    edits: Vec<(String, u64)>,
+    /// The last edit id given out.
+    edit_seq: u64,
+    /// The owner's typing since the last tap or key (`typed_text`): the
+    /// edits it made, and whether it began in an empty field (then what was
+    /// typed is the whole value, and hiding it covers those edits).
+    run_edits: Vec<u64>,
+    run_from_empty: bool,
 }
 
 /// Whether the agent may use the current page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Access {
     Open,
-    /// The owner typed private details into it: closed until it moves on.
+    /// The owner typed private details into it that Iris could not read
+    /// back (or it was reopened from history): closed until it moves on.
     Typed,
-    /// A saved secret Iris filled is still on it: only redacted reads.
+    /// A secret Iris knows (filled, or captured from the owner's typing)
+    /// is on it: usable, with the secret hidden from text and blacked out
+    /// in pictures; searching its text is not.
     Filled,
 }
 
@@ -352,6 +389,10 @@ pub struct Shared {
     last_input: AtomicI64,
     /// Serializes actions on the page (tool calls and the owner's input).
     pub(crate) op_lock: tokio::sync::Mutex<()>,
+    /// One picture at a time: a live-view picture taken at the same moment
+    /// as the agent's changes its scale (and the agent's masks are painted
+    /// for the scale Iris asked for).
+    pub(crate) capture_lock: tokio::sync::Mutex<()>,
     /// "Pause Iris" in the app: no turns, jobs, or browsing until resumed.
     paused: AtomicBool,
     /// Disconnect everything disables browser tools until the owner reopens it.
@@ -475,16 +516,19 @@ const PAGE_CODE: &str = r#"async (page) => ({
   url: page.url(),
   title: await page.title(),
   private: await page.evaluate("window.__irisPrivate === true"),
+  captured: await page.evaluate("window.__irisCaptured_GEN === true"),
+  closed: await page.evaluate("window.__irisClosed === true"),
 })"#;
 
-/// The focused field, followed into shadow roots and same-origin frames:
-/// whether it takes private details (passwords, card fields, one-time
-/// codes; a field in another site's frame cannot be inspected and counts
-/// as private) and whether it is in another site's frame. With `MARK`, a
-/// private field marks the document private before anything is typed;
-/// with `FORCE` it counts as private whatever it is.
-const FIELD_FN: &str = r#"() => {
-  const sensitive = (e) => {
+/// `PAGE_CODE` asking whether this document was read back after the
+/// owner's latest private typing (`generation`).
+fn page_code(generation: u64) -> String {
+    PAGE_CODE.replace("GEN", &generation.to_string())
+}
+
+/// Whether a field takes private details (passwords, card fields, one-time
+/// codes), from its type, autocomplete, name, id, labels and placeholder.
+const SENSITIVE_FN: &str = r#"(e) => {
     const doc = e.ownerDocument;
     const named = (e.getAttribute('aria-labelledby') || '').split(/\s+/)
       .map((id) => id && doc.getElementById(id)).filter(Boolean).map((l) => l.textContent);
@@ -493,7 +537,446 @@ const FIELD_FN: &str = r#"() => {
       .filter(Boolean).join(' ').toLowerCase();
     if (/password|passcode|cc-|card|cvc|cvv|csc|security code|expir|one-time|otp|\bpin\b|verification|2fa|mfa|totp|authenticat/.test(a)) return true;
     return /\bcode\b/.test(a) && !/postal|zip|promo|coupon|discount|gift|voucher|referral|country|area code|dial/.test(a);
+  }"#;
+
+/// A field that takes private details other than an expiry date (`SENSITIVE`
+/// is `SENSITIVE_FN`): an expiry month or year is not hidden (see the API
+/// docs), and two digits are too short to look for, so typing into one
+/// neither closes the page nor holds back reading the page's fields back.
+/// Pictures still black out every `SENSITIVE_FN` field.
+const SECRET_FIELD_FN: &str = r#"(e) => (SENSITIVE)(e) && !(EXPIRY)(e)"#;
+
+/// A field that takes only an expiry month, year or date (see
+/// `SECRET_FIELD_FN`).
+const EXPIRY_ONLY_FN: &str = r#"(e) => {
+    const doc = e.ownerDocument;
+    const named = (e.getAttribute('aria-labelledby') || '').split(/\s+/)
+      .map((id) => id && doc.getElementById(id)).filter(Boolean).map((l) => l.textContent);
+    const a = [e.type, e.autocomplete, e.name, e.id, e.getAttribute('aria-label'), e.placeholder,
+      ...Array.from(e.labels || [], (l) => l.textContent), ...named]
+      .filter(Boolean).join(' ').toLowerCase();
+    return /cc-exp|expir/.test(a)
+      && !/password|passcode|cvc|cvv|csc|security|one-time|otp|\bpin\b|verification|2fa|mfa|totp|authenticat|\bcode\b|number|cc-csc/.test(a);
+  }"#;
+
+/// `SECRET_FIELD_FN`, ready to insert.
+fn secret_field_fn() -> String {
+    SECRET_FIELD_FN
+        .replace("SENSITIVE", SENSITIVE_FN)
+        .replace("EXPIRY", EXPIRY_ONLY_FN)
+}
+
+/// What the owner typed into private fields, read from Iris's side when
+/// the agent next uses the browser, so it can be hidden like a saved
+/// secret instead of closing the page: per tab, the values of its
+/// private fields and private editable areas in every frame. In other
+/// sites' frames, where the check before typing could not tell which
+/// field the owner typed into (`ALLFRAMES`), every field and editable
+/// area that holds something. A tab whose frames were all read and whose
+/// values are all long enough to look for counts as read back; Iris marks
+/// it so (`MARK_CAPTURED_CODE`) only after storing its values, and only
+/// once every field the owner changed there was found again holding a
+/// value long enough to look for (`edits`: the edit ids on such fields).
+/// `MIN` is `fill::MIN_HIDDEN`.
+const CAPTURE_CODE: &str = r#"async (page) => { /* iris:capture */
+  const origin = (u) => { try { return new URL(u).origin; } catch (_) { return ''; } };
+  const hideable = (v) => [...v].length >= MIN || /^[0-9]{3}$/.test(v);
+  const out = [];
+  const pages = page.context().pages();
+  for (let i = 0; i < pages.length; i++) {
+    const p = pages[i];
+    const top = p.mainFrame();
+    let ok = true;
+    const values = [];
+    const edits = [];
+    for (const f of p.frames()) {
+      const other = f !== top && origin(f.url()) !== origin(top.url());
+      const r = await f.evaluate((all) => {
+        const sensitive = SENSITIVE;
+        const expiryOnly = EXPIRY;
+        const vals = [];
+        const edits = [];
+        const walk = (root) => {
+          for (const e of root.querySelectorAll('input, textarea, [contenteditable]')) {
+            const editable = e.tagName !== 'INPUT' && e.tagName !== 'TEXTAREA';
+            if (editable && !e.isContentEditable) continue;
+            if (!editable && ['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'hidden', 'image', 'range', 'color'].includes(e.type)) continue;
+            if (!((all && !expiryOnly(e)) || e.__irisTyped === true || sensitive(e))) continue;
+            const v = String(editable ? e.innerText || '' : e.value || '').trim();
+            if (v) vals.push(v);
+            // A changed field counts as found again only holding a value
+            // long enough to look for (one the page emptied may have moved
+            // it elsewhere).
+            const kept = [...v].length >= MIN || /^[0-9]{3}$/.test(v);
+            if (kept && Array.isArray(e.__irisEdits)) edits.push(...e.__irisEdits.filter((n) => typeof n === 'number'));
+          }
+          for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
+        };
+        walk(document);
+        return { vals, edits };
+      }, other && ALLFRAMES).catch(() => null);
+      if (r === null) {
+        if (!f.isDetached()) ok = false;
+        continue;
+      }
+      values.push(...r.vals);
+      edits.push(...r.edits);
+    }
+    const captured = ok && values.every(hideable);
+    const state = await p.evaluate(() => ({ marked: window.__irisPrivate === true, doc: String(window.__irisDoc || '') }))
+      .catch(() => ({ marked: false, doc: '' }));
+    out.push({ i, url: p.url(), captured, ...state, edits, values: values.filter(hideable) });
+  }
+  return out;
+}"#;
+
+fn capture_code(all_frames: bool) -> String {
+    CAPTURE_CODE
+        .replace("EXPIRY", EXPIRY_ONLY_FN)
+        .replace("SENSITIVE", &secret_field_fn())
+        .replace("MIN", &fill::MIN_HIDDEN.to_string())
+        .replace("ALLFRAMES", if all_frames { "true" } else { "false" })
+}
+
+/// Marks the tabs `WANT` (`{i, url}`, still at that address) as read back
+/// for typing generation `GEN`; answers the indexes marked.
+const MARK_CAPTURED_CODE: &str = r#"async (page) => { /* iris:markcaptured */
+  const want = WANT;
+  const pages = page.context().pages();
+  const done = [];
+  for (const w of want) {
+    const p = pages[w.i];
+    if (!p || p.url() !== w.url) continue;
+    const ok = await p.evaluate(() => {
+      try { Object.defineProperty(window, '__irisCaptured_GEN', { value: true }); } catch (_) {}
+      return window.__irisCaptured_GEN === true;
+    }).catch(() => false);
+    if (ok) done.push(w.i);
+  }
+  return done;
+}"#;
+
+/// Every field and editable area of every frame of the current tab, in
+/// document order (`null` for a frame that cannot be read): its value and
+/// whether it takes private details. Compared before and after an action
+/// on a page holding a secret (`hide_changed`).
+const FIELDS_CODE: &str = r#"async (page) => { /* iris:fields */
+  const out = [];
+  for (const f of page.frames()) {
+    const r = await f.evaluate(() => {
+      const sensitive = SENSITIVE;
+      const vals = [];
+      const walk = (root) => {
+        for (const e of root.querySelectorAll('input, textarea, [contenteditable]')) {
+          const editable = e.tagName !== 'INPUT' && e.tagName !== 'TEXTAREA';
+          if (editable && !e.isContentEditable) continue;
+          vals.push([String(editable ? e.innerText || '' : e.value || ''), e.type === 'password' || e.__irisTyped === true || sensitive(e)]);
+        }
+        for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
+      };
+      walk(document);
+      return vals;
+    }).catch(() => null);
+    out.push(r);
+  }
+  return out;
+}"#;
+
+/// `SHOT_CODE` for these secret forms and screenshot options.
+pub(crate) fn shot_code(groups: &[Vec<String>], opts: &Value) -> Result<String> {
+    Ok(SHOT_CODE
+        .replace("SECRETS", &serde_json::to_string(groups)?)
+        .replace("OPTS", &opts.to_string())
+        .replace("SENSITIVE", SENSITIVE_FN))
+}
+
+/// Paint `rects` (x, y, width, height in CSS pixels of an area `css_w` by
+/// `css_h`) black on a PNG picture of that area, a pixel wider on every
+/// side. The picture's scale is its size over the area's; one that does
+/// not match on both sides is refused rather than masked in the wrong place.
+pub(crate) fn paint_masks(
+    png_bytes: &[u8],
+    css_w: f64,
+    css_h: f64,
+    rects: &[[f64; 4]],
+) -> Result<Vec<u8>> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info()?;
+    let mut pixels = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .ok_or("the picture is too large")?
+    ];
+    let info = reader.next_frame(&mut pixels)?;
+    let (w, h) = (info.width as usize, info.height as usize);
+    let channels = info.color_type.samples();
+    if css_w <= 0.0 || css_h <= 0.0 {
+        return Err("the picture has no size".into());
+    }
+    let (sx, sy) = (w as f64 / css_w, h as f64 / css_h);
+    if (sx - sy).abs() > 0.02 * sx.max(sy) {
+        return Err("the picture does not have the page's shape".into());
+    }
+    let stride = info.line_size;
+    for &[x, y, rw, rh] in rects {
+        if !(x.is_finite() && y.is_finite() && rw.is_finite() && rh.is_finite()) {
+            return Err("a private area has no position".into());
+        }
+        let clamp = |v: f64, max: usize| v.max(0.0).min(max as f64) as usize;
+        let (x0, x1) = (
+            clamp((x * sx).floor() - 1.0, w),
+            clamp(((x + rw) * sx).ceil() + 1.0, w),
+        );
+        let (y0, y1) = (
+            clamp((y * sy).floor() - 1.0, h),
+            clamp(((y + rh) * sy).ceil() + 1.0, h),
+        );
+        for row in y0..y1 {
+            let line = &mut pixels[row * stride..row * stride + w * channels];
+            for px in line[x0 * channels..x1 * channels].chunks_mut(channels) {
+                // Black, fully opaque.
+                match channels {
+                    2 | 4 => {
+                        let a = channels - 1;
+                        px[..a].fill(0);
+                        px[a] = 255;
+                    }
+                    _ => px.fill(0),
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, info.width, info.height);
+        encoder.set_color(info.color_type);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header()?;
+        let rows: Vec<u8> = pixels
+            .chunks(stride)
+            .take(h)
+            .flat_map(|l| l[..w * channels].iter().copied())
+            .collect();
+        writer.write_image_data(&rows)?;
+    }
+    Ok(out)
+}
+
+/// What `FIELDS_CODE` found: per frame, (value, private) of each field.
+pub(crate) type Fields = Vec<Option<Vec<(String, bool)>>>;
+
+/// The agent's picture of the page, and where its private details are:
+/// every private field (as `SENSITIVE_FN` sees them, or typed into by the
+/// owner), every field or text holding one of `SECRETS` (every written
+/// form `hide_secrets` knows, see `mask_form_groups`) in each frame, and any
+/// frame Iris cannot look into, whole, as rectangles in the picture's
+/// pixels. Iris paints them black itself (`paint_masks`): nothing is drawn
+/// in the page, and nothing there depends on the secrets (the page lists
+/// its fields and text nodes the same way for every page; matching happens
+/// here, positions come from Playwright). The picture is taken with Chrome's
+/// own capture at a fixed scale, between two measurements that must agree
+/// (a page moving meanwhile is measured again). Only what is on screen is
+/// pictured. `OPTS`: `target` (a snapshot ref; its part on screen),
+/// `scale` (`css`, the default, or `device`).
+const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
+  // Every written form of each secret, one group per secret.
+  const groups = SECRETS;
+  const secrets = groups.flat();
+  const opts = OPTS;
+  // Compared without regard to case or the kind of white space (a card
+  // number may be grouped with non-breaking spaces).
+  const norm = (x) => String(x).toLowerCase().replace(/\s+/g, ' ');
+  const low = secrets.map(norm);
+  const scanPage = () => {
+    const sensitive = SENSITIVE;
+    const xpath = (el) => {
+      // An element inside a shadow root is named by its outermost host.
+      let e = el;
+      for (let r = e.getRootNode(); r && r.host; r = e.getRootNode()) e = r.host;
+      const steps = [];
+      for (; e && e.nodeType === 1; e = e.parentElement) {
+        let i = 1;
+        for (let s = e.previousElementSibling; s; s = s.previousElementSibling) i++;
+        steps.unshift('*[' + i + ']');
+      }
+      return '/' + steps.join('/');
+    };
+    const up = (e) => e.parentElement || (e.parentNode && e.parentNode.host) || null;
+    const inside = (b, r) => b.left <= r.left + 1 && b.top <= r.top + 1 && b.right >= r.right - 1 && b.bottom >= r.bottom - 1;
+    const fields = [];
+    const texts = [];
+    const walk = (root) => {
+      for (const e of root.querySelectorAll('input, textarea, select, [contenteditable]')) {
+        if (e.type === 'password' || e.__irisTyped === true || sensitive(e)) fields.push(xpath(e));
+      }
+      const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      for (let n = w.nextNode(); n; n = w.nextNode()) {
+        if (!n.data.trim()) continue;
+        const range = document.createRange();
+        range.selectNodeContents(n);
+        const r = range.getBoundingClientRect();
+        let e = n.parentElement || (n.parentNode && n.parentNode.host) || null;
+        while (e && e !== document.documentElement && !inside(e.getBoundingClientRect(), r)) e = up(e);
+        texts.push([n.data, xpath(e || document.documentElement), r.width > 0 && r.height > 0]);
+      }
+      for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
+    };
+    walk(document);
+    return { fields, texts };
   };
+  // Every rectangle to black out, in CSS pixels of the viewport.
+  const measure = async () => {
+    const targets = [];
+    for (const f of page.frames()) {
+      const scan = await f.evaluate(scanPage).catch(() => null);
+      if (scan === null) {
+        if (f.isDetached()) continue;
+        // Cannot look inside: the whole frame.
+        const el = await f.frameElement().catch(() => null);
+        if (!el) throw new Error('the page could not be checked for private details');
+        targets.push(el);
+        continue;
+      }
+      for (const x of scan.fields) targets.push(f.locator('xpath=' + x));
+      if (!secrets.length) continue;
+      const seen = new Set();
+      const cover = (x) => {
+        if (!seen.has(x)) {
+          seen.add(x);
+          targets.push(f.locator('xpath=' + x));
+        }
+      };
+      for (const [t, x] of scan.texts) {
+        const l = norm(t);
+        if (low.some((s) => l.includes(s))) cover(x);
+      }
+      // Text split over several nodes (a number styled group by group): the
+      // drawn nodes in page order, joined with a space and with nothing;
+      // every node a match spans is blacked out (a hidden copy elsewhere in
+      // the element does not take its place).
+      const drawn = scan.texts.filter((t) => t[2]);
+      const digitsOnly = (k) => /^[0-9]+$/.test(norm(drawn[k][0]).trim());
+      for (const sep of [' ', '']) {
+        let stream = '';
+        const owner = [];
+        drawn.forEach(([t], k) => {
+          const piece = norm(t).trim();
+          if (stream && sep) {
+            stream += sep;
+            owner.push(-1);
+          }
+          stream += piece;
+          for (let c = 0; c < piece.length; c++) owner.push(k);
+        });
+        for (const s of low) {
+          // A short code only as whole nodes of digits alone (boxes, one
+          // digit each): digits of neighbouring prices must not match.
+          const short = s.length < 6;
+          if (short && !/^[0-9]{4,}$/.test(s)) continue;
+          for (let at = stream.indexOf(s); at !== -1; at = stream.indexOf(s, at + 1)) {
+            const ks = new Set(owner.slice(at, at + s.length).filter((k) => k >= 0));
+            if (ks.size < 2) continue;
+            if (short) {
+              const end = at + s.length;
+              const whole = (at === 0 || owner[at - 1] !== owner[at]) && (end === owner.length || owner[end] !== owner[end - 1]);
+              if (!whole || ![...ks].every(digitsOnly)) continue;
+            }
+            for (const k of ks) cover(drawn[k][1]);
+          }
+        }
+      }
+      const fields = f.locator('input, textarea');
+      const values = await fields.evaluateAll((els) => els.map((e) => String(e.value))).catch(() => null);
+      if (values === null) throw new Error('the page could not be checked for private details');
+      values.forEach((v, i) => {
+        const l = norm(v);
+        if (low.some((s) => l.includes(s))) targets.push(fields.nth(i));
+      });
+      // Text split over several elements: Playwright's own text search (in
+      // its isolated world, out of the page's reach), one per secret (a
+      // child matching another secret must not hide this one's element),
+      // any white space matching any.
+      for (const g of groups) {
+        const alts = g.map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+'));
+        targets.push(f.getByText(new RegExp(alts.join('|'), 'i')));
+      }
+    }
+    const rects = [];
+    const box = async (h) => {
+      const b = await h.boundingBox({ timeout: 2000 }).catch(() => undefined);
+      if (b === undefined) throw new Error('the page could not be checked for private details');
+      return b && b.width > 0 && b.height > 0 ? b : null;
+    };
+    for (const t of targets) {
+      const each = typeof t.all === 'function' ? await t.all() : [t];
+      for (const h of each) {
+        let b = await box(h);
+        // Shown without a box of its own (display: contents, its parts laid
+        // out in its parent's): the nearest ancestor with one. Playwright
+        // tells, in its isolated world.
+        if (!b && typeof h.isVisible === 'function' && await h.isVisible().catch(() => true)) {
+          let up = h;
+          for (let k = 0; k < 20 && !b; k++) {
+            up = up.locator('xpath=..');
+            b = await box(up);
+          }
+          if (!b) throw new Error('the page could not be checked for private details');
+        }
+        if (b) rects.push([b.x, b.y, b.width, b.height]);
+      }
+    }
+    return rects;
+  };
+  const same = (a, b) => a.length === b.length && a.every((r, i) => r.every((v, k) => Math.abs(v - b[i][k]) < 1));
+  // The element asked for, scrolled into view first.
+  const target = opts.target ? page.locator('aria-ref=' + opts.target) : null;
+  if (target) await target.scrollIntoViewIfNeeded({ timeout: 5000 });
+  const s = await page.context().newCDPSession(page);
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const before = await measure();
+      const m = await s.send('Page.getLayoutMetrics');
+      const vv = m.cssVisualViewport;
+      // Only what is on screen: capturing beyond it can lay the page out
+      // again (and move what was measured). An element: its part on screen.
+      let x0 = 0, y0 = 0, x1 = vv.clientWidth, y1 = vv.clientHeight;
+      if (target) {
+        const b = await target.boundingBox({ timeout: 5000 });
+        if (!b) throw new Error('that element is not on the page');
+        x0 = Math.max(0, b.x); y0 = Math.max(0, b.y);
+        x1 = Math.min(vv.clientWidth, b.x + b.width); y1 = Math.min(vv.clientHeight, b.y + b.height);
+        if (x1 <= x0 || y1 <= y0) throw new Error('that element is not on the screen');
+      }
+      const clip = { x: vv.pageX + x0, y: vv.pageY + y0, width: x1 - x0, height: y1 - y0 };
+      const [ox, oy] = [x0, y0];
+      // In CSS pixels unless device pixels are asked for, as Playwright's
+      // own (the device's pixel ratio from Chrome, not the page).
+      const ratio = m.visualViewport && m.visualViewport.clientWidth > 0 ? m.visualViewport.clientWidth / vv.clientWidth : 1;
+      const scale = opts.scale === 'device' ? 1 : 1 / ratio;
+      const shot = await s.send('Page.captureScreenshot', { format: 'png', clip: { ...clip, scale }, captureBeyondViewport: false });
+      const after = await measure();
+      if (!same(before, after)) continue;
+      const rects = before.concat(after).map(([x, y, w, h]) => [x - ox, y - oy, w, h]);
+      return { data: shot.data, width: clip.width, height: clip.height, rects };
+    }
+    throw new Error('the page kept moving');
+  } finally {
+    s.detach().catch(() => {});
+  }
+}"#;
+
+/// The focused field, followed into shadow roots and same-origin frames:
+/// whether it takes private details (passwords, card fields, one-time
+/// codes; a field in another site's frame cannot be inspected and counts
+/// as private; so does one the owner typed private details into) and
+/// whether it is in another site's frame. With `MARK`, a private field
+/// marks the document private before anything is typed and is tagged with
+/// edit id `EDIT` (`edit`: tagged; `empty`: it held nothing); with
+/// `FORCE` it counts as private whatever it is.
+const FIELD_FN: &str = r#"() => {
+  const sensitive = SENSITIVE;
   let e = document.activeElement;
   let frame = false;
   let inner = false;
@@ -509,11 +992,26 @@ const FIELD_FN: &str = r#"() => {
   const field = !!e && e !== e.ownerDocument.body && e !== e.ownerDocument.documentElement;
   // Focus inside a frame but on no field of it: where typing goes is unclear.
   if (inner && !field) frame = true;
-  const priv = FORCE || frame || (field && sensitive(e));
+  const priv = FORCE || frame || (field && (e.__irisTyped === true || sensitive(e)));
+  let edit = false;
   if (MARK && priv) {
     try { Object.defineProperty(window, '__irisPrivate', { value: true }); } catch (_) {}
+    // The field itself is remembered as private, whatever it looks like
+    // later (a "show password" button makes it an ordinary text field).
+    try { if (field) Object.defineProperty(e, '__irisTyped', { value: true }); } catch (_) {}
+    // This change, so a read can tell it found this very field again.
+    try {
+      if (field && !frame) {
+        e.__irisEdits = (Array.isArray(e.__irisEdits) ? e.__irisEdits : []).concat([EDIT]);
+        edit = true;
+      }
+    } catch (_) {}
+    try {
+      if (!window.__irisDoc) Object.defineProperty(window, '__irisDoc', { value: Math.random().toString(36).slice(2) + Date.now().toString(36) });
+    } catch (_) {}
   }
-  return { private: priv, frame };
+  const held = field && !frame ? String(e.isContentEditable ? e.textContent || '' : e.value || '').trim() : 'unknown';
+  return { private: priv, frame, edit, empty: held === '', doc: String(window.__irisDoc || '') };
 }"#;
 
 /// What every field holds (inputs, text areas) and the text of every
@@ -546,17 +1044,51 @@ const SECRET_CHECK_CODE: &str = r#"async (page) => {
   return out.join('\n');
 }"#;
 
-/// Marks the current document private (see `page_access`).
-pub(crate) const MARK_JS: &str = "(() => { try { Object.defineProperty(window, '__irisPrivate', { value: true }); } catch (_) {} })()";
+/// Closes the current document to the agent for good (until it is gone):
+/// it holds something private Iris cannot hide, which no read-back undoes.
+pub(crate) const CLOSE_JS: &str = "(() => { try { Object.defineProperty(window, '__irisPrivate', { value: true }); } catch (_) {} try { Object.defineProperty(window, '__irisClosed', { value: true }); } catch (_) {} })()";
 
 /// Run `FIELD_FN` from Playwright's Node side, with the real address.
-fn field_code(mark: bool, force: bool) -> String {
+/// In another site's frame (Playwright evaluates there; the page cannot):
+/// the focused field of the innermost focused document, tagged as typed
+/// into and with edit id `EDIT` (`empty`: it held nothing; an expiry-only
+/// field is not tagged and not private, `expiry`). `null` when this frame
+/// does not hold the focus.
+const FRAME_FIELD_FN: &str = r#"() => {
+  if (!document.hasFocus()) return null;
+  let e = document.activeElement;
+  while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
+  if (!e || e.tagName === 'IFRAME' || e.tagName === 'FRAME' || e === document.body || e === document.documentElement) return null;
+  // An expiry month or year is not private (`SECRET_FIELD_FN`).
+  if ((EXPIRY)(e)) return { expiry: true };
+  try { Object.defineProperty(e, '__irisTyped', { value: true }); } catch (_) {}
+  e.__irisEdits = (Array.isArray(e.__irisEdits) ? e.__irisEdits : []).concat([EDIT]);
+  const held = String(e.isContentEditable ? e.textContent || '' : e.value || '').trim();
+  return { edit: true, empty: held === '' };
+}"#;
+
+fn field_code(mark: bool, force: bool, edit: u64) -> String {
     let f = FIELD_FN
+        .replace("SENSITIVE", &secret_field_fn())
         .replace("FORCE", if force { "true" } else { "false" })
-        .replace("MARK", if mark { "true" } else { "false" });
+        .replace("MARK", if mark { "true" } else { "false" })
+        .replace("EDIT", &edit.to_string());
+    let tag = FRAME_FIELD_FN
+        .replace("EDIT", &edit.to_string())
+        .replace("EXPIRY", EXPIRY_ONLY_FN);
+    // Typing into another site's frame: its field is tagged from that
+    // frame (`edit: "unknown"` when it cannot be found: nothing read later
+    // can count as finding it again).
     format!(
-        "async (page) => ({{ url: page.url(), ...(await page.evaluate({})) }})",
-        serde_json::to_string(&format!("({f})()")).unwrap_or_default()
+        "async (page) => {{ const r = await page.evaluate({}); \
+         if ({mark} && r.private && r.frame) {{ r.edit = 'unknown'; \
+         for (const f of page.frames()) {{ if (f === page.mainFrame()) continue; \
+         const t = await f.evaluate({}).catch(() => null); \
+         if (t) {{ if (t.expiry) {{ r.private = false; r.edit = false; }} \
+         else {{ r.edit = true; r.empty = t.empty; }} break; }} }} }} \
+         return {{ url: page.url(), ...r }}; }}",
+        serde_json::to_string(&format!("({f})()")).unwrap_or_default(),
+        serde_json::to_string(&format!("({tag})()")).unwrap_or_default(),
     )
 }
 
@@ -566,8 +1098,13 @@ pub(crate) struct Field {
     pub url: String,
     pub private: bool,
     /// In another site's frame.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub frame: bool,
+    /// The id Iris gave the document when it was marked (empty: none).
+    pub doc: String,
+    /// The edit id the field was tagged with (marking a private field).
+    pub edit: Option<u64>,
+    /// It held nothing.
+    pub empty: bool,
 }
 
 /// Keys the owner can press while in control (names as in the DOM).
@@ -625,12 +1162,118 @@ fn written_forms(secret: &str) -> Vec<String> {
     forms
 }
 
+/// What the owner typed into a private field, as Iris passed it on: hidden
+/// like a secret too, should the page move it out of the field before it
+/// is read back (another document may show it). Typing that began in an
+/// empty field covers its edits; any other change needs the field read
+/// again (`Private::edits`).
+fn flush_typed(p: &mut Private) {
+    let typed = std::mem::take(&mut p.typed_text);
+    let typed = typed.trim();
+    let edits = std::mem::take(&mut p.run_edits);
+    if fill::watchable(typed) {
+        add_secret(p, typed);
+        // Typed into an empty field (Backspace only taking back the last
+        // character): what was typed is what it holds, so it is covered
+        // even should the page remove the field by itself (a code sent as
+        // soon as it is complete).
+        if std::mem::take(&mut p.run_from_empty) {
+            p.edits.retain(|(_, id)| !edits.contains(id));
+        }
+    }
+    p.run_from_empty = false;
+}
+
+/// A private value read back or typed: hidden from now on.
+fn add_secret(p: &mut Private, value: &str) {
+    if !p.secrets.iter().any(|s| s == value) {
+        p.secrets.push(value.to_string());
+    }
+    p.filled = true;
+}
+
+/// A card number written in groups (`4111 1111 1111 1111`, `4111-1111-…`):
+/// its digits, so that every other way of writing it is hidden too.
+fn card_digits(s: &str) -> Option<String> {
+    let digits: String = s.chars().filter(char::is_ascii_digit).collect();
+    let grouped = s
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == ' ' || c == '-');
+    (grouped && digits.len() != s.len() && (12..=19).contains(&digits.len())).then_some(digits)
+}
+
+/// `secrets` with the digits of card numbers written in groups.
+fn with_card_digits(secrets: &[String]) -> Vec<String> {
+    let mut out = secrets.to_vec();
+    for d in secrets.iter().filter_map(|s| card_digits(s)) {
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// Every written form of `secrets` that `hide_secrets` hides, to mask in
+/// pictures, one group per secret: each secret, its encodings, and card
+/// numbers written in groups (also one known only in groups).
+pub(crate) fn mask_form_groups(secrets: &[String]) -> Vec<Vec<String>> {
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    for secret in secrets {
+        let mut out: Vec<String> = Vec::new();
+        for s in std::iter::once(secret.clone()).chain(card_digits(secret)) {
+            let s = &s;
+            let n = s.chars().count();
+            let mut forms = vec![s.clone()];
+            if n >= 4 {
+                forms.extend(written_forms(s));
+            }
+            if n >= 8 {
+                forms.extend(crate::gateway::encoded_secret_forms(s));
+            }
+            let digits = !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+            if digits && s.len() >= 12 {
+                let groups: &[usize] = if s.len() == 15 {
+                    &[4, 6, 5]
+                } else {
+                    &[4, 4, 4, 4, 4]
+                };
+                let mut parts = Vec::new();
+                let mut at = 0;
+                for g in groups {
+                    if at >= s.len() {
+                        break;
+                    }
+                    let end = (at + g).min(s.len());
+                    parts.push(&s[at..end]);
+                    at = end;
+                }
+                for sep in [" ", "-", "  ", " - "] {
+                    forms.push(parts.join(sep));
+                }
+            }
+            for f in forms {
+                if !f.is_empty() && !out.contains(&f) {
+                    out.push(f);
+                }
+            }
+        }
+        if !out.is_empty() {
+            groups.push(out);
+        }
+    }
+    groups
+}
+
 /// `text` with saved secrets replaced by `[hidden]`: the gateway's matcher
 /// (the value and its common encodings), the forms pages and Playwright
 /// write values in (`written_forms`, any length), and what pages do with
-/// card details: numbers split into groups by spaces or dashes, and short
-/// security codes (only where they stand alone, not inside longer numbers).
+/// card details: numbers split into groups by spaces or dashes (also one
+/// known only in groups, and groups shown apart, `hide_split_cards`, as
+/// codes shown digit by digit), and
+/// short security codes (only where they stand alone, not inside longer
+/// numbers).
 pub(crate) fn hide_secrets(text: &str, secrets: &[String]) -> String {
+    let secrets = &with_card_digits(secrets)[..];
     let mut out = crate::gateway::redact(text, secrets);
     for s in secrets.iter().filter(|s| s.chars().count() >= 4) {
         for f in written_forms(s) {
@@ -667,6 +1310,76 @@ pub(crate) fn hide_secrets(text: &str, secrets: &[String]) -> String {
             out = hide_standalone(&out, s);
         }
     }
+    hide_split_cards(&out, secrets)
+}
+
+/// Card numbers and codes shown in parts in separate parts of a page (a
+/// card preview, a code shown digit by digit in boxes: a snapshot lists
+/// each part as its own entry): runs of digits standing apart (not part of
+/// a name such as `e12`), close together, that make up at least eight
+/// digits of a known card number in order, or a whole known code of 4 to
+/// 11 digits, are hidden, each run.
+fn hide_split_cards(text: &str, secrets: &[String]) -> String {
+    let cards: Vec<&String> = secrets
+        .iter()
+        .filter(|s| (4..=19).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()))
+        .collect();
+    if cards.is_empty() {
+        return text.to_string();
+    }
+    let b = text.as_bytes();
+    let word = |i: usize| b[i].is_ascii_alphanumeric() || b[i] == b'_';
+    // Runs of digits not touching a letter.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        let alone = (start == 0 || !word(start - 1)) && (i == b.len() || !word(i));
+        if alone {
+            runs.push((start, i));
+        }
+    }
+    const NEAR: usize = 80;
+    let mut hide = vec![false; runs.len()];
+    for first in 0..runs.len() {
+        let mut digits = String::new();
+        for last in first..runs.len() {
+            if last > first && runs[last].0 - runs[last - 1].1 > NEAR {
+                break;
+            }
+            digits.push_str(&text[runs[last].0..runs[last].1]);
+            if digits.len() > 19 || !cards.iter().any(|c| c.contains(&digits)) {
+                break;
+            }
+            let enough = cards.iter().any(|c| {
+                if c.len() >= 12 {
+                    digits.len() >= 8
+                } else {
+                    **c == digits
+                }
+            });
+            if last > first && enough {
+                hide[first..=last].iter_mut().for_each(|h| *h = true);
+            }
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (k, (start, end)) in runs.iter().enumerate() {
+        if hide[k] {
+            out.push_str(&text[at..*start]);
+            out.push_str("[hidden]");
+            at = *end;
+        }
+    }
+    out.push_str(&text[at..]);
     out
 }
 
@@ -740,6 +1453,7 @@ impl Browser {
             last_used: AtomicI64::new(0),
             last_input: AtomicI64::new(0),
             op_lock: tokio::sync::Mutex::new(()),
+            capture_lock: tokio::sync::Mutex::new(()),
             paused: AtomicBool::new(false),
             disconnected: AtomicBool::new(false),
             allow_no_sandbox: AtomicBool::new(false),
@@ -1297,15 +2011,256 @@ impl Browser {
     /// anything the page wrote) and whether the owner typed private
     /// details into this document.
     pub(crate) async fn page_info(&self, run: &Running) -> Result<(String, bool)> {
-        let v = self.run_code(run, PAGE_CODE).await?;
+        let (url, marked, captured, closed) = self.page_state(run).await?;
+        Ok((url, closed || (marked && !captured)))
+    }
+
+    /// The current tab's address, whether the owner typed private details
+    /// into this document, whether Iris read them back since, and whether
+    /// it was closed for good (`CLOSE_JS`).
+    async fn page_state(&self, run: &Running) -> Result<(String, bool, bool, bool)> {
+        let generation = lock(&self.private).typed_gen;
+        let v = self.run_code(run, &page_code(generation)).await?;
         let url = v["url"].as_str().ok_or("the browser has no open page")?;
         self.set_page_info(Some(url), v["title"].as_str());
-        Ok((url.to_string(), v["private"] == true))
+        Ok((
+            url.to_string(),
+            v["private"] == true,
+            v["captured"] == true,
+            v["closed"] == true,
+        ))
     }
 
     /// The current tab's address.
     pub(crate) async fn current_url(&self, run: &Running) -> Result<String> {
         Ok(self.page_info(run).await?.0)
+    }
+
+    /// Read back what the owner typed into private fields (in every tab
+    /// and frame), so it is hidden from the agent like a saved secret and
+    /// the page stays usable. A tab read completely is marked as captured;
+    /// its address is forgotten when the typing happened in that very
+    /// document. Anything not read keeps its page closed.
+    pub(crate) async fn capture_typed(&self, run: &Running) -> Result<()> {
+        let (generation, all_frames) = {
+            let p = lock(&self.private);
+            (p.typed_gen, p.typed_in_frame)
+        };
+        let v = self.run_code(run, &capture_code(all_frames)).await?;
+        let tabs = v.as_array().ok_or("the browser gave no answer")?.clone();
+        // The values first: a tab is only marked as read back once they are
+        // hidden (a read cut short marks nothing).
+        {
+            let mut p = lock(&self.private);
+            for t in &tabs {
+                for value in t["values"].as_array().into_iter().flatten() {
+                    let Some(value) = value.as_str() else {
+                        continue;
+                    };
+                    add_secret(&mut p, value);
+                }
+            }
+            if p.typed_gen != generation {
+                // Typed again meanwhile: read again next time.
+                return Ok(());
+            }
+        }
+        // A field the owner changed and this read did not find again (the
+        // page may have moved its value out of it, or removed it) keeps its
+        // document from counting as read back.
+        let found = |t: &Value, id: u64| {
+            t["edits"]
+                .as_array()
+                .is_some_and(|e| e.iter().any(|n| n.as_u64() == Some(id)))
+        };
+        let complete = |t: &Value| {
+            let p = lock(&self.private);
+            p.edits
+                .iter()
+                .filter(|(d, _)| t["doc"] == d.as_str())
+                .all(|(_, id)| found(t, *id))
+        };
+        let want: Vec<Value> = tabs
+            .iter()
+            .filter(|t| t["captured"] == true && complete(t))
+            .map(|t| json!({"i": t["i"], "url": t["url"]}))
+            .collect();
+        let marked: Vec<u64> = if want.is_empty() {
+            Vec::new()
+        } else {
+            let code = MARK_CAPTURED_CODE
+                .replace("WANT", &Value::Array(want).to_string())
+                .replace("GEN", &generation.to_string());
+            let done = self.run_code(run, &code).await?;
+            done.as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_u64)
+                .collect()
+        };
+        let mut p = lock(&self.private);
+        for t in &tabs {
+            // Addresses typed into in a document now read back are no longer
+            // needed (its address may have changed since, in a single-page
+            // site).
+            let doc = t["doc"].as_str().unwrap_or("");
+            if t["marked"] == true
+                && !doc.is_empty()
+                && t["i"].as_u64().is_some_and(|i| marked.contains(&i))
+            {
+                p.pages.retain(|(_, d)| d != doc);
+                // Its changed fields were found again, every value hidden.
+                p.edits.retain(|(d, _)| d != doc);
+            }
+        }
+        // Read again next time while a private document could not be read
+        // back (a frame that failed may answer later; the page may change).
+        let all_read = tabs
+            .iter()
+            .all(|t| t["marked"] != true || t["i"].as_u64().is_some_and(|i| marked.contains(&i)));
+        if p.typed_gen == generation {
+            p.typed_dirty = !all_read;
+        }
+        Ok(())
+    }
+
+    /// Every field of the current tab and whether it takes private details
+    /// (`FIELDS_CODE`), read on Iris's side.
+    pub(crate) async fn private_fields(&self, run: &Running) -> Result<Fields> {
+        let v = self
+            .run_code(run, &FIELDS_CODE.replace("SENSITIVE", &secret_field_fn()))
+            .await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    /// After an action on a page holding a secret: a private field (or one
+    /// that held a secret) now holding something else that is not hidden
+    /// (a number field's arrows turned 737 into 738, the page cut a value)
+    /// is hidden too, or the page closes when it cannot be (answers true:
+    /// the action's result must not reach the agent). Run before the
+    /// action's result reaches the agent.
+    pub(crate) async fn hide_changed(&self, run: &Running, before: &Fields) -> bool {
+        let after = match self.private_fields(run).await {
+            Ok(a) => a,
+            Err(e) => {
+                crate::warn!("browser: could not check the page after an action: {e}");
+                self.close_current(run).await;
+                return true;
+            }
+        };
+        let secrets = self.filled_secrets();
+        let holds = |v: &str| !v.is_empty() && hide_secrets(v, &secrets) != v;
+        // Known in full (a value only partly matching one, such as a code
+        // stepped up past an earlier read of its first digits, is new).
+        let known = |v: &str| secrets.iter().any(|s| s == v.trim());
+        let mut changed: Vec<String> = Vec::new();
+        let mut unknown = false;
+        for (i, a) in after.iter().enumerate() {
+            let b = before.get(i).and_then(Option::as_ref);
+            let Some(a) = a else {
+                unknown |= b.is_some_and(|b| b.iter().any(|(v, _)| holds(v)));
+                continue;
+            };
+            match b {
+                Some(b) if b.len() == a.len() => {
+                    for ((v, private), (old, _)) in a.iter().zip(b) {
+                        if v != old && !v.trim().is_empty() && !known(v) && (*private || holds(old))
+                        {
+                            changed.push(v.clone());
+                        }
+                    }
+                }
+                _ => {
+                    let olds: Vec<&String> = b.into_iter().flatten().map(|(v, _)| v).collect();
+                    for (v, private) in a {
+                        if *private && !v.trim().is_empty() && !known(v) && !olds.contains(&v) {
+                            changed.push(v.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let mut close = unknown;
+        for v in changed {
+            if fill::watchable(&v) {
+                self.remember_secret(&v);
+                self.note_filled();
+            } else {
+                close = true;
+            }
+        }
+        if close {
+            self.close_current(run).await;
+        }
+        close
+    }
+
+    /// Close the current document to the agent (as if the owner typed
+    /// something private into it that Iris cannot hide).
+    pub(crate) async fn close_current(&self, run: &Running) {
+        let url = self
+            .page_info(run)
+            .await
+            .map(|(u, _)| u)
+            .unwrap_or_default();
+        if !url.is_empty() {
+            self.remember_private(&url);
+        }
+        let close = format!(
+            "async (page) => {{ /* iris:close */ await page.evaluate({}); return true; }}",
+            serde_json::to_string(CLOSE_JS).unwrap_or_default()
+        );
+        let _ = self.run_code(run, &close).await;
+    }
+
+    /// The owner (or a fill Iris cannot hide) put private details into the
+    /// page: earlier reads no longer count, and the next look reads again.
+    pub(crate) fn note_private_input(&self, in_frame: bool) {
+        let mut p = lock(&self.private);
+        p.typed_dirty = true;
+        p.typed_gen += 1;
+        p.typed_in_frame |= in_frame;
+    }
+
+    /// A picture of the page for the agent, with private details blacked
+    /// out (`SHOT_CODE`), as a tool result.
+    pub(crate) async fn masked_screenshot(&self, run: &Running, args: &Value) -> Result<Value> {
+        use base64::Engine as _;
+        let target = args["target"].as_str().or_else(|| args["ref"].as_str());
+        if let Some(t) = target
+            && !tools::is_ref(t)
+        {
+            return Err("Use a snapshot ref (like e12) as `target` here.".into());
+        }
+        let scale = if args["scale"] == "device" {
+            "device"
+        } else {
+            "css"
+        };
+        let opts = json!({"target": target, "scale": scale});
+        let code = shot_code(&mask_form_groups(&self.filled_secrets()), &opts)?;
+        let v = {
+            let _one = self.capture_lock.lock().await;
+            self.run_code_within(run, &code, CALL_TIMEOUT).await?
+        };
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let raw = b64.decode(v["data"].as_str().ok_or("the browser gave no picture")?)?;
+        let rects: Vec<[f64; 4]> = serde_json::from_value(v["rects"].clone())?;
+        let size = |k: &str| v[k].as_f64().ok_or("the browser gave no picture size");
+        let painted = paint_masks(&raw, size("width")?, size("height")?, &rects)?;
+        let what = if target.is_some() {
+            "element (its part on screen)"
+        } else if args["fullPage"] == true {
+            "screen (not the full page while private details are known: scroll and take \
+             another for more)"
+        } else {
+            "viewport"
+        };
+        Ok(json!({"content": [
+            {"type": "text", "text": format!("### Result\nScreenshot of the {what}. \
+                Passwords, card details and codes are blacked out.")},
+            {"type": "image", "data": b64.encode(painted), "mimeType": "image/png"},
+        ]}))
     }
 
     /// The focused field (`FIELD_FN`); with `mark`, a private one closes
@@ -1316,7 +2271,12 @@ impl Browser {
         mark: bool,
         force: bool,
     ) -> Result<Field> {
-        let v = self.run_code(run, &field_code(mark, force)).await?;
+        let edit = {
+            let mut p = lock(&self.private);
+            p.edit_seq += 1;
+            p.edit_seq
+        };
+        let v = self.run_code(run, &field_code(mark, force, edit)).await?;
         let field = Field {
             url: v["url"]
                 .as_str()
@@ -1324,22 +2284,42 @@ impl Browser {
                 .into(),
             private: v["private"] != false,
             frame: v["frame"] != false,
+            doc: v["doc"].as_str().unwrap_or("").into(),
+            // (A field Iris could not find in another site's frame still
+            // needs reading again: never found, it keeps the page closed.)
+            edit: (v["edit"] == true || v["edit"] == "unknown").then_some(edit),
+            empty: v["empty"] == true,
         };
         if mark && field.private {
-            self.remember_private(&field.url);
+            {
+                let mut p = lock(&self.private);
+                p.ever_marked = true;
+                if field.edit.is_some() {
+                    let e = (field.doc.clone(), edit);
+                    p.edits.push(e);
+                }
+            }
+            self.remember_private_in(&field.url, &field.doc);
+            self.note_private_input(field.frame);
         }
         Ok(field)
     }
 
     /// Keep the agent off this address (see `page_access`).
     pub(crate) fn remember_private(&self, url: &str) {
+        self.remember_private_in(url, "");
+    }
+
+    /// Keep the agent off this address, typed into in document `doc`.
+    fn remember_private_in(&self, url: &str, doc: &str) {
         let mut p = lock(&self.private);
-        let key = page_key(url).to_string();
-        if !p.pages.contains(&key) {
+        p.ever_marked = true;
+        let entry = (page_key(url).to_string(), doc.to_string());
+        if !p.pages.contains(&entry) {
             if p.pages.len() >= PRIVATE_PAGES_MAX {
                 p.pages.remove(0);
             }
-            p.pages.push(key);
+            p.pages.push(entry);
         }
     }
 
@@ -1554,9 +2534,11 @@ impl Browser {
                     let _ = self.follow_new_tab(run).await;
                 }
             }
-            let shot = self
-                .run_code_within(run, &frame_code(width, mode.quality()), FRAME_TIMEOUT)
-                .await;
+            let shot = {
+                let _one = self.capture_lock.lock().await;
+                self.run_code_within(run, &frame_code(width, mode.quality()), FRAME_TIMEOUT)
+                    .await
+            };
             // Failures are logged (the first, then every 50th; no page
             // content), so a live view that stays blank can be explained.
             match &shot {
@@ -1668,6 +2650,19 @@ impl Browser {
     }
 
     pub fn hand_back(&self) {
+        // Before the agent can act again: what the owner typed is hidden, and
+        // private details they may have changed any way (a page's buttons,
+        // arrow keys) are read back before its turn.
+        if self.control() != Control::Agent {
+            {
+                let mut p = lock(&self.private);
+                flush_typed(&mut p);
+                // The agent may change the page meanwhile: the next typing
+                // checks the field again.
+                p.field_checked = None;
+            }
+            self.note_private_input(false);
+        }
         if self.control.send_replace(Control::Agent) != Control::Agent {
             crate::info!("browser: control handed back");
         }
@@ -1793,9 +2788,30 @@ impl Browser {
         };
         let still = || self.controller(device_id).map(|_| ());
         let kind = ev["kind"].as_str().unwrap_or("");
+        if kind == "key" && !KEYS.iter().any(|k| ev["key"] == *k) {
+            return Err("that key is not supported".into());
+        }
         if kind != "text" && kind != "scroll" {
             // Focus may move: check the field again before more typing.
-            lock(&self.private).field_checked = None;
+            let mut p = lock(&self.private);
+            p.field_checked = None;
+            // What was typed so far is complete (Backspace edits it).
+            let backspace = kind == "key" && ev["key"] == "Backspace";
+            if backspace && p.typing_private {
+                p.typed_text.pop();
+            } else if !backspace {
+                flush_typed(&mut p);
+            }
+        }
+        // What the owner changed is read back before anything that may
+        // submit it or take its field away (a tap on Review, Enter): the
+        // value is still in its field now.
+        let edits = kind == "key" && matches!(ev["key"].as_str(), Some("Backspace" | "Delete"));
+        if !matches!(kind, "text" | "scroll") && !edits && lock(&self.private).typed_dirty {
+            if let Err(e) = self.capture_typed(&run).await {
+                crate::warn!("browser: could not read back what the owner typed: {e}");
+            }
+            still()?;
         }
         match kind {
             "tap" => {
@@ -1836,6 +2852,23 @@ impl Browser {
                     .iter()
                     .find(|k| **k == key)
                     .ok_or("that key is not supported")?;
+                // Deleting edits the field like typing does: a private one is
+                // marked first (and read back again before the agent's turn).
+                if matches!(*key, "Backspace" | "Delete") {
+                    let field = self.focused_field(&run, true, false).await?;
+                    // Taking back what was just typed stays part of that
+                    // typing; anything else is a change to read again.
+                    {
+                        let mut p = lock(&self.private);
+                        if let Some(id) = field.edit
+                            && *key == "Backspace"
+                            && !p.run_edits.is_empty()
+                        {
+                            p.run_edits.push(id);
+                        }
+                    }
+                    still()?;
+                }
                 self.act(&run, "browser_press_key", json!({"key": key}))
                     .await?;
             }
@@ -1848,6 +2881,12 @@ impl Browser {
                     .await?;
             }
             _ => return Err("unknown input kind".into()),
+        }
+        // A tap or key may change a private value without typing (a page's
+        // keypad or stepper, an arrow key): read back again before the next
+        // one, which may submit it and take its field away.
+        if !matches!(kind, "text" | "scroll") && lock(&self.private).ever_marked {
+            self.note_private_input(false);
         }
         Ok(())
     }
@@ -1865,8 +2904,26 @@ impl Browser {
             .field_checked
             .is_some_and(|t| t.elapsed() < FIELD_CHECK_FOR);
         if !fresh {
-            self.focused_field(run, true, false).await?;
-            lock(&self.private).field_checked = Some(std::time::Instant::now());
+            let field = self.focused_field(run, true, false).await?;
+            let mut p = lock(&self.private);
+            p.field_checked = Some(std::time::Instant::now());
+            if !field.private || field.doc != p.typing_doc {
+                flush_typed(&mut p);
+            }
+            if let Some(id) = field.edit {
+                if p.run_edits.is_empty() && p.typed_text.is_empty() {
+                    p.run_from_empty = field.empty;
+                }
+                p.run_edits.push(id);
+            }
+            p.typing_private = field.private;
+            p.typing_doc = field.doc;
+        }
+        {
+            let mut p = lock(&self.private);
+            if p.typing_private {
+                p.typed_text.push_str(text);
+            }
         }
         let mut other = String::new();
         for c in text.chars().chain(std::iter::once('\0')) {
@@ -1890,6 +2947,12 @@ impl Browser {
             }
         }
         Ok(())
+    }
+
+    /// The agent holds the page again: what the owner typed is complete
+    /// (also when their last key raced handing back).
+    pub(crate) fn owner_typing_done(&self) {
+        flush_typed(&mut lock(&self.private));
     }
 
     /// The focused field must be checked again before the owner's typing.
@@ -1916,20 +2979,33 @@ impl Browser {
     }
 
     /// What the agent may do on the current page: the owner typed private
-    /// details into this document, or on this address (closed); a saved
-    /// secret Iris filled is still on it (redacted reads only); or open.
+    /// details into this document that Iris could not read back, or a
+    /// document at this address that is gone (history may bring it back
+    /// with what was typed) (closed); a secret Iris knows is on it (usable,
+    /// hidden); or open. What the owner typed since the last look is read
+    /// back first (`capture_typed`).
     pub(crate) async fn page_access(&self, run: &Running) -> Result<Access> {
+        if lock(&self.private).typed_dirty
+            && let Err(e) = self.capture_typed(run).await
+        {
+            crate::warn!("browser: could not read back what the owner typed: {e}");
+        }
         let (typed, filled) = {
             let p = lock(&self.private);
-            (!p.pages.is_empty(), p.filled)
+            (p.ever_marked || !p.pages.is_empty(), p.filled)
         };
         if typed {
-            let (url, marked) = self.page_info(run).await?;
-            if marked
+            let (url, marked, captured, closed) = self.page_state(run).await?;
+            // An address typed into stays closed for every document there
+            // until the one typed into was read back (another one read back
+            // there does not count: history or the site may bring back what
+            // was typed).
+            if closed
+                || (!captured && marked)
                 || lock(&self.private)
                     .pages
                     .iter()
-                    .any(|p| p == page_key(&url))
+                    .any(|(p, _)| p == page_key(&url))
             {
                 return Ok(Access::Typed);
             }
@@ -1987,6 +3063,60 @@ mod tests {
         };
         let b = Browser::new(BrowserConfig::default(), &paths, Hub::new());
         (tmp, b)
+    }
+
+    fn png_of(w: u32, h: u32, color: png::ColorType, fill: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut e = png::Encoder::new(&mut out, w, h);
+        e.set_color(color);
+        e.set_depth(png::BitDepth::Eight);
+        let mut wr = e.write_header().unwrap();
+        let n = (w * h) as usize * color.samples();
+        wr.write_image_data(&vec![fill; n]).unwrap();
+        drop(wr);
+        out
+    }
+
+    fn pixels_of(png_bytes: &[u8]) -> (u32, u32, usize, Vec<u8>) {
+        let mut d = png::Decoder::new(std::io::Cursor::new(png_bytes))
+            .read_info()
+            .unwrap();
+        let mut buf = vec![0; d.output_buffer_size().unwrap()];
+        let info = d.next_frame(&mut buf).unwrap();
+        (info.width, info.height, info.color_type.samples(), buf)
+    }
+
+    #[test]
+    fn masks_are_painted_black_where_the_page_shows_private_details() {
+        // A white 10x10 picture of a 10x10 area; one private box at (3,3).
+        let white = png_of(10, 10, png::ColorType::Rgba, 255);
+        let out = paint_masks(&white, 10.0, 10.0, &[[3.0, 3.0, 2.0, 2.0]]).unwrap();
+        let (w, h, c, px) = pixels_of(&out);
+        assert_eq!((w, h, c), (10, 10, 4));
+        let at = |x: usize, y: usize| &px[(y * 10 + x) * 4..(y * 10 + x) * 4 + 4];
+        // The box and a pixel around it are black and opaque; the rest is not.
+        for (x, y) in [(2, 2), (3, 3), (4, 4), (5, 5)] {
+            assert_eq!(at(x, y), [0, 0, 0, 255], "({x},{y})");
+        }
+        for (x, y) in [(1, 1), (6, 6), (0, 9), (9, 0)] {
+            assert_eq!(at(x, y), [255, 255, 255, 255], "({x},{y})");
+        }
+        // A picture at twice the area's size: the box is scaled with it.
+        let big = png_of(20, 20, png::ColorType::Rgb, 255);
+        let out = paint_masks(&big, 10.0, 10.0, &[[3.0, 3.0, 2.0, 2.0]]).unwrap();
+        let (_, _, c, px) = pixels_of(&out);
+        assert_eq!(c, 3);
+        let at = |x: usize, y: usize| &px[(y * 20 + x) * 3..(y * 20 + x) * 3 + 3];
+        // (6..10 doubled, a pixel wider: 5..11.)
+        assert_eq!(at(5, 5), [0, 0, 0]);
+        assert_eq!(at(10, 10), [0, 0, 0]);
+        assert_eq!(at(4, 4), [255, 255, 255]);
+        assert_eq!(at(11, 11), [255, 255, 255]);
+        // Off the picture, clamped; a picture not the area's shape, refused.
+        assert!(paint_masks(&white, 10.0, 10.0, &[[-5.0, -5.0, 100.0, 1.0]]).is_ok());
+        assert!(paint_masks(&white, 10.0, 20.0, &[]).is_err());
+        assert!(paint_masks(&white, 10.0, 10.0, &[[f64::NAN, 0.0, 1.0, 1.0]]).is_err());
+        assert!(paint_masks(b"not a png", 10.0, 10.0, &[]).is_err());
     }
 
     #[tokio::test]
@@ -2197,6 +3327,44 @@ mod tests {
         let amex = ["378282246310005".to_string()];
         assert_eq!(hide_secrets("3782 822463 10005", &amex), "[hidden]");
         assert_eq!(hide_secrets("nothing here", &secrets), "nothing here");
+        // A card number known only in groups (typed or saved that way) is
+        // hidden however a page writes it, and so are its picture masks.
+        let grouped = ["5555 4444 3333 1111".to_string()];
+        for shown in [
+            "5555444433331111",
+            "5555-4444-3333-1111",
+            "5555 4444 3333 1111",
+        ] {
+            assert_eq!(hide_secrets(shown, &grouped), "[hidden]", "{shown}");
+        }
+        let forms = mask_form_groups(&grouped);
+        assert_eq!(forms.len(), 1);
+        for f in ["5555444433331111", "5555-4444-3333-1111"] {
+            assert!(forms[0].contains(&f.to_string()), "{f}");
+        }
+        // Shown group by group in a card preview (a snapshot lists each
+        // group apart): every group is hidden, nothing else.
+        let preview = "- generic [ref=e5]:\n  - generic [ref=e6]: \"5555\"\n  - generic [ref=e7]: \"4444\"\n  - generic [ref=e8]: \"3333\"\n  - generic [ref=e9]: \"1111\"\n- generic [ref=e10]: Expires 12/26, order 2024";
+        // (Never printed: it would show the number if the check failed.)
+        let t = hide_secrets(preview, &grouped);
+        assert!(!t.contains("5555") && !t.contains("4444") && !t.contains("3333"));
+        assert!(t.matches("[hidden]").count() == 4);
+        assert!(t.contains("[ref=e9]") && t.contains("Expires 12/26, order 2024"));
+        // Groups far apart, or digits that are not this card's in order, stay.
+        let apart = format!("5555 {} 4444", "x".repeat(100));
+        assert_eq!(hide_secrets(&apart, &grouped), apart);
+        assert_eq!(hide_secrets("1111 3333 4444", &grouped), "1111 3333 4444");
+        // A code shown digit by digit in boxes: hidden whole; a part of it,
+        // or other digits, stay.
+        let code = ["482913".to_string()];
+        let boxes = "- generic [ref=e3]: \"4\"\n- generic [ref=e4]: \"8\"\n- generic [ref=e5]: \"2\"\n- generic [ref=e6]: \"9\"\n- generic [ref=e7]: \"1\"\n- generic [ref=e8]: \"3\"";
+        let t = hide_secrets(boxes, &code);
+        assert!(t.matches("[hidden]").count() == 6);
+        assert_eq!(hide_secrets("Step 4 of 8", &code), "Step 4 of 8");
+        // Not a card number: left as it is.
+        assert_eq!(card_digits("12 34"), None);
+        assert_eq!(card_digits("5555444433331111"), None);
+        assert_eq!(card_digits("pass 5555 4444 3333"), None);
     }
 
     #[test]

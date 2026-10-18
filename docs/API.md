@@ -2838,15 +2838,63 @@ image:
 
 Typing into a private field (a password, card, or one-time-code field, by
 its type, autocomplete, name, or label, or a field in another site's
-frame; checked before the first `text` input, again after any other input, and at least every 3 seconds of typing), and filling a `password`,
-`number`, `exp`, or `cvc`, closes that page to the agent before anything is
-typed: its browser tools other than `browser_navigate`,
+frame; checked before the first `text` input, again after any other input,
+and at least every 3 seconds of typing; `Backspace` and `Delete` count as
+typing) marks that document and its address before anything is typed, and
+starts a new typing generation. Before the
+agent's next browser tool call that reads or acts on a page, Iris reads
+back, on its own side, the values of every private field and private
+editable area in every tab and frame (a field that takes only an expiry
+month, year or date does not count, also in another site's frame: an
+expiry is not hidden, so typing into one neither closes the page nor holds
+back its read-back; pictures still black it out), and of every field the
+owner typed
+private details into (remembered on the element, so a "show password"
+button turning it into a plain text field does not drop it); in another
+site's frame, where the field cannot be told apart, every field and
+editable area that holds something once the owner typed in such a frame.
+Every hand-back starts a new generation too (the owner may have changed a
+value with a page's buttons or arrow keys), so values are read again before
+the agent's next call. They are also read right before Iris passes on a
+`tap`, `navigate`, `back`, or a key other than `Backspace` and `Delete`
+after the owner changed something, while the value is still in its field
+(a review step may move it into the page's text and remove the field);
+once the owner typed anything private this session, every tap or key they
+send counts as a change (a page's stepper or keypad, an arrow key).
+Every field the owner types into or deletes from is tagged with an edit id
+(a plain property on the element; in another site's frame, set from that
+frame, and a field Iris cannot find there keeps the page closed until it
+moves on), and its document counts as read back only once a read finds
+that very field again holding a value long enough to look for, every value
+hideable; a field the page removed, replaced or emptied first keeps it
+closed. A
+field the owner typed private details into stays private however it looks
+later. What the owner types into a private field is also kept as Iris
+passes it on (`Backspace` takes back the last character; a tap, another
+key, typing into an ordinary field or another document, handing back, or
+the agent's next call completes it): 4 or more characters (or a 3-digit
+code) join the secrets hidden from the agent, so another document showing
+it (a receipt) is covered too. Values of 4 or more
+characters (or a 3-digit code) join the secrets hidden from the agent, and
+only then is a tab read completely marked as read back for that generation
+(a read cut short marks nothing): it stays usable like a page holding a
+secret Iris filled (below), also after its address changes within the
+document, and every address typed into in that document (a single-page
+site may have moved since) is forgotten. Typing again starts a new
+generation, so an earlier read no longer counts. A document marked private
+keeps being checked after its addresses are forgotten, values are read
+again on each call until every such document is read back, and once the
+owner typed in another site's frame every field of such frames is read
+back for the rest of the session. A
+document that could not be read back (a shorter value, a frame that
+failed) stays closed: its browser tools other than `browser_navigate`,
 `browser_navigate_back`, `browser_tabs`, `browser_handle_dialog`, and the
-fill tools answer that the owner typed private details there. Both the document (in whichever tab, also after its
-address changes within it) and its address (ignoring the fragment; a page
-brought back from history may still hold what was typed) stay closed until
-the browser closes. Pages and addresses are read from the browser itself,
-never from page-controlled text. A login is filled only when its site
+fill tools answer that the owner typed private details there, in whichever
+tab, and its address (ignoring the fragment; a page brought back from
+history may still hold what was typed) stays closed until the browser
+closes, for every document there (another one read back there does not
+count), unless the document typed into was read back. Pages and addresses are read from the
+browser itself, never from page-controlled text. A login is filled only when its site
 matches that real address and the focused field is not in another site's
 frame.
 
@@ -4288,30 +4336,93 @@ Iris locates each field and types its value through Playwright's own
 `browser_run_code_unsafe` on Iris's side (never offered to the agent); the
 values never appear in a tool result, message, log, or command line. The
 answers are `filled`, `filled and submitted`, `denied`, `not filled (...)`,
-or `not found (...)`. A password, card number, CVC, or expiry that Iris filled
-closes the page to the agent while one of the owner's saved secrets is still
-on it (in a field value or the text of any frame, also in open shadow roots,
-including the forms Iris hides below; a frame that cannot be read counts as
-holding one), for example until the sign-in form is sent or cleared, even if
-the address never changes (a sign-in inside a frame). Meanwhile `browser_snapshot` still works
-(with the secrets hidden, below), so the agent can tell whether a sign-in
-went through; screenshots, searches, and actions are refused. With `submit`
+or `not found (...)`. While a secret Iris knows (a password, card number or
+CVC it filled, or a value the owner typed and Iris read back) is on the
+page (in a field value or the text of any frame, also in open shadow roots;
+a frame that cannot be read counts as holding one), the page stays usable:
+snapshots, clicks (left button), hovering, scrolling and picking from lists
+work, with the secrets hidden (below), and screenshots are masked (below).
+Refused, with an answer saying why: `browser_type`, `browser_fill_form`,
+`browser_press_key`, `browser_drag`, `browser_mouse_drag_xy`,
+`browser_mouse_down`, `browser_mouse_up`, and clicks with another button
+(an edit could cut a secret into a part no longer recognized, or move part
+of it into another field), and searches (below). Before any other action
+there, Iris reads what every field holds (on its side); afterwards, a
+private field, or one that held a secret, now holding something new that
+is not hidden (a number field's arrows, a page script reacting to the
+click) has that hidden too before the result comes back, or the page closes
+(and the result is withheld) when it is too short to look for. When a
+filled field keeps something other than the saved value (a length limit
+cut it, the page changed it), that is hidden too, or the page closes. A
+page closed this way (something private Iris cannot hide) stays closed
+until it is gone: reading back the owner's typing does not reopen it. With `submit`
 or `submit_ref`, `fill_saved_login` waits up to 5 seconds for the password
 to leave the page and answers `filled and submitted (the password is no
 longer on the page: ...)` or `filled and submitted, but the password is
 still in its field (...)`. A secret too short to look for (under 4
-characters, except a 3-digit code) closes the page as if the owner had typed
-it (see below). The fill tools themselves stay usable there. The owner's saved passwords and card
+characters, except a 3-digit code) closes the page like a typed value Iris
+could not read back (see below). The fill tools themselves stay usable there. The owner's saved passwords and card
 numbers, and every value Iris filled this browser session (a CVC only
 where it stands alone), are replaced with `[hidden]` in every result the
 agent gets (addresses, titles, dialogs, page text; also their common
-encodings, card numbers written in groups, and values trimmed and with
-whitespace runs collapsed, as snapshots show them). While the page's text or
-fields (all frames) show one, screenshots, `browser_find`,
-`browser_wait_for`, and targets written as selectors instead of snapshot
-refs are refused (their outcome would tell what is hidden); a screenshot
-is checked again once taken and dropped if the page became private or
-showed one meanwhile. Expiry dates
+encodings, card numbers written in groups or, for one known only in
+groups, without them, or shown group by group in separate parts of the
+page such as a card preview (runs of digits close together that make up
+eight or more of its digits in order; for a code of 4 to 11 digits shown
+digit by digit, all of it), and values trimmed and with whitespace runs
+collapsed, as snapshots show them). While the page's text or fields (all
+frames) show one, `browser_find`, `browser_wait_for`, and targets written
+as selectors instead of snapshot refs are refused (their outcome would tell
+what is hidden), `browser_snapshot` takes no `target`, `depth` or
+`boxes` (a part of the page, or positions between its lines, could show a
+secret's parts apart, where they are not recognized), and an error from
+Playwright comes back as its first line without the markup it quotes from
+the page (an element and its text).
+
+**Masked screenshots.** While the browser knows any secret (the owner's
+saved passwords and card numbers count from the start, so in practice
+always once one is saved), `browser_take_screenshot` is answered by Iris
+instead of passed through. Iris works out what to black out: every
+private field (as above, also `select`s such as an expiry month, and any
+field the owner typed private details into) in every frame, every field
+whose value contains a secret, every element whose text contains one
+(Playwright's own text search, in its isolated world, one search per
+secret so an element holding another secret inside it is still found; and,
+for each text node holding one, the smallest element showing all of that
+text, also text running past its own box; for a secret split over several
+drawn text nodes, such as a number styled group by group, every node a
+match spans, found on Iris's side across neighbouring nodes so a hidden
+copy elsewhere in the element does not take its place (a code shorter than
+six digits only as whole nodes of digits alone, such as boxes holding one
+digit each); a match shown
+without a box of its own, such as `display: contents`, gives the nearest
+ancestor with one),
+and any frame Iris cannot look into, whole. Secrets are looked for in
+every written form text redaction knows (encodings, card numbers written
+in groups, also a number known only in groups written without them),
+whatever the case and
+the kind of white space (a non-breaking space matches a space). Only what
+is on screen is pictured (capturing beyond it can lay the page out again):
+a `target` (a snapshot ref) is scrolled into view first and its part on
+screen pictured, and `fullPage` gives the viewport, saying so. It takes the
+picture with Chrome's own capture (`Page.captureScreenshot`, in CSS pixels
+like Playwright's own, or device pixels with `scale: "device"`, one picture
+at a time with the live view's), between
+two measurements of those areas that must agree (a page moving meanwhile is
+measured again, three times at most, else no picture), and paints the areas
+black itself, a pixel wider on every side (`paint_masks`, with the `png`
+crate), refusing a picture whose size does not match what it asked for.
+Nothing is drawn in the page and nothing there depends on the secrets: the
+page lists its private fields and every text node with the element that
+shows it, the same way for every page; matching happens on Iris's side and
+positions come from Playwright (`boundingBox`), so a page planting guesses
+cannot tell which ones matched. The picture is always a PNG (`type` is
+ignored). The answer is `Screenshot of the viewport. Passwords, card
+details and codes are blacked out.` (or of the element, its part on
+screen, or of the screen when the full page was asked for) plus the image. Text rendered as
+pictures (a canvas, an image) is not recognized. A screenshot is checked
+again once taken and dropped if the page closed meanwhile (or, for one
+passed through, if a secret became known). Expiry dates
 and names are not hidden. Playwright writes no
 page snapshots to files (`snapshot.mode: none`); `browser_snapshot`
 answers inline, and Playwright's output folder (screenshot files, its
@@ -4323,9 +4434,9 @@ an abandoned call.
   (browsers drop them while parsing) is refused.
 - Anything but `browser_navigate`, `browser_navigate_back`, `browser_tabs`,
   `browser_handle_dialog`, and Iris's own tools while the current page holds
-  private details the owner typed (see [Input while in
-  control](#4-websocket-get-apiws)), and anything but those and
-  `browser_snapshot` while a saved secret Iris filled is still on it.
+  private details the owner typed that Iris could not read back (see [Input
+  while in control](#4-websocket-get-apiws)), and typing, keys, drags and
+  searches while a secret Iris knows is on it.
 
 Each call waits while the owner has taken over (up to about 50 seconds,
 then tells the agent the user is still using it), and checks again once it
