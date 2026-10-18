@@ -2844,9 +2844,14 @@ typing) marks that document and its address before anything is typed, and
 starts a new typing generation. Before the
 agent's next browser tool call that reads or acts on a page, Iris reads
 back, on its own side, the values of every private field and private
-editable area in every tab and frame (in another site's frame, where the
-field cannot be told apart, every field and editable area that holds
-something once the owner typed in such a frame). Values of 4 or more
+editable area in every tab and frame, and of every field the owner typed
+private details into (remembered on the element, so a "show password"
+button turning it into a plain text field does not drop it); in another
+site's frame, where the field cannot be told apart, every field and
+editable area that holds something once the owner typed in such a frame.
+Every hand-back starts a new generation too (the owner may have changed a
+value with a page's buttons or arrow keys), so values are read again before
+the agent's next call. Values of 4 or more
 characters (or a 3-digit code) join the secrets hidden from the agent, and
 only then is a tab read completely marked as read back for that generation
 (a read cut short marks nothing): it stays usable like a page holding a
@@ -4320,7 +4325,9 @@ is not hidden (a number field's arrows, a page script reacting to the
 click) has that hidden too before the result comes back, or the page closes
 (and the result is withheld) when it is too short to look for. When a
 filled field keeps something other than the saved value (a length limit
-cut it, the page changed it), that is hidden too, or the page closes. With `submit`
+cut it, the page changed it), that is hidden too, or the page closes. A
+page closed this way (something private Iris cannot hide) stays closed
+until it is gone: reading back the owner's typing does not reopen it. With `submit`
 or `submit_ref`, `fill_saved_login` waits up to 5 seconds for the password
 to leave the page and answers `filled and submitted (the password is no
 longer on the page: ...)` or `filled and submitted, but the password is
@@ -4345,7 +4352,9 @@ element where it is when the picture is taken. Masked are every private
 field (as above, also `select`s such as an expiry month) in every frame,
 every field whose value contains a secret, every element whose text
 contains one (Playwright's own text search, which runs apart from the
-page's scripts; secrets never go into the page), and any frame Iris cannot
+page's scripts, plus the element around each text node holding one, so a
+secret beside a child element holding another is covered too; text is
+compared on Iris's side and secrets never go into the page), and any frame Iris cannot
 look into, whole. Secrets are looked for in every written form text
 redaction knows (encodings, card numbers written in groups), in a few
 batched text searches per frame. Its own arguments (`type`, `fullPage`, `target` as a

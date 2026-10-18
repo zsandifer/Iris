@@ -535,7 +535,7 @@ fn field_code(
         "async (page) => {{
   {find}
   if (info.top !== {top} || info.frame !== {frame} || info.tag !== {tag} || info.kind !== {kind}) return {{ moved: true }};
-  if ({mark}) await page.evaluate({mark_js});
+  if ({mark}) await page.evaluate({close_js});
   const values = {values};
   let filled = false;
   let kept;
@@ -591,7 +591,7 @@ fn field_code(
         frame = serde_json::to_string(&at.frame)?,
         tag = serde_json::to_string(&at.tag)?,
         kind = serde_json::to_string(&at.kind)?,
-        mark_js = serde_json::to_string(super::MARK_JS)?,
+        close_js = serde_json::to_string(super::CLOSE_JS)?,
         values = serde_json::to_string(values)?,
     ))
 }
@@ -658,7 +658,6 @@ async fn put(
     let mark = private && !watched;
     if mark {
         state.browser.remember_private(&at.top);
-        state.browser.note_private_input(false);
     }
     if secret {
         for v in values {

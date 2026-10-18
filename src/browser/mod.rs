@@ -488,6 +488,7 @@ const PAGE_CODE: &str = r#"async (page) => ({
   title: await page.title(),
   private: await page.evaluate("window.__irisPrivate === true"),
   captured: await page.evaluate("window.__irisCaptured_GEN === true"),
+  closed: await page.evaluate("window.__irisClosed === true"),
 })"#;
 
 /// `PAGE_CODE` asking whether this document was read back after the
@@ -540,7 +541,7 @@ const CAPTURE_CODE: &str = r#"async (page) => { /* iris:capture */
             if (editable && !e.isContentEditable) continue;
             if (!editable && ['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'hidden', 'image', 'range', 'color'].includes(e.type)) continue;
             const v = String(editable ? e.innerText || '' : e.value || '').trim();
-            if (v && (all || sensitive(e))) vals.push(v);
+            if (v && (all || e.__irisTyped === true || sensitive(e))) vals.push(v);
           }
           for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
         };
@@ -600,7 +601,7 @@ const FIELDS_CODE: &str = r#"async (page) => { /* iris:fields */
         for (const e of root.querySelectorAll('input, textarea, [contenteditable]')) {
           const editable = e.tagName !== 'INPUT' && e.tagName !== 'TEXTAREA';
           if (editable && !e.isContentEditable) continue;
-          vals.push([String(editable ? e.innerText || '' : e.value || ''), e.type === 'password' || sensitive(e)]);
+          vals.push([String(editable ? e.innerText || '' : e.value || ''), e.type === 'password' || e.__irisTyped === true || sensitive(e)]);
         }
         for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
       };
@@ -611,6 +612,15 @@ const FIELDS_CODE: &str = r#"async (page) => { /* iris:fields */
   }
   return out;
 }"#;
+
+/// `SHOT_CODE` for these secret forms and screenshot options.
+pub(crate) fn shot_code(forms: &[String], opts: &Value) -> Result<String> {
+    Ok(SHOT_CODE
+        .replace("SECRETS", &serde_json::to_string(forms)?)
+        .replace("OPTS", &opts.to_string())
+        .replace("NONCE", &new_id())
+        .replace("SENSITIVE", SENSITIVE_FN))
+}
 
 /// What `FIELDS_CODE` found: per frame, (value, private) of each field.
 pub(crate) type Fields = Vec<Option<Vec<(String, bool)>>>;
@@ -646,6 +656,40 @@ const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
       if (!el) throw new Error('the page could not be checked for private details');
       await el.evaluate((e, a) => e.setAttribute(a, ''), attr);
       continue;
+    }
+    if (secrets.length) {
+      // Text holding a secret, node by node (compared here, never in the
+      // page): its element is masked whole, also when a child element
+      // holds another match (which the text search below would pick alone).
+      const low = secrets.map((s) => s.toLowerCase());
+      const texts = await f.evaluate(() => {
+        const out = [];
+        const walk = (root) => {
+          const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+          for (let n = w.nextNode(); n; n = w.nextNode()) out.push(n.data);
+          for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
+        };
+        walk(document);
+        return out;
+      }).catch(() => null);
+      if (texts === null) throw new Error('the page could not be checked for private details');
+      const hits = [];
+      texts.forEach((t, i) => { const l = t.toLowerCase(); if (low.some((s) => l.includes(s))) hits.push(i); });
+      if (hits.length) {
+        await f.evaluate(([attr, hits]) => {
+          const want = new Set(hits);
+          let i = 0;
+          const walk = (root) => {
+            const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+            for (let n = w.nextNode(); n; n = w.nextNode()) {
+              if (want.has(i) && n.parentElement) n.parentElement.setAttribute(attr, '');
+              i++;
+            }
+            for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
+          };
+          walk(document);
+        }, [attr, hits]);
+      }
     }
     masks.push(f.locator('[' + attr + ']'));
     if (secrets.length) {
@@ -713,6 +757,9 @@ const FIELD_FN: &str = r#"() => {
   const priv = FORCE || frame || (field && sensitive(e));
   if (MARK && priv) {
     try { Object.defineProperty(window, '__irisPrivate', { value: true }); } catch (_) {}
+    // The field itself is remembered as private, whatever it looks like
+    // later (a "show password" button makes it an ordinary text field).
+    try { if (field) Object.defineProperty(e, '__irisTyped', { value: true }); } catch (_) {}
     try {
       if (!window.__irisDoc) Object.defineProperty(window, '__irisDoc', { value: Math.random().toString(36).slice(2) + Date.now().toString(36) });
     } catch (_) {}
@@ -750,8 +797,9 @@ const SECRET_CHECK_CODE: &str = r#"async (page) => {
   return out.join('\n');
 }"#;
 
-/// Marks the current document private (see `page_access`).
-pub(crate) const MARK_JS: &str = "(() => { try { Object.defineProperty(window, '__irisPrivate', { value: true }); } catch (_) {} })()";
+/// Closes the current document to the agent for good (until it is gone):
+/// it holds something private Iris cannot hide, which no read-back undoes.
+pub(crate) const CLOSE_JS: &str = "(() => { try { Object.defineProperty(window, '__irisPrivate', { value: true }); } catch (_) {} try { Object.defineProperty(window, '__irisClosed', { value: true }); } catch (_) {} })()";
 
 /// Run `FIELD_FN` from Playwright's Node side, with the real address.
 fn field_code(mark: bool, force: bool) -> String {
@@ -1547,18 +1595,24 @@ impl Browser {
     /// anything the page wrote) and whether the owner typed private
     /// details into this document.
     pub(crate) async fn page_info(&self, run: &Running) -> Result<(String, bool)> {
-        let (url, marked, captured) = self.page_state(run).await?;
-        Ok((url, marked && !captured))
+        let (url, marked, captured, closed) = self.page_state(run).await?;
+        Ok((url, closed || (marked && !captured)))
     }
 
     /// The current tab's address, whether the owner typed private details
-    /// into this document, and whether Iris read them back since.
-    async fn page_state(&self, run: &Running) -> Result<(String, bool, bool)> {
+    /// into this document, whether Iris read them back since, and whether
+    /// it was closed for good (`CLOSE_JS`).
+    async fn page_state(&self, run: &Running) -> Result<(String, bool, bool, bool)> {
         let generation = lock(&self.private).typed_gen;
         let v = self.run_code(run, &page_code(generation)).await?;
         let url = v["url"].as_str().ok_or("the browser has no open page")?;
         self.set_page_info(Some(url), v["title"].as_str());
-        Ok((url.to_string(), v["private"] == true, v["captured"] == true))
+        Ok((
+            url.to_string(),
+            v["private"] == true,
+            v["captured"] == true,
+            v["closed"] == true,
+        ))
     }
 
     /// The current tab's address.
@@ -1715,12 +1769,11 @@ impl Browser {
         if !url.is_empty() {
             self.remember_private(&url);
         }
-        let mark = format!(
-            "async (page) => {{ await page.evaluate({}); return true; }}",
-            serde_json::to_string(MARK_JS).unwrap_or_default()
+        let close = format!(
+            "async (page) => {{ /* iris:close */ await page.evaluate({}); return true; }}",
+            serde_json::to_string(CLOSE_JS).unwrap_or_default()
         );
-        let _ = self.run_code(run, &mark).await;
-        self.note_private_input(false);
+        let _ = self.run_code(run, &close).await;
     }
 
     /// The owner (or a fill Iris cannot hide) put private details into the
@@ -1746,12 +1799,7 @@ impl Browser {
         {
             return Err("Use a snapshot ref (like e12) as `target` here.".into());
         }
-        let forms = mask_forms(&self.filled_secrets());
-        let code = SHOT_CODE
-            .replace("SECRETS", &serde_json::to_string(&forms)?)
-            .replace("OPTS", &opts.to_string())
-            .replace("NONCE", &new_id())
-            .replace("SENSITIVE", SENSITIVE_FN);
+        let code = shot_code(&mask_forms(&self.filled_secrets()), &opts)?;
         let v = self.run_code_within(run, &code, CALL_TIMEOUT).await?;
         let data = v["data"].as_str().ok_or("the browser gave no picture")?;
         let what = if opts["target"].is_string() {
@@ -2138,6 +2186,9 @@ impl Browser {
     pub fn hand_back(&self) {
         if self.control.send_replace(Control::Agent) != Control::Agent {
             crate::info!("browser: control handed back");
+            // The owner may have changed private details any way (a page's
+            // buttons, arrow keys): read them back before the agent's turn.
+            self.note_private_input(false);
         }
         self.broadcast_state();
     }
@@ -2406,13 +2457,14 @@ impl Browser {
             (!p.pages.is_empty(), p.filled)
         };
         if typed {
-            let (url, marked, captured) = self.page_state(run).await?;
-            if !captured
-                && (marked
-                    || lock(&self.private)
-                        .pages
-                        .iter()
-                        .any(|(p, _)| p == page_key(&url)))
+            let (url, marked, captured, closed) = self.page_state(run).await?;
+            if closed
+                || !captured
+                    && (marked
+                        || lock(&self.private)
+                            .pages
+                            .iter()
+                            .any(|(p, _)| p == page_key(&url)))
             {
                 return Ok(Access::Typed);
             }

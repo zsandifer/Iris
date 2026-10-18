@@ -57,7 +57,7 @@ while IFS= read -r line; do
         browser_navigate)
           to=$(printf '%s' "$line" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')
           printf '%s' "$to" > url
-          rm -f marked captured_*
+          rm -f marked closed captured_*
           reply "### Page\\n- Page URL: $to\\n- Page Title: Sign in\\n### Snapshot\\n- [Snapshot](out/page-2.yml)" '' '' ;;
         browser_run_code_unsafe)
           case "$line" in
@@ -72,6 +72,9 @@ while IFS= read -r line; do
               g=$(printf '%s' "$line" | sed -n 's/.*__irisCaptured_\([0-9]*\).*/\1/p')
               : > "captured_$g"
               reply "### Result\n[0]" '' '' ;;
+            *iris:close*)
+              : > marked; : > closed
+              reply "### Result\ntrue" '' '' ;;
             *iris:fields*)
               # `privfields`: what the fields hold (JSON, quotes escaped);
               # `privfields_after` replaces it after one read (an action
@@ -100,8 +103,13 @@ while IFS= read -r line; do
                   *'h.click('*)
                     reply "### Result\\n{\\\"clicked\\\":true}" '' '' ;;
                   *'const values'*)
-                    case "$line" in *'if (true) await page.evaluate'*) : > marked ;; esac
-                    reply "### Result\\n{\\\"filled\\\":true}" '' '' ;;
+                    case "$line" in *'if (true) await page.evaluate'*) : > marked; : > closed ;; esac
+                    # `kept`: what the field kept instead (JSON).
+                    if [ -f kept ]; then
+                      reply "### Result\\n{\\\"filled\\\":true,\\\"kept\\\":$(cat kept)}" '' ''
+                    else
+                      reply "### Result\\n{\\\"filled\\\":true}" '' ''
+                    fi ;;
                   *"h.press('Enter'"*)
                     reply "### Result\\n{\\\"clicked\\\":true}" '' '' ;;
                   *)
@@ -131,7 +139,8 @@ while IFS= read -r line; do
               m=false; [ -f marked ] && m=true
               g=$(printf '%s' "$line" | sed -n 's/.*__irisCaptured_\([0-9]*\).*/\1/p')
               c=false; [ -n "$g" ] && [ -f "captured_$g" ] && c=true
-              reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"title\\\":\\\"Sign in\\\",\\\"private\\\":$m,\\\"captured\\\":$c}" '' '' ;;
+              cl=false; [ -f closed ] && cl=true
+              reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"title\\\":\\\"Sign in\\\",\\\"private\\\":$m,\\\"captured\\\":$c,\\\"closed\\\":$cl}" '' '' ;;
           esac ;;
         browser_snapshot)
           t=$(cat fields 2>/dev/null)
@@ -201,6 +210,7 @@ impl Fake {
     fn load(&self, url: &str) {
         self.set("url", url);
         let _ = std::fs::remove_file(self.file("marked"));
+        let _ = std::fs::remove_file(self.file("closed"));
         for e in std::fs::read_dir(self.browser().work_dir.clone())
             .into_iter()
             .flatten()
@@ -1961,6 +1971,155 @@ fn jpeg_size(b64: &str) -> (u32, u32) {
     panic!("no JPEG frame header");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_field_that_keeps_something_else_is_hidden_or_closed() {
+    let f = Fake::new();
+    let b = f.browser();
+    let id = "login-k".to_string();
+    let secret = f
+        .state
+        .vault
+        .encrypt(json!({"password": "Pw-12345"}).to_string().as_bytes(), &id)
+        .unwrap();
+    f.state
+        .db
+        .with(|c| {
+            crate::entities::insert_credential(
+                c,
+                &id,
+                &f.owner,
+                "login",
+                "Site",
+                &json!({"site": "site.test"}),
+                &secret,
+            )
+        })
+        .unwrap();
+    let g = b.begin_turn(&f.owner, &f.conv, "m", std::slice::from_ref(&f.owner));
+    let token = g.token().to_string();
+    f.set("kinds", "e4 password\n");
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://site.test/login"}),
+    )
+    .await;
+    // Cut short but long enough to look for: hidden as well.
+    f.set("kept", r#"\"Pw-123\""#);
+    let r = f
+        .agent(&token, "fill_saved_login", json!({"password_ref": "e4"}))
+        .await;
+    assert_eq!(text(&r), "filled", "{r}");
+    assert!(b.filled_secrets().contains(&"Pw-123".to_string()));
+    f.set("fields", "Pw-123");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert!(!r.to_string().contains("Pw-123"), "{r}");
+    // Too short, or unknown: the page closes, also one read back before
+    // (the owner typed there), and reading it back again does not reopen it.
+    for kept in [r#"\"Pw\""#, "null"] {
+        f.load("https://site.test/login");
+        b.take_over(&f.owner, "dev").await.unwrap();
+        f.set("typed", "pw-typed-77");
+        b.user_input("dev", &json!({"kind": "text", "text": "x"}))
+            .await
+            .unwrap();
+        b.hand_back();
+        let r = f.agent(&token, "browser_snapshot", json!({})).await;
+        assert_ne!(r["isError"], true, "{r}");
+        f.set("kept", kept);
+        let r = f
+            .agent(&token, "fill_saved_login", json!({"password_ref": "e4"}))
+            .await;
+        assert_eq!(text(&r), "filled", "{r}");
+        for _ in 0..2 {
+            let r = f.agent(&token, "browser_snapshot", json!({})).await;
+            assert_eq!(text(&r), PRIVATE_PAGE, "{kept}");
+            b.take_over(&f.owner, "dev").await.unwrap();
+            b.hand_back();
+        }
+    }
+    drop(g);
+    b.close().await;
+}
+
+/// The masked screenshot's code itself, run by node against a stand-in
+/// page: a frame Iris cannot look into is blacked out whole, and a page it
+/// cannot look into at all gives no picture. Skipped without node.
+#[test]
+fn the_screenshot_masks_a_frame_it_cannot_look_into() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("node not found; skipped");
+        return;
+    }
+    let code = super::shot_code(&["Pw-5678".to_string()], &json!({"type": "png"})).unwrap();
+    let harness = format!(
+        r#"const shot = {code};
+const marked = [];
+let taken = null;
+const frame = (name, fail, top) => ({{
+  name,
+  evaluate: async () => {{ if (fail) throw new Error('gone'); return []; }},
+  isDetached: () => false,
+  frameElement: async () => top ? null : {{
+    evaluate: async (fn, a) => fn({{ setAttribute: (k) => marked.push([name, k]) }}, a),
+  }},
+  locator: (sel) => ({{ sel, frame: name, evaluateAll: async () => [] }}),
+  getByText: (re) => ({{ sel: String(re), frame: name }}),
+}});
+const page = (frames) => ({{
+  frames: () => frames,
+  screenshot: async (o) => {{ taken = o; return Buffer.from('PNG'); }},
+  locator: () => ({{ screenshot: async (o) => {{ taken = o; return Buffer.from('PNG'); }} }}),
+}});
+(async () => {{
+  const r = await shot(page([frame('main', false, true), frame('box', true, false)]));
+  const masks = taken.mask.map((m) => m.frame + ' ' + m.sel);
+  let refused = '';
+  taken = null;
+  try {{ await shot(page([frame('main', true, true)])); }} catch (e) {{ refused = e.message; }}
+  console.log(JSON.stringify({{ r, marked, masks, refused, taken }}));
+}})();"#
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("harness.js");
+    std::fs::write(&file, harness).unwrap();
+    let out = std::process::Command::new("node")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["r"]["data"], "UE5H");
+    // The frame's own element is marked in its parent and masked there.
+    let attr = v["marked"][0][1].as_str().unwrap().to_string();
+    assert_eq!(v["marked"][0][0], "box");
+    assert!(attr.starts_with("data-iris-mask-"), "{v}");
+    assert!(
+        v["masks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == &json!(format!("main iframe[{attr}], frame[{attr}]"))),
+        "{v}"
+    );
+    assert!(
+        v["refused"]
+            .as_str()
+            .unwrap()
+            .contains("could not be checked"),
+        "{v}"
+    );
+    assert!(v["taken"].is_null(), "{v}");
+}
+
 /// End to end with the real Playwright MCP and Chromium, installed by
 /// Iris: `iris engines install browser --dir DIR`, then
 /// `IRIS_REAL_BROWSER=DIR cargo test real_playwright -- --ignored`.
@@ -2090,6 +2249,28 @@ async fn real_playwright() {
                 format!(
                     "<html><body style='margin:0'><div contenteditable aria-label='One-time code' \
                      style='{big};top:100px;border:1px solid #888'></div></body></html>"
+                )
+            } else if req.starts_with("GET /maxlen") {
+                // A password field that keeps only six characters.
+                "<html><body><input type=password aria-label=Password maxlength=6></body></html>"
+                    .to_string()
+            } else if req.starts_with("GET /cut3") {
+                // One that keeps only three (too few to look for).
+                "<html><body><input type=password aria-label=Password maxlength=3></body></html>"
+                    .to_string()
+            } else if req.starts_with("GET /nested") {
+                // A card number with its code inside a child element.
+                "<html><body style='margin:0'>\
+                 <div id=d style='font-size:20px;margin:40px 0;width:480px;overflow-wrap:anywhere'>Card 4111111111111111 <span id=s>737</span></div>\
+                 <p id=n style='font-size:20px;margin:40px 0;width:480px'>Nothing secret here</p></body></html>"
+                    .to_string()
+            } else if req.starts_with("GET /reveal") {
+                // A password field known only by its type, and a button that
+                // shows what it holds.
+                format!(
+                    "<html><body style='margin:0'><input type=password name=pwd style='{big};top:100px'>\
+                     <button onclick=\"document.querySelector('input').type = 'text'\" \
+                     style='{big};top:400px'>Show</button></body></html>"
                 )
             } else if req.starts_with("GET /numcode") {
                 // A code in a number field, and a button that steps it up (as
@@ -2544,6 +2725,51 @@ async fn real_playwright() {
         !home_now.contains("Real-Pw-42"),
         "the password reached the agent"
     );
+
+    // A field that keeps only part of the password: that part is hidden
+    // too; one too short to look for closes the page.
+    for (page, kept) in [("maxlen", "Real-P"), ("cut3", "Rea")] {
+        f.agent(
+            &token,
+            "browser_navigate",
+            json!({"url": format!("http://127.0.0.1:{port}/{page}")}),
+        )
+        .await;
+        let snap = text(&f.agent(&token, "browser_snapshot", json!({})).await);
+        let pw = {
+            let line = snap
+                .lines()
+                .find(|l| l.contains("textbox \"Password\""))
+                .unwrap_or_else(|| panic!("password in {snap}"));
+            let at = line.find("[ref=").unwrap() + 5;
+            line[at..line[at..].find(']').unwrap() + at].to_string()
+        };
+        let r = f
+            .agent(&token, "fill_saved_login", json!({"password_ref": pw}))
+            .await;
+        assert_eq!(text(&r), "filled", "{r}");
+        let held = b
+            .tool(
+                &run,
+                "browser_evaluate",
+                &json!({"function": "() => document.querySelector('input').value"}),
+                QUICK,
+            )
+            .await
+            .unwrap();
+        assert!(
+            text_of(&held).contains(kept),
+            "the field kept something else"
+        );
+        let r = f.agent(&token, "browser_snapshot", json!({})).await;
+        assert!(
+            !r.to_string().contains(kept),
+            "the kept part reached the agent"
+        );
+        if page == "cut3" {
+            assert_eq!(text(&r), PRIVATE_PAGE, "{r}");
+        }
+    }
 
     // A page that echoes the password (a sign-in form sending with GET):
     // the agent's results have it hidden, and no picture is taken.
@@ -3036,6 +3262,25 @@ async fn real_playwright() {
         !pixel(&shot, x, y).await.contains("\"0,0,0\""),
         "plain text is masked"
     );
+    // A secret whose element also holds another one in a child: both are
+    // blacked out (the parent whole).
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/nested")}),
+    )
+    .await;
+    let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    let (x, y) = spot("#d", 0.97).await;
+    assert!(
+        pixel(&shot, x, y).await.contains("\"0,0,0\""),
+        "the outer secret is not masked"
+    );
+    let (x, y) = spot("#n", 0.97).await;
+    assert!(
+        !pixel(&shot, x, y).await.contains("\"0,0,0\""),
+        "plain text is masked"
+    );
 
     // The owner again: a code field known only by its label is private,
     // and a field in another site's frame says so.
@@ -3153,6 +3398,55 @@ async fn real_playwright() {
     assert!(
         !r.to_string().contains("12345"),
         "the changed code reached the agent"
+    );
+    // The owner changes it themselves, with the page's button and an
+    // arrow key and no typing: read back again before the agent's turn.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.5})).await;
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.15})).await;
+    input(json!({"kind": "key", "key": "ArrowUp"})).await;
+    let now = b
+        .tool(
+            &run,
+            "browser_evaluate",
+            &json!({"function": "() => document.querySelector('input').value"}),
+            QUICK,
+        )
+        .await
+        .unwrap();
+    assert!(text_of(&now).contains("12345"), "{now}");
+    assert!(
+        !text_of(&now).contains("123457"),
+        "the owner did not change it"
+    );
+    b.hand_back();
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert!(
+        !r.to_string().contains("12345"),
+        "the owner's changed code reached the agent"
+    );
+    // A password field known only by its type, shown as plain text before
+    // the hand-back: still read back, as the field the owner typed into.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    input(json!({"kind": "navigate", "url": format!("http://127.0.0.1:{port}/reveal")})).await;
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.15})).await;
+    input(json!({"kind": "text", "text": "reveal-typed-55"})).await;
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.5})).await;
+    let kind = b
+        .tool(
+            &run,
+            "browser_evaluate",
+            &json!({"function": "() => document.querySelector('input').type + ' ' + document.querySelector('input').value.length"}),
+            QUICK,
+        )
+        .await
+        .unwrap();
+    assert!(text_of(&kind).contains("text 15"), "{kind}");
+    b.hand_back();
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert!(
+        !r.to_string().contains("reveal-typed"),
+        "the shown password reached the agent"
     );
     b.take_over(&f.owner, "dev").await.unwrap();
 
