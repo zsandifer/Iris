@@ -539,6 +539,28 @@ const SENSITIVE_FN: &str = r#"(e) => {
     return /\bcode\b/.test(a) && !/postal|zip|promo|coupon|discount|gift|voucher|referral|country|area code|dial/.test(a);
   }"#;
 
+/// A field that takes private details other than an expiry date (`SENSITIVE`
+/// is `SENSITIVE_FN`): an expiry month or year is not hidden (see the API
+/// docs), and two digits are too short to look for, so typing into one
+/// neither closes the page nor holds back reading the page's fields back.
+/// Pictures still black out every `SENSITIVE_FN` field.
+const SECRET_FIELD_FN: &str = r#"(e) => {
+    if (!(SENSITIVE)(e)) return false;
+    const doc = e.ownerDocument;
+    const named = (e.getAttribute('aria-labelledby') || '').split(/\s+/)
+      .map((id) => id && doc.getElementById(id)).filter(Boolean).map((l) => l.textContent);
+    const a = [e.type, e.autocomplete, e.name, e.id, e.getAttribute('aria-label'), e.placeholder,
+      ...Array.from(e.labels || [], (l) => l.textContent), ...named]
+      .filter(Boolean).join(' ').toLowerCase();
+    const expiry = /cc-exp|expir/.test(a);
+    return !expiry || /password|passcode|cvc|cvv|csc|security|one-time|otp|\bpin\b|verification|2fa|mfa|totp|authenticat|\bcode\b|number|cc-csc/.test(a);
+  }"#;
+
+/// `SECRET_FIELD_FN`, ready to insert.
+fn secret_field_fn() -> String {
+    SECRET_FIELD_FN.replace("SENSITIVE", SENSITIVE_FN)
+}
+
 /// What the owner typed into private fields, read from Iris's side when
 /// the agent next uses the browser, so it can be hidden like a saved
 /// secret instead of closing the page: per tab, the values of its
@@ -604,7 +626,7 @@ const CAPTURE_CODE: &str = r#"async (page) => { /* iris:capture */
 
 fn capture_code(all_frames: bool) -> String {
     CAPTURE_CODE
-        .replace("SENSITIVE", SENSITIVE_FN)
+        .replace("SENSITIVE", &secret_field_fn())
         .replace("MIN", &fill::MIN_HIDDEN.to_string())
         .replace("ALLFRAMES", if all_frames { "true" } else { "false" })
 }
@@ -1028,7 +1050,7 @@ const FRAME_FIELD_FN: &str = r#"() => {
 
 fn field_code(mark: bool, force: bool, edit: u64) -> String {
     let f = FIELD_FN
-        .replace("SENSITIVE", SENSITIVE_FN)
+        .replace("SENSITIVE", &secret_field_fn())
         .replace("FORCE", if force { "true" } else { "false" })
         .replace("MARK", if mark { "true" } else { "false" })
         .replace("EDIT", &edit.to_string());
@@ -2012,7 +2034,7 @@ impl Browser {
     /// (`FIELDS_CODE`), read on Iris's side.
     pub(crate) async fn private_fields(&self, run: &Running) -> Result<Fields> {
         let v = self
-            .run_code(run, &FIELDS_CODE.replace("SENSITIVE", SENSITIVE_FN))
+            .run_code(run, &FIELDS_CODE.replace("SENSITIVE", &secret_field_fn()))
             .await?;
         Ok(serde_json::from_value(v)?)
     }

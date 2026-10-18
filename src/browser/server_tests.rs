@@ -2718,6 +2718,20 @@ async fn real_playwright_run() {
                  <span>1111</span> <span>1111</span> <span id=cv>737</span></div>\
                  <p id=n style='font-size:20px;margin:40px 0;width:480px'>Nothing secret here</p></body></html>"
                     .to_string()
+            } else if req.starts_with("GET /checkout") {
+                // A card form with the expiry in two short fields.
+                let field = |top: u32, attrs: &str| {
+                    format!(
+                        "<input {attrs} style='position:absolute;left:0;width:500px;height:150px;top:{top}px;font-size:30px'>"
+                    )
+                };
+                format!(
+                    "<html><body style='margin:0'>{}{}{}{}</body></html>",
+                    field(0, "aria-label='Card number' autocomplete=cc-number"),
+                    field(170, "aria-label='Expiry month' autocomplete=cc-exp-month"),
+                    field(340, "aria-label='Expiry year' autocomplete=cc-exp-year"),
+                    field(510, "aria-label='Security code' autocomplete=cc-csc"),
+                )
             } else if req.starts_with("GET /autoclear") {
                 // A card form that, once the number is complete, shows it
                 // and empties its field (keeping the field).
@@ -4275,6 +4289,30 @@ async fn real_playwright_run() {
     b.hand_back();
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_eq!(text(&r), PRIVATE_PAGE, "{r}");
+    // A checkout with the expiry in two short fields: typing the card
+    // number, the expiry and the code keeps the page usable (an expiry is
+    // not hidden, so its two digits do not hold back the read-back).
+    b.take_over(&f.owner, "dev").await.unwrap();
+    for ev in [
+        json!({"kind": "navigate", "url": format!("http://127.0.0.1:{port}/checkout")}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.075}),
+        json!({"kind": "text", "text": "5555 4444 3333 1111"}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.245}),
+        json!({"kind": "text", "text": "12"}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.415}),
+        json!({"kind": "text", "text": "26"}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.585}),
+        json!({"kind": "text", "text": "818"}),
+    ] {
+        input(ev).await;
+    }
+    b.hand_back();
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(
+        !r.to_string().contains("5555") && !r.to_string().contains("818"),
+        "card details reached the agent: {r}"
+    );
     b.take_over(&f.owner, "dev").await.unwrap();
 
     // A confirmation the owner cannot see is answered; a window the page
