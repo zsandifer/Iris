@@ -59,6 +59,7 @@ pub fn routes() -> Router<AppState> {
             "/credentials/{id}",
             axum::routing::patch(update_credential).delete(delete_credential),
         )
+        .route("/credentials/{id}/use-here", post(use_login_here))
         .route("/push/vapid-public-key", get(vapid_key))
         .route("/push/subscriptions", get(list_push).post(subscribe_push))
         .route(
@@ -809,6 +810,8 @@ struct CredentialBody {
     label: Option<String>,
     // login
     site: Option<String>,
+    /// More sites the same login works on (a shop on its own domain).
+    also_sites: Option<Vec<String>>,
     allow_subdomains: Option<bool>,
     username: Option<String>,
     password: Option<String>,
@@ -857,6 +860,71 @@ pub fn luhn_ok(digits: &str) -> bool {
     sum.is_multiple_of(10)
 }
 
+/// Most extra sites one login may list.
+const MAX_ALSO_SITES: usize = 20;
+
+/// A login's extra sites: trimmed, each a web address, no repeats.
+fn also_sites(list: &[String]) -> Result<Vec<String>, ApiError> {
+    let mut out: Vec<String> = Vec::new();
+    for s in list {
+        let s = s.trim();
+        if s.is_empty() {
+            continue;
+        }
+        check_text("also_sites", s, 300, false)?;
+        if !crate::browser::fill::valid_site(s) {
+            return Err(ApiError::bad_request(format!(
+                "{s} is not a website address"
+            )));
+        }
+        if !out.iter().any(|o| o.eq_ignore_ascii_case(s)) {
+            out.push(s.to_string());
+        }
+    }
+    if out.len() > MAX_ALSO_SITES {
+        return Err(ApiError::bad_request(format!(
+            "at most {MAX_ALSO_SITES} extra sites"
+        )));
+    }
+    Ok(out)
+}
+
+/// The host of a saved site (`https://` assumed when it has no scheme).
+fn site_host(site: &str) -> String {
+    crate::browser::fill::origin_of(&if site.contains("://") {
+        site.to_string()
+    } else {
+        format!("https://{site}")
+    })
+    .map(|(_, h)| h)
+    .unwrap_or_default()
+}
+
+/// After the owner answers an agent's "save a login" card, the chat picks
+/// up where the agent stopped, with a message from them saying so.
+async fn continue_after_login(state: &AppState, card: &db::Message, owner: &str, text: String) {
+    let posted_mid_turn = card
+        .card
+        .as_ref()
+        .is_some_and(|c| c["turn_message_id"].is_string());
+    if !posted_mid_turn {
+        return;
+    }
+    if let Err(e) = crate::turn::start_chat_turn(
+        state,
+        &card.conversation_id,
+        Some(owner),
+        crate::turn::ChatPrompt::LoginSaved(&text),
+        &[],
+        crate::router::Purpose::Chat,
+        owner,
+    )
+    .await
+    {
+        crate::warn!("could not continue after a saved login: {e}");
+    }
+}
+
 /// Secret fields supplied in a request (only those present).
 type SecretFields = serde_json::Map<String, Value>;
 
@@ -869,7 +937,8 @@ fn credential_parts(kind: &str, b: &CredentialBody) -> Result<(Value, SecretFiel
             check_text("username", b.username.as_deref().unwrap_or(""), 300, false)?;
             check_text("password", b.password.as_deref().unwrap_or(""), 1000, false)?;
             check_text("notes", b.notes.as_deref().unwrap_or(""), 4000, false)?;
-            let meta = json!({"site": b.site, "username": b.username, "allow_subdomains": b.allow_subdomains});
+            let also = b.also_sites.as_deref().map(also_sites).transpose()?;
+            let meta = json!({"site": b.site, "also_sites": also, "username": b.username, "allow_subdomains": b.allow_subdomains});
             let mut secret = SecretFields::new();
             if let Some(p) = &b.password {
                 secret.insert("password".into(), p.clone().into());
@@ -979,17 +1048,8 @@ async fn create_credential(
             "only a login can be saved from that card",
         ));
     }
-    let host = meta["site"]
-        .as_str()
-        .and_then(|s| {
-            crate::browser::fill::origin_of(&if s.contains("://") {
-                s.to_string()
-            } else {
-                format!("https://{s}")
-            })
-        })
-        .map(|(_, h)| h)
-        .unwrap_or_default();
+    let host = meta["site"].as_str().map(site_host).unwrap_or_default();
+    let shown_host = host.clone();
     // Checked and written under one lock: one card saves one login.
     let saved = state
         .db
@@ -1039,6 +1099,129 @@ async fn create_credential(
     };
     crate::login::broadcast_updated(&state, &updated).await;
     crate::awareness::broadcast_created(&state, &note).await;
+    let text = if shown_host.is_empty() {
+        "I saved the login. Go ahead and pick up where you left off.".to_string()
+    } else {
+        format!("I saved my login for {shown_host}. Go ahead and pick up where you left off.")
+    };
+    continue_after_login(&state, &updated, user.id(), text).await;
+    ok(json!({"credential": cred, "message": updated}))
+}
+
+#[derive(Deserialize)]
+struct UseHereBody {
+    /// The `save_login` card being answered.
+    message_id: String,
+}
+
+/// Answer an agent's "save a login" card with a login already saved: the
+/// card's sites are added to it (`also_sites`), the card is marked saved,
+/// and the chat continues.
+async fn use_login_here(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody<UseHereBody>,
+) -> ApiResult {
+    user.require_owner()?;
+    let uid = user.id().to_string();
+    let card_id = body.message_id;
+    // Checked and written under one lock: one card is answered once.
+    let done = state
+        .db
+        .call(move |c| {
+            let Some(cred) = entities::get_credential(c, &uid, &id)? else {
+                return Ok(Err(ApiError::not_found("credential")));
+            };
+            if cred.kind != "login" {
+                return Ok(Err(ApiError::bad_request("only a login can be used here")));
+            }
+            let Some(m) = db::get_message(c, &card_id)? else {
+                return Ok(Err(ApiError::not_found("message")));
+            };
+            let mut card = m.card.clone().unwrap_or_default();
+            if card["type"] != "save_login"
+                || !db::conversation_member_ids(c, &m.conversation_id)?.contains(&uid)
+            {
+                return Ok(Err(ApiError::not_found("message")));
+            }
+            if card["state"] != "pending" {
+                return Ok(Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "conflict",
+                    "this login was already saved",
+                )));
+            }
+            // The sites came from the browser when the card was posted.
+            let wanted: Vec<String> = card["site"]
+                .as_str()
+                .into_iter()
+                .chain(
+                    card["also_sites"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str),
+                )
+                .map(String::from)
+                .collect();
+            let mut meta = cred.metadata.clone();
+            let mut also: Vec<String> = meta["also_sites"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            for site in &wanted {
+                let covered = crate::browser::fill::credential_sites(&cred)
+                    .iter()
+                    .any(|s| {
+                        crate::browser::fill::site_matches(
+                            site,
+                            s,
+                            meta["allow_subdomains"] == true,
+                        )
+                    })
+                    || also.iter().any(|s| s == site);
+                if !covered {
+                    also.push(site.clone());
+                }
+            }
+            let also = match also_sites(&also) {
+                Ok(a) => a,
+                Err(e) => return Ok(Err(e)),
+            };
+            meta["also_sites"] = json!(also);
+            let host = card["host"].as_str().unwrap_or("").to_string();
+            db::write_tx(c, |c| {
+                let Some(cred) =
+                    entities::update_credential(c, &uid, &cred.id, None, Some(&meta), None)?
+                else {
+                    return Ok(Err(ApiError::not_found("credential")));
+                };
+                card["state"] = "saved".into();
+                card["credential_id"] = cred.id.clone().into();
+                card["credential_label"] = cred.label.clone().into();
+                card["used_existing"] = true.into();
+                card["saved_at"] = now_ms().into();
+                let updated = db::update_message_card(c, &card_id, &card)?;
+                let note = crate::awareness::insert_note(
+                    c,
+                    &updated.conversation_id,
+                    &format!("You let me use your {} login on {host}.", cred.label),
+                )?;
+                Ok(Ok((cred, updated, note, host)))
+            })
+        })
+        .await??;
+    let (cred, updated, note, host) = done;
+    crate::login::broadcast_updated(&state, &updated).await;
+    crate::awareness::broadcast_created(&state, &note).await;
+    let text = format!(
+        "You can use my {} login on {host} now. Go ahead and pick up where you left off.",
+        cred.label
+    );
+    continue_after_login(&state, &updated, user.id(), text).await;
     ok(json!({"credential": cred, "message": updated}))
 }
 

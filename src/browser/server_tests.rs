@@ -653,9 +653,14 @@ async fn the_agent_fills_saved_logins_without_seeing_them() {
         json!({"url": "https://site.test/login"}),
     )
     .await;
+    // The login does not cover that frame's site: nothing is typed, and
+    // the owner is asked (the card names both sites).
     f.set("fieldframe", "https://ads.test/frame");
     let r = f.agent(&token, "fill_saved_login", login.clone()).await;
-    assert!(text(&r).contains("won't fill"), "{r}");
+    assert!(
+        text(&r).starts_with("not found (no saved login for site.test and ads.test)"),
+        "{r}"
+    );
     std::fs::remove_file(f.file("fieldframe")).unwrap();
     let r = f
         .agent(
@@ -1271,6 +1276,125 @@ async fn the_agent_asks_the_owner_to_save_a_login_for_the_open_site() {
     let r = f.agent(job.token(), "ask_to_save_login", json!({})).await;
     assert!(text(&r).starts_with("not posted (only in a chat"), "{r}");
     assert_eq!(cards(&f).len(), 1);
+    drop(job);
+    drop(g);
+    b.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_saved_login_posts_a_card_for_the_sign_in_page() {
+    let f = Fake::new();
+    let b = f.browser();
+    let g = b.begin_turn(&f.owner, &f.conv, "m", std::slice::from_ref(&f.owner));
+    let token = g.token().to_string();
+    let cards = |f: &Fake| {
+        f.state
+            .db
+            .with(|c| crate::db::list_messages(c, &f.conv, None, 100))
+            .unwrap()
+            .into_iter()
+            .filter_map(|m| m.card)
+            .collect::<Vec<_>>()
+    };
+    let login = json!({"username_ref": "e3", "password_ref": "e4", "submit": true});
+    f.set("kinds", "e4 password\n");
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://shop.test/account/login"}),
+    )
+    .await;
+    let r = f.agent(&token, "fill_saved_login", login.clone()).await;
+    assert!(
+        text(&r).starts_with("not found (no saved login for shop.test). I posted a card"),
+        "{r}"
+    );
+    let posted = cards(&f);
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0]["type"], "save_login");
+    assert_eq!(posted[0]["site"], "https://shop.test");
+    assert_eq!(posted[0]["state"], "pending");
+    assert_eq!(posted[0]["turn_message_id"], "m");
+    assert!(posted[0].get("also_sites").is_none());
+    // Asked again while it waits: no second card.
+    let r = f.agent(&token, "fill_saved_login", login.clone()).await;
+    assert!(text(&r).contains("already in the chat"), "{r}");
+    assert_eq!(cards(&f).len(), 1);
+    // The sign-in box is another site's frame: the card names both sites.
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://order.shop.test/"}),
+    )
+    .await;
+    f.set("fieldframe", "https://auth.test/sign_in.iframe");
+    let r = f.agent(&token, "fill_saved_login", login.clone()).await;
+    assert!(text(&r).contains("order.shop.test"), "{r}");
+    let posted = cards(&f);
+    assert_eq!(posted.len(), 2);
+    assert_eq!(posted[1]["site"], "https://order.shop.test");
+    assert_eq!(posted[1]["also_sites"], json!(["https://auth.test"]));
+    std::fs::remove_file(f.file("fieldframe")).unwrap();
+    // A login for the page that does not cover the sign-in frame's site:
+    // nothing is typed, and a card asks to extend it.
+    let save = |id: &str, meta: Value| {
+        let secret = f
+            .state
+            .vault
+            .encrypt(json!({"password": "Pw-5678"}).to_string().as_bytes(), id)
+            .unwrap();
+        f.state
+            .db
+            .with(|c| {
+                crate::entities::insert_credential(c, id, &f.owner, "login", id, &meta, &secret)
+            })
+            .unwrap();
+    };
+    save("covers-page", json!({"site": "https://page.test"}));
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://page.test/"}),
+    )
+    .await;
+    f.set("fieldframe", "https://signin.test/box");
+    let r = f.agent(&token, "fill_saved_login", login.clone()).await;
+    assert!(
+        text(&r).starts_with("not found (no saved login for page.test and signin.test)"),
+        "{r}"
+    );
+    let posted = cards(&f);
+    assert_eq!(posted.len(), 3);
+    assert_eq!(posted[2]["site"], "https://page.test");
+    assert_eq!(posted[2]["also_sites"], json!(["https://signin.test"]));
+    // A login that names an insecure page and a secure sign-in frame: the
+    // page itself must be secure too.
+    save(
+        "plain-page",
+        json!({"site": "http://plain.test", "also_sites": ["https://signin2.test"]}),
+    );
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "http://plain.test/"}),
+    )
+    .await;
+    f.set("fieldframe", "https://signin2.test/box");
+    let r = f.agent(&token, "fill_saved_login", login.clone()).await;
+    assert!(text(&r).contains("over a secure connection"), "{r}");
+    assert_eq!(cards(&f).len(), 3);
+    std::fs::remove_file(f.file("fieldframe")).unwrap();
+    // A job: nobody would see a card.
+    let job = b.begin_turn(&f.owner, &f.conv, "j", &[]);
+    f.agent(
+        job.token(),
+        "browser_navigate",
+        json!({"url": "https://other.test/login"}),
+    )
+    .await;
+    let r = f.agent(job.token(), "fill_saved_login", login).await;
+    assert!(text(&r).contains("ask the user to add it"), "{r}");
+    assert_eq!(cards(&f).len(), 3);
     drop(job);
     drop(g);
     b.close().await;

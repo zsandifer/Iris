@@ -79,25 +79,57 @@ pub fn origin_of(url: &str) -> Option<(String, String)> {
     Some((scheme, host))
 }
 
+/// Whether a page belongs to a saved site: same scheme and port, and the
+/// same host (`www.` in front of one of them counts as the same site), or
+/// a subdomain of it when `allow_subdomains`.
 pub fn site_matches(page_url: &str, site: &str, allow_subdomains: bool) -> bool {
     let (Some((ps, ph, pp)), Some((ss, sh, sp))) = (login_origin(page_url), login_origin(site))
     else {
         return false;
     };
+    let ip = sh.parse::<std::net::IpAddr>().is_ok();
+    let www = |a: &str, b: &str| a.strip_prefix("www.") == Some(b) && b.contains('.');
+    // A saved `www.` address covers the rest of the site's subdomains too.
+    let base = sh
+        .strip_prefix("www.")
+        .filter(|b| b.contains('.'))
+        .unwrap_or(&sh);
     ps == ss
         && pp == sp
         && (ph == sh
+            || (!ip && (www(&ph, &sh) || www(&sh, &ph)))
             || (allow_subdomains
-                && sh.parse::<std::net::IpAddr>().is_err()
+                && !ip
                 && ph
-                    .strip_suffix(&sh)
+                    .strip_suffix(base)
                     .is_some_and(|prefix| prefix.ends_with('.'))))
 }
 
+/// The sites a saved login is for: its `site`, then its `also_sites`.
+pub fn credential_sites(c: &Credential) -> Vec<&str> {
+    let mut out: Vec<&str> = c.metadata["site"].as_str().into_iter().collect();
+    out.extend(
+        c.metadata["also_sites"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str),
+    );
+    out
+}
+
 fn credential_matches(page_url: &str, c: &Credential) -> bool {
-    c.metadata["site"]
-        .as_str()
-        .is_some_and(|site| site_matches(page_url, site, c.metadata["allow_subdomains"] == true))
+    let subdomains = c.metadata["allow_subdomains"] == true;
+    credential_sites(c)
+        .iter()
+        .any(|site| site_matches(page_url, site, subdomains))
+}
+
+/// A site the owner may save a login for: a web origin (a bare domain
+/// means HTTPS), without user info.
+pub fn valid_site(site: &str) -> bool {
+    let site = site.trim();
+    !site.is_empty() && !site.chars().any(char::is_whitespace) && login_origin(site).is_some()
 }
 
 /// This machine: `localhost` (and its reserved subdomains) or a loopback
@@ -728,8 +760,8 @@ pub fn site_of(url: &str) -> Option<(String, String)> {
     Some((site, host))
 }
 
-/// Where a saved login may go: the field's own frame and the page are the
-/// saved site, over HTTPS (HTTP only on this machine), and a password only
+/// Where a saved login may go: the field's own frame and the page are each
+/// one of the saved sites, both over HTTPS (HTTP only on this machine), and a password only
 /// into a password field (a page could echo any other field into its
 /// address).
 fn login_target_ok(cred: &Credential, field: &str, at: &Target) -> bool {
@@ -739,6 +771,7 @@ fn login_target_ok(cred: &Credential, field: &str, at: &Target) -> bool {
     };
     kind_ok
         && secure_url(&at.frame)
+        && secure_url(&at.top)
         && credential_matches(&at.frame, cred)
         && credential_matches(&at.top, cred)
 }
@@ -781,11 +814,16 @@ async fn login_inner(
         };
         targets.push((*field, *r, at));
     }
-    let page = targets[0].2.top.clone();
+    // A login must cover the page and every field's frame (a sign-in box
+    // can come from another site).
+    let sites: Vec<String> = targets
+        .iter()
+        .flat_map(|(_, _, at)| [at.top.clone(), at.frame.clone()])
+        .collect();
     let logins: Vec<Credential> = credentials(state, &ctx.user_id, "login")
         .await
         .into_iter()
-        .filter(|c| credential_matches(&page, c))
+        .filter(|c| sites.iter().all(|u| credential_matches(u, c)))
         .collect();
     let cred = match choose(&logins, args["login"].as_str(), |c, h| {
         let h = h.to_lowercase();
@@ -796,9 +834,27 @@ async fn login_inner(
     }) {
         Ok(c) => c.clone(),
         Err(many) if many.is_empty() => {
+            // Ask the owner for one right away: a card in the chat opens
+            // Logins & wallet with these sites filled in, or lets them use a
+            // login they saved for part of it.
+            let sites: Vec<&str> = sites.iter().map(String::as_str).collect();
             return Ok(text(
-                "not found (no saved login for this site; ask the user to add it in Logins & \
-                 wallet, or to take over the browser and sign in)",
+                match super::own::post_save_login_card(state, ctx, &sites, None, None).await {
+                    Ok(super::own::Posted::New(host)) => format!(
+                        "not found (no saved login for {host}). I posted a card in the chat \
+                         asking the user to add one; they type it in Logins & wallet and you \
+                         never see it. Tell them in a sentence that you need it and end your \
+                         reply: the chat continues by itself once they save it."
+                    ),
+                    Ok(super::own::Posted::Already(host)) => format!(
+                        "not found (no saved login for {host}; a card asking the user to add \
+                         one is already in the chat). End your reply and wait for them: the \
+                         chat continues by itself once they save it."
+                    ),
+                    Err(_) => "not found (no saved login for this site; ask the user to add it \
+                               in Logins & wallet, or to take over the browser and sign in)"
+                        .to_string(),
+                },
             ));
         }
         Err(many) => {
@@ -829,6 +885,7 @@ async fn login_inner(
     }
     let button = match submit_target(state, run, args, |at| {
         secure_url(&at.frame)
+            && secure_url(&at.top)
             && credential_matches(&at.frame, &cred)
             && credential_matches(&at.top, &cred)
     })
@@ -1406,6 +1463,78 @@ mod tests {
     }
 
     #[test]
+    fn a_login_matches_its_extra_sites() {
+        let cred = |metadata: Value| Credential {
+            id: "c".into(),
+            kind: "login".into(),
+            label: "Shop".into(),
+            metadata,
+            created_at: 0,
+            updated_at: 0,
+            last_used_at: None,
+        };
+        let c = cred(json!({"site": "https://auth.example.test/sign_in",
+            "also_sites": ["order.shop.test", "https://shop.test"]}));
+        assert_eq!(
+            credential_sites(&c),
+            [
+                "https://auth.example.test/sign_in",
+                "order.shop.test",
+                "https://shop.test"
+            ]
+        );
+        for page in [
+            "https://auth.example.test/other",
+            "https://order.shop.test/menu",
+            "https://www.shop.test/",
+        ] {
+            assert!(credential_matches(page, &c), "{page}");
+        }
+        for page in [
+            "https://evil.test/",
+            "https://cdn.shop.test/",
+            "http://order.shop.test/",
+        ] {
+            assert!(!credential_matches(page, &c), "{page}");
+        }
+        // A saved www address with subdomains covers the site's others.
+        assert!(site_matches(
+            "https://login.example.test/",
+            "https://www.example.test",
+            true
+        ));
+        assert!(!site_matches(
+            "https://login.example.test/",
+            "https://www.example.test",
+            false
+        ));
+        assert!(!site_matches(
+            "https://evil.test/",
+            "https://www.example.test",
+            true
+        ));
+        // Subdomains, when allowed, cover the extra sites too.
+        let mut sub = c.clone();
+        sub.metadata["allow_subdomains"] = true.into();
+        assert!(credential_matches("https://cdn.shop.test/", &sub));
+        // No sites, or not a list: nothing matches.
+        assert!(!credential_matches(
+            "https://shop.test",
+            &cred(json!({"also_sites": "https://shop.test"}))
+        ));
+        assert!(valid_site("example.test") && valid_site("https://shop.test:8443/x"));
+        for bad in [
+            "",
+            "  ",
+            "ftp://x.test",
+            "https://a b.test",
+            "https://user@x.test",
+        ] {
+            assert!(!valid_site(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn origins_and_site_matching() {
         assert_eq!(
             origin_of("https://www.Shop.example:8443/cart?x=1").unwrap(),
@@ -1447,8 +1576,26 @@ mod tests {
             "example.test",
             false
         ));
-        assert!(!site_matches(
+        // `www.` is the same site, either way round; other subdomains
+        // only with `allow_subdomains`.
+        assert!(site_matches(
             "https://www.example.test/login",
+            "example.test",
+            false
+        ));
+        assert!(site_matches(
+            "https://example.test/login",
+            "https://www.example.test",
+            false
+        ));
+        assert!(!site_matches("https://www.test", "test", false));
+        assert!(!site_matches(
+            "https://www.example.test:8443/",
+            "example.test",
+            false
+        ));
+        assert!(!site_matches(
+            "https://www.accounts.example.test/login",
             "example.test",
             false
         ));

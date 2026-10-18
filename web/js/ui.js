@@ -170,8 +170,12 @@ export function Row({ icon, iconBg, title, sub, value, onClick, right, danger = 
     if (inner && inner !== e.currentTarget && e.currentTarget.contains(inner)) return;
     onClick(e);
   });
+  // Enter and Space open a focused row, as they would a button.
+  const key = onClick && ((e) => {
+    if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) { e.preventDefault(); onClick(e); }
+  });
   return html`<div class=${'r' + (onClick ? ' tap' : '') + (danger ? ' danger' : '') + (accent ? ' accent' : '')}
-    onClick=${tap} role=${onClick ? 'button' : undefined} tabindex=${onClick ? 0 : undefined}>
+    onClick=${tap} onKeyDown=${key} role=${onClick ? 'button' : undefined} tabindex=${onClick ? 0 : undefined}>
     ${icon && html`<div class="ri" style=${iconBg ? `background:${iconBg}` : ''}>${typeof icon === 'string' ? html`<${Icon} name=${icon} size=${17} />` : icon}</div>`}
     <div class="rt">${title}${sub && html`<small>${sub}</small>`}</div>
     ${value != null && html`<span class="rv">${value}</span>`}
