@@ -2774,6 +2774,19 @@ async fn real_playwright_run() {
                      <div style='position:absolute;top:400px;font-size:28px'>{}</div></body></html>",
                     "<span class=d style='display:inline-block;width:60px'></span>".repeat(6)
                 )
+            } else if req.starts_with("GET /pinboxes") {
+                // A four-digit code shown digit by digit in light gray
+                // boxes, spaced apart.
+                format!(
+                    "<html><body style='margin:0'><input aria-label='One-time code' autocomplete=one-time-code \
+                     oninput=\"var v = this.value; document.querySelectorAll('.d').forEach(function (s, i) {{ s.textContent = v[i] || ''; }})\" \
+                     style='{big};top:100px;font-size:30px'>\
+                     <div style='position:absolute;top:400px;font-size:40px;color:#999'>{}</div></body></html>",
+                    (1..=4)
+                        .map(|i| format!("<span class=d id=p{i} style='display:inline-block;width:80px;text-align:center'></span>"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
             } else if req.starts_with("GET /preview") {
                 // A card form that previews the number group by group.
                 format!(
@@ -4458,6 +4471,47 @@ async fn real_playwright_run() {
         assert!(
             !unported(&r).contains(g),
             "the group {g} reached the agent: {r}"
+        );
+    }
+    // Nor through an error quoting a group's element (an action that does
+    // not fit it).
+    let refs: Vec<String> = text(&r)
+        .lines()
+        .filter(|l| l.contains("[hidden]") && l.contains("generic"))
+        .filter_map(|l| l.split("[ref=").nth(1).and_then(|x| x.split(']').next()))
+        .map(str::to_string)
+        .collect();
+    assert!(!refs.is_empty(), "{r}");
+    for g in &refs {
+        let e = f
+            .agent(
+                &token,
+                "browser_select_option",
+                json!({"target": g, "values": ["x"]}),
+            )
+            .await;
+        assert_eq!(e["isError"], true, "{e}");
+        for d in ["4000", "0566", "5566", "5556"] {
+            assert!(!unported(&e).contains(d), "an error showed {d}: {e}");
+        }
+    }
+    // A four-digit code shown digit by digit, spaced apart: hidden, and
+    // every box blacked out in pictures.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    for ev in [
+        json!({"kind": "navigate", "url": format!("http://127.0.0.1:{port}/pinboxes")}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.2}),
+        json!({"kind": "text", "text": "4826"}),
+    ] {
+        input(ev).await;
+    }
+    b.hand_back();
+    let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    for p in ["#p1", "#p4"] {
+        let (x, y) = spot(p, 0.5).await;
+        assert!(
+            pixel(&shot, x, y).await == "0,0,0",
+            "the code's box {p} is not masked"
         );
     }
     b.take_over(&f.owner, "dev").await.unwrap();

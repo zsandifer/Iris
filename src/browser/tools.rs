@@ -130,6 +130,43 @@ const SECRET_EDIT: &str = "A password, card number or code is on this page, so t
 const SEARCH_SECRET: &str = "This page shows saved sign-in or card details, so searching it \
     or naming elements by their text is not available. Use browser_snapshot and its refs.";
 
+/// The first line of a Playwright error, without markup it quotes from the
+/// page (an element with its text, `<span class="g">4000</span>`).
+fn plain_error(text: &str) -> String {
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("###"))
+        .unwrap_or("Error");
+    let mut out = String::new();
+    let mut rest = first;
+    while let Some(at) = rest.find('<') {
+        out.push_str(&rest[..at]);
+        let tag = &rest[at + 1..];
+        let name: String = tag
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        let Some(open_end) = tag.find('>') else {
+            // A tag cut short: nothing after it is kept.
+            rest = "";
+            out.push_str("[element]");
+            break;
+        };
+        let after = &tag[open_end + 1..];
+        // The element's text up to its closing tag goes with it.
+        let close = format!("</{name}>");
+        rest = match (!name.is_empty()).then(|| after.find(&close)).flatten() {
+            Some(c) => &after[c + close.len()..],
+            None if !name.is_empty() => "",
+            None => after,
+        };
+        out.push_str("[element]");
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
 /// A snapshot of part of a page holding a secret, or one with positions
 /// between its lines, could show a secret's parts apart (a card number
 /// shown group by group), where they are not recognized.
@@ -551,10 +588,12 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     // could cut a secret into parts no longer recognized) and searching its
     // text are not.
     let mut guarded: Option<super::Fields> = None;
+    let mut secret_page = false;
     if !NAVIGATION.contains(&name) && !fill && !own {
         match b.page_access(&run).await {
             Ok(Access::Open) => {}
             Ok(Access::Filled) => {
+                secret_page = true;
                 if EDITS.contains(&name) || other_button(&args) {
                     return error(SECRET_EDIT);
                 }
@@ -634,6 +673,12 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
         });
     }
     let mut out = result.unwrap_or_else(|e| error(e.to_string()));
+    // Playwright's errors quote the page (an element's markup and text in
+    // its call log): on a page showing a secret, a part of one (a card
+    // number's group) would not be recognized there.
+    if secret_page && out["isError"] == true {
+        out = error(plain_error(&super::text_of(&out)));
+    }
     // A file picker would block every tool, and the agent may not upload
     // files: Iris cancels it.
     let text = super::text_of(&out);
@@ -756,6 +801,26 @@ pub(crate) mod tests {
             h.enabled = false;
         }
         AppState::new(cfg, paths, db).unwrap()
+    }
+
+    #[test]
+    fn errors_on_secret_pages_quote_nothing_from_the_page() {
+        let select = "### Error\nError: Element is not a <select> element\nCall log:\n  - waiting for locator('aria-ref=e5')\n    - locator resolved to <span class=\"g\">4000</span>";
+        let t = plain_error(select);
+        assert_eq!(t, "Error: Element is not a [element]");
+        let covered = "### Error\nError: <span class=\"g\">4000</span> intercepts pointer events";
+        assert_eq!(
+            plain_error(covered),
+            "Error: [element] intercepts pointer events"
+        );
+        assert_eq!(
+            plain_error("### Error\nError: Timeout 5000ms exceeded."),
+            "Error: Timeout 5000ms exceeded."
+        );
+        assert_eq!(
+            plain_error("### Error\nError: cut <span>40"),
+            "Error: cut [element]"
+        );
     }
 
     #[test]

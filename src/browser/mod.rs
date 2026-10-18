@@ -857,6 +857,7 @@ const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
       // every node a match spans is blacked out (a hidden copy elsewhere in
       // the element does not take its place).
       const drawn = scan.texts.filter((t) => t[2]);
+      const digitsOnly = (k) => /^[0-9]+$/.test(norm(drawn[k][0]).trim());
       for (const sep of [' ', '']) {
         let stream = '';
         const owner = [];
@@ -869,12 +870,20 @@ const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
           stream += piece;
           for (let c = 0; c < piece.length; c++) owner.push(k);
         });
-        // (Not short codes: digits of neighbouring prices would match.)
         for (const s of low) {
-          if (s.length < 6) continue;
+          // A short code only as whole nodes of digits alone (boxes, one
+          // digit each): digits of neighbouring prices must not match.
+          const short = s.length < 6;
+          if (short && !/^[0-9]{4,}$/.test(s)) continue;
           for (let at = stream.indexOf(s); at !== -1; at = stream.indexOf(s, at + 1)) {
             const ks = new Set(owner.slice(at, at + s.length).filter((k) => k >= 0));
-            if (ks.size > 1) for (const k of ks) cover(drawn[k][1]);
+            if (ks.size < 2) continue;
+            if (short) {
+              const end = at + s.length;
+              const whole = (at === 0 || owner[at - 1] !== owner[at]) && (end === owner.length || owner[end] !== owner[end - 1]);
+              if (!whole || ![...ks].every(digitsOnly)) continue;
+            }
+            for (const k of ks) cover(drawn[k][1]);
           }
         }
       }
