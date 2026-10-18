@@ -548,8 +548,9 @@ const SENSITIVE_FN: &str = r#"(e) => {
 /// area that holds something. A tab whose frames were all read and whose
 /// values are all long enough to look for counts as read back; Iris marks
 /// it so (`MARK_CAPTURED_CODE`) only after storing its values, and only
-/// once every field the owner changed there was found again (`edits`: the
-/// edit ids on the fields read). `MIN` is `fill::MIN_HIDDEN`.
+/// once every field the owner changed there was found again holding a
+/// value long enough to look for (`edits`: the edit ids on such fields).
+/// `MIN` is `fill::MIN_HIDDEN`.
 const CAPTURE_CODE: &str = r#"async (page) => { /* iris:capture */
   const origin = (u) => { try { return new URL(u).origin; } catch (_) { return ''; } };
   const hideable = (v) => [...v].length >= MIN || /^[0-9]{3}$/.test(v);
@@ -575,7 +576,11 @@ const CAPTURE_CODE: &str = r#"async (page) => { /* iris:capture */
             if (!(all || e.__irisTyped === true || sensitive(e))) continue;
             const v = String(editable ? e.innerText || '' : e.value || '').trim();
             if (v) vals.push(v);
-            if (Array.isArray(e.__irisEdits)) edits.push(...e.__irisEdits.filter((n) => typeof n === 'number'));
+            // A changed field counts as found again only holding a value
+            // long enough to look for (one the page emptied may have moved
+            // it elsewhere).
+            const kept = [...v].length >= MIN || /^[0-9]{3}$/.test(v);
+            if (kept && Array.isArray(e.__irisEdits)) edits.push(...e.__irisEdits.filter((n) => typeof n === 'number'));
           }
           for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
         };
@@ -1006,15 +1011,40 @@ const SECRET_CHECK_CODE: &str = r#"async (page) => {
 pub(crate) const CLOSE_JS: &str = "(() => { try { Object.defineProperty(window, '__irisPrivate', { value: true }); } catch (_) {} try { Object.defineProperty(window, '__irisClosed', { value: true }); } catch (_) {} })()";
 
 /// Run `FIELD_FN` from Playwright's Node side, with the real address.
+/// In another site's frame (Playwright evaluates there; the page cannot):
+/// the focused field of the innermost focused document, tagged as typed
+/// into and with edit id `EDIT` (`empty`: it held nothing). `null` when
+/// this frame does not hold the focus.
+const FRAME_FIELD_FN: &str = r#"() => {
+  if (!document.hasFocus()) return null;
+  let e = document.activeElement;
+  while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
+  if (!e || e.tagName === 'IFRAME' || e.tagName === 'FRAME' || e === document.body || e === document.documentElement) return null;
+  try { Object.defineProperty(e, '__irisTyped', { value: true }); } catch (_) {}
+  e.__irisEdits = (Array.isArray(e.__irisEdits) ? e.__irisEdits : []).concat([EDIT]);
+  const held = String(e.isContentEditable ? e.textContent || '' : e.value || '').trim();
+  return { edit: true, empty: held === '' };
+}"#;
+
 fn field_code(mark: bool, force: bool, edit: u64) -> String {
     let f = FIELD_FN
         .replace("SENSITIVE", SENSITIVE_FN)
         .replace("FORCE", if force { "true" } else { "false" })
         .replace("MARK", if mark { "true" } else { "false" })
         .replace("EDIT", &edit.to_string());
+    let tag = FRAME_FIELD_FN.replace("EDIT", &edit.to_string());
+    // Typing into another site's frame: its field is tagged from that
+    // frame (`edit: "unknown"` when it cannot be found: nothing read later
+    // can count as finding it again).
     format!(
-        "async (page) => ({{ url: page.url(), ...(await page.evaluate({})) }})",
-        serde_json::to_string(&format!("({f})()")).unwrap_or_default()
+        "async (page) => {{ const r = await page.evaluate({}); \
+         if ({mark} && r.private && r.frame) {{ r.edit = 'unknown'; \
+         for (const f of page.frames()) {{ if (f === page.mainFrame()) continue; \
+         const t = await f.evaluate({}).catch(() => null); \
+         if (t) {{ r.edit = true; r.empty = t.empty; break; }} }} }} \
+         return {{ url: page.url(), ...r }}; }}",
+        serde_json::to_string(&format!("({f})()")).unwrap_or_default(),
+        serde_json::to_string(&format!("({tag})()")).unwrap_or_default(),
     )
 }
 
@@ -2136,7 +2166,9 @@ impl Browser {
             private: v["private"] != false,
             frame: v["frame"] != false,
             doc: v["doc"].as_str().unwrap_or("").into(),
-            edit: (v["edit"] == true).then_some(edit),
+            // (A field Iris could not find in another site's frame still
+            // needs reading again: never found, it keeps the page closed.)
+            edit: (v["edit"] == true || v["edit"] == "unknown").then_some(edit),
             empty: v["empty"] == true,
         };
         if mark && field.private {
@@ -2503,7 +2535,13 @@ impl Browser {
         // private details they may have changed any way (a page's buttons,
         // arrow keys) are read back before its turn.
         if self.control() != Control::Agent {
-            flush_typed(&mut lock(&self.private));
+            {
+                let mut p = lock(&self.private);
+                flush_typed(&mut p);
+                // The agent may change the page meanwhile: the next typing
+                // checks the field again.
+                p.field_checked = None;
+            }
             self.note_private_input(false);
         }
         if self.control.send_replace(Control::Agent) != Control::Agent {

@@ -20,7 +20,8 @@ use crate::state::AppState;
 /// `doc` the current document's id (default d1; a new page gets a new
 /// one), `edits` the edit ids Iris tagged the owner's field with (reads
 /// find them; `fieldgone` makes them miss the field), `fieldfull` that the
-/// focused field already holds something,
+/// focused field already holds something, `framefield` that Iris finds the
+/// focused field in another site's frame (else it cannot),
 /// `privfields` what Iris's field check sees, `calls.log` records calls.
 const FAKE: &str = r####"#!/bin/sh
 cfg="$2"
@@ -95,6 +96,26 @@ while IFS= read -r line; do
               if [ -f shotjson ]; then t=$(cat shotjson)
               else t='{\"data\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=\",\"width\":1,\"height\":1,\"rects\":[]}'; fi
               reply "### Result\n$t" '' '' ;;
+            *'&& priv)'*)
+              p=$(cat field 2>/dev/null || echo true)
+              fr=$(cat frame 2>/dev/null || echo false)
+              case "$line" in *'priv = true ||'*) p=true ;; esac
+              ed=false
+              em=true; [ -f fieldfull ] && em=false
+              case "$line" in *'if (true && priv)'*)
+                if [ "$p" = true ]; then
+                  : > marked
+                  e=$(printf '%s' "$line" | sed -n 's/.*concat(\[\([0-9]*\)\]).*/\1/p')
+                  if [ -n "$e" ] && { [ "$fr" = false ] || [ -f framefield ]; }; then
+                    ed=true
+                    if [ -s edits ]; then printf ',%s' "$e" >> edits; else printf '%s' "$e" > edits; fi
+                  elif [ "$fr" = true ]; then
+                    ed='\"unknown\"'; em=false
+                  fi
+                fi ;;
+              esac
+              d=$(cat doc 2>/dev/null || echo d1)
+              reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"private\\\":$p,\\\"frame\\\":$fr,\\\"edit\\\":$ed,\\\"empty\\\":$em,\\\"doc\\\":\\\"$d\\\"}" '' '' ;;
             *aria-ref=*|*hasFocus*)
               # Iris's fills: `fieldframe` is the field's frame address
               # (default: the page's), `noref` hides the field, `kinds`
@@ -140,24 +161,6 @@ while IFS= read -r line; do
               else reply '### Result\n\"QUJD\"' '' ''; fi ;;
             *insertText*)
               reply "### Page\\n- Page URL: $url" '' '' ;;
-            *activeElement*)
-              p=$(cat field 2>/dev/null || echo true)
-              fr=$(cat frame 2>/dev/null || echo false)
-              case "$line" in *'priv = true ||'*) p=true ;; esac
-              ed=false
-              case "$line" in *'if (true && priv)'*)
-                if [ "$p" = true ]; then
-                  : > marked
-                  e=$(printf '%s' "$line" | sed -n 's/.*concat(\[\([0-9]*\)\]).*/\1/p')
-                  if [ "$fr" = false ] && [ -n "$e" ]; then
-                    ed=true
-                    if [ -s edits ]; then printf ',%s' "$e" >> edits; else printf '%s' "$e" > edits; fi
-                  fi
-                fi ;;
-              esac
-              d=$(cat doc 2>/dev/null || echo d1)
-              em=true; [ -f fieldfull ] && em=false
-              reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"private\\\":$p,\\\"frame\\\":$fr,\\\"edit\\\":$ed,\\\"empty\\\":$em,\\\"doc\\\":\\\"$d\\\"}" '' '' ;;
             *)
               m=false; [ -f marked ] && m=true
               g=$(printf '%s' "$line" | sed -n 's/.*__irisCaptured_\([0-9]*\).*/\1/p')
@@ -2160,6 +2163,7 @@ async fn typing_in_another_sites_frame_reads_its_fields_for_the_session() {
     // Typed into another site's frame: every field there is read back.
     b.take_over(&f.owner, "dev").await.unwrap();
     f.set("frame", "true");
+    f.set("framefield", "");
     f.set("typed", "frame-typed-1");
     b.user_input("dev", &json!({"kind": "text", "text": "1"}))
         .await
@@ -2175,6 +2179,22 @@ async fn typing_in_another_sites_frame_reads_its_fields_for_the_session() {
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(last_capture(&f).contains("other && true"));
+    // A field Iris cannot find in that frame cannot be found again either:
+    // the page stays closed, and the next one is open.
+    f.load("https://site.test/pay-2");
+    f.set("frame", "true");
+    let _ = std::fs::remove_file(f.file("framefield"));
+    b.take_over(&f.owner, "dev").await.unwrap();
+    b.user_input("dev", &json!({"kind": "text", "text": "frame-typed-2"}))
+        .await
+        .unwrap();
+    f.set("typed", "frame-typed-2");
+    b.hand_back();
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE, "{r}");
+    f.load("https://site.test/done");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
     drop(g);
     b.close().await;
 }
@@ -2697,6 +2717,28 @@ async fn real_playwright_run() {
                  <div id=c style='font-size:20px;margin:40px 0;width:480px'><span>4111</span> <span>1111</span> \
                  <span>1111</span> <span>1111</span> <span id=cv>737</span></div>\
                  <p id=n style='font-size:20px;margin:40px 0;width:480px'>Nothing secret here</p></body></html>"
+                    .to_string()
+            } else if req.starts_with("GET /autoclear") {
+                // A card form that, once the number is complete, shows it
+                // and empties its field (keeping the field).
+                format!(
+                    "<html><body style='margin:0'><input aria-label='Card number' autocomplete=cc-number \
+                     oninput=\"if (this.value.length >= 19) {{ document.getElementById('r').textContent = 'Card ' + this.value; this.value = ''; }}\" \
+                     style='{big};top:100px;font-size:30px'>\
+                     <p id=r style='position:absolute;top:700px;margin:0;width:480px;font-size:28px'></p></body></html>"
+                )
+            } else if req.starts_with("GET /framecode") {
+                // A code field in another site's frame.
+                format!(
+                    "<html><body style='margin:0'><iframe src='http://127.0.0.1:{other_port}/autoframe' \
+                     style='position:absolute;left:0;top:0;width:500px;height:300px;border:0'></iframe></body></html>"
+                )
+            } else if req.starts_with("GET /autoframe") {
+                // That frame: the code is sent (and its field removed) once
+                // it has eight characters.
+                "<html><body style='margin:0'><input aria-label='Security code' autocomplete=one-time-code \
+                 oninput=\"if (this.value.length >= 8) this.remove()\" \
+                 style='position:absolute;left:0;top:0;width:500px;height:200px;font-size:30px'></body></html>"
                     .to_string()
             } else if req.starts_with("GET /srcopy") {
                 // A card number shown group by group (light gray), with the
@@ -4174,6 +4216,65 @@ async fn real_playwright_run() {
         !r.to_string().contains("reveal-typed"),
         "the shown password reached the agent"
     );
+    // A number corrected, then shown and emptied by the page itself once
+    // complete (the field stays): what it holds now is unknown, so the page
+    // stays closed.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    for ev in [
+        json!({"kind": "navigate", "url": format!("http://127.0.0.1:{port}/autoclear")}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.2}),
+        json!({"kind": "text", "text": "5555 4444 3333 111"}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.5}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.2}),
+        json!({"kind": "key", "key": "End"}),
+        json!({"kind": "key", "key": "Backspace"}),
+        json!({"kind": "text", "text": "11"}),
+    ] {
+        input(ev).await;
+    }
+    let echoed = b
+        .tool(
+            &run,
+            "browser_evaluate",
+            &json!({"function": "() => document.getElementById('r').textContent + ' [' + document.querySelector('input').value + ']'"}),
+            QUICK,
+        )
+        .await
+        .unwrap();
+    assert!(
+        text_of(&echoed).contains("Card 5555 4444 3333 1111 []"),
+        "{echoed}"
+    );
+    b.hand_back();
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE, "{r}");
+    // The same in another site's frame: corrected, then sent (its field
+    // removed) by the frame itself.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    input(json!({"kind": "navigate", "url": format!("http://127.0.0.1:{port}/framecode")})).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    for ev in [
+        json!({"kind": "tap", "x": 0.5, "y": 0.1}),
+        json!({"kind": "text", "text": "1234567"}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.6}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.1}),
+        json!({"kind": "key", "key": "End"}),
+        json!({"kind": "key", "key": "Backspace"}),
+        json!({"kind": "text", "text": "89"}),
+    ] {
+        input(ev).await;
+    }
+    let gone = b
+        .run_code(
+            &run,
+            "async (page) => page.frames()[1].evaluate(() => document.querySelectorAll('input').length)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(gone, json!(0), "the frame kept its field");
+    b.hand_back();
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE, "{r}");
     b.take_over(&f.owner, "dev").await.unwrap();
 
     // A confirmation the owner cannot see is answered; a window the page
