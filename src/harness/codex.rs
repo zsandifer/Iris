@@ -203,6 +203,15 @@ impl Harness for Codex {
         "codex"
     }
 
+    /// Codex sub-agents take a `model` argument (codex-cli 0.163); the
+    /// instruction is the only way to choose it per turn.
+    fn helper_guide(&self, model: &str) -> Option<String> {
+        Some(super::helper_guide_text(&format!(
+            "call `spawn_agent` with `model` set to `{model}` and `reasoning_effort` set to \
+             `low`, then wait for it before you answer"
+        )))
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             images: true,
@@ -640,6 +649,7 @@ mod tests {
                 "/home/agent/.codex/auth.json".into(),
             ],
             split: false,
+            subagent_model: None,
         }
     }
 
@@ -857,6 +867,7 @@ mod tests {
                 "/home/agent/.codex/auth.json".into(),
             ],
             split: false,
+            subagent_model: None,
         };
         let mut cfg = HarnessConfig::codex_default();
         cfg.sandbox = "workspace-write".into();
@@ -1009,6 +1020,17 @@ mod tests {
         assert_eq!(h.parse_own_mcp_servers("[]"), Some(vec![]));
         assert_eq!(h.parse_own_mcp_servers("not json"), None);
         assert_eq!(h.parse_own_mcp_servers(r#"[{"nom": "x"}]"#), None);
+    }
+
+    #[test]
+    fn research_helpers_are_told_their_model() {
+        let h = Codex::new(HarnessConfig::codex_default());
+        let guide = h.helper_guide("gpt-6-luna").unwrap();
+        assert!(guide.contains("## Research helpers"), "{guide}");
+        assert!(
+            guide.contains("`spawn_agent` with `model` set to `gpt-6-luna`"),
+            "{guide}"
+        );
     }
 
     #[test]

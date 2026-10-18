@@ -307,6 +307,7 @@ pub async fn verify(
             Err(_) => return AuthState::Unknown,
         },
         split: !state.cfg.agent.user.is_empty(),
+        subagent_model: None,
         own_mcp_servers: match crate::turn::own_mcp_servers(state, entry, &program).await {
             Some(names) => names,
             None => return AuthState::Unknown,

@@ -129,8 +129,13 @@ fn validate_policy(p: &Policy) -> Result<()> {
     Ok(())
 }
 
-fn allowed_env(harness: &str, name: &str) -> bool {
+pub(crate) fn allowed_env(harness: &str, name: &str) -> bool {
     crate::keys::option(harness, name).is_some()
+        || (harness == "claude"
+            && matches!(
+                name,
+                "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" | "CLAUDE_CODE_SUBAGENT_MODEL"
+            ))
         || matches!(
             name,
             "CLAUDE_CODE_DISABLE_CLAUDE_MDS"
@@ -167,6 +172,16 @@ fn validate_request(r: &Request, p: &Policy) -> Result<()> {
     for (name, value) in &r.env {
         if !allowed_env(&r.harness, name) || value.contains('\0') {
             return Err("environment variable is not allowed in agent launcher".into());
+        }
+        // A model name, as `claude --model` takes it.
+        if name == "CLAUDE_CODE_SUBAGENT_MODEL"
+            && (value.is_empty()
+                || value.len() > 100
+                || !value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-._:/[]".contains(&b)))
+        {
+            return Err("invalid subagent model".into());
         }
         if matches!(name.as_str(), "GEMINI_SYSTEM_MD" | "OPENCODE_CONFIG") {
             let path = Path::new(value);
@@ -813,6 +828,24 @@ mod tests {
             r.env = vec![(name.into(), "x".into())];
             assert!(validate_request(&r, &p).is_err(), "{name}");
         }
+        // Claude's own switches only for Claude, and a plain model name.
+        let mut with_claude = test_policy();
+        with_claude
+            .engines
+            .insert("claude".into(), "/opt/iris/engines/bin/claude".into());
+        r.env = vec![
+            ("CLAUDE_CODE_SUBAGENT_MODEL".into(), "haiku".into()),
+            ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".into(), "1".into()),
+        ];
+        assert!(validate_request(&r, &with_claude).is_err());
+        r.harness = "claude".into();
+        validate_request(&r, &with_claude).unwrap();
+        let long = "x".repeat(101);
+        for bad in ["", "haiku; rm -rf /", "a b", long.as_str()] {
+            r.env = vec![("CLAUDE_CODE_SUBAGENT_MODEL".into(), bad.into())];
+            assert!(validate_request(&r, &with_claude).is_err(), "{bad:?}");
+        }
+        r.harness = "codex".into();
         r.env.clear();
         r.harness = "/bin/sh".into();
         assert!(validate_request(&r, &p).is_err());

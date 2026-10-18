@@ -446,9 +446,17 @@ async fn run_locked(
                 shared,
                 assessment: &assessment,
             };
-            select_engine(&route_input, &env)
+            select_engine(&route_input, &env).map(|d| {
+                // Research helpers (subagents) run on the background
+                // model of the same CLI.
+                let helper = catalog
+                    .get(&d.model)
+                    .and_then(|main| crate::router::helper_model(&env, main))
+                    .map(|h| h.model.clone());
+                (d, helper)
+            })
         };
-        let d = match routed {
+        let (d, helper) = match routed {
             Ok(d) => d,
             Err(NoEngine::PausedPolicy) => {
                 post_policy_card_once(state, conv_id).await;
@@ -646,6 +654,17 @@ async fn run_locked(
                  before replacing them.\n{memory_refresh}\n</current_memory>\n\n{prompt}"
             );
         }
+        let helper_guide = helper
+            .as_deref()
+            .and_then(|m| entry.harness.helper_guide(m));
+        if let Some(guide) = &helper_guide {
+            system_prompt.push_str(guide);
+            // A resumed session that keeps its first system prompt (Codex)
+            // gets the current helper model with the message instead.
+            if session.is_some() && !entry.harness.resume_updates_system_prompt() {
+                prompt = format!("<research_helpers>{guide}</research_helpers>\n\n{prompt}");
+            }
+        }
         if let Some(status) = system_status {
             system_prompt.push_str(&format!("\n## System status\n\n{status}\n"));
             if session.is_some() && !entry.harness.resume_updates_system_prompt() {
@@ -689,6 +708,7 @@ async fn run_locked(
             own_mcp_servers: Vec::new(),
             protected_paths,
             split: !state.cfg.agent.user.is_empty(),
+            subagent_model: helper.filter(|_| helper_guide.is_some()),
         };
         if spec.isolated
             && !spec.split
@@ -1155,7 +1175,7 @@ async fn one_shot_with_cancel(
             .as_ref()
             .filter(|p| p.model == model_id)
             .and_then(|p| p.effort.clone())
-            .or_else(|| crate::ranking::default_effort(m));
+            .or_else(|| crate::ranking::default_effort(m, state.rankings.family_of(m)));
         let keys = crate::keys::env_for(state, &m.harness).await;
         let prepared = (|| -> crate::util::Result<_> {
             Ok((
@@ -1199,6 +1219,7 @@ async fn one_shot_with_cancel(
             },
             protected_paths,
             split: !state.cfg.agent.user.is_empty(),
+            subagent_model: None,
         };
         let mut invocation = match build_invocation(state, &m.harness, &spec).await {
             Ok(i) => i,
