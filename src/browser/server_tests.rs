@@ -2718,6 +2718,24 @@ async fn real_playwright_run() {
                  <span>1111</span> <span>1111</span> <span id=cv>737</span></div>\
                  <p id=n style='font-size:20px;margin:40px 0;width:480px'>Nothing secret here</p></body></html>"
                     .to_string()
+            } else if req.starts_with("GET /framecheckout") {
+                // The same card form in a payment provider's frame.
+                format!(
+                    "<html><body style='margin:0'><iframe src='http://127.0.0.1:{other_port}/checkout' \
+                     style='position:absolute;left:0;top:0;width:500px;height:700px;border:0'></iframe></body></html>"
+                )
+            } else if req.starts_with("GET /preview") {
+                // A card form that previews the number group by group.
+                format!(
+                    "<html><body style='margin:0'><input aria-label='Card number' autocomplete=cc-number \
+                     oninput=\"var g = this.value.replace(/\\D/g, '').match(/.{{1,4}}/g) || []; \
+                     document.querySelectorAll('.g').forEach(function (s, i) {{ s.textContent = g[i] || ''; }})\" \
+                     style='{big};top:100px;font-size:30px'>\
+                     <div style='position:absolute;top:400px;font-size:28px'>\
+                     <span class=g style='display:inline-block;width:100px'></span><span class=g style='display:inline-block;width:100px'></span>\
+                     <span class=g style='display:inline-block;width:100px'></span><span class=g style='display:inline-block;width:100px'></span></div>\
+                     </body></html>"
+                )
             } else if req.starts_with("GET /checkout") {
                 // A card form with the expiry in two short fields.
                 let field = |top: u32, attrs: &str| {
@@ -4313,6 +4331,49 @@ async fn real_playwright_run() {
         !r.to_string().contains("5555") && !r.to_string().contains("818"),
         "card details reached the agent: {r}"
     );
+    // The same in a payment provider's frame.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    input(json!({"kind": "navigate", "url": format!("http://127.0.0.1:{port}/framecheckout")}))
+        .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    for ev in [
+        json!({"kind": "tap", "x": 0.5, "y": 0.075}),
+        json!({"kind": "text", "text": "5555 4444 3333 1111"}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.245}),
+        json!({"kind": "text", "text": "12"}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.415}),
+        json!({"kind": "text", "text": "26"}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.585}),
+        json!({"kind": "text", "text": "818"}),
+    ] {
+        input(ev).await;
+    }
+    b.hand_back();
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(
+        !r.to_string().contains("5555") && !r.to_string().contains("818"),
+        "card details reached the agent: {r}"
+    );
+    // A new number previewed group by group as it is typed: no group
+    // reaches the agent.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    for ev in [
+        json!({"kind": "navigate", "url": format!("http://127.0.0.1:{port}/preview")}),
+        json!({"kind": "tap", "x": 0.5, "y": 0.2}),
+        json!({"kind": "text", "text": "4000 0566 5566 5556"}),
+    ] {
+        input(ev).await;
+    }
+    b.hand_back();
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    for g in ["4000", "0566", "5566", "5556"] {
+        assert!(
+            !r.to_string().contains(g),
+            "the group {g} reached the agent: {r}"
+        );
+    }
     b.take_over(&f.owner, "dev").await.unwrap();
 
     // A confirmation the owner cannot see is answered; a window the page

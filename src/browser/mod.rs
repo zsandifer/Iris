@@ -544,21 +544,26 @@ const SENSITIVE_FN: &str = r#"(e) => {
 /// docs), and two digits are too short to look for, so typing into one
 /// neither closes the page nor holds back reading the page's fields back.
 /// Pictures still black out every `SENSITIVE_FN` field.
-const SECRET_FIELD_FN: &str = r#"(e) => {
-    if (!(SENSITIVE)(e)) return false;
+const SECRET_FIELD_FN: &str = r#"(e) => (SENSITIVE)(e) && !(EXPIRY)(e)"#;
+
+/// A field that takes only an expiry month, year or date (see
+/// `SECRET_FIELD_FN`).
+const EXPIRY_ONLY_FN: &str = r#"(e) => {
     const doc = e.ownerDocument;
     const named = (e.getAttribute('aria-labelledby') || '').split(/\s+/)
       .map((id) => id && doc.getElementById(id)).filter(Boolean).map((l) => l.textContent);
     const a = [e.type, e.autocomplete, e.name, e.id, e.getAttribute('aria-label'), e.placeholder,
       ...Array.from(e.labels || [], (l) => l.textContent), ...named]
       .filter(Boolean).join(' ').toLowerCase();
-    const expiry = /cc-exp|expir/.test(a);
-    return !expiry || /password|passcode|cvc|cvv|csc|security|one-time|otp|\bpin\b|verification|2fa|mfa|totp|authenticat|\bcode\b|number|cc-csc/.test(a);
+    return /cc-exp|expir/.test(a)
+      && !/password|passcode|cvc|cvv|csc|security|one-time|otp|\bpin\b|verification|2fa|mfa|totp|authenticat|\bcode\b|number|cc-csc/.test(a);
   }"#;
 
 /// `SECRET_FIELD_FN`, ready to insert.
 fn secret_field_fn() -> String {
-    SECRET_FIELD_FN.replace("SENSITIVE", SENSITIVE_FN)
+    SECRET_FIELD_FN
+        .replace("SENSITIVE", SENSITIVE_FN)
+        .replace("EXPIRY", EXPIRY_ONLY_FN)
 }
 
 /// What the owner typed into private fields, read from Iris's side when
@@ -588,6 +593,7 @@ const CAPTURE_CODE: &str = r#"async (page) => { /* iris:capture */
       const other = f !== top && origin(f.url()) !== origin(top.url());
       const r = await f.evaluate((all) => {
         const sensitive = SENSITIVE;
+        const expiryOnly = EXPIRY;
         const vals = [];
         const edits = [];
         const walk = (root) => {
@@ -595,7 +601,7 @@ const CAPTURE_CODE: &str = r#"async (page) => { /* iris:capture */
             const editable = e.tagName !== 'INPUT' && e.tagName !== 'TEXTAREA';
             if (editable && !e.isContentEditable) continue;
             if (!editable && ['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'hidden', 'image', 'range', 'color'].includes(e.type)) continue;
-            if (!(all || e.__irisTyped === true || sensitive(e))) continue;
+            if (!((all && !expiryOnly(e)) || e.__irisTyped === true || sensitive(e))) continue;
             const v = String(editable ? e.innerText || '' : e.value || '').trim();
             if (v) vals.push(v);
             // A changed field counts as found again only holding a value
@@ -626,6 +632,7 @@ const CAPTURE_CODE: &str = r#"async (page) => { /* iris:capture */
 
 fn capture_code(all_frames: bool) -> String {
     CAPTURE_CODE
+        .replace("EXPIRY", EXPIRY_ONLY_FN)
         .replace("SENSITIVE", &secret_field_fn())
         .replace("MIN", &fill::MIN_HIDDEN.to_string())
         .replace("ALLFRAMES", if all_frames { "true" } else { "false" })
@@ -1035,13 +1042,16 @@ pub(crate) const CLOSE_JS: &str = "(() => { try { Object.defineProperty(window, 
 /// Run `FIELD_FN` from Playwright's Node side, with the real address.
 /// In another site's frame (Playwright evaluates there; the page cannot):
 /// the focused field of the innermost focused document, tagged as typed
-/// into and with edit id `EDIT` (`empty`: it held nothing). `null` when
-/// this frame does not hold the focus.
+/// into and with edit id `EDIT` (`empty`: it held nothing; an expiry-only
+/// field is not tagged, `edit: false`). `null` when this frame does not
+/// hold the focus.
 const FRAME_FIELD_FN: &str = r#"() => {
   if (!document.hasFocus()) return null;
   let e = document.activeElement;
   while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
   if (!e || e.tagName === 'IFRAME' || e.tagName === 'FRAME' || e === document.body || e === document.documentElement) return null;
+  // An expiry month or year is not private (`SECRET_FIELD_FN`).
+  if ((EXPIRY)(e)) return { edit: false, empty: false };
   try { Object.defineProperty(e, '__irisTyped', { value: true }); } catch (_) {}
   e.__irisEdits = (Array.isArray(e.__irisEdits) ? e.__irisEdits : []).concat([EDIT]);
   const held = String(e.isContentEditable ? e.textContent || '' : e.value || '').trim();
@@ -1054,7 +1064,9 @@ fn field_code(mark: bool, force: bool, edit: u64) -> String {
         .replace("FORCE", if force { "true" } else { "false" })
         .replace("MARK", if mark { "true" } else { "false" })
         .replace("EDIT", &edit.to_string());
-    let tag = FRAME_FIELD_FN.replace("EDIT", &edit.to_string());
+    let tag = FRAME_FIELD_FN
+        .replace("EDIT", &edit.to_string())
+        .replace("EXPIRY", EXPIRY_ONLY_FN);
     // Typing into another site's frame: its field is tagged from that
     // frame (`edit: "unknown"` when it cannot be found: nothing read later
     // can count as finding it again).
@@ -1063,7 +1075,7 @@ fn field_code(mark: bool, force: bool, edit: u64) -> String {
          if ({mark} && r.private && r.frame) {{ r.edit = 'unknown'; \
          for (const f of page.frames()) {{ if (f === page.mainFrame()) continue; \
          const t = await f.evaluate({}).catch(() => null); \
-         if (t) {{ r.edit = true; r.empty = t.empty; break; }} }} }} \
+         if (t) {{ r.edit = t.edit; r.empty = t.empty; break; }} }} }} \
          return {{ url: page.url(), ...r }}; }}",
         serde_json::to_string(&format!("({f})()")).unwrap_or_default(),
         serde_json::to_string(&format!("({tag})()")).unwrap_or_default(),
@@ -1246,8 +1258,9 @@ pub(crate) fn mask_form_groups(secrets: &[String]) -> Vec<Vec<String>> {
 /// (the value and its common encodings), the forms pages and Playwright
 /// write values in (`written_forms`, any length), and what pages do with
 /// card details: numbers split into groups by spaces or dashes (also one
-/// known only in groups), and short security codes (only where they stand
-/// alone, not inside longer numbers).
+/// known only in groups, and groups shown apart, `hide_split_cards`), and
+/// short security codes (only where they stand alone, not inside longer
+/// numbers).
 pub(crate) fn hide_secrets(text: &str, secrets: &[String]) -> String {
     let secrets = &with_card_digits(secrets)[..];
     let mut out = crate::gateway::redact(text, secrets);
@@ -1286,6 +1299,68 @@ pub(crate) fn hide_secrets(text: &str, secrets: &[String]) -> String {
             out = hide_standalone(&out, s);
         }
     }
+    hide_split_cards(&out, secrets)
+}
+
+/// Card numbers shown group by group in separate parts of a page (a card
+/// preview: a snapshot lists each group as its own entry): runs of digits
+/// standing apart (not part of a name such as `e12`), close together, that
+/// make up at least eight digits of a known card number in order are
+/// hidden, each run.
+fn hide_split_cards(text: &str, secrets: &[String]) -> String {
+    let cards: Vec<&String> = secrets
+        .iter()
+        .filter(|s| (12..=19).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()))
+        .collect();
+    if cards.is_empty() {
+        return text.to_string();
+    }
+    let b = text.as_bytes();
+    let word = |i: usize| b[i].is_ascii_alphanumeric() || b[i] == b'_';
+    // Runs of digits not touching a letter.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        let alone = (start == 0 || !word(start - 1)) && (i == b.len() || !word(i));
+        if alone {
+            runs.push((start, i));
+        }
+    }
+    const NEAR: usize = 80;
+    let mut hide = vec![false; runs.len()];
+    for first in 0..runs.len() {
+        let mut digits = String::new();
+        for last in first..runs.len() {
+            if last > first && runs[last].0 - runs[last - 1].1 > NEAR {
+                break;
+            }
+            digits.push_str(&text[runs[last].0..runs[last].1]);
+            if digits.len() > 19 || !cards.iter().any(|c| c.contains(&digits)) {
+                break;
+            }
+            if last > first && digits.len() >= 8 {
+                hide[first..=last].iter_mut().for_each(|h| *h = true);
+            }
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (k, (start, end)) in runs.iter().enumerate() {
+        if hide[k] {
+            out.push_str(&text[at..*start]);
+            out.push_str("[hidden]");
+            at = *end;
+        }
+    }
+    out.push_str(&text[at..]);
     out
 }
 
@@ -3245,6 +3320,23 @@ mod tests {
         for f in ["5555444433331111", "5555-4444-3333-1111"] {
             assert!(forms[0].contains(&f.to_string()), "{f}");
         }
+        // Shown group by group in a card preview (a snapshot lists each
+        // group apart): every group is hidden, nothing else.
+        let preview = "- generic [ref=e5]:\n  - generic [ref=e6]: \"5555\"\n  - generic [ref=e7]: \"4444\"\n  - generic [ref=e8]: \"3333\"\n  - generic [ref=e9]: \"1111\"\n- generic [ref=e10]: Expires 12/26, order 2024";
+        let t = hide_secrets(preview, &grouped);
+        assert!(
+            !t.contains("5555") && !t.contains("4444") && !t.contains("3333"),
+            "{t}"
+        );
+        assert_eq!(t.matches("[hidden]").count(), 4, "{t}");
+        assert!(
+            t.contains("[ref=e9]") && t.contains("Expires 12/26, order 2024"),
+            "{t}"
+        );
+        // Groups far apart, or digits that are not this card's in order, stay.
+        let apart = format!("5555 {} 4444", "x".repeat(100));
+        assert_eq!(hide_secrets(&apart, &grouped), apart);
+        assert_eq!(hide_secrets("1111 3333 4444", &grouped), "1111 3333 4444");
         // Not a card number: left as it is.
         assert_eq!(card_digits("12 34"), None);
         assert_eq!(card_digits("5555444433331111"), None);
