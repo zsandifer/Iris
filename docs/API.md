@@ -324,6 +324,7 @@ All paths are under `/api`. "Any" means any authenticated user.
 | POST | `/credentials` | **Owner** | Create a credential |
 | PATCH | `/credentials/{id}` | **Owner** | Update a credential |
 | DELETE | `/credentials/{id}` | **Owner** | Delete a credential |
+| POST | `/credentials/{id}/use-here` | **Owner** | Answer a `save_login` card with this saved login |
 | GET | `/browser` | **Owner** | Iris's browser: status and setup state |
 | POST | `/browser/start` | **Owner** | Open the browser |
 | POST | `/browser/stop` | **Owner** | Close the browser (sign-ins are kept) |
@@ -2032,10 +2033,11 @@ owner's OK on an approval card. While the owner has taken over Iris's
 browser, the app can also fill one field at a time into the page
 (`browser.input` with `kind: "fill"`, see [the
 WebSocket](#4-websocket-get-apiws)). Either way the value never reaches a
-tool result, a message, a client, or a log. A login is filled only into the site
-it was saved for (scheme, host, and port must match the saved `site`;
-subdomains require `allow_subdomains: true`), and anything only over HTTPS
-(plain HTTP only on this machine). `last_used_at` records the last fill.
+tool result, a message, a client, or a log. A login is filled only into the sites
+it was saved for (scheme, host, and port must match the saved `site` or one
+of its `also_sites`; `www.` in front of either host counts as the same site;
+other subdomains require `allow_subdomains: true`), and anything only over
+HTTPS (plain HTTP only on this machine). `last_used_at` records the last fill.
 
 #### `GET /api/credentials`
 
@@ -2059,7 +2061,8 @@ Login fields:
 | Field | Type | Stored as | Notes |
 |---|---|---|---|
 | `site` | string | metadata | Max 300. Full origin; bare domains mean HTTPS on port 443. |
-| `allow_subdomains` | bool | metadata | Optional, default false. Allows subdomains only on the same scheme and port. |
+| `also_sites` | string[] | metadata | Optional. More sites the same login works on (a store's ordering site, a sign-in page on another domain): at most 20, each a web address like `site` (max 300), trimmed, repeats and empty entries dropped (`400` for anything else). |
+| `allow_subdomains` | bool | metadata | Optional, default false. Allows subdomains of `site` and `also_sites`, only on the same scheme and port. |
 | `username` | string | metadata | Max 300. |
 | `password` | string | secret | Max 1,000. |
 | `notes` | string | secret | Max 4,000. |
@@ -2080,8 +2083,8 @@ Card fields:
 
 Response `{"credential": {Credential}}`.
 
-Saving from a `save_login` card (posted by the agent's `ask_to_save_login`,
-see [the browser tools](#the-browser-tools)): add `"message_id"` with the
+Saving from a `save_login` card (posted by `fill_saved_login` or the agent's
+`ask_to_save_login`, see [the browser tools](#the-browser-tools)): add `"message_id"` with the
 card's message id (logins only, `400` otherwise). The card must be a
 `save_login` card in a conversation the caller is a member of (`404
 message` otherwise) and still `pending` (`409 conflict`, "this login was
@@ -2089,8 +2092,26 @@ already saved", and nothing is stored). In one write the credential is
 stored, the card moves to `state: "saved"` with `credential_id` and
 `saved_at`, and a system note "You saved a login for <host>." is added to
 the chat (so the agent knows); both are sent as `message.updated` /
-`message.created`. Response `{"credential": {Credential}, "message":
-{Message}}` (the updated card).
+`message.created`. When the card was posted during a turn
+(`turn_message_id`), the chat then continues: a user message from the owner,
+"I saved my login for <host>. Go ahead and pick up where you left off."
+(`meta.initiated_by: "save_login"`), starts a turn like any message.
+Response `{"credential": {Credential}, "message": {Message}}` (the updated
+card).
+
+#### `POST /api/credentials/{id}/use-here`
+
+Answers a `save_login` card with a login already saved, instead of a new
+one. Body `{"message_id": "..."}`: a pending `save_login` card in a
+conversation the caller is a member of (`404 message` otherwise, `409
+conflict` once answered; `400` when the credential is a card). The card's
+`site` and `also_sites` (taken from the browser when it was posted) that the
+login does not already cover are added to its `also_sites`; in the same
+write the card moves to `state: "saved"` with `credential_id`,
+`credential_label`, `used_existing: true` and `saved_at`, and a note "You let
+me use your <label> login on <host>." is added. The chat continues as above
+("You can use my <label> login on <host> now. ..."). Response
+`{"credential": {Credential}, "message": {Message}}`.
 
 #### `PATCH /api/credentials/{id}`
 
@@ -3611,7 +3632,7 @@ Metadata only; the encrypted secret is never returned.
 | `id` | string | |
 | `kind` | string | `login` or `card`. |
 | `label` | string | |
-| `metadata` | object | login: `{"site", "username", "allow_subdomains"}`; card: `{"brand", "last4", "exp_month", "exp_year", "cardholder"}` (values may be `null`). |
+| `metadata` | object | login: `{"site", "also_sites", "username", "allow_subdomains"}`; card: `{"brand", "last4", "exp_month", "exp_year", "cardholder"}` (values may be `null`). |
 | `created_at`, `updated_at` | int | |
 | `last_used_at` | int or null | When Iris last filled it into a page. |
 
@@ -4217,10 +4238,16 @@ Iris adds tools of its own, after Playwright's:
 - `fill_saved_login` (`username_ref`, `password_ref`, optional `login`,
   `submit`, `submit_ref`): types the owner's saved login for the current site into the
   fields with those element refs (from `browser_snapshot`). Each field's own
-  frame and the page must be the site the login was saved for, over HTTPS
+  frame and the page must be a site the login was saved for, over HTTPS
   (plain HTTP only on this machine), and the password goes only into a
   password field. `submit` presses Enter in the last field; `submit_ref`
-  clicks that button instead (it must be on the same site).
+  clicks that button instead (it must be on the same site). When no saved
+  login matches, it posts a `save_login` card itself (as `ask_to_save_login`
+  does) for the page and, when a field sits in another site's frame, that
+  site too (`also_sites`), unless one for the same site is still pending in
+  the chat; the answer (`not found (no saved login for <host>). I posted a
+  card ...` or `... already in the chat`) tells the agent to end its reply,
+  since the chat continues once the owner saves it.
 - `fill_saved_card` (`number_ref`, optional `exp_ref`, `exp_month_ref`,
   `exp_year_ref`, `cvc_ref`, `name_ref`, `card`, `submit`, `submit_ref`): only after the
   owner approves an approval card in the chat (service `wallet`; the same
@@ -4246,11 +4273,15 @@ Iris adds tools of its own, after Playwright's:
   from the browser (`https://host`, with a port only when it is not the
   default; never from the agent's arguments), only for an `https` page (or
   plain HTTP on this machine). Card fields: `type`, `title` ("Save a login
-  for host"), `site`, `host`, `state` (`pending`, then `saved`), optional
-  `label` and `username`, `owner_only`, `turn_message_id`; once saved also
-  `credential_id`, `saved_at`. A suggestion that contains a saved secret is
-  dropped. The owner fills the card in the app, which saves it with
-  [`POST /api/credentials`](#post-apicredentials) plus `message_id`. Answers
+  for host"), `site`, `host`, optional `also_sites`, `state` (`pending`, then
+  `saved`), optional `label` and `username`, `owner_only`, `turn_message_id`;
+  once saved also `credential_id`, `saved_at` (and `credential_label`,
+  `used_existing` when an existing login was used). A suggestion that
+  contains a saved secret is dropped. One pending card per site and chat. In
+  the app, the card opens Logins & wallet's add form with the site, name and
+  username filled in, which saves with
+  [`POST /api/credentials`](#post-apicredentials) plus `message_id`, or picks
+  a saved login ([`use-here`](#post-apicredentialsiduse-here)). Answers
   `posted (...)` or `not posted (...)`.
 
 Iris locates each field and types its value through Playwright's own

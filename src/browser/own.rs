@@ -25,11 +25,12 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "name": SAVE_LOGIN,
             "description": "Post a card in this chat where the user saves a login (username and \
-                password) for the site open in your browser, to Logins & wallet. The site is \
-                taken from the current page; they type the login into the card and you never \
-                see it. Use it when they want help saving a login, or when fill_saved_login \
-                answers `not found` and they would rather save one than sign in themselves. \
-                Then wait for them: once saved, fill_saved_login can use it.",
+                password) for the site open in your browser, in Logins & wallet, or lets you \
+                use one they already saved. The site is taken from the current page; they type \
+                the login in and you never see it. fill_saved_login posts this card by itself \
+                when nothing is saved for a sign-in page; use this when they ask for help \
+                saving a login. Then end your reply: the chat continues by itself once they \
+                save it.",
             "inputSchema": {"type": "object", "properties": {
                 "label": r("A short name for the login, like the site's name (optional; the user can change it)"),
                 "username": r("The username or email to prefill, only if the user told you (optional; never a password)"),
@@ -64,8 +65,110 @@ fn arg(args: &Value, key: &str, max: usize) -> std::result::Result<Option<String
     Ok((!s.is_empty()).then(|| s.to_string()))
 }
 
-/// `ask_to_save_login`: a `save_login` card for the current page's site
-/// (from the browser itself, never from the agent), in the turn's chat.
+/// Why no card was posted.
+#[derive(Debug, PartialEq)]
+pub enum NotPosted {
+    /// A job or routine run: nobody would see the card.
+    NoChat,
+    /// No web page is open.
+    NoSite,
+    /// The page is not HTTPS, so a saved login would never be filled there.
+    Insecure,
+    Failed(String),
+}
+
+/// A card asking for a login, new or already waiting in this chat.
+#[derive(Debug, PartialEq)]
+pub enum Posted {
+    New(String),
+    Already(String),
+}
+
+/// Post a `save_login` card for the sites of `urls` (the page, then any
+/// frame holding the fields; taken from the browser, never from the
+/// agent) in the turn's chat, unless one for the same site is still
+/// waiting there. The card opens Logins & wallet with them filled in, or
+/// lets the owner use a login they already saved.
+pub async fn post_save_login_card(
+    state: &AppState,
+    ctx: &TurnCtx,
+    urls: &[&str],
+    label: Option<String>,
+    username: Option<String>,
+) -> std::result::Result<Posted, NotPosted> {
+    if ctx.audience.is_empty() {
+        return Err(NotPosted::NoChat);
+    }
+    let mut sites: Vec<(String, String)> = Vec::new();
+    for url in urls {
+        let Some((site, host)) = super::fill::site_of(url) else {
+            continue;
+        };
+        if !super::fill::secure_url(url) {
+            return Err(NotPosted::Insecure);
+        }
+        if !sites.iter().any(|(s, _)| *s == site) {
+            sites.push((site, host));
+        }
+    }
+    let Some((site, host)) = sites.first().cloned() else {
+        return Err(NotPosted::NoSite);
+    };
+    let also: Vec<String> = sites[1..].iter().map(|(s, _)| s.clone()).collect();
+    // A label or username that echoes a saved secret is dropped.
+    let secrets = state.browser.filled_secrets();
+    let clean = |v: Option<String>| v.filter(|s| super::hide_secrets(s, &secrets) == *s);
+    let mut card = json!({
+        "type": "save_login",
+        "title": format!("Save a login for {host}"),
+        "site": site,
+        "host": host,
+        "state": "pending",
+        "owner_only": true,
+        "turn_message_id": ctx.message_id,
+    });
+    if !also.is_empty() {
+        card["also_sites"] = json!(also);
+    }
+    if let Some(l) = clean(label) {
+        card["label"] = l.into();
+    }
+    if let Some(u) = clean(username) {
+        card["username"] = u.into();
+    }
+    let conv = ctx.conversation_id.clone();
+    let made = state
+        .db
+        .call(move |c| {
+            // One waiting card per site in a chat.
+            let waiting = c
+                .prepare(
+                    "SELECT 1 FROM messages WHERE conversation_id = ?1 AND kind = 'card'
+                       AND json_extract(card, '$.type') = 'save_login'
+                       AND json_extract(card, '$.state') = 'pending'
+                       AND json_extract(card, '$.site') = ?2",
+                )?
+                .exists(rusqlite::params![conv, site])?;
+            if waiting {
+                return Ok(None);
+            }
+            crate::entities::insert_card(c, &conv, &card, "assistant").map(Some)
+        })
+        .await;
+    let msg = match made {
+        Ok(Some(m)) => m,
+        Ok(None) => return Ok(Posted::Already(host)),
+        Err(e) => return Err(NotPosted::Failed(e.to_string())),
+    };
+    state.hub.to_users(
+        &ctx.audience,
+        json!({"type": "message.created", "conversation_id": msg.conversation_id, "message": msg}),
+    );
+    crate::info!("browser: posted a save-login card {}", msg.id);
+    Ok(Posted::New(host))
+}
+
+/// `ask_to_save_login`: a `save_login` card for the current page's site.
 pub async fn ask_to_save_login(
     state: &AppState,
     ctx: &TurnCtx,
@@ -83,49 +186,26 @@ pub async fn ask_to_save_login(
         Ok(u) => u,
         Err(e) => return error(format!("not posted ({e})")),
     };
-    let Some((site, host)) = super::fill::site_of(&url) else {
-        return text("not posted (open the site's sign-in page in the browser first)");
-    };
-    if !super::fill::secure_url(&url) {
-        return text(
+    match post_save_login_card(state, ctx, &[url.as_str()], label, username).await {
+        Ok(Posted::New(host)) => text(format!(
+            "posted (a card in the chat asks the user to save a login for {host}; they type it in \
+             Logins & wallet and you never see it. End your reply: the chat continues by itself \
+             once they save it, and then fill_saved_login can use it.)"
+        )),
+        Ok(Posted::Already(host)) => text(format!(
+            "not posted (a card asking the user to save a login for {host} is already in the \
+             chat; wait for them)"
+        )),
+        Err(NotPosted::NoChat) => {
+            text("not posted (only in a chat with the user, who saves it there)")
+        }
+        Err(NotPosted::NoSite) => {
+            text("not posted (open the site's sign-in page in the browser first)")
+        }
+        Err(NotPosted::Insecure) => text(
             "not posted (this page is not secure (https), so a saved login would never be filled \
              here)",
-        );
+        ),
+        Err(NotPosted::Failed(e)) => error(format!("not posted ({e})")),
     }
-    // A label or username that echoes a saved secret is dropped.
-    let secrets = state.browser.filled_secrets();
-    let clean = |v: Option<String>| v.filter(|s| super::hide_secrets(s, &secrets) == *s);
-    let mut card = json!({
-        "type": "save_login",
-        "title": format!("Save a login for {host}"),
-        "site": site,
-        "host": host,
-        "state": "pending",
-        "owner_only": true,
-        "turn_message_id": ctx.message_id,
-    });
-    if let Some(l) = clean(label) {
-        card["label"] = l.into();
-    }
-    if let Some(u) = clean(username) {
-        card["username"] = u.into();
-    }
-    let conv = ctx.conversation_id.clone();
-    let made = state
-        .db
-        .call(move |c| crate::entities::insert_card(c, &conv, &card, "assistant"))
-        .await;
-    let msg = match made {
-        Ok(m) => m,
-        Err(e) => return error(format!("not posted ({e})")),
-    };
-    state.hub.to_users(
-        &ctx.audience,
-        json!({"type": "message.created", "conversation_id": msg.conversation_id, "message": msg}),
-    );
-    crate::info!("browser: posted a save-login card {}", msg.id);
-    text(format!(
-        "posted (a card in the chat asks the user to save a login for {host}; they type it there \
-         and you never see it. Once they have saved it, fill_saved_login can use it.)"
-    ))
 }

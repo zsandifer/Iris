@@ -1277,6 +1277,76 @@ async fn the_agent_asks_the_owner_to_save_a_login_for_the_open_site() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_saved_login_posts_a_card_for_the_sign_in_page() {
+    let f = Fake::new();
+    let b = f.browser();
+    let g = b.begin_turn(&f.owner, &f.conv, "m", std::slice::from_ref(&f.owner));
+    let token = g.token().to_string();
+    let cards = |f: &Fake| {
+        f.state
+            .db
+            .with(|c| crate::db::list_messages(c, &f.conv, None, 100))
+            .unwrap()
+            .into_iter()
+            .filter_map(|m| m.card)
+            .collect::<Vec<_>>()
+    };
+    let login = json!({"username_ref": "e3", "password_ref": "e4", "submit": true});
+    f.set("kinds", "e4 password\n");
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://shop.test/account/login"}),
+    )
+    .await;
+    let r = f.agent(&token, "fill_saved_login", login.clone()).await;
+    assert!(
+        text(&r).starts_with("not found (no saved login for shop.test). I posted a card"),
+        "{r}"
+    );
+    let posted = cards(&f);
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0]["type"], "save_login");
+    assert_eq!(posted[0]["site"], "https://shop.test");
+    assert_eq!(posted[0]["state"], "pending");
+    assert_eq!(posted[0]["turn_message_id"], "m");
+    assert!(posted[0].get("also_sites").is_none());
+    // Asked again while it waits: no second card.
+    let r = f.agent(&token, "fill_saved_login", login.clone()).await;
+    assert!(text(&r).contains("already in the chat"), "{r}");
+    assert_eq!(cards(&f).len(), 1);
+    // The sign-in box is another site's frame: the card names both sites.
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": "https://order.shop.test/"}),
+    )
+    .await;
+    f.set("fieldframe", "https://auth.test/sign_in.iframe");
+    let r = f.agent(&token, "fill_saved_login", login.clone()).await;
+    assert!(text(&r).contains("order.shop.test"), "{r}");
+    let posted = cards(&f);
+    assert_eq!(posted.len(), 2);
+    assert_eq!(posted[1]["site"], "https://order.shop.test");
+    assert_eq!(posted[1]["also_sites"], json!(["https://auth.test"]));
+    std::fs::remove_file(f.file("fieldframe")).unwrap();
+    // A job: nobody would see a card.
+    let job = b.begin_turn(&f.owner, &f.conv, "j", &[]);
+    f.agent(
+        job.token(),
+        "browser_navigate",
+        json!({"url": "https://other.test/login"}),
+    )
+    .await;
+    let r = f.agent(job.token(), "fill_saved_login", login).await;
+    assert!(text(&r).contains("ask the user to add it"), "{r}");
+    assert_eq!(cards(&f).len(), 2);
+    drop(job);
+    drop(g);
+    b.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_finished_turns_peek_stays_until_the_owner_takes_over() {
     let f = Fake::new();
     let b = f.browser();

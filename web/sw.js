@@ -28,6 +28,7 @@ const SHELL = [
   '/js/h.js',
   '/js/hub.js',
   '/js/lists.js',
+  '/js/login-text.js',
   '/js/md.js',
   '/js/memory.js',
   '/js/memory-text.js',

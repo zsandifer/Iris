@@ -6,7 +6,8 @@ import { api, get, post, put, patch, seg, isId } from './api.js';
 import {
   S, set, go, isOwner, toast, loadGoals, loadEngines, loginMark, applyLoginResponse, ensureConnectors, upsertMessage,
 } from './store.js';
-import { Icon, Img, LetterTile, hostOf, safeUrl } from './ui.js';
+import { Icon, Img, LetterTile, hostOf, safeUrl, openSheet, closeSheet } from './ui.js';
+import { saveLoginPath } from './login-text.js';
 import { plain } from './md.js';
 import { CATALOG_IDS, ServiceSignIn, ServiceTile, labelOf } from './connect.js';
 
@@ -303,38 +304,42 @@ function Countdown({ until }) {
   return html`<span>${s >= 60 ? `${Math.ceil(s / 60)} min` : `${s}s`} left</span>`;
 }
 
-/** Save a login for the site open in Iris's browser (asked for by the
- * agent; the site comes from the page). Saved straight to Logins & wallet:
- * the agent never sees what is typed here. */
+/** An agent's request for a login it needs (the site comes from its
+ * browser). Add one in Logins & wallet with the site filled in, or let it
+ * use a login already saved there; either way the chat then continues. */
 function SaveLoginCard({ c, m }) {
-  const [f, setF] = useState({ label: c.label || c.host || '', site: c.site || '', username: c.username || '', password: '' });
-  const [busy, setBusy] = useState(false);
-  const up = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const done = c.state === 'saved';
-  const save = async (e) => {
-    e.preventDefault();
-    setBusy(true);
-    try {
-      const r = await post('/credentials', { kind: 'login', label: f.label.trim() || c.host, site: f.site.trim(), username: f.username.trim(), password: f.password, message_id: m.id });
-      setF({ ...f, password: '' });
-      if (r.message) upsertMessage(r.message);
-      toast('Login saved');
-    } catch (err) { toast(err.message); }
-    setBusy(false);
-  };
   return html`<div class=${'card-x' + (done ? ' done' : '')}>
     <div class="card-h"><${LetterTile} name=${c.host || c.title} size=${30} radius=${9} /><b>${c.title}</b></div>
-    ${done ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> Saved to Logins & wallet</div>`
+    ${done ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> ${c.used_existing ? `Using your ${c.credential_label || 'saved'} login here` : 'Saved to Logins & wallet'}</div>`
       : !isOwner() ? html`<small class="mu">Only the owner can save this.</small>`
-      : html`<p>It goes straight to Logins & wallet. I never see it; I just sign in with it.</p>
-        <form class="form" onSubmit=${save}>
-          <label class="lbl" for=${`sl-n-${m.id}`}>Name</label><input id=${`sl-n-${m.id}`} class="field" required value=${f.label} onInput=${up('label')} />
-          <label class="lbl" for=${`sl-s-${m.id}`}>Website</label><input id=${`sl-s-${m.id}`} class="field" required autocapitalize="off" value=${f.site} onInput=${up('site')} />
-          <label class="lbl" for=${`sl-u-${m.id}`}>Username or email</label><input id=${`sl-u-${m.id}`} class="field" autocapitalize="off" autocomplete="off" value=${f.username} onInput=${up('username')} />
-          <label class="lbl" for=${`sl-p-${m.id}`}>Password</label><input id=${`sl-p-${m.id}`} class="field" type="password" autocomplete="new-password" required value=${f.password} onInput=${up('password')} />
-          <div class="act"><button disabled=${busy}>${busy ? 'Saving…' : 'Save login'}</button></div>
-        </form>`}
+      : html`<p>I need a login for ${c.host} to keep going. I've filled in the website; you add the username and password. I never see them, I just sign in with them.</p>
+        <div class="act"><button onClick=${() => go(saveLoginPath(c, m))}>Add login</button>
+          <button class="mu" onClick=${() => useSavedLogin(c, m)}>Use one I saved</button></div>`}
   </div>`;
+}
+
+/** Pick a saved login to use on the card's site too (added to its sites). */
+async function useSavedLogin(c, m) {
+  let list;
+  try { list = ((await get('/credentials')).credentials || []).filter((x) => x.kind === 'login'); } catch (e) { toast(e.message); return; }
+  const pick = async (cred) => {
+    closeSheet();
+    try {
+      const r = await post(`/credentials/${seg(cred.id)}/use-here`, { message_id: m.id });
+      if (r.message) upsertMessage(r.message);
+      toast(`${cred.label} works on ${c.host} now`);
+    } catch (e) { toast(e.message); }
+  };
+  openSheet(() => html`<div class="sheet-body">
+    <h3>Use a saved login on ${c.host}</h3>
+    <p class="mu">The login you pick will also work on ${c.host}.</p>
+    ${!list.length && html`<p class="mu">Nothing saved yet.</p>`}
+    ${list.map((x) => html`<button class="fill-item" onClick=${() => pick(x)}><b>${x.label}</b>
+      <small class="mu">${[x.metadata.site, x.metadata.username].filter(Boolean).join(' · ')}</small></button>`)}
+    <div class="btns"><button class="b2" onClick=${closeSheet}>Cancel</button>
+      ${!list.length && html`<button class="b1" onClick=${() => { closeSheet(); go(saveLoginPath(c, m)); }}>Add login</button>`}</div>
+  </div>`);
 }
 
 const APPROVAL_DONE = {

@@ -1,8 +1,8 @@
 // The Iris hub: Routines (routines.js), Connections, Logins & wallet, System files (Iris's computer
 // lives in computer.js).
 import { html, useEffect, useState } from './h.js';
-import { get, post, patch, put, del, seg, sessionGen } from './api.js';
-import { S, set, useStore, go, back, toast, isOwner, loadRoutines } from './store.js';
+import { get, post, patch, put, del, seg, isId, sessionGen } from './api.js';
+import { S, set, useStore, go, back, toast, isOwner, loadRoutines, upsertMessage } from './store.js';
 import {
   Icon, Avatar, Row, Group, Page, Empty, Spinner, Toggle, LetterTile,
   agentName, ago, since, confirmSheet,
@@ -10,6 +10,7 @@ import {
 import { describe, visible } from './status.js';
 import { md } from './md.js';
 import { routinesSub } from './routines.js';
+import { bareDomain, loginDraft, parseSites, siteHost } from './login-text.js';
 
 // The last answer per path, so a screen you come back to shows it at once
 // instead of an empty state that reflows when the request returns. Keyed by
@@ -62,67 +63,156 @@ export function Hub() {
 
 // ---------------------------------------------------------- logins/wallet
 
-function CredentialForm({ kind, onDone }) {
-  const [f, setF] = useState({});
+function SitesField({ value, onInput, id }) {
+  return html`<label class="lbl" for=${id}>Also works on</label>
+    <textarea id=${id} class="field" rows="2" autocapitalize="off" spellcheck="false"
+      placeholder="shop.example.com" value=${value} onInput=${(e) => onInput(e.target.value)} />
+    <small class="mu">Other websites that take the same login, one per line (like a store's ordering site).</small>`;
+}
+
+/** Add a login or card. Opened from an agent's "save a login" card, it
+ * starts with what Iris knows (the site from its browser) and returns to
+ * that chat once saved; the chat then continues by itself. */
+function AddCredential({ kind }) {
+  useStore();
+  const draft = loginDraft(S.route.query);
+  const [f, setF] = useState({ ...draft, also: draft.also_sites.join('\n') });
+  const [touched, setTouched] = useState(false);
   const [busy, setBusy] = useState(false);
+  const up = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const site = (e) => {
+    const v = e.target.value;
+    // A bare domain (example.com) means the whole site, until the owner says otherwise.
+    setF({ ...f, site: v, allow_subdomains: touched ? f.allow_subdomains : bareDomain(v) });
+  };
+  const save = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    const body = { kind, label: f.label };
+    if (kind === 'card') {
+      const [m, y] = String(f.exp || '').split('/').map((x) => parseInt(x, 10));
+      Object.assign(body, { number: f.number, cvc: f.cvc, cardholder: f.cardholder });
+      if (m) body.exp_month = m;
+      if (y) body.exp_year = y < 100 ? 2000 + y : y;
+    } else {
+      Object.assign(body, {
+        site: f.site.trim(), username: f.username.trim(), password: f.password,
+        allow_subdomains: !!f.allow_subdomains, also_sites: parseSites(f.also),
+      });
+      if (draft.card) body.message_id = draft.card;
+    }
+    try {
+      const r = await post('/credentials', body);
+      if (r.message) upsertMessage(r.message);
+      toast(draft.card ? `Saved. ${agentName()} is picking up where it left off.` : 'Saved');
+      back();
+    } catch (err) { toast(err.message); }
+    setBusy(false);
+  };
+  const title = kind === 'card' ? 'Add card' : 'Add login';
+  const sub = draft.card
+    ? `${agentName()} filled in the website. Add your username and password; ${agentName()} never sees them.`
+    : "Stored encrypted on your server. You won't see the secret again.";
+  return html`<${Page} title=${title} sub=${sub}>
+    <form class="form" onSubmit=${save}>
+      <label class="lbl" for="cr-name">Name</label><input id="cr-name" class="field" required value=${f.label} placeholder=${kind === 'card' ? 'Everyday card' : 'Grocery store'} onInput=${up('label')} />
+      ${kind === 'login' ? html`
+        <label class="lbl" for="cr-site">Website</label><input id="cr-site" class="field" required placeholder="example.com" autocapitalize="off" value=${f.site} onInput=${site} />
+        <label class="lbl"><input type="checkbox" checked=${!!f.allow_subdomains} onChange=${(e) => { setTouched(true); setF({ ...f, allow_subdomains: e.target.checked }); }} /> Also its subdomains (like login.example.com)</label>
+        <label class="lbl" for="cr-user">Username or email</label><input id="cr-user" class="field" autocapitalize="off" autocomplete="off" value=${f.username} onInput=${up('username')} />
+        <label class="lbl" for="cr-pass">Password</label><input id="cr-pass" class="field" type="password" autocomplete="new-password" required onInput=${up('password')} />
+        <${SitesField} id="cr-also" value=${f.also} onInput=${(v) => setF({ ...f, also: v })} />`
+      : html`
+        <label class="lbl">Card number</label><input class="field" inputmode="numeric" autocomplete="off" required onInput=${up('number')} />
+        <div class="two"><div><label class="lbl">Expires (MM/YY)</label><input class="field" placeholder="08/29" onInput=${up('exp')} /></div>
+        <div><label class="lbl">CVC</label><input class="field" inputmode="numeric" autocomplete="off" onInput=${up('cvc')} /></div></div>
+        <label class="lbl">Name on card</label><input class="field" onInput=${up('cardholder')} />`}
+      <button class="b1 wide" disabled=${busy}>${busy ? 'Saving…' : 'Save'}</button>
+    </form>
+  <//>`;
+}
+
+/** One saved login: its name, websites and username; a new password only
+ * when one is typed (the saved one is never shown). */
+function EditLogin({ id }) {
+  const [data, reload] = useData('/credentials');
+  const c = (data?.credentials || []).find((x) => x.id === id);
+  const [f, setF] = useState(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (c && !f) {
+      setF({
+        label: c.label, site: c.metadata.site || '', username: c.metadata.username || '',
+        allow_subdomains: !!c.metadata.allow_subdomains, also: (c.metadata.also_sites || []).join('\n'), password: '',
+      });
+    }
+  }, [c]);
+  if (!data) return html`<${Page} title="Login"><${Spinner} /><//>`;
+  if (!c || c.kind !== 'login') return html`<${Page} title="Login"><${Empty} icon="lock" title="This login is gone" /><//>`;
+  if (!f) return html`<${Page} title=${c.label}><${Spinner} /><//>`;
   const up = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const save = async (e) => {
     e.preventDefault();
     setBusy(true);
-    const body = { kind, ...f };
-    if (kind === 'card') {
-      const [m, y] = String(f.exp || '').split('/').map((x) => parseInt(x, 10));
-      delete body.exp;
-      if (m) body.exp_month = m;
-      if (y) body.exp_year = y < 100 ? 2000 + y : y;
-    }
-    try { await post('/credentials', body); onDone(); } catch (err) { toast(err.message); }
+    const body = {
+      label: f.label, site: f.site.trim(), username: f.username.trim(),
+      allow_subdomains: !!f.allow_subdomains, also_sites: parseSites(f.also),
+    };
+    if (f.password) body.password = f.password;
+    try { await patch(`/credentials/${seg(id)}`, body); await reload(); toast('Saved'); back(); } catch (err) { toast(err.message); }
     setBusy(false);
   };
-  return html`<form class="form" onSubmit=${save}>
-    <label class="lbl">Name</label><input class="field" required placeholder=${kind === 'card' ? 'Everyday card' : 'Grocery store'} onInput=${up('label')} />
-    ${kind === 'login' ? html`
-      <label class="lbl">Website (exact address, including port)</label><input class="field" placeholder="https://example.com" autocapitalize="off" onInput=${up('site')} />
-      <label class="lbl"><input type="checkbox" checked=${!!f.allow_subdomains} onChange=${(e) => setF({ ...f, allow_subdomains: e.target.checked })} /> Also allow subdomains (same scheme and port)</label>
-      <label class="lbl">Username or email</label><input class="field" autocapitalize="off" autocomplete="off" onInput=${up('username')} />
-      <label class="lbl">Password</label><input class="field" type="password" autocomplete="new-password" required onInput=${up('password')} />`
-    : html`
-      <label class="lbl">Card number</label><input class="field" inputmode="numeric" autocomplete="off" required onInput=${up('number')} />
-      <div class="two"><div><label class="lbl">Expires (MM/YY)</label><input class="field" placeholder="08/29" onInput=${up('exp')} /></div>
-      <div><label class="lbl">CVC</label><input class="field" inputmode="numeric" autocomplete="off" onInput=${up('cvc')} /></div></div>
-      <label class="lbl">Name on card</label><input class="field" onInput=${up('cardholder')} />`}
-    <button class="b1 wide" disabled=${busy}>Save</button>
-  </form>`;
+  const remove = async () => {
+    if (!(await confirmSheet({ title: `Delete ${c.label}?`, yes: 'Delete', danger: true }))) return;
+    try { await del(`/credentials/${seg(id)}`); toast('Deleted'); back(); } catch (err) { toast(err.message); }
+  };
+  return html`<${Page} title=${c.label} sub=${`${agentName()} can use this but never sees the password`}>
+    <form class="form" onSubmit=${save}>
+      <label class="lbl" for="el-name">Name</label><input id="el-name" class="field" required value=${f.label} onInput=${up('label')} />
+      <label class="lbl" for="el-site">Website</label><input id="el-site" class="field" required autocapitalize="off" value=${f.site} onInput=${up('site')} />
+      <label class="lbl"><input type="checkbox" checked=${f.allow_subdomains} onChange=${(e) => setF({ ...f, allow_subdomains: e.target.checked })} /> Also its subdomains (like login.example.com)</label>
+      <${SitesField} id="el-also" value=${f.also} onInput=${(v) => setF({ ...f, also: v })} />
+      <label class="lbl" for="el-user">Username or email</label><input id="el-user" class="field" autocapitalize="off" autocomplete="off" value=${f.username} onInput=${up('username')} />
+      <label class="lbl" for="el-pass">New password</label><input id="el-pass" class="field" type="password" autocomplete="new-password" placeholder="Leave empty to keep the saved one" onInput=${up('password')} />
+      <button class="b1 wide" disabled=${busy}>${busy ? 'Saving…' : 'Save'}</button>
+    </form>
+    <div class="del-gap"><${Group}><${Row} title="Delete login" danger onClick=${remove} chevron=${false} /><//></div>
+  <//>`;
 }
 
 export function Logins() {
+  useStore();
+  const a = S.route.parts[2];
+  if (a === 'new') return html`<${AddCredential} kind="login" key=${S.route.query.toString()} />`;
+  if (a === 'new-card') return html`<${AddCredential} kind="card" key="new-card" />`;
+  if (isId(a)) return html`<${EditLogin} id=${a} key=${a} />`;
+  return html`<${LoginList} />`;
+}
+
+function LoginList() {
   const [data, reload] = useData('/credentials');
-  const [adding, setAdding] = useState(null);
   const list = data?.credentials || [];
   const remove = async (c) => {
     if (!(await confirmSheet({ title: `Delete ${c.label}?`, yes: 'Delete', danger: true }))) return;
     try { await del(`/credentials/${seg(c.id)}`); reload(); } catch (e) { toast(e.message); }
   };
-  if (adding) {
-    return html`<${Page} title=${adding === 'card' ? 'Add card' : 'Add login'} sub="Stored encrypted on your server. You won't see the secret again." onBack=${() => setAdding(null)}>
-      <${CredentialForm} kind=${adding} onDone=${() => { setAdding(null); reload(); }} /><//>`;
-  }
   const logins = list.filter((c) => c.kind === 'login');
   const cards = list.filter((c) => c.kind === 'card');
+  const sites = (c) => [c.metadata.site, ...(c.metadata.also_sites || [])].filter(Boolean).map(siteHost).filter(Boolean);
   return html`<${Page} title="Logins & wallet" sub=${`${agentName()} can use these but never sees them`}>
     <div class="lock"><${Icon} name="lock" size=${15} /> Stored encrypted on your server, separate from ${agentName()}. ${agentName()} signs in for you in its own browser: the password is typed into the site directly and never enters its chat or memory. Cards always ask you first, every time. When you take over the browser, tap the key to fill one yourself.</div>
     ${!data ? html`<${Spinner} />` : html`
     <${Group} label="Logins">
-      ${logins.map((c) => html`<${Row} icon=${html`<${LetterTile} name=${c.metadata.site || c.label} />`} title=${c.label}
-        sub=${[c.metadata.site, c.metadata.username].filter(Boolean).join(' · ')} value=${c.last_used_at ? `used ${since(c.last_used_at)}` : ''}
-        chevron=${false} right=${html`<button class="icon-btn" aria-label="Delete" onClick=${() => remove(c)}><${Icon} name="trash" size=${16} /></button>`} />`)}
-      <${Row} title="Add login" accent icon="plus" onClick=${() => setAdding('login')} chevron=${false} />
+      ${logins.map((c) => html`<${Row} icon=${html`<${LetterTile} name=${siteHost(c.metadata.site).replace(/^www\./, '') || c.label} />`} title=${c.label}
+        sub=${[sites(c).join(', '), c.metadata.username].filter(Boolean).join(' · ')} value=${c.last_used_at ? `used ${since(c.last_used_at)}` : ''}
+        onClick=${() => go(`iris/logins/${c.id}`)} />`)}
+      <${Row} title="Add login" accent icon="plus" onClick=${() => go('iris/logins/new')} chevron=${false} />
     <//>
     <${Group} label="Wallet">
       ${cards.map((c) => html`<${Row} icon="card" title=${`${(c.metadata.brand || 'Card').replace(/^./, (x) => x.toUpperCase())} ••${c.metadata.last4 || ''}`}
         sub=${[c.label, c.metadata.exp_month && `exp ${String(c.metadata.exp_month).padStart(2, '0')}/${String(c.metadata.exp_year || '').slice(-2)}`].filter(Boolean).join(' · ')}
         value="always asks" chevron=${false} right=${html`<button class="icon-btn" aria-label="Delete" onClick=${() => remove(c)}><${Icon} name="trash" size=${16} /></button>`} />`)}
-      <${Row} title="Add card" accent icon="plus" onClick=${() => setAdding('card')} chevron=${false} />
+      <${Row} title="Add card" accent icon="plus" onClick=${() => go('iris/logins/new-card')} chevron=${false} />
     <//>`}
   <//>`;
 }

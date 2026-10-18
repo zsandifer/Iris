@@ -1577,6 +1577,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn answering_an_agents_login_card_continues_the_chat() {
+        let h = setup();
+        let token = pair_as(&h, None).await;
+        let (main, add_card, use_card, info) = h
+            .state
+            .db
+            .with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                let main = db::ensure_main_conversation(c, &owner)?;
+                let card = |site: &str, host: &str, also: Value| {
+                    json!({"type": "save_login", "title": format!("Save a login for {host}"),
+                        "site": site, "host": host, "also_sites": also, "state": "pending",
+                        "owner_only": true, "turn_message_id": "turn-1"})
+                };
+                let a = crate::entities::insert_card(
+                    c,
+                    &main,
+                    &card("https://shop.test", "shop.test", json!([])),
+                    "assistant",
+                )?;
+                let u = crate::entities::insert_card(
+                    c,
+                    &main,
+                    &card(
+                        "https://order.shop.test",
+                        "order.shop.test",
+                        json!(["https://auth.test"]),
+                    ),
+                    "assistant",
+                )?;
+                let i = crate::entities::insert_card(
+                    c,
+                    &main,
+                    &json!({"type": "info", "title": "x"}),
+                    "assistant",
+                )?;
+                Ok((main, a.id, u.id, i.id))
+            })
+            .unwrap();
+        let continued = |h: &Harness| -> Vec<db::Message> {
+            h.state
+                .db
+                .with(|c| db::list_messages(c, &main, None, 100))
+                .unwrap()
+                .into_iter()
+                .filter(|m| m.role == "user" && m.meta["initiated_by"] == "save_login")
+                .collect()
+        };
+        // Extra sites must be web addresses.
+        let (status, _) = send(
+            &h.app,
+            "POST",
+            "/api/credentials",
+            Some(&token),
+            Some(
+                json!({"kind": "login", "label": "Bad", "site": "https://bad.test",
+                "password": "synthetic-password", "also_sites": ["not a site"]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let many: Vec<String> = (0..21).map(|i| format!("s{i}.test")).collect();
+        let (status, _) = send(
+            &h.app,
+            "POST",
+            "/api/credentials",
+            Some(&token),
+            Some(
+                json!({"kind": "login", "label": "Bad", "site": "https://bad.test",
+                "password": "synthetic-password", "also_sites": many}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Added from the first card: saved, and the chat picks up again.
+        let (status, saved) = send(
+            &h.app,
+            "POST",
+            "/api/credentials",
+            Some(&token),
+            Some(
+                json!({"kind": "login", "label": "Shop", "site": "https://shop.test",
+                "username": "sam", "password": "synthetic-password", "message_id": add_card,
+                "also_sites": [" shop-orders.test ", "shop-orders.test", ""]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["message"]["card"]["state"], "saved");
+        assert_eq!(
+            saved["credential"]["metadata"]["also_sites"],
+            json!(["shop-orders.test"])
+        );
+        let id = saved["credential"]["id"].as_str().unwrap().to_string();
+        let first = continued(&h);
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].content,
+            "I saved my login for shop.test. Go ahead and pick up where you left off."
+        );
+        // The second card: use that login there too, sites from the card.
+        let path = format!("/api/credentials/{id}/use-here");
+        for bad in [info.as_str(), "nope"] {
+            let (status, _) = send(
+                &h.app,
+                "POST",
+                &path,
+                Some(&token),
+                Some(json!({"message_id": bad})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{bad}");
+        }
+        let (status, used) = send(
+            &h.app,
+            "POST",
+            &path,
+            Some(&token),
+            Some(json!({"message_id": use_card})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{used}");
+        assert_eq!(
+            used["credential"]["metadata"]["also_sites"],
+            json!([
+                "shop-orders.test",
+                "https://order.shop.test",
+                "https://auth.test"
+            ])
+        );
+        assert_eq!(used["credential"]["metadata"]["site"], "https://shop.test");
+        let card = &used["message"]["card"];
+        assert_eq!(card["state"], "saved");
+        assert_eq!(card["used_existing"], true);
+        assert_eq!(card["credential_label"], "Shop");
+        assert!(!used.to_string().contains("synthetic-password"));
+        let notes: Vec<String> = h
+            .state
+            .db
+            .with(|c| db::list_messages(c, &main, None, 100))
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.kind == "system_note")
+            .map(|m| m.content)
+            .collect();
+        assert!(
+            notes.contains(&"You let me use your Shop login on order.shop.test.".to_string()),
+            "{notes:?}"
+        );
+        let all = continued(&h);
+        assert_eq!(all.len(), 2);
+        assert!(
+            all[1]
+                .content
+                .starts_with("You can use my Shop login on order.shop.test now.")
+        );
+        // Answered once.
+        let (status, _) = send(
+            &h.app,
+            "POST",
+            &path,
+            Some(&token),
+            Some(json!({"message_id": use_card})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // Extra sites can be edited (and cleared) later.
+        let (status, edited) = send(
+            &h.app,
+            "PATCH",
+            &format!("/api/credentials/{id}"),
+            Some(&token),
+            Some(json!({"also_sites": []})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(edited["credential"]["metadata"]["also_sites"], json!([]));
+        assert_eq!(edited["credential"]["metadata"]["username"], "sam");
+    }
+
+    #[tokio::test]
     async fn a_save_login_card_saves_one_login_and_is_marked_saved() {
         let h = setup();
         let token = pair_as(&h, None).await;

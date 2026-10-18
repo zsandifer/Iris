@@ -1987,6 +1987,8 @@ fn browser_allowed(state: &AppState) -> bool {
 pub enum ChatPrompt<'a> {
     Owner(&'a str),
     Idea(&'a str),
+    /// The owner answered the agent's "save a login" card.
+    LoginSaved(&'a str),
 }
 
 /// Store a user message and an assistant placeholder, broadcast both, and
@@ -2003,6 +2005,7 @@ pub async fn start_chat_turn(
     let (text, meta) = match prompt {
         ChatPrompt::Owner(text) => (text, json!({})),
         ChatPrompt::Idea(text) => (text, json!({"initiated_by":"idea"})),
+        ChatPrompt::LoginSaved(text) => (text, json!({"initiated_by":"save_login"})),
     };
     let (conv, author_s, text_s, att) = (
         conversation_id.to_string(),
