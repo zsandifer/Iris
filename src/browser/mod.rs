@@ -3345,16 +3345,11 @@ mod tests {
         // Shown group by group in a card preview (a snapshot lists each
         // group apart): every group is hidden, nothing else.
         let preview = "- generic [ref=e5]:\n  - generic [ref=e6]: \"5555\"\n  - generic [ref=e7]: \"4444\"\n  - generic [ref=e8]: \"3333\"\n  - generic [ref=e9]: \"1111\"\n- generic [ref=e10]: Expires 12/26, order 2024";
+        // (Never printed: it would show the number if the check failed.)
         let t = hide_secrets(preview, &grouped);
-        assert!(
-            !t.contains("5555") && !t.contains("4444") && !t.contains("3333"),
-            "{t}"
-        );
-        assert_eq!(t.matches("[hidden]").count(), 4, "{t}");
-        assert!(
-            t.contains("[ref=e9]") && t.contains("Expires 12/26, order 2024"),
-            "{t}"
-        );
+        assert!(!t.contains("5555") && !t.contains("4444") && !t.contains("3333"));
+        assert!(t.matches("[hidden]").count() == 4);
+        assert!(t.contains("[ref=e9]") && t.contains("Expires 12/26, order 2024"));
         // Groups far apart, or digits that are not this card's in order, stay.
         let apart = format!("5555 {} 4444", "x".repeat(100));
         assert_eq!(hide_secrets(&apart, &grouped), apart);
@@ -3364,7 +3359,7 @@ mod tests {
         let code = ["482913".to_string()];
         let boxes = "- generic [ref=e3]: \"4\"\n- generic [ref=e4]: \"8\"\n- generic [ref=e5]: \"2\"\n- generic [ref=e6]: \"9\"\n- generic [ref=e7]: \"1\"\n- generic [ref=e8]: \"3\"";
         let t = hide_secrets(boxes, &code);
-        assert_eq!(t.matches("[hidden]").count(), 6, "{t}");
+        assert!(t.matches("[hidden]").count() == 6);
         assert_eq!(hide_secrets("Step 4 of 8", &code), "Step 4 of 8");
         // Not a card number: left as it is.
         assert_eq!(card_digits("12 34"), None);
