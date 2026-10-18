@@ -4373,9 +4373,11 @@ digit by digit, all of it), and values trimmed and with whitespace runs
 collapsed, as snapshots show them). While the page's text or fields (all
 frames) show one, `browser_find`, `browser_wait_for`, and targets written
 as selectors instead of snapshot refs are refused (their outcome would tell
-what is hidden), and `browser_snapshot` takes no `target`, `depth` or
+what is hidden), `browser_snapshot` takes no `target`, `depth` or
 `boxes` (a part of the page, or positions between its lines, could show a
-secret's parts apart, where they are not recognized).
+secret's parts apart, where they are not recognized), and an error from
+Playwright comes back as its first line without the markup it quotes from
+the page (an element and its text).
 
 **Masked screenshots.** While the browser knows any secret (the owner's
 saved passwords and card numbers count from the start, so in practice
@@ -4390,7 +4392,9 @@ for each text node holding one, the smallest element showing all of that
 text, also text running past its own box; for a secret split over several
 drawn text nodes, such as a number styled group by group, every node a
 match spans, found on Iris's side across neighbouring nodes so a hidden
-copy elsewhere in the element does not take its place; a match shown
+copy elsewhere in the element does not take its place (a code shorter than
+six digits only as whole nodes of digits alone, such as boxes holding one
+digit each); a match shown
 without a box of its own, such as `display: contents`, gives the nearest
 ancestor with one),
 and any frame Iris cannot look into, whole. Secrets are looked for in
