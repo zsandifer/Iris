@@ -2845,9 +2845,10 @@ starts a new typing generation. Before the
 agent's next browser tool call that reads or acts on a page, Iris reads
 back, on its own side, the values of every private field and private
 editable area in every tab and frame (a field that takes only an expiry
-month, year or date does not count: an expiry is not hidden, so typing into
-one neither closes the page nor holds back its read-back; pictures still
-black it out), and of every field the owner typed
+month, year or date does not count, also in another site's frame: an
+expiry is not hidden, so typing into one neither closes the page nor holds
+back its read-back; pictures still black it out), and of every field the
+owner typed
 private details into (remembered on the element, so a "show password"
 button turning it into a plain text field does not drop it); in another
 site's frame, where the field cannot be told apart, every field and
@@ -4365,8 +4366,10 @@ numbers, and every value Iris filled this browser session (a CVC only
 where it stands alone), are replaced with `[hidden]` in every result the
 agent gets (addresses, titles, dialogs, page text; also their common
 encodings, card numbers written in groups or, for one known only in
-groups, without them, and values trimmed and with whitespace runs
-collapsed, as snapshots show them). While the page's text or
+groups, without them, or shown group by group in separate parts of the
+page such as a card preview (runs of digits close together that make up
+eight or more of its digits in order), and values trimmed and with
+whitespace runs collapsed, as snapshots show them). While the page's text or
 fields (all frames) show one, `browser_find`, `browser_wait_for`, and
 targets written as selectors instead of snapshot refs are refused (their
 outcome would tell what is hidden).
