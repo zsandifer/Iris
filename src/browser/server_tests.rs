@@ -2577,6 +2577,13 @@ async fn real_playwright_run() {
     let port = listener.local_addr().unwrap().port();
     let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let other_port = other.local_addr().unwrap().port();
+    // What the agent got, without the test servers' ports (a random port
+    // may hold any digits, such as a card number's first four).
+    let unported = |r: &Value| {
+        r.to_string()
+            .replace(&format!(":{port}"), ":PORT")
+            .replace(&format!(":{other_port}"), ":PORT")
+    };
     let serve = move |listener: std::net::TcpListener| {
         for stream in listener.incoming().flatten() {
             let mut stream = stream;
@@ -3017,7 +3024,7 @@ async fn real_playwright_run() {
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(
-        text(&r).contains("[hidden]") && !r.to_string().contains("hunter2"),
+        text(&r).contains("[hidden]") && !unported(&r).contains("hunter2"),
         "the typed password reached the agent"
     );
     // The color of the picture at page point (x, y) in CSS pixels of the
@@ -3075,7 +3082,7 @@ async fn real_playwright_run() {
     b.hand_back();
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert!(
-        !r.to_string().contains("hunter2"),
+        !unported(&r).contains("hunter2"),
         "the shortened password reached the agent"
     );
     // The page changes its address without a new document (a single-page
@@ -3105,7 +3112,7 @@ async fn real_playwright_run() {
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(
-        !r.to_string().contains("hunter2"),
+        !unported(&r).contains("hunter2"),
         "the typed password reached the agent"
     );
     b.tool(
@@ -3140,7 +3147,7 @@ async fn real_playwright_run() {
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(
-        !r.to_string().contains("hunter2"),
+        !unported(&r).contains("hunter2"),
         "the typed password reached the agent"
     );
     let r = f
@@ -3159,7 +3166,7 @@ async fn real_playwright_run() {
     assert_ne!(r["isError"], true, "{r}");
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert!(
-        !r.to_string().contains("hunter2"),
+        !unported(&r).contains("hunter2"),
         "the typed password reached the agent"
     );
     let r = f
@@ -3252,7 +3259,7 @@ async fn real_playwright_run() {
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(
-        !r.to_string().contains("Real-Pw-42"),
+        !unported(&r).contains("Real-Pw-42"),
         "the password reached the agent"
     );
     let r = f
@@ -3348,7 +3355,7 @@ async fn real_playwright_run() {
         );
         let r = f.agent(&token, "browser_snapshot", json!({})).await;
         assert!(
-            !r.to_string().contains(kept),
+            !unported(&r).contains(kept),
             "the kept part reached the agent"
         );
         if page == "cut3" {
@@ -3403,7 +3410,7 @@ async fn real_playwright_run() {
     ] {
         let r = f.agent(&token, tool, args).await;
         assert!(
-            !r.to_string().contains("Real-Pw-42"),
+            !unported(&r).contains("Real-Pw-42"),
             "{tool} showed the password"
         );
         if tool == "browser_snapshot" {
@@ -3522,7 +3529,7 @@ async fn real_playwright_run() {
     assert_ne!(r["isError"], true, "{r}");
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert!(
-        text(&r).contains("You typed") && !r.to_string().contains("Real-Pw-42"),
+        text(&r).contains("You typed") && !unported(&r).contains("Real-Pw-42"),
         "the password reached the agent"
     );
     let r = f
@@ -3666,8 +3673,8 @@ async fn real_playwright_run() {
     let r = f.agent(&chat_token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(
-        !r.to_string().contains("4111"),
-        "the card number reached the agent"
+        !unported(&r).contains("4111"),
+        "the card number reached the agent: {r}"
     );
     let r = f
         .agent(&chat_token, "browser_press_key", json!({"key": "Tab"}))
@@ -3787,8 +3794,8 @@ async fn real_playwright_run() {
     let r = f.agent(&chat_token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(
-        !r.to_string().contains("4111"),
-        "the card number reached the agent"
+        !unported(&r).contains("4111"),
+        "the card number reached the agent: {r}"
     );
     let r = f
         .agent(
@@ -3830,8 +3837,8 @@ async fn real_playwright_run() {
     assert_ne!(r["isError"], true, "{r}");
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert!(
-        !r.to_string().contains("4111"),
-        "the card number reached the agent"
+        !unported(&r).contains("4111"),
+        "the card number reached the agent: {r}"
     );
     let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
     let (x, y) = spot("#g", 0.97).await;
@@ -3957,7 +3964,7 @@ async fn real_playwright_run() {
     .await;
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert!(
-        !r.to_string().contains("4111"),
+        !unported(&r).contains("4111"),
         "the card number reached the agent: {r}"
     );
     let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
@@ -4065,7 +4072,7 @@ async fn real_playwright_run() {
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(
-        !r.to_string().contains("5555"),
+        !unported(&r).contains("5555"),
         "the moved number reached the agent: {r}"
     );
     let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
@@ -4103,7 +4110,7 @@ async fn real_playwright_run() {
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(
-        !r.to_string().contains("frame-typed") && !r.to_string().contains("code-typed"),
+        !unported(&r).contains("frame-typed") && !unported(&r).contains("code-typed"),
         "typed details reached the agent"
     );
     // A code typed into an editable area (not a field) is read back too.
@@ -4136,7 +4143,7 @@ async fn real_playwright_run() {
     b.hand_back();
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert!(
-        !r.to_string().contains("ce-typed"),
+        !unported(&r).contains("ce-typed"),
         "the typed code reached the agent"
     );
     // Read back, so its first address is no longer kept from the agent.
@@ -4173,7 +4180,7 @@ async fn real_playwright_run() {
         .agent(&token, "browser_click", json!({"target": step}))
         .await;
     assert!(
-        !r.to_string().contains("123457"),
+        !unported(&r).contains("123457"),
         "the changed code reached the agent"
     );
     let now = b
@@ -4191,7 +4198,7 @@ async fn real_playwright_run() {
     );
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert!(
-        !r.to_string().contains("12345"),
+        !unported(&r).contains("12345"),
         "the changed code reached the agent"
     );
     // The owner changes it themselves, with the page's button and an
@@ -4219,7 +4226,7 @@ async fn real_playwright_run() {
     assert_ne!(r["isError"], true, "{r}");
     assert!(text(&r).contains("[hidden]"), "{r}");
     assert!(
-        !r.to_string().contains("12345"),
+        !unported(&r).contains("12345"),
         "the owner's changed code reached the agent"
     );
     // Stepped up once more, then Review, which shows it and removes the
@@ -4244,7 +4251,7 @@ async fn real_playwright_run() {
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(
-        !r.to_string().contains("1234"),
+        !unported(&r).contains("1234"),
         "the stepped code reached the agent: {r}"
     );
     let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
@@ -4289,7 +4296,7 @@ async fn real_playwright_run() {
     assert_ne!(r["isError"], true, "{r}");
     assert!(text(&r).contains("[hidden]"), "{r}");
     assert!(
-        !r.to_string().contains("reveal-typed"),
+        !unported(&r).contains("reveal-typed"),
         "the shown password reached the agent"
     );
     // A number corrected, then shown and emptied by the page itself once
@@ -4372,7 +4379,7 @@ async fn real_playwright_run() {
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(
-        !r.to_string().contains("5555") && !r.to_string().contains("818"),
+        !unported(&r).contains("5555") && !unported(&r).contains("818"),
         "card details reached the agent: {r}"
     );
     // The same in a payment provider's frame.
@@ -4398,12 +4405,12 @@ async fn real_playwright_run() {
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
     assert!(
-        !r.to_string().contains("5555") && !r.to_string().contains("818"),
+        !unported(&r).contains("5555") && !unported(&r).contains("818"),
         "card details reached the agent: {r}"
     );
     // (The expiry is not hidden.)
     assert!(
-        !b.filled_secrets().contains(&"12/26".to_string()) && r.to_string().contains("12/26"),
+        !b.filled_secrets().contains(&"12/26".to_string()) && unported(&r).contains("12/26"),
         "{r}"
     );
     // A code shown digit by digit in boxes as it is typed: no digit reaches
@@ -4449,7 +4456,7 @@ async fn real_playwright_run() {
     assert_ne!(r["isError"], true, "{r}");
     for g in ["4000", "0566", "5566", "5556"] {
         assert!(
-            !r.to_string().contains(g),
+            !unported(&r).contains(g),
             "the group {g} reached the agent: {r}"
         );
     }
