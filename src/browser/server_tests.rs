@@ -17,7 +17,9 @@ use crate::state::AppState;
 /// show it), `typed` what the owner typed into a private field (Iris reads
 /// it back; `capturefail` makes that fail; `captured_N` exists once it was
 /// marked read back for typing generation N in the current document),
-/// `doc` the current document's id (default d1),
+/// `doc` the current document's id (default d1; a new page gets a new
+/// one), `edits` the edit ids Iris tagged the owner's field with (reads
+/// find them; `fieldgone` makes them miss the field),
 /// `privfields` what Iris's field check sees, `calls.log` records calls.
 const FAKE: &str = r####"#!/bin/sh
 cfg="$2"
@@ -58,7 +60,8 @@ while IFS= read -r line; do
         browser_navigate)
           to=$(printf '%s' "$line" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')
           printf '%s' "$to" > url
-          rm -f marked closed captured_*
+          rm -f marked closed captured_* edits fieldgone
+          n=$(( $(cat docn 2>/dev/null || echo 1) + 1 )); echo "$n" > docn; echo "d$n" > doc
           reply "### Page\\n- Page URL: $to\\n- Page Title: Sign in\\n### Snapshot\\n- [Snapshot](out/page-2.yml)" '' '' ;;
         browser_run_code_unsafe)
           case "$line" in
@@ -69,7 +72,8 @@ while IFS= read -r line; do
               [ -n "$v" ] && [ "${#v}" -lt 4 ] && { c=false; v=''; }
               vals=''; [ -n "$v" ] && vals="\\\"$v\\\""
               d=$(cat doc 2>/dev/null || echo d1)
-              reply "### Result\n[{\\\"i\\\":0,\\\"url\\\":\\\"$url\\\",\\\"doc\\\":\\\"$d\\\",\\\"captured\\\":$c,\\\"marked\\\":$m,\\\"values\\\":[$vals]}]" '' '' ;;
+              ed=$(cat edits 2>/dev/null); [ -f fieldgone ] && ed=''
+              reply "### Result\n[{\\\"i\\\":0,\\\"url\\\":\\\"$url\\\",\\\"doc\\\":\\\"$d\\\",\\\"captured\\\":$c,\\\"marked\\\":$m,\\\"edits\\\":[$ed],\\\"values\\\":[$vals]}]" '' '' ;;
             *iris:markcaptured*)
               g=$(printf '%s' "$line" | sed -n 's/.*__irisCaptured_\([0-9]*\).*/\1/p')
               : > "captured_$g"
@@ -139,9 +143,19 @@ while IFS= read -r line; do
               p=$(cat field 2>/dev/null || echo true)
               fr=$(cat frame 2>/dev/null || echo false)
               case "$line" in *'priv = true ||'*) p=true ;; esac
-              case "$line" in *'if (true && priv)'*) [ "$p" = true ] && : > marked ;; esac
+              ed=false
+              case "$line" in *'if (true && priv)'*)
+                if [ "$p" = true ]; then
+                  : > marked
+                  e=$(printf '%s' "$line" | sed -n 's/.*concat(\[\([0-9]*\)\]).*/\1/p')
+                  if [ "$fr" = false ] && [ -n "$e" ]; then
+                    ed=true
+                    if [ -s edits ]; then printf ',%s' "$e" >> edits; else printf '%s' "$e" > edits; fi
+                  fi
+                fi ;;
+              esac
               d=$(cat doc 2>/dev/null || echo d1)
-              reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"private\\\":$p,\\\"frame\\\":$fr,\\\"doc\\\":\\\"$d\\\"}" '' '' ;;
+              reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"private\\\":$p,\\\"frame\\\":$fr,\\\"edit\\\":$ed,\\\"doc\\\":\\\"$d\\\"}" '' '' ;;
             *)
               m=false; [ -f marked ] && m=true
               g=$(printf '%s' "$line" | sed -n 's/.*__irisCaptured_\([0-9]*\).*/\1/p')
@@ -216,8 +230,16 @@ impl Fake {
     /// A new document at `url` (nothing marked on it).
     fn load(&self, url: &str) {
         self.set("url", url);
-        let _ = std::fs::remove_file(self.file("marked"));
-        let _ = std::fs::remove_file(self.file("closed"));
+        for f in ["marked", "closed", "edits", "fieldgone"] {
+            let _ = std::fs::remove_file(self.file(f));
+        }
+        let n: u32 = std::fs::read_to_string(self.file("docn"))
+            .ok()
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(1)
+            + 1;
+        self.set("docn", &n.to_string());
+        self.set("doc", &format!("d{n}"));
         for e in std::fs::read_dir(self.browser().work_dir.clone())
             .into_iter()
             .flatten()
@@ -567,8 +589,13 @@ async fn agent_calls_pass_through_and_private_pages_stay_closed() {
     b.hand_back();
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_eq!(text(&r), PRIVATE_PAGE);
-    f.load("https://site.test/home");
+    // A later document at that address, read back with nothing in it
+    // (history or the site may bring back what was typed): still closed.
     let _ = std::fs::remove_file(f.file("typed"));
+    f.load("https://site.test/pin");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE);
+    f.load("https://site.test/home");
 
     // Typing into an ordinary field keeps the page open.
     b.take_over(&f.owner, "dev").await.unwrap();
@@ -2075,9 +2102,10 @@ async fn a_field_that_keeps_something_else_is_hidden_or_closed() {
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert!(!r.to_string().contains("Pw-123"), "{r}");
     // Too short, or unknown: the page closes, also one read back before
-    // (the owner typed there), and reading it back again does not reopen it.
-    for kept in [r#"\"Pw\""#, "null"] {
-        f.load("https://site.test/login");
+    // (the owner typed there), and reading it back again does not reopen it
+    // (nor does a later document at its address).
+    for (n, kept) in [r#"\"Pw\""#, "null"].into_iter().enumerate() {
+        f.load(&format!("https://site.test/login-{n}"));
         b.take_over(&f.owner, "dev").await.unwrap();
         f.set("typed", "pw-typed-77");
         b.user_input("dev", &json!({"kind": "text", "text": "7"}))
@@ -2097,6 +2125,9 @@ async fn a_field_that_keeps_something_else_is_hidden_or_closed() {
             b.take_over(&f.owner, "dev").await.unwrap();
             b.hand_back();
         }
+        f.load(&format!("https://site.test/login-{n}"));
+        let r = f.agent(&token, "browser_snapshot", json!({})).await;
+        assert_eq!(text(&r), PRIVATE_PAGE, "{kept}");
     }
     drop(g);
     b.close().await;
@@ -2146,36 +2177,86 @@ async fn typing_in_another_sites_frame_reads_its_fields_for_the_session() {
     b.close().await;
 }
 
-/// What the owner typed into a private field is hidden even when the page
-/// moves it out of the field before Iris reads the fields back (a review
-/// step showing the number); something too short to look for keeps its
-/// document closed unless it is inside what was read back.
+/// What the owner typed or corrected in a private field is read back while
+/// it is still there, before a tap or key that may take the field away (a
+/// review step showing the number), and hidden; a document whose changed
+/// field is gone before it was read again stays closed, and what was
+/// typed is hidden on the next page too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn what_the_owner_types_stays_hidden_when_the_page_moves_it() {
     let f = Fake::new();
     let b = f.browser();
     let g = b.begin_turn(&f.owner, &f.conv, "m", &[]);
     let token = g.token().to_string();
+    let input = |ev: Value| {
+        let b = b.clone();
+        async move { b.user_input("dev", &ev).await.unwrap() }
+    };
     f.agent(
         &token,
         "browser_navigate",
         json!({"url": "https://site.test/pay"}),
     )
     .await;
-    // Typed in pieces with one mistake taken back; the page then empties
-    // the field and shows the number in its review text.
+    // Typed, then Review: read back before the tap, while still in the
+    // field; the review step then shows it and removes the field.
+    b.take_over(&f.owner, "dev").await.unwrap();
+    input(json!({"kind": "text", "text": "5555 4444 3333 1112"})).await;
+    f.set("typed", "5555 4444 3333 1112");
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.5})).await;
+    f.set("fieldgone", "");
+    let _ = std::fs::remove_file(f.file("typed"));
+    b.hand_back();
+    f.set("fields", "Card 5555444433331112, review and pay");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    // (Also the number without its groups.)
+    assert!(!text(&r).contains("5555444433331112"), "{r}");
+    assert!(text(&r).contains("review and pay"), "{r}");
+    // Back to the form: the last digit corrected, then Review again. Only
+    // the new digit was typed; the field is read again before the tap.
+    f.load("https://site.test/pay");
+    f.set("typed", "5555 4444 3333 1112");
+    b.take_over(&f.owner, "dev").await.unwrap();
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.2})).await;
+    input(json!({"kind": "key", "key": "Backspace"})).await;
+    input(json!({"kind": "text", "text": "1"})).await;
+    f.set("typed", "5555 4444 3333 1111");
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.5})).await;
+    f.set("fieldgone", "");
+    let _ = std::fs::remove_file(f.file("typed"));
+    b.hand_back();
+    f.set("fields", "Card 5555 4444 3333 1111, review and pay");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(!text(&r).contains("5555 4444 3333 1111"), "{r}");
+    // Corrected, and the page takes the field away by itself before any
+    // tap: what the field holds now is unknown, so the document stays
+    // closed (an older value it contains proves nothing).
+    f.load("https://site.test/pay");
+    f.set("typed", "5555 4444 3333 1111");
+    b.take_over(&f.owner, "dev").await.unwrap();
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.2})).await;
+    input(json!({"kind": "key", "key": "Backspace"})).await;
+    input(json!({"kind": "text", "text": "7"})).await;
+    f.set("fieldgone", "");
+    let _ = std::fs::remove_file(f.file("typed"));
+    b.hand_back();
+    f.set("fields", "Card 5555 4444 3333 1117, review and pay");
+    for _ in 0..2 {
+        let r = f.agent(&token, "browser_snapshot", json!({})).await;
+        assert_eq!(text(&r), PRIVATE_PAGE, "{r}");
+    }
+    // Typed in pieces with a mistake taken back, and gone the same way:
+    // closed too, and what was typed is hidden on the next page.
+    f.load("https://site.test/pay-2");
     b.take_over(&f.owner, "dev").await.unwrap();
     for t in ["4111 1111 1111 11", "19"] {
-        b.user_input("dev", &json!({"kind": "text", "text": t}))
-            .await
-            .unwrap();
+        input(json!({"kind": "text", "text": t})).await;
     }
-    b.user_input("dev", &json!({"kind": "key", "key": "Backspace"}))
-        .await
-        .unwrap();
-    b.user_input("dev", &json!({"kind": "text", "text": "1"}))
-        .await
-        .unwrap();
+    input(json!({"kind": "key", "key": "Backspace"})).await;
+    input(json!({"kind": "text", "text": "1"})).await;
+    f.set("fieldgone", "");
     b.hand_back();
     assert!(
         b.filled_secrets()
@@ -2185,56 +2266,31 @@ async fn what_the_owner_types_stays_hidden_when_the_page_moves_it() {
         !b.filled_secrets()
             .contains(&"4111 1111 1111 1119".to_string())
     );
-    f.set("fields", "Card 4111 1111 1111 1111, review and pay");
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE, "{r}");
+    f.load("https://site.test/receipt");
+    f.set("fields", "Paid with 4111 1111 1111 1111");
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
-    assert!(!text(&r).contains("4111 1111 1111 1111"), "{r}");
-    assert!(text(&r).contains("review and pay"), "{r}");
-    // Too short to look for and gone from the field: the document stays
-    // closed; the next one is open.
+    assert!(!text(&r).contains("4111"), "{r}");
+    // Too short to look for: closed while there, open on the next page.
+    f.load("https://site.test/pin");
     b.take_over(&f.owner, "dev").await.unwrap();
-    b.user_input("dev", &json!({"kind": "tap", "x": 0.5, "y": 0.5}))
-        .await
-        .unwrap();
-    b.user_input("dev", &json!({"kind": "text", "text": "42"}))
-        .await
-        .unwrap();
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.5})).await;
+    input(json!({"kind": "text", "text": "42"})).await;
+    f.set("typed", "42");
     b.hand_back();
-    f.set("fields", "Code 42, review and pay");
-    for _ in 0..2 {
-        let r = f.agent(&token, "browser_snapshot", json!({})).await;
-        assert_eq!(text(&r), PRIVATE_PAGE, "{r}");
-    }
+    let r = f.agent(&token, "browser_snapshot", json!({})).await;
+    assert_eq!(text(&r), PRIVATE_PAGE, "{r}");
     f.load("https://site.test/done");
-    f.set("doc", "d2");
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
-    // Inside what was read back (typed into the middle of a longer
-    // value): open, the value hidden.
-    f.load("https://site.test/pay-2");
-    f.set("doc", "d3");
-    f.set("typed", "Pw-9a8b7c");
-    b.take_over(&f.owner, "dev").await.unwrap();
-    b.user_input("dev", &json!({"kind": "tap", "x": 0.5, "y": 0.5}))
-        .await
-        .unwrap();
-    b.user_input("dev", &json!({"kind": "text", "text": "a8"}))
-        .await
-        .unwrap();
-    b.hand_back();
-    f.set("fields", "Pw-9a8b7c");
-    let r = f.agent(&token, "browser_snapshot", json!({})).await;
-    assert_ne!(r["isError"], true, "{r}");
-    assert!(!text(&r).contains("Pw-9a8b7c"), "{r}");
     // Control back without the hand-back completing the typing (a last key
     // racing it): the agent taking the page completes it.
     f.load("https://site.test/pay-3");
-    f.set("doc", "d4");
     let _ = std::fs::remove_file(f.file("typed"));
     b.take_over(&f.owner, "dev").await.unwrap();
-    b.user_input("dev", &json!({"kind": "text", "text": "Code-31415"}))
-        .await
-        .unwrap();
+    input(json!({"kind": "text", "text": "Code-31415"})).await;
     b.control.send_replace(Control::Agent);
     f.set("fields", "Code-31415");
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
@@ -2271,15 +2327,18 @@ let captured = 0;
 // Everything that goes into the page: the functions run there and their
 // arguments.
 const sent = (fn, arg) => inPage.push(String(fn) + ' ' + JSON.stringify(arg === undefined ? null : arg));
-const located = (name, box) => ({{
+// `parent`: the element holding it (a locator for `xpath=..`).
+const located = (name, box, parent) => ({{
   name,
-  all: async () => [located(name, box)],
+  all: async () => [located(name, box, parent)],
   boundingBox: async () => box,
+  isVisible: async () => !!box || !!parent,
+  locator: (sel) => sel === 'xpath=..' && parent ? parent : located(name, null),
   evaluateAll: async (fn, arg) => {{ sent(fn, arg); return []; }},
-  nth: () => located(name, box),
+  nth: () => located(name, box, parent),
 }});
 // `ys`: where the frame is at each measurement (the last one stays).
-const frame = (name, fail, top, ys = [400]) => {{
+const frame = (name, fail, top, ys = [400], contents = false) => {{
   let n = 0;
   return {{
     name,
@@ -2289,7 +2348,11 @@ const frame = (name, fail, top, ys = [400]) => {{
       boundingBox: async () => ({{ x: 0, y: ys[Math.min(n++, ys.length - 1)], width: 300, height: 200 }}),
     }},
     locator: () => located(name, null),
-    getByText: () => ({{ all: async () => [] }}),
+    // `contents`: the text search finds an element without a box of its
+    // own (display: contents) whose parent has one.
+    getByText: () => contents && top
+      ? located('contents', null, located('parent', {{ x: 10, y: 700, width: 400, height: 40 }}))
+      : {{ all: async () => [] }},
   }};
 }};
 const page = (frames) => ({{
@@ -2321,7 +2384,9 @@ const page = (frames) => ({{
     movingData = await shot(page([frame('main', false, true), frame('box', true, false, [400, 410, 420, 430, 440, 450, 460])]));
   }} catch (e) {{ moving = e.message; }}
   const movingShots = captured - start2;
-  console.log(JSON.stringify({{ r, refused, again, settled, settledShots, moving, movingData, movingShots, inPage }}));
+  // A match shown only through its children: its parent is blacked out.
+  const boxless = await shot(page([frame('main', false, true, [400], true)]));
+  console.log(JSON.stringify({{ r, refused, again, settled, settledShots, moving, movingData, movingShots, boxless, inPage }}));
 }})();"#
     );
     let dir = tempfile::tempdir().unwrap();
@@ -2371,6 +2436,13 @@ const page = (frames) => ({{
     assert_eq!(v["movingShots"], 3, "{v}");
     assert!(v["moving"].as_str().unwrap().contains("kept moving"), "{v}");
     assert_eq!(v["movingData"], Value::Null);
+    assert!(
+        v["boxless"]["rects"]
+            .as_array()
+            .unwrap()
+            .contains(&json!([10, 700, 400, 40])),
+        "{v}"
+    );
     // No secret (in any written form) goes into the page, neither in the
     // code run there nor in its arguments; the check itself catches one.
     let forms: Vec<String> = super::mask_form_groups(&["Pw-5678".to_string()]).concat();
@@ -2568,6 +2640,14 @@ async fn real_playwright() {
                 "<html><body style='margin:0'>\
                  <div id=c style='font-size:20px;margin:40px 0;width:480px'><span>4111</span> <span>1111</span> \
                  <span>1111</span> <span>1111</span> <span id=cv>737</span></div>\
+                 <p id=n style='font-size:20px;margin:40px 0;width:480px'>Nothing secret here</p></body></html>"
+                    .to_string()
+            } else if req.starts_with("GET /contents") {
+                // A card number in groups inside a wrapper without a box of
+                // its own (display: contents).
+                "<html><body style='margin:0'>\
+                 <div id=w style='font-size:20px;margin:40px 0;width:480px'><span style='display:contents'>\
+                 <span>4111</span> <span>1111</span> <span>1111</span> <span>1111</span></span></div>\
                  <p id=n style='font-size:20px;margin:40px 0;width:480px'>Nothing secret here</p></body></html>"
                     .to_string()
             } else if req.starts_with("GET /nbsp") {
@@ -3651,6 +3731,22 @@ async fn real_playwright() {
     );
     let (x, y) = spot("#n", 0.97).await;
     assert!(pixel(&shot, x, y).await != "0,0,0", "plain text is masked");
+    // Inside a wrapper without a box of its own: the element around it is
+    // blacked out.
+    f.agent(
+        &token,
+        "browser_navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/contents")}),
+    )
+    .await;
+    let shot = f.agent(&token, "browser_take_screenshot", json!({})).await;
+    let (x, y) = spot("#w", 0.97).await;
+    assert!(
+        pixel(&shot, x, y).await == "0,0,0",
+        "the number in a boxless wrapper is not masked"
+    );
+    let (x, y) = spot("#n", 0.97).await;
+    assert!(pixel(&shot, x, y).await != "0,0,0", "plain text is masked");
     // Grouped with non-breaking spaces: hidden and blacked out as well.
     f.agent(
         &token,
@@ -3735,14 +3831,18 @@ async fn real_playwright() {
         "the rest of the element is not shown"
     );
 
-    // The owner types a new card number; the page's review step moves it
-    // into its text and removes the field before they hand back: hidden
-    // and blacked out all the same.
+    // The owner types a new card number and corrects its last digit; the
+    // page's review step moves it into its text and removes the field
+    // before they hand back: read back before the tap, so hidden and
+    // blacked out all the same.
     b.take_over(&f.owner, "dev").await.unwrap();
     for ev in [
         json!({"kind": "navigate", "url": format!("http://127.0.0.1:{port}/review")}),
         json!({"kind": "tap", "x": 0.5, "y": 0.2}),
-        json!({"kind": "text", "text": "5555 4444 3333 1111"}),
+        json!({"kind": "text", "text": "5555 4444 3333 1112"}),
+        json!({"kind": "key", "key": "End"}),
+        json!({"kind": "key", "key": "Backspace"}),
+        json!({"kind": "text", "text": "1"}),
         json!({"kind": "tap", "x": 0.5, "y": 0.5}),
     ] {
         b.user_input("dev", &ev).await.unwrap();
@@ -3938,6 +4038,20 @@ async fn real_playwright() {
         .await
         .unwrap();
     assert!(text_of(&kind).contains("text 15"), "{kind}");
+    // Then corrected while shown: what it holds now is read back too.
+    input(json!({"kind": "tap", "x": 0.5, "y": 0.15})).await;
+    input(json!({"kind": "key", "key": "End"})).await;
+    input(json!({"kind": "key", "key": "Backspace"})).await;
+    let kind = b
+        .tool(
+            &run,
+            "browser_evaluate",
+            &json!({"function": "() => document.querySelector('input').type + ' ' + document.querySelector('input').value.length"}),
+            QUICK,
+        )
+        .await
+        .unwrap();
+    assert!(text_of(&kind).contains("text 14"), "{kind}");
     b.hand_back();
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
     assert_ne!(r["isError"], true, "{r}");
