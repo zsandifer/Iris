@@ -100,6 +100,33 @@ const PAGE_TEXT_CODE: &str = "async (page) => {
   return out.join('\\n').slice(0, 4000000);
 }";
 
+/// Tools that type, press keys, or drag: on a page holding a secret they
+/// could change it into something no longer recognized (deleting its
+/// last character) or move part of it elsewhere, and a later read would
+/// show that part.
+const EDITS: &[&str] = &[
+    "browser_type",
+    "browser_fill_form",
+    "browser_press_key",
+    "browser_drag",
+    "browser_mouse_drag_xy",
+    "browser_mouse_down",
+    "browser_mouse_up",
+];
+
+/// A click with a button other than the left one (a middle click can
+/// paste a selection).
+fn other_button(args: &Value) -> bool {
+    args.get("button")
+        .and_then(Value::as_str)
+        .is_some_and(|b| b != "left")
+}
+
+const SECRET_EDIT: &str = "A password, card number or code is on this page, so typing, \
+    pressing keys and dragging wait until it is gone. You can still click (left button), \
+    scroll, pick from lists, and look with browser_snapshot or browser_take_screenshot (private \
+    details are hidden). To send a sign-in form, use fill_saved_login with submit or submit_ref, \
+    or click its button.";
 const SEARCH_SECRET: &str = "This page shows saved sign-in or card details, so searching it \
     or naming elements by their text is not available. Use browser_snapshot and its refs.";
 
@@ -378,11 +405,11 @@ are fine.
   user you are waiting for them to hand it back. You never see passwords,
   card details or codes, whether Iris filled them or the user typed them:
   screenshots black those fields out, and snapshots show them as [hidden].
-  The page stays usable meanwhile (click, tick a check box, type in other
-  fields, take a screenshot to see whether a sign-in worked); only text
-  searches (`browser_find`, waiting for text, text selectors) wait until
-  they are gone. Rarely a page stays closed because Iris could not read
-  back what the user typed; then open another page.
+  While one is on the page you can still click, tick a check box, scroll,
+  pick from lists, and take a screenshot to see whether a sign-in worked;
+  typing, keys, dragging and text searches wait until it is gone. Rarely a
+  page stays closed because Iris could not read back what the user typed;
+  then open another page.
 - If the browser is stuck or crashed (pages never load, tools keep timing
   out), call `restart_browser`: it closes and reopens it, sign-ins kept. Then
   open the page again.
@@ -513,11 +540,16 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     // to save a login reads only the page's address. A secret Iris knows
     // is hidden from what the agent reads and blacked out in pictures, so
     // the page stays usable while it is there (to see whether a sign-in
-    // went through, or tick a check box); only searching its text is not.
+    // went through, or tick a check box); typing, keys and dragging (which
+    // could cut a secret into parts no longer recognized) and searching its
+    // text are not.
     if !NAVIGATION.contains(&name) && !fill && !own {
         match b.page_access(&run).await {
             Ok(Access::Open) => {}
             Ok(Access::Filled) => {
+                if EDITS.contains(&name) || other_button(&args) {
+                    return error(SECRET_EDIT);
+                }
                 if name != "browser_take_screenshot" && probes_page(name, &args) {
                     return error(SEARCH_SECRET);
                 }

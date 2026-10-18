@@ -538,6 +538,7 @@ fn field_code(
   if ({mark}) await page.evaluate({mark_js});
   const values = {values};
   let filled = false;
+  let kept;
   if (info.tag === 'select') {{
     // The option is picked from the list itself (selecting one that is not
     // there would wait for it): by value, label, number, or a word of the
@@ -574,9 +575,17 @@ fn field_code(
     const pick = fits.length ? fits : values;
     const v = short ? pick.reduce((a, b) => (b.length < a.length ? b : a)) : pick[0];
     filled = await h.fill(v, {{ timeout: 5000 }}).then(() => true, () => false);
+    // What the field kept, when it differs (a length limit or the page may
+    // cut or change it; null: unknown), so Iris hides that too. Iris's
+    // side only: never in what the agent gets.
+    if (filled) {{
+      const got = await h.inputValue({{ timeout: 2000 }}).catch(() => null);
+      if (got === null) kept = null;
+      else if (got !== v) kept = got;
+    }}
   }}
   if (filled && {submit}) await h.press('Enter', {{ timeout: 5000 }}).catch(() => {{}});
-  return {{ filled }};
+  return {{ filled, kept }};
 }}",
         top = serde_json::to_string(&at.top)?,
         frame = serde_json::to_string(&at.frame)?,
@@ -662,6 +671,25 @@ async fn put(
     let v = state.browser.run_code(run, &code).await?;
     if v["moved"] == true {
         return Err(PAGE_CHANGED.into());
+    }
+    // The field kept something else (cut short by a length limit, changed
+    // by the page): hidden as well, or the page closes when it cannot be.
+    if secret && let Some(kept) = v.get("kept") {
+        match kept.as_str() {
+            Some("") => {}
+            Some(k) if watchable(k) => {
+                state.browser.remember_secret(k);
+                state.browser.note_filled();
+            }
+            _ => {
+                state.browser.remember_private(&at.top);
+                let mark = format!(
+                    "async (page) => {{ await page.evaluate({}); return true; }}",
+                    serde_json::to_string(super::MARK_JS)?
+                );
+                state.browser.run_code(run, &mark).await?;
+            }
+        }
     }
     Ok(v["filled"] == true)
 }

@@ -297,6 +297,12 @@ struct Private {
     /// The owner typed into a private field since Iris last read what
     /// they typed (`capture_typed`).
     typed_dirty: bool,
+    /// Counts the owner's private typing: a document read back is marked
+    /// for the generation it was read at, so typing again needs a new read.
+    typed_gen: u64,
+    /// Some of that typing went into another site's frame, where the field
+    /// could not be told apart: every field of such frames is read back.
+    typed_in_frame: bool,
 }
 
 /// Whether the agent may use the current page.
@@ -480,8 +486,14 @@ const PAGE_CODE: &str = r#"async (page) => ({
   url: page.url(),
   title: await page.title(),
   private: await page.evaluate("window.__irisPrivate === true"),
-  captured: await page.evaluate("window.__irisCaptured === true"),
+  captured: await page.evaluate("window.__irisCaptured_GEN === true"),
 })"#;
+
+/// `PAGE_CODE` asking whether this document was read back after the
+/// owner's latest private typing (`generation`).
+fn page_code(generation: u64) -> String {
+    PAGE_CODE.replace("GEN", &generation.to_string())
+}
 
 /// Whether a field takes private details (passwords, card fields, one-time
 /// codes), from its type, autocomplete, name, id, labels and placeholder.
@@ -499,10 +511,12 @@ const SENSITIVE_FN: &str = r#"(e) => {
 /// What the owner typed into private fields, read from Iris's side when
 /// the agent next uses the browser, so it can be hidden like a saved
 /// secret instead of closing the page: per tab, the values of its
-/// private fields in every frame (and, in another site's frame, of the
-/// field with focus, which the check before typing could not inspect).
-/// A tab whose frames were all read and whose values are all long enough
-/// to look for is marked as captured. `MIN` is `fill::MIN_HIDDEN`.
+/// private fields and private editable areas in every frame. In other
+/// sites' frames, where the check before typing could not tell which
+/// field the owner typed into (`ALLFRAMES`), every field and editable
+/// area that holds something. A tab whose frames were all read and whose
+/// values are all long enough to look for is marked as read back for this
+/// typing generation (`GEN`). `MIN` is `fill::MIN_HIDDEN`.
 const CAPTURE_CODE: &str = r#"async (page) => { /* iris:capture */
   const origin = (u) => { try { return new URL(u).origin; } catch (_) { return ''; } };
   const hideable = (v) => [...v].length >= MIN || /^[0-9]{3}$/.test(v);
@@ -513,18 +527,22 @@ const CAPTURE_CODE: &str = r#"async (page) => { /* iris:capture */
     const values = [];
     for (const f of p.frames()) {
       const other = f !== top && origin(f.url()) !== origin(top.url());
-      const r = await f.evaluate((other) => {
+      const r = await f.evaluate((all) => {
         const sensitive = SENSITIVE;
         const vals = [];
         const walk = (root) => {
-          for (const e of root.querySelectorAll('input, textarea')) {
-            if (e.value && (sensitive(e) || (other && e === document.activeElement))) vals.push(String(e.value));
+          for (const e of root.querySelectorAll('input, textarea, [contenteditable]')) {
+            const editable = e.tagName !== 'INPUT' && e.tagName !== 'TEXTAREA';
+            if (editable && !e.isContentEditable) continue;
+            if (!editable && ['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'hidden', 'image', 'range', 'color'].includes(e.type)) continue;
+            const v = String(editable ? e.innerText || '' : e.value || '').trim();
+            if (v && (all || sensitive(e))) vals.push(v);
           }
           for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
         };
         walk(document);
         return vals;
-      }, other).catch(() => null);
+      }, other && ALLFRAMES).catch(() => null);
       if (r === null) {
         if (!f.isDetached()) ok = false;
         continue;
@@ -534,22 +552,25 @@ const CAPTURE_CODE: &str = r#"async (page) => { /* iris:capture */
     const captured = ok && values.every(hideable);
     const marked = await p.evaluate(() => window.__irisPrivate === true).catch(() => false);
     if (captured) {
-      await p.evaluate(() => { try { Object.defineProperty(window, '__irisCaptured', { value: true }); } catch (_) {} }).catch(() => {});
+      await p.evaluate(() => { try { Object.defineProperty(window, '__irisCaptured_GEN', { value: true }); } catch (_) {} }).catch(() => {});
     }
     out.push({ url: p.url(), captured, marked, values: values.filter(hideable) });
   }
   return out;
 }"#;
 
-fn capture_code() -> String {
+fn capture_code(generation: u64, all_frames: bool) -> String {
     CAPTURE_CODE
         .replace("SENSITIVE", SENSITIVE_FN)
         .replace("MIN", &fill::MIN_HIDDEN.to_string())
+        .replace("ALLFRAMES", if all_frames { "true" } else { "false" })
+        .replace("GEN", &generation.to_string())
 }
 
 /// A screenshot for the agent with private details blacked out: every
 /// private field (as `SENSITIVE_FN` sees them) and every field or text
-/// holding one of `SECRETS` in each frame, and any frame Iris cannot look
+/// holding one of `SECRETS` (every written form `hide_secrets` knows, see
+/// `mask_forms`) in each frame, and any frame Iris cannot look
 /// into as a whole (Playwright's own `mask`, placed where each element is
 /// when the picture is taken). The secrets only go to Playwright's own
 /// text search, never into the page's scripts. `OPTS`: `type` (png or
@@ -583,7 +604,10 @@ const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
       const fields = f.locator('input, textarea');
       const values = await fields.evaluateAll((els) => els.map((e) => String(e.value))).catch(() => null);
       if (values === null) throw new Error('the page could not be checked for private details');
-      values.forEach((v, i) => { if (secrets.some((s) => v.includes(s))) masks.push(fields.nth(i)); });
+      values.forEach((v, i) => {
+        const low = v.toLowerCase();
+        if (secrets.some((s) => low.includes(s.toLowerCase()))) masks.push(fields.nth(i));
+      });
       for (const s of secrets) masks.push(f.getByText(s));
     }
   }
@@ -598,7 +622,13 @@ const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
       : await page.screenshot({ ...shot, fullPage: !!opts.fullPage });
   } finally {
     for (const f of page.frames()) {
-      await f.evaluate((a) => { for (const e of document.querySelectorAll('[' + a + ']')) e.removeAttribute(a); }, attr).catch(() => {});
+      await f.evaluate((a) => {
+        const clean = (root) => {
+          for (const e of root.querySelectorAll('[' + a + ']')) e.removeAttribute(a);
+          for (const e of root.querySelectorAll('*')) if (e.shadowRoot) clean(e.shadowRoot);
+        };
+        clean(document);
+      }, attr).catch(() => {});
     }
   }
   return { data: data.toString('base64'), type };
@@ -749,6 +779,50 @@ fn written_forms(secret: &str) -> Vec<String> {
 /// write values in (`written_forms`, any length), and what pages do with
 /// card details: numbers split into groups by spaces or dashes, and short
 /// security codes (only where they stand alone, not inside longer numbers).
+/// Every written form of `secrets` that `hide_secrets` hides, to mask in
+/// pictures: each secret, its encodings, and card numbers written in
+/// groups.
+pub(crate) fn mask_forms(secrets: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in secrets {
+        let n = s.chars().count();
+        let mut forms = vec![s.clone()];
+        if n >= 4 {
+            forms.extend(written_forms(s));
+        }
+        if n >= 8 {
+            forms.extend(crate::gateway::encoded_secret_forms(s));
+        }
+        let digits = !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if digits && s.len() >= 12 {
+            let groups: &[usize] = if s.len() == 15 {
+                &[4, 6, 5]
+            } else {
+                &[4, 4, 4, 4, 4]
+            };
+            let mut parts = Vec::new();
+            let mut at = 0;
+            for g in groups {
+                if at >= s.len() {
+                    break;
+                }
+                let end = (at + g).min(s.len());
+                parts.push(&s[at..end]);
+                at = end;
+            }
+            for sep in [" ", "-", "  ", " - "] {
+                forms.push(parts.join(sep));
+            }
+        }
+        for f in forms {
+            if !f.is_empty() && !out.contains(&f) {
+                out.push(f);
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn hide_secrets(text: &str, secrets: &[String]) -> String {
     let mut out = crate::gateway::redact(text, secrets);
     for s in secrets.iter().filter(|s| s.chars().count() >= 4) {
@@ -1423,7 +1497,8 @@ impl Browser {
     /// The current tab's address, whether the owner typed private details
     /// into this document, and whether Iris read them back since.
     async fn page_state(&self, run: &Running) -> Result<(String, bool, bool)> {
-        let v = self.run_code(run, PAGE_CODE).await?;
+        let generation = lock(&self.private).typed_gen;
+        let v = self.run_code(run, &page_code(generation)).await?;
         let url = v["url"].as_str().ok_or("the browser has no open page")?;
         self.set_page_info(Some(url), v["title"].as_str());
         Ok((url.to_string(), v["private"] == true, v["captured"] == true))
@@ -1440,9 +1515,19 @@ impl Browser {
     /// its address is forgotten when the typing happened in that very
     /// document. Anything not read keeps its page closed.
     pub(crate) async fn capture_typed(&self, run: &Running) -> Result<()> {
-        let v = self.run_code(run, &capture_code()).await?;
+        let (generation, all_frames) = {
+            let p = lock(&self.private);
+            (p.typed_gen, p.typed_in_frame)
+        };
+        let v = self
+            .run_code(run, &capture_code(generation, all_frames))
+            .await?;
         let tabs = v.as_array().ok_or("the browser gave no answer")?;
         let mut p = lock(&self.private);
+        if p.typed_gen != generation {
+            // Typed again meanwhile: read again next time.
+            return Ok(());
+        }
         for t in tabs {
             for value in t["values"].as_array().into_iter().flatten() {
                 let Some(value) = value.as_str() else {
@@ -1462,6 +1547,7 @@ impl Browser {
             }
         }
         p.typed_dirty = false;
+        p.typed_in_frame = false;
         Ok(())
     }
 
@@ -1479,9 +1565,9 @@ impl Browser {
         {
             return Err("Use a snapshot ref (like e12) as `target` here.".into());
         }
-        let secrets = self.filled_secrets();
+        let forms = mask_forms(&self.filled_secrets());
         let code = SHOT_CODE
-            .replace("SECRETS", &serde_json::to_string(&secrets)?)
+            .replace("SECRETS", &serde_json::to_string(&forms)?)
             .replace("OPTS", &opts.to_string())
             .replace("NONCE", &new_id())
             .replace("SENSITIVE", SENSITIVE_FN);
@@ -1521,7 +1607,10 @@ impl Browser {
         };
         if mark && field.private {
             self.remember_private(&field.url);
-            lock(&self.private).typed_dirty = true;
+            let mut p = lock(&self.private);
+            p.typed_dirty = true;
+            p.typed_gen += 1;
+            p.typed_in_frame |= field.frame;
         }
         Ok(field)
     }

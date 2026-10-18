@@ -2840,14 +2840,18 @@ Typing into a private field (a password, card, or one-time-code field, by
 its type, autocomplete, name, or label, or a field in another site's
 frame; checked before the first `text` input, again after any other input,
 and at least every 3 seconds of typing) marks that document and its address
-before anything is typed. Before the agent's next browser tool call that
-reads or acts on a page, Iris reads back, on its own side, the values of
-every private field in every tab and frame (and of the focused field in
-another site's frame). Values of 4 or more characters (or a 3-digit code)
-join the secrets hidden from the agent, and a tab read completely is
-marked as read back: it stays usable like a page holding a secret Iris
-filled (below), also after its address changes within the document, and
-the address is forgotten when the typing happened in that document. A
+before anything is typed, and starts a new typing generation. Before the
+agent's next browser tool call that reads or acts on a page, Iris reads
+back, on its own side, the values of every private field and private
+editable area in every tab and frame (in another site's frame, where the
+field cannot be told apart, every field and editable area that holds
+something once the owner typed in such a frame). Values of 4 or more
+characters (or a 3-digit code) join the secrets hidden from the agent, and
+a tab read completely is marked as read back for that generation: it stays
+usable like a page holding a secret Iris filled (below), also after its
+address changes within the document, and the address is forgotten when
+the typing happened in that document. Typing again starts a new
+generation, so an earlier read no longer counts. A
 document that could not be read back (a shorter value, a frame that
 failed) stays closed: its browser tools other than `browser_navigate`,
 `browser_navigate_back`, `browser_tabs`, `browser_handle_dialog`, and the
@@ -4301,8 +4305,16 @@ or `not found (...)`. While a secret Iris knows (a password, card number or
 CVC it filled, or a value the owner typed and Iris read back) is on the
 page (in a field value or the text of any frame, also in open shadow roots;
 a frame that cannot be read counts as holding one), the page stays usable:
-snapshots and actions work, with the secrets hidden (below), and
-screenshots are masked (below); only searches are refused. With `submit`
+snapshots, clicks (left button), hovering, scrolling and picking from lists
+work, with the secrets hidden (below), and screenshots are masked (below).
+Refused, with an answer saying why: `browser_type`, `browser_fill_form`,
+`browser_press_key`, `browser_drag`, `browser_mouse_drag_xy`,
+`browser_mouse_down`, `browser_mouse_up`, and clicks with another button
+(an edit could cut a secret into a part no longer recognized, or move part
+of it into another field), and searches (below). When a filled field keeps
+something other than the saved value (a length limit cut it, the page
+changed it), that is hidden too, or the page closes when it is too short to
+look for. With `submit`
 or `submit_ref`, `fill_saved_login` waits up to 5 seconds for the password
 to leave the page and answers `filled and submitted (the password is no
 longer on the page: ...)` or `filled and submitted, but the password is
@@ -4328,7 +4340,8 @@ field (as above, also `select`s such as an expiry month) in every frame,
 every field whose value contains a secret, every element whose text
 contains one (Playwright's own text search, which runs apart from the
 page's scripts; secrets never go into the page), and any frame Iris cannot
-look into, whole. Its own arguments (`type`, `fullPage`, `target` as a
+look into, whole. Secrets are looked for in every written form text
+redaction knows (encodings, card numbers written in groups). Its own arguments (`type`, `fullPage`, `target` as a
 snapshot ref, `scale`) are honored; the answer is `Screenshot of the
 viewport. Passwords, card details and codes are blacked out.` plus the
 image. Text rendered as pictures (a canvas, an image) is not recognized.
@@ -4346,8 +4359,8 @@ an abandoned call.
 - Anything but `browser_navigate`, `browser_navigate_back`, `browser_tabs`,
   `browser_handle_dialog`, and Iris's own tools while the current page holds
   private details the owner typed that Iris could not read back (see [Input
-  while in control](#4-websocket-get-apiws)), and searches while a secret
-  Iris knows is on it.
+  while in control](#4-websocket-get-apiws)), and typing, keys, drags and
+  searches while a secret Iris knows is on it.
 
 Each call waits while the owner has taken over (up to about 50 seconds,
 then tells the agent the user is still using it), and checks again once it

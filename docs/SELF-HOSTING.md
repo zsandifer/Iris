@@ -561,8 +561,9 @@ computer).
   it is shown to the agent as `[hidden]` and blacked out of its
   screenshots (every private field, and anything showing a secret, in every
   frame). The page stays usable meanwhile, so the agent can see whether a
-  sign-in worked or tick a "not a robot" box; only searching the page's
-  text waits until the secret is gone. If Iris cannot read back what you
+  sign-in worked, click, or tick a "not a robot" box; typing, keys,
+  dragging and searching the page's text wait until the secret is gone
+  (an edit could cut it into a part no longer recognized). If Iris cannot read back what you
   typed (a value under 4 characters, a frame it cannot read), that page
   stays closed to the agent until it moves on, and so does its address
   until the browser closes (history could bring it back). The agent never
