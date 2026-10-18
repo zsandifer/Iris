@@ -1743,6 +1743,63 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
+        // Only the owner, and only a card in a chat they are in; nothing
+        // changes otherwise.
+        let theirs = h
+            .state
+            .db
+            .with(|c| {
+                c.execute(
+                    "INSERT INTO users(id,display_name,created_at) VALUES ('guest','Guest',0)",
+                    [],
+                )?;
+                let conv = db::create_conversation(c, "guest", "side", "theirs", None)?;
+                let card = json!({"type": "save_login", "title": "Save a login for x.test",
+                    "site": "https://x.test", "host": "x.test", "state": "pending",
+                    "turn_message_id": "turn-2"});
+                Ok(crate::entities::insert_card(c, &conv.id, &card, "assistant")?.id)
+            })
+            .unwrap();
+        let guest = pair_as(&h, Some("guest")).await;
+        let (status, _) = send(
+            &h.app,
+            "POST",
+            &path,
+            Some(&guest),
+            Some(json!({"message_id": use_card})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = send(
+            &h.app,
+            "POST",
+            &path,
+            Some(&token),
+            Some(json!({"message_id": theirs})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let after = h
+            .state
+            .db
+            .with(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                crate::entities::get_credential(c, &owner, &id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.metadata["also_sites"],
+            used["credential"]["metadata"]["also_sites"]
+        );
+        let theirs_card = h
+            .state
+            .db
+            .with(|c| db::get_message(c, &theirs))
+            .unwrap()
+            .unwrap();
+        assert_eq!(theirs_card.card.unwrap()["state"], "pending");
+        assert_eq!(continued(&h).len(), 2);
         // Extra sites can be edited (and cleared) later.
         let (status, edited) = send(
             &h.app,

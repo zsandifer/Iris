@@ -135,21 +135,28 @@ function AddCredential({ kind }) {
 /** One saved login: its name, websites and username; a new password only
  * when one is typed (the saved one is never shown). */
 function EditLogin({ id }) {
-  const [data, reload] = useData('/credentials');
-  const c = (data?.credentials || []).find((x) => x.id === id);
+  // Always from a fresh read (never a remembered list): saving sends every
+  // field, so a stale copy would undo sites added meanwhile from a chat.
+  const [c, setC] = useState(undefined);
   const [f, setF] = useState(null);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
-    if (c && !f) {
-      setF({
-        label: c.label, site: c.metadata.site || '', username: c.metadata.username || '',
-        allow_subdomains: !!c.metadata.allow_subdomains, also: (c.metadata.also_sites || []).join('\n'), password: '',
-      });
-    }
-  }, [c]);
-  if (!data) return html`<${Page} title="Login"><${Spinner} /><//>`;
-  if (!c || c.kind !== 'login') return html`<${Page} title="Login"><${Empty} icon="lock" title="This login is gone" /><//>`;
-  if (!f) return html`<${Page} title=${c.label}><${Spinner} /><//>`;
+    let live = true;
+    get('/credentials').then((d) => {
+      if (!live) return;
+      const x = (d.credentials || []).find((y) => y.id === id && y.kind === 'login') || null;
+      setC(x);
+      if (x) {
+        setF({
+          label: x.label, site: x.metadata.site || '', username: x.metadata.username || '',
+          allow_subdomains: !!x.metadata.allow_subdomains, also: (x.metadata.also_sites || []).join('\n'), password: '',
+        });
+      }
+    }).catch((e) => { if (live) { toast(e.message); setC(null); } });
+    return () => { live = false; };
+  }, [id]);
+  if (c === undefined) return html`<${Page} title="Login"><${Spinner} /><//>`;
+  if (!c || !f) return html`<${Page} title="Login"><${Empty} icon="lock" title="This login is gone" /><//>`;
   const up = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const save = async (e) => {
     e.preventDefault();
@@ -159,7 +166,7 @@ function EditLogin({ id }) {
       allow_subdomains: !!f.allow_subdomains, also_sites: parseSites(f.also),
     };
     if (f.password) body.password = f.password;
-    try { await patch(`/credentials/${seg(id)}`, body); await reload(); toast('Saved'); back(); } catch (err) { toast(err.message); }
+    try { await patch(`/credentials/${seg(id)}`, body); toast('Saved'); back(); } catch (err) { toast(err.message); }
     setBusy(false);
   };
   const remove = async () => {

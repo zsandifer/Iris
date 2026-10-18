@@ -7,7 +7,7 @@ import {
   S, set, go, isOwner, toast, loadGoals, loadEngines, loginMark, applyLoginResponse, ensureConnectors, upsertMessage,
 } from './store.js';
 import { Icon, Img, LetterTile, hostOf, safeUrl, openSheet, closeSheet } from './ui.js';
-import { saveLoginPath } from './login-text.js';
+import { saveLoginPath, cardHosts } from './login-text.js';
 import { plain } from './md.js';
 import { CATALOG_IDS, ServiceSignIn, ServiceTile, labelOf } from './connect.js';
 
@@ -309,11 +309,12 @@ function Countdown({ until }) {
  * use a login already saved there; either way the chat then continues. */
 function SaveLoginCard({ c, m }) {
   const done = c.state === 'saved';
+  const others = cardHosts(c).slice(1);
   return html`<div class=${'card-x' + (done ? ' done' : '')}>
     <div class="card-h"><${LetterTile} name=${c.host || c.title} size=${30} radius=${9} /><b>${c.title}</b></div>
     ${done ? html`<div class="ok-line"><${Icon} name="check" size=${16} /> ${c.used_existing ? `Using your ${c.credential_label || 'saved'} login here` : 'Saved to Logins & wallet'}</div>`
       : !isOwner() ? html`<small class="mu">Only the owner can save this.</small>`
-      : html`<p>I need a login for ${c.host} to keep going. I've filled in the website; you add the username and password. I never see them, I just sign in with them.</p>
+      : html`<p>I need a login for ${c.host} to keep going${others.length ? ` (its sign-in box comes from ${others.join(' and ')})` : ''}. I've filled in the website; you add the username and password. I never see them, I just sign in with them.</p>
         <div class="act"><button onClick=${() => go(saveLoginPath(c, m))}>Add login</button>
           <button class="mu" onClick=${() => useSavedLogin(c, m)}>Use one I saved</button></div>`}
   </div>`;
@@ -331,9 +332,11 @@ async function useSavedLogin(c, m) {
       toast(`${cred.label} works on ${c.host} now`);
     } catch (e) { toast(e.message); }
   };
+  const hosts = cardHosts(c);
   openSheet(() => html`<div class="sheet-body">
     <h3>Use a saved login on ${c.host}</h3>
-    <p class="mu">The login you pick will also work on ${c.host}.</p>
+    <p class="mu">The login you pick will also be filled on ${hosts.length > 1 ? 'these sites' : 'this site'}:</p>
+    <ul class="site-list">${hosts.map((h) => html`<li><b>${h}</b></li>`)}</ul>
     ${!list.length && html`<p class="mu">Nothing saved yet.</p>`}
     ${list.map((x) => html`<button class="fill-item" onClick=${() => pick(x)}><b>${x.label}</b>
       <small class="mu">${[x.metadata.site, x.metadata.username].filter(Boolean).join(' · ')}</small></button>`)}

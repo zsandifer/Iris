@@ -77,7 +77,8 @@ pub enum NotPosted {
     Failed(String),
 }
 
-/// A card asking for a login, new or already waiting in this chat.
+/// A card asking for a login, new or already waiting in this chat (with
+/// the sites it names, for the agent: "shop.test and auth.test").
 #[derive(Debug, PartialEq)]
 pub enum Posted {
     New(String),
@@ -115,6 +116,11 @@ pub async fn post_save_login_card(
         return Err(NotPosted::NoSite);
     };
     let also: Vec<String> = sites[1..].iter().map(|(s, _)| s.clone()).collect();
+    let named = sites
+        .iter()
+        .map(|(_, h)| h.as_str())
+        .collect::<Vec<_>>()
+        .join(" and ");
     // A label or username that echoes a saved secret is dropped.
     let secrets = state.browser.filled_secrets();
     let clean = |v: Option<String>| v.filter(|s| super::hide_secrets(s, &secrets) == *s);
@@ -157,7 +163,7 @@ pub async fn post_save_login_card(
         .await;
     let msg = match made {
         Ok(Some(m)) => m,
-        Ok(None) => return Ok(Posted::Already(host)),
+        Ok(None) => return Ok(Posted::Already(named)),
         Err(e) => return Err(NotPosted::Failed(e.to_string())),
     };
     state.hub.to_users(
@@ -165,7 +171,7 @@ pub async fn post_save_login_card(
         json!({"type": "message.created", "conversation_id": msg.conversation_id, "message": msg}),
     );
     crate::info!("browser: posted a save-login card {}", msg.id);
-    Ok(Posted::New(host))
+    Ok(Posted::New(named))
 }
 
 /// `ask_to_save_login`: a `save_login` card for the current page's site.

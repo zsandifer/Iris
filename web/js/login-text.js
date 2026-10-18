@@ -12,12 +12,25 @@ export function siteHost(site) {
   }
 }
 
-/** A bare domain such as example.com (or www.example.com): the owner most
- * likely means the whole site, its sign-in subdomains included. */
+/** A bare domain the owner typed, such as example.com (or www.example.com):
+ * they most likely mean the whole site, its sign-in subdomains included. A
+ * full address (with https:// or a path) means just that host. */
 export function bareDomain(site) {
-  const host = siteHost(site).replace(/^www\./, '');
+  const s = String(site || '').trim();
+  if (/[/:@?#]/.test(s)) return false;
+  const host = siteHost(s).replace(/^www\./, '');
   if (!host || /^[\d.]+$/.test(host) || host.includes(':')) return false;
   return host.split('.').length === 2;
+}
+
+/** The hosts a save_login card would let a login be used on. */
+export function cardHosts(card) {
+  const out = [];
+  for (const s of [card.site, ...(card.also_sites || [])]) {
+    const h = siteHost(s);
+    if (h && !out.includes(h)) out.push(h);
+  }
+  return out;
 }
 
 /** The Logins & wallet route that adds the login an agent's save_login
