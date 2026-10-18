@@ -5,8 +5,8 @@
 //! of its fields to fill (`browser.input` with `kind: "fill"`). Iris types
 //! it into the focused field through the browser server. The agent never
 //! gets it: secrets travel from the vault to the page only, never into a
-//! tool result, a message, or a log, and the page is closed to the agent
-//! while they are on it. Logins are only filled into the site they were saved
+//! tool result, a message, or a log, and while they are on the page the
+//! agent's screenshots black them out (`Browser::masked_screenshot`). Logins are only filled into the site they were saved
 //! for (the page's real address, and never into another site's frame on
 //! it), cards and secrets only over HTTPS (plain HTTP only on this
 //! machine).
@@ -356,9 +356,10 @@ pub fn definitions() -> Vec<Value> {
             "description": "Sign in with the user's saved login for this site. Give the refs \
                 (from browser_snapshot) of the username and/or password fields; Iris types the \
                 saved values in itself and you never see them. Set `submit` to press Enter in \
-                the last field filled, or `submit_ref` to click the sign-in button. After a \
-                password is filled you cannot read the page until it moves on, so usually \
-                submit. Answers `filled`, or `not found (...)`.",
+                the last field filled, or `submit_ref` to click the sign-in button (usually \
+                submit). The password stays hidden from you afterwards: screenshots black it \
+                out and snapshots show [hidden]. Answers `filled`, `filled and submitted`, or \
+                `not found (...)`.",
             "inputSchema": {"type": "object", "properties": {
                 "username_ref": r("Ref of the username or email field"),
                 "password_ref": r("Ref of the password field"),
@@ -485,7 +486,7 @@ enum Find<'a> {
 }
 
 /// A secret too short to hide reliably from what the agent reads.
-const MIN_HIDDEN: usize = 4;
+pub(crate) const MIN_HIDDEN: usize = 4;
 
 /// Iris's fixed Playwright code for one field: find it; with `fill`
 /// (candidate values: the first that fits the field), check it is still
@@ -627,11 +628,11 @@ fn watchable(v: &str) -> bool {
 
 /// Fill `values` (candidates) into a located field of the saved item's
 /// `field`. Whether it was filled. A secret value (a password, card number,
-/// or code) is hidden from everything the agent reads afterwards, and the
-/// page is closed to the agent while one is still on it. An expiry (shown
-/// on ordinary pages, never filled without the number it goes with) is
-/// left to that rule too. A secret too short to look for closes the page
-/// until it moves on, as if the owner typed it.
+/// or code) is hidden from everything the agent reads afterwards, and
+/// blacked out of its screenshots while one is still on the page. An
+/// expiry (shown on ordinary pages, never filled without the number it goes
+/// with) is left to that rule too. A secret too short to look for closes
+/// the page until it moves on.
 #[allow(clippy::too_many_arguments)]
 async fn put(
     state: &AppState,
@@ -941,8 +942,8 @@ async fn login_inner(
     if !(submit || button.is_some()) {
         return Ok(text("filled"));
     }
-    // The page is closed to the agent while the password is on it: say
-    // whether the form took it, so the agent knows what it can do next.
+    // Say whether the form took the password, so the agent knows to check
+    // for an error or a check box (text searches wait while it is there).
     let password = targets.iter().any(|(f, _, _)| *f == "password");
     if password && !settled(state, ctx, run).await {
         return Ok(text(STILL_THERE));
@@ -953,9 +954,10 @@ async fn login_inner(
 pub(crate) const SUBMITTED: &str = "filled and submitted (the password is no longer on the page: \
     take a browser_snapshot to see whether the sign-in worked)";
 pub(crate) const STILL_THERE: &str = "filled and submitted, but the password is still in its field \
-    (the page may still be working, or the sign-in did not go through). Read the page with \
-    browser_snapshot to check (saved details show as [hidden]); other actions wait until the \
-    password leaves the page. If it stays stuck, ask the user to take over.";
+    (the page may still be working, or the sign-in did not go through). Take a screenshot (the \
+    password is blacked out) or a browser_snapshot (it shows as [hidden]) to see why: an error, \
+    or a check like \"I'm not a robot\" you can click. If it stays stuck, ask the user to take \
+    over.";
 
 /// How long a submitted sign-in may take to clear the password from the
 /// page before the answer says it is still there.
@@ -1304,7 +1306,7 @@ async fn card_inner(
     }
     drop(secret);
     // Sent only when everything asked for was filled: an incomplete form
-    // is left for the user (the page is closed to the agent now).
+    // is left for the user.
     let sent = missing.is_empty() && (submit || button.is_some());
     if sent {
         b.check_agent(ctx)?;

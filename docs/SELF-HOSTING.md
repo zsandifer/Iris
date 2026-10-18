@@ -554,15 +554,19 @@ computer).
   from Logins & wallet. Logins only go into fields on the site they were
   saved for, and
   everything only over HTTPS (plain HTTP only on this machine), and never
-  into another site's frame inside the page. When you type into a
-  password, card, or code field, the agent cannot use that page at all (in
-  any tab) until it moves on to a new page, for example after the sign-in;
-  it can still open another page, but not that address again until the
-  browser closes. A saved password or card Iris filled closes the page only
-  while it is still on it, in a field or its text (sent or cleared forms
-  open it again, even when the address stays the same); meanwhile the agent can still read the
-  page, with the secret hidden, to see whether the sign-in worked. The agent never gets your saved
-  logins or cards. While you are in control, dialogs the page shows are
+  into another site's frame inside the page. The agent never sees a
+  password, card number or code, and still sees the page around it: what
+  you type into a password, card, or code field is read back on Iris's
+  side when you hand the browser back, and like a saved secret Iris filled,
+  it is shown to the agent as `[hidden]` and blacked out of its
+  screenshots (every private field, and anything showing a secret, in every
+  frame). The page stays usable meanwhile, so the agent can see whether a
+  sign-in worked or tick a "not a robot" box; only searching the page's
+  text waits until the secret is gone. If Iris cannot read back what you
+  typed (a value under 4 characters, a frame it cannot read), that page
+  stays closed to the agent until it moves on, and so does its address
+  until the browser closes (history could bring it back). The agent never
+  gets your saved logins or cards. While you are in control, dialogs the page shows are
   answered for you (alerts and confirmations accepted, prompts dismissed),
   file pickers are cancelled, and a window the page opens (a sign-in
   popup) becomes the one you see.
@@ -933,9 +937,9 @@ dropping them; when they end you get one summary notification.
   for reviewed tools (no code execution in the server, no page scripts, no
   file access, no request headers). Saved secrets go from the vault straight
   into the page, typed by Iris (the agent names the fields and never sees
-  the values; cards need your OK each time); a page
-  where you typed or filled private details is closed to the agent until
-  it moves on. Only `http`/`https` pages can be opened. When a turn ends or
+  the values; cards need your OK each time); private details you typed or
+  Iris filled are hidden from the agent and blacked out of its screenshots
+  (a page whose typing cannot be read back stays closed until it moves on). Only `http`/`https` pages can be opened. When a turn ends or
   you take over, its pending browser reads stop, and an action already
   sent finishes first (opening a page: at most 8 seconds; other actions:
   up to the call's 90-second limit).

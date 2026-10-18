@@ -6,8 +6,11 @@
 //!
 //! Iris passes Playwright calls through unchanged or refuses them; it never
 //! decides what to call. Refused: tools outside [`ALLOWED`], calls that would read
-//! or write files on the server, addresses that are not web pages, and any
-//! use of a page where the owner just typed private details.
+//! or write files on the server, addresses that are not web pages, any use
+//! of a page where the owner typed private details Iris could not read back,
+//! and text searches of a page showing a secret. One call is answered by
+//! Iris itself: a screenshot while the browser knows secrets is taken with
+//! private details blacked out (`Browser::masked_screenshot`).
 
 use super::{Access, Browser, Control, TurnCtx};
 use crate::state::AppState;
@@ -97,8 +100,6 @@ const PAGE_TEXT_CODE: &str = "async (page) => {
   return out.join('\\n').slice(0, 4000000);
 }";
 
-const SHOWS_SECRET: &str = "No screenshot right now: this page shows saved sign-in or card \
-    details. Use browser_snapshot instead.";
 const SEARCH_SECRET: &str = "This page shows saved sign-in or card details, so searching it \
     or naming elements by their text is not available. Use browser_snapshot and its refs.";
 
@@ -125,7 +126,7 @@ fn probes_page(name: &str, args: &Value) -> bool {
 }
 
 /// A snapshot ref (`e12`, `f1e3`).
-fn is_ref(s: &str) -> bool {
+pub(crate) fn is_ref(s: &str) -> bool {
     let s = s.trim();
     let rest = match s.strip_prefix('f') {
         Some(r) => match r.find('e') {
@@ -374,11 +375,14 @@ are fine.
 - Paying: call `fill_saved_card` with the refs of the payment fields. The user
   approves every use in the chat; tell them you are waiting for their OK.
 - While the user has control, tools answer that they are waiting; tell the
-  user you are waiting for them to hand it back. A page where the user typed
-  a password or card stays closed to you until it moves on (you can still
-  fill saved details there, or open another page). A page where Iris filled
-  a saved password or card is closed only while it is still on the page:
-  meanwhile `browser_snapshot` works, with saved details shown as [hidden].
+  user you are waiting for them to hand it back. You never see passwords,
+  card details or codes, whether Iris filled them or the user typed them:
+  screenshots black those fields out, and snapshots show them as [hidden].
+  The page stays usable meanwhile (click, tick a check box, type in other
+  fields, take a screenshot to see whether a sign-in worked); only text
+  searches (`browser_find`, waiting for text, text selectors) wait until
+  they are gone. Rarely a page stays closed because Iris could not read
+  back what the user typed; then open another page.
 - If the browser is stuck or crashed (pages never load, tools keep timing
   out), call `restart_browser`: it closes and reopens it, sign-ins kept. Then
   open the page again.
@@ -506,37 +510,34 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
     }
     // Filling saved details reads nothing, so it may go on on a page that
     // already holds some (the password step after the username); asking
-    // to save a login reads only the page's address. A saved secret Iris
-    // filled is hidden from snapshots, so the page can still be read while
-    // it is there (to see whether a sign-in went through).
+    // to save a login reads only the page's address. A secret Iris knows
+    // is hidden from what the agent reads and blacked out in pictures, so
+    // the page stays usable while it is there (to see whether a sign-in
+    // went through, or tick a check box); only searching its text is not.
     if !NAVIGATION.contains(&name) && !fill && !own {
         match b.page_access(&run).await {
             Ok(Access::Open) => {}
-            Ok(Access::Filled) => match name {
-                "browser_snapshot" => {}
-                "browser_take_screenshot" => return error(SHOWS_SECRET),
-                _ if probes_page(name, &args) => return error(SEARCH_SECRET),
-                _ => return error(super::FILLED_PAGE),
-            },
+            Ok(Access::Filled) => {
+                if name != "browser_take_screenshot" && probes_page(name, &args) {
+                    return error(SEARCH_SECRET);
+                }
+            }
             Ok(Access::Typed) => return error(super::PRIVATE_PAGE),
             Err(e) => return error(e.to_string()),
         }
     }
-    // Saved secrets may show on later pages (echoed into the text or a
-    // field): no pictures of those, and no searching them (a match or not
-    // tells what is hidden, a character at a time).
+    // Secrets may show on later pages (echoed into the text or a field):
+    // pictures black them out, and searching for text is refused (a
+    // match or not tells what is hidden, a character at a time).
     let secrets = b.filled_secrets();
-    if !secrets.is_empty() && probes_page(name, &args) {
+    let masked = name == "browser_take_screenshot" && !secrets.is_empty();
+    if !secrets.is_empty() && probes_page(name, &args) && name != "browser_take_screenshot" {
         let shown = match b.run_code(&run, PAGE_TEXT_CODE).await {
             Ok(v) => v.as_str().unwrap_or("").to_string(),
             Err(e) => return error(e.to_string()),
         };
         if super::hide_secrets(&shown, &secrets) != shown {
-            return error(if name == "browser_take_screenshot" {
-                SHOWS_SECRET
-            } else {
-                SEARCH_SECRET
-            });
+            return error(SEARCH_SECRET);
         }
     }
     b.set_busy(true);
@@ -551,6 +552,7 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
             (super::own::SAVE_LOGIN, _) => {
                 Ok(super::own::ask_to_save_login(state, &ctx, &run, &args).await)
             }
+            ("browser_take_screenshot", _) if masked => b.masked_screenshot(&run, &args).await,
             _ => b.tool(&run, name, &args, super::CALL_TIMEOUT).await,
         }
     };
@@ -578,25 +580,14 @@ pub async fn call(state: &AppState, token: &str, name: &str, args: &Value) -> Va
         parts.push(json!({"type": "text",
             "text": "(Iris closed the file picker: uploading files is not available.)"}));
     }
-    // A picture is checked again once taken: the page may have shown a
-    // saved secret, or become private, while it was being taken (text is
-    // redacted below; pixels cannot be).
+    // A picture is checked again once taken: the owner's typing may have
+    // closed the page while it was being taken (text is redacted below;
+    // pixels cannot be). One taken without masks (no secret was known
+    // then) is dropped if one is known now.
     if name == "browser_take_screenshot" && out["isError"] != true {
         let access = b.page_access(&run).await.unwrap_or(Access::Typed);
-        let shown = if access == Access::Filled {
-            Some(true)
-        } else if secrets.is_empty() {
-            Some(false)
-        } else {
-            b.run_code(&run, PAGE_TEXT_CODE).await.ok().map(|v| {
-                let t = v.as_str().unwrap_or("");
-                super::hide_secrets(t, &secrets) != t
-            })
-        };
-        if access == Access::Typed {
+        if access == Access::Typed || (!masked && !b.filled_secrets().is_empty()) {
             out = error(super::PRIVATE_PAGE);
-        } else if shown != Some(false) {
-            out = error(SHOWS_SECRET);
         }
     }
     // Files Playwright wrote for this call (a screenshot) are not for the
