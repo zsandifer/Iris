@@ -392,6 +392,13 @@ terminal. Never copy subscription credential files. `iris status`,
 for that account; Gemini has no auth-status command, so its status stays
 unknown until a turn reports it.
 
+**Upgrading.** The root-owned launcher checks every request against the
+rules of its own build (allowed CLI variables and arguments), so install the
+new build there with every upgrade, together with the service binary
+(`install -Dm755 target/release/iris /usr/local/bin/iris` as root, then
+restart Iris). An older launcher refuses requests from a newer service, and
+CLI turns fail until it is replaced.
+
 After engines are installed and Iris has created its vault key, run as the
 service account:
 
