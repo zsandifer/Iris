@@ -324,6 +324,11 @@ struct Private {
     edits: Vec<(String, u64)>,
     /// The last edit id given out.
     edit_seq: u64,
+    /// The owner's typing since the last tap or key (`typed_text`): the
+    /// edits it made, and whether it began in an empty field (then what was
+    /// typed is the whole value, and hiding it covers those edits).
+    run_edits: Vec<u64>,
+    run_from_empty: bool,
 }
 
 /// Whether the agent may use the current page.
@@ -896,8 +901,8 @@ const SHOT_CODE: &str = r#"async (page) => { /* iris:shot */
 /// as private; so does one the owner typed private details into) and
 /// whether it is in another site's frame. With `MARK`, a private field
 /// marks the document private before anything is typed and is tagged with
-/// edit id `EDIT` (`edit`: tagged); with `FORCE` it counts as private
-/// whatever it is.
+/// edit id `EDIT` (`edit`: tagged; `empty`: it held nothing); with
+/// `FORCE` it counts as private whatever it is.
 const FIELD_FN: &str = r#"() => {
   const sensitive = SENSITIVE;
   let e = document.activeElement;
@@ -933,7 +938,8 @@ const FIELD_FN: &str = r#"() => {
       if (!window.__irisDoc) Object.defineProperty(window, '__irisDoc', { value: Math.random().toString(36).slice(2) + Date.now().toString(36) });
     } catch (_) {}
   }
-  return { private: priv, frame, edit, doc: String(window.__irisDoc || '') };
+  const held = field && !frame ? String(e.isContentEditable ? e.textContent || '' : e.value || '').trim() : 'unknown';
+  return { private: priv, frame, edit, empty: held === '', doc: String(window.__irisDoc || '') };
 }"#;
 
 /// What every field holds (inputs, text areas) and the text of every
@@ -992,6 +998,10 @@ pub(crate) struct Field {
     pub frame: bool,
     /// The id Iris gave the document when it was marked (empty: none).
     pub doc: String,
+    /// The edit id the field was tagged with (marking a private field).
+    pub edit: Option<u64>,
+    /// It held nothing.
+    pub empty: bool,
 }
 
 /// Keys the owner can press while in control (names as in the DOM).
@@ -1051,14 +1061,24 @@ fn written_forms(secret: &str) -> Vec<String> {
 
 /// What the owner typed into a private field, as Iris passed it on: hidden
 /// like a secret too, should the page move it out of the field before it
-/// is read back (its document stays closed until the field is read again,
-/// see `Private::edits`, but another document may show it).
+/// is read back (another document may show it). Typing that began in an
+/// empty field covers its edits; any other change needs the field read
+/// again (`Private::edits`).
 fn flush_typed(p: &mut Private) {
     let typed = std::mem::take(&mut p.typed_text);
     let typed = typed.trim();
+    let edits = std::mem::take(&mut p.run_edits);
     if fill::watchable(typed) {
         add_secret(p, typed);
+        // Typed into an empty field (Backspace only taking back the last
+        // character): what was typed is what it holds, so it is covered
+        // even should the page remove the field by itself (a code sent as
+        // soon as it is complete).
+        if std::mem::take(&mut p.run_from_empty) {
+            p.edits.retain(|(_, id)| !edits.contains(id));
+        }
     }
+    p.run_from_empty = false;
 }
 
 /// A private value read back or typed: hidden from now on.
@@ -2087,12 +2107,14 @@ impl Browser {
             private: v["private"] != false,
             frame: v["frame"] != false,
             doc: v["doc"].as_str().unwrap_or("").into(),
+            edit: (v["edit"] == true).then_some(edit),
+            empty: v["empty"] == true,
         };
         if mark && field.private {
             {
                 let mut p = lock(&self.private);
                 p.ever_marked = true;
-                if v["edit"] == true {
+                if field.edit.is_some() {
                     let e = (field.doc.clone(), edit);
                     p.edits.push(e);
                 }
@@ -2647,7 +2669,18 @@ impl Browser {
                 // Deleting edits the field like typing does: a private one is
                 // marked first (and read back again before the agent's turn).
                 if matches!(*key, "Backspace" | "Delete") {
-                    self.focused_field(&run, true, false).await?;
+                    let field = self.focused_field(&run, true, false).await?;
+                    // Taking back what was just typed stays part of that
+                    // typing; anything else is a change to read again.
+                    {
+                        let mut p = lock(&self.private);
+                        if let Some(id) = field.edit
+                            && *key == "Backspace"
+                            && !p.run_edits.is_empty()
+                        {
+                            p.run_edits.push(id);
+                        }
+                    }
                     still()?;
                 }
                 self.act(&run, "browser_press_key", json!({"key": key}))
@@ -2684,6 +2717,12 @@ impl Browser {
             p.field_checked = Some(std::time::Instant::now());
             if !field.private || field.doc != p.typing_doc {
                 flush_typed(&mut p);
+            }
+            if let Some(id) = field.edit {
+                if p.run_edits.is_empty() && p.typed_text.is_empty() {
+                    p.run_from_empty = field.empty;
+                }
+                p.run_edits.push(id);
             }
             p.typing_private = field.private;
             p.typing_doc = field.doc;

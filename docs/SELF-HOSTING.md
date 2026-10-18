@@ -557,8 +557,9 @@ computer).
   into another site's frame inside the page. The agent never sees a
   password, card number or code, and still sees the page around it: what
   you type into a password, card, or code field is read back on Iris's
-  side when you hand the browser back (and kept as you type it, in case the
-  page moves it out of the field first), and like a saved secret Iris filled,
+  side when you hand the browser back, and before each tap or key you send
+  after changing it (while it is still in its field: a review step may take
+  the field away), and like a saved secret Iris filled,
   it is shown to the agent as `[hidden]` and blacked out of its
   screenshots (every private field, and anything showing a secret, in every
   frame). The page stays usable meanwhile, so the agent can see whether a

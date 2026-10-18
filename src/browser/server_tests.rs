@@ -19,7 +19,8 @@ use crate::state::AppState;
 /// marked read back for typing generation N in the current document),
 /// `doc` the current document's id (default d1; a new page gets a new
 /// one), `edits` the edit ids Iris tagged the owner's field with (reads
-/// find them; `fieldgone` makes them miss the field),
+/// find them; `fieldgone` makes them miss the field), `fieldfull` that the
+/// focused field already holds something,
 /// `privfields` what Iris's field check sees, `calls.log` records calls.
 const FAKE: &str = r####"#!/bin/sh
 cfg="$2"
@@ -60,7 +61,7 @@ while IFS= read -r line; do
         browser_navigate)
           to=$(printf '%s' "$line" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')
           printf '%s' "$to" > url
-          rm -f marked closed captured_* edits fieldgone
+          rm -f marked closed captured_* edits fieldgone fieldfull
           n=$(( $(cat docn 2>/dev/null || echo 1) + 1 )); echo "$n" > docn; echo "d$n" > doc
           reply "### Page\\n- Page URL: $to\\n- Page Title: Sign in\\n### Snapshot\\n- [Snapshot](out/page-2.yml)" '' '' ;;
         browser_run_code_unsafe)
@@ -155,7 +156,8 @@ while IFS= read -r line; do
                 fi ;;
               esac
               d=$(cat doc 2>/dev/null || echo d1)
-              reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"private\\\":$p,\\\"frame\\\":$fr,\\\"edit\\\":$ed,\\\"doc\\\":\\\"$d\\\"}" '' '' ;;
+              em=true; [ -f fieldfull ] && em=false
+              reply "### Result\\n{\\\"url\\\":\\\"$url\\\",\\\"private\\\":$p,\\\"frame\\\":$fr,\\\"edit\\\":$ed,\\\"empty\\\":$em,\\\"doc\\\":\\\"$d\\\"}" '' '' ;;
             *)
               m=false; [ -f marked ] && m=true
               g=$(printf '%s' "$line" | sed -n 's/.*__irisCaptured_\([0-9]*\).*/\1/p')
@@ -230,7 +232,7 @@ impl Fake {
     /// A new document at `url` (nothing marked on it).
     fn load(&self, url: &str) {
         self.set("url", url);
-        for f in ["marked", "closed", "edits", "fieldgone"] {
+        for f in ["marked", "closed", "edits", "fieldgone", "fieldfull"] {
             let _ = std::fs::remove_file(self.file(f));
         }
         let n: u32 = std::fs::read_to_string(self.file("docn"))
@@ -2217,6 +2219,7 @@ async fn what_the_owner_types_stays_hidden_when_the_page_moves_it() {
     // the new digit was typed; the field is read again before the tap.
     f.load("https://site.test/pay");
     f.set("typed", "5555 4444 3333 1112");
+    f.set("fieldfull", "");
     b.take_over(&f.owner, "dev").await.unwrap();
     input(json!({"kind": "tap", "x": 0.5, "y": 0.2})).await;
     input(json!({"kind": "key", "key": "Backspace"})).await;
@@ -2233,22 +2236,32 @@ async fn what_the_owner_types_stays_hidden_when_the_page_moves_it() {
     // Corrected, and the page takes the field away by itself before any
     // tap: what the field holds now is unknown, so the document stays
     // closed (an older value it contains proves nothing).
-    f.load("https://site.test/pay");
-    f.set("typed", "5555 4444 3333 1111");
-    b.take_over(&f.owner, "dev").await.unwrap();
-    input(json!({"kind": "tap", "x": 0.5, "y": 0.2})).await;
-    input(json!({"kind": "key", "key": "Backspace"})).await;
-    input(json!({"kind": "text", "text": "7"})).await;
-    f.set("fieldgone", "");
-    let _ = std::fs::remove_file(f.file("typed"));
-    b.hand_back();
-    f.set("fields", "Card 5555 4444 3333 1117, review and pay");
-    for _ in 0..2 {
-        let r = f.agent(&token, "browser_snapshot", json!({})).await;
-        assert_eq!(text(&r), PRIVATE_PAGE, "{r}");
+    // (Also when what was typed is long enough to hide, or only inserted
+    // into what the field held: the rest of the field is unknown.)
+    for (fix, back) in [("7", 1), ("9999", 4), ("9999", 0)] {
+        // (Each at its own address: a closed one stays closed.)
+        f.load(&format!("https://site.test/pay-{fix}-{back}"));
+        f.set("typed", "5555 4444 3333 1111");
+        f.set("fieldfull", "");
+        b.take_over(&f.owner, "dev").await.unwrap();
+        input(json!({"kind": "tap", "x": 0.5, "y": 0.2})).await;
+        for _ in 0..back {
+            input(json!({"kind": "key", "key": "Backspace"})).await;
+        }
+        input(json!({"kind": "text", "text": fix})).await;
+        f.set("fieldgone", "");
+        let _ = std::fs::remove_file(f.file("typed"));
+        b.hand_back();
+        f.set("fields", "Card 5555 4444 3333 1117, review and pay");
+        for _ in 0..2 {
+            let r = f.agent(&token, "browser_snapshot", json!({})).await;
+            assert_eq!(text(&r), PRIVATE_PAGE, "{fix}: {r}");
+        }
     }
-    // Typed in pieces with a mistake taken back, and gone the same way:
-    // closed too, and what was typed is hidden on the next page.
+    // Typed into the empty field in pieces with a mistake taken back, and
+    // gone the same way (a code sent as soon as it is complete): what was
+    // typed is all the field held, so the page stays open with it hidden,
+    // and so does the next one.
     f.load("https://site.test/pay-2");
     b.take_over(&f.owner, "dev").await.unwrap();
     for t in ["4111 1111 1111 11", "19"] {
@@ -2266,8 +2279,10 @@ async fn what_the_owner_types_stays_hidden_when_the_page_moves_it() {
         !b.filled_secrets()
             .contains(&"4111 1111 1111 1119".to_string())
     );
+    f.set("fields", "Card 4111 1111 1111 1111 sent");
     let r = f.agent(&token, "browser_snapshot", json!({})).await;
-    assert_eq!(text(&r), PRIVATE_PAGE, "{r}");
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(!text(&r).contains("4111"), "{r}");
     f.load("https://site.test/receipt");
     f.set("fields", "Paid with 4111 1111 1111 1111");
     let r = f.agent(&token, "browser_snapshot", json!({})).await;

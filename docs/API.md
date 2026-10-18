@@ -2851,15 +2851,21 @@ site's frame, where the field cannot be told apart, every field and
 editable area that holds something once the owner typed in such a frame.
 Every hand-back starts a new generation too (the owner may have changed a
 value with a page's buttons or arrow keys), so values are read again before
-the agent's next call. What the owner types into a private field is also
-kept as Iris passes it on (`Backspace` takes back the last character; a
-tap, another key, typing into an ordinary field or another document, or
-handing back completes it): 4 or more characters (or a 3-digit code) join
-the secrets hidden from the agent right away, so a page moving the value
-out of its field before it is read back (a review step showing the number)
-still cannot show it, and anything shorter keeps the document it was typed
-into from being marked read back unless it is inside a value read back or
-known. Values of 4 or more
+the agent's next call. They are also read right before Iris passes on a
+`tap`, `navigate`, `back`, or a key other than `Backspace` and `Delete`
+after the owner changed something, while the value is still in its field
+(a review step may move it into the page's text and remove the field).
+Every field the owner types into or deletes from is tagged with an edit id
+(a plain property on the element), and its document counts as read back
+only once a read finds that very field again with every value long enough
+to look for; a field the page removed or replaced first keeps it closed. A
+field the owner typed private details into stays private however it looks
+later. What the owner types into a private field is also kept as Iris
+passes it on (`Backspace` takes back the last character; a tap, another
+key, typing into an ordinary field or another document, handing back, or
+the agent's next call completes it): 4 or more characters (or a 3-digit
+code) join the secrets hidden from the agent, so another document showing
+it (a receipt) is covered too. Values of 4 or more
 characters (or a 3-digit code) join the secrets hidden from the agent, and
 only then is a tab read completely marked as read back for that generation
 (a read cut short marks nothing): it stays usable like a page holding a
@@ -2876,8 +2882,9 @@ failed) stays closed: its browser tools other than `browser_navigate`,
 `browser_navigate_back`, `browser_tabs`, `browser_handle_dialog`, and the
 fill tools answer that the owner typed private details there, in whichever
 tab, and its address (ignoring the fragment; a page brought back from
-history may still hold what was typed) stays closed for documents not read
-back until the browser closes. Pages and addresses are read from the
+history may still hold what was typed) stays closed until the browser
+closes, for every document there (another one read back there does not
+count), unless the document typed into was read back. Pages and addresses are read from the
 browser itself, never from page-controlled text. A login is filled only when its site
 matches that real address and the focused field is not in another site's
 frame.
@@ -4349,8 +4356,9 @@ could not read back (see below). The fill tools themselves stay usable there. Th
 numbers, and every value Iris filled this browser session (a CVC only
 where it stands alone), are replaced with `[hidden]` in every result the
 agent gets (addresses, titles, dialogs, page text; also their common
-encodings, card numbers written in groups, and values trimmed and with
-whitespace runs collapsed, as snapshots show them). While the page's text or
+encodings, card numbers written in groups or, for one known only in
+groups, without them, and values trimmed and with whitespace runs
+collapsed, as snapshots show them). While the page's text or
 fields (all frames) show one, `browser_find`, `browser_wait_for`, and
 targets written as selectors instead of snapshot refs are refused (their
 outcome would tell what is hidden).
@@ -4365,9 +4373,12 @@ whose value contains a secret, every element whose text contains one
 (Playwright's own text search, in its isolated world, one search per
 secret so an element holding another secret inside it is still found; and,
 for each text node holding one, the smallest element showing all of that
-text, also text running past its own box), and any frame Iris cannot look
-into, whole. Secrets are looked for in every written form text redaction
-knows (encodings, card numbers written in groups), whatever the case and
+text, also text running past its own box; a match shown without a box of
+its own, such as `display: contents`, gives the nearest ancestor with one),
+and any frame Iris cannot look into, whole. Secrets are looked for in
+every written form text redaction knows (encodings, card numbers written
+in groups, also a number known only in groups written without them),
+whatever the case and
 the kind of white space (a non-breaking space matches a space). Only what
 is on screen is pictured (capturing beyond it can lay the page out again):
 a `target` (a snapshot ref) is scrolled into view first and its part on
