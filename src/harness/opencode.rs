@@ -791,6 +791,7 @@ anthropic/claude-haiku-4-5
                 "/home/agent/.codex/auth.json".into(),
             ],
             split: false,
+            subagent_model: None,
         };
         let inv = OpenCode::new(HarnessConfig::opencode_default())
             .build(&spec)

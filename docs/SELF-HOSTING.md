@@ -223,7 +223,8 @@ Data directory layout:
 
 End users never pick models. Each turn uses a **slot**: `chat` (everyday
 conversation), `chat_strong` (clearly hard requests), `background`
-(heartbeat), `feed`, and an optional `classifier`. A slot's model is the
+(heartbeat, routines, memory upkeep, and research helpers), `feed`, and an
+optional `classifier`. A slot's model is the
 highest-ranked model that is available on this machine right now (its CLI is
 installed, enabled, and signed in, and the CLI lists the model), unless you
 pin one in the app (`PUT /api/models/slots/{slot}`). Pinned slots never
@@ -236,16 +237,26 @@ model families by pattern, so new versions slot in by themselves:
 
 | Slot | Preference (abridged) |
 |------|-----------------------|
-| chat | Claude Haiku, GPT Luna, Gemini Flash, local models, ... |
+| chat | Claude Sonnet, GPT Sol, Gemini Pro, then Claude Haiku, GPT Luna, Gemini Flash, local models, ... |
 | chat_strong | Claude Sonnet, GPT Sol, Gemini Pro, large local models, ... |
 | background, feed | Claude Haiku, GPT Luna, Gemini Flash, local models, ... |
 
-Effort starts at `low`. A rule-based classifier (no extra model call) raises
-it to `medium` or `high` for code, research, planning, math, long or
-multi-step requests, and when you say an answer was wrong, retry, or keep
-working on the same problem; it drops back to `low` when the conversation
-turns casual. Clearly hard requests also move to `chat_strong`. The choice
-(slot, model, effort, and why) is stored in message metadata only.
+Effort starts at the model family's level: `medium` for Claude Sonnet,
+`low` for GPT Sol and everything else. A rule-based classifier (no extra
+model call) raises it to `medium` or `high` for code, research, planning,
+math, long or multi-step requests, and when you say an answer was wrong,
+retry, or keep working on the same problem; it drops back to the starting
+level when the conversation turns casual. Clearly hard requests also move to
+`chat_strong`. The choice (slot, model, effort, and why) is stored in
+message metadata only.
+
+The small models do the work behind the scenes: heartbeat, routines, feed,
+memory upkeep, and research. A chat turn on Claude Code or Codex can hand
+research to a helper (subagent), which runs on the `background` slot's
+model of the same CLI (Haiku under Sonnet, Luna under Sol; a background pin
+on that CLI is used instead). Claude Code gets it through
+`CLAUDE_CODE_SUBAGENT_MODEL`, with background tasks off so a helper finishes
+before the reply does; Codex is told the model to pass to `spawn_agent`.
 
 If a CLI is missing or signed out, Iris uses the next-ranked model, even in
 the middle of a turn, and tells you once with a "Reconnect" card. Features

@@ -792,6 +792,7 @@ mod tests {
                 "/home/agent/.codex/auth.json".into(),
             ],
             split: false,
+            subagent_model: None,
         };
         let inv = Gemini::new(HarnessConfig::gemini_default())
             .build(&spec)

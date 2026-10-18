@@ -3678,7 +3678,7 @@ and `opencode models --verbose` (at every harness probe).
 | `effective` | string or null | What turns use now: the pin if usable, else `recommended`. |
 | `pin_unavailable` | bool | Pinned, but the pinned model is not usable right now. |
 | `status` | string | `ok`, `no_model` (nothing available), or `paused_policy`. |
-| `models` | object[] | Available models, best first: `id`, `label`, `harness`, `provider`, `family` (ranking family id or `null`), `known` (matched a family), `local`, `cost` (`free`, `low`, `medium`, `high`, `unknown`), `efforts`, `default_effort`, `images`, `rank` (1-based), `recommended`, `allowed`. |
+| `models` | object[] | Available models, best first: `id`, `label`, `harness`, `provider`, `family` (ranking family id or `null`), `known` (matched a family), `local`, `cost` (`free`, `low`, `medium`, `high`, `unknown`), `efforts`, `default_effort` (the effort turns start at: the family's, else `low`), `images`, `rank` (1-based), `recommended`, `allowed`. |
 | `shared` | object | `chat` only: `{"effective", "paused", "allow_claude_for_shared"}` for conversations with more than one person. |
 
 ### LoginStatus
@@ -3868,14 +3868,15 @@ operators can layer their own with `router.rankings_file`) defines model
 **families** by glob patterns over model names (`haiku`,
 `claude-*-haiku*`, `gpt-*-luna*`, `gemini-*flash*`, `qwen*`, `llama*`, ...)
 with a provider, a cost tier, the harnesses that can run them (in
-preference order), and optional filters (`local`, minimum parameter count).
+preference order), an optional starting `effort`, and optional filters
+(`local`, minimum parameter count).
 Each slot lists families in order of preference:
 
 | Slot | Preference (abridged) |
 |---|---|
-| `chat` | Claude Haiku, GPT Luna, Gemini Flash, local models, then other small and open-weight families, then the larger models |
+| `chat` | Claude Sonnet, GPT Sol, Gemini Pro, then Claude Haiku, GPT Luna, Gemini Flash, local models, other small and open-weight families, then the larger models |
 | `chat_strong` | Claude Sonnet, GPT Sol, Gemini Pro, large local models (30B+), Claude Opus, GPT Astra, open-weight families, then the small models |
-| `background`, `feed` | Claude Haiku, GPT Luna, Gemini Flash, local models, then the rest |
+| `background`, `feed` | Claude Haiku, GPT Luna, Gemini Flash, local models, then the rest. `background` also picks the research-helper (subagent) model of chat turns: its choice among models of the turn's own CLI |
 | `classifier` | Gemini Flash-Lite, GPT mini, Claude Haiku, GPT Luna, Gemini Flash, local |
 
 Within one family, newer versions rank first (`gpt-7-luna` over
@@ -3888,7 +3889,9 @@ the CLIs resolve to their newest version.
 
 ### Effort
 
-The default effort for any model with an effort setting is `low`. A
+The default effort for a model with an effort setting is its family's
+`effort` when the model offers it (`medium` for Claude Sonnet), else `low`.
+The classifier's level is raised to that default, never below it. A
 deterministic, zero-cost rule classifier (no model call) scores each chat
 message:
 
@@ -3904,7 +3907,7 @@ message:
 | `previous_failed` | 2 | The last reply ended in an error. |
 | `same_problem` | 1 to 2 | Recent user messages share most content words with this one. |
 | `carryover` | 1 to 2 | A follow-up (short, repeated, or a correction) after a `medium` / `high` reply. |
-| `casual` | resets | Small talk ("thanks", "ok cool", "good morning") returns straight to `low`. |
+| `casual` | resets | Small talk ("thanks", "ok cool", "good morning") returns straight to `low` (the model's default effort). |
 
 A score of 3 or more is `medium`, 6 or more is `high`, and 7 or more is
 **clearly hard**: the turn moves from `chat` to `chat_strong`. The effort is

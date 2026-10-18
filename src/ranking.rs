@@ -53,7 +53,7 @@ impl Slot {
         match self {
             Slot::Chat => "Everyday conversations",
             Slot::ChatStrong => "Hard requests (planning, code, research)",
-            Slot::Background => "Heartbeat and scheduled jobs",
+            Slot::Background => "Heartbeat, scheduled jobs, and research helpers",
             Slot::Feed => "Feed generation",
             Slot::Classifier => "Helper for ambiguous effort decisions (off by default)",
         }
@@ -83,6 +83,10 @@ pub struct Family {
     pub order: Option<String>,
     #[serde(default)]
     pub cost: Option<String>,
+    /// Starting reasoning effort for this family's models (`low`,
+    /// `medium`, `high`); the classifier may raise it, never lower it.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -406,11 +410,17 @@ pub fn provider_of(m: &ModelEntry, family: Option<&Family>) -> String {
         })
 }
 
-/// Default effort for a model: `low` when it exposes efforts, else the
-/// lowest it offers above "none"; None when it has no effort setting.
-pub fn default_effort(m: &ModelEntry) -> Option<String> {
+/// Default effort for a model: its family's starting effort when the model
+/// offers it, else `low` when it exposes efforts, else the lowest it offers
+/// above "none"; None when it has no effort setting.
+pub fn default_effort(m: &ModelEntry, family: Option<&Family>) -> Option<String> {
     if m.efforts.is_empty() {
         return None;
+    }
+    if let Some(e) = family.and_then(|f| f.effort.as_deref())
+        && m.efforts.iter().any(|x| x == e)
+    {
+        return Some(e.to_string());
     }
     if m.efforts.iter().any(|e| e == "low") {
         return Some("low".into());
@@ -508,7 +518,7 @@ pub fn slot_json(
                 "local": m.local,
                 "cost": cost,
                 "efforts": m.efforts,
-                "default_effort": default_effort(m),
+                "default_effort": default_effort(m, family),
                 "images": m.images,
                 "rank": i + 1,
                 "recommended": res.recommended.as_deref() == Some(id.as_str()),
@@ -607,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_ranking_prefers_haiku_then_luna_then_flash_then_local() {
+    fn chat_ranking_prefers_mid_size_models_then_small_ones() {
         let r = Rankings::builtin();
         let models = [
             entry("opencode", "ollama/qwen3:8b", true),
@@ -621,14 +631,32 @@ mod tests {
         assert_eq!(
             ids(&r.rank(Slot::Chat, &refs)),
             [
+                "claude:sonnet",
                 "claude:haiku",
                 "codex:gpt-6-luna",
                 "gemini:flash",
                 "opencode:ollama/qwen3:8b",
-                "claude:sonnet",
                 "opencode:lab/mystery-model"
             ]
         );
+        let mid = [
+            entry("gemini", "pro", false),
+            entry("codex", "gpt-6.1-sol", false),
+            entry("claude", "haiku", false),
+            entry("claude", "sonnet", false),
+        ];
+        let mid_refs: Vec<&ModelEntry> = mid.iter().collect();
+        assert_eq!(
+            ids(&r.rank(Slot::Chat, &mid_refs)),
+            [
+                "claude:sonnet",
+                "codex:gpt-6.1-sol",
+                "gemini:pro",
+                "claude:haiku"
+            ]
+        );
+        // Background work stays on the small models.
+        assert_eq!(ids(&r.rank(Slot::Background, &mid_refs))[0], "claude:haiku");
         assert_eq!(
             ids(&r.rank(Slot::ChatStrong, &refs))[..2],
             ["claude:sonnet", "opencode:ollama/qwen3:8b"]
@@ -713,10 +741,29 @@ mod tests {
     #[test]
     fn default_efforts() {
         let mut m = entry("codex", "x", false);
-        assert_eq!(default_effort(&m).as_deref(), Some("low"));
+        assert_eq!(default_effort(&m, None).as_deref(), Some("low"));
         m.efforts = vec!["minimal".into(), "high".into()];
-        assert_eq!(default_effort(&m).as_deref(), Some("high"));
+        assert_eq!(default_effort(&m, None).as_deref(), Some("high"));
         m.efforts.clear();
-        assert_eq!(default_effort(&m), None);
+        assert_eq!(default_effort(&m, None), None);
+        // A family's starting effort, when the model offers it.
+        let r = Rankings::builtin();
+        let sonnet = entry("claude", "sonnet", false);
+        let sol = entry("codex", "gpt-6.1-sol", false);
+        let haiku = entry("claude", "haiku", false);
+        for (m, want) in [(&sonnet, "medium"), (&sol, "low"), (&haiku, "low")] {
+            assert_eq!(
+                default_effort(m, r.family_of(m)).as_deref(),
+                Some(want),
+                "{}",
+                m.id
+            );
+        }
+        let mut no_medium = sonnet.clone();
+        no_medium.efforts = vec!["low".into(), "high".into()];
+        assert_eq!(
+            default_effort(&no_medium, r.family_of(&no_medium)).as_deref(),
+            Some("low")
+        );
     }
 }

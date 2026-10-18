@@ -98,6 +98,9 @@ pub struct TurnSpec {
     pub own_mcp_servers: Vec<String>,
     pub protected_paths: Vec<PathBuf>,
     pub split: bool,
+    /// CLI model for research helpers (subagents), when it differs from
+    /// `model` and the CLI supports it (`Harness::helper_guide`).
+    pub subagent_model: Option<String>,
 }
 
 /// The names Iris's MCP servers get in a CLI whose own configuration
@@ -353,6 +356,26 @@ pub trait Harness: Send + Sync {
     }
     /// What the owner runs on the server when `login` is None (or fails).
     fn manual_login_hint(&self) -> String;
+    /// System-prompt section on handing research to a helper (subagent)
+    /// that runs on `model` (the CLI's own name for it), when this CLI can
+    /// run its subagents on another model (`TurnSpec::subagent_model`).
+    fn helper_guide(&self, _model: &str) -> Option<String> {
+        None
+    }
+}
+
+/// When to hand research to a helper and what to keep; `how` names the
+/// CLI's subagent tool.
+pub fn helper_guide_text(how: &str) -> String {
+    format!(
+        "\n## Research helpers\n\n\
+         For research that needs several searches or a lot of reading, hand the digging to a \
+         helper: {how}. Helpers run on a smaller, faster model. Give one a self-contained brief \
+         (what to find, what to skip, how much detail) and ask for a short summary with \
+         sources, then answer from it. Do quick lookups yourself. Keep the browser, the \
+         user's accounts, and Iris's app tools (memory, cards, messages, connected services) \
+         for yourself: never ask a helper to use them.\n"
+    )
 }
 
 /// Phrases CLIs print when the user must sign in again. Matched
@@ -516,6 +539,7 @@ mod tests {
             own_mcp_servers: Vec::new(),
             protected_paths: vec!["/private/iris".into()],
             split: false,
+            subagent_model: None,
         };
         let args = |h: &dyn Harness| h.build(&spec).unwrap();
 
@@ -699,6 +723,7 @@ mod isolation_tests {
                 "/agent/home/.codex/auth.json".into(),
             ],
             split: false,
+            subagent_model: None,
         }
     }
 

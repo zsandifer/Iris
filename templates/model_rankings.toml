@@ -22,6 +22,11 @@
 # listed ones.
 #
 # cost: free | low | medium | high (informational; shown in the app).
+#
+# effort: the family's starting reasoning effort (`low`, `medium`, `high`),
+# for models that offer one. The classifier can raise it for a harder
+# request, never lower it; an effort pinned in the app wins. Families
+# without one start at `low`.
 
 # ---------------------------------------------------------------- Anthropic
 
@@ -40,6 +45,7 @@ provider = "anthropic"
 models = ["sonnet", "claude-sonnet*", "claude-*-sonnet*"]
 harnesses = ["claude", "opencode"]
 cost = "medium"
+effort = "medium"
 
 [[family]]
 id = "claude-opus"
@@ -74,6 +80,7 @@ provider = "openai"
 models = ["gpt-*-sol*"]
 harnesses = ["codex", "opencode"]
 cost = "medium"
+effort = "low"
 
 [[family]]
 id = "gpt-astra"
@@ -184,18 +191,21 @@ cost = "free"
 
 # -------------------------------------------------------------------- Slots
 #
-# chat         everyday personal conversations
+# chat         everyday personal conversations: each provider's mid-size
+#              model first (Claude preferred), small and large ones after
 # chat_strong  escalation target for clearly hard requests
-# background   heartbeat and other scheduled jobs
+# background   heartbeat, routines, memory upkeep, and the research
+#              helpers (subagents) of chat turns on the same CLI
 # feed         feed generation
 # classifier   optional helper for ambiguous effort decisions (off by default)
 
 [slots]
 chat = [
+  "claude-sonnet", "gpt-sol", "gemini-pro",
   "claude-haiku", "gpt-luna", "gemini-flash", "local",
   "gpt-mini", "gemini-flash-lite", "qwen", "llama", "gemma", "mistral",
   "deepseek", "gpt-oss", "phi",
-  "claude-sonnet", "gpt-sol", "gemini-pro", "claude-opus", "gpt-astra", "claude-fable",
+  "claude-opus", "gpt-astra", "claude-fable",
 ]
 chat_strong = [
   "claude-sonnet", "gpt-sol", "gemini-pro", "local-large",

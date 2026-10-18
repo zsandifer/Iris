@@ -94,11 +94,20 @@ impl Harness for Claude {
         inv.temp_files.push(prompt_file.clone());
 
         {
+            // Background tasks off: an Agent call would otherwise start an
+            // async subagent, and its answer would come in a second
+            // `result` after the one the parser ends the run on (verified
+            // with 2.1.302).
             for var in [
                 "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
                 "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+                "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",
             ] {
                 inv.env.push((var.into(), "1".into()));
+            }
+            if let Some(m) = &spec.subagent_model {
+                inv.env
+                    .push(("CLAUDE_CODE_SUBAGENT_MODEL".into(), m.clone()));
             }
         }
         let a = &mut inv.args;
@@ -234,6 +243,13 @@ impl Harness for Claude {
 
     fn api_key_env(&self) -> &'static [&'static str] {
         &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+    }
+
+    /// `CLAUDE_CODE_SUBAGENT_MODEL` puts every subagent on the helper model.
+    fn helper_guide(&self, _model: &str) -> Option<String> {
+        Some(super::helper_guide_text(
+            "call the Agent tool with a general-purpose subagent",
+        ))
     }
 }
 
@@ -718,6 +734,7 @@ mod tests {
                 "/home/agent/.local/share/opencode/auth.json".into(),
             ],
             split: false,
+            subagent_model: None,
         };
         let inv = Claude::new(HarnessConfig::claude_default())
             .build(&spec)
@@ -762,6 +779,35 @@ mod tests {
                 .env
                 .contains(&("CLAUDE_CODE_DISABLE_CLAUDE_MDS".into(), "1".into()))
         );
+        // Subagents run in the foreground, on the turn's model unless a
+        // helper model is given.
+        assert!(
+            plain
+                .env
+                .contains(&("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".into(), "1".into()))
+        );
+        assert!(
+            !plain
+                .env
+                .iter()
+                .any(|(k, _)| k == "CLAUDE_CODE_SUBAGENT_MODEL")
+        );
+        let mut with_helper = spec.clone();
+        with_helper.model = "sonnet".into();
+        with_helper.subagent_model = Some("haiku".into());
+        let helped = Claude::new(HarnessConfig::claude_default())
+            .build(&with_helper)
+            .unwrap();
+        assert!(
+            helped
+                .env
+                .contains(&("CLAUDE_CODE_SUBAGENT_MODEL".into(), "haiku".into()))
+        );
+        assert!(helped.args.join(" ").contains("--model sonnet"));
+        let guide = Claude::new(HarnessConfig::claude_default())
+            .helper_guide("haiku")
+            .unwrap();
+        assert!(guide.contains("## Research helpers") && guide.contains("Agent tool"));
         let deny_index = plain
             .args
             .iter()

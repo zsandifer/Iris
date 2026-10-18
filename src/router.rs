@@ -86,15 +86,47 @@ pub enum NoEngine {
     NoModel,
 }
 
-/// The effort to pass: the wanted level clamped to what the model offers,
-/// or the model's default when it offers nothing at or below it.
-pub fn choose_effort(catalog: &Catalog, m: &ModelEntry, wanted: Effort) -> Option<String> {
+/// The effort to pass: the wanted level, raised to the family's starting
+/// effort, clamped to what the model offers; or the model's default when it
+/// offers nothing at or below it.
+pub fn choose_effort(
+    rankings: &Rankings,
+    catalog: &Catalog,
+    m: &ModelEntry,
+    wanted: Effort,
+) -> Option<String> {
     if m.efforts.is_empty() {
         return None;
     }
+    let family = rankings.family_of(m);
+    let start = family
+        .and_then(|f| f.effort.as_deref())
+        .and_then(Effort::parse);
+    let wanted = start.map_or(wanted, |s| wanted.max(s));
     catalog
         .clamp_effort(&m.id, wanted.as_str())
-        .or_else(|| default_effort(m))
+        .or_else(|| default_effort(m, family))
+}
+
+/// The model for research helpers (subagents) of a turn on `main`: the
+/// `background` slot's choice among models of the same CLI (the owner's
+/// pin when it is one of them and usable). None when that is `main`
+/// itself or nothing else is available.
+pub fn helper_model<'a>(env: &EngineEnv<'a>, main: &ModelEntry) -> Option<&'a ModelEntry> {
+    let same_cli = |m: &ModelEntry| m.harness == main.harness && (env.available)(m);
+    let pinned = env
+        .pins
+        .get(&Slot::Background)
+        .and_then(|p| env.catalog.get(&p.model))
+        .filter(|m| same_cli(m));
+    let pick = pinned.or_else(|| {
+        let models: Vec<&ModelEntry> = env.catalog.models.iter().filter(|m| same_cli(m)).collect();
+        env.rankings
+            .rank(Slot::Background, &models)
+            .first()
+            .map(|r| r.entry)
+    })?;
+    (pick.id != main.id).then_some(pick)
 }
 
 /// Pick the engine for one turn.
@@ -119,7 +151,7 @@ pub fn select_engine(input: &RouteInput, env: &EngineEnv) -> Result<RouteDecisio
                         .effort
                         .as_deref()
                         .and_then(|e| env.catalog.clamp_effort(&m.id, e))
-                        .or_else(|| choose_effort(env.catalog, m, a.effort));
+                        .or_else(|| choose_effort(env.rankings, env.catalog, m, a.effort));
                     notes.insert(0, format!("{} pinned for {}", m.id, slot.name()));
                     return Ok(decision("pinned", m, effort, slot, i, input, notes));
                 }
@@ -157,7 +189,7 @@ pub fn select_engine(input: &RouteInput, env: &EngineEnv) -> Result<RouteDecisio
             if i > 0 {
                 notes.push(format!("no {} model available", slots[0].name()));
             }
-            let effort = choose_effort(env.catalog, m, a.effort);
+            let effort = choose_effort(env.rankings, env.catalog, m, a.effort);
             return Ok(decision(router, m, effort, slot, i, input, notes));
         }
     }
@@ -304,21 +336,22 @@ mod tests {
         let d = m
             .route(Slot::Chat, "what's a good name for a cat?", false, false)
             .unwrap();
+        // Sonnet starts at medium, even for an everyday message.
         assert_eq!(
             (d.model.as_str(), d.effort.as_deref()),
-            ("claude:haiku", Some("low"))
+            ("claude:sonnet", Some("medium"))
         );
         assert_eq!(
             (d.slot, d.router, d.escalated),
             (Slot::Chat, "automatic", false)
         );
-        assert_eq!((d.harness(), d.cli_model()), ("claude", "haiku"));
+        assert_eq!((d.harness(), d.cli_model()), ("claude", "sonnet"));
         let d = m
             .route(Slot::Chat, "Help me debug my build", false, false)
             .unwrap();
         assert_eq!(
             (d.model.as_str(), d.effort.as_deref()),
-            ("claude:haiku", Some("medium"))
+            ("claude:sonnet", Some("medium"))
         );
         let d = m.route(Slot::Chat, HARD, false, false).unwrap();
         assert_eq!(
@@ -334,20 +367,29 @@ mod tests {
     #[test]
     fn codex_only_machine() {
         let m = Machine::new(&["codex"], vec![], &[]);
-        assert_eq!(m.model(Slot::Chat, "hi"), "codex:gpt-6-luna");
-        assert_eq!(m.model(Slot::Chat, HARD), "codex:gpt-6.1-sol");
+        // Sol starts at low; the classifier raises it for hard requests.
+        let d = m.route(Slot::Chat, "hi", false, false).unwrap();
+        assert_eq!(
+            (d.model.as_str(), d.effort.as_deref()),
+            ("codex:gpt-6.1-sol", Some("low"))
+        );
+        let d = m.route(Slot::Chat, HARD, false, false).unwrap();
+        assert_eq!(
+            (d.model.as_str(), d.effort.as_deref()),
+            ("codex:gpt-6.1-sol", Some("high"))
+        );
         assert_eq!(m.model(Slot::Background, ""), "codex:gpt-6-luna");
         assert_eq!(m.model(Slot::Feed, ""), "codex:gpt-6-luna");
         let d = m.route(Slot::Chat, "hi", false, false).unwrap();
         assert!(
-            d.reason.contains("claude:haiku unavailable"),
+            d.reason.contains("claude:sonnet unavailable"),
             "{}",
             d.reason
         );
         // Shared chats work without Claude.
         assert_eq!(
             m.route(Slot::Chat, "hi all", true, false).unwrap().model,
-            "codex:gpt-6-luna"
+            "codex:gpt-6.1-sol"
         );
     }
 
@@ -372,7 +414,7 @@ mod tests {
     #[test]
     fn claude_only_machine_pauses_only_shared_chats() {
         let mut m = Machine::new(&["claude"], vec![], &[]);
-        assert_eq!(m.model(Slot::Chat, "hi"), "claude:haiku");
+        assert_eq!(m.model(Slot::Chat, "hi"), "claude:sonnet");
         assert_eq!(m.model(Slot::Chat, HARD), "claude:sonnet");
         assert_eq!(m.model(Slot::Background, ""), "claude:haiku");
         assert_eq!(m.model(Slot::Feed, ""), "claude:haiku");
@@ -383,7 +425,7 @@ mod tests {
         m.allow_shared = true;
         assert_eq!(
             m.route(Slot::Chat, "hi all", true, false).unwrap().model,
-            "claude:haiku"
+            "claude:sonnet"
         );
     }
 
@@ -391,7 +433,7 @@ mod tests {
     fn gemini_only_machine() {
         let m = Machine::new(&["gemini"], vec![], &[]);
         let d = m.route(Slot::Chat, "hi", false, false).unwrap();
-        assert_eq!((d.model.as_str(), d.effort), ("gemini:flash", None));
+        assert_eq!((d.model.as_str(), d.effort), ("gemini:pro", None));
         assert_eq!(m.model(Slot::Chat, HARD), "gemini:pro");
         assert_eq!(m.model(Slot::Background, ""), "gemini:flash");
         assert_eq!(m.model(Slot::Feed, ""), "gemini:flash");
@@ -411,10 +453,13 @@ mod tests {
     fn installing_a_higher_ranked_model_changes_the_choice() {
         let m = Machine::new(&["opencode"], local_models(), &[]);
         assert_eq!(m.model(Slot::Chat, "hi"), "opencode:ollama/qwen3:32b");
-        // Codex appears and lists a newer Luna: it takes over automatically.
+        // Codex appears: Sol takes over chat, and its newer Luna the
+        // background work, automatically.
         let m = Machine::new(&["opencode", "codex"], local_models(), &["gpt-7-luna"]);
-        assert_eq!(m.model(Slot::Chat, "hi"), "codex:gpt-7-luna");
+        assert_eq!(m.model(Slot::Chat, "hi"), "codex:gpt-6.1-sol");
         assert_eq!(m.model(Slot::Background, ""), "codex:gpt-7-luna");
+        let m = Machine::new(&["opencode", "codex"], local_models(), &["gpt-7-sol"]);
+        assert_eq!(m.model(Slot::Chat, "hi"), "codex:gpt-7-sol");
         // A newer local model family version outranks the older one.
         let mut models = local_models();
         models.push(dm("ollama/qwen4:8b", true, None, &[]));
@@ -458,7 +503,7 @@ mod tests {
             },
         );
         let d = m.route(Slot::Chat, "hi", false, false).unwrap();
-        assert_eq!((d.router, d.model.as_str()), ("fallback", "claude:haiku"));
+        assert_eq!((d.router, d.model.as_str()), ("fallback", "claude:sonnet"));
         assert!(d.reason.contains("engine unavailable"));
     }
 
@@ -473,9 +518,76 @@ mod tests {
         assert_eq!(d.effort.as_deref(), Some("high"));
         let cat = Catalog::build(&Config::default(), &BTreeMap::new());
         let luna = cat.get("codex:gpt-6-luna").unwrap();
+        let r = Rankings::builtin();
         assert_eq!(
-            choose_effort(&cat, luna, Effort::High).as_deref(),
+            choose_effort(&r, &cat, luna, Effort::High).as_deref(),
             Some("high")
         );
+        // A family's starting effort is a floor, clamped like any other.
+        let sonnet = cat.get("claude:sonnet").unwrap();
+        assert_eq!(
+            choose_effort(&r, &cat, sonnet, Effort::Low).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            choose_effort(&r, &cat, sonnet, Effort::High).as_deref(),
+            Some("high")
+        );
+        let mut low_only = sonnet.clone();
+        low_only.efforts = vec!["low".into()];
+        let mut cat2 = cat.clone();
+        cat2.models.retain(|m| m.id != "claude:sonnet");
+        cat2.models.push(low_only.clone());
+        assert_eq!(
+            choose_effort(&r, &cat2, &low_only, Effort::Low).as_deref(),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn research_helpers_use_the_background_model_of_the_same_cli() {
+        let mut m = Machine::new(&["claude", "codex"], vec![], &[]);
+        let rankings = Rankings::builtin();
+        let helper = |m: &Machine, main: &str| {
+            let installed = m.installed.clone();
+            let available = move |e: &ModelEntry| installed.contains(&e.harness.as_str());
+            let env = EngineEnv {
+                rankings: &rankings,
+                catalog: &m.catalog,
+                pins: &m.pins,
+                available: &available,
+                allow_claude_for_shared: false,
+            };
+            let main = m.catalog.get(main).unwrap();
+            helper_model(&env, main).map(|h| h.id.clone())
+        };
+        assert_eq!(helper(&m, "claude:sonnet").as_deref(), Some("claude:haiku"));
+        assert_eq!(
+            helper(&m, "codex:gpt-6.1-sol").as_deref(),
+            Some("codex:gpt-6-luna")
+        );
+        // Already the small model: no helper.
+        assert_eq!(helper(&m, "claude:haiku"), None);
+        // A background pin on another CLI does not apply; one on the same
+        // CLI does.
+        m.pins.insert(
+            Slot::Background,
+            Pin {
+                model: "codex:gpt-6-luna".into(),
+                effort: None,
+            },
+        );
+        assert_eq!(helper(&m, "claude:sonnet").as_deref(), Some("claude:haiku"));
+        m.pins.insert(
+            Slot::Background,
+            Pin {
+                model: "claude:opus".into(),
+                effort: None,
+            },
+        );
+        assert_eq!(helper(&m, "claude:sonnet").as_deref(), Some("claude:opus"));
+        // Nothing else on that CLI.
+        let only = Machine::new(&["opencode"], local_models(), &[]);
+        assert_eq!(helper(&only, "opencode:ollama/qwen3:32b"), None);
     }
 }
