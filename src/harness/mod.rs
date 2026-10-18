@@ -743,6 +743,7 @@ mod isolation_tests {
                     spec.split = split;
                     spec.isolated = isolated;
                     spec.resume = resume.then(|| "synthetic-session".into());
+                    spec.subagent_model = Some("synthetic-helper".into());
                     let harnesses: Vec<Box<dyn Harness>> = vec![
                         Box::new(claude::Claude::new(HarnessConfig::claude_default())),
                         Box::new(codex::Codex::new(HarnessConfig::codex_default())),
@@ -843,6 +844,15 @@ mod isolation_tests {
                             },
                             ..Default::default()
                         };
+                        // Split mode: the root launcher must accept every
+                        // variable the adapter sets.
+                        for (name, _) in &inv.env {
+                            assert!(
+                                crate::agent::allowed_env(h.name(), name),
+                                "{} sets {name}, which agent-exec refuses",
+                                h.name()
+                            );
+                        }
                         crate::agent::wrap(&cfg, h.name(), &spec.scope, &mut inv).unwrap();
                         assert_eq!(inv.program.is_some(), split);
                         assert!(

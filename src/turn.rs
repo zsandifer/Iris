@@ -659,6 +659,11 @@ async fn run_locked(
             .and_then(|m| entry.harness.helper_guide(m));
         if let Some(guide) = &helper_guide {
             system_prompt.push_str(guide);
+            // A resumed session that keeps its first system prompt (Codex)
+            // gets the current helper model with the message instead.
+            if session.is_some() && !entry.harness.resume_updates_system_prompt() {
+                prompt = format!("<research_helpers>{guide}</research_helpers>\n\n{prompt}");
+            }
         }
         if let Some(status) = system_status {
             system_prompt.push_str(&format!("\n## System status\n\n{status}\n"));
