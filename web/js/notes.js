@@ -4,7 +4,7 @@
 // subtitle.
 import { html, useEffect, useRef, useState } from './h.js';
 import { get, put, del, seg } from './api.js';
-import { S, useStore, go, back, toast } from './store.js';
+import { S, useStore, go, toast } from './store.js';
 import { Icon, Row, Group, Page, Empty, Spinner, agentName, ago, confirmSheet, promptSheet } from './ui.js';
 import { md } from './md.js';
 
@@ -91,7 +91,7 @@ export function NoteScreen({ domain }) {
   };
   const remove = async () => {
     if (!(await confirmSheet({ title: `Stop keeping a note on ${note.title}?`, body: 'I’ll forget my plan and notes for this. Your memory and goals are not affected.', yes: 'Delete', danger: true }))) return;
-    try { await del(`/working-notes/${seg(domain)}`); back(); } catch (e) { toast(e.message); }
+    try { await del(`/working-notes/${seg(domain)}`); go('iris/notes', true); } catch (e) { toast(e.message); }
   };
   if (err && !note) return html`<${Page} title="Working note"><${Empty} icon="file" title="I can't open this note">${err}<//><//>`;
   if (!note) return html`<${Page} title="Working note"><${Spinner} /><//>`;

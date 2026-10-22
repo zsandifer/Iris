@@ -3886,6 +3886,37 @@ esac
             ),
             (json!(1), json!(1))
         );
+
+        // A check-in from before the scorecard existed (no row) still takes
+        // a verdict: the row is created from the message itself.
+        let legacy = h
+            .state
+            .db
+            .with(|c| {
+                db::insert_message(
+                    c,
+                    &db::NewMessage {
+                        conversation_id: &main,
+                        role: "assistant",
+                        content: "Old check-in.",
+                        meta: Some(&json!({"initiated_by": "heartbeat"})),
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+        let (status, r) = send(
+            &h.app,
+            "POST",
+            &format!("/api/proactive/{}/outcome", legacy.id),
+            Some(&owner_t),
+            Some(json!({"outcome": "useful"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{r}");
+        assert_eq!(r["proactive"]["outcome"], "useful");
+        let (_, s) = send(&h.app, "GET", "/api/settings", Some(&owner_t), None).await;
+        assert_eq!(s["proactive"]["useful"], json!(1));
     }
 
     #[tokio::test]

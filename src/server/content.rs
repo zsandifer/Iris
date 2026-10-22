@@ -1203,9 +1203,37 @@ async fn proactive_outcome(
         .db
         .call(move |c| {
             db::write_tx(c, |c| {
-                let Some(m) = crate::proactive::set_outcome(c, &uid, &message_id, &body.outcome)?
-                else {
-                    return Ok(None);
+                let m = match crate::proactive::set_outcome(c, &uid, &message_id, &body.outcome)? {
+                    Some(m) => m,
+                    // A check-in message from before the scorecard existed
+                    // has no row yet: it is still the agent's own message
+                    // in the owner's Main chat, so record it now.
+                    None => match db::get_message(c, &message_id)? {
+                        Some(legacy)
+                            if legacy.role == "assistant"
+                                && legacy.meta["initiated_by"] == "heartbeat"
+                                && legacy.conversation_id
+                                    == db::ensure_main_conversation(c, &uid)? =>
+                        {
+                            let row = crate::proactive::record(
+                                c,
+                                &uid,
+                                Some(&legacy.id),
+                                "heartbeat",
+                                &legacy.content,
+                                "posted",
+                            )?;
+                            c.execute(
+                                "UPDATE proactive_messages SET created_at = ?2 WHERE id = ?1",
+                                rusqlite::params![row.id, legacy.created_at],
+                            )?;
+                            match crate::proactive::set_outcome(c, &uid, &message_id, &body.outcome)? {
+                                Some(m) => m,
+                                None => return Ok(None),
+                            }
+                        }
+                        _ => return Ok(None),
+                    },
                 };
                 // The chat shows the verdict on the message itself.
                 c.execute(
