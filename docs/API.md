@@ -1170,7 +1170,10 @@ All routes in this section are **owner-only**.
 
 System files are the persona and memory markdown files the agent reads.
 The memory files are a generated, **read-only** copy of the memory notes
-(see [Memory](#memory)):
+(see [Memory](#memory)). Missing persona files are created from Iris's
+templates at startup; a persona file that still equals an earlier version
+of its template (never edited) is upgraded to the current one, and an
+edited file is left alone:
 
 | Name | Folder | In chat system prompt | Description |
 |---|---|---|---|

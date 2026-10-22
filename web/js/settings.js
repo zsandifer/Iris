@@ -110,6 +110,8 @@ export function Settings() {
     get('/devices').then((r) => setCounts((c) => ({ ...c, devices: r.devices.filter((d) => !d.revoked_at).length }))).catch(() => {});
     if (owner) get('/users').then((r) => setCounts((c) => ({ ...c, people: r.users.length }))).catch(() => {});
     if (owner && !S.slots) loadSlots().catch(() => {});
+    // The scorecard under "Check in on its own" changes between visits.
+    if (owner) get('/settings').then((settings) => set({ settings })).catch(() => {});
   }, []);
   const rename = async () => {
     const name = await promptSheet({ title: `Rename ${agentName()}`, value: agentName(), yes: 'Save' });

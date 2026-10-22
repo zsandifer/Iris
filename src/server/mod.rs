@@ -3749,7 +3749,7 @@ esac
         )
         .await;
         assert_eq!(r["goal"]["due"], "2026-06-30", "an absent due is unchanged");
-        let (_, r) = send(
+        let (status, r) = send(
             &h.app,
             "PATCH",
             &format!("/api/goals/{gid}"),
@@ -3757,7 +3757,17 @@ esac
             Some(json!({"due": null})),
         )
         .await;
+        assert_eq!(status, StatusCode::OK, "{r}");
+        assert_eq!(r["goal"]["id"], gid);
         assert_eq!(r["goal"]["due"], Value::Null);
+        let (_, r) = send(&h.app, "GET", "/api/goals", Some(&owner_t), None).await;
+        let stored = r["goals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["id"] == gid)
+            .unwrap();
+        assert_eq!(stored["due"], Value::Null);
 
         // The daily budget setting, and the scorecard in settings.
         let (status, s) = send(

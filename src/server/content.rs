@@ -1221,5 +1221,7 @@ async fn proactive_outcome(
         &[user.id().to_string()],
         json!({"type": "message.updated", "conversation_id": msg.conversation_id, "message": msg}),
     );
+    // The scorecard in Settings changed.
+    state.broadcast_settings().await;
     ok(json!({"proactive": m}))
 }

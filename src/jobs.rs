@@ -517,6 +517,8 @@ pub async fn deliver_proactive(
             .call(move |c| crate::proactive::record(c, &o, None, &by, &t, "held"))
             .await?;
         crate::info!("{initiated_by}: message held, {sent_today} of {max_per_day} sent today");
+        // Settings shows the scorecard; keep open apps current.
+        state.broadcast_settings().await;
         return Ok(());
     }
     let posted = post_to_main(state, owner, text, source, initiated_by).await?;
@@ -531,6 +533,7 @@ pub async fn deliver_proactive(
         .call(move |c| crate::proactive::record(c, &o, Some(&id), &by, &t, "posted"))
         .await?;
     move_cards_to_main(state, owner, source).await?;
+    state.broadcast_settings().await;
     Ok(())
 }
 

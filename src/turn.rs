@@ -637,6 +637,7 @@ async fn run_locked(
             );
             let browser = browser_server.clone();
             let notices = notices.clone();
+            let working_notes = working_notes.clone();
             let refresh_memory = session.is_some()
                 && !entry.harness.resume_updates_system_prompt()
                 && scope == Scope::Private;
@@ -666,11 +667,20 @@ async fn run_locked(
             .unwrap_or_default()
         };
         if !memory_refresh.is_empty() {
+            // The same resumed sessions keep their first working notes too.
+            let notes_refresh = if working_notes.is_empty() {
+                "(No working notes right now.)".to_string()
+            } else {
+                working_notes.clone()
+            };
             prompt = format!(
                 "<current_memory>\nThis is the current memory snapshot. It replaces earlier \
                  memory snapshots in this conversation, including notes that were corrected \
                  or removed. Use this snapshot for MEMORY.md writes. Read topic files again \
-                 before replacing them.\n{memory_refresh}\n</current_memory>\n\n{prompt}"
+                 before replacing them.\n{memory_refresh}\n</current_memory>\n\n\
+                 <current_working_notes>\nYour working notes as they are now. This replaces \
+                 every earlier working-notes snapshot in this conversation, including notes \
+                 that were rewritten or deleted since.\n{notes_refresh}\n</current_working_notes>\n\n{prompt}"
             );
         }
         let helper_guide = helper

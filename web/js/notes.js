@@ -2,7 +2,7 @@
 // (plan, state, what it is watching). Owner only. The list, one note
 // (rendered Markdown, Edit, earlier versions, Delete), and the hub row's
 // subtitle.
-import { html, useEffect, useState } from './h.js';
+import { html, useEffect, useRef, useState } from './h.js';
 import { get, put, del, seg } from './api.js';
 import { S, useStore, go, back, toast } from './store.js';
 import { Icon, Row, Group, Page, Empty, Spinner, agentName, ago, confirmSheet, promptSheet } from './ui.js';
@@ -20,9 +20,12 @@ export function NotesScreen() {
   const add = async () => {
     const name = await promptSheet({ title: 'What should I look after?', body: 'One domain per note, like “Household budget” or “Kitchen remodel”. I’ll keep the plan and where things stand in it.', placeholder: 'Household budget', yes: 'Start note' });
     if (!name?.trim()) return;
-    const domain = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    const domain = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60).replace(/-+$/, '');
     if (!domain) { toast('Give it a name with some letters in it.'); return; }
     try {
+      // Never replace a note that already exists under this name: open it.
+      const current = await get('/working-notes');
+      if (current.notes.some((n) => n.domain === domain)) { go(`iris/notes/${domain}`); return; }
       await put(`/working-notes/${seg(domain)}`, { title: name.trim(), body: '' });
       go(`iris/notes/${domain}?edit=1`);
     } catch (e) { toast(e.message); }
@@ -48,17 +51,38 @@ export function NoteScreen({ domain }) {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  // The version the editor started from, so a note the agent rewrote
+  // meanwhile is never overwritten without asking.
+  const base = useRef(null);
+  const editingRef = useRef(editing);
+  editingRef.current = editing;
   const load = () => get(`/working-notes/${seg(domain)}`)
-    .then((r) => { setData(r); setText(r.note.body); })
+    .then((r) => {
+      setData(r);
+      if (!editingRef.current || base.current == null) { setText(r.note.body); base.current = r.note.updated_at; }
+    })
     .catch((e) => setErr(e.message));
-  useEffect(() => { load(); }, [domain]);
+  useEffect(() => { load(); }, [domain, S.workingNotesRev]);
   const note = data?.note;
   const dirty = note && text !== note.body;
+  const changedMeanwhile = editing && note && base.current != null && note.updated_at !== base.current;
+  const startEditing = () => { base.current = note.updated_at; setText(note.body); setEditing(true); };
+  const stopEditing = () => { base.current = note.updated_at; setText(note.body); setEditing(false); };
   const save = async () => {
     setBusy(true);
     try {
+      const latest = await get(`/working-notes/${seg(domain)}`);
+      if (base.current != null && latest.note.updated_at !== base.current) {
+        const ok = await confirmSheet({
+          title: `${agentName()} changed this note while you were editing`,
+          body: `Updated ${byLabel(latest.note)}. Replace that version with yours? Its text stays under Earlier versions.`,
+          yes: 'Replace',
+        });
+        if (!ok) { setData(latest); setBusy(false); return; }
+      }
       const r = await put(`/working-notes/${seg(domain)}`, { body: text });
-      setData({ ...data, note: r.note });
+      setData({ ...latest, note: r.note });
+      base.current = r.note.updated_at;
       setEditing(false);
       toast('Saved. I’ll read it on my next check-in.');
       load();
@@ -75,11 +99,12 @@ export function NoteScreen({ domain }) {
   return html`<${Page} title=${note.title} sub=${`Updated ${byLabel(note)}`}
     right=${editing
       ? html`<button class="b1 sm" disabled=${busy || !dirty} onClick=${save}>Save</button>`
-      : html`<button class="b2 sm" onClick=${() => setEditing(true)}>Edit</button>`}>
+      : html`<button class="b2 sm" onClick=${startEditing}>Edit</button>`}>
     ${editing
-      ? html`<textarea class="editor" value=${text} spellcheck=${false} onInput=${(e) => setText(e.target.value)}
+      ? html`${changedMeanwhile && html`<div class="note">${agentName()} updated this note while you were editing. Saving will ask before replacing that version.</div>`}
+        <textarea class="editor" value=${text} spellcheck=${false} onInput=${(e) => setText(e.target.value)}
           placeholder=${'Plan:\nState:\nWatching:\nOpen questions:'} aria-label=${`Edit ${note.title}`} />
-        ${dirty && html`<button class="lk-m" onClick=${() => { setText(note.body); setEditing(false); }}>Discard changes</button>`}`
+        ${dirty && html`<button class="lk-m" onClick=${stopEditing}>Discard changes</button>`}`
       : note.body.trim()
         ? html`<div class="mdview" dangerouslySetInnerHTML=${{ __html: md(note.body) }} />`
         : html`<${Empty} icon="file" title="Nothing written yet">${agentName()} fills this in on the next check-in, or you can write the plan yourself.<//>`}
@@ -91,7 +116,7 @@ export function NoteScreen({ domain }) {
     ${!editing && showHistory && history.map((h) => html`<div class="note-ver" key=${h.id}>
       <div class="gl">${ago(h.replaced_at)} · ${BY[h.updated_by] || h.updated_by}</div>
       <div class="mdview" dangerouslySetInnerHTML=${{ __html: md(h.body || '_(empty)_') }} />
-      <button class="lk-m" onClick=${() => { setText(h.body); setEditing(true); }}>Restore this version</button>
+      <button class="lk-m" onClick=${() => { base.current = note.updated_at; setText(h.body); setEditing(true); }}>Restore this version</button>
     </div>`)}
   <//>`;
 }
