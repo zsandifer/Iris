@@ -608,6 +608,24 @@ async fn run_locked(
         };
         let keys = crate::keys::env_for(state, &harness_name).await;
         let participants: Vec<String> = ctx.names.values().cloned().collect();
+        // The agent's own working notes, only where the owner's private
+        // context is available.
+        let working_notes = if scope == Scope::Private {
+            let owner = input.owner_user_id.clone();
+            state
+                .db
+                .call(move |c| {
+                    let notes = crate::proactive::list_notes(c, &owner)?;
+                    Ok(crate::proactive::render_notes(
+                        &notes,
+                        crate::proactive::PROMPT_NOTES_CHARS,
+                    ))
+                })
+                .await
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         // Reads persona files and indexes the memory tree: blocking I/O.
         let (mut system_prompt, memory_refresh) = {
             let (paths, name, kind, purpose, app_tools) = (
@@ -619,6 +637,7 @@ async fn run_locked(
             );
             let browser = browser_server.clone();
             let notices = notices.clone();
+            let working_notes = working_notes.clone();
             let refresh_memory = session.is_some()
                 && !entry.harness.resume_updates_system_prompt()
                 && scope == Scope::Private;
@@ -639,6 +658,7 @@ async fn run_locked(
                         browser: browser.as_deref(),
                         scope,
                         notices: &notices,
+                        working_notes: &working_notes,
                     },
                 );
                 (system_prompt, memory_refresh)
@@ -647,11 +667,20 @@ async fn run_locked(
             .unwrap_or_default()
         };
         if !memory_refresh.is_empty() {
+            // The same resumed sessions keep their first working notes too.
+            let notes_refresh = if working_notes.is_empty() {
+                "(No working notes right now.)".to_string()
+            } else {
+                working_notes.clone()
+            };
             prompt = format!(
                 "<current_memory>\nThis is the current memory snapshot. It replaces earlier \
                  memory snapshots in this conversation, including notes that were corrected \
                  or removed. Use this snapshot for MEMORY.md writes. Read topic files again \
-                 before replacing them.\n{memory_refresh}\n</current_memory>\n\n{prompt}"
+                 before replacing them.\n{memory_refresh}\n</current_memory>\n\n\
+                 <current_working_notes>\nYour working notes as they are now. This replaces \
+                 every earlier working-notes snapshot in this conversation, including notes \
+                 that were rewritten or deleted since.\n{notes_refresh}\n</current_working_notes>\n\n{prompt}"
             );
         }
         let helper_guide = helper
@@ -1782,6 +1811,7 @@ fn changed_entity_kinds(activities: &[Activity]) -> Vec<&'static str> {
             t if t.contains("feed") => "feed",
             t if t.contains("library") => "library",
             t if t.contains("routine") => "routines",
+            t if t.contains("working_note") => "working_notes",
             _ => continue,
         };
         if !kinds.contains(&kind) {

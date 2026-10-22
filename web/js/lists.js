@@ -9,6 +9,34 @@ import { md } from './md.js';
 import { Post, findPost, photos } from './feed.js';
 import { openPhoto } from './photo.js';
 
+// A goal's plan: what done looks like and when (the check-in measures
+// against these).
+function GoalPlanSheet({ g, onSave }) {
+  const [target, setTarget] = useState(g.target || '');
+  const [due, setDue] = useState(g.due || '');
+  const [busy, setBusy] = useState(false);
+  // The sheet stays open, with the draft, until the save succeeds.
+  const save = async (body) => { setBusy(true); try { await onSave(body); } finally { setBusy(false); } };
+  return html`<div class="sheet-body"><h3>${g.title}</h3>
+    <p class="mu">I measure progress against this on every check-in and tell you when we're drifting.</p>
+    <label class="lbl" for="goal-target">What does done look like?</label>
+    <textarea id="goal-target" class="field" rows="3" value=${target} placeholder="e.g. Every bill paid on time and $500 moved to savings each month"
+      onInput=${(e) => setTarget(e.target.value)} />
+    <label class="lbl" for="goal-due">By when</label>
+    <input id="goal-due" class="field" type="date" value=${due} onInput=${(e) => setDue(e.target.value)} />
+    <div class="btns">${g.due && html`<button class="b2" disabled=${busy} onClick=${() => save({ target: target.trim(), due: null })}>Clear date</button>`}
+      <button class="b1" disabled=${busy} onClick=${() => save({ target: target.trim(), due: due || null })}>Save</button></div></div>`;
+}
+
+const todayKey = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+const overdue = (due) => due < todayKey();
+function dueLabel(due) {
+  const [y, m, d] = due.split('-').map(Number);
+  const date = new Date(y, m - 1, d);
+  const sameYear = y === new Date().getFullYear();
+  return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', ...(sameYear ? {} : { year: 'numeric' }) });
+}
+
 function Head({ title, sub }) {
   return html`<h1 class="ttl">${title}</h1>${sub && html`<div class="sub">${sub}</div>`}`;
 }
@@ -81,14 +109,26 @@ export function GoalsScreen() {
   };
   const menu = (g) => openSheet(() => html`<div class="sheet-body">
     <h3>${g.title}</h3>${g.status_text && html`<p class="mu">${g.status_text}</p>`}
+    ${(g.target || g.due) && html`<p class="mu">${g.target && html`<b>Done looks like:</b> ${g.target}`}${g.target && g.due && html`<br />`}${g.due && html`<b>Due:</b> ${dueLabel(g.due)}`}</p>`}
     <div class="grp">
+      <div class="r tap" onClick=${() => { closeSheet(); editGoal(g); }}><div class="rt">${g.target || g.due ? 'Edit target and due date' : 'Set a target and due date'}</div></div>
       <div class="r tap" onClick=${() => { closeSheet(); update(g, { done: !g.done }); }}><div class="rt">${g.done ? 'Mark as not done' : 'Mark as done'}</div></div>
       <div class="r tap danger" onClick=${async () => { closeSheet(); if (await confirmSheet({ title: 'Delete this goal?', yes: 'Delete', danger: true })) remove(g); }}><div class="rt">Delete goal</div></div>
     </div></div>`);
+  const editGoal = (g) => openSheet(() => html`<${GoalPlanSheet} g=${g} onSave=${async (body) => {
+    // Save first; the sheet (and the draft) only closes on success.
+    try { await patch(`/goals/${seg(g.id)}`, body); } catch (e) { toast(e.message); return; }
+    closeSheet();
+    touchList('goals');
+    set({ goals: S.goals.map((x) => (x.id === g.id ? { ...x, ...body } : x)) });
+    loadGoals().catch(() => {});
+  }} />`);
   const GoalRow = ({ g }) => html`<div class="goal">
     <button class=${'chk' + (g.done ? ' on' : '')} aria-label=${g.done ? 'Mark not done' : 'Mark done'} onClick=${() => update(g, { done: !g.done })}>
       ${g.done && html`<${Icon} name="check" size=${14} />`}</button>
-    <div class="grow" onClick=${() => menu(g)}><b>${g.title}</b>${g.status_text && html`<p>${g.status_text}</p>`}</div>
+    <div class="grow" onClick=${() => menu(g)}><b>${g.title}</b>
+      ${g.status_text && html`<p>${g.status_text}</p>`}
+      ${(g.due && !g.done) && html`<p class=${'due' + (overdue(g.due) ? ' late' : '')}>${overdue(g.due) ? 'Was due' : 'Due'} ${dueLabel(g.due)}</p>`}</div>
   </div>`;
   return html`<div class="scr tabscr">
     <${Head} title="Goals" sub="What you're working toward. I keep the status up to date." />

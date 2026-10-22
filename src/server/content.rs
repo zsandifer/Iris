@@ -3,7 +3,7 @@
 use super::chat::file_response;
 use super::{ApiError, ApiResult, AuthUser, JsonBody, ok};
 use crate::db;
-use crate::entities::{self, MAX_TITLE, check_text};
+use crate::entities::{self, MAX_GOAL_TEXT, MAX_TITLE, check_text};
 use crate::persona::{SYSTEM_FILES, system_file, system_file_path};
 use crate::router::Purpose;
 use crate::state::AppState;
@@ -46,6 +46,14 @@ pub fn routes() -> Router<AppState> {
             "/goals/{id}",
             axum::routing::patch(update_goal).delete(delete_goal),
         )
+        .route("/working-notes", get(list_working_notes))
+        .route(
+            "/working-notes/{domain}",
+            get(get_working_note)
+                .put(put_working_note)
+                .delete(delete_working_note),
+        )
+        .route("/proactive/{message_id}/outcome", post(proactive_outcome))
         .route("/library", get(list_library))
         .route(
             "/library/{id}",
@@ -610,6 +618,11 @@ struct NewGoal {
     title: String,
     #[serde(default)]
     status_text: String,
+    /// What done looks like.
+    #[serde(default)]
+    target: String,
+    /// `YYYY-MM-DD`.
+    due: Option<String>,
 }
 
 async fn create_goal(
@@ -618,11 +631,26 @@ async fn create_goal(
     JsonBody(body): JsonBody<NewGoal>,
 ) -> ApiResult {
     check_text("title", &body.title, MAX_TITLE, true)?;
-    check_text("status_text", &body.status_text, 2000, false)?;
+    check_text("status_text", &body.status_text, MAX_GOAL_TEXT, false)?;
+    check_text("target", &body.target, MAX_GOAL_TEXT, false)?;
+    let due = body.due.as_deref().map(str::trim).filter(|d| !d.is_empty());
+    entities::check_due(due)?;
     let uid = user.id().to_string();
     let goal = state
         .db
-        .call(move |c| entities::create_goal(c, &uid, &body.title, &body.status_text, false))
+        .call(move |c| {
+            entities::create_goal_with(
+                c,
+                &uid,
+                &entities::NewGoal {
+                    title: &body.title,
+                    status_text: &body.status_text,
+                    target: &body.target,
+                    due: body.due.as_deref().map(str::trim).filter(|d| !d.is_empty()),
+                    suggested: false,
+                },
+            )
+        })
         .await?;
     changed(&state, &user, "goals");
     ok(json!({"goal": goal}))
@@ -632,9 +660,22 @@ async fn create_goal(
 struct PatchGoal {
     title: Option<String>,
     status_text: Option<String>,
+    target: Option<String>,
+    /// `YYYY-MM-DD`; `null` or `""` clears it. Left out: unchanged.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    due: Option<Option<String>>,
     done: Option<bool>,
     /// `false` confirms a goal the agent suggested.
     suggested: Option<bool>,
+}
+
+/// Tells an absent field (`None`) from an explicit `null` (`Some(None)`).
+fn deserialize_some<'de, T, D>(d: D) -> Result<Option<T>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(d).map(Some)
 }
 
 async fn update_goal(
@@ -647,7 +688,17 @@ async fn update_goal(
         check_text("title", t, MAX_TITLE, true)?;
     }
     if let Some(s) = &body.status_text {
-        check_text("status_text", s, 2000, false)?;
+        check_text("status_text", s, MAX_GOAL_TEXT, false)?;
+    }
+    if let Some(t) = &body.target {
+        check_text("target", t, MAX_GOAL_TEXT, false)?;
+    }
+    let due = body
+        .due
+        .as_ref()
+        .map(|d| d.as_deref().map(str::trim).filter(|d| !d.is_empty()));
+    if let Some(d) = due {
+        entities::check_due(d)?;
     }
     let uid = user.id().to_string();
     let goal = state
@@ -660,6 +711,11 @@ async fn update_goal(
                 &entities::GoalChanges {
                     title: body.title.as_deref(),
                     status_text: body.status_text.as_deref(),
+                    target: body.target.as_deref(),
+                    due: body
+                        .due
+                        .as_ref()
+                        .map(|d| d.as_deref().map(str::trim).filter(|d| !d.is_empty())),
                     done: body.done,
                     suggested: body.suggested,
                 },
@@ -1028,4 +1084,172 @@ mod tests {
         assert!(safe_join(root, ".git/config").is_err());
         assert!(safe_join(root, "link/passwd").is_err());
     }
+}
+
+// ------------------------------------------------------------ working notes
+
+async fn list_working_notes(State(state): State<AppState>, user: AuthUser) -> ApiResult {
+    user.require_owner()?;
+    let uid = user.id().to_string();
+    let notes = state
+        .db
+        .call(move |c| crate::proactive::list_notes(c, &uid))
+        .await?;
+    ok(json!({"notes": notes}))
+}
+
+fn note_domain(domain: &str) -> Result<String, ApiError> {
+    crate::proactive::slug(domain).ok_or_else(|| ApiError::not_found("working note"))
+}
+
+async fn get_working_note(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(domain): Path<String>,
+) -> ApiResult {
+    user.require_owner()?;
+    let uid = user.id().to_string();
+    let domain = note_domain(&domain)?;
+    let (note, history) = state
+        .db
+        .call(move |c| {
+            Ok((
+                crate::proactive::get_note(c, &uid, &domain)?,
+                crate::proactive::note_history(c, &uid, &domain)?,
+            ))
+        })
+        .await?;
+    let note = note.ok_or_else(|| ApiError::not_found("working note"))?;
+    ok(json!({"note": note, "history": history}))
+}
+
+#[derive(Deserialize)]
+struct PutWorkingNote {
+    title: Option<String>,
+    body: String,
+}
+
+/// Create or replace a note (the owner's edit).
+async fn put_working_note(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(domain): Path<String>,
+    JsonBody(body): JsonBody<PutWorkingNote>,
+) -> ApiResult {
+    user.require_owner()?;
+    let uid = user.id().to_string();
+    let domain = crate::proactive::slug(&domain)
+        .ok_or_else(|| ApiError::bad_request("the note needs a name"))?;
+    crate::proactive::check_note(body.title.as_deref(), &body.body)?;
+    let note = state
+        .db
+        .call(move |c| {
+            crate::proactive::upsert_note(
+                c,
+                &uid,
+                &domain,
+                body.title.as_deref(),
+                &body.body,
+                "owner",
+            )
+        })
+        .await?
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    changed(&state, &user, "working_notes");
+    ok(json!({"note": note}))
+}
+
+async fn delete_working_note(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(domain): Path<String>,
+) -> ApiResult {
+    user.require_owner()?;
+    let uid = user.id().to_string();
+    let domain = note_domain(&domain)?;
+    if !state
+        .db
+        .call(move |c| crate::proactive::delete_note(c, &uid, &domain))
+        .await?
+    {
+        return Err(ApiError::not_found("working note"));
+    }
+    changed(&state, &user, "working_notes");
+    ok(json!({"ok": true}))
+}
+
+// ------------------------------------------------------ proactive outcome
+
+#[derive(Deserialize)]
+struct Outcome {
+    outcome: String,
+}
+
+/// The owner's verdict on a message the agent sent on its own.
+async fn proactive_outcome(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(message_id): Path<String>,
+    JsonBody(body): JsonBody<Outcome>,
+) -> ApiResult {
+    user.require_owner()?;
+    if !matches!(body.outcome.as_str(), "useful" | "not_needed") {
+        return Err(ApiError::bad_request(
+            "outcome must be useful or not_needed",
+        ));
+    }
+    let uid = user.id().to_string();
+    let (m, msg) = state
+        .db
+        .call(move |c| {
+            db::write_tx(c, |c| {
+                let m = match crate::proactive::set_outcome(c, &uid, &message_id, &body.outcome)? {
+                    Some(m) => m,
+                    // A check-in message from before the scorecard existed
+                    // has no row yet: it is still the agent's own message
+                    // in the owner's Main chat, so record it now.
+                    None => match db::get_message(c, &message_id)? {
+                        Some(legacy)
+                            if legacy.role == "assistant"
+                                && legacy.meta["initiated_by"] == "heartbeat"
+                                && legacy.conversation_id
+                                    == db::ensure_main_conversation(c, &uid)? =>
+                        {
+                            let row = crate::proactive::record(
+                                c,
+                                &uid,
+                                Some(&legacy.id),
+                                "heartbeat",
+                                &legacy.content,
+                                "posted",
+                            )?;
+                            c.execute(
+                                "UPDATE proactive_messages SET created_at = ?2 WHERE id = ?1",
+                                rusqlite::params![row.id, legacy.created_at],
+                            )?;
+                            match crate::proactive::set_outcome(c, &uid, &message_id, &body.outcome)? {
+                                Some(m) => m,
+                                None => return Ok(None),
+                            }
+                        }
+                        _ => return Ok(None),
+                    },
+                };
+                // The chat shows the verdict on the message itself.
+                c.execute(
+                    "UPDATE messages SET meta = json_set(meta, '$.proactive_outcome', ?2) WHERE id = ?1",
+                    rusqlite::params![message_id, body.outcome],
+                )?;
+                Ok(db::get_message(c, &message_id)?.map(|msg| (m, msg)))
+            })
+        })
+        .await?
+        .ok_or_else(|| ApiError::not_found("proactive message"))?;
+    state.hub.to_users(
+        &[user.id().to_string()],
+        json!({"type": "message.updated", "conversation_id": msg.conversation_id, "message": msg}),
+    );
+    // The scorecard in Settings changed.
+    state.broadcast_settings().await;
+    ok(json!({"proactive": m}))
 }

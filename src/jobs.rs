@@ -277,18 +277,106 @@ pub fn spawn_scheduler(state: AppState) {
     });
 }
 
-fn heartbeat_prompt(state: &AppState) -> String {
+/// What one check-in compares: the agent's working notes, the open goals
+/// with their targets, what it held back last time, and the scorecard.
+#[derive(Debug, Default)]
+pub struct HeartbeatContext {
+    pub notes: Vec<crate::proactive::WorkingNote>,
+    pub goals: Vec<crate::entities::Goal>,
+    pub held: Vec<crate::proactive::ProactiveMessage>,
+    pub scorecard: crate::proactive::Scorecard,
+    pub max_per_day: u64,
+    pub sent_today: i64,
+}
+
+pub fn heartbeat_context(
+    c: &rusqlite::Connection,
+    owner: &str,
+    now: i64,
+    max_per_day: u64,
+) -> rusqlite::Result<HeartbeatContext> {
+    Ok(HeartbeatContext {
+        notes: crate::proactive::list_notes(c, owner)?,
+        goals: crate::entities::list_goals(c, owner, false)?,
+        held: crate::proactive::held_recent(c, owner, now)?,
+        scorecard: crate::proactive::scorecard(c, owner, now)?,
+        max_per_day,
+        sent_today: crate::proactive::posted_today(c, owner, now)?,
+    })
+}
+
+pub fn heartbeat_prompt(state: &AppState, ctx: &HeartbeatContext) -> String {
     let checklist =
         std::fs::read_to_string(state.paths.persona_dir().join("HEARTBEAT.md")).unwrap_or_default();
-    format!(
-        "Scheduled heartbeat check at {}.\n\nWork through this checklist. Use your \
-         memory files and connected tools as needed.\n\n<heartbeat>\n{}\n</heartbeat>\n\n\
-         If nothing needs the user's attention, reply with exactly {HEARTBEAT_OK} and \
-         nothing else. Otherwise reply with the short message you want to send the \
-         user (it will appear in their Main chat and as a notification).",
+    let mut out = format!(
+        "Scheduled check-in at {}.\n\nThis is a comparison of plan against reality, \
+         not a status report. Follow the procedure below. Use your working notes, \
+         memory and connected tools as needed.\n\n<heartbeat>\n{}\n</heartbeat>\n",
         local_timestamp(),
         truncate_chars(checklist.trim(), 20_000)
-    )
+    );
+    out.push_str("\n## Your working notes (the plan)\n");
+    if ctx.notes.is_empty() {
+        out.push_str(
+            "\nYou have no working notes yet. Start one per domain the user has asked you \
+             to look after (see PROACTIVE_PREFERENCES.md and your memory) with \
+             `update_working_note`, even if all it holds for now is the plan and what \
+             you will watch.\n",
+        );
+    } else {
+        out.push_str(&crate::proactive::render_notes(
+            &ctx.notes,
+            crate::proactive::HEARTBEAT_NOTES_CHARS,
+        ));
+    }
+    out.push_str("\n## Open goals\n");
+    if ctx.goals.is_empty() {
+        out.push_str("\n(No open goals.)\n");
+    } else {
+        for g in ctx.goals.iter().take(50) {
+            out.push_str(&format!("\n- **{}**", g.title));
+            if g.suggested {
+                out.push_str(" (suggested, not confirmed yet)");
+            }
+            if let Some(d) = &g.due {
+                out.push_str(&format!(" · due {d}"));
+            }
+            if !g.target.is_empty() {
+                out.push_str(&format!("\n  Target: {}", truncate_chars(&g.target, 400)));
+            }
+            if !g.status_text.is_empty() {
+                out.push_str(&format!(
+                    "\n  Status: {}",
+                    truncate_chars(&g.status_text, 400)
+                ));
+            }
+        }
+        out.push('\n');
+    }
+    if !ctx.held.is_empty() {
+        out.push_str(
+            "\n## Held back\n\nThese messages were not sent because the day's budget was \
+             spent. Raise one again only if it still matters now.\n",
+        );
+        for h in &ctx.held {
+            out.push_str(&format!("\n- {}", h.excerpt.replace('\n', " ")));
+        }
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "\n## Scorecard\n\n{}\nToday: {} of {} messages used.\n",
+        ctx.scorecard.render(),
+        ctx.sent_today,
+        ctx.max_per_day
+    ));
+    out.push_str(&format!(
+        "\n## Reply\n\nFirst update your working notes with `update_working_note` (every \
+         run). Then, if nothing needs the user, reply with exactly {HEARTBEAT_OK} and \
+         nothing else. Otherwise reply with the one short message you want to send \
+         (it appears in their Main chat and as a notification): what you did, what \
+         you noticed, and what you recommend, answerable with yes or no."
+    ));
+    out
 }
 
 pub async fn run_job(state: &AppState, job: Job, manual: bool) -> crate::util::Result<()> {
@@ -315,7 +403,13 @@ pub async fn run_job(state: &AppState, job: Job, manual: bool) -> crate::util::R
     if job == Job::Dream {
         return crate::memory::dream::run(state, &owner, manual).await;
     }
-    let prompt = heartbeat_prompt(state);
+    let max_per_day = state.heartbeat_max_per_day().await;
+    let (o, now) = (owner.clone(), now_ms());
+    let hb = state
+        .db
+        .call(move |c| heartbeat_context(c, &o, now, max_per_day))
+        .await?;
+    let prompt = heartbeat_prompt(state, &hb);
     let (o, name) = (owner.clone(), job.name());
     let (conv_id, user_msg, assistant_msg) = state
         .db
@@ -385,8 +479,61 @@ pub async fn run_job(state: &AppState, job: Job, manual: bool) -> crate::util::R
     if text.is_empty() || text.contains(HEARTBEAT_OK) {
         return Ok(());
     }
-    post_to_main(state, &owner, &text, &result.message, "heartbeat").await?;
-    move_cards_to_main(state, &owner, &result.message).await?;
+    deliver_proactive(
+        state,
+        &owner,
+        &text,
+        &result.message,
+        "heartbeat",
+        max_per_day,
+    )
+    .await
+}
+
+/// Post a message the agent wrote on its own initiative, within the daily
+/// budget: over it, the message is held for the next run instead (and its
+/// cards stay in the job conversation).
+pub async fn deliver_proactive(
+    state: &AppState,
+    owner: &str,
+    text: &str,
+    source: &db::Message,
+    initiated_by: &str,
+    max_per_day: u64,
+) -> crate::util::Result<()> {
+    let (o, now) = (owner.to_string(), now_ms());
+    let sent_today = state
+        .db
+        .call(move |c| crate::proactive::posted_today(c, &o, now))
+        .await?;
+    if sent_today >= max_per_day as i64 {
+        let (o, t, by) = (
+            owner.to_string(),
+            text.to_string(),
+            initiated_by.to_string(),
+        );
+        state
+            .db
+            .call(move |c| crate::proactive::record(c, &o, None, &by, &t, "held"))
+            .await?;
+        crate::info!("{initiated_by}: message held, {sent_today} of {max_per_day} sent today");
+        // Settings shows the scorecard; keep open apps current.
+        state.broadcast_settings().await;
+        return Ok(());
+    }
+    let posted = post_to_main(state, owner, text, source, initiated_by).await?;
+    let (o, t, by, id) = (
+        owner.to_string(),
+        text.to_string(),
+        initiated_by.to_string(),
+        posted.id.clone(),
+    );
+    state
+        .db
+        .call(move |c| crate::proactive::record(c, &o, Some(&id), &by, &t, "posted"))
+        .await?;
+    move_cards_to_main(state, owner, source).await?;
+    state.broadcast_settings().await;
     Ok(())
 }
 
@@ -432,7 +579,7 @@ pub async fn post_to_main(
     text: &str,
     source: &db::Message,
     initiated_by: &str,
-) -> crate::util::Result<()> {
+) -> crate::util::Result<db::Message> {
     post_to_main_opts(state, user_id, text, source, initiated_by, true).await
 }
 
@@ -444,11 +591,12 @@ pub async fn post_to_main_opts(
     source: &db::Message,
     initiated_by: &str,
     push: bool,
-) -> crate::util::Result<()> {
+) -> crate::util::Result<db::Message> {
     post_note_to_main(state, user_id, text, Some(source), initiated_by, push).await
 }
 
 /// [`post_to_main_opts`] for a note no engine wrote (`source` None).
+/// Returns the Main chat message.
 pub async fn post_note_to_main(
     state: &AppState,
     user_id: &str,
@@ -456,7 +604,7 @@ pub async fn post_note_to_main(
     source: Option<&db::Message>,
     initiated_by: &str,
     push: bool,
-) -> crate::util::Result<()> {
+) -> crate::util::Result<db::Message> {
     let (uid, text_s) = (user_id.to_string(), text.to_string());
     let meta = json!({"initiated_by": initiated_by, "routing": source.and_then(|s| s.meta.get("routing"))});
     let (harness, model, effort) = (
@@ -488,7 +636,7 @@ pub async fn post_note_to_main(
         json!({"type": "message.created", "conversation_id": msg.conversation_id, "message": msg}),
     );
     if !push {
-        return Ok(());
+        return Ok(msg);
     }
     let title = state.agent_name().await;
     crate::notify::push_users(
@@ -502,7 +650,7 @@ pub async fn post_note_to_main(
             "kind": initiated_by,
         }),
     );
-    Ok(())
+    Ok(msg)
 }
 
 #[cfg(test)]
@@ -564,6 +712,93 @@ mod tests {
             .into_iter()
             .find(|j| j["name"] == "heartbeat")
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn proactive_messages_stop_at_the_daily_budget_and_are_held() {
+        let (state, _tmp) = test_state();
+        let owner = state.db.with(db::owner_user_id).unwrap().unwrap();
+        let (source, main) = state
+            .db
+            .with(|c| {
+                let job = db::ensure_job_conversation(c, &owner, "heartbeat")?;
+                let m = db::insert_message(
+                    c,
+                    &db::NewMessage {
+                        conversation_id: &job,
+                        role: "assistant",
+                        content: "x",
+                        ..Default::default()
+                    },
+                )?;
+                Ok((m, db::ensure_main_conversation(c, &owner)?))
+            })
+            .unwrap();
+        for text in ["Rent is due Friday.", "The package slipped a day."] {
+            deliver_proactive(&state, &owner, text, &source, "heartbeat", 2)
+                .await
+                .unwrap();
+        }
+        deliver_proactive(&state, &owner, "One more thing.", &source, "heartbeat", 2)
+            .await
+            .unwrap();
+        let posted: Vec<String> = state
+            .db
+            .with(|c| db::list_messages(c, &main, None, 10))
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        assert!(posted.contains(&"Rent is due Friday.".to_string()));
+        assert!(
+            !posted.contains(&"One more thing.".to_string()),
+            "{posted:?}"
+        );
+        let hb = state
+            .db
+            .with(|c| heartbeat_context(c, &owner, now_ms(), 2))
+            .unwrap();
+        assert_eq!(hb.sent_today, 2);
+        assert_eq!(hb.held.len(), 1);
+        assert_eq!(hb.held[0].excerpt, "One more thing.");
+        let prompt = heartbeat_prompt(&state, &hb);
+        assert!(prompt.contains("## Held back"));
+        assert!(prompt.contains("One more thing."));
+        assert!(prompt.contains("Today: 2 of 2 messages used."));
+        assert!(prompt.contains("You have no working notes yet."));
+        assert!(prompt.contains(HEARTBEAT_OK));
+        // Notes and goals with targets show up in the plan.
+        state
+            .db
+            .with(|c| {
+                crate::proactive::upsert_note(
+                    c,
+                    &owner,
+                    "garden",
+                    None,
+                    "Water Tuesdays.",
+                    "agent",
+                )?
+                .unwrap();
+                crate::entities::create_goal_with(
+                    c,
+                    &owner,
+                    &crate::entities::NewGoal {
+                        title: "Paint the fence",
+                        target: "Both coats done",
+                        due: Some("2026-05-01"),
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+        let hb = state
+            .db
+            .with(|c| heartbeat_context(c, &owner, now_ms(), 2))
+            .unwrap();
+        let prompt = heartbeat_prompt(&state, &hb);
+        assert!(prompt.contains("<working_note domain=\"garden\""));
+        assert!(prompt.contains("**Paint the fence** · due 2026-05-01\n  Target: Both coats done"));
     }
 
     #[tokio::test]

@@ -92,6 +92,8 @@ src/
 ├── entities.rs      feed, ideas, goals, library, cards, connectors, credentials, push subs
 ├── auth.rs          pairing codes, device tokens, lockout
 ├── persona.rs       system files, per-turn system prompt, persona hash
+├── proactive.rs     the agent's working notes (one per domain), the scorecard of
+│                    messages it sent on its own, the heartbeat's daily budget
 ├── memory/          owner memory: notes in SQLite (history, FTS5), the
 │                    generated read-only Markdown export, Markdown import
 ├── catalog.rs       model catalog (config + models the CLIs report)

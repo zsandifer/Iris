@@ -18,6 +18,7 @@ if the two ever disagree, the code wins and this file has a bug.
    - [3.6 Ideas](#36-ideas)
    - [3.7 Goals](#37-goals)
    - [3.7a Activity and approvals](#37a-activity-and-approvals)
+   - [3.7b Working notes and proactive verdicts](#37b-working-notes-and-proactive-verdicts)
    - [3.8 Library](#38-library)
    - [3.9 System files and folders](#39-system-files-and-folders)
    - [3.10 Settings and avatar](#310-settings-and-avatar)
@@ -263,6 +264,11 @@ All paths are under `/api`. "Any" means any authenticated user.
 | POST | `/goals` | Any | Create a goal |
 | PATCH | `/goals/{id}` | Any | Update a goal |
 | DELETE | `/goals/{id}` | Any | Delete a goal |
+| GET | `/working-notes` | **Owner** | The agent's working notes (one per domain) |
+| GET | `/working-notes/{domain}` | **Owner** | One working note with its earlier versions |
+| PUT | `/working-notes/{domain}` | **Owner** | Create or replace a working note |
+| DELETE | `/working-notes/{domain}` | **Owner** | Delete a working note |
+| POST | `/proactive/{message_id}/outcome` | **Owner** | Verdict on a message the agent sent on its own |
 | GET | `/library` | Any | List library items |
 | GET | `/library/{id}` | Any | One library item |
 | DELETE | `/library/{id}` | Any | Delete a library item |
@@ -992,6 +998,8 @@ suggestions with "Add goal" (`PATCH {"suggested": false}`) and "No thanks"
 |---|---|---|
 | `title` | string | Required, non-blank, max 300. |
 | `status_text` | string | Optional progress note, max 2,000. |
+| `target` | string | Optional: what done looks like, max 2,000. The heartbeat measures progress against it. |
+| `due` | string | Optional `YYYY-MM-DD` (a real date, else `400`). |
 
 Goals created here are never suggestions.
 
@@ -1003,6 +1011,8 @@ Response `{"goal": {Goal}}`. Emits `entities.changed` `["goals"]`.
 |---|---|---|
 | `title` | string | Optional, non-blank, max 300. |
 | `status_text` | string | Optional, max 2,000. |
+| `target` | string | Optional, max 2,000. |
+| `due` | string or null | Optional `YYYY-MM-DD`; `null` or `""` clears it; left out, unchanged. |
 | `done` | bool | Optional. `true` sets `done_at` to now; `false` clears it. |
 | `suggested` | bool | Optional. `false` confirms a suggested goal. |
 
@@ -1062,6 +1072,61 @@ request returns `400`. Every accepted decision atomically inserts a `system_note
 and broadcasts `message.created` alongside the card update. Approval notes record
 the decision, not a claim that the held operation succeeded.
 
+### 3.7b Working notes and proactive verdicts
+
+Working notes are the agent's own picture of each domain it looks after
+(its plan, the current state, what it is watching, open questions): one note
+per domain, written by the agent in chats and on every heartbeat
+(`update_working_note`), readable and editable by the owner. They are not
+memory (memory is about the owner); the private system prompt and the
+heartbeat prompt both carry them. All routes are **owner-only**.
+
+#### `GET /api/working-notes`
+
+```json
+{"notes": [{WorkingNote}]}
+```
+
+Most recently updated first; at most 40 notes per owner.
+
+#### `GET /api/working-notes/{domain}`
+
+```json
+{"note": {WorkingNote}, "history": [{"id": 3, "title": "...", "body": "...", "updated_by": "heartbeat", "replaced_at": 1760000000000}]}
+```
+
+`history` lists earlier versions, newest first (the last 20). `404` when
+there is no note for that domain.
+
+#### `PUT /api/working-notes/{domain}`
+
+| Field | Type | Notes |
+|---|---|---|
+| `title` | string | Optional, one line, max 120. A new note without one gets a title made from the domain. |
+| `body` | string | Required (may be empty), Markdown, max 8,000. |
+
+`{domain}` is turned into a key (lowercase letters, digits and dashes, max
+60; `Household budget` → `household-budget`); `400` when nothing usable is
+left. Creates the note or replaces it (the previous version goes to
+history) with `updated_by: "owner"`. `400` past the 40-note limit. Response
+`{"note": {WorkingNote}}`. Emits `entities.changed` `["working_notes"]`.
+
+#### `DELETE /api/working-notes/{domain}`
+
+`{"ok": true}` (`404` if there is none). Emits `entities.changed`
+`["working_notes"]`.
+
+#### `POST /api/proactive/{message_id}/outcome`
+
+The owner's verdict on a message the agent sent on its own (a Main chat
+message with `meta.initiated_by: "heartbeat"`). Body
+`{"outcome": "useful" | "not_needed"}` (else `400`). `404` when the message
+was not posted by a job (the scorecard only tracks those). Sets
+`meta.proactive_outcome` on the message (broadcast as `message.updated`) and
+records the verdict in the scorecard the next heartbeat reads (see
+[Scheduled jobs](#scheduled-jobs)). Response `{"proactive": {"id", "message_id",
+"source", "excerpt", "outcome", "created_at", "outcome_at"}}`.
+
 ### 3.8 Library
 
 Items are saved by the agent through `save_to_library`. Kinds: `artifact`
@@ -1105,7 +1170,10 @@ All routes in this section are **owner-only**.
 
 System files are the persona and memory markdown files the agent reads.
 The memory files are a generated, **read-only** copy of the memory notes
-(see [Memory](#memory)):
+(see [Memory](#memory)). Missing persona files are created from Iris's
+templates at startup; a persona file that still equals an earlier version
+of its template (never edited) is upgraded to the current one, and an
+edited file is left alone:
 
 | Name | Folder | In chat system prompt | Description |
 |---|---|---|---|
@@ -1114,7 +1182,7 @@ The memory files are a generated, **read-only** copy of the memory notes
 | `USER.md` | persona | yes | Facts about you: preferences, goals, people |
 | `TOOLS.md` | persona | yes | Notes about tools, accounts and connectors |
 | `PROACTIVE_PREFERENCES.md` | persona | yes | When and how the agent acts on its own |
-| `HEARTBEAT.md` | persona | no (read by the heartbeat job) | Checklist for scheduled check-ins |
+| `HEARTBEAT.md` | persona | no (read by the heartbeat job) | What the agent does on each check-in (plan versus reality) |
 | `MEMORY.md` | memory | `in_prompt: false` (included separately as memory) | What the agent always keeps in mind (a read-only copy of its memory) |
 
 #### `GET /api/files`
@@ -1221,13 +1289,20 @@ Returns the [Settings](#settings) object directly (not wrapped):
   "heartbeat_interval_mins": 60,
   "heartbeat_active_start": "08:00",
   "heartbeat_active_end": "22:00",
+  "heartbeat_max_per_day": 2,
+  "proactive": {"days": 14, "sent": 3, "useful": 1, "not_needed": 1, "replied": 1, "ignored": 0, "held": 0},
   "paused": false,
   "memory": {"learning_paused": false, "morning_note": true, "reset": null},
   "voice": {"enabled": false, "status": "not_implemented"}
 }
 ```
 
-`memory` and the `heartbeat_*` fields are owner-only (`null` for other users).
+`memory`, `proactive` and the `heartbeat_*` fields are owner-only (`null` for
+other users). `proactive` is the scorecard of messages the agent sent on its
+own in the last `days` days: `sent` (posted, of which `useful` and
+`not_needed` carry the owner's verdict, `replied` were written back to within
+six hours, `ignored` neither) and `held` (not posted because the day's budget
+was spent).
 `memory.reset` is an opaque
 marker (`null` until the first Forget everything) that changes with every
 Forget everything; an app that sees it change (for example in `ready` after
@@ -1249,6 +1324,7 @@ All fields optional; only supplied fields change.
 | `heartbeat_enabled` | bool | Turns the [heartbeat](#scheduled-jobs) (the agent checking in on its own) on or off. Default false. Stored as `heartbeat.enabled`. |
 | `heartbeat_interval_mins` | integer | How often the heartbeat runs, 15 to 1440 (once a day). Default 60. Stored as `heartbeat.interval_mins`. |
 | `heartbeat_active_start`, `heartbeat_active_end` | string | Local `HH:MM` window the heartbeat runs in (`H:MM` is accepted and saved zero-padded; may wrap past midnight; equal means all day). Defaults `08:00` and `22:00`. Stored as `heartbeat.active_start` / `heartbeat.active_end`. |
+| `heartbeat_max_per_day` | integer | Most messages the heartbeat may post on its own per local day, 1 to 10 (default 2); further messages are held for the next run. Stored as `heartbeat.max_per_day`. |
 
 The `heartbeat_*` settings are the only place the heartbeat is configured
 (config.toml has no `[heartbeat]` section; an older one is imported once at
@@ -1256,7 +1332,8 @@ startup, see [Scheduled jobs](#scheduled-jobs)). The scheduler reads them on
 its next minute tick, no restart. An interval out of range or a malformed
 time is `400 bad_request` with a plain message ("I can check in as often as
 every 15 minutes or as rarely as once a day.", "That time doesn't look
-right. Use a time like 08:00."), and then nothing in that request is saved.
+right. Use a time like 08:00.", "I can send between 1 and 10 messages a day
+on my own."), and then nothing in that request is saved.
 | `memory_learning_paused` | bool | Stops Dream and agent memory writes (including legacy `write_memory`). Recall and owner edits/undo stay available. Default false; stored as `memory.learning_paused`. |
 | `memory_morning_note` | bool | Show a morning note after Dream changes notes. Default true; stored as `memory.morning_note`. |
 | `paused` | bool | "Pause Iris". `true` stops every running turn (its CLI process group is killed), closes the browser, and until it is turned off again: chat turns end at once with a short first-person note (error kind `paused`, no push), scheduled jobs do not run, and the browser tools are refused. Saved in the database, so it survives restarts. |
@@ -2720,7 +2797,7 @@ was emitted). Events are delivered only to the users listed under
 | `memory.reset` | `{"reset"}` (the new `Settings.memory.reset` marker) after Forget everything: drop cached Noted metadata and morning cards (they now read "I cleared my notes.") and close open memory sheets | Owner only |
 | `turn.status` | `{"conversation_id", "message_id", "status": "queued" \| "running"}` | Conversation members |
 | `conversation.created` | `{"conversation": {Conversation}}` | Conversation members |
-| `entities.changed` | `{"kinds": ["goals" \| "ideas" \| "feed" \| "library" \| "memory" \| "routines", ...]}` | The affected user |
+| `entities.changed` | `{"kinds": ["goals" \| "ideas" \| "feed" \| "library" \| "memory" \| "routines" \| "working_notes", ...]}` | The affected user |
 | `settings.changed` | `{"settings": {Settings}}` | All users |
 | `harness.status` | `{"harness": {HarnessStatus}}` (`path` always `null`) | All users |
 | `message.updated` | `{"conversation_id", "message": {Message}}` | Conversation members |
@@ -3155,11 +3232,22 @@ Afterwards the section is ignored and startup logs a one-line notice.
   before clearing history. No new tables or
   MCP tools. Morning-card data and undo are described in [Memory](#320-memory).
 
-- **heartbeat**: the agent works through `HEARTBEAT.md`. If it replies
-  `HEARTBEAT_OK` (or the reply contains it, or is empty), nothing happens.
-  Otherwise the reply is posted as a new assistant message in the owner's Main
-  chat (`message.created`, `meta.initiated_by: "heartbeat"`) and pushed to all
-  of the owner's subscriptions.
+- **heartbeat**: a check-in that compares the plan with reality. The prompt
+  carries `HEARTBEAT.md` (the procedure), the agent's
+  [working notes](#37b-working-notes-and-proactive-verdicts) in full (up to
+  40,000 characters, the rest by title), the open goals with their `target`,
+  `due` and status, the messages held back in the last two days, and the
+  scorecard (the last 14 days of proactive messages and what the owner did
+  with them, with the texts marked not needed). The agent updates its notes
+  with `update_working_note` (recorded as `updated_by: "heartbeat"`). If it
+  replies `HEARTBEAT_OK` (or the reply contains it, or is empty), nothing
+  else happens. Otherwise, within the daily budget (`heartbeat_max_per_day`,
+  counted per local day), the reply is posted as a new assistant message in
+  the owner's Main chat (`message.created`, `meta.initiated_by: "heartbeat"`),
+  pushed to all of the owner's subscriptions, and recorded in the scorecard
+  as `posted`; past the budget it is recorded as `held` instead (not posted,
+  no push, its cards stay in the job conversation) and shown to the next run,
+  which raises it again only if it still matters.
 - **feed**: the For you pipeline for the owner. It publishes at most one
   batch per local day; scheduled runs after that (every `interval_mins`,
   default 60, between `active_start` 06:00 and `active_end` 22:00) do
@@ -3547,9 +3635,22 @@ changes are re-sent as `message.updated`.
 | `id` | string | |
 | `title` | string | Max 300. |
 | `status_text` | string | Free-text progress note the agent keeps current, max 2,000. |
+| `target` | string | What done looks like, max 2,000 (may be empty). |
+| `due` | string or null | `YYYY-MM-DD`. |
 | `suggested` | bool | Proposed by the agent, not yet confirmed by the user. |
 | `done` | bool | |
 | `done_at` | int or null | |
+| `created_at`, `updated_at` | int | |
+
+### WorkingNote
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string | |
+| `domain` | string | Key: lowercase letters, digits and dashes, max 60; unique per owner. |
+| `title` | string | One line, max 120. |
+| `body` | string | Markdown, max 8,000. |
+| `updated_by` | string | `agent` (a chat turn), `heartbeat`, or `owner`. |
 | `created_at`, `updated_at` | int | |
 
 ### LibraryItem
@@ -4185,8 +4286,12 @@ a new turn. Resolved cards are explicitly described as resolved in replay histor
 | `request_engine_install` | `engine` (same names) | `{"outcome", "card_id"?}`; install card or already installed |
 | `request_connector_setup` | `name`: a catalog id (`"google"`, `"github"`, `"notion"`, `"todoist"`, `"linear"`, `"sentry"`, `"stripe"`, ..., `"custom"`; the tool's schema lists every one) | `{"outcome", "card_id"?}`; connect/reconnect card or already connected (a Google connection that `needs_more_access` gets an "Add more Google services" `connector_reconnect` card instead); paused/disabled connectors return `connector paused by owner` / `connector disabled by owner` with a Resume action card |
 | `list_goals` | `include_done?: bool` (default false) | `{"goals": [Goal]}` |
-| `create_goal` | `title: string` (required, max 300), `status_text?: string` (max 2,000), `suggested?: bool` (a proposal the user confirms; default false) | `{"goal": Goal}` |
-| `update_goal` | `id: string` (required), `title?` (non-blank, max 300), `status_text?` (max 2,000), `done?: bool` | `{"goal": Goal}`; error `no goal with that id` |
+| `create_goal` | `title: string` (required, max 300), `status_text?: string` (max 2,000), `target?: string` (what done looks like, max 2,000), `due?: string` (`YYYY-MM-DD`), `suggested?: bool` (a proposal the user confirms; default false) | `{"goal": Goal}` |
+| `update_goal` | `id: string` (required), `title?` (non-blank, max 300), `status_text?` (max 2,000), `target?` (max 2,000), `due?` (`YYYY-MM-DD`; `""` clears it), `done?: bool` | `{"goal": Goal}`; error `no goal with that id` |
+| `list_working_notes` | none; owner private context only | `{"notes": [WorkingNote], "note"?: string}` |
+| `get_working_note` | `domain` (required); owner private context only | `{"note": WorkingNote, "history": [...]}`; error `no working note for that domain` |
+| `update_working_note` | `domain`, `body` (required, Markdown, max 8,000), `title?` (one line, max 120); owner private context only | `{"note": WorkingNote}`: creates or replaces the note (the old version goes to history; `updated_by` is `heartbeat` in the job conversation, else `agent`); errors past 40 notes |
+| `delete_working_note` | `domain` (required); owner private context only | `{"deleted": true}` |
 | `list_ideas` | `status?: "open" \| "started" \| "done" \| "dismissed"` | `{"ideas": [Idea]}` (max 200) |
 | `create_idea` | `title` (required, max 300), `description?` (max 2,000), `prompt?` (max 4,000; sent when the user taps the idea) | `{"idea": Idea}` (status `open`) |
 | `list_feed_posts` | `limit?: int` (1 to 50, default 10) | `{"posts": [FeedPost]}` |
@@ -4227,8 +4332,8 @@ PEM blocks are scrubbed across the whole document before it is split into notes.
 message (`role: "assistant"`) into the current conversation. Clients receive
 it as `message.created` right after the turn's `message.completed`.
 
-The routine tools are only listed and only work in the owner's own private
-conversations (never shared chats, nor other people's). Their proposals are
+The routine and working-note tools are only listed and only work in the
+owner's own private conversations (never shared chats, nor other people's). Their proposals are
 stored in SQLite (`routine_changes`), so they survive restarts, and their
 cards are published with the turn's reply like `create_card` cards. The
 system prompt tells Iris when to propose a routine.
@@ -4491,8 +4596,8 @@ The bridge runs in a separate process and does not emit events itself. When
 the turn ends, Iris looks at the turn's `mcp` activities named
 `iris/<tool>` with status `completed`, skips the read-only `list_*` tools,
 and emits one `entities.changed` to the turn's `--user` with `goals`,
-`ideas`, `feed`, `library`, and/or `routines` for tool names containing
-`goal`, `idea`, `feed`, `library`, or `routine`. This also happens for job turns, which emit no other
+`ideas`, `feed`, `library`, `routines`, and/or `working_notes` for tool names
+containing `goal`, `idea`, `feed`, `library`, `routine`, or `working_note`. This also happens for job turns, which emit no other
 conversation events.
 
 ---

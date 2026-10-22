@@ -40,7 +40,7 @@ own personality. It is not a clone.
   chats, + New side chat), then "Together" (shared chats). An **Iris profile**
   entry is pinned at the bottom and opens the **Iris hub**.
 - **Iris hub:** Connections · Logins & wallet · Iris's computer · Memory ·
-  System files · Settings.
+  Working notes · System files · Settings.
 
 ## Chat
 
@@ -185,6 +185,13 @@ own personality. It is not a clone.
   no browser yet, the screen offers to set one up. Pause Iris stops what it
   is doing and holds chats and check-ins until turned back on.
   Trusted people manages recipients who can receive messages without another approval.
+- **Working notes** (below Memory; owner only): "My own notes on what I
+  look after for you". One note per domain Iris owns (Japan trip, porch
+  garden): the plan, where things stand, what it is watching, open
+  questions, written by Iris on every check-in and in chats. Tap one to
+  read it as Markdown, Edit to rewrite it, see earlier versions and restore
+  one, or Delete. "Add" starts an empty note for something new to look
+  after.
 - **Memory** (above System files; owner only): "What I know about you · N
   things", a "Search my memory" box (the same keyword search Iris uses), and
   segments All · You · People · Projects · Routines. Pinned notes come first
@@ -224,10 +231,14 @@ own personality. It is not a clone.
   link: you change memory in Memory or by asking in chat.
 - **Settings:**
   - Name, picture, voice replies, "Check in on its own" (owner only: the
-    agent looks over things on a schedule and messages you only when
-    something needs your attention; while on, "How often" offers every 30
-    minutes, hour, 2 hours, 4 hours or once a day, and "Between" sets the
-    hours, like Quiet hours), notifications, quiet hours.
+    agent compares its plan with reality on a schedule and messages you only
+    when it matters; while on, "How often" offers every 30 minutes, hour,
+    2 hours, 4 hours or once a day, "Between" sets the hours, like Quiet
+    hours, "Messages a day" caps what it sends on its own (the rest waits
+    for the next check-in), and "How I'm doing" shows the last two weeks:
+    sent, useful, not needed, held), notifications, quiet hours.
+  - Under a message Iris sent on its own, "Worth sending? Yes · Not needed"
+    records a verdict the next check-in learns from.
   - Advanced: **AI engine**, devices, people, activity log (all steps, or
     just connected services with whether each ran on its own or you
     approved it).

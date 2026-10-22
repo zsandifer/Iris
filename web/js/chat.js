@@ -67,6 +67,22 @@ function peekFor(m, list) {
   return S.browsing[m.id] ? html`<${Peek} m=${m} list=${list} />` : null;
 }
 
+/** Under a message the agent sent on its own (a check-in): was it worth
+ * sending? The verdict is the scorecard the next check-in learns from. */
+function Verdict({ m }) {
+  if (m.meta?.initiated_by !== 'heartbeat' || !isOwner()) return null;
+  const v = m.meta.proactive_outcome;
+  const mark = async (outcome) => {
+    try { await post(`/proactive/${seg(m.id)}/outcome`, { outcome }); } catch (e) { toast(e.message); }
+  };
+  if (v) return html`<div class="verdict done">${v === 'useful' ? 'Marked useful' : 'Marked not needed. I’ll send fewer like this.'}</div>`;
+  return html`<div class="verdict" role="group" aria-label="Was this worth sending?">
+    <span class="mu">Worth sending?</span>
+    <button onClick=${() => mark('useful')}>Yes</button>
+    <button onClick=${() => mark('not_needed')}>Not needed</button>
+  </div>`;
+}
+
 function Assistant({ m, list }) {
   const live = S.live[m.id];
   const peek = peekFor(m, list);
@@ -91,6 +107,7 @@ function Assistant({ m, list }) {
     ${content ? html`<div class=${'b' + (failed ? ' b-err' : '')} dangerouslySetInnerHTML=${{ __html: md(content) }} />`
       : m.status === 'cancelled' ? html`<div class="note">Stopped.</div>` : null}
     <${NotedLine} m=${m} />
+    <${Verdict} m=${m} />
     ${peek}
     ${failed && m.meta?.error?.kind !== 'paused' && retryFor(list, m) && html`<button class="retry" onClick=${retry}><${Icon} name="refresh" size=${15} /> Try again</button>`}`;
 }

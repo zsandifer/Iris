@@ -9,7 +9,7 @@
 
 use crate::config::{Paths, ensure_private_dir, write_private_file};
 use crate::router::Purpose;
-use crate::util::{Result, truncate_chars};
+use crate::util::{Result, sha256_hex, truncate_chars};
 use std::path::{Path, PathBuf};
 
 /// Where a system file lives inside the data directory.
@@ -26,6 +26,9 @@ pub struct SystemFile {
     pub description: &'static str,
     /// Included in the chat system prompt.
     pub in_prompt: bool,
+    /// SHA-256 of earlier versions of this template. A file that still
+    /// equals one of them was never customized, so `seed` upgrades it.
+    pub superseded: &'static [&'static str],
 }
 
 /// Editable persona markdown, seeded from generic templates on first run.
@@ -36,6 +39,7 @@ pub const SYSTEM_FILES: &[SystemFile] = &[
         template: include_str!("../templates/IDENTITY.md"),
         description: "Who the agent is: role, boundaries, introduction",
         in_prompt: true,
+        superseded: &["b646e06404e8d3fc2b29c3d6662b60baaf0500e205c767c39c22d6eed53f8eec"],
     },
     SystemFile {
         name: "SOUL.md",
@@ -43,6 +47,7 @@ pub const SYSTEM_FILES: &[SystemFile] = &[
         template: include_str!("../templates/SOUL.md"),
         description: "How the agent communicates and thinks",
         in_prompt: true,
+        superseded: &["aa571f3046fdd654af7ab99ef67a99774b7ac96751a34d229d80f1a2de19626c"],
     },
     SystemFile {
         name: "USER.md",
@@ -50,6 +55,7 @@ pub const SYSTEM_FILES: &[SystemFile] = &[
         template: include_str!("../templates/USER.md"),
         description: "Facts about you: preferences, goals, people",
         in_prompt: true,
+        superseded: &[],
     },
     SystemFile {
         name: "TOOLS.md",
@@ -57,6 +63,7 @@ pub const SYSTEM_FILES: &[SystemFile] = &[
         template: include_str!("../templates/TOOLS.md"),
         description: "Notes about tools, accounts and connectors",
         in_prompt: true,
+        superseded: &[],
     },
     SystemFile {
         name: "PROACTIVE_PREFERENCES.md",
@@ -64,13 +71,15 @@ pub const SYSTEM_FILES: &[SystemFile] = &[
         template: include_str!("../templates/PROACTIVE_PREFERENCES.md"),
         description: "When and how the agent acts on its own",
         in_prompt: true,
+        superseded: &["6cf04e47f994d77e63e9fe632db7d7b6d01d862f839f00b851fd647728252533"],
     },
     SystemFile {
         name: "HEARTBEAT.md",
         area: Area::Persona,
         template: include_str!("../templates/HEARTBEAT.md"),
-        description: "Checklist for scheduled check-ins",
+        description: "What the agent does on each check-in",
         in_prompt: false,
+        superseded: &["e1437260342b71f17c0bf6d9d824ff9e7c275d5b73a6067dae92aa817df6d283"],
     },
     SystemFile {
         name: "MEMORY.md",
@@ -78,6 +87,7 @@ pub const SYSTEM_FILES: &[SystemFile] = &[
         template: include_str!("../templates/MEMORY.md"),
         description: "What the agent always keeps in mind (a read-only copy of its memory)",
         in_prompt: false,
+        superseded: &[],
     },
 ];
 
@@ -147,13 +157,28 @@ pub fn seed(paths: &Paths) -> Result<Vec<String>> {
     }
     let mut created = Vec::new();
     for f in SYSTEM_FILES {
-        let path = system_file_path(paths, f);
-        if !path.exists() {
-            write_private_file(&path, f.template.as_bytes())?;
+        if seed_file(paths, f)? {
             created.push(f.name.to_string());
         }
     }
     Ok(created)
+}
+
+/// Write `f`'s template when the file is missing, or when it still equals
+/// an earlier default (the owner never edited it, so they get the new one).
+/// A customized file is left alone. Returns whether it was written.
+fn seed_file(paths: &Paths, f: &SystemFile) -> Result<bool> {
+    let path = system_file_path(paths, f);
+    if path.exists() {
+        let unedited = !f.superseded.is_empty()
+            && std::fs::read_to_string(&path)
+                .is_ok_and(|current| f.superseded.contains(&sha256_hex(&current).as_str()));
+        if !unedited {
+            return Ok(false);
+        }
+    }
+    write_private_file(&path, f.template.as_bytes())?;
+    Ok(true)
 }
 
 /// Per-turn context that shapes the system prompt.
@@ -174,6 +199,9 @@ pub struct PromptContext<'a> {
     pub scope: Scope,
     /// Short notes such as "the Claude engine needs the owner to sign in".
     pub notices: &'a [String],
+    /// The agent's working notes rendered for the prompt
+    /// (`proactive::render_notes`); only used in private scope.
+    pub working_notes: &'a str,
 }
 
 /// Assemble the system prompt appended to the harness's own system prompt.
@@ -249,6 +277,15 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
 
     out.push_str(&memory_prompt(paths, ctx.scope));
 
+    if private {
+        out.push_str(WORKING_NOTES_GUIDE);
+        if ctx.working_notes.is_empty() {
+            out.push_str("\n(No working notes yet.)\n");
+        } else {
+            out.push_str(ctx.working_notes);
+        }
+    }
+
     if !ctx.notices.is_empty() {
         out.push_str("\n## Notices\n\n");
         for n in ctx.notices {
@@ -274,6 +311,18 @@ pub fn truncate_bytes(s: &str, max: usize) -> String {
     }
     s[..end].to_string()
 }
+
+const WORKING_NOTES_GUIDE: &str = "
+## Your working notes
+
+These are your own notes, one per domain you look after (not the user's \
+memory): the plan, where things stand, what you are watching, open \
+questions, and what you did last. They are what makes you a teammate \
+rather than a chatbot: read them before acting in a domain, and keep them \
+current with `update_working_note` whenever you learn or do something that \
+changes the picture. When the user hands you something to own, start a note \
+for it. The user can read and edit them in the app.
+";
 
 const SHARED_TOOLS_GUIDE: &str = "
 ## The Iris app
@@ -529,6 +578,7 @@ mod tests {
             browser: None,
             scope: Scope::Private,
             notices: &[],
+            working_notes: "",
         }
     }
 
@@ -546,6 +596,50 @@ mod tests {
             "custom"
         );
         assert!(p.workspace_dir().is_dir() && p.library_dir().is_dir());
+    }
+
+    #[test]
+    fn seed_upgrades_unedited_earlier_defaults_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        seed(&p).unwrap();
+        let old_default = "# Soul\n\nSuggest, don't surprise.\n";
+        let hash: &'static str = Box::leak(sha256_hex(old_default).into_boxed_str());
+        let f = SystemFile {
+            name: "SYNTHETIC.md",
+            area: Area::Persona,
+            template: "# Soul\n\nBring a recommendation.\n",
+            description: "test",
+            in_prompt: true,
+            superseded: std::slice::from_ref(Box::leak(Box::new(hash))),
+        };
+        let path = system_file_path(&p, &f);
+        // Missing: created.
+        assert!(seed_file(&p, &f).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), f.template);
+        // Current default: untouched.
+        assert!(!seed_file(&p, &f).unwrap());
+        // The earlier default, never edited: upgraded.
+        std::fs::write(&path, old_default).unwrap();
+        assert!(seed_file(&p, &f).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), f.template);
+        // Edited by the owner: kept.
+        std::fs::write(&path, "# Soul\n\nMy own words.\n").unwrap();
+        assert!(!seed_file(&p, &f).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# Soul\n\nMy own words.\n"
+        );
+        // The real templates list hashes of their earlier versions, never
+        // of the current text (which would rewrite customized-then-restored
+        // files forever).
+        for f in SYSTEM_FILES {
+            assert!(
+                !f.superseded.contains(&sha256_hex(f.template).as_str()),
+                "{}",
+                f.name
+            );
+        }
     }
 
     #[test]
@@ -592,6 +686,28 @@ mod tests {
         assert!(with_browser.contains("take over"));
         b.scope = Scope::Shared;
         assert!(!assemble(&p, &b).contains("## Your browser"));
+    }
+
+    #[test]
+    fn working_notes_only_in_private_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        seed(&p).unwrap();
+        let mut c = ctx("Nova");
+        c.working_notes = "<working_note domain=\"garden\">Water Tuesdays</working_note>";
+        let private = assemble(&p, &c);
+        assert!(private.contains("## Your working notes"));
+        assert!(private.contains("Water Tuesdays"));
+        assert!(private.contains("update_working_note"));
+        for scope in [Scope::Personal, Scope::Shared] {
+            c.scope = scope;
+            let other = assemble(&p, &c);
+            assert!(!other.contains("Water Tuesdays"), "{scope:?}");
+            assert!(!other.contains("## Your working notes"), "{scope:?}");
+        }
+        c.scope = Scope::Private;
+        c.working_notes = "";
+        assert!(assemble(&p, &c).contains("(No working notes yet.)"));
     }
 
     #[test]

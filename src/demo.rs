@@ -239,7 +239,7 @@ fn seed_all(c: &Connection, paths: &Paths, assets: &Path, vault: &Vault) -> Resu
         8,
     )?;
     let hb_meta = json!({"initiated_by": "heartbeat", "routing": null});
-    s.msg(
+    let hb = s.msg(
         now - 52 * MIN,
         NewMessage {
             conversation_id: &main,
@@ -248,6 +248,24 @@ fn seed_all(c: &Connection, paths: &Paths, assets: &Path, vault: &Vault) -> Resu
             meta: Some(&hb_meta),
             ..Default::default()
         },
+    )?;
+    let sent =
+        crate::proactive::record(c, &owner, Some(&hb.id), "heartbeat", &hb.content, "posted")?;
+    c.execute(
+        "UPDATE proactive_messages SET created_at = ?2 WHERE id = ?1",
+        params![sent.id, now - 52 * MIN],
+    )?;
+    let earlier = crate::proactive::record(
+        c,
+        &owner,
+        None,
+        "heartbeat",
+        "Japan fund is $2,650 after today's transfer; still on track for March.",
+        "useful",
+    )?;
+    c.execute(
+        "UPDATE proactive_messages SET created_at = ?2, outcome_at = ?2 WHERE id = ?1",
+        params![earlier.id, yday + 8 * HOUR],
     )?;
     s.user(
         &main,
@@ -546,20 +564,47 @@ fn seed_all(c: &Connection, paths: &Paths, assets: &Path, vault: &Vault) -> Resu
         "You've run 3 times this month. A 12-week plan would get you there.",
         true,
     )?;
-    entities::create_goal(
+    entities::create_goal_with(
         c,
         &owner,
-        "Save $4,000 for Japan",
-        "$2,650 saved · on track for March",
-        false,
+        &entities::NewGoal {
+            title: "Save $4,000 for Japan",
+            status_text: "$2,650 saved · on track for March",
+            target: "$4,000 in the travel account before flights go on sale",
+            due: Some("2027-03-01"),
+            suggested: false,
+        },
     )?;
-    entities::create_goal(
+    entities::create_goal_with(
         c,
         &owner,
-        "Read 12 books this year",
-        "8 of 12 · halfway through a mystery",
-        false,
+        &entities::NewGoal {
+            title: "Read 12 books this year",
+            status_text: "8 of 12 · halfway through a mystery",
+            target: "12 finished, at least 3 of them non-fiction",
+            due: Some("2026-12-31"),
+            suggested: false,
+        },
     )?;
+
+    // ------------------------------------------------------ working notes
+    for (domain, title, body, by) in [
+        (
+            "japan-trip",
+            "Japan trip",
+            "**Plan:** $4,000 saved by March 1, flights booked when the fare alert fires (under $900).\n\n**Where we are:** $2,650 saved, $150 a week going in. On track with two weeks of slack.\n\n**Watching:** the Tokyo fare alert, the travel account balance every Friday.\n\n**Open questions:** Kyoto for 2 nights or 3? Sam leaned toward 3 last week.",
+            "heartbeat",
+        ),
+        (
+            "porch-garden",
+            "Porch garden",
+            "**Plan:** keep the mums and the herbs alive through the first frost.\n\n**Where we are:** watered Tuesday; the mum was dry again today.\n\n**Watching:** overnight lows (first frost usually mid October here).\n\n**Last done:** reminded about the soak last night.",
+            "agent",
+        ),
+    ] {
+        crate::proactive::upsert_note(c, &owner, domain, Some(title), body, by)?
+            .map_err(|e| e.to_string())?;
+    }
     let done = entities::create_goal(c, &owner, "Fix the porch light", "", false)?;
     entities::update_goal(
         c,
