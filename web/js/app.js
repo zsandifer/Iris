@@ -13,6 +13,7 @@ import { FeedScreen, StoryViewer, FeedSettings } from './feed.js';
 import { IdeasScreen, GoalsScreen, LibraryScreen } from './lists.js';
 import { Hub, Logins, Files, FileEditor, Folder } from './hub.js';
 import { MemoryScreen, MemorySettings } from './memory.js';
+import { NotesScreen, NoteScreen } from './notes.js';
 import { Computer } from './computer.js';
 import { RoutinesScreen, RoutineEditor } from './routines.js';
 import { Connections, CatalogGroup, AddService, GoogleHttpsHelp, ConnectorPage, ConnectorForm, TrustedPeople, CATALOG_IDS } from './connect.js';
@@ -282,6 +283,10 @@ function Screen() {
       }
       if (sub === 'logins') return html`<${Logins} />`;
       if (sub === 'memory') return html`<${MemoryScreen} />`;
+      if (sub === 'notes') {
+        if (a && /^[a-z0-9-]{1,60}$/.test(a)) return html`<${NoteScreen} domain=${a} key=${a} />`;
+        return html`<${NotesScreen} />`;
+      }
       if (sub === 'routines') {
         if (a === 'new' || isId(a)) return html`<${RoutineEditor} id=${a} key=${a} />`;
         return html`<${RoutinesScreen} />`;

@@ -608,6 +608,24 @@ async fn run_locked(
         };
         let keys = crate::keys::env_for(state, &harness_name).await;
         let participants: Vec<String> = ctx.names.values().cloned().collect();
+        // The agent's own working notes, only where the owner's private
+        // context is available.
+        let working_notes = if scope == Scope::Private {
+            let owner = input.owner_user_id.clone();
+            state
+                .db
+                .call(move |c| {
+                    let notes = crate::proactive::list_notes(c, &owner)?;
+                    Ok(crate::proactive::render_notes(
+                        &notes,
+                        crate::proactive::PROMPT_NOTES_CHARS,
+                    ))
+                })
+                .await
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         // Reads persona files and indexes the memory tree: blocking I/O.
         let (mut system_prompt, memory_refresh) = {
             let (paths, name, kind, purpose, app_tools) = (
@@ -639,6 +657,7 @@ async fn run_locked(
                         browser: browser.as_deref(),
                         scope,
                         notices: &notices,
+                        working_notes: &working_notes,
                     },
                 );
                 (system_prompt, memory_refresh)
@@ -1782,6 +1801,7 @@ fn changed_entity_kinds(activities: &[Activity]) -> Vec<&'static str> {
             t if t.contains("feed") => "feed",
             t if t.contains("library") => "library",
             t if t.contains("routine") => "routines",
+            t if t.contains("working_note") => "working_notes",
             _ => continue,
         };
         if !kinds.contains(&kind) {

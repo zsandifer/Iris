@@ -1,7 +1,23 @@
 # Proactive preferences
 
 How and when the agent should act on its own: heartbeat check-ins, feed
-posts, and suggested ideas.
+posts, and suggested ideas. Edit this to tune it; the agent reads it on
+every turn.
+
+## Domains I look after
+
+<!-- The parts of your life or work the agent should own, one per line, with
+     what "on track" means. Each becomes a working note, e.g.
+     "Household budget: every bill paid on time, savings transfer made the
+      day I'm paid." -->
+
+## Interruptions
+
+- Message unprompted only for drift from a plan, a decision I need to make
+  (with your recommendation ready), or something time-sensitive.
+- Never message to say nothing changed.
+- Respect quiet hours and the daily message budget (Settings, "Check in on
+  its own").
 
 ## Feed
 
@@ -10,9 +26,5 @@ posts, and suggested ideas.
 
 ## Ideas
 
-- Suggest tasks the agent could do for you, at most a few per day.
-
-## Interruptions
-
-- Only message unprompted when something is time-sensitive or clearly useful.
-- Respect quiet hours (see HEARTBEAT.md).
+- Suggest tasks the agent could do for you, at most a few per day, and only
+  ones it can actually finish.

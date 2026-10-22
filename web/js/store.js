@@ -25,6 +25,7 @@ function initialState() {
     library: null,
     memory: null,        // {items, more}: the owner's notes (Memory screen)
     memoryRev: 0,        // bumped when memory changes (open note sheets refresh)
+    workingNotesRev: 0,  // bumped when the agent's working notes change
     routines: null,      // GET /api/routines (owner)
     routinesInfo: null,  // {default_tz, max_doc_bytes}
     route: parseRoute(),
@@ -759,6 +760,7 @@ export function handleEvent(ev) {
         if (memoryLoads > 0) memoryChanged = true;
         set({ memoryRev: S.memoryRev + 1 });
       }
+      if (ev.kinds.includes('working_notes')) set({ workingNotesRev: S.workingNotesRev + 1 });
       for (const k of ev.kinds) if (S[k] && loaders[k]) loaders[k]().catch(() => {});
       if (ev.kinds.includes('feed') && S.library) loadLibrary().catch(() => {});
       break;

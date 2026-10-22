@@ -178,6 +178,11 @@ const HEARTBEAT_KEYS: [&str; 4] = [
 /// How often check-ins may run: every 15 minutes up to once a day.
 pub const HEARTBEAT_MIN_INTERVAL: u64 = 15;
 pub const HEARTBEAT_MAX_INTERVAL: u64 = 1440;
+/// Most messages the heartbeat may send on its own per local day; the rest
+/// are held for the next run.
+pub const HEARTBEAT_MAX_PER_DAY: &str = "heartbeat.max_per_day";
+pub const HEARTBEAT_DEFAULT_MAX_PER_DAY: u64 = 2;
+pub const HEARTBEAT_MAX_PER_DAY_LIMIT: u64 = 10;
 
 /// Parse a "HH:MM" time and write it back zero-padded ("8:5" -> "08:05").
 pub fn normalize_hhmm(s: &str) -> Option<String> {
@@ -816,6 +821,15 @@ impl AppState {
         cfg
     }
 
+    /// How many messages a day the heartbeat may send on its own.
+    pub async fn heartbeat_max_per_day(&self) -> u64 {
+        self.setting(HEARTBEAT_MAX_PER_DAY)
+            .await
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| (1..=HEARTBEAT_MAX_PER_DAY_LIMIT).contains(n))
+            .unwrap_or(HEARTBEAT_DEFAULT_MAX_PER_DAY)
+    }
+
     /// App settings as the API shows them. The feed instructions describe
     /// the owner's interests, so only the owner sees them.
     pub async fn settings_json(&self, owner: bool) -> Value {
@@ -839,6 +853,8 @@ impl AppState {
             "heartbeat_interval_mins": heartbeat.as_ref().map(|h| h.interval_mins),
             "heartbeat_active_start": heartbeat.as_ref().map(|h| h.active_start.clone()),
             "heartbeat_active_end": heartbeat.as_ref().map(|h| h.active_end.clone()),
+            "heartbeat_max_per_day": if owner { Some(self.heartbeat_max_per_day().await) } else { None },
+            "proactive": if owner { self.scorecard_json().await } else { Value::Null },
             "voice": {"enabled": false, "status": "not_implemented"},
             "paused": self.is_paused().await,
             "memory": if owner { Some(json!({
@@ -849,6 +865,20 @@ impl AppState {
                 "reset": self.setting(crate::memory::lifecycle::RESET_AFTER).await,
             })) } else { None },
         })
+    }
+
+    /// The owner's scorecard of proactive messages (Settings shows it).
+    async fn scorecard_json(&self) -> Value {
+        let now = crate::util::now_ms();
+        self.db
+            .call(move |c| {
+                let Some(owner) = db::owner_user_id(c)? else {
+                    return Ok(Value::Null);
+                };
+                Ok(crate::proactive::scorecard(c, &owner, now)?.json())
+            })
+            .await
+            .unwrap_or(Value::Null)
     }
 
     /// Tell every app about changed settings (the owner's with the private

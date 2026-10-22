@@ -487,6 +487,10 @@ pub struct Goal {
     pub title: String,
     /// Free-text progress note the agent keeps current.
     pub status_text: String,
+    /// What done looks like: the state a check-in measures against.
+    pub target: String,
+    /// When it should be done (`YYYY-MM-DD`), if there is a date.
+    pub due: Option<String>,
     /// Suggested by the agent and not yet confirmed by the user.
     pub suggested: bool,
     pub done: bool,
@@ -495,17 +499,65 @@ pub struct Goal {
     pub updated_at: i64,
 }
 
+/// Largest goal target or progress note.
+pub const MAX_GOAL_TEXT: usize = 2000;
+
+/// A goal's due date: `YYYY-MM-DD` with a real month and day.
+pub fn valid_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    let num = |r: std::ops::Range<usize>| s[r].parse::<u32>().ok();
+    let (Some(y), Some(m), Some(d)) = (num(0..4), num(5..7), num(8..10)) else {
+        return false;
+    };
+    let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&d)
+        && s.bytes()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 4 | 7) || c.is_ascii_digit())
+}
+
+/// Validate a due date given by the user or agent (`None` clears it).
+pub fn check_due(due: Option<&str>) -> Result<(), String> {
+    match due {
+        Some(d) if !valid_date(d) => Err("due must be a date like 2026-03-31".into()),
+        _ => Ok(()),
+    }
+}
+
 fn goal_from_row(r: &rusqlite::Row) -> rusqlite::Result<Goal> {
     Ok(Goal {
         id: r.get("id")?,
         title: r.get("title")?,
         status_text: r.get("status_text")?,
+        target: r.get("target")?,
+        due: r.get("due")?,
         suggested: r.get("suggested")?,
         done: r.get("done")?,
         done_at: r.get("done_at")?,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
     })
+}
+
+/// A goal to create. `target` and `due` are the plan a check-in measures
+/// against; both may be empty.
+#[derive(Debug, Default)]
+pub struct NewGoal<'a> {
+    pub title: &'a str,
+    pub status_text: &'a str,
+    pub target: &'a str,
+    pub due: Option<&'a str>,
+    pub suggested: bool,
 }
 
 pub fn create_goal(
@@ -515,17 +567,32 @@ pub fn create_goal(
     status_text: &str,
     suggested: bool,
 ) -> rusqlite::Result<Goal> {
+    create_goal_with(
+        conn,
+        user_id,
+        &NewGoal {
+            title,
+            status_text,
+            suggested,
+            ..Default::default()
+        },
+    )
+}
+
+pub fn create_goal_with(conn: &Connection, user_id: &str, g: &NewGoal) -> rusqlite::Result<Goal> {
     let id = new_id();
     let now = now_ms();
     conn.execute(
-        "INSERT INTO goals (id, user_id, title, status_text, suggested, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+        "INSERT INTO goals (id, user_id, title, status_text, target, due, suggested, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
         params![
             id,
             user_id,
-            title.trim(),
-            status_text.trim(),
-            suggested,
+            g.title.trim(),
+            g.status_text.trim(),
+            g.target.trim(),
+            g.due.map(str::trim).filter(|d| !d.is_empty()),
+            g.suggested,
             now
         ],
     )?;
@@ -559,6 +626,9 @@ pub fn list_goals(
 pub struct GoalChanges<'a> {
     pub title: Option<&'a str>,
     pub status_text: Option<&'a str>,
+    pub target: Option<&'a str>,
+    /// `Some(None)` clears the due date.
+    pub due: Option<Option<&'a str>>,
     pub done: Option<bool>,
     pub suggested: Option<bool>,
 }
@@ -576,6 +646,8 @@ pub fn update_goal(
                           done = COALESCE(?5, done),
                           done_at = CASE WHEN ?5 IS NULL THEN done_at WHEN ?5 THEN ?6 ELSE NULL END,
                           suggested = COALESCE(?7, suggested),
+                          target = COALESCE(?8, target),
+                          due = CASE WHEN ?9 THEN ?10 ELSE due END,
                           updated_at = ?6
          WHERE id = ?1 AND user_id = ?2",
         params![
@@ -585,7 +657,10 @@ pub fn update_goal(
             ch.status_text.map(str::trim),
             ch.done,
             now,
-            ch.suggested
+            ch.suggested,
+            ch.target.map(str::trim),
+            ch.due.is_some(),
+            ch.due.flatten().map(str::trim).filter(|d| !d.is_empty()),
         ],
     )?;
     if n == 0 {
@@ -1741,6 +1816,47 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn goal_target_and_due() {
+        with_db(|c, u| {
+            let g = create_goal_with(
+                c,
+                u,
+                &NewGoal {
+                    title: "Run a 10k",
+                    target: " Finish under an hour ",
+                    due: Some("2026-06-30"),
+                    ..Default::default()
+                },
+            )?;
+            assert_eq!(g.target, "Finish under an hour");
+            assert_eq!(g.due.as_deref(), Some("2026-06-30"));
+            let kept = update_goal(c, u, &g.id, &GoalChanges::default())?.unwrap();
+            assert_eq!(kept.due.as_deref(), Some("2026-06-30"));
+            let cleared = update_goal(
+                c,
+                u,
+                &g.id,
+                &GoalChanges {
+                    due: Some(None),
+                    target: Some(""),
+                    ..Default::default()
+                },
+            )?
+            .unwrap();
+            assert_eq!(cleared.due, None);
+            assert_eq!(cleared.target, "");
+            assert!(valid_date("2024-02-29"));
+            assert!(!valid_date("2023-02-29"));
+            assert!(!valid_date("2026-13-01"));
+            assert!(!valid_date("2026-1-01"));
+            assert!(!valid_date("2026/01/01"));
+            assert!(check_due(None).is_ok());
+            assert!(check_due(Some("soon")).is_err());
+            Ok(())
+        })
     }
 
     #[test]

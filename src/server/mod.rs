@@ -3640,6 +3640,245 @@ esac
     }
 
     #[tokio::test]
+    async fn working_notes_goal_plans_and_proactive_verdicts() {
+        let h = setup();
+        let owner_t = pair_as(&h, None).await;
+        let owner = h.state.db.with(db::owner_user_id).unwrap().unwrap();
+        h.state
+            .db
+            .with(|c| {
+                c.execute(
+                    "INSERT INTO users(id,display_name,created_at) VALUES ('guest','Guest',0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let guest = pair_as(&h, Some("guest")).await;
+
+        // Working notes: owner only.
+        let (status, _) = send(&h.app, "GET", "/api/working-notes", Some(&guest), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, r) = send(
+            &h.app,
+            "PUT",
+            "/api/working-notes/Household%20budget",
+            Some(&owner_t),
+            Some(json!({"title": "Household budget", "body": "Plan: bills on time."})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{r}");
+        assert_eq!(r["note"]["domain"], "household-budget");
+        assert_eq!(r["note"]["updated_by"], "owner");
+        let (_, r) = send(
+            &h.app,
+            "PUT",
+            "/api/working-notes/household-budget",
+            Some(&owner_t),
+            Some(json!({"body": "State: paid."})),
+        )
+        .await;
+        assert_eq!(r["note"]["title"], "Household budget");
+        let (status, r) = send(
+            &h.app,
+            "GET",
+            "/api/working-notes/household-budget",
+            Some(&owner_t),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(r["history"][0]["body"], "Plan: bills on time.");
+        let (_, r) = send(&h.app, "GET", "/api/working-notes", Some(&owner_t), None).await;
+        assert_eq!(r["notes"].as_array().unwrap().len(), 1);
+        let (status, _) = send(
+            &h.app,
+            "PUT",
+            "/api/working-notes/household-budget",
+            Some(&owner_t),
+            Some(json!({"body": "x".repeat(crate::proactive::MAX_NOTE_BODY + 1)})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = send(
+            &h.app,
+            "DELETE",
+            "/api/working-notes/household-budget",
+            Some(&owner_t),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = send(
+            &h.app,
+            "GET",
+            "/api/working-notes/household-budget",
+            Some(&owner_t),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Goals carry a target and a due date; a null due clears it.
+        let (status, r) = send(
+            &h.app,
+            "POST",
+            "/api/goals",
+            Some(&owner_t),
+            Some(json!({"title": "Run a 10k", "target": "Under an hour", "due": "2026-06-30"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{r}");
+        let gid = r["goal"]["id"].as_str().unwrap().to_string();
+        assert_eq!(r["goal"]["due"], "2026-06-30");
+        let (status, _) = send(
+            &h.app,
+            "POST",
+            "/api/goals",
+            Some(&owner_t),
+            Some(json!({"title": "x", "due": "June"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, r) = send(
+            &h.app,
+            "PATCH",
+            &format!("/api/goals/{gid}"),
+            Some(&owner_t),
+            Some(json!({"status_text": "Week 2"})),
+        )
+        .await;
+        assert_eq!(r["goal"]["due"], "2026-06-30", "an absent due is unchanged");
+        let (_, r) = send(
+            &h.app,
+            "PATCH",
+            &format!("/api/goals/{gid}"),
+            Some(&owner_t),
+            Some(json!({"due": null})),
+        )
+        .await;
+        assert_eq!(r["goal"]["due"], Value::Null);
+
+        // The daily budget setting, and the scorecard in settings.
+        let (status, s) = send(
+            &h.app,
+            "PUT",
+            "/api/settings",
+            Some(&owner_t),
+            Some(json!({"heartbeat_max_per_day": 3})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{s}");
+        assert_eq!(s["heartbeat_max_per_day"], 3);
+        assert_eq!(s["proactive"]["sent"], 0);
+        assert_eq!(h.state.heartbeat_max_per_day().await, 3);
+        for bad in [0, 11] {
+            let (status, _) = send(
+                &h.app,
+                "PUT",
+                "/api/settings",
+                Some(&owner_t),
+                Some(json!({"heartbeat_max_per_day": bad})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let (_, s) = send(&h.app, "GET", "/api/settings", Some(&guest), None).await;
+        assert_eq!(s["heartbeat_max_per_day"], Value::Null);
+        assert_eq!(s["proactive"], Value::Null);
+
+        // A verdict on a check-in message marks the message and the scorecard.
+        let (source, main) = h
+            .state
+            .db
+            .with(|c| {
+                let job = db::ensure_job_conversation(c, &owner, "heartbeat")?;
+                let m = db::insert_message(
+                    c,
+                    &db::NewMessage {
+                        conversation_id: &job,
+                        role: "assistant",
+                        content: "x",
+                        ..Default::default()
+                    },
+                )?;
+                Ok((m, db::ensure_main_conversation(c, &owner)?))
+            })
+            .unwrap();
+        crate::jobs::deliver_proactive(
+            &h.state,
+            &owner,
+            "Rent is due Friday.",
+            &source,
+            "heartbeat",
+            3,
+        )
+        .await
+        .unwrap();
+        let posted = h
+            .state
+            .db
+            .with(|c| db::list_messages(c, &main, None, 10))
+            .unwrap()
+            .into_iter()
+            .find(|m| m.content == "Rent is due Friday.")
+            .unwrap();
+        let path = format!("/api/proactive/{}/outcome", posted.id);
+        let (status, _) = send(
+            &h.app,
+            "POST",
+            &path,
+            Some(&guest),
+            Some(json!({"outcome": "useful"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = send(
+            &h.app,
+            "POST",
+            &path,
+            Some(&owner_t),
+            Some(json!({"outcome": "meh"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, r) = send(
+            &h.app,
+            "POST",
+            &path,
+            Some(&owner_t),
+            Some(json!({"outcome": "not_needed"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{r}");
+        assert_eq!(r["proactive"]["outcome"], "not_needed");
+        let marked = h
+            .state
+            .db
+            .with(|c| db::get_message(c, &posted.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(marked.meta["proactive_outcome"], "not_needed");
+        let (status, _) = send(
+            &h.app,
+            "POST",
+            &format!("/api/proactive/{}/outcome", source.id),
+            Some(&owner_t),
+            Some(json!({"outcome": "useful"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "not a proactive message");
+        let (_, s) = send(&h.app, "GET", "/api/settings", Some(&owner_t), None).await;
+        assert_eq!(
+            (
+                s["proactive"]["sent"].clone(),
+                s["proactive"]["not_needed"].clone()
+            ),
+            (json!(1), json!(1))
+        );
+    }
+
+    #[tokio::test]
     async fn feed_photos_saved_posts_and_suggested_goals() {
         let h = setup();
         let t = pair_as(&h, None).await;

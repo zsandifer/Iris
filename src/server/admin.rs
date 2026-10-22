@@ -90,6 +90,8 @@ struct SettingsBody {
     /// Local "HH:MM" window the heartbeat runs in; overrides config.
     heartbeat_active_start: Option<String>,
     heartbeat_active_end: Option<String>,
+    /// Most heartbeat messages per day (1 to 10); the rest are held.
+    heartbeat_max_per_day: Option<u64>,
     /// "Pause Iris": stop what it is doing and start nothing new.
     paused: Option<bool>,
     memory_learning_paused: Option<bool>,
@@ -120,6 +122,14 @@ async fn put_settings(
             ));
         }
         writes.push((crate::state::HEARTBEAT_INTERVAL, Some(n.to_string())));
+    }
+    if let Some(n) = body.heartbeat_max_per_day {
+        if !(1..=crate::state::HEARTBEAT_MAX_PER_DAY_LIMIT).contains(&n) {
+            return Err(ApiError::bad_request(
+                "I can send between 1 and 10 messages a day on my own.",
+            ));
+        }
+        writes.push((crate::state::HEARTBEAT_MAX_PER_DAY, Some(n.to_string())));
     }
     for (key, value) in [
         (crate::state::HEARTBEAT_START, &body.heartbeat_active_start),

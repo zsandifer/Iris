@@ -47,6 +47,18 @@ const ROUTINE_TOOLS: &[&str] = &[
     "delete_routine",
 ];
 
+/// Working-note tools: only in the owner's own conversations.
+const WORKING_NOTE_TOOLS: &[&str] = &[
+    "list_working_notes",
+    "get_working_note",
+    "update_working_note",
+    "delete_working_note",
+];
+
+fn list_is_empty<T>(v: &[T]) -> bool {
+    v.is_empty()
+}
+
 /// Largest `write_memory` content for an export file (the whole file).
 const MAX_MEMORY_FILE: usize = 1_000_000;
 
@@ -299,25 +311,63 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "create_goal",
-            "Create a goal the user wants to track. Set `suggested` when you are proposing a \
-             goal the user did not ask for; they confirm it in the app.",
+            "Create a goal the user wants to track. Give it a `target` (what done looks \
+             like) and a `due` date whenever you can: check-ins measure progress against \
+             them. Set `suggested` when you are proposing a goal the user did not ask for; \
+             they confirm it in the app.",
             json!({
                 "title": s("Short goal title"),
                 "status_text": s("Current progress note"),
+                "target": s("What done looks like, concretely"),
+                "due": s("When it should be done, YYYY-MM-DD"),
                 "suggested": {"type": "boolean", "description": "A proposal the user still has to confirm"},
             }),
             &["title"],
         ),
         tool(
             "update_goal",
-            "Update a goal's title, progress note, or completion.",
+            "Update a goal's title, progress note, target, due date, or completion.",
             json!({
                 "id": s("Goal id"),
                 "title": s("New title"),
                 "status_text": s("New progress note"),
+                "target": s("New target (what done looks like)"),
+                "due": s("New due date, YYYY-MM-DD; an empty string clears it"),
                 "done": {"type": "boolean", "description": "Mark complete (true) or reopen (false)"},
             }),
             &["id"],
+        ),
+        tool(
+            "list_working_notes",
+            "List your working notes: one per domain you look after, with your plan, the \
+             current state, what you are watching, and open questions. These are your own \
+             notes, not the user's memory.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "get_working_note",
+            "Read one working note in full, with its earlier versions.",
+            json!({"domain": s("The note's domain key, e.g. household-budget")}),
+            &["domain"],
+        ),
+        tool(
+            "update_working_note",
+            "Create or rewrite your working note for a domain with its full new body \
+             (Markdown, short and current: plan, state, watching, open questions). Do this \
+             on every check-in. Use a stable `domain` such as household-budget.",
+            json!({
+                "domain": s("Domain key, e.g. household-budget (letters, digits, dashes)"),
+                "title": s("Short title; kept from before when left out"),
+                "body": s("The whole note, Markdown"),
+            }),
+            &["domain", "body"],
+        ),
+        tool(
+            "delete_working_note",
+            "Delete a working note for a domain you no longer look after.",
+            json!({"domain": s("Domain key")}),
+            &["domain"],
         ),
         tool(
             "list_ideas",
@@ -465,6 +515,7 @@ impl Bridge {
                                 || crate::memory::recall::TOOLS.contains(&name))
                                 || self.private_status_context())
                             && (!ROUTINE_TOOLS.contains(&name) || self.owner_context())
+                            && (!WORKING_NOTE_TOOLS.contains(&name) || self.owner_context())
                     })
                     .collect();
                 json!({"tools": tools})
@@ -536,6 +587,71 @@ impl Bridge {
 
     fn private_status_context(&self) -> bool {
         self.owner_context()
+    }
+
+    /// The working-note tools (caller has checked `owner_context`).
+    fn working_note_call(&self, name: &str, a: &Value) -> std::result::Result<Value, String> {
+        use crate::proactive as notes;
+        let uid = self.user_id.as_str();
+        let s = |k: &str| a.get(k).and_then(Value::as_str);
+        let db_err = |e: crate::util::BoxError| e.to_string();
+        match name {
+            "list_working_notes" => {
+                let list = self
+                    .db
+                    .with(|c| notes::list_notes(c, uid))
+                    .map_err(db_err)?;
+                Ok(json!({"notes": list, "note": if list_is_empty(&list) {
+                    "No working notes yet. Create one per domain you look after with update_working_note."
+                } else { "" }}))
+            }
+            "get_working_note" => {
+                let domain = notes::slug(s("domain").unwrap_or("")).ok_or("domain is required")?;
+                let (note, history) = self
+                    .db
+                    .with(|c| {
+                        Ok((
+                            notes::get_note(c, uid, &domain)?,
+                            notes::note_history(c, uid, &domain)?,
+                        ))
+                    })
+                    .map_err(db_err)?;
+                let note = note.ok_or("no working note for that domain")?;
+                Ok(json!({"note": note, "history": history}))
+            }
+            "update_working_note" => {
+                let domain = s("domain").unwrap_or("");
+                let body = s("body").ok_or("body is required")?;
+                let conv = self.conversation_id.clone();
+                let note =
+                    self.db
+                        .with(|c| {
+                            // A job conversation (the heartbeat) is hidden from
+                            // the owner; label its edits so the app can say so.
+                            let by = match conv.as_deref().and_then(|id| {
+                                crate::db::get_conversation(c, uid, id).ok().flatten()
+                            }) {
+                                Some(conv) if conv.kind == "job" => "heartbeat",
+                                _ => "agent",
+                            };
+                            notes::upsert_note(c, uid, domain, s("title"), body, by)
+                        })
+                        .map_err(db_err)?
+                        .map_err(|e| e.to_string())?;
+                Ok(json!({"note": note}))
+            }
+            _ => {
+                let domain = notes::slug(s("domain").unwrap_or("")).ok_or("domain is required")?;
+                let deleted = self
+                    .db
+                    .with(|c| notes::delete_note(c, uid, &domain))
+                    .map_err(db_err)?;
+                if !deleted {
+                    return Err("no working note for that domain".into());
+                }
+                Ok(json!({"deleted": true}))
+            }
+        }
     }
 
     fn call(&self, name: &str, a: &Value) -> std::result::Result<Value, String> {
@@ -785,12 +901,28 @@ impl Bridge {
             "create_goal" => {
                 let title = s("title").unwrap_or("");
                 let status = s("status_text").unwrap_or("");
+                let target = s("target").unwrap_or("");
+                let due = s("due").map(str::trim).filter(|d| !d.is_empty());
                 let suggested = a["suggested"].as_bool().unwrap_or(false);
                 check_text("title", title, MAX_TITLE, true)?;
-                check_text("status_text", status, 2000, false)?;
+                check_text("status_text", status, entities::MAX_GOAL_TEXT, false)?;
+                check_text("target", target, entities::MAX_GOAL_TEXT, false)?;
+                entities::check_due(due)?;
                 let g = self
                     .db
-                    .with(|c| entities::create_goal(c, uid, title, status, suggested))
+                    .with(|c| {
+                        entities::create_goal_with(
+                            c,
+                            uid,
+                            &entities::NewGoal {
+                                title,
+                                status_text: status,
+                                target,
+                                due,
+                                suggested,
+                            },
+                        )
+                    })
                     .map_err(db_err)?;
                 Ok(json!({"goal": g}))
             }
@@ -800,7 +932,16 @@ impl Bridge {
                     check_text("title", t, MAX_TITLE, true)?;
                 }
                 if let Some(t) = s("status_text") {
-                    check_text("status_text", t, 2000, false)?;
+                    check_text("status_text", t, entities::MAX_GOAL_TEXT, false)?;
+                }
+                if let Some(t) = s("target") {
+                    check_text("target", t, entities::MAX_GOAL_TEXT, false)?;
+                }
+                let due = s("due")
+                    .map(|d| d.trim())
+                    .map(|d| (!d.is_empty()).then_some(d));
+                if let Some(d) = due {
+                    entities::check_due(d)?;
                 }
                 let g = self
                     .db
@@ -812,6 +953,8 @@ impl Bridge {
                             &entities::GoalChanges {
                                 title: s("title"),
                                 status_text: s("status_text"),
+                                target: s("target"),
+                                due,
                                 done: a["done"].as_bool(),
                                 suggested: None,
                             },
@@ -820,6 +963,15 @@ impl Bridge {
                     .map_err(db_err)?
                     .ok_or("no goal with that id")?;
                 Ok(json!({"goal": g}))
+            }
+            "list_working_notes"
+            | "get_working_note"
+            | "update_working_note"
+            | "delete_working_note" => {
+                if !self.owner_context() {
+                    return Err(format!("{name} is only available in the owner's own chats"));
+                }
+                self.working_note_call(name, a)
             }
             "list_ideas" => {
                 let ideas = self
@@ -1233,6 +1385,145 @@ mod tests {
                           "params": {"name": name, "arguments": args}}))
             .unwrap()["result"]
             .clone()
+    }
+
+    #[test]
+    fn working_note_tools_only_in_the_owner_s_own_chats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = bridge(tmp.path());
+        let names = |b: &Bridge| -> Vec<String> {
+            b.handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+                .unwrap()["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for t in WORKING_NOTE_TOOLS {
+            assert!(names(&b).contains(&t.to_string()), "{t}");
+        }
+        let empty = call(&b, "list_working_notes", json!({}));
+        assert_eq!(empty["structuredContent"]["notes"], json!([]));
+        assert!(
+            empty["structuredContent"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("update_working_note")
+        );
+        let r = call(
+            &b,
+            "update_working_note",
+            json!({"domain": "Household budget", "body": "Plan: pay bills on time."}),
+        );
+        assert_eq!(r["isError"], false, "{r}");
+        let note = &r["structuredContent"]["note"];
+        assert_eq!(note["domain"], "household-budget");
+        assert_eq!(note["title"], "Household budget");
+        assert_eq!(note["updated_by"], "agent");
+        let got = call(
+            &b,
+            "get_working_note",
+            json!({"domain": "household-budget"}),
+        );
+        assert_eq!(
+            got["structuredContent"]["note"]["body"],
+            "Plan: pay bills on time."
+        );
+        assert_eq!(
+            call(&b, "update_working_note", json!({"domain": "x"}))["isError"],
+            true
+        );
+        assert_eq!(
+            call(&b, "get_working_note", json!({"domain": "nope"}))["isError"],
+            true
+        );
+
+        // Heartbeat turns run in the hidden job conversation: edits say so.
+        let job =
+            b.db.with(|c| db::ensure_job_conversation(c, &b.user_id, "heartbeat"))
+                .unwrap();
+        b.conversation_id = Some(job);
+        let r = call(
+            &b,
+            "update_working_note",
+            json!({"domain": "household-budget", "body": "State: paid."}),
+        );
+        assert_eq!(r["structuredContent"]["note"]["updated_by"], "heartbeat");
+        let got = call(
+            &b,
+            "get_working_note",
+            json!({"domain": "household-budget"}),
+        );
+        assert_eq!(
+            got["structuredContent"]["history"][0]["body"],
+            "Plan: pay bills on time."
+        );
+
+        // Another person's chat, or a shared one: not listed, not callable.
+        let other =
+            b.db.with(|c| {
+                c.execute(
+                    "INSERT INTO users(id,display_name,created_at) VALUES ('guest','Guest',0)",
+                    [],
+                )?;
+                db::ensure_main_conversation(c, "guest")
+            })
+            .unwrap();
+        b.conversation_id = Some(other);
+        for t in WORKING_NOTE_TOOLS {
+            assert!(!names(&b).contains(&t.to_string()), "{t}");
+            assert_eq!(
+                call(&b, t, json!({"domain": "household-budget", "body": ""}))["isError"],
+                true
+            );
+        }
+        let deleted = {
+            b.conversation_id = Some(
+                b.db.with(|c| db::ensure_main_conversation(c, &b.user_id))
+                    .unwrap(),
+            );
+            call(
+                &b,
+                "delete_working_note",
+                json!({"domain": "household-budget"}),
+            )
+        };
+        assert_eq!(deleted["structuredContent"]["deleted"], true);
+        assert_eq!(
+            call(
+                &b,
+                "delete_working_note",
+                json!({"domain": "household-budget"})
+            )["isError"],
+            true
+        );
+    }
+
+    #[test]
+    fn goal_tools_carry_target_and_due() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = bridge(tmp.path());
+        let r = call(
+            &b,
+            "create_goal",
+            json!({"title": "Run a 10k", "target": "Under an hour", "due": "2026-06-30"}),
+        );
+        assert_eq!(r["isError"], false, "{r}");
+        let id = r["structuredContent"]["goal"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(r["structuredContent"]["goal"]["due"], "2026-06-30");
+        let bad = call(&b, "create_goal", json!({"title": "x", "due": "soon"}));
+        assert_eq!(bad["isError"], true);
+        let cleared = call(
+            &b,
+            "update_goal",
+            json!({"id": id, "due": "", "target": "Finish it"}),
+        );
+        assert_eq!(cleared["structuredContent"]["goal"]["due"], Value::Null);
+        assert_eq!(cleared["structuredContent"]["goal"]["target"], "Finish it");
     }
 
     #[test]

@@ -637,6 +637,52 @@ CREATE INDEX routine_changes_pending ON routine_changes(routine_id) WHERE state 
 -- Text extracted once when a document is uploaded (routine documents).
 ALTER TABLE library_items ADD COLUMN extracted_text TEXT;
 "#,
+    r#"
+-- What done looks like, and when: the plan a check-in measures against.
+ALTER TABLE goals ADD COLUMN target TEXT NOT NULL DEFAULT '';
+ALTER TABLE goals ADD COLUMN due TEXT;
+
+-- The agent's own working notes: one per domain it looks after (its plan,
+-- the current state, what it is watching). Owner memory is about the
+-- owner; these are the agent's picture of its work.
+CREATE TABLE working_notes (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    domain      TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL DEFAULT '',
+    updated_by  TEXT NOT NULL DEFAULT 'agent',
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    UNIQUE (user_id, domain)
+);
+-- Earlier versions of a note (capped per note), so a bad update can be read back.
+CREATE TABLE working_note_history (
+    id          INTEGER PRIMARY KEY,
+    note_id     TEXT NOT NULL REFERENCES working_notes(id) ON DELETE CASCADE,
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    updated_by  TEXT NOT NULL,
+    replaced_at INTEGER NOT NULL
+);
+CREATE INDEX working_note_history_note ON working_note_history(note_id, replaced_at);
+
+-- Every message the agent sent (or held back) on its own initiative, and
+-- what the owner did with it. The scorecard the next check-in reads.
+CREATE TABLE proactive_messages (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    message_id  TEXT,
+    source      TEXT NOT NULL,
+    excerpt     TEXT NOT NULL,
+    outcome     TEXT NOT NULL DEFAULT 'posted'
+                CHECK (outcome IN ('posted', 'held', 'useful', 'not_needed')),
+    created_at  INTEGER NOT NULL,
+    outcome_at  INTEGER
+);
+CREATE INDEX proactive_messages_recent ON proactive_messages(user_id, created_at);
+CREATE INDEX proactive_messages_message ON proactive_messages(message_id);
+"#,
 ];
 
 /// Run `f` in a write transaction taken up front (`BEGIN IMMEDIATE`), so a

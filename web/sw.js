@@ -31,6 +31,7 @@ const SHELL = [
   '/js/login-text.js',
   '/js/md.js',
   '/js/memory.js',
+  '/js/notes.js',
   '/js/memory-text.js',
   '/js/photo.js',
   '/js/photo-math.js',

@@ -27,6 +27,7 @@ mod memory;
 mod notify;
 mod oauth;
 mod persona;
+mod proactive;
 mod push;
 mod ranking;
 mod router;

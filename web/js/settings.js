@@ -56,10 +56,21 @@ function CheckIns() {
       <div class="btns"><button class="b1" disabled=${!start || !end}
         onClick=${async () => { if (await save({ heartbeat_active_start: start, heartbeat_active_end: end })) closeSheet(); }}>Save</button></div></div>`;
   };
-  return html`<${Row} icon="chat" title="Check in on its own" sub="Messages you when something needs your attention"
+  const perDay = () => openSheet(() => html`<div class="sheet-body"><h3>Messages a day</h3>
+    <p class="mu">The most I'll message you on my own in a day. Anything past that waits for the next check-in, and I only raise it again if it still matters.</p>
+    <div class="grp">${[1, 2, 3, 5, 10].map((n) => html`<div class="r tap"
+      onClick=${async () => { if (await save({ heartbeat_max_per_day: n })) closeSheet(); }}>
+      <div class="rt">${n === 1 ? 'Once a day' : `Up to ${n} a day`}</div><div class=${'rad' + ((S.settings?.heartbeat_max_per_day || 2) === n ? ' on' : '')} /></div>`)}</div></div>`);
+  const sc = st?.proactive;
+  const scoreLine = sc && sc.sent + sc.held > 0
+    ? `Last ${sc.days} days: ${sc.sent} sent · ${sc.useful} useful · ${sc.not_needed} not needed${sc.held ? ` · ${sc.held} held` : ''}`
+    : `I haven't messaged you on my own in the last ${sc?.days || 14} days.`;
+  return html`<${Row} icon="chat" title="Check in on its own" sub="Compares the plan with reality and messages you only when it matters"
       right=${html`<${Toggle} on=${!!st?.heartbeat_enabled} onChange=${(on) => save({ heartbeat_enabled: on })} label="Check in on its own" />`} />
     ${st?.heartbeat_enabled && html`<${Row} icon="repeat" title="How often" value=${everyLabel(st.heartbeat_interval_mins)} onClick=${often} />
-      <${Row} icon="clock" title="Between" value=${betweenLabel(st.heartbeat_active_start, st.heartbeat_active_end)} onClick=${() => openSheet(() => html`<${Between} />`)} />`}`;
+      <${Row} icon="clock" title="Between" value=${betweenLabel(st.heartbeat_active_start, st.heartbeat_active_end)} onClick=${() => openSheet(() => html`<${Between} />`)} />
+      <${Row} icon="chat" title="Messages a day" value=${`${st.heartbeat_max_per_day || 2}`} onClick=${perDay} />
+      <${Row} icon="check" title="How I'm doing" sub=${scoreLine} chevron=${false} />`}`;
 }
 
 function Notifications() {

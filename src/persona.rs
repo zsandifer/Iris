@@ -174,6 +174,9 @@ pub struct PromptContext<'a> {
     pub scope: Scope,
     /// Short notes such as "the Claude engine needs the owner to sign in".
     pub notices: &'a [String],
+    /// The agent's working notes rendered for the prompt
+    /// (`proactive::render_notes`); only used in private scope.
+    pub working_notes: &'a str,
 }
 
 /// Assemble the system prompt appended to the harness's own system prompt.
@@ -249,6 +252,15 @@ pub fn assemble(paths: &Paths, ctx: &PromptContext) -> String {
 
     out.push_str(&memory_prompt(paths, ctx.scope));
 
+    if private {
+        out.push_str(WORKING_NOTES_GUIDE);
+        if ctx.working_notes.is_empty() {
+            out.push_str("\n(No working notes yet.)\n");
+        } else {
+            out.push_str(ctx.working_notes);
+        }
+    }
+
     if !ctx.notices.is_empty() {
         out.push_str("\n## Notices\n\n");
         for n in ctx.notices {
@@ -274,6 +286,18 @@ pub fn truncate_bytes(s: &str, max: usize) -> String {
     }
     s[..end].to_string()
 }
+
+const WORKING_NOTES_GUIDE: &str = "
+## Your working notes
+
+These are your own notes, one per domain you look after (not the user's \
+memory): the plan, where things stand, what you are watching, open \
+questions, and what you did last. They are what makes you a teammate \
+rather than a chatbot: read them before acting in a domain, and keep them \
+current with `update_working_note` whenever you learn or do something that \
+changes the picture. When the user hands you something to own, start a note \
+for it. The user can read and edit them in the app.
+";
 
 const SHARED_TOOLS_GUIDE: &str = "
 ## The Iris app
@@ -529,6 +553,7 @@ mod tests {
             browser: None,
             scope: Scope::Private,
             notices: &[],
+            working_notes: "",
         }
     }
 
@@ -592,6 +617,28 @@ mod tests {
         assert!(with_browser.contains("take over"));
         b.scope = Scope::Shared;
         assert!(!assemble(&p, &b).contains("## Your browser"));
+    }
+
+    #[test]
+    fn working_notes_only_in_private_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        seed(&p).unwrap();
+        let mut c = ctx("Nova");
+        c.working_notes = "<working_note domain=\"garden\">Water Tuesdays</working_note>";
+        let private = assemble(&p, &c);
+        assert!(private.contains("## Your working notes"));
+        assert!(private.contains("Water Tuesdays"));
+        assert!(private.contains("update_working_note"));
+        for scope in [Scope::Personal, Scope::Shared] {
+            c.scope = scope;
+            let other = assemble(&p, &c);
+            assert!(!other.contains("Water Tuesdays"), "{scope:?}");
+            assert!(!other.contains("## Your working notes"), "{scope:?}");
+        }
+        c.scope = Scope::Private;
+        c.working_notes = "";
+        assert!(assemble(&p, &c).contains("(No working notes yet.)"));
     }
 
     #[test]

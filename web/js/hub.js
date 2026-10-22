@@ -10,6 +10,7 @@ import {
 import { describe, visible } from './status.js';
 import { md } from './md.js';
 import { routinesSub } from './routines.js';
+import { notesSub } from './notes.js';
 import { bareDomain, loginDraft, parseSites, siteHost } from './login-text.js';
 
 // The last answer per path, so a screen you come back to shows it at once
@@ -39,6 +40,7 @@ export function Hub() {
   const owner = isOwner();
   const [cons] = useData(owner ? '/connectors' : '/me');
   const [creds] = useData(owner ? '/credentials' : '/me');
+  const [notes] = useData(owner ? '/working-notes' : '/me', [S.workingNotesRev]);
   useEffect(() => { if (owner) loadRoutines().catch(() => {}); }, [owner]);
   const working = Object.keys(S.live).length > 0;
   const computer = S.settings?.paused ? 'paused' : S.browser?.busy ? 'browsing' : working ? 'working' : 'idle';
@@ -55,6 +57,7 @@ export function Hub() {
       <${Row} icon="lock" title="Logins & wallet" sub=${creds ? `${logins} login${logins === 1 ? '' : 's'} · ${cards} card${cards === 1 ? '' : 's'}` : '\u00a0'} onClick=${() => go('iris/logins')} />
       <${Row} icon="monitor" title=${`${agentName()}'s computer`} sub=${computer} onClick=${() => go('iris/computer')} />
       <${Row} icon="memory" title="Memory" sub="What I remember about you" onClick=${() => go('iris/memory')} />
+      <${Row} icon="file" title="Working notes" sub=${notesSub(notes?.notes)} onClick=${() => go('iris/notes')} />
       <${Row} icon="folder" title="System files" sub="Personality, memory, and notes" onClick=${() => go('iris/files')} />`}
       <${Row} icon="sliders" title="Settings" onClick=${() => go('settings')} />
     <//>
