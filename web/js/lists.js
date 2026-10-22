@@ -14,6 +14,9 @@ import { openPhoto } from './photo.js';
 function GoalPlanSheet({ g, onSave }) {
   const [target, setTarget] = useState(g.target || '');
   const [due, setDue] = useState(g.due || '');
+  const [busy, setBusy] = useState(false);
+  // The sheet stays open, with the draft, until the save succeeds.
+  const save = async (body) => { setBusy(true); try { await onSave(body); } finally { setBusy(false); } };
   return html`<div class="sheet-body"><h3>${g.title}</h3>
     <p class="mu">I measure progress against this on every check-in and tell you when we're drifting.</p>
     <label class="lbl" for="goal-target">What does done look like?</label>
@@ -21,8 +24,8 @@ function GoalPlanSheet({ g, onSave }) {
       onInput=${(e) => setTarget(e.target.value)} />
     <label class="lbl" for="goal-due">By when</label>
     <input id="goal-due" class="field" type="date" value=${due} onInput=${(e) => setDue(e.target.value)} />
-    <div class="btns">${g.due && html`<button class="b2" onClick=${() => onSave({ target: target.trim(), due: null })}>Clear date</button>`}
-      <button class="b1" onClick=${() => onSave({ target: target.trim(), due: due || null })}>Save</button></div></div>`;
+    <div class="btns">${g.due && html`<button class="b2" disabled=${busy} onClick=${() => save({ target: target.trim(), due: null })}>Clear date</button>`}
+      <button class="b1" disabled=${busy} onClick=${() => save({ target: target.trim(), due: due || null })}>Save</button></div></div>`;
 }
 
 const todayKey = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
@@ -112,7 +115,14 @@ export function GoalsScreen() {
       <div class="r tap" onClick=${() => { closeSheet(); update(g, { done: !g.done }); }}><div class="rt">${g.done ? 'Mark as not done' : 'Mark as done'}</div></div>
       <div class="r tap danger" onClick=${async () => { closeSheet(); if (await confirmSheet({ title: 'Delete this goal?', yes: 'Delete', danger: true })) remove(g); }}><div class="rt">Delete goal</div></div>
     </div></div>`);
-  const editGoal = (g) => openSheet(() => html`<${GoalPlanSheet} g=${g} onSave=${(body) => { closeSheet(); update(g, body); }} />`);
+  const editGoal = (g) => openSheet(() => html`<${GoalPlanSheet} g=${g} onSave=${async (body) => {
+    // Save first; the sheet (and the draft) only closes on success.
+    try { await patch(`/goals/${seg(g.id)}`, body); } catch (e) { toast(e.message); return; }
+    closeSheet();
+    touchList('goals');
+    set({ goals: S.goals.map((x) => (x.id === g.id ? { ...x, ...body } : x)) });
+    loadGoals().catch(() => {});
+  }} />`);
   const GoalRow = ({ g }) => html`<div class="goal">
     <button class=${'chk' + (g.done ? ' on' : '')} aria-label=${g.done ? 'Mark not done' : 'Mark done'} onClick=${() => update(g, { done: !g.done })}>
       ${g.done && html`<${Icon} name="check" size=${14} />`}</button>
