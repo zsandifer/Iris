@@ -818,8 +818,8 @@ function reconcileLive() {
 
 /** Refetch whatever is loaded (after a reconnect or a resync). */
 export function refreshAll() {
-  // Events may have been missed: open note sheets reload too.
-  set({ memoryRev: S.memoryRev + 1 });
+  // Events may have been missed: open note sheets and working notes reload too.
+  set({ memoryRev: S.memoryRev + 1, workingNotesRev: S.workingNotesRev + 1 });
   loadConvs().catch(() => {});
   for (const cid of Object.keys(S.msgs)) loadMessages(cid).catch(() => {});
   reconcileLive();

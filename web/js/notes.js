@@ -69,17 +69,21 @@ export function NoteScreen({ domain }) {
   const startEditing = () => { base.current = note.updated_at; setText(note.body); setEditing(true); };
   const stopEditing = () => { base.current = note.updated_at; setText(note.body); setEditing(false); };
   const save = async () => {
+    // Not busy while the conflict sheet is up: dismissing it by tapping
+    // outside never resolves, and Save must stay usable.
+    let latest;
+    try { latest = await get(`/working-notes/${seg(domain)}`); } catch (e) { toast(e.message); return; }
+    if (base.current != null && latest.note.updated_at !== base.current) {
+      setData(latest);
+      const ok = await confirmSheet({
+        title: `${agentName()} changed this note while you were editing`,
+        body: `Updated ${byLabel(latest.note)}. Replace that version with yours? Its text stays under Earlier versions.`,
+        yes: 'Replace',
+      });
+      if (!ok) return;
+    }
     setBusy(true);
     try {
-      const latest = await get(`/working-notes/${seg(domain)}`);
-      if (base.current != null && latest.note.updated_at !== base.current) {
-        const ok = await confirmSheet({
-          title: `${agentName()} changed this note while you were editing`,
-          body: `Updated ${byLabel(latest.note)}. Replace that version with yours? Its text stays under Earlier versions.`,
-          yes: 'Replace',
-        });
-        if (!ok) { setData(latest); setBusy(false); return; }
-      }
       const r = await put(`/working-notes/${seg(domain)}`, { body: text });
       setData({ ...latest, note: r.note });
       base.current = r.note.updated_at;
