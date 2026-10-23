@@ -2384,7 +2384,10 @@ up to 300 characters, 50 sheets per workbook, 500 PDF pages, and 200,000
 characters of text per document; each limit leaves a note in the text
 (for example `[Showing the first 1,000 of 5,321 rows.]`). Zipped formats
 may unpack to at most 256 MiB in at most 20,000 parts, and PDF streams to
-32 MiB each. One file is read at a time, for at most 30 seconds. Over
+32 MiB each. One file is read at a time, for at most 30 seconds, in a
+child process (`iris extract-doc`) limited to 1 GiB of memory and killed
+at the deadline, so a file that makes a reader run away fails with
+`422 too_complex` instead of affecting the server. Over
 `max_upload_bytes` is `413 too_large`. When the routine runs, the text of
 all its documents together is capped at 40,000 characters; a document cut
 there says so (`[Truncated: ...]`).

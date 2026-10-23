@@ -2,7 +2,7 @@
 //! JSON (pretty-printed), HTML (readable text with headings and lists) and
 //! RTF (plain text).
 
-use super::{Budget, DocError, DocType, Out, plural, words};
+use super::{Budget, DocError, DocType, MAX_STORED_CHARS, Out, plural, words};
 use crate::feed::markup::{Token, tokenize};
 
 /// Bytes as text: a byte order mark picks UTF-8 or UTF-16; otherwise UTF-8,
@@ -60,7 +60,7 @@ const HIDDEN: &[&str] = &[
 
 /// HTML as readable text: headings become `#` lines, list items `- `
 /// lines, paragraphs and table rows their own lines.
-pub(crate) fn html(bytes: &[u8], kind: DocType) -> Result<String, DocError> {
+pub(crate) fn html(bytes: &[u8], kind: DocType, budget: &Budget) -> Result<String, DocError> {
     let src = decode(bytes, kind)?;
     let mut out = String::new();
     let mut hidden = 0usize;
@@ -68,7 +68,14 @@ pub(crate) fn html(bytes: &[u8], kind: DocType) -> Result<String, DocError> {
     let mut pre = 0usize;
     // Cells so far in the current table row.
     let mut cells = 0usize;
-    for tok in tokenize(&src, true) {
+    for (i, tok) in tokenize(&src, true).into_iter().enumerate() {
+        if i % 4096 == 4095 {
+            budget.check()?;
+        }
+        // Far more than the text kept: stop building.
+        if out.len() > MAX_STORED_CHARS * 4 {
+            break;
+        }
         match tok {
             Token::Start {
                 name, self_closing, ..
@@ -100,7 +107,7 @@ pub(crate) fn html(bytes: &[u8], kind: DocType) -> Result<String, DocError> {
                     }
                     "li" => {
                         line(&mut out);
-                        out.push_str(&"  ".repeat(lists.saturating_sub(1)));
+                        out.push_str(&"  ".repeat(lists.saturating_sub(1).min(8)));
                         out.push_str("- ");
                     }
                     "br" => out.push('\n'),

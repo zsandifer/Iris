@@ -162,6 +162,12 @@ fn main() {
         }
         return;
     }
+    // The daemon reads an uploaded routine document in a child process.
+    if raw.first().map(String::as_str) == Some(routines::docs::child::ARG) {
+        std::process::exit(routines::docs::child::main(
+            raw.get(1).map(String::as_str).unwrap_or(""),
+        ));
+    }
     if raw.first().map(String::as_str) == Some("mcp-relay") {
         if let Err(e) = agent::relay_stdio(&raw[1..]) {
             eprintln!("mcp-relay: {e}");

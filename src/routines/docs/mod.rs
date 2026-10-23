@@ -11,6 +11,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+pub mod child;
 mod office;
 mod pdf;
 mod sheets;
@@ -333,7 +334,7 @@ pub(crate) fn extract_with(
         }
         DocType::Json => text::json(bytes)?,
         DocType::Html => {
-            let t = text::html(bytes, kind)?;
+            let t = text::html(bytes, kind, &budget)?;
             let s = words(&t);
             (t, s)
         }
@@ -357,25 +358,66 @@ pub(crate) fn extract_with(
     })
 }
 
-/// Read one file at a time on the blocking pool, within
-/// [`EXTRACT_TIMEOUT`]. A file still being read past its deadline holds the
-/// slot until it notices and stops, so a stuck file never piles up threads.
-pub async fn extract_bounded(file_name: String, bytes: Vec<u8>) -> Result<Extracted, DocError> {
-    static SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+/// One file is read at a time.
+static SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Read an upload within [`EXTRACT_TIMEOUT`], one file at a time. With
+/// `isolate` (the daemon), the file is read in a child process with memory
+/// and CPU limits that is killed at the deadline, so no file can take the
+/// daemon down. Without it (tests, or if the child can't start), it is read
+/// on the blocking pool, where a file past its deadline holds the slot
+/// until its reader notices and stops, so a stuck file never piles up
+/// threads.
+pub async fn extract_bounded(
+    file_name: String,
+    bytes: Vec<u8>,
+    isolate: bool,
+) -> Result<Extracted, DocError> {
     let kind = doc_type(&file_name).ok_or_else(|| unsupported(&file_name))?;
-    let permit = match tokio::time::timeout(EXTRACT_TIMEOUT, SLOT.acquire()).await {
-        Ok(Ok(p)) => p,
-        _ => return Err(DocError::Busy),
+    let permit = take_slot(&SLOT, EXTRACT_TIMEOUT).await?;
+    let bytes = if isolate {
+        match child::run(kind, bytes).await {
+            Ok(result) => return result,
+            Err(bytes) => bytes,
+        }
+    } else {
+        bytes
     };
-    let budget = Budget::new(EXTRACT_TIMEOUT);
+    blocking(permit, EXTRACT_TIMEOUT, kind.noun(), move |budget| {
+        extract_with(&file_name, &bytes, budget)
+    })
+    .await
+}
+
+/// Wait up to `wait` for the reading slot.
+async fn take_slot(
+    slot: &'static tokio::sync::Semaphore,
+    wait: Duration,
+) -> Result<tokio::sync::SemaphorePermit<'static>, DocError> {
+    match tokio::time::timeout(wait, slot.acquire()).await {
+        Ok(Ok(p)) => Ok(p),
+        _ => Err(DocError::Busy),
+    }
+}
+
+/// Run `read` on the blocking pool with a deadline, holding `permit` until
+/// it returns (even after the caller has stopped waiting).
+async fn blocking<T: Send + 'static>(
+    permit: tokio::sync::SemaphorePermit<'static>,
+    timeout: Duration,
+    noun: &'static str,
+    read: impl FnOnce(Budget) -> Result<T, DocError> + Send + 'static,
+) -> Result<T, DocError> {
+    let budget = Budget::new(timeout);
     let task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        extract_with(&file_name, &bytes, budget)
+        read(budget)
     });
-    match tokio::time::timeout(EXTRACT_TIMEOUT + Duration::from_secs(5), task).await {
+    // A little grace past the deadline for a reader that is about to stop.
+    match tokio::time::timeout(timeout + timeout / 10, task).await {
         Ok(Ok(result)) => result,
         // A reader panicked on a malformed file.
-        Ok(Err(_)) => Err(DocError::Unreadable(kind.noun())),
+        Ok(Err(_)) => Err(DocError::Unreadable(noun)),
         Err(_) => Err(DocError::TooComplex),
     }
 }

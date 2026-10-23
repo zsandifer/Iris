@@ -307,7 +307,7 @@ async fn upload_doc(
         kind,
         text,
         summary,
-    } = docs::extract_bounded(name.clone(), body.to_vec())
+    } = docs::extract_bounded(name.clone(), body.to_vec(), !cfg!(test))
         .await
         .map_err(|e| {
             let status = match e {

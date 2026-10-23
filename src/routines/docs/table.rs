@@ -52,6 +52,13 @@ impl Table {
         }
     }
 
+    /// Count non-empty rows a reader left out before they got here.
+    pub(crate) fn add_dropped(&mut self, n: usize) {
+        if self.total > 0 {
+            self.total += n;
+        }
+    }
+
     /// Every non-empty row, the header included.
     pub(crate) fn rows(&self) -> usize {
         self.total

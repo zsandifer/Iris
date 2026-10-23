@@ -115,9 +115,20 @@ enum Block {
 #[derive(Default)]
 struct TableBuild {
     rows: Vec<Vec<String>>,
+    /// Rows left out past the cap.
+    dropped: usize,
     row: Vec<String>,
     cell: Option<String>,
+    /// Columns the open cell covers (merged cells), and how many times its
+    /// content repeats (OpenDocument's repeated cells).
+    span: usize,
+    repeat: usize,
 }
+
+/// Most columns one merged or repeated cell is taken to cover.
+const MAX_SPAN: usize = 64;
+/// Most cells kept per table row.
+const MAX_ROW_CELLS: usize = 1_000;
 
 /// Markdown assembled from paragraphs and tables.
 struct Writer {
@@ -183,13 +194,36 @@ impl Writer {
     fn cell_start(&mut self) {
         if let Some(t) = self.tables.last_mut() {
             t.cell = Some(String::new());
+            (t.span, t.repeat) = (1, 1);
+        }
+    }
+    /// The open cell covers `span` grid columns (Word's gridSpan) or is
+    /// repeated `repeat` times (OpenDocument's number-columns-repeated).
+    fn cell_size(&mut self, span: usize, repeat: usize) {
+        if let Some(t) = self.tables.last_mut() {
+            t.span = span.clamp(1, MAX_SPAN);
+            t.repeat = repeat.clamp(1, MAX_SPAN);
         }
     }
     fn cell_end(&mut self) {
         if let Some(t) = self.tables.last_mut()
             && let Some(c) = t.cell.take()
         {
-            t.row.push(c);
+            // Keep later cells under their own columns: a merged cell's
+            // extra columns are empty.
+            for _ in 1..t.repeat {
+                if t.row.len() < MAX_ROW_CELLS {
+                    t.row.push(c.clone());
+                }
+            }
+            if t.row.len() < MAX_ROW_CELLS {
+                t.row.push(c);
+            }
+            for _ in 1..t.span {
+                if t.row.len() < MAX_ROW_CELLS {
+                    t.row.push(String::new());
+                }
+            }
         }
     }
     fn row_end(&mut self) {
@@ -197,6 +231,8 @@ impl Writer {
             let row = std::mem::take(&mut t.row);
             if t.rows.len() <= super::MAX_TABLE_ROWS {
                 t.rows.push(row);
+            } else if row.iter().any(|c| !c.trim().is_empty()) {
+                t.dropped += 1;
             }
         }
     }
@@ -221,6 +257,7 @@ impl Writer {
                     .collect(),
             );
         }
+        table.add_dropped(t.dropped);
         if table.is_empty() {
             return;
         }
@@ -444,6 +481,10 @@ fn docx_body<R: BufRead>(src: R, styles: &Styles, budget: &Budget) -> Result<Str
                     "tbl" if !empty => w.table_start(),
                     "tr" if !empty => w.row_start(),
                     "tc" if !empty => w.cell_start(),
+                    "gridSpan" => {
+                        let span = attr(e, "val").and_then(|v| v.parse().ok()).unwrap_or(1);
+                        w.cell_size(span, 1);
+                    }
                     _ => {}
                 }
             }
@@ -609,8 +650,15 @@ pub(crate) fn odt(bytes: &[u8], budget: &Budget) -> Result<String, DocError> {
                     "line-break" => odt_text(&mut paras, "\n"),
                     "table" if !empty => w.table_start(),
                     "table-row" if !empty => w.row_start(),
-                    "table-cell" => {
+                    "table-cell" | "covered-table-cell" => {
                         w.cell_start();
+                        let n = |a: &str| attr(e, a).and_then(|v| v.parse().ok()).unwrap_or(1);
+                        // A covered cell is the hidden part of a merged one.
+                        if name == "covered-table-cell" {
+                            w.cell_size(n("number-columns-repeated"), 1);
+                        } else {
+                            w.cell_size(1, n("number-columns-repeated"));
+                        }
                         if empty {
                             w.cell_end();
                         }
@@ -638,7 +686,7 @@ pub(crate) fn odt(bytes: &[u8], budget: &Budget) -> Result<String, DocError> {
                         }
                     }
                     "list" => lists = lists.saturating_sub(1),
-                    "table-cell" => w.cell_end(),
+                    "table-cell" | "covered-table-cell" => w.cell_end(),
                     "table-row" => w.row_end(),
                     "table" => w.table_end(),
                     _ => {}

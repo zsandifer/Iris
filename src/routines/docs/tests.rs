@@ -844,27 +844,83 @@ fn many_pdf_pages_are_capped() {
 // ------------------------------------------------------------------ bounds
 
 #[test]
-fn a_past_deadline_stops_reading() {
-    let csv = "a,b\n".repeat(10_000);
-    let late = Budget {
+fn a_past_deadline_stops_every_reader() {
+    let late = || Budget {
         deadline: std::time::Instant::now() - std::time::Duration::from_secs(1),
     };
-    assert_eq!(
-        extract_with("late.csv", csv.as_bytes(), late).unwrap_err(),
-        DocError::TooComplex
-    );
+    let many_paras: String = (0..3_000)
+        .map(|i| para(None, None, &format!("p{i}")))
+        .collect();
+    let odt_body: String = (0..3_000)
+        .map(|i| format!("<text:p>p{i}</text:p>"))
+        .collect();
+    let odt = zip_of(&[(
+        "content.xml",
+        &format!(
+            "<office:document-content xmlns:office=\"o\" xmlns:text=\"t\"><office:body><office:text>{odt_body}</office:text></office:body></office:document-content>"
+        ),
+    )]);
+    let rtf = format!("{{\\rtf1 {}}}", "word ".repeat(20_000));
+    let html = "<p>word</p>".repeat(5_000);
+    for (name, bytes) in [
+        ("late.csv", "a,b\n".repeat(10).into_bytes()),
+        ("late.xlsx", xlsx(&[("S", grid(&[&["a"]]))])),
+        ("late.pdf", text_pdf(&["BT /F1 9 Tf (x) Tj ET"])),
+        ("late.docx", docx(&many_paras, "", "")),
+        ("late.odt", odt),
+        ("late.rtf", rtf.into_bytes()),
+        ("late.html", html.into_bytes()),
+    ] {
+        assert_eq!(
+            extract_with(name, &bytes, late()).unwrap_err(),
+            DocError::TooComplex,
+            "{name}"
+        );
+        assert!(extract(name, &bytes).is_ok(), "{name}");
+    }
 }
 
 #[tokio::test]
-async fn bounded_extraction_runs_off_the_async_threads() {
-    let d = extract_bounded("a.csv".into(), b"x,y\n1,2\n".to_vec())
+async fn bounded_extraction_reads_in_process_without_isolation() {
+    let d = extract_bounded("a.csv".into(), b"x,y\n1,2\n".to_vec(), false)
         .await
         .unwrap();
     assert_eq!(d.summary, "2 rows · 2 columns");
     assert!(matches!(
-        extract_bounded("a.bin".into(), vec![1, 2]).await,
+        extract_bounded("a.bin".into(), vec![1, 2], true).await,
         Err(DocError::Unsupported(_))
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_file_at_a_time_and_a_stuck_one_times_out() {
+    use std::time::{Duration, Instant};
+    static SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let ms = Duration::from_millis;
+    let (release, stuck) = std::sync::mpsc::channel::<()>();
+    let permit = take_slot(&SLOT, ms(100)).await.unwrap();
+    // A reader that ignores its deadline until it's let go.
+    let started = Instant::now();
+    let r = blocking(permit, ms(200), "file", move |_| {
+        stuck.recv().ok();
+        Ok(())
+    })
+    .await;
+    assert_eq!(r, Err(DocError::TooComplex));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    // The async side kept running; the stuck reader still holds the slot,
+    // so the next file is told to wait rather than starting a second one.
+    assert_eq!(take_slot(&SLOT, ms(100)).await.unwrap_err(), DocError::Busy);
+    release.send(()).unwrap();
+    // Once it stops, the slot is free again.
+    let permit = take_slot(&SLOT, Duration::from_secs(5)).await.unwrap();
+    // A reader that panics on a malformed file reports it as unreadable.
+    let r: Result<(), DocError> = blocking(permit, Duration::from_secs(5), "PDF", |_| {
+        panic!("bad file")
+    })
+    .await;
+    assert_eq!(r, Err(DocError::Unreadable("PDF")));
+    assert!(take_slot(&SLOT, ms(100)).await.is_ok());
 }
 
 #[test]
@@ -903,4 +959,159 @@ fn sections_are_labelled_and_capped() {
     assert!(!s.contains('c'.to_string().repeat(5).as_str()));
     let all = prompt_sections(&docs, MAX_DOC_CHARS);
     assert!(!all.contains("Truncated") && !all.contains("Left out"));
+}
+
+// ------------------------------------------------------------ round 1 fixes
+
+#[test]
+fn pdf_text_inside_forms_is_read() {
+    // Page 1 draws a form (with its own font) and has text of its own;
+    // page 2 is only a form, drawn twice, that draws a nested form.
+    let objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 >>".to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> /XObject << /Fm1 7 0 R >> >> /Contents 5 0 R >>".to_string(),
+        stream("BT /F1 12 Tf 72 720 Td (Page text) Tj ET q /Fm1 Do Q"),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Fm2 8 0 R >> >> /Contents 9 0 R >>".to_string(),
+        format!(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F9 3 0 R >> >> /Length {} >>\nstream\n{}\nendstream",
+            "BT /F9 10 Tf 72 600 Td (Form text) Tj ET".len(),
+            "BT /F9 10 Tf 72 600 Td (Form text) Tj ET"
+        ),
+        format!(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> /XObject << /Fm1 7 0 R >> >> /Length {} >>\nstream\n{}\nendstream",
+            "BT /F1 10 Tf (Outer form) Tj ET /Fm1 Do".len(),
+            "BT /F1 10 Tf (Outer form) Tj ET /Fm1 Do"
+        ),
+        stream("/Fm2 Do /Fm2 Do /Missing Do"),
+    ];
+    let d = extract("forms.pdf", &pdf(&objects, "")).unwrap();
+    assert_eq!(
+        d.text,
+        "[Page 1]\nPage text\nForm text\n\n\
+         [Page 2]\nOuter form\nForm text\nOuter form\nForm text\n\n"
+    );
+    // A form that draws itself stops at the nesting limit.
+    let looped = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [4 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> /XObject << /Me 6 0 R >> >> /Contents 5 0 R >>".to_string(),
+        stream("/Me Do"),
+        format!(
+            "<< /Type /XObject /Subtype /Form /Length {} >>\nstream\n{}\nendstream",
+            "BT /F1 9 Tf (loop) Tj ET /Me Do".len(),
+            "BT /F1 9 Tf (loop) Tj ET /Me Do"
+        ),
+    ];
+    let d = extract("loop.pdf", &pdf(&looped, "")).unwrap();
+    assert_eq!(d.text.matches("loop").count(), 8, "{}", d.text);
+}
+
+/// The text PDF with every stream compressed, and optionally a page whose
+/// content inflates past the limit.
+fn compressed_pdf(pages: &[&str], huge_page: bool) -> Vec<u8> {
+    let mut doc = lopdf::Document::load_mem(&text_pdf(pages)).unwrap();
+    if huge_page {
+        let page = *doc.get_pages().values().next().unwrap();
+        let mut content = "BT /F1 9 Tf (x) Tj ET\n".to_string();
+        content.push_str(&" ".repeat(MAX_PDF_STREAM_BYTES + 1));
+        let id = doc.add_object(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            content.into_bytes(),
+        ));
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Contents", lopdf::Object::Reference(id));
+    }
+    doc.compress();
+    let mut out = Vec::new();
+    doc.save_to(&mut out).unwrap();
+    out
+}
+
+#[test]
+fn compressed_pdf_streams_are_inflated_within_the_limit() {
+    let padded = format!("BT /F1 12 Tf (Squeezed text) Tj ET{}", " ".repeat(500));
+    let small = compressed_pdf(&[&padded], false);
+    assert!(!small.windows(13).any(|w| w == b"Squeezed text"));
+    assert_eq!(
+        extract("small.pdf", &small).unwrap().text,
+        "[Page 1]\nSqueezed text\n\n"
+    );
+    let bomb = compressed_pdf(&["BT /F1 12 Tf (x) Tj ET"], true);
+    assert!(bomb.len() < 1024 * 1024, "{}", bomb.len());
+    assert_eq!(
+        extract("bomb.pdf", &bomb).unwrap_err(),
+        DocError::TooComplex
+    );
+}
+
+#[test]
+fn deeply_nested_html_stays_small() {
+    let html = "<ul><li>x".repeat(50_000);
+    let started = std::time::Instant::now();
+    let d = extract("deep.html", html.as_bytes()).unwrap();
+    assert!(d.text.len() < MAX_STORED_CHARS * 2, "{}", d.text.len());
+    assert!(d.text.contains(&format!("{}- x", "  ".repeat(8))));
+    assert!(!d.text.contains(&format!("{}- x", "  ".repeat(9))));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+}
+
+#[test]
+fn merged_table_cells_keep_later_cells_in_their_columns() {
+    let cell = |t: &str, span: usize| {
+        let pr = if span > 1 {
+            format!("<w:tcPr><w:gridSpan w:val=\"{span}\"/></w:tcPr>")
+        } else {
+            String::new()
+        };
+        format!("<w:tc>{pr}<w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc>")
+    };
+    let row = |cells: &[String]| format!("<w:tr>{}</w:tr>", cells.concat());
+    let body = format!(
+        "<w:tbl>{}{}{}</w:tbl>",
+        row(&[cell("Item", 1), cell("Qty", 1), cell("Amount", 1)]),
+        row(&[cell("Rice", 1), cell("2", 1), cell("17", 1)]),
+        row(&[cell("Subtotal", 2), cell("17", 1)]),
+    );
+    let d = extract("t.docx", &docx(&body, "", "")).unwrap();
+    assert!(
+        d.text
+            .ends_with("| Rice | 2 | 17 |\n| Subtotal |  | 17 |\n"),
+        "{}",
+        d.text
+    );
+    // OpenDocument: a merged cell is followed by covered cells, and equal
+    // neighbours may be one repeated cell.
+    let content = "<office:document-content xmlns:office=\"o\" xmlns:text=\"t\" xmlns:table=\"b\"><office:body><office:text><table:table>\
+        <table:table-row><table:table-cell><text:p>Item</text:p></table:table-cell><table:table-cell><text:p>Qty</text:p></table:table-cell><table:table-cell><text:p>Amount</text:p></table:table-cell></table:table-row>\
+        <table:table-row><table:table-cell table:number-columns-spanned=\"2\"><text:p>Subtotal</text:p></table:table-cell><table:covered-table-cell/><table:table-cell><text:p>17</text:p></table:table-cell></table:table-row>\
+        <table:table-row><table:table-cell table:number-columns-repeated=\"3\"><text:p>-</text:p></table:table-cell></table:table-row>\
+        </table:table></office:text></office:body></office:document-content>";
+    let d = extract("t.odt", &zip_of(&[("content.xml", content)])).unwrap();
+    assert_eq!(
+        d.text,
+        "| Item | Qty | Amount |\n| --- | --- | --- |\n| Subtotal |  | 17 |\n| - | - | - |\n"
+    );
+}
+
+#[test]
+fn long_word_tables_say_rows_were_left_out() {
+    let rows: String = (0..1_200)
+        .map(|i| format!("<w:tr><w:tc><w:p><w:r><w:t>r{i}</w:t></w:r></w:p></w:tc></w:tr>"))
+        .collect();
+    let d = extract(
+        "long.docx",
+        &docx(&format!("<w:tbl>{rows}</w:tbl>"), "", ""),
+    )
+    .unwrap();
+    assert!(d.text.contains("| r1000 |") && !d.text.contains("| r1001 |"));
+    assert!(
+        d.text.contains("[Showing the first 1,000 of 1,199 rows.]"),
+        "{}",
+        &d.text[d.text.len() - 200..]
+    );
 }
