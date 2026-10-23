@@ -1241,3 +1241,65 @@ fn blank_table_rows_do_not_use_up_the_row_cap() {
         &d.text[d.text.len() - 80..]
     );
 }
+
+// ------------------------------------------------------------ round 4 fixes
+
+#[test]
+fn pdf_q_and_q_restore_the_font() {
+    let objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [5 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_string(),
+        // Shows code 65 ("A") as Z.
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [65 /Z] >> >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents 6 0 R >>".to_string(),
+        stream(
+            "BT /F1 10 Tf 72 700 Td (AAA) Tj ET \
+             q BT /F2 10 Tf 72 680 Td (AAA) Tj ET Q \
+             BT 72 660 Td (AAA) Tj ET",
+        ),
+    ];
+    let d = extract("fonts.pdf", &pdf(&objects, "")).unwrap();
+    assert_eq!(d.text, "[Page 1]\nAAA\nZZZ\nAAA\n\n");
+}
+
+#[test]
+fn pdf_form_limits_leave_a_note() {
+    let draws = "/Fm1 Do ".repeat(MAX_FORMS_PER_PAGE_FOR_TESTS + 1);
+    let form = "BT /F1 9 Tf (x) Tj ET";
+    let objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [4 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> /XObject << /Fm1 6 0 R >> >> /Contents 5 0 R >>".to_string(),
+        stream(&draws),
+        format!(
+            "<< /Type /XObject /Subtype /Form /Length {} >>\nstream\n{form}\nendstream",
+            form.len()
+        ),
+    ];
+    let d = extract("many.pdf", &pdf(&objects, "")).unwrap();
+    assert_eq!(d.text.matches('x').count(), MAX_FORMS_PER_PAGE_FOR_TESTS);
+    assert!(
+        d.text.contains("[Part of this page is left out"),
+        "{}",
+        d.text
+    );
+}
+
+const MAX_FORMS_PER_PAGE_FOR_TESTS: usize = 200;
+
+#[test]
+fn json_numbers_keep_every_digit() {
+    let src = br#"{"id": 123456789012345678901, "price": 0.10000000000000000001,
+        "empty": [], "none": {}, "note": "a, {b}: \"c\" \\", "list": [1, [2, 3]]}"#;
+    let d = extract("big.json", src).unwrap();
+    assert_eq!(
+        d.text,
+        "```json\n{\n  \"id\": 123456789012345678901,\n  \"price\": 0.10000000000000000001,\n  \
+         \"empty\": [],\n  \"none\": {},\n  \"note\": \"a, {b}: \\\"c\\\" \\\\\",\n  \
+         \"list\": [\n    1,\n    [\n      2,\n      3\n    ]\n  ]\n}\n```\n"
+    );
+    assert_eq!(d.summary, "6 fields");
+}

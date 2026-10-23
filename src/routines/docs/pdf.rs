@@ -322,9 +322,14 @@ fn page_text(doc: &Document, id: ObjectId, budget: &Budget) -> Result<String, Pa
         text: TextState::default(),
         pen: None,
         ctm: IDENTITY,
-        saved: Vec::new(),
+        skipped: false,
     };
     page.run(&content, &dicts, 0)?;
+    if page.skipped {
+        newline(&mut page.s);
+        page.s
+            .push_str("[Part of this page is left out: it draws the same content too many times.]");
+    }
     Ok(page.s)
 }
 
@@ -371,9 +376,10 @@ struct Page<'a> {
     text: TextState,
     /// Where the last fragment ended on the page (x if known, baseline y).
     pen: Option<(Option<f32>, f32)>,
-    /// The graphics transform (`cm`), and the ones saved by `q`.
+    /// The graphics transform (`cm`).
     ctm: Matrix,
-    saved: Vec<Matrix>,
+    /// Forms left out at the nesting or count limit.
+    skipped: bool,
 }
 
 type Matrix = [f32; 6];
@@ -484,14 +490,24 @@ impl<'a> Page<'a> {
         let res = Resources::new(self.doc, dicts);
         let content = Content::decode(content)?;
         let mut font: Option<&Font> = None;
+        // Graphics states saved by `q`: the transform, font and text
+        // parameters (not the text matrices, which aren't part of it).
+        let mut saved: Vec<(Matrix, Option<&Font>, TextState)> = Vec::new();
         for op in &content.operations {
             let args = &op.operands;
             let n = |i: usize| args.get(i).and_then(number);
             match op.operator.as_str() {
-                "q" if self.saved.len() < MAX_SAVED => self.saved.push(self.ctm),
+                "q" if saved.len() < MAX_SAVED => saved.push((self.ctm, font, self.text)),
                 "Q" => {
-                    if let Some(m) = self.saved.pop() {
+                    if let Some((m, f, t)) = saved.pop() {
                         self.ctm = m;
+                        font = f;
+                        let now = &mut self.text;
+                        now.size = t.size;
+                        now.char_spacing = t.char_spacing;
+                        now.word_spacing = t.word_spacing;
+                        now.scale = t.scale;
+                        now.leading = t.leading;
                     }
                 }
                 "cm" => {
@@ -580,6 +596,7 @@ impl<'a> Page<'a> {
                         continue;
                     };
                     if depth >= MAX_FORM_DEPTH || self.forms >= MAX_FORMS_PER_PAGE {
+                        self.skipped = true;
                         continue;
                     }
                     self.forms += 1;
@@ -594,7 +611,7 @@ impl<'a> Page<'a> {
                         .collect();
                     inner.extend_from_slice(dicts);
                     newline(&mut self.s);
-                    let (text, ctm, depth_saved) = (self.text, self.ctm, self.saved.len());
+                    let (text, ctm) = (self.text, self.ctm);
                     if let Some(m) = form
                         .dict
                         .get(b"Matrix")
@@ -607,7 +624,6 @@ impl<'a> Page<'a> {
                     self.pen = None;
                     self.run(&body, &inner, depth + 1)?;
                     (self.text, self.ctm) = (text, ctm);
-                    self.saved.truncate(depth_saved);
                     self.pen = None;
                     newline(&mut self.s);
                 }

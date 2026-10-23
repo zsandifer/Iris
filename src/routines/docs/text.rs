@@ -34,13 +34,13 @@ pub(crate) fn plain(bytes: &[u8], kind: DocType) -> Result<String, DocError> {
     Ok(out.finish())
 }
 
-/// JSON, checked and pretty-printed in a code block.
+/// JSON, checked and pretty-printed in a code block. The layout is redone
+/// on the text itself, so numbers keep every digit as written.
 pub(crate) fn json(bytes: &[u8]) -> Result<(String, String), DocError> {
     let src = decode(bytes, DocType::Json)?;
     let value: serde_json::Value =
         serde_json::from_str(&src).map_err(|_| DocError::Unreadable(DocType::Json.noun()))?;
-    let pretty = serde_json::to_string_pretty(&value)
-        .map_err(|_| DocError::Unreadable(DocType::Json.noun()))?;
+    let pretty = indent_json(&src);
     let summary = match &value {
         serde_json::Value::Array(a) => plural(a.len(), "item", "items"),
         serde_json::Value::Object(o) => plural(o.len(), "field", "fields"),
@@ -51,6 +51,63 @@ pub(crate) fn json(bytes: &[u8]) -> Result<(String, String), DocError> {
     out.push(&pretty);
     out.push("\n```\n");
     Ok((out.finish(), summary))
+}
+
+/// Re-indent JSON text (already checked to be valid) two spaces per level,
+/// without parsing its values.
+fn indent_json(src: &str) -> String {
+    let mut out = String::with_capacity(src.len() + src.len() / 4);
+    let mut depth = 0usize;
+    let (mut in_string, mut escaped) = (false, false);
+    let newline = |out: &mut String, depth: usize| {
+        out.push('\n');
+        out.push_str(&"  ".repeat(depth.min(64)));
+    };
+    let mut chars = src.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '{' | '[' => {
+                out.push(c);
+                // Skip whitespace to see whether it's empty.
+                while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                    chars.next();
+                }
+                if matches!(chars.peek(), Some('}' | ']')) {
+                    out.push(chars.next().unwrap_or(' '));
+                } else {
+                    depth += 1;
+                    newline(&mut out, depth);
+                }
+            }
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                newline(&mut out, depth);
+                out.push(c);
+            }
+            ',' => {
+                out.push(c);
+                newline(&mut out, depth);
+            }
+            ':' => out.push_str(": "),
+            c if c.is_whitespace() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Elements whose content is never shown.
