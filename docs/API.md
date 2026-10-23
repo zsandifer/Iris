@@ -2447,12 +2447,14 @@ anything.
     "version": "2.1.296 (Claude Code)", "managed_version": "2.1.296",
     "auth": "ok", "requires": null,
     "isolation": "split", "agent_user": "iris-agent", "signed_in_as_agent": true,
+    "launcher_outdated": false,
     "operation": {"op": "update", "state": "done", "error": null, "version": "2.1.296",
                   "started_at": 1760000000000, "finished_at": 1760000017000}
   }],
   "dir": "/home/user/.local/share/iris/engines",
   "privileged_helper": false,
-  "auto_update": true
+  "auto_update": true,
+  "launcher": {"state": "current", "build_id": "0a1b2c3d", "service_build_id": "0a1b2c3d"}
 }
 ```
 
@@ -2467,6 +2469,23 @@ its sign-in is known in split mode; null in single-user mode or when unknown).
 Version, model and auth probes and app-driven sign-in use the configured
 account. Gemini's `mcp` capability is false while project context is disabled
 through restricted mode.
+
+In split mode the server also checks the root-owned agent launcher
+(`agent.launcher`), which validates every request against the rules of its
+own build. At startup, and again when a turn is refused by the launcher, it
+runs `<launcher> version` directly (no sudo, empty environment, cwd `/`, 5 s
+timeout) and compares the reported build with its own. `launcher` is the
+last result (null in single-user mode or before the first check): `state` is
+`current`, `outdated` (a different build, or a launcher from before builds
+were reported, when `build_id` is null), or `unknown` (a development build
+on either side, or the launcher could not be run or answered unexpectedly;
+nothing is shown then). Each engine's `launcher_outdated` mirrors it: true
+or false, null in single-user mode or when unknown. When the launcher is
+outdated, the owner gets one `info` card in their Main chat ("Update the
+agent launcher") with the command to reinstall it from the running service
+binary; it is posted once per service/launcher build pair, rewritten while
+it is still open, and changed to "Agent launcher updated" (`state: "done"`)
+when a later check finds the launcher current.
 
 #### `POST /api/engines/{name}/install`, `POST /api/engines/{name}/update`
 
@@ -3136,6 +3155,7 @@ A Main chat message posted by the heartbeat job has
 | `timeout` | No result within `turn_timeout_secs` (default 600) | `no result after 600s` | "That took too long, so I stopped. Want me to try again?" |
 | `paused` | The owner paused Iris | `the owner paused Iris` | "I'm paused right now, so I didn't do anything. You can resume me from my computer screen in the app whenever you're ready." (no "stuck" push) |
 | `harness_error` | The CLI reported an error, or exited without a result | The CLI's error text | "Something went wrong on my end. Want me to try again?" |
+| `launcher_outdated` | Split mode: the root-owned agent launcher refused the turn before any CLI ran (nothing streamed, no tools) and a fresh check found it out of date (see [`GET /api/engines`](#get-apiengines)); otherwise such a refusal stays `harness_error` or `internal` | The launcher's error text | "I can't reply right now because my agent launcher on the server is out of date: it needs to be reinstalled to match this version of Iris. I left the steps for the owner in the Main chat; once that's done, send your message again." |
 | `internal` | Iris could not build the CLI command | `could not build command: ...` | "Something went wrong on my end. Want me to try again?" |
 | `paused` | The owner turned on "Pause Iris" (the engine is not run; no "stuck" push) | `the owner paused Iris` | "I'm paused right now, so I'm not doing anything. You can turn me back on in my computer settings whenever you want me again." |
 
@@ -3316,8 +3336,9 @@ from when a run actually started.
   `max_retries` times (status `failed` with `retry_at` meanwhile). An
   attempt that may have acted is never retried automatically: the acting
   step after an OK, and an attempt of a routine without ask before acting
-  unless its engine never got to work (no engine, signed out, or Iris could
-  not set the run up) and it used no tool. Some CLIs report a tool only
+  unless its engine never got to work (no engine, signed out, Iris could
+  not set the run up, or an out-of-date agent launcher refused it) and it
+  used no tool. Some CLIs report a tool only
   after it finished, so a timeout or crash counts as possibly acted. Such
   attempts are also never restarted inside the turn (on another engine or
   with a fresh session). A retry that came due while Iris was offline or

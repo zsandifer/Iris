@@ -145,6 +145,12 @@ fn main() {
     // `mcp-exec` passes the server's own arguments through untouched, so it
     // bypasses the option parser.
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    // The service reads the root-owned launcher's build with this: no
+    // config or data directory work.
+    if raw == ["version"] {
+        println!("{}", agent::version_line());
+        return;
+    }
     if raw.first().map(String::as_str) == Some("agent-exec") {
         if raw.len() != 1 {
             eprintln!("agent-exec accepts no arguments");
@@ -197,7 +203,7 @@ fn run(args: Args) -> Result<()> {
             Ok(())
         }
         ["version"] => {
-            println!("iris {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", agent::version_line());
             Ok(())
         }
         ["init"] => {
@@ -437,6 +443,8 @@ fn serve(cfg: Config, paths: Paths) -> Result<()> {
         gateway::listen(state.clone())?;
         let probe = state.clone();
         tokio::spawn(async move {
+            // Split mode: a launcher left behind by an upgrade refuses turns.
+            setup::check_launcher(&probe).await;
             probe.refresh_harnesses().await;
             // Reconcile cards left by an older daemon against persisted connection state.
             if let Ok(connectors) = probe.db.call(|c| entities::list_connectors(c, false)).await {

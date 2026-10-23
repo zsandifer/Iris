@@ -941,7 +941,9 @@ async fn run_locked(
                     && acc.text.is_empty()
                     && acc.activities.is_empty()
                     && !input.may_act
-                    && !fresh_session =>
+                    && !fresh_session
+                    // The launcher refused it: the session is fine.
+                    && !(spec.split && crate::agent::launcher_refused(&message)) =>
             {
                 // Typically a session the CLI no longer has; start fresh and
                 // replay the conversation instead (never after tool use,
@@ -977,7 +979,53 @@ async fn run_locked(
         .as_ref()
         .map(|d| routing_json(d, &routing_notes))
         .unwrap_or(json!(null));
+    let outcome = explain_launcher_refusal(state, &acc, outcome).await;
     finish(state, input, &mut audience, &acc, routing, outcome).await
+}
+
+/// Split mode: a turn the root-owned launcher refused before any CLI ran
+/// fails as `launcher_outdated` when the launcher is out of date (an
+/// upgrade replaced only the service binary), so the owner learns the fix
+/// instead of a generic failure. Checking also posts the fix card.
+async fn explain_launcher_refusal(state: &AppState, acc: &Acc, outcome: Outcome) -> Outcome {
+    classify_launcher_refusal(!state.cfg.agent.user.is_empty(), acc, outcome, || {
+        crate::setup::check_launcher(state)
+    })
+    .await
+}
+
+/// `explain_launcher_refusal` with the launcher check passed in. It runs
+/// only for a refusal in split mode before anything streamed or any tool ran
+/// (routines retry `launcher_outdated` as "nothing ran").
+async fn classify_launcher_refusal<F, Fut>(
+    split: bool,
+    acc: &Acc,
+    outcome: Outcome,
+    check: F,
+) -> Outcome
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<crate::agent::LauncherCheck>>,
+{
+    match outcome {
+        Outcome::Failed {
+            kind: kind @ ("harness_error" | "internal"),
+            detail,
+        } if split
+            && acc.text.is_empty()
+            && acc.activities.is_empty()
+            && crate::agent::launcher_refused(&detail) =>
+        {
+            let outdated = check()
+                .await
+                .is_some_and(|c| c.state == crate::agent::LauncherState::Outdated);
+            Outcome::Failed {
+                kind: if outdated { "launcher_outdated" } else { kind },
+                detail,
+            }
+        }
+        other => other,
+    }
 }
 
 /// Why no engine could run the turn: harnesses allowed here that are
@@ -1588,6 +1636,11 @@ fn failure_text(kind: &str, detail: &str) -> String {
             shared conversations unless the owner turns that on."
             .into(),
         "timeout" => "That took too long, so I stopped. Want me to try again?".into(),
+        "launcher_outdated" => "I can't reply right now because my agent launcher on the \
+            server is out of date: it needs to be reinstalled to match this version of Iris. \
+            I left the steps for the owner in the Main chat; once that's done, send your \
+            message again."
+            .into(),
         "paused" => "I'm paused right now, so I didn't do anything. You can resume me from \
             my computer screen in the app whenever you're ready."
             .into(),
@@ -3080,5 +3133,137 @@ printf '%s\n' '{"type":"init","session_id":"pre-join-session"}' \
             both.contains("/login") && both.contains("codex login"),
             "{both}"
         );
+        let launcher = failure_text("launcher_outdated", "agent-exec: refused");
+        assert!(
+            launcher.contains("launcher") && launcher.contains("Main chat"),
+            "{launcher}"
+        );
+        assert!(!launcher.contains("agent-exec"), "{launcher}");
+    }
+
+    #[tokio::test]
+    async fn single_user_turn_errors_never_mention_the_launcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let state = AppState::new(
+            crate::config::Config::default(),
+            paths,
+            crate::db::Db::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        for kind in ["harness_error", "internal"] {
+            let failed = Outcome::Failed {
+                kind,
+                detail: "agent-exec: environment variable is not allowed in agent launcher".into(),
+            };
+            match explain_launcher_refusal(&state, &Acc::default(), failed).await {
+                Outcome::Failed { kind: k, .. } => assert_eq!(k, kind),
+                _ => panic!("outcome changed"),
+            }
+        }
+        assert!(state.launcher.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn split_mode_launcher_refusals_name_an_outdated_launcher() {
+        use crate::agent::{LauncherCheck, LauncherState};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const REFUSED: &str = "agent-exec: environment variable is not allowed in agent launcher";
+        const PREPARE: &str = "could not prepare isolated turn: agent launcher failed; check root setup and service permissions";
+        let launcher = |state| LauncherCheck {
+            state,
+            build_id: Some("59d96590".into()),
+            service_build_id: "0a1b2c3d".into(),
+        };
+        let calls = AtomicUsize::new(0);
+        let run = |split: bool,
+                   acc: Acc,
+                   kind: &'static str,
+                   detail: &str,
+                   found: Option<LauncherState>| {
+            let calls = &calls;
+            let detail = detail.to_owned();
+            async move {
+                let out = classify_launcher_refusal(
+                    split,
+                    &acc,
+                    Outcome::Failed {
+                        kind,
+                        detail: detail.clone(),
+                    },
+                    || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        found.map(launcher)
+                    },
+                )
+                .await;
+                match out {
+                    Outcome::Failed { kind, detail: d } => {
+                        assert_eq!(d, detail, "the detail is kept for metadata");
+                        kind
+                    }
+                    _ => panic!("outcome changed"),
+                }
+            }
+        };
+        let outdated = Some(LauncherState::Outdated);
+        // An outdated launcher refused it: both refusal paths are named.
+        for (kind, detail) in [("harness_error", REFUSED), ("internal", PREPARE)] {
+            assert_eq!(
+                run(true, Acc::default(), kind, detail, outdated).await,
+                "launcher_outdated"
+            );
+        }
+        assert_eq!(calls.swap(0, Ordering::SeqCst), 2);
+        // The launcher is current or cannot be told: the kind stays.
+        for found in [
+            Some(LauncherState::Current),
+            Some(LauncherState::Unknown),
+            None,
+        ] {
+            assert_eq!(
+                run(true, Acc::default(), "harness_error", REFUSED, found).await,
+                "harness_error"
+            );
+        }
+        assert_eq!(calls.swap(0, Ordering::SeqCst), 3);
+        // Never checked: single-user mode, another error, other kinds, or
+        // an attempt that streamed text or used a tool (it may have acted).
+        let streamed = Acc {
+            text: "Hello".into(),
+            ..Acc::default()
+        };
+        let acted = Acc {
+            activities: vec![Activity {
+                id: "t1".into(),
+                kind: "command".into(),
+                name: "shell".into(),
+                status: "completed".into(),
+                summary: "ls".into(),
+                auth_error: false,
+            }],
+            ..Acc::default()
+        };
+        let cases: [(bool, Acc, &'static str, &str); 6] = [
+            (false, Acc::default(), "harness_error", REFUSED),
+            (
+                true,
+                Acc::default(),
+                "harness_error",
+                "Claude Code exited without a result",
+            ),
+            (true, Acc::default(), "timeout", REFUSED),
+            (true, Acc::default(), "auth_required", REFUSED),
+            (true, streamed, "harness_error", REFUSED),
+            (true, acted, "harness_error", REFUSED),
+        ];
+        for (split, acc, kind, detail) in cases {
+            assert_eq!(run(split, acc, kind, detail, outdated).await, kind);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

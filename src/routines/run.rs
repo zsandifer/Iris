@@ -1139,8 +1139,14 @@ pub enum Retry {
 }
 
 /// Failures where the engine never got to work (none available, signed
-/// out, or Iris could not set the run up), so nothing can have been done.
-const NOTHING_RAN: &[&str] = &["no_engine", "auth_required", "internal"];
+/// out, Iris could not set the run up, or the agent launcher refused it
+/// before any CLI ran), so nothing can have been done.
+const NOTHING_RAN: &[&str] = &[
+    "no_engine",
+    "auth_required",
+    "internal",
+    "launcher_outdated",
+];
 
 /// Whether a failed attempt is tried again. An attempt allowed to act (the
 /// step after the owner's OK, or a routine that does not ask first) is
@@ -1325,7 +1331,12 @@ mod tests {
         assert_eq!(retry_after(Step::Prepare, true, true, "timeout", 3, 2), No);
         // A routine that acts without asking: only when its engine never
         // got to work.
-        for kind in ["no_engine", "auth_required", "internal"] {
+        for kind in [
+            "no_engine",
+            "auth_required",
+            "internal",
+            "launcher_outdated",
+        ] {
             assert_eq!(
                 retry_after(Step::Prepare, false, false, kind, 1, 2),
                 After(1)
