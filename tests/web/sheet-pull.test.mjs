@@ -35,4 +35,11 @@ test('pull a sheet down to close it, only from the top and not from a text box',
   h.onTouchMove({ touches: [touch(260)] });
   h.onTouchEnd({ changedTouches: [touch(260)] });
   assert.equal(closed, 1);
+  // A document scrolled down inside the sheet: the pull scrolls it.
+  const doc = { scrollTop: 250, parentElement: null, closest: () => null };
+  drag(300, { target: doc });
+  assert.equal(closed, 1);
+  doc.scrollTop = 0;
+  drag(300, { target: doc });
+  assert.equal(closed, 2);
 });

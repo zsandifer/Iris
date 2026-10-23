@@ -329,7 +329,7 @@ export function ChatScreen({ cid }) {
   const rcpt = receiptFor(list, S.me?.user?.id, S.live);
   // New messages pop in; ones already there when the chat opened (or
   // older pages loaded later) don't.
-  if (firstNewest.current == null && box) firstNewest.current = list.at(-1)?.created_at ?? 0;
+  if (firstNewest.current == null && box && !box.loading) firstNewest.current = list.at(-1)?.created_at ?? 0;
   const rows = [];
   shown.forEach((m, i) => {
     const h = heads[i];
