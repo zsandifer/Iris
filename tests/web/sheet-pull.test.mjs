@@ -27,4 +27,12 @@ test('pull a sheet down to close it, only from the top and not from a text box',
   top = 0;
   drag(300, { target: { closest: () => ({}) } }); // started in a text box
   assert.equal(closed, 1);
+  // Scrolled down at the start, reaching the top partway: still a scroll.
+  top = 80;
+  h.onTouchStart({ target, touches: [touch(100)] });
+  h.onTouchMove({ touches: [touch(140)] });
+  top = 0;
+  h.onTouchMove({ touches: [touch(260)] });
+  h.onTouchEnd({ changedTouches: [touch(260)] });
+  assert.equal(closed, 1);
 });

@@ -1982,15 +1982,27 @@ fn replay_line(ctx: &Ctx, agent_name: &str, m: &Message) -> Option<String> {
             .unwrap_or_else(|| "User".into())
     };
     Some(match (m.role.as_str(), m.kind.as_str()) {
-        (_, "card") => format!(
-            "[{agent_name} showed a card ({}): {}]",
-            if m.card.as_ref().is_some_and(crate::awareness::resolved) {
-                "resolved"
-            } else {
-                "awaiting action"
-            },
-            m.content.trim()
-        ),
+        (_, "card") => {
+            // The title is the message content; the text shown under it
+            // (choices, details) is the card's body, when it is text.
+            let body = m
+                .card
+                .as_ref()
+                .and_then(|c| c["body"].as_str())
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .map(|b| format!(" — {b}"))
+                .unwrap_or_default();
+            format!(
+                "[{agent_name} showed a card ({}): {}{body}]",
+                if m.card.as_ref().is_some_and(crate::awareness::resolved) {
+                    "resolved"
+                } else {
+                    "awaiting action"
+                },
+                m.content.trim()
+            )
+        }
         (_, "system_note") => format!("[system note] {}", m.content.trim()),
         ("user", _) => format!("{}: {}", name_of(m), m.content.trim()),
         ("assistant", _) => format!("{agent_name}: {}", m.content.trim()),
@@ -2477,17 +2489,45 @@ mod tests {
     fn prompt_recent_messages_are_bounded() {
         let long = "x".repeat(RECENT_MESSAGE_CHARS * 2);
         let messages: Vec<Message> = (0..10)
-            .map(|i| at(msg("assistant", "text", None, &long), OCT21_2112 + i))
+            .map(|i| {
+                at(
+                    msg("assistant", "text", None, &format!("m{i} {long}")),
+                    OCT21_2112 + i * 60_000,
+                )
+            })
             .collect();
         let recent = Recent::new("America/New_York", OCT22_1945, messages);
-        let cur = msg("user", "text", Some("u1"), "hi");
+        let (lines, ids) = recent_lines(&ctx("main"), "Iris", &recent);
+        // Each line is capped, and the block stays within the total.
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.chars().count() <= RECENT_MESSAGE_CHARS + 40)
+        );
+        let total: usize = lines.iter().map(|l| l.chars().count()).sum();
+        assert!(total <= RECENT_CHARS, "{total}");
+        assert!(lines.iter().all(|l| l.contains('…')));
+        // The newest messages are the ones kept, oldest first.
+        assert!((1..10).contains(&lines.len()), "{}", lines.len());
+        let first = 10 - lines.len();
+        for (k, l) in lines.iter().enumerate() {
+            assert!(l.contains(&format!("Iris: m{} ", first + k)), "{l}");
+        }
+        assert_eq!(ids.len(), lines.len());
+    }
+
+    #[test]
+    fn prompt_recent_messages_show_a_card_body() {
+        let mut card = msg("assistant", "card", None, "Pick a finish");
+        card.card = Some(json!({"type": "info", "body": "A: satin lacquer\nB: oil"}));
+        let card = at(card, OCT21_2112);
+        let recent = Recent::new("America/New_York", OCT22_1945, vec![card]);
+        let cur = msg("user", "text", Some("u1"), "B");
         let p = render_prompt_with(&ctx("main"), "Iris", &[], Some(&recent), &cur);
-        let block = &p[p.find("<recent_messages>").unwrap()..p.find("</recent_messages>").unwrap()];
-        assert!(block.chars().count() < RECENT_CHARS + RECENT_MESSAGE_CHARS + 1_000);
-        assert!(block.contains('…'));
-        // The newest messages are the ones kept.
-        let kept = block.matches("] Iris: ").count();
-        assert!((1..10).contains(&kept), "{kept}");
+        assert!(
+            p.contains("Pick a finish — A: satin lacquer\nB: oil]"),
+            "{p}"
+        );
     }
 
     #[test]

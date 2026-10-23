@@ -4,7 +4,7 @@
 /**
  * Touch handlers that let a sheet be pulled down to close: the drag starts
  * only when it is mostly downward and the sheet's content is scrolled to
- * the top, follows the finger, and closes past `distance` px (else springs
+ * the top when the touch starts, follows the finger, and closes past `distance` px (else springs
  * back). `sheet()` and `scroller()` return elements; drags that start in a
  * text box are left alone.
  */
@@ -14,7 +14,10 @@ export function pullToClose({ sheet, scroller, onClose, distance = 110 }) {
   return {
     onTouchStart: (e) => {
       const t = e.touches[0];
-      d = e.touches.length === 1 && !e.target.closest?.('input, textarea, select, [contenteditable]')
+      // Only a pull that starts at the top: a scroll back up that reaches
+      // the top on the way must not count as a pull.
+      d = e.touches.length === 1 && (scroller()?.scrollTop || 0) <= 0
+        && !e.target.closest?.('input, textarea, select, [contenteditable]')
         ? { x: t.clientX, y: t.clientY, on: false } : null;
     },
     onTouchMove: (e) => {
