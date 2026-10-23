@@ -7,6 +7,14 @@ All notable changes to Iris are documented here, following
 
 ### Added
 
+- Routine documents in more formats: PDF (its text layer), Word (.docx,
+  .odt), Excel and other spreadsheets (.xlsx, .xlsm, .xls, .ods; each sheet
+  a table, formulas as their values), CSV/TSV, JSON, HTML and RTF, besides
+  Markdown and text. The documents list shows what was read ("3 sheets ·
+  120 rows", "12 pages"), uploading a file with the same name replaces the
+  attached copy, and password-protected, damaged or scanned files get a
+  plain explanation of what to do instead.
+
 - Check-ins set in the app: Settings → "Check in on its own" turns the
   heartbeat on or off, with "How often" (every 30 minutes to once a day) and
   "Between" (its hours) while on. These app settings are the only place the

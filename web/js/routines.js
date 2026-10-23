@@ -340,6 +340,9 @@ export function RoutineEditor({ id }) {
   <//>`;
 }
 
+// Files routines can read (the server decides by extension).
+const DOC_TYPES = '.pdf,.docx,.odt,.xlsx,.xlsm,.xls,.ods,.csv,.tsv,.md,.markdown,.txt,.json,.html,.htm,.rtf';
+
 function WhatTab({ draft, up, docs, setDocs, routineId, latestDocs, uploading, setUploading }) {
   const file = useRef();
   const [removing, setRemoving] = useState(false);
@@ -350,10 +353,12 @@ function WhatTab({ draft, up, docs, setDocs, routineId, latestDocs, uploading, s
     setUploading(true);
     try {
       const { doc } = await api('POST', `/routines/docs?name=${encodeURIComponent(f.name)}`, f);
-      // The tab may have changed meanwhile: add to the latest list.
-      const next = [...latestDocs(), doc];
+      // The tab may have changed meanwhile: add to the latest list. A file
+      // with the same name as an attached one replaces it.
+      const keep = (list) => list.filter((d) => d.id !== doc.id && d.title !== doc.title);
+      const next = [...keep(latestDocs()), doc];
       if (routineId) await patch(`/routines/${seg(routineId)}`, { doc_ids: next.map((d) => d.id) });
-      setDocs([...latestDocs().filter((d) => d.id !== doc.id), doc]);
+      setDocs([...keep(latestDocs()), doc]);
     } catch (err) { toast(err.message); }
     setUploading(false);
   };
@@ -380,11 +385,11 @@ function WhatTab({ draft, up, docs, setDocs, routineId, latestDocs, uploading, s
     <div class="gl">Reference documents</div>
     ${docs.length > 0 && html`<div class="grp">${docs.map((d) => html`<div class="r" key=${d.id}>
       <div class="ri"><${Icon} name="file" size=${17} /></div>
-      <div class="rt">${d.title}<small>${d.chars < 1000 ? `${d.chars} characters` : `${Math.round(d.chars / 1000)}k characters`} · in your Library · read every run</small></div>
+      <div class="rt">${d.title}<small>${d.summary || (d.chars < 1000 ? `${d.chars} characters` : `${Math.round(d.chars / 1000)}k characters`)} · in your Library · read every run</small></div>
       <button class="icon-btn" aria-label=${`Remove ${d.title}`} disabled=${uploading || removing} onClick=${() => remove(d)}><${Icon} name="x" size=${16} /></button></div>`)}</div>`}
-    <input ref=${file} type="file" hidden accept=".md,.markdown,.txt,text/markdown,text/plain" onChange=${upload} />
+    <input ref=${file} type="file" hidden accept=${DOC_TYPES} onChange=${upload} />
     <button class="b2 wide" disabled=${uploading || removing} onClick=${() => file.current?.click()}><${Icon} name="upload" size=${17} /> ${uploading ? 'Uploading…' : 'Upload'}</button>
-    <div class="gnote">Markdown or text files, up to ${Math.round((S.routinesInfo?.max_doc_bytes || 10485760) / 1048576)} MB. Saved to your Library. I read them on every run.</div>
+    <div class="gnote">PDF, Word, Excel, CSV or text files, up to ${Math.round((S.routinesInfo?.max_doc_bytes || 10485760) / 1048576)} MB. Saved to your Library. I read them on every run.</div>
   </div>`;
 }
 
