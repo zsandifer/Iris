@@ -90,9 +90,19 @@ code { font-family: var(--mono); font-size: .88em; background: var(--sf2); borde
 
 /* ------------------------------------------------------------ messages */
 .row { display: flow-root; }
-.day { text-align: center; color: var(--mu); font-size: 12px; font-weight: 600; margin: 16px 0 4px; }
-.mt { display: block; color: var(--mu); font-size: 11px; margin: -2px 6px 8px; font-variant-numeric: tabular-nums; }
-.mt.mine { text-align: right; }
+.ts { text-align: center; font-size: 11.5px; color: var(--mu); margin: 14px 0 6px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.ts b { font-weight: 600; }
+.own-rcpt { text-align: right; font-size: 11px; color: var(--mu); margin: -2px 4px 4px; font-variant-numeric: tabular-nums; }
+.own-rcpt b { font-weight: 600; }
+.typing { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--mu); margin: 8px 0 2px; }
+.typing .dots { display: inline-flex; gap: 3px; background: var(--sf2); border-radius: 999px; padding: 8px 10px; }
+.typing .dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--mu); display: block; animation: dot-bounce 1.2s infinite; }
+.typing .dots i:nth-child(2) { animation-delay: .15s; }
+.typing .dots i:nth-child(3) { animation-delay: .3s; }
+@keyframes dot-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: .5; } 30% { transform: translateY(-3px); opacity: 1; } }
+.row.pop { animation: msg-in .32s cubic-bezier(.2, .9, .3, 1.1); }
+@keyframes msg-in { from { transform: translateY(10px) scale(.96); opacity: 0; } to { transform: none; opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .row.pop, .typing .dots i { animation: none; } }
 .b { max-width: 84%; width: fit-content; padding: 9px 13px; border-radius: 20px 20px 20px 6px; margin: 6px 0; background: var(--sf);
   border: 1px solid var(--ln); overflow-wrap: anywhere; }
 .b p { margin: 0 0 .55em; } .b p:last-child, .b > :last-child { margin-bottom: 0; }
@@ -432,6 +442,8 @@ span.fav { display: inline-block; overflow: hidden; }
 /* ------------------------------------------------------------ overlays */
 .sheet-wrap { position: absolute; inset: 0; z-index: 30; background: rgba(0,0,0,.35); display: flex; align-items: flex-end; animation: fade .2s; }
 .sheet { width: 100%; background: var(--bg); border-radius: 22px 22px 0 0; padding: 8px 16px calc(var(--sab) + 18px); max-height: 88%; overflow-y: auto; animation: rise .25s ease; }
+.sheet { transition: transform .2s ease; }
+.sheet.dragging { transition: none; }
 .grab { width: 38px; height: 5px; border-radius: 3px; background: var(--ln); margin: 0 auto 10px; }
 .sheet-body h3 { font: 600 21px/1.25 var(--serif); margin: 4px 0 6px; }
 .sheet-body p { margin: 0 0 12px; font-size: 14px; }

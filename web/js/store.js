@@ -14,7 +14,7 @@ function initialState() {
     convs: null,         // Conversation[] (not archived)
     archived: null,      // archived Conversation[] (loaded on demand)
     msgs: {},            // conversation id -> {list, hasMore, loading}
-    live: {},            // assistant message id -> {text, acts: Activity[], queued, cid}
+    live: {},            // assistant message id -> {text, acts: Activity[], queued, readAt, cid}
     logins: {},          // harness -> LoginStatus (owner)
     engines: null,       // GET /api/engines (owner)
     connectors: null,    // GET /api/connectors (owner)
@@ -728,7 +728,9 @@ export function handleEvent(ev) {
     }
     case 'turn.status': {
       const l = liveFor(ev.message_id, ev.conversation_id);
-      set({ live: { ...S.live, [ev.message_id]: { ...l, queued: ev.status === 'queued' } } });
+      // "running": the CLI picked the message up (the owner's receipt says Read).
+      const readAt = ev.status === 'running' ? (ev.read_at || Date.now()) : l.readAt;
+      set({ live: { ...S.live, [ev.message_id]: { ...l, queued: ev.status === 'queued', readAt } } });
       break;
     }
     case 'message.completed': {

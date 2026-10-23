@@ -38,6 +38,7 @@ const SHELL = [
   '/js/push.js',
   '/js/routines.js',
   '/js/schedule-text.js',
+  '/js/sheet-pull.js',
   '/js/settings.js',
   '/js/status.js',
   '/js/store.js',

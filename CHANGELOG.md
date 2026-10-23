@@ -7,6 +7,18 @@ All notable changes to Iris are documented here, following
 
 ### Added
 
+- Iris keeps track of the conversation and the clock: every turn in your
+  own chats carries the current date and time (your time zone) and the
+  last 10 messages word for word with when each was sent, so a short reply
+  like "choose B" a day later still lands after the CLI compacts its
+  history.
+
+- Read receipts and an iMessage-style chat: your latest message shows
+  Delivered, then Read with the time once Iris picks it up (kept after a
+  reload); typing dots with what Iris is doing; a "Today 6:30 PM" header
+  after an hour's gap or a new day instead of a time under every run of
+  messages; new messages pop in; sheets close when pulled down.
+
 - Routine documents in more formats: PDF (its text layer), Word (.docx,
   .odt), Excel and other spreadsheets (.xlsx, .xlsm, .xls, .ods; each sheet
   a table, formulas as their values), CSV/TSV, JSON, HTML and RTF, besides

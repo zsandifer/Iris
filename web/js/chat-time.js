@@ -1,9 +1,9 @@
-// Pure chat timeline helpers: day separators, message times, and the
-// new-message count on the jump-to-latest button. No DOM, so node tests
-// import this directly. Times are in the device's time zone and locale.
+// Pure chat timeline helpers: time headers, the owner's Delivered / Read
+// receipt, and the new-message count on the jump-to-latest button. No
+// DOM, so node tests import this directly. Times are in the device's time zone and locale.
 
-/** A run of messages from one sender gets a new time after this long. */
-export const RUN_GAP = 10 * 60 * 1000;
+/** A time header goes above a message after this long a gap. */
+export const HEADER_GAP = 60 * 60 * 1000;
 /** Show the jump-to-latest button this far (px) from the bottom. */
 export const JUMP_AWAY = 300;
 /** Within this distance (px) of the bottom the chat follows new messages. */
@@ -40,30 +40,41 @@ export function fullLabel(ms, locale = undefined) {
 }
 
 /**
- * Which separators and times to show. `items` are the messages in display
- * order as `{ at, who }`: `at` is created_at (ms), `who` identifies the
- * sender (null for lines with no time of their own, like system notes,
- * which never split a run). Returns `{ day, time }` per item: `day` is the
- * separator label to put before it (or null), and `time` says whether it
- * ends a run and shows its time. A run ends at a change of sender or day,
- * or when that sender's next message comes more than RUN_GAP later.
+ * Time headers for messages in display order (`ats` = created_at ms), as
+ * in iMessage: one before the first message, and before any message that
+ * comes more than HEADER_GAP after the one before it or on a new day.
+ * Returns `{ day, time }` (such as `{ day: 'Today', time: '6:30 PM' }`) or
+ * null per message.
  */
-export function timeline(items, now = Date.now(), locale = undefined) {
-  const next = new Array(items.length).fill(null);
-  for (let i = items.length - 2, after = null; i >= 0; i--) {
-    if (items[i + 1].who != null) after = items[i + 1];
-    next[i] = after;
-  }
-  let lastDay = null;
-  return items.map((it, i) => {
-    const day = dayNumber(it.at);
-    const label = day !== lastDay ? dayLabel(it.at, now, locale) : null;
-    lastDay = day;
-    if (it.who == null) return { day: label, time: false };
-    const n = next[i];
-    const time = !n || n.who !== it.who || n.at - it.at > RUN_GAP || dayNumber(n.at) !== day;
-    return { day: label, time };
+export function timeHeaders(ats, now = Date.now(), locale = undefined) {
+  let last = null;
+  return ats.map((at) => {
+    const show = last == null || at - last > HEADER_GAP || dayNumber(at) !== dayNumber(last);
+    last = at;
+    return show ? { day: dayLabel(at, now, locale), time: timeLabel(at, locale) } : null;
   });
+}
+
+/**
+ * The owner's receipt: under their most recent message, only while no
+ * reply has finished after it. 'delivered' until the CLI picks the turn
+ * up, then 'read' with the time (`meta.read_at`, or `readAt` from the
+ * live turn event). Returns `{ id, state, at }` or null.
+ */
+export function receiptFor(list, meId, live = {}) {
+  let i = -1;
+  for (let j = list.length - 1; j >= 0; j--) {
+    const m = list[j];
+    if (m.role === 'user' && m.author_user_id === meId && m.kind !== 'system_note') { i = j; break; }
+  }
+  if (i < 0) return null;
+  let readAt = null;
+  for (const m of list.slice(i + 1)) {
+    if (m.role !== 'assistant' || m.kind === 'card') continue;
+    if (m.status !== 'streaming') return null; // answered (or failed): no receipt
+    readAt = readAt ?? m.meta?.read_at ?? live[m.id]?.readAt ?? null;
+  }
+  return { id: list[i].id, state: readAt ? 'read' : 'delivered', at: readAt };
 }
 
 /**

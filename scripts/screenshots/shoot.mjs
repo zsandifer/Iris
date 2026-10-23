@@ -73,7 +73,7 @@ async function chatWithStatus(page, inject, store) {
   inject({ type: 'message.created', conversation_id: main, message: live(main, Date.now()) });
   inject({ type: 'message.activity', conversation_id: main, message_id: 'live-demo',
     activity: { id: 'demo-1', kind: 'mcp', name: 'calendar/list_events', status: 'started', summary: 'tomorrow morning' } });
-  await page.waitForSelector('.status');
+  await page.waitForSelector('.typing');
 }
 
 async function openChat(page, store, title) {

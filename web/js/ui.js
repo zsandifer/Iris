@@ -3,6 +3,7 @@ import { html, useEffect, useState, useRef } from './h.js';
 import { holdBlob } from './api.js';
 import { S, set, back } from './store.js';
 import { openPhoto } from './photo.js';
+import { pullToClose } from './sheet-pull.js';
 
 // Line icons (24px grid, drawn for Iris).
 const P = {
@@ -217,10 +218,14 @@ export function Sheet() {
     const id = setTimeout(() => setLast(null), 220);
     return () => clearTimeout(id);
   }, [S.sheet]);
+  // Pull a sheet down (from the top of its content) to close it.
+  const el = useRef();
+  const pull = useRef(null);
+  pull.current ||= pullToClose({ sheet: () => el.current, scroller: () => el.current, onClose: closeSheet });
   const render = S.sheet || last;
   if (!render) return null;
   return html`<div class=${'sheet-wrap' + (S.sheet ? '' : ' leaving')} onClick=${closeSheet}>
-    <div class="sheet" onClick=${(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+    <div class="sheet" ref=${el} onClick=${(e) => e.stopPropagation()} role="dialog" aria-modal="true" ...${pull.current}>
       <div class="grab" />
       ${render()}
     </div>
