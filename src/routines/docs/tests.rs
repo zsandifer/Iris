@@ -260,6 +260,7 @@ fn every_error_has_a_code_and_a_friendly_message() {
         DocError::NoText,
         DocError::TooComplex,
         DocError::Busy,
+        DocError::Unavailable,
     ] {
         assert!(!e.code().is_empty());
         let m = e.message();
@@ -1113,5 +1114,70 @@ fn long_word_tables_say_rows_were_left_out() {
         d.text.contains("[Showing the first 1,000 of 1,199 rows.]"),
         "{}",
         &d.text[d.text.len() - 200..]
+    );
+}
+
+// ------------------------------------------------------------ round 2 fixes
+
+#[test]
+fn pdf_fragments_join_by_their_glyph_widths() {
+    // Every glyph 500/1000 wide, so at size 10 each is 5 units.
+    let widths = vec!["500"; 95].join(" ");
+    let content = "BT /F1 10 Tf 1 0 0 1 72 700 Tm (Total:) Tj 1 0 0 1 105 700 Tm (123) Tj \
+                   1 0 0 1 120 700 Tm (.45) Tj ET \
+                   BT /F1 10 Tf 72 680 Td (NA) Tj 10 0 Td (ME) Tj 13 0 Td (here) Tj 0 -20 Td \
+                   [(kern) 30 (ed) -400 (gap)] TJ ET";
+    let objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [4 0 R] /Count 1 >>".to_string(),
+        format!(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Synthetic /Encoding /WinAnsiEncoding /FirstChar 32 /LastChar 126 /Widths [{widths}] >>"
+        ),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>".to_string(),
+        stream(content),
+    ];
+    let d = extract("widths.pdf", &pdf(&objects, "")).unwrap();
+    assert_eq!(d.text, "[Page 1]\nTotal: 123.45\nNAME here\nkerned gap\n\n");
+}
+
+#[test]
+fn odt_repeated_rows_are_kept_and_counted() {
+    let table = |rows: &str| {
+        format!(
+            "<office:document-content xmlns:office=\"o\" xmlns:text=\"t\" xmlns:table=\"b\"><office:body><office:text><table:table>\
+             <table:table-row><table:table-cell><text:p>Item</text:p></table:table-cell></table:table-row>{rows}\
+             <table:table-row table:number-rows-repeated=\"1048000\"><table:table-cell/></table:table-row>\
+             </table:table></office:text></office:body></office:document-content>"
+        )
+    };
+    let three = table(
+        "<table:table-row table:number-rows-repeated=\"3\"><table:table-cell><text:p>Rice</text:p></table:table-cell></table:table-row>",
+    );
+    let d = extract("rows.odt", &zip_of(&[("content.xml", &three)])).unwrap();
+    assert_eq!(d.text, "| Item |\n| --- |\n| Rice |\n| Rice |\n| Rice |\n");
+    let many = table(
+        "<table:table-row table:number-rows-repeated=\"5000\"><table:table-cell><text:p>Rice</text:p></table:table-cell></table:table-row>",
+    );
+    let d = extract("many.odt", &zip_of(&[("content.xml", &many)])).unwrap();
+    assert!(
+        d.text
+            .ends_with("[Showing the first 1,000 of 5,000 rows.]\n"),
+        "{}",
+        &d.text[d.text.len() - 80..]
+    );
+}
+
+#[test]
+fn html_past_the_tokenizer_limit_says_it_was_cut() {
+    let html = format!(
+        "<p>First</p>{}<p>Last instruction</p>",
+        "<b></b>".repeat(crate::feed::markup::MAX_TOKENS)
+    );
+    let d = extract("tags.html", html.as_bytes()).unwrap_or_else(|e| panic!("{e:?}"));
+    assert!(!d.text.contains("Last instruction"));
+    assert!(
+        d.text.contains("[Cut here: this page has more markup"),
+        "{}",
+        d.text
     );
 }

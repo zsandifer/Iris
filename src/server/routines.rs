@@ -312,7 +312,9 @@ async fn upload_doc(
         .map_err(|e| {
             let status = match e {
                 docs::DocError::Unsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                docs::DocError::Busy => StatusCode::SERVICE_UNAVAILABLE,
+                docs::DocError::Busy | docs::DocError::Unavailable => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
                 _ => StatusCode::UNPROCESSABLE_ENTITY,
             };
             // The type and size, never the name or content.

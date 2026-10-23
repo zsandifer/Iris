@@ -123,6 +123,9 @@ struct TableBuild {
     /// content repeats (OpenDocument's repeated cells).
     span: usize,
     repeat: usize,
+    /// How many times the open row repeats (OpenDocument's
+    /// number-rows-repeated).
+    row_repeat: usize,
 }
 
 /// Most columns one merged or repeated cell is taken to cover.
@@ -186,9 +189,10 @@ impl Writer {
     fn table_start(&mut self) {
         self.tables.push(TableBuild::default());
     }
-    fn row_start(&mut self) {
+    fn row_start(&mut self, repeat: usize) {
         if let Some(t) = self.tables.last_mut() {
             t.row.clear();
+            t.row_repeat = repeat.max(1);
         }
     }
     fn cell_start(&mut self) {
@@ -229,11 +233,21 @@ impl Writer {
     fn row_end(&mut self) {
         if let Some(t) = self.tables.last_mut() {
             let row = std::mem::take(&mut t.row);
-            if t.rows.len() <= super::MAX_TABLE_ROWS {
-                t.rows.push(row);
-            } else if row.iter().any(|c| !c.trim().is_empty()) {
-                t.dropped += 1;
+            let repeat = std::mem::replace(&mut t.row_repeat, 1).max(1);
+            if row.iter().all(|c| c.trim().is_empty()) {
+                // Blank rows are dropped anyway (and are what huge repeat
+                // counts are used for).
+                if t.rows.len() <= super::MAX_TABLE_ROWS {
+                    t.rows.push(row);
+                }
+                return;
             }
+            let room = (super::MAX_TABLE_ROWS + 1).saturating_sub(t.rows.len());
+            let keep = repeat.min(room);
+            for _ in 0..keep {
+                t.rows.push(row.clone());
+            }
+            t.dropped = t.dropped.saturating_add(repeat - keep);
         }
     }
     fn table_end(&mut self) {
@@ -479,7 +493,7 @@ fn docx_body<R: BufRead>(src: R, styles: &Styles, budget: &Budget) -> Result<Str
                     "br" | "cr" if in_ppr == 0 => push_text(&mut paras, "\n"),
                     "noBreakHyphen" => push_text(&mut paras, "-"),
                     "tbl" if !empty => w.table_start(),
-                    "tr" if !empty => w.row_start(),
+                    "tr" if !empty => w.row_start(1),
                     "tc" if !empty => w.cell_start(),
                     "gridSpan" => {
                         let span = attr(e, "val").and_then(|v| v.parse().ok()).unwrap_or(1);
@@ -649,7 +663,11 @@ pub(crate) fn odt(bytes: &[u8], budget: &Budget) -> Result<String, DocError> {
                     "tab" => odt_text(&mut paras, "\t"),
                     "line-break" => odt_text(&mut paras, "\n"),
                     "table" if !empty => w.table_start(),
-                    "table-row" if !empty => w.row_start(),
+                    "table-row" if !empty => w.row_start(
+                        attr(e, "number-rows-repeated")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(1),
+                    ),
                     "table-cell" | "covered-table-cell" => {
                         w.cell_start();
                         let n = |a: &str| attr(e, a).and_then(|v| v.parse().ok()).unwrap_or(1);

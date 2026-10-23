@@ -68,12 +68,16 @@ pub(crate) fn html(bytes: &[u8], kind: DocType, budget: &Budget) -> Result<Strin
     let mut pre = 0usize;
     // Cells so far in the current table row.
     let mut cells = 0usize;
-    for (i, tok) in tokenize(&src, true).into_iter().enumerate() {
+    let tokens = tokenize(&src, true);
+    // The tokenizer stops at its limit; say the page was cut.
+    let mut cut = tokens.len() >= crate::feed::markup::MAX_TOKENS;
+    for (i, tok) in tokens.into_iter().enumerate() {
         if i % 4096 == 4095 {
             budget.check()?;
         }
         // Far more than the text kept: stop building.
         if out.len() > MAX_STORED_CHARS * 4 {
+            cut = true;
             break;
         }
         match tok {
@@ -177,7 +181,14 @@ pub(crate) fn html(bytes: &[u8], kind: DocType, budget: &Budget) -> Result<Strin
     }
     let mut capped = Out::new();
     capped.push(&tidy(&out));
-    Ok(capped.finish())
+    let full = capped.full();
+    let mut text = capped.finish();
+    if cut && !full {
+        text.push_str(
+            "\n[Cut here: this page has more markup than I read, so the rest is missing.]",
+        );
+    }
+    Ok(text)
 }
 
 fn is_block(name: &str) -> bool {

@@ -94,7 +94,7 @@ Errors produced by Iris use this shape:
 | `locked` | 429 | Pairing is locked after repeated failures (see [section 2](#2-authentication-and-pairing)). |
 | `internal` | 500 | Unexpected server error. Message is always `internal server error`; details only go to the server log. |
 | `not_implemented` | 501 | `POST /api/voice/speak`. |
-| `busy` | 503 | A routine document upload while another file was still being read. |
+| `busy`, `unavailable` | 503 | A routine document upload while another file was still being read, or when the document reader couldn't start. |
 
 A few responses come from the HTTP framework (axum) and do **not** use the
 envelope:
@@ -2403,6 +2403,7 @@ Errors (each with a first-person `message` to show as is):
 | 422 | `no_text` | A PDF without a text layer (a scan). |
 | 422 | `too_complex` | Over the unpacking or time limits above. |
 | 503 | `busy` | Another file was still being read for 30 seconds. |
+| 503 | `unavailable` | The reader process couldn't start (the file is not read in the server instead). |
 
 The file is saved as an ordinary [Library item](#libraryitem) (`kind:
 "artifact"`, title = the file name, `mime` for its type) with its text

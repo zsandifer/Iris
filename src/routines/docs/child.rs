@@ -62,34 +62,41 @@ fn self_exe() -> std::path::PathBuf {
     }
 }
 
-/// Run the child for one upload. The bytes come back when it couldn't be
-/// started (the caller reads the file in-process instead).
-pub(crate) async fn run(
-    kind: DocType,
-    bytes: Vec<u8>,
-) -> Result<Result<Extracted, DocError>, Vec<u8>> {
+/// Run the child for one upload. If it can't start, the file is not read
+/// at all (never in the daemon instead).
+pub(crate) async fn run(kind: DocType, bytes: Vec<u8>) -> Result<Extracted, DocError> {
     let mut cmd = tokio::process::Command::new(self_exe());
     cmd.arg(ARG).arg(kind.ext());
     limit(&mut cmd);
     run_command(cmd, kind, bytes, EXTRACT_TIMEOUT).await
 }
 
-/// Memory, CPU, core dump and file-size limits for the child.
+/// Memory, CPU, core dump and file-size limits for the child, never
+/// above a stricter limit it inherits.
 fn limit(cmd: &mut tokio::process::Command) {
-    // SAFETY: setrlimit is async-signal-safe and touches only the child.
+    // SAFETY: getrlimit and setrlimit are async-signal-safe and touch only
+    // the child.
     unsafe {
         cmd.pre_exec(|| {
-            let set = |cur: u64| libc::rlimit {
-                rlim_cur: cur as libc::rlim_t,
-                rlim_max: cur as libc::rlim_t,
-            };
-            for (res, v) in [
+            for (res, want) in [
                 (libc::RLIMIT_AS, MAX_MEMORY),
                 (libc::RLIMIT_CPU, MAX_CPU_SECS),
                 (libc::RLIMIT_CORE, 0),
                 (libc::RLIMIT_FSIZE, 0),
             ] {
-                if libc::setrlimit(res, &set(v)) != 0 {
+                let mut cur = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(res, &mut cur) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let v = capped(want, cur.rlim_max);
+                let l = libc::rlimit {
+                    rlim_cur: v,
+                    rlim_max: v,
+                };
+                if libc::setrlimit(res, &l) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
             }
@@ -98,13 +105,19 @@ fn limit(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// A limit of `want`, but never above the inherited hard limit (which an
+/// unprivileged process can't raise).
+fn capped(want: u64, hard: libc::rlim_t) -> libc::rlim_t {
+    (want as libc::rlim_t).min(hard)
+}
+
 /// Feed `bytes` to the command and read its answer within `timeout`.
 pub(crate) async fn run_command(
     mut cmd: tokio::process::Command,
     kind: DocType,
     bytes: Vec<u8>,
     timeout: Duration,
-) -> Result<Result<Extracted, DocError>, Vec<u8>> {
+) -> Result<Extracted, DocError> {
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -114,11 +127,11 @@ pub(crate) async fn run_command(
         Ok(c) => c,
         Err(e) => {
             crate::warn!("could not start the document reader: {e}");
-            return Err(bytes);
+            return Err(DocError::Unavailable);
         }
     };
     let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-        return Err(bytes);
+        return Err(DocError::Unavailable);
     };
     // The child may stop reading early (a bad file); that's not an error here.
     let feed = tokio::spawn(async move {
@@ -133,26 +146,26 @@ pub(crate) async fn run_command(
     feed.abort();
     let Ok((answer, status)) = outcome else {
         // Out of time: kill_on_drop ends it.
-        return Ok(Err(DocError::TooComplex));
+        return Err(DocError::TooComplex);
     };
     let noun = kind.noun();
     let status = match status {
         Ok(s) => s,
-        Err(_) => return Ok(Err(DocError::Unreadable(noun))),
+        Err(_) => return Err(DocError::Unreadable(noun)),
     };
     if !status.success() {
         // A panic (exit 101) is a file the parser choked on; a signal
         // (out of memory, out of CPU) is a file too big to read.
-        return Ok(Err(if status.code() == Some(101) {
+        return Err(if status.code() == Some(101) {
             DocError::Unreadable(noun)
         } else {
             DocError::TooComplex
-        }));
+        });
     }
     let Ok(v) = serde_json::from_slice::<Value>(&answer) else {
-        return Ok(Err(DocError::Unreadable(noun)));
+        return Err(DocError::Unreadable(noun));
     };
-    Ok(
+    {
         match (
             v["text"].as_str(),
             v["summary"].as_str(),
@@ -171,8 +184,8 @@ pub(crate) async fn run_command(
                 _ => DocError::Unreadable(noun),
             }),
             _ => Err(DocError::Unreadable(noun)),
-        },
-    )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -195,7 +208,6 @@ mod tests {
             Duration::from_millis(timeout_ms),
         )
         .await
-        .expect("started")
     }
 
     #[tokio::test]
@@ -254,12 +266,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_reader_falls_back() {
+    async fn a_reader_that_cannot_start_reads_nothing() {
         let cmd = tokio::process::Command::new("/nonexistent/iris");
-        assert!(
+        assert_eq!(
             run_command(cmd, DocType::Csv, vec![1], Duration::from_secs(1))
                 .await
-                .is_err_and(|bytes| bytes == [1])
+                .unwrap_err(),
+            DocError::Unavailable
         );
+    }
+
+    #[test]
+    fn stricter_inherited_limits_are_kept() {
+        assert_eq!(
+            capped(MAX_MEMORY, libc::RLIM_INFINITY),
+            MAX_MEMORY as libc::rlim_t
+        );
+        assert_eq!(capped(MAX_MEMORY, 512 << 20), 512 << 20);
+        assert_eq!(capped(0, libc::RLIM_INFINITY), 0);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_reader_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        // Without the file-size limit, so it can write its pid.
+        let r = run_command(
+            sh(&script),
+            DocType::Csv,
+            vec![],
+            Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(r.unwrap_err(), DocError::TooComplex);
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_string();
+        // Killed: gone, or at most a zombie waiting to be reaped.
+        let stat = format!("/proc/{pid}/stat");
+        let mut alive = true;
+        for _ in 0..50 {
+            alive = std::fs::read_to_string(&stat)
+                .ok()
+                .and_then(|s| s.rsplit(") ").next().map(|r| !r.starts_with('Z')))
+                .unwrap_or(false);
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!alive, "the reader {pid} is still running");
     }
 }

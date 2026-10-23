@@ -168,6 +168,8 @@ pub enum DocError {
     TooComplex,
     /// Another file is still being read.
     Busy,
+    /// The reader process couldn't start.
+    Unavailable,
 }
 
 impl DocError {
@@ -181,6 +183,7 @@ impl DocError {
             DocError::NoText => "no_text",
             DocError::TooComplex => "too_complex",
             DocError::Busy => "busy",
+            DocError::Unavailable => "unavailable",
         }
     }
 
@@ -205,6 +208,9 @@ impl DocError {
                                      its own file."
                 .into(),
             DocError::Busy => "I'm still reading another file. Try again in a minute.".into(),
+            DocError::Unavailable => {
+                "I couldn't start reading that file just now. Try again in a minute.".into()
+            }
         }
     }
 }
@@ -364,10 +370,9 @@ static SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 /// Read an upload within [`EXTRACT_TIMEOUT`], one file at a time. With
 /// `isolate` (the daemon), the file is read in a child process with memory
 /// and CPU limits that is killed at the deadline, so no file can take the
-/// daemon down. Without it (tests, or if the child can't start), it is read
-/// on the blocking pool, where a file past its deadline holds the slot
-/// until its reader notices and stops, so a stuck file never piles up
-/// threads.
+/// daemon down; if that can't start, the file isn't read. Without it
+/// (tests), it is read on the blocking pool, where a file past its
+/// deadline holds the slot until its reader notices and stops.
 pub async fn extract_bounded(
     file_name: String,
     bytes: Vec<u8>,
@@ -375,14 +380,11 @@ pub async fn extract_bounded(
 ) -> Result<Extracted, DocError> {
     let kind = doc_type(&file_name).ok_or_else(|| unsupported(&file_name))?;
     let permit = take_slot(&SLOT, EXTRACT_TIMEOUT).await?;
-    let bytes = if isolate {
-        match child::run(kind, bytes).await {
-            Ok(result) => return result,
-            Err(bytes) => bytes,
-        }
-    } else {
-        bytes
-    };
+    if isolate {
+        let result = child::run(kind, bytes).await;
+        drop(permit);
+        return result;
+    }
     blocking(permit, EXTRACT_TIMEOUT, kind.noun(), move |budget| {
         extract_with(&file_name, &bytes, budget)
     })
