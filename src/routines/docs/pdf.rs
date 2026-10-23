@@ -321,6 +321,8 @@ fn page_text(doc: &Document, id: ObjectId, budget: &Budget) -> Result<String, Pa
         forms: 0,
         text: TextState::default(),
         pen: None,
+        ctm: IDENTITY,
+        saved: Vec::new(),
     };
     page.run(&content, &dicts, 0)?;
     Ok(page.s)
@@ -367,8 +369,33 @@ struct Page<'a> {
     /// Forms drawn so far on this page.
     forms: usize,
     text: TextState,
-    /// Where the last fragment ended (page x if known, baseline y).
+    /// Where the last fragment ended on the page (x if known, baseline y).
     pen: Option<(Option<f32>, f32)>,
+    /// The graphics transform (`cm`), and the ones saved by `q`.
+    ctm: Matrix,
+    saved: Vec<Matrix>,
+}
+
+type Matrix = [f32; 6];
+const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+/// Deepest `q` nesting followed.
+const MAX_SAVED: usize = 256;
+
+/// `m` then `n` (PDF's row-vector order: a point goes through `m` first).
+fn concat(m: Matrix, n: Matrix) -> Matrix {
+    [
+        m[0] * n[0] + m[1] * n[2],
+        m[0] * n[1] + m[1] * n[3],
+        m[2] * n[0] + m[3] * n[2],
+        m[2] * n[1] + m[3] * n[3],
+        m[4] * n[0] + m[5] * n[2] + n[4],
+        m[4] * n[1] + m[5] * n[3] + n[5],
+    ]
+}
+
+fn matrix(args: &[Object]) -> Option<Matrix> {
+    let v: Vec<f32> = args.iter().filter_map(number).collect();
+    (v.len() == 6).then(|| [v[0], v[1], v[2], v[3], v[4], v[5]])
 }
 
 impl<'a> Page<'a> {
@@ -388,16 +415,25 @@ impl<'a> Page<'a> {
             return;
         };
         let t = self.text;
-        let start_x = t.x.map(|x| t.e + x * t.a);
-        let em = (t.size * t.d).abs().max(0.1);
+        // Positions on the page: text space through the text line matrix,
+        // then the graphics transform.
+        let m = self.ctm;
+        let page = |x: f32| {
+            let (ux, uy) = (t.e + x * t.a, t.f);
+            (m[0] * ux + m[2] * uy + m[4], m[1] * ux + m[3] * uy + m[5])
+        };
+        let (sx, sy) = (m[0].hypot(m[1]), m[2].hypot(m[3]));
+        let start = page(t.x.unwrap_or(0.0));
+        let start_x = t.x.map(|_| start.0);
+        let em = (t.size * t.d * sy).abs().max(0.1);
         if let Some((end_x, y)) = self.pen {
-            if (t.f - y).abs() > em * 0.3 {
+            if (start.1 - y).abs() > em * 0.3 {
                 newline(&mut self.s);
             } else {
                 match (end_x, start_x) {
                     // A gap wider than a thin space, or a jump back.
                     (Some(end), Some(start)) => {
-                        let gap = (start - end) / (t.size * t.a).abs().max(0.1);
+                        let gap = (start - end) / (t.size * t.a * sx).abs().max(0.1);
                         if !(-1.0..=0.15).contains(&gap) {
                             space(&mut self.s);
                         }
@@ -427,7 +463,7 @@ impl<'a> Page<'a> {
                     * t.scale
             });
         self.text.x = t.x.zip(advance).map(|(x, a)| x + a);
-        self.pen = Some((self.text.x.map(|x| t.e + x * t.a), t.f));
+        self.pen = Some((self.text.x.map(|x| page(x).0), start.1));
     }
 
     /// Next line, as `T*` does.
@@ -452,6 +488,17 @@ impl<'a> Page<'a> {
             let args = &op.operands;
             let n = |i: usize| args.get(i).and_then(number);
             match op.operator.as_str() {
+                "q" if self.saved.len() < MAX_SAVED => self.saved.push(self.ctm),
+                "Q" => {
+                    if let Some(m) = self.saved.pop() {
+                        self.ctm = m;
+                    }
+                }
+                "cm" => {
+                    if let Some(m) = matrix(args) {
+                        self.ctm = concat(m, self.ctm);
+                    }
+                }
                 "BT" => {
                     let t = &mut self.text;
                     (t.a, t.d) = (1.0, 1.0);
@@ -547,10 +594,20 @@ impl<'a> Page<'a> {
                         .collect();
                     inner.extend_from_slice(dicts);
                     newline(&mut self.s);
-                    let saved = self.text;
+                    let (text, ctm, depth_saved) = (self.text, self.ctm, self.saved.len());
+                    if let Some(m) = form
+                        .dict
+                        .get(b"Matrix")
+                        .ok()
+                        .and_then(|m| m.as_array().ok())
+                        .and_then(|m| matrix(m))
+                    {
+                        self.ctm = concat(m, self.ctm);
+                    }
                     self.pen = None;
                     self.run(&body, &inner, depth + 1)?;
-                    self.text = saved;
+                    (self.text, self.ctm) = (text, ctm);
+                    self.saved.truncate(depth_saved);
                     self.pen = None;
                     newline(&mut self.s);
                 }

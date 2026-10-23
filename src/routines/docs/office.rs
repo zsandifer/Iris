@@ -234,12 +234,9 @@ impl Writer {
         if let Some(t) = self.tables.last_mut() {
             let row = std::mem::take(&mut t.row);
             let repeat = std::mem::replace(&mut t.row_repeat, 1).max(1);
+            // Blank rows are dropped anyway (and are what huge repeat counts
+            // are used for): they don't use up the row cap.
             if row.iter().all(|c| c.trim().is_empty()) {
-                // Blank rows are dropped anyway (and are what huge repeat
-                // counts are used for).
-                if t.rows.len() <= super::MAX_TABLE_ROWS {
-                    t.rows.push(row);
-                }
                 return;
             }
             let room = (super::MAX_TABLE_ROWS + 1).saturating_sub(t.rows.len());

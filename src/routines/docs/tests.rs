@@ -1181,3 +1181,63 @@ fn html_past_the_tokenizer_limit_says_it_was_cut() {
         d.text
     );
 }
+
+// ------------------------------------------------------------ round 3 fixes
+
+#[test]
+fn pdf_positions_go_through_graphics_transforms() {
+    let widths = vec!["500"; 95].join(" ");
+    let content = "q 1 0 0 1 72 700 cm BT /F1 10 Tf (123) Tj ET Q \
+                   q 1 0 0 1 87 700 cm BT /F1 10 Tf (.45) Tj ET Q \
+                   q 1 0 0 1 72 680 cm BT /F1 10 Tf (1) Tj ET Q \
+                   q 1 0 0 1 72 660 cm BT /F1 10 Tf (2) Tj ET Q \
+                   q 2 0 0 2 0 0 cm 1 0 0 1 36 320 cm BT /F1 5 Tf (scaled) Tj ET Q \
+                   q 1 0 0 1 112 640 cm BT /F1 10 Tf (gap) Tj ET Q";
+    let objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [4 0 R] /Count 1 >>".to_string(),
+        format!(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Synthetic /Encoding /WinAnsiEncoding /FirstChar 32 /LastChar 126 /Widths [{widths}] >>"
+        ),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>".to_string(),
+        stream(content),
+    ];
+    let d = extract("cm.pdf", &pdf(&objects, "")).unwrap();
+    // "scaled" (size 5, scaled 2×) ends at 72 + 2 × 15 = 102 on page y 640;
+    // "gap" starts 1 em later on the same line: a space.
+    assert_eq!(d.text, "[Page 1]\n123.45\n1\n2\nscaled gap\n\n");
+}
+
+#[test]
+fn html_without_a_closing_head_tag_keeps_its_body() {
+    let d = extract(
+        "page.html",
+        b"<html><head><title>Weekly order</title><style>p{}</style><body><p>Buy 2 teas.</p>",
+    )
+    .unwrap();
+    assert_eq!(d.text, "Buy 2 teas.\n");
+}
+
+#[test]
+fn blank_table_rows_do_not_use_up_the_row_cap() {
+    let rows: String = (0..1_000)
+        .map(|i| {
+            format!(
+                "<table:table-row><table:table-cell><text:p>r{i}</text:p></table:table-cell></table:table-row>\
+                 <table:table-row><table:table-cell/></table:table-row>"
+            )
+        })
+        .collect();
+    let content = format!(
+        "<office:document-content xmlns:office=\"o\" xmlns:text=\"t\" xmlns:table=\"b\"><office:body><office:text><table:table>\
+         <table:table-row><table:table-cell><text:p>Item</text:p></table:table-cell></table:table-row>{rows}\
+         </table:table></office:text></office:body></office:document-content>"
+    );
+    let d = extract("gaps.odt", &zip_of(&[("content.xml", &content)])).unwrap();
+    assert!(d.text.contains("| r999 |"));
+    assert!(
+        !d.text.contains("Showing the first"),
+        "{}",
+        &d.text[d.text.len() - 80..]
+    );
+}

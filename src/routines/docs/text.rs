@@ -55,8 +55,12 @@ pub(crate) fn json(bytes: &[u8]) -> Result<(String, String), DocError> {
 
 /// Elements whose content is never shown.
 const HIDDEN: &[&str] = &[
-    "head", "script", "style", "noscript", "template", "svg", "iframe", "object", "textarea",
+    "script", "style", "noscript", "template", "svg", "iframe", "object", "textarea",
 ];
+
+/// What may appear in `<head>`; anything else starts the body, even
+/// without `</head>` (HTML lets it be left out).
+const HEAD_ONLY: &[&str] = &["head", "title", "meta", "link", "base"];
 
 /// HTML as readable text: headings become `#` lines, list items `- `
 /// lines, paragraphs and table rows their own lines.
@@ -64,6 +68,8 @@ pub(crate) fn html(bytes: &[u8], kind: DocType, budget: &Budget) -> Result<Strin
     let src = decode(bytes, kind)?;
     let mut out = String::new();
     let mut hidden = 0usize;
+    // Inside <head>: nothing there is shown.
+    let mut in_head = false;
     let mut lists = 0usize;
     let mut pre = 0usize;
     // Cells so far in the current table row.
@@ -84,13 +90,23 @@ pub(crate) fn html(bytes: &[u8], kind: DocType, budget: &Budget) -> Result<Strin
             Token::Start {
                 name, self_closing, ..
             } => {
+                if name == "head" {
+                    in_head = !self_closing;
+                    continue;
+                }
+                if in_head
+                    && !HEAD_ONLY.contains(&name.as_str())
+                    && !HIDDEN.contains(&name.as_str())
+                {
+                    in_head = false;
+                }
                 if HIDDEN.contains(&name.as_str()) {
                     if !self_closing {
                         hidden += 1;
                     }
                     continue;
                 }
-                if hidden > 0 {
+                if hidden > 0 || in_head {
                     continue;
                 }
                 match name.as_str() {
@@ -134,11 +150,15 @@ pub(crate) fn html(bytes: &[u8], kind: DocType, budget: &Budget) -> Result<Strin
                 }
             }
             Token::End { name } => {
+                if name == "head" {
+                    in_head = false;
+                    continue;
+                }
                 if HIDDEN.contains(&name.as_str()) {
                     hidden = hidden.saturating_sub(1);
                     continue;
                 }
-                if hidden > 0 {
+                if hidden > 0 || in_head {
                     continue;
                 }
                 match name.as_str() {
@@ -159,7 +179,7 @@ pub(crate) fn html(bytes: &[u8], kind: DocType, budget: &Budget) -> Result<Strin
                     _ => {}
                 }
             }
-            Token::Text(t) if hidden == 0 => {
+            Token::Text(t) if hidden == 0 && !in_head => {
                 if pre > 0 {
                     out.push_str(&t);
                 } else {
