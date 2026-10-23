@@ -722,9 +722,240 @@ pub fn relay_stdio(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `iris version` output. The service reads the root-owned launcher's
+/// build from it (`check_launcher`): the launcher checks every request
+/// against its own build's rules, so a launcher left behind by an upgrade
+/// refuses the newer service's turns.
+pub fn version_line() -> String {
+    format!(
+        "iris {} (build {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("IRIS_BUILD_ID")
+    )
+}
+
+/// How the root-owned launcher's build compares with this service's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LauncherState {
+    /// The same build as the service.
+    Current,
+    /// A different build, or one from before `iris version` reported builds.
+    Outdated,
+    /// Cannot tell (a development build on either side, or the launcher
+    /// could not be run or answered unexpectedly). Nothing is shown.
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LauncherCheck {
+    pub state: LauncherState,
+    /// The build the launcher reported; null when it reported none.
+    pub build_id: Option<String>,
+    pub service_build_id: String,
+}
+
+/// The build in `iris version` output. Outer `None`: not Iris's output.
+/// Inner `None`: a launcher from before builds were reported (`iris X.Y.Z`).
+fn parse_version(out: &str) -> Option<Option<String>> {
+    let rest = out.lines().next()?.trim().strip_prefix("iris ")?;
+    let Some((version, build)) = rest.split_once(" (build ") else {
+        return (!rest.is_empty() && !rest.contains(char::is_whitespace)).then_some(None);
+    };
+    let id = build.strip_suffix(')')?;
+    let valid = !version.is_empty()
+        && !id.is_empty()
+        && id.len() <= 64
+        && id.bytes().all(|b| b.is_ascii_alphanumeric());
+    valid.then(|| Some(id.to_owned()))
+}
+
+/// Compare the launcher's `iris version` output (None: it could not be
+/// run) with this service's build id. Development builds are never compared.
+pub fn compare_launcher(service: &str, output: Option<&str>) -> LauncherCheck {
+    let parsed = output.and_then(parse_version);
+    let build_id = parsed.clone().flatten();
+    let state = match parsed {
+        _ if service == "dev" => LauncherState::Unknown,
+        None => LauncherState::Unknown,
+        Some(None) => LauncherState::Outdated,
+        Some(Some(id)) if id == "dev" => LauncherState::Unknown,
+        Some(Some(id)) if id == service => LauncherState::Current,
+        Some(Some(_)) => LauncherState::Outdated,
+    };
+    LauncherCheck {
+        state,
+        build_id,
+        service_build_id: service.to_owned(),
+    }
+}
+
+/// Read the launcher's build by running its `version` command directly:
+/// it is world-executable, so this needs no sudo and runs as the service
+/// user, with nothing inherited. `None` in single-user mode.
+pub async fn check_launcher(cfg: &AgentConfig) -> Option<LauncherCheck> {
+    if cfg.user.is_empty() {
+        return None;
+    }
+    let mut cmd = tokio::process::Command::new(&cfg.launcher);
+    cmd.arg("version")
+        .env_clear()
+        .current_dir("/")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = match crate::util::spawn_retrying(|| cmd.spawn()) {
+        Ok(child) => {
+            tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output()).await
+        }
+        Err(e) => Ok(Err(e)),
+    };
+    let output = match output {
+        Ok(Ok(o)) if o.status.success() => {
+            Some(String::from_utf8_lossy(&o.stdout[..o.stdout.len().min(4096)]).into_owned())
+        }
+        _ => None,
+    };
+    Some(compare_launcher(env!("IRIS_BUILD_ID"), output.as_deref()))
+}
+
+/// Whether a turn's error is the launcher refusing the request before any
+/// CLI ran: its own `agent-exec:` message (everything after that prefix
+/// replaces the launcher with the CLI), or a failed launcher operation.
+pub fn launcher_refused(detail: &str) -> bool {
+    detail.trim_start().starts_with("agent-exec:") || detail.contains("agent launcher failed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_output_is_parsed() {
+        assert_eq!(
+            parse_version("iris 0.4.0 (build 0dbad0a1)\n"),
+            Some(Some("0dbad0a1".into()))
+        );
+        assert_eq!(
+            parse_version("iris 0.4.0 (build dev)"),
+            Some(Some("dev".into()))
+        );
+        // A launcher from before builds were reported.
+        assert_eq!(parse_version("iris 0.3.2\n"), Some(None));
+        for bad in [
+            "",
+            "\n",
+            "iris",
+            "iris ",
+            "something else 1.0",
+            "iris 0.4.0 (build )",
+            "iris 0.4.0 (build ab;cd)",
+            "iris 0.4.0 (build abc",
+            "iris  (build abc)",
+            "iris 0.4.0 extra words",
+        ] {
+            assert_eq!(parse_version(bad), None, "{bad:?}");
+        }
+        let own = version_line();
+        assert_eq!(
+            parse_version(&own),
+            Some(Some(env!("IRIS_BUILD_ID").to_owned()))
+        );
+    }
+
+    #[test]
+    fn launcher_builds_are_compared_except_development_builds() {
+        let state = |service: &str, out: Option<&str>| compare_launcher(service, out).state;
+        use LauncherState::*;
+        assert_eq!(
+            state("0dbad0a1", Some("iris 0.4.0 (build 0dbad0a1)")),
+            Current
+        );
+        assert_eq!(
+            state("0dbad0a1", Some("iris 0.4.0 (build 59d96590)")),
+            Outdated
+        );
+        assert_eq!(state("0dbad0a1", Some("iris 0.3.2")), Outdated);
+        // Development builds on either side cannot be compared.
+        assert_eq!(state("dev", Some("iris 0.4.0 (build 59d96590)")), Unknown);
+        assert_eq!(state("dev", Some("iris 0.3.2")), Unknown);
+        assert_eq!(state("0dbad0a1", Some("iris 0.4.0 (build dev)")), Unknown);
+        // Not runnable, or unexpected output.
+        assert_eq!(state("0dbad0a1", None), Unknown);
+        assert_eq!(state("0dbad0a1", Some("Permission denied")), Unknown);
+        let c = compare_launcher("0dbad0a1", Some("iris 0.4.0 (build 59d96590)"));
+        assert_eq!(c.build_id.as_deref(), Some("59d96590"));
+        assert_eq!(c.service_build_id, "0dbad0a1");
+        assert_eq!(
+            compare_launcher("0dbad0a1", Some("iris 0.3.2")).build_id,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn launcher_version_runs_directly_without_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        // Single-user mode never runs anything.
+        assert_eq!(check_launcher(&AgentConfig::default()).await, None);
+        let tmp = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            AgentConfig {
+                user: "iris-agent".into(),
+                launcher: path.to_string_lossy().into_owned(),
+            }
+        };
+        let service = env!("IRIS_BUILD_ID");
+        // The launcher gets only `version`, no environment, and runs in `/`.
+        let same = script(
+            "same",
+            &format!(
+                "[ \"$*\" = version ] && [ -z \"$HOME\" ] && [ \"$(pwd)\" = / ] || exit 1\n\
+                 echo 'iris 0.0.0 (build {service})'"
+            ),
+        );
+        let expect_same = if service == "dev" {
+            LauncherState::Unknown
+        } else {
+            LauncherState::Current
+        };
+        assert_eq!(check_launcher(&same).await.unwrap().state, expect_same);
+        let old = script("old", "echo 'iris 0.0.1'");
+        let expect_old = if service == "dev" {
+            LauncherState::Unknown
+        } else {
+            LauncherState::Outdated
+        };
+        assert_eq!(check_launcher(&old).await.unwrap().state, expect_old);
+        let failing = script("failing", "echo 'iris 0.0.1'; exit 1");
+        assert_eq!(
+            check_launcher(&failing).await.unwrap().state,
+            LauncherState::Unknown
+        );
+        let missing = AgentConfig {
+            user: "iris-agent".into(),
+            launcher: tmp.path().join("missing").to_string_lossy().into_owned(),
+        };
+        assert_eq!(
+            check_launcher(&missing).await.unwrap().state,
+            LauncherState::Unknown
+        );
+    }
+
+    #[test]
+    fn launcher_refusals_are_recognized() {
+        assert!(launcher_refused(
+            "agent-exec: environment variable is not allowed in agent launcher"
+        ));
+        assert!(launcher_refused(
+            "could not prepare isolated turn: agent launcher failed; check root setup and service permissions"
+        ));
+        assert!(!launcher_refused("Claude Code exited without a result"));
+        assert!(!launcher_refused("error: see agent-exec: in the docs"));
+    }
 
     fn test_policy() -> Policy {
         Policy {

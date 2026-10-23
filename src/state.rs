@@ -137,6 +137,9 @@ pub struct Inner {
     pub rankings: Rankings,
     pub logins: crate::login::LoginManager,
     pub engine_ops: crate::setup::EngineOps,
+    /// The root-owned agent launcher's build compared with this service's
+    /// (split mode, once checked; `setup::check_launcher`).
+    pub launcher: Mutex<Option<crate::agent::LauncherCheck>>,
     /// Iris's computer: the agent's browser.
     pub browser: crate::browser::Browser,
     /// Connector gateway: turn grants, running connectors, approvals.
@@ -301,6 +304,7 @@ impl AppState {
             browser,
             logins: crate::login::LoginManager::default(),
             engine_ops: crate::setup::EngineOps::default(),
+            launcher: Mutex::default(),
             gateway: crate::gateway::Gateway::default(),
             oauth: crate::oauth::Flows::default(),
             serving: std::sync::atomic::AtomicBool::new(false),

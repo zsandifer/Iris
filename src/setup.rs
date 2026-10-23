@@ -3,6 +3,7 @@
 //! engines Iris installed, and the cards that walk the owner through
 //! first-run setup in chat (set up an engine -> sign in -> done).
 
+use crate::agent::{LauncherCheck, LauncherState};
 use crate::db;
 use crate::engines::{self, ENGINES};
 use crate::harness::AuthState;
@@ -78,6 +79,7 @@ pub fn engines_root(state: &AppState) -> PathBuf {
 pub fn engines_json(state: &AppState) -> Vec<Value> {
     let root = engines_root(state);
     let npm = crate::harness::resolve_command("npm").is_some();
+    let launcher_outdated = launcher_outdated(state);
     ENGINES
         .iter()
         .map(|e| {
@@ -103,11 +105,192 @@ pub fn engines_json(state: &AppState) -> Vec<Value> {
                 "isolation": if state.cfg.agent.user.is_empty() { "single_user" } else { "split" },
                 "agent_user": status.as_ref().and_then(|s| s.agent_user.clone()),
                 "signed_in_as_agent": if state.cfg.agent.user.is_empty() { None } else { status.as_ref().and_then(|s| match s.auth { AuthState::Unknown => None, other => Some(other == AuthState::Ok) }) },
+                "launcher_outdated": launcher_outdated,
                 "requires": needs,
                 "operation": state.engine_ops.get(e.name),
             })
         })
         .collect()
+}
+
+/// The last launcher check, for `GET /api/engines` (null in single-user
+/// mode or before the first check).
+pub fn launcher_json(state: &AppState) -> Value {
+    json!(*state.launcher.lock().unwrap_or_else(|p| p.into_inner()))
+}
+
+/// True when the root-owned launcher is known to be out of date; null in
+/// single-user mode or when it cannot be told.
+fn launcher_outdated(state: &AppState) -> Option<bool> {
+    match state
+        .launcher
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+    {
+        Some(c) if c.state != LauncherState::Unknown => Some(c.state == LauncherState::Outdated),
+        _ => None,
+    }
+}
+
+const LAUNCHER_CARD: &str = "launcher_card";
+const LAUNCHER_CARD_KEY: &str = "launcher_card.key";
+
+/// Compare the root-owned launcher's build with this service's (split
+/// mode only; at startup and when a turn was refused by the launcher). An
+/// outdated launcher gets one card in the owner's Main chat with the fix;
+/// once a later check finds it current, that card says so.
+pub async fn check_launcher(state: &AppState) -> Option<LauncherCheck> {
+    let check = crate::agent::check_launcher(&state.cfg.agent).await?;
+    apply_launcher_check(state, &check).await;
+    Some(check)
+}
+
+async fn apply_launcher_check(state: &AppState, check: &LauncherCheck) {
+    let changed = {
+        let mut last = state.launcher.lock().unwrap_or_else(|p| p.into_inner());
+        let changed = last.as_ref() != Some(check);
+        *last = Some(check.clone());
+        changed
+    };
+    match check.state {
+        LauncherState::Outdated => {
+            if changed {
+                crate::warn!(
+                    "agent launcher {} is from build {}, this service is build {}; reinstall the launcher",
+                    state.cfg.agent.launcher,
+                    check.build_id.as_deref().unwrap_or("(unreported)"),
+                    check.service_build_id
+                );
+            }
+            post_launcher_card(state, check).await;
+        }
+        LauncherState::Current => resolve_launcher_card(state).await,
+        LauncherState::Unknown => {}
+    }
+    if changed {
+        broadcast(state);
+    }
+}
+
+/// The binary to install as the launcher: the one this service runs.
+fn service_binary(state: &AppState) -> String {
+    let exe = state.exe.to_string_lossy();
+    exe.strip_suffix(" (deleted)").unwrap_or(&exe).to_string()
+}
+
+fn launcher_card(state: &AppState, check: &LauncherCheck) -> Value {
+    let launcher = &state.cfg.agent.launcher;
+    let why = if check.build_id.is_some() {
+        format!(
+            "My agent launcher ({launcher}) is from a different build of Iris than the one \
+             running now"
+        )
+    } else {
+        format!(
+            "My agent launcher ({launcher}) looks like it's from an older version of Iris \
+             (it doesn't report its build)"
+        )
+    };
+    json!({
+        "type": "info",
+        "title": "Update the agent launcher",
+        "body": format!(
+            "{why}, so it may refuse my requests and I can't reply until it matches. To fix \
+             it, run this as root on the server, then restart Iris: install -Dm755 {} {launcher}",
+            service_binary(state)
+        ),
+        "state": "pending",
+        "owner_only": true,
+    })
+}
+
+async fn post_launcher_card(state: &AppState, check: &LauncherCheck) {
+    let key = format!(
+        "{}:{}",
+        check.service_build_id,
+        check.build_id.as_deref().unwrap_or("none")
+    );
+    let card = launcher_card(state, check);
+    let posted = state
+        .db
+        .call(move |c| {
+            if db::get_setting(c, LAUNCHER_CARD_KEY)?.as_deref() == Some(key.as_str()) {
+                return Ok(None);
+            }
+            let Some(owner) = db::owner_user_id(c)? else {
+                return Ok(None);
+            };
+            // A card still waiting (another build pair) is rewritten, not repeated.
+            let open = match db::get_setting(c, LAUNCHER_CARD)? {
+                Some(id) => db::get_message(c, &id)?
+                    .filter(|m| m.card.as_ref().is_some_and(|c| c["state"] == "pending")),
+                None => None,
+            };
+            let (m, created) = match open {
+                Some(m) => (db::update_message_card(c, &m.id, &card)?, false),
+                None => {
+                    let main = db::ensure_main_conversation(c, &owner)?;
+                    let m = crate::entities::insert_card(c, &main, &card, "assistant")?;
+                    db::set_setting(c, LAUNCHER_CARD, &m.id)?;
+                    (m, true)
+                }
+            };
+            db::set_setting(c, LAUNCHER_CARD_KEY, &key)?;
+            Ok(Some((owner, m, created)))
+        })
+        .await
+        .ok()
+        .flatten();
+    if let Some((owner, m, created)) = posted {
+        let kind = if created {
+            "message.created"
+        } else {
+            "message.updated"
+        };
+        state.hub.to_users(
+            std::slice::from_ref(&owner),
+            json!({"type": kind, "conversation_id": m.conversation_id, "message": m}),
+        );
+    }
+}
+
+async fn resolve_launcher_card(state: &AppState) {
+    let updated = state
+        .db
+        .call(move |c| {
+            // A later mismatch posts a new card, even with the same builds.
+            db::delete_setting(c, LAUNCHER_CARD_KEY)?;
+            let Some(id) = db::get_setting(c, LAUNCHER_CARD)? else {
+                return Ok(None);
+            };
+            let Some(m) = db::get_message(c, &id)? else {
+                return Ok(None);
+            };
+            let mut card = m.card.clone().unwrap_or(Value::Null);
+            if card["state"] == "done" {
+                return Ok(None);
+            }
+            card["state"] = "done".into();
+            card["title"] = "Agent launcher updated".into();
+            card["body"] = "My agent launcher matches this version of Iris now.".into();
+            db::update_message_card(c, &id, &card).map(Some)
+        })
+        .await
+        .ok()
+        .flatten();
+    if let Some(m) = updated {
+        let conv = m.conversation_id.clone();
+        let members = state
+            .db
+            .call(move |c| db::conversation_member_ids(c, &conv))
+            .await
+            .unwrap_or_default();
+        state.hub.to_users(
+            &members,
+            json!({"type": "message.updated", "conversation_id": m.conversation_id, "message": m}),
+        );
+    }
 }
 
 /// Run an engine operation through the privileged helper.
@@ -426,5 +609,125 @@ pub async fn update_setup_card(state: &AppState) {
             &members,
             json!({"type": "message.updated", "conversation_id": m.conversation_id, "message": m}),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state(tmp: &tempfile::TempDir) -> AppState {
+        let paths = crate::config::Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        AppState::new(
+            crate::config::Config::default(),
+            paths,
+            db::Db::open_in_memory().unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn check(state: LauncherState, build: Option<&str>) -> LauncherCheck {
+        LauncherCheck {
+            state,
+            build_id: build.map(String::from),
+            service_build_id: "0a1b2c3d".into(),
+        }
+    }
+
+    async fn cards(state: &AppState) -> Vec<db::Message> {
+        state
+            .db
+            .call(|c| {
+                let owner = db::owner_user_id(c)?.unwrap();
+                let main = db::ensure_main_conversation(c, &owner)?;
+                Ok(db::list_messages(c, &main, None, 100)?
+                    .into_iter()
+                    .filter(|m| m.kind == "card")
+                    .collect())
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn single_user_mode_never_checks_the_launcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        assert!(state.cfg.agent.user.is_empty());
+        assert_eq!(check_launcher(&state).await, None);
+        assert_eq!(launcher_json(&state), Value::Null);
+        for e in engines_json(&state) {
+            assert_eq!(e["launcher_outdated"], Value::Null);
+        }
+        assert!(cards(&state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn outdated_launcher_gets_one_card_until_it_is_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        // Unknown (dev build, unreadable launcher): nothing shown.
+        apply_launcher_check(&state, &check(LauncherState::Unknown, None)).await;
+        assert!(cards(&state).await.is_empty());
+        assert_eq!(engines_json(&state)[0]["launcher_outdated"], Value::Null);
+        assert_eq!(launcher_json(&state)["state"], "unknown");
+
+        // A launcher from before build ids: one card, posted once.
+        let old = check(LauncherState::Outdated, None);
+        apply_launcher_check(&state, &old).await;
+        apply_launcher_check(&state, &old).await;
+        let c = cards(&state).await;
+        assert_eq!(c.len(), 1);
+        let card = c[0].card.clone().unwrap();
+        assert_eq!(card["type"], "info");
+        assert_eq!(card["state"], "pending");
+        let body = card["body"].as_str().unwrap();
+        assert!(body.contains("doesn't report its build"), "{body}");
+        assert!(
+            body.contains(&format!("install -Dm755 {}", state.exe.display())),
+            "{body}"
+        );
+        assert!(body.ends_with("/usr/local/bin/iris"), "{body}");
+        assert_eq!(engines_json(&state)[0]["launcher_outdated"], true);
+        assert_eq!(launcher_json(&state)["build_id"], Value::Null);
+
+        // Another build pair while the card is open: rewritten, not repeated.
+        apply_launcher_check(&state, &check(LauncherState::Outdated, Some("59d96590"))).await;
+        let c = cards(&state).await;
+        assert_eq!(c.len(), 1);
+        let body = c[0].card.as_ref().unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(body.contains("different build"), "{body}");
+
+        // Reinstalled: the card says so, and status clears.
+        let current = check(LauncherState::Current, Some("0a1b2c3d"));
+        apply_launcher_check(&state, &current).await;
+        let c = cards(&state).await;
+        assert_eq!(c.len(), 1);
+        let card = c[0].card.clone().unwrap();
+        assert_eq!(card["state"], "done");
+        assert_eq!(card["title"], "Agent launcher updated");
+        assert_eq!(engines_json(&state)[0]["launcher_outdated"], false);
+
+        // Outdated again later (even the same builds): a new card.
+        apply_launcher_check(&state, &old).await;
+        let c = cards(&state).await;
+        let mut states: Vec<String> = c
+            .iter()
+            .map(|m| {
+                m.card.as_ref().unwrap()["state"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        states.sort();
+        assert_eq!(states, ["done", "pending"]);
     }
 }

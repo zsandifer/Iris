@@ -261,6 +261,7 @@ async fn list_engines(State(state): State<AppState>, user: AuthUser) -> ApiResul
         "dir": crate::setup::engines_root(&state),
         "privileged_helper": !state.cfg.engines.helper.is_empty(),
         "auto_update": state.cfg.engines.auto_update,
+        "launcher": crate::setup::launcher_json(&state),
     }))
 }
 

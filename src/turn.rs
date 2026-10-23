@@ -941,7 +941,9 @@ async fn run_locked(
                     && acc.text.is_empty()
                     && acc.activities.is_empty()
                     && !input.may_act
-                    && !fresh_session =>
+                    && !fresh_session
+                    // The launcher refused it: the session is fine.
+                    && !(spec.split && crate::agent::launcher_refused(&message)) =>
             {
                 // Typically a session the CLI no longer has; start fresh and
                 // replay the conversation instead (never after tool use,
@@ -977,7 +979,34 @@ async fn run_locked(
         .as_ref()
         .map(|d| routing_json(d, &routing_notes))
         .unwrap_or(json!(null));
+    let outcome = explain_launcher_refusal(state, &acc, outcome).await;
     finish(state, input, &mut audience, &acc, routing, outcome).await
+}
+
+/// Split mode: a turn the root-owned launcher refused before any CLI ran
+/// fails as `launcher_outdated` when the launcher is out of date (an
+/// upgrade replaced only the service binary), so the owner learns the fix
+/// instead of a generic failure. Checking also posts the fix card.
+async fn explain_launcher_refusal(state: &AppState, acc: &Acc, outcome: Outcome) -> Outcome {
+    match outcome {
+        Outcome::Failed {
+            kind: kind @ ("harness_error" | "internal"),
+            detail,
+        } if !state.cfg.agent.user.is_empty()
+            && acc.text.is_empty()
+            && acc.activities.is_empty()
+            && crate::agent::launcher_refused(&detail) =>
+        {
+            let outdated = crate::setup::check_launcher(state)
+                .await
+                .is_some_and(|c| c.state == crate::agent::LauncherState::Outdated);
+            Outcome::Failed {
+                kind: if outdated { "launcher_outdated" } else { kind },
+                detail,
+            }
+        }
+        other => other,
+    }
 }
 
 /// Why no engine could run the turn: harnesses allowed here that are
@@ -1588,6 +1617,11 @@ fn failure_text(kind: &str, detail: &str) -> String {
             shared conversations unless the owner turns that on."
             .into(),
         "timeout" => "That took too long, so I stopped. Want me to try again?".into(),
+        "launcher_outdated" => "I can't reply right now because my agent launcher on the \
+            server is out of date: it needs to be reinstalled to match this version of Iris. \
+            I left the steps for the owner in the Main chat; once that's done, send your \
+            message again."
+            .into(),
         "paused" => "I'm paused right now, so I didn't do anything. You can resume me from \
             my computer screen in the app whenever you're ready."
             .into(),
@@ -3080,5 +3114,38 @@ printf '%s\n' '{"type":"init","session_id":"pre-join-session"}' \
             both.contains("/login") && both.contains("codex login"),
             "{both}"
         );
+        let launcher = failure_text("launcher_outdated", "agent-exec: refused");
+        assert!(
+            launcher.contains("launcher") && launcher.contains("Main chat"),
+            "{launcher}"
+        );
+        assert!(!launcher.contains("agent-exec"), "{launcher}");
+    }
+
+    #[tokio::test]
+    async fn single_user_turn_errors_never_mention_the_launcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths {
+            config_file: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+        };
+        crate::persona::seed(&paths).unwrap();
+        let state = AppState::new(
+            crate::config::Config::default(),
+            paths,
+            crate::db::Db::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        for kind in ["harness_error", "internal"] {
+            let failed = Outcome::Failed {
+                kind,
+                detail: "agent-exec: environment variable is not allowed in agent launcher".into(),
+            };
+            match explain_launcher_refusal(&state, &Acc::default(), failed).await {
+                Outcome::Failed { kind: k, .. } => assert_eq!(k, kind),
+                _ => panic!("outcome changed"),
+            }
+        }
+        assert!(state.launcher.lock().unwrap().is_none());
     }
 }

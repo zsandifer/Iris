@@ -397,7 +397,14 @@ rules of its own build (allowed CLI variables and arguments), so install the
 new build there with every upgrade, together with the service binary
 (`install -Dm755 target/release/iris /usr/local/bin/iris` as root, then
 restart Iris). An older launcher refuses requests from a newer service, and
-CLI turns fail until it is replaced.
+CLI turns fail until it is replaced. Iris checks for this at startup by
+running `<launcher> version` (no sudo) and comparing its build with its own;
+when they differ, or the launcher predates build reporting, the owner gets
+an "Update the agent launcher" card in the Main chat with the exact
+`install` command, and refused turns say the launcher is out of date instead
+of failing with a generic error. `iris version` prints the build
+(`iris 0.4.0 (build 0a1b2c3d)`); builds made outside a git checkout report
+`dev` and are not compared.
 
 After engines are installed and Iris has created its vault key, run as the
 service account:
