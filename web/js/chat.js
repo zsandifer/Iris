@@ -2,8 +2,8 @@
 import { html, useEffect, useLayoutEffect, useRef, useState } from './h.js';
 import { post, put, api, seg, isId } from './api.js';
 import { S, set, useStore, loadMessages, loadOlder, sendMessage, toast, mainId, isOwner, convFor, lookUpConv, peekShown } from './store.js';
-import { Icon, Img, Avatar, agentName, Spinner } from './ui.js';
-import { timeline, timeLabel, fullLabel, newSince, badge, JUMP_AWAY, NEAR_BOTTOM } from './chat-time.js';
+import { Icon, Img, Avatar, agentName, Spinner, clock } from './ui.js';
+import { timeHeaders, receiptFor, fullLabel, newSince, badge, JUMP_AWAY, NEAR_BOTTOM } from './chat-time.js';
 import { openPhoto } from './photo.js';
 import { md } from './md.js';
 import { Card } from './cards.js';
@@ -13,8 +13,16 @@ import { BrowserPeek } from './computer.js';
 import { focusComposer, prepareComposerFocus } from './viewport.js';
 import { NotedLine } from './memory.js';
 
-export function StatusLine({ live }) {
-  return html`<div class="status shimmer" aria-live="polite">${statusPhrase(live)}</div>`;
+/** Typing dots, with what the agent is doing. */
+function Typing({ live, text }) {
+  const phrase = text || statusPhrase(live);
+  const line = phrase === 'Thinking…' ? `${agentName()} is thinking…` : phrase;
+  return html`<div class="typing" aria-live="polite"><span class="dots" aria-hidden="true"><i /><i /><i /></span><span>${line}</span></div>`;
+}
+
+/** Delivered / Read under the owner's most recent message. */
+function OwnerReceipt({ r }) {
+  return html`<div class="own-rcpt" role="status"><b>${r.state === 'read' ? 'Read' : 'Delivered'}</b>${r.at ? ` ${clock(r.at)}` : ''}</div>`;
 }
 
 function Receipt({ meta }) {
@@ -90,10 +98,12 @@ function Assistant({ m, list }) {
     const text = live?.text || '';
     const running = (live?.acts || []).some((a) => a.status === 'started');
     const waiting = list.some((x) => x.card?.type === 'approval' && x.card.turn_message_id === m.id && x.card.state === 'pending');
-    if (waiting) return html`${text && html`<div class="b" dangerouslySetInnerHTML=${{ __html: md(text) }} />`}<div class="status shimmer" aria-live="polite">Waiting for your OK…</div>${peek}`;
-    if (!text) return html`<${StatusLine} live=${live} />${peek}`;
+    // Until the CLI picks the turn up, the owner's receipt says Delivered.
+    const read = !!(m.meta?.read_at || live?.readAt || text || live?.acts?.length);
+    if (waiting) return html`${text && html`<div class="b" dangerouslySetInnerHTML=${{ __html: md(text) }} />`}<${Typing} text="Waiting for your OK…" />${peek}`;
+    if (!text) return html`${read && html`<${Typing} live=${live} />`}${peek}`;
     return html`<div class="b" dangerouslySetInnerHTML=${{ __html: md(text) }} />
-      ${running && html`<${StatusLine} live=${live} />`}${peek}`;
+      ${running && html`<${Typing} live=${live} />`}${peek}`;
   }
   const retry = async () => {
     const u = retryFor(list, m);
@@ -126,16 +136,6 @@ function Message({ m, list, members, composing }) {
   }
   if (m.role === 'assistant') return html`<${Assistant} m=${m} list=${list} />`;
   return html`<div class="note">${m.content}</div>`;
-}
-
-/** Who sent a message, for runs of message times (null: system notes,
- * which have no time of their own). */
-const sender = (m) => (m.kind === 'system_note' ? null : m.role === 'user' ? `u:${m.author_user_id}` : 'a');
-
-function Time({ m }) {
-  const mine = m.role === 'user' && m.author_user_id === S.me?.user?.id;
-  return html`<time class=${'mt' + (mine ? ' mine' : '')} datetime=${new Date(m.created_at).toISOString()}
-    title=${fullLabel(m.created_at)}>${timeLabel(m.created_at)}</time>`;
 }
 
 /** Round button above the composer that scrolls to the newest message,
@@ -202,6 +202,7 @@ export function ChatScreen({ cid }) {
   const list = box?.list || [];
   const [members, setMembers] = useState(null);
   const [composing, setComposing] = useState(false);
+  const firstNewest = useRef(null);
 
   useEffect(() => {
     stick.current = true;
@@ -322,13 +323,20 @@ export function ChatScreen({ cid }) {
     if (held.has(m.id)) continue;
     shown.push(...(asks[m.id] || []), m);
   }
-  const marks = timeline(shown.map((m) => ({ at: m.created_at, who: sender(m) })));
+  // A time header after an hour's gap (or a new day), and the owner's
+  // receipt under their latest message.
+  const heads = timeHeaders(shown.map((m) => m.created_at));
+  const rcpt = receiptFor(list, S.me?.user?.id, S.live);
+  // New messages pop in; ones already there when the chat opened (or
+  // older pages loaded later) don't.
+  if (firstNewest.current == null && box && !box.loading) firstNewest.current = list.at(-1)?.created_at ?? 0;
   const rows = [];
   shown.forEach((m, i) => {
-    const { day, time } = marks[i];
-    if (day) rows.push(html`<div class="day" role="separator" aria-label=${day} key=${'d' + m.id}><span>${day}</span></div>`);
-    rows.push(html`<div class="row" key=${m.id}><${Message} m=${m} list=${list} members=${members} composing=${composing} />
-      ${time && html`<${Time} m=${m} />`}</div>`);
+    const h = heads[i];
+    if (h) rows.push(html`<div class="ts" role="separator" aria-label=${`${h.day} ${h.time}`} key=${'d' + m.id}><b>${h.day}</b> ${h.time}</div>`);
+    const fresh = firstNewest.current != null && m.created_at > firstNewest.current;
+    rows.push(html`<div class=${'row' + (fresh ? ' pop' : '')} key=${m.id} title=${fullLabel(m.created_at)}><${Message} m=${m} list=${list} members=${members} composing=${composing} />
+      ${rcpt?.id === m.id && html`<${OwnerReceipt} r=${rcpt} />`}</div>`);
   });
 
   // New messages from others while scrolled up: count them on the button.

@@ -1,10 +1,10 @@
-// chat-time.js: day separators, message times, and the new-message count.
+// chat-time.js: time headers, the owner's receipt, and the new-message count.
 // A fixed zone with daylight saving (node applies TZ changes at runtime).
 process.env.TZ = 'America/New_York';
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { dayNumber, dayLabel, timeLabel, timeline, newSince, badge, RUN_GAP } from '../../web/js/chat-time.js';
+import { dayNumber, dayLabel, timeLabel, timeHeaders, receiptFor, newSince, badge, HEADER_GAP } from '../../web/js/chat-time.js';
 
 const at = (y, mo, d, h = 12, mi = 0) => new Date(y, mo - 1, d, h, mi).getTime();
 const MIN = 60 * 1000;
@@ -38,47 +38,44 @@ test('times follow the locale', () => {
   assert.equal(timeLabel(at(2026, 10, 14, 15, 42), 'en-GB'), '15:42');
 });
 
-test('a time ends each run of messages from one sender', () => {
-  const t0 = at(2026, 10, 14, 9, 0);
-  const marks = timeline([
-    { at: t0, who: 'u:me' },
-    { at: t0 + MIN, who: 'u:me' },
-    { at: t0 + 2 * MIN, who: 'a' },
-    { at: t0 + 3 * MIN, who: null }, // a system note: no time, keeps the run
-    { at: t0 + 4 * MIN, who: 'a' },
-    { at: t0 + 5 * MIN, who: 'u:sam' },
-    { at: t0 + 6 * MIN, who: 'u:me' },
-  ], NOW, 'en-US');
-  assert.deepEqual(marks.map((m) => m.time), [false, true, false, false, true, true, true]);
-  assert.deepEqual(marks.map((m) => m.day), ['Today', null, null, null, null, null, null]);
+test('a time header starts the chat and follows each gap of over an hour', () => {
+  const t0 = at(2026, 10, 14, 13, 30);
+  const heads = timeHeaders([t0, t0 + MIN, t0 + MIN + HEADER_GAP, t0 + 2 * MIN + 2 * HEADER_GAP + 1], NOW, 'en-US');
+  assert.deepEqual(heads.map((h) => h && h.day), ['Today', null, null, 'Today']);
+  assert.equal(heads[0].time.replace(/\s/g, ' '), '1:30 PM');
+  assert.deepEqual(timeHeaders([], NOW), []);
 });
 
-test('a long pause or a new day splits a run', () => {
-  const t0 = at(2026, 10, 13, 23, 40);
-  const marks = timeline([
-    { at: t0, who: 'u:me' },
-    { at: t0 + RUN_GAP, who: 'u:me' }, // exactly the gap: same run
-    { at: t0 + 2 * RUN_GAP + 1, who: 'u:me' }, // 00:00 the next day, and past the gap
-    { at: t0 + 2 * RUN_GAP + 2, who: 'u:me' },
-  ], NOW, 'en-US');
-  assert.deepEqual(marks, [
-    { day: 'Yesterday', time: false },
-    { day: null, time: true },
-    { day: 'Today', time: false },
-    { day: null, time: true },
-  ]);
-  // Same sender across midnight, a minute apart: each day ends its run.
-  const night = timeline([
-    { at: at(2026, 10, 13, 23, 59), who: 'a' },
-    { at: at(2026, 10, 14, 0, 0), who: 'a' },
-  ], NOW, 'en-US');
-  assert.deepEqual(night, [{ day: 'Yesterday', time: true }, { day: 'Today', time: true }]);
+test('a new day always gets a header', () => {
+  const heads = timeHeaders([at(2026, 10, 13, 23, 50), at(2026, 10, 14, 0, 5)], NOW, 'en-US');
+  assert.deepEqual(heads.map((h) => h.day), ['Yesterday', 'Today']);
 });
 
-test('lines with no time of their own still get a day separator', () => {
-  const marks = timeline([{ at: at(2026, 10, 12), who: null }, { at: at(2026, 10, 14), who: 'a' }], NOW, 'en-US');
-  assert.deepEqual(marks, [{ day: 'Monday', time: false }, { day: 'Today', time: true }]);
-  assert.deepEqual(timeline([], NOW), []);
+const me = 'u1';
+const user = (id, extra = {}) => ({ id, role: 'user', kind: 'text', author_user_id: me, ...extra });
+const reply = (id, status, meta = {}) => ({ id, role: 'assistant', kind: 'text', status, meta });
+
+test('receipt: Delivered until the CLI starts, then Read with the time', () => {
+  const list = [user('m1'), reply('r1', 'streaming')];
+  assert.deepEqual(receiptFor(list, me), { id: 'm1', state: 'delivered', at: null });
+  assert.deepEqual(receiptFor(list, me, { r1: { readAt: 5 } }), { id: 'm1', state: 'read', at: 5 });
+  const stored = [user('m1'), reply('r1', 'streaming', { read_at: 7 })];
+  assert.deepEqual(receiptFor(stored, me), { id: 'm1', state: 'read', at: 7 });
+});
+
+test('receipt: only the latest owner message, gone once answered', () => {
+  assert.equal(receiptFor([user('m1'), reply('r1', 'complete')], me), null);
+  assert.equal(receiptFor([user('m1'), reply('r1', 'error')], me), null);
+  const two = [user('m1'), reply('r1', 'complete'), user('m2'), reply('r2', 'streaming')];
+  assert.equal(receiptFor(two, me).id, 'm2');
+  // A card the agent shows mid-turn doesn't count as the answer.
+  const card = [user('m1'), { id: 'c', role: 'assistant', kind: 'card', status: 'complete' }, reply('r1', 'streaming')];
+  assert.equal(receiptFor(card, me).state, 'delivered');
+  // Someone else's message, or none from the owner: no receipt.
+  assert.equal(receiptFor([user('m1', { author_user_id: 'u2' })], me), null);
+  assert.equal(receiptFor([], me), null);
+  // Sent, reply not created yet: Delivered.
+  assert.equal(receiptFor([user('m1')], me).state, 'delivered');
 });
 
 test('new messages since the last one in view, not counting my own', () => {

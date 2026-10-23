@@ -1344,6 +1344,27 @@ pub fn get_message(conn: &Connection, id: &str) -> rusqlite::Result<Option<Messa
     .optional()
 }
 
+/// Keeps a reply's `read_at` (see `mark_message_read`) when its meta is
+/// replaced. SQL for `meta = ...` with the new meta as `?N`.
+fn keep_read_at(param: &str) -> String {
+    format!(
+        "CASE WHEN json_extract(meta, '$.read_at') IS NULL THEN {param} \
+         ELSE json_set({param}, '$.read_at', json_extract(meta, '$.read_at')) END"
+    )
+}
+
+/// When the CLI picked up the turn of this reply placeholder: the owner's
+/// receipt reads "Read" from then on. Set once.
+pub fn mark_message_read(conn: &Connection, id: &str, at: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE messages SET meta = json_set(CASE WHEN json_valid(meta) THEN meta ELSE '{}' END,
+                '$.read_at', ?2)
+         WHERE id = ?1 AND (NOT json_valid(meta) OR json_extract(meta, '$.read_at') IS NULL)",
+        params![id, at],
+    )?;
+    Ok(())
+}
+
 /// Record the engine chosen for an assistant message once routing is done.
 pub fn set_message_engine(
     conn: &Connection,
@@ -1354,8 +1375,11 @@ pub fn set_message_engine(
     meta: &Value,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE messages SET harness = ?2, model = ?3, effort = ?4, meta = ?5, updated_at = ?6
-         WHERE id = ?1",
+        &format!(
+            "UPDATE messages SET harness = ?2, model = ?3, effort = ?4, meta = {}, updated_at = ?6
+             WHERE id = ?1",
+            keep_read_at("?5")
+        ),
         params![id, harness, model, effort, meta.to_string(), now_ms()],
     )?;
     Ok(())
@@ -1369,7 +1393,10 @@ pub fn finish_message(
     meta: &Value,
 ) -> rusqlite::Result<Message> {
     conn.execute(
-        "UPDATE messages SET content = ?2, status = ?3, meta = ?4, updated_at = ?5 WHERE id = ?1",
+        &format!(
+            "UPDATE messages SET content = ?2, status = ?3, meta = {}, updated_at = ?5 WHERE id = ?1",
+            keep_read_at("?4")
+        ),
         params![id, content, status, meta.to_string(), now_ms()],
     )?;
     get_message(conn, id).map(|m| m.expect("exists"))

@@ -31,6 +31,13 @@ use tokio::sync::{mpsc, watch};
 
 const MAX_REPLAY_MESSAGES: usize = 40;
 const MAX_REPLAY_CHARS: usize = 24_000;
+/// The newest messages of an owner chat go to the CLI word for
+/// word, with when each was sent, on every turn (even when the resumed
+/// session saw them), so "choose B" a day later still lands after the CLI
+/// compacted its history. Bounded per message and in total.
+const RECENT_MESSAGES: usize = 10;
+const RECENT_MESSAGE_CHARS: usize = 3_000;
+const RECENT_CHARS: usize = 12_000;
 const MAX_ATTEMPTS: usize = 3;
 
 pub struct TurnInput {
@@ -279,6 +286,56 @@ impl Audience {
     }
 }
 
+/// The owner's clock and the newest messages of their chat, word for word
+/// with timestamps (see `RECENT_MESSAGES`).
+struct Recent {
+    tz_name: String,
+    tz: jiff::tz::TimeZone,
+    now_ms: i64,
+    /// Oldest first, as `db::replay_messages` returns them.
+    messages: Vec<Message>,
+}
+
+impl Recent {
+    fn new(tz_name: &str, now_ms: i64, messages: Vec<Message>) -> Self {
+        let (tz_name, tz) = match crate::routines::schedule::parse_tz(tz_name) {
+            Ok(tz) => (tz_name.trim().to_string(), tz),
+            Err(_) => ("UTC".to_string(), jiff::tz::TimeZone::UTC),
+        };
+        Recent {
+            tz_name,
+            tz,
+            now_ms,
+            messages,
+        }
+    }
+
+    fn zoned(&self, ms: i64) -> Option<jiff::Zoned> {
+        jiff::Timestamp::from_millisecond(ms)
+            .ok()
+            .map(|t| t.to_zoned(self.tz.clone()))
+    }
+
+    /// "Thursday, October 22, 2026, 7:45 PM EDT"
+    fn now_label(&self) -> String {
+        self.zoned(self.now_ms)
+            .map(|z| z.strftime("%A, %B %-d, %Y, %-I:%M %p %Z").to_string())
+            .unwrap_or_default()
+    }
+
+    /// "Wed Oct 21, 9:12 PM" (with the year when it is not this year).
+    fn stamp(&self, ms: i64) -> String {
+        let (Some(at), Some(now)) = (self.zoned(ms), self.zoned(self.now_ms)) else {
+            return String::new();
+        };
+        if at.year() == now.year() {
+            at.strftime("%a %b %-d, %-I:%M %p").to_string()
+        } else {
+            at.strftime("%a %b %-d %Y, %-I:%M %p").to_string()
+        }
+    }
+}
+
 async fn run_locked(
     state: &AppState,
     input: &TurnInput,
@@ -381,9 +438,19 @@ async fn run_locked(
         )
         .await;
     }
+    // The CLI picks the message up now: the owner's receipt turns from
+    // Delivered to Read. Stored on the reply so a reloaded app shows it too.
+    let read_at = crate::util::now_ms();
+    {
+        let m = msg_id.to_string();
+        let _ = state
+            .db
+            .call(move |c| db::mark_message_read(c, &m, read_at))
+            .await;
+    }
     state.hub.to_users(
         audience.current(state).await,
-        json!({"type": "turn.status", "conversation_id": conv_id, "message_id": msg_id, "status": "running"}),
+        json!({"type": "turn.status", "conversation_id": conv_id, "message_id": msg_id, "status": "running", "read_at": read_at}),
     );
 
     let catalog = state.catalog();
@@ -552,7 +619,29 @@ async fn run_locked(
         } else {
             Vec::new()
         };
-        let mut prompt = render_prompt(&ctx, &agent_name, &replay, &input.user_message);
+        // Owner chats (not jobs): the clock and the last messages, every turn.
+        let recent = if input.continuity && scope == Scope::Private && ctx.kind != "job" {
+            let (c, before) = (conv_id.to_string(), input.user_message.created_at);
+            state
+                .db
+                .call(move |db| {
+                    let tz = crate::routines::default_tz(db);
+                    let messages = db::replay_messages(db, &c, 0, before, RECENT_MESSAGES)?;
+                    Ok((tz, messages))
+                })
+                .await
+                .ok()
+                .map(|(tz, messages)| Recent::new(&tz, crate::util::now_ms(), messages))
+        } else {
+            None
+        };
+        let mut prompt = render_prompt_with(
+            &ctx,
+            &agent_name,
+            &replay,
+            recent.as_ref(),
+            &input.user_message,
+        );
         let mut notices = Vec::new();
         let caps = entry.harness.capabilities();
         if !caps.mcp {
@@ -1875,8 +1964,16 @@ fn changed_entity_kinds(activities: &[Activity]) -> Vec<&'static str> {
 }
 
 /// Build the text sent to the harness as the user message.
+#[cfg(test)]
 fn render_prompt(ctx: &Ctx, agent_name: &str, replay: &[Message], current: &Message) -> String {
-    let group = ctx.kind == "group";
+    render_prompt_with(ctx, agent_name, replay, None, current)
+}
+
+/// One replayed message as a line of the prompt (None: nothing to show).
+fn replay_line(ctx: &Ctx, agent_name: &str, m: &Message) -> Option<String> {
+    if m.content.trim().is_empty() || m.status == "streaming" {
+        return None;
+    }
     let name_of = |m: &Message| -> String {
         m.author_user_id
             .as_ref()
@@ -1884,25 +1981,82 @@ fn render_prompt(ctx: &Ctx, agent_name: &str, replay: &[Message], current: &Mess
             .cloned()
             .unwrap_or_else(|| "User".into())
     };
-    let mut lines: Vec<String> = Vec::new();
-    for m in replay.iter().rev() {
-        if m.content.trim().is_empty() || m.status == "streaming" {
-            continue;
-        }
-        let line = match (m.role.as_str(), m.kind.as_str()) {
-            (_, "card") => format!(
-                "[{agent_name} showed a card ({}): {}]",
+    Some(match (m.role.as_str(), m.kind.as_str()) {
+        (_, "card") => {
+            // The title is the message content; the text shown under it
+            // (choices, details) is the card's body, when it is text.
+            let body = m
+                .card
+                .as_ref()
+                .and_then(|c| c["body"].as_str())
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .map(|b| format!(" — {b}"))
+                .unwrap_or_default();
+            format!(
+                "[{agent_name} showed a card ({}): {}{body}]",
                 if m.card.as_ref().is_some_and(crate::awareness::resolved) {
                     "resolved"
                 } else {
                     "awaiting action"
                 },
                 m.content.trim()
-            ),
-            (_, "system_note") => format!("[system note] {}", m.content.trim()),
-            ("user", _) => format!("{}: {}", name_of(m), m.content.trim()),
-            ("assistant", _) => format!("{agent_name}: {}", m.content.trim()),
-            _ => format!("[context] {}", m.content.trim()),
+            )
+        }
+        (_, "system_note") => format!("[system note] {}", m.content.trim()),
+        ("user", _) => format!("{}: {}", name_of(m), m.content.trim()),
+        ("assistant", _) => format!("{agent_name}: {}", m.content.trim()),
+        _ => format!("[context] {}", m.content.trim()),
+    })
+}
+
+/// The recent-messages lines, newest kept first within the caps, returned
+/// oldest first with the ids they cover.
+fn recent_lines(ctx: &Ctx, agent_name: &str, recent: &Recent) -> (Vec<String>, Vec<String>) {
+    let mut lines = Vec::new();
+    let mut ids = Vec::new();
+    let mut total = 0;
+    for m in recent.messages.iter().rev().take(RECENT_MESSAGES) {
+        let Some(line) = replay_line(ctx, agent_name, m) else {
+            continue;
+        };
+        let line = format!(
+            "[{}] {}",
+            recent.stamp(m.created_at),
+            truncate_chars(&line, RECENT_MESSAGE_CHARS)
+        );
+        total += line.chars().count();
+        if total > RECENT_CHARS && !lines.is_empty() {
+            break;
+        }
+        lines.push(line);
+        ids.push(m.id.clone());
+    }
+    lines.reverse();
+    (lines, ids)
+}
+
+/// The prompt, with the clock and recent messages when `recent` is
+/// given (owner chats). Unseen messages the recent block already repeats
+/// are left out of the replay.
+fn render_prompt_with(
+    ctx: &Ctx,
+    agent_name: &str,
+    replay: &[Message],
+    recent: Option<&Recent>,
+    current: &Message,
+) -> String {
+    let group = ctx.kind == "group";
+    let (recent_lines, recent_ids) = recent
+        .map(|r| recent_lines(ctx, agent_name, r))
+        .unwrap_or_default();
+    let mut lines: Vec<String> = Vec::new();
+    for m in replay.iter().rev() {
+        if recent_ids.contains(&m.id) {
+            continue;
+        }
+        let Some(line) = replay_line(ctx, agent_name, m) else {
+            continue;
         };
         lines.push(line);
         if lines.len() >= MAX_REPLAY_MESSAGES
@@ -1921,8 +2075,32 @@ fn render_prompt(ctx: &Ctx, agent_name: &str, replay: &[Message], current: &Mess
         out.push_str(&truncate_chars(&lines.join("\n\n"), MAX_REPLAY_CHARS));
         out.push_str("\n</conversation_history>\n\n");
     }
+    if let Some(r) = recent {
+        if !recent_lines.is_empty() {
+            out.push_str(&format!(
+                "<recent_messages>\nThe newest messages in this conversation, word for word, \
+                 oldest first, with when each was sent ({}). They repeat what you may already \
+                 have seen, so a short reply (like \"choose B\") can be matched to what it \
+                 answers.\n\n",
+                r.tz_name
+            ));
+            out.push_str(&recent_lines.join("\n\n"));
+            out.push_str("\n</recent_messages>\n\n");
+        }
+        out.push_str(&format!(
+            "<current_time>{} ({})</current_time>\n\n",
+            r.now_label(),
+            r.tz_name
+        ));
+    }
     if group && current.role == "user" {
-        out.push_str(&format!("{}: ", name_of(current)));
+        let name = current
+            .author_user_id
+            .as_ref()
+            .and_then(|u| ctx.names.get(u))
+            .cloned()
+            .unwrap_or_else(|| "User".into());
+        out.push_str(&format!("{name}: "));
     }
     out.push_str(current.content.trim());
     if !current.attachments.is_empty() && current.content.trim().is_empty() {
@@ -2244,6 +2422,170 @@ mod tests {
         assert!(p.contains("Sam: m99"));
         assert!(!p.contains("Sam: m10\n"));
         assert_eq!(p.matches("Sam: m").count(), MAX_REPLAY_MESSAGES);
+    }
+
+    // 2026-10-21 21:12 and 2026-10-22 19:45 in New York (EDT, UTC-4).
+    const OCT21_2112: i64 = 1_792_631_520_000;
+    const OCT22_1945: i64 = 1_792_712_700_000;
+
+    fn at(mut m: Message, ms: i64) -> Message {
+        m.created_at = ms;
+        m
+    }
+
+    #[test]
+    fn prompt_replays_recent_messages_with_times_and_the_clock() {
+        let ask = at(
+            msg(
+                "assistant",
+                "text",
+                None,
+                "A: Mozaik price, or B: flat rate?",
+            ),
+            OCT21_2112,
+        );
+        let older = at(
+            msg("user", "text", Some("u1"), "older"),
+            OCT21_2112 - 60_000,
+        );
+        let recent = Recent::new(
+            "America/New_York",
+            OCT22_1945,
+            vec![older.clone(), ask.clone()],
+        );
+        let cur = msg("user", "text", Some("u1"), "choose B");
+        let p = render_prompt_with(&ctx("main"), "Iris", &[older, ask], Some(&recent), &cur);
+        assert!(p.starts_with("<recent_messages>"), "{p}");
+        assert!(p.contains("(America/New_York)"));
+        assert!(p.contains("[Wed Oct 21, 9:11 PM] Sam: older\n\n[Wed Oct 21, 9:12 PM] Iris: A: Mozaik price, or B: flat rate?\n</recent_messages>"), "{p}");
+        assert!(p.contains("<current_time>Thursday, October 22, 2026, 7:45 PM EDT (America/New_York)</current_time>"), "{p}");
+        // Repeated by the recent block, so not replayed twice.
+        assert!(!p.contains("<conversation_history>"), "{p}");
+        assert!(p.ends_with("</current_time>\n\nchoose B"));
+    }
+
+    #[test]
+    fn prompt_replays_older_unseen_messages_before_the_recent_ones() {
+        let all: Vec<Message> = (0..14)
+            .map(|i| {
+                at(
+                    msg("user", "text", Some("u1"), &format!("m{i}")),
+                    OCT21_2112 + i * 60_000,
+                )
+            })
+            .collect();
+        let recent = Recent::new("America/New_York", OCT22_1945, all[4..].to_vec());
+        let cur = msg("user", "text", Some("u1"), "now");
+        let p = render_prompt_with(&ctx("main"), "Iris", &all, Some(&recent), &cur);
+        let history = &p[..p.find("</conversation_history>").unwrap()];
+        assert_eq!(history.matches("Sam: m").count(), 4, "{p}");
+        assert!(history.contains("Sam: m3") && !history.contains("Sam: m4"));
+        let block = &p[p.find("<recent_messages>").unwrap()..p.find("</recent_messages>").unwrap()];
+        assert_eq!(block.matches("] Sam: m").count(), RECENT_MESSAGES);
+        assert!(block.contains("Sam: m4") && block.contains("Sam: m13"));
+    }
+
+    #[test]
+    fn prompt_recent_messages_are_bounded() {
+        let long = "x".repeat(RECENT_MESSAGE_CHARS * 2);
+        let messages: Vec<Message> = (0..10)
+            .map(|i| {
+                at(
+                    msg("assistant", "text", None, &format!("m{i} {long}")),
+                    OCT21_2112 + i * 60_000,
+                )
+            })
+            .collect();
+        let recent = Recent::new("America/New_York", OCT22_1945, messages);
+        let (lines, ids) = recent_lines(&ctx("main"), "Iris", &recent);
+        // Each line is capped, and the block stays within the total.
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.chars().count() <= RECENT_MESSAGE_CHARS + 40)
+        );
+        let total: usize = lines.iter().map(|l| l.chars().count()).sum();
+        assert!(total <= RECENT_CHARS, "{total}");
+        assert!(lines.iter().all(|l| l.contains('…')));
+        // The newest messages are the ones kept, oldest first.
+        assert!((1..10).contains(&lines.len()), "{}", lines.len());
+        let first = 10 - lines.len();
+        for (k, l) in lines.iter().enumerate() {
+            assert!(l.contains(&format!("Iris: m{} ", first + k)), "{l}");
+        }
+        assert_eq!(ids.len(), lines.len());
+    }
+
+    #[test]
+    fn prompt_recent_messages_show_a_card_body() {
+        let mut card = msg("assistant", "card", None, "Pick a finish");
+        card.card = Some(json!({"type": "info", "body": "A: satin lacquer\nB: oil"}));
+        let card = at(card, OCT21_2112);
+        let recent = Recent::new("America/New_York", OCT22_1945, vec![card]);
+        let cur = msg("user", "text", Some("u1"), "B");
+        let p = render_prompt_with(&ctx("main"), "Iris", &[], Some(&recent), &cur);
+        assert!(
+            p.contains("Pick a finish — A: satin lacquer\nB: oil]"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn prompt_recent_without_messages_still_has_the_clock_and_bad_zones_fall_back() {
+        let recent = Recent::new("Not/AZone", OCT22_1945, vec![]);
+        let cur = msg("user", "text", Some("u1"), "hi");
+        let p = render_prompt_with(&ctx("main"), "Iris", &[], Some(&recent), &cur);
+        assert_eq!(
+            p,
+            "<current_time>Thursday, October 22, 2026, 11:45 PM UTC (UTC)</current_time>\n\nhi"
+        );
+        let last_year = Recent::new("America/New_York", OCT22_1945, vec![]);
+        assert_eq!(
+            last_year.stamp(OCT21_2112 - 365 * 86_400_000),
+            "Tue Oct 21 2025, 9:12 PM"
+        );
+    }
+
+    #[test]
+    fn read_at_survives_engine_and_finish_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db::Db::open(&tmp.path().join("t.db")).unwrap();
+        db.with(|c| {
+            let owner = db::owner_user_id(c)?.expect("owner");
+            let conv = db::create_conversation(c, &owner, "side", "", None)?;
+            let m = db::insert_message(
+                c,
+                &db::NewMessage {
+                    conversation_id: &conv.id,
+                    role: "assistant",
+                    status: "streaming",
+                    ..Default::default()
+                },
+            )?;
+            db::mark_message_read(c, &m.id, 42)?;
+            db::mark_message_read(c, &m.id, 99)?; // set once
+            db::set_message_engine(c, &m.id, "codex", "x", None, &json!({"routing": {}}))?;
+            let got = db::get_message(c, &m.id)?.unwrap();
+            assert_eq!(got.meta["read_at"], 42);
+            assert!(got.meta["routing"].is_object());
+            let done = db::finish_message(c, &m.id, "hi", "complete", &json!({"activity": []}))?;
+            assert_eq!(done.meta["read_at"], 42);
+            assert!(done.meta["activity"].is_array());
+            // A reply that never started has no read_at.
+            let other = db::insert_message(
+                c,
+                &db::NewMessage {
+                    conversation_id: &conv.id,
+                    role: "assistant",
+                    status: "streaming",
+                    ..Default::default()
+                },
+            )?;
+            let done = db::finish_message(c, &other.id, "x", "complete", &json!({}))?;
+            assert!(done.meta.get("read_at").is_none());
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[tokio::test]

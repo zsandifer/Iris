@@ -2852,7 +2852,7 @@ was emitted). Events are delivered only to the users listed under
 | `message.completed` | `{"conversation_id", "message": {Message}}` | Conversation members |
 | `memory.noted` | `{"conversation_id", "message_id", "changes": [{"history_id", "item_id", "op", "text"}]}` | Owner only |
 | `memory.reset` | `{"reset"}` (the new `Settings.memory.reset` marker) after Forget everything: drop cached Noted metadata and morning cards (they now read "I cleared my notes.") and close open memory sheets | Owner only |
-| `turn.status` | `{"conversation_id", "message_id", "status": "queued" \| "running"}` | Conversation members |
+| `turn.status` | `{"conversation_id", "message_id", "status": "queued" \| "running", "read_at"?}` | Conversation members |
 | `conversation.created` | `{"conversation": {Conversation}}` | Conversation members |
 | `entities.changed` | `{"kinds": ["goals" \| "ideas" \| "feed" \| "library" \| "memory" \| "routines" \| "working_notes", ...]}` | The affected user |
 | `settings.changed` | `{"settings": {Settings}}` | All users |
@@ -2894,7 +2894,11 @@ Event details:
   (`complete`, `error`, or `cancelled`) with full `meta`.
 - **`turn.status`**: `queued` is sent only when every CLI slot is busy as the
   turn starts waiting; `running` when the turn gets a slot. There is no
-  terminal `turn.status`; use `message.completed`.
+  terminal `turn.status`; use `message.completed`. `running` carries
+  `read_at` (ms): when the CLI picked the message up, also stored as the
+  placeholder's `meta.read_at`. The app shows the owner's latest message as
+  Delivered until then and Read (with that time) after, until the reply
+  finishes.
 - **`entities.changed`**: refetch the listed collections. Sent after REST
   changes (to the caller), after a turn in which the agent successfully
   changed data through the bridge (to the conversation creator; see
@@ -3084,7 +3088,8 @@ After `POST /api/conversations/{id}/messages` (or `POST
 2. The turn waits for the conversation (one turn at a time per conversation)
    and then for a global CLI slot (`max_concurrent_turns`, default 2). If all
    slots are busy it emits `turn.status` `queued`. When it gets a slot it
-   emits `turn.status` `running`.
+   records `meta.read_at` on the placeholder and emits `turn.status`
+   `running`.
 3. It classifies the message (effort, and whether it is clearly hard), picks
    a slot and model ([section 7](#7-engine-selection)), and records it on the
    placeholder (`harness`, `model`, `effort`, and `meta.routing`; no event is
@@ -3093,7 +3098,12 @@ After `POST /api/conversations/{id}/messages` (or `POST
    MCP support.
 4. It resumes the CLI session for this conversation and harness when possible,
    replaying messages the session has not seen (up to 40 messages / 24,000
-   characters), wires in the [iris-mcp bridge](#8-the-iris-mcp-bridge) and
+   characters). In the owner's own conversations (not jobs) every prompt
+   also carries the current date and time in the owner's time zone (the
+   routines default zone) and the last 10 messages word for word with when
+   each was sent (at most 3,000 characters each, 12,000 in all, newest
+   kept), even if the session saw them; replayed messages already in that
+   block are left out of the replay. It wires in the [iris-mcp bridge](#8-the-iris-mcp-bridge) and
    enabled connectors, and starts the CLI. In shared conversations (more than
    one member) the bridge runs in cards-only mode; connectors and the
    owner's private files are only passed in the owner's own conversations
@@ -3175,6 +3185,7 @@ On a finished assistant message (`message.completed`):
 | `activity` | [Activity](#activity)[] | Final state of every tool-use activity in the last attempt. |
 | `usage` | object | Present only if the CLI reported usage. Passed through per harness. Claude: `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `duration_ms`. Codex: `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`. Gemini: `input_tokens`, `output_tokens`, `cached_tokens`, `tool_calls`, `duration_ms`. OpenCode: `input_tokens`, `output_tokens`, `reasoning_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cost`, `steps`. |
 | `duration_ms` | int | Time from placeholder creation to completion, including any queueing. |
+| `read_at` | int | When the turn got a CLI slot (ms), set while the reply is still streaming and kept afterwards. Absent if the turn never started. |
 | `error` | object | Present only when `status` is `error`: `{"kind": "...", "detail": "..."}`, `detail` at most 500 characters. |
 
 While a turn is running, the placeholder's `meta` is `{}` and then
