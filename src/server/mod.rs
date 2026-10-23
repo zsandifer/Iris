@@ -2519,7 +2519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routine_documents_are_markdown_or_text_and_saved_to_the_library() {
+    async fn routine_documents_are_read_and_saved_to_the_library() {
         let h = setup();
         let t = pair_as(&h, None).await;
         let upload = |name: &str, body: Vec<u8>| {
@@ -2551,6 +2551,40 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{b}");
         let doc = b["doc"]["id"].as_str().unwrap().to_string();
         assert_eq!(b["doc"]["title"], "Takeout SOP.md");
+        assert_eq!(b["doc"]["summary"], "4 words");
+        // Spreadsheets come back with a short summary.
+        let (s, b) = read(
+            h.app
+                .clone()
+                .oneshot(upload(
+                    "orders.csv",
+                    b"item,qty\nPad See Ew,2\nTea,1\n".to_vec(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["doc"]["summary"], "3 rows · 2 columns");
+        assert_eq!(b["doc"]["mime"], "text/csv");
+        let csv_doc = b["doc"]["id"].as_str().unwrap().to_string();
+        let (s, b) = read(
+            h.app
+                .clone()
+                .oneshot(upload("menu.pages", b"data".to_vec()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(b["error"]["code"], "unsupported_media_type");
+        assert!(
+            b["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("I can't read Apple iWork files")
+        );
+        // Damaged files get a friendly sentence and their own code.
         let (s, b) = read(
             h.app
                 .clone()
@@ -2559,12 +2593,13 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(s, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(b["error"]["code"], "unreadable");
         assert!(
             b["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("Markdown (.md) or plain text (.txt)")
+                .starts_with("I couldn't read that PDF.")
         );
         let big = vec![b'a'; h.state.cfg.max_upload_bytes + 1];
         let (s, _) = read(h.app.clone().oneshot(upload("big.txt", big)).await.unwrap()).await;
@@ -2586,12 +2621,15 @@ mod tests {
             Some(&t),
             Some(
                 json!({"title": "Dinner", "instructions": "Order dinner.", "schedule_kind": "once",
-                        "run_at": "2030-01-05T18:00", "tz": "UTC", "doc_ids": [doc]}),
+                        "run_at": "2030-01-05T18:00", "tz": "UTC", "doc_ids": [doc, csv_doc]}),
             ),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{b}");
-        assert_eq!(b["routine"]["docs"][0]["title"], "Takeout SOP.md");
+        let attached = b["routine"]["docs"].as_array().unwrap();
+        let by_id = |id: &str| attached.iter().find(|d| d["id"] == id).unwrap().clone();
+        assert_eq!(by_id(&doc)["title"], "Takeout SOP.md");
+        assert_eq!(by_id(&csv_doc)["summary"], "3 rows · 2 columns");
         let id = b["routine"]["id"].as_str().unwrap();
         let (s, b) = send(
             &h.app,
@@ -2602,7 +2640,7 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::OK);
-        assert_eq!(b["routine"]["docs"], json!([]));
+        assert_eq!(b["routine"]["docs"].as_array().unwrap().len(), 1);
         // Bad schedules come back as a friendly sentence.
         let (s, b) = send(
             &h.app,

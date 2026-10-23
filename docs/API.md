@@ -88,11 +88,13 @@ Errors produced by Iris use this shape:
 | `conflict` | 409 | Creating a connector whose name already exists; deciding an approval card that is no longer pending. |
 | `needs_client` | 409 | `POST /api/connectors/{id}/oauth/start` for a service without dynamic registration and no saved client. |
 | `paused` | 409 | Running a job while Iris is paused. |
-| `too_large` | 413 | Uploaded image larger than `max_upload_bytes`. |
-| `unsupported_media_type` | 415 | Uploaded bytes are not PNG, JPEG, GIF, or WebP. |
+| `too_large` | 413 | Uploaded image or document larger than `max_upload_bytes`. |
+| `unsupported_media_type` | 415 | Uploaded bytes are not PNG, JPEG, GIF, or WebP; or a routine document of a type routines don't read. |
+| `encrypted`, `unreadable`, `empty`, `no_text`, `too_complex` | 422 | A routine document that can't be read (see [`POST /api/routines/docs`](#post-apiroutinesdocsnamefile-name)). |
 | `locked` | 429 | Pairing is locked after repeated failures (see [section 2](#2-authentication-and-pairing)). |
 | `internal` | 500 | Unexpected server error. Message is always `internal server error`; details only go to the server log. |
 | `not_implemented` | 501 | `POST /api/voice/speak`. |
+| `busy` | 503 | A routine document upload while another file was still being read. |
 
 A few responses come from the HTTP framework (axum) and do **not** use the
 envelope:
@@ -2363,16 +2365,48 @@ I can run it." for a routine still waiting for its first OK, and
 
 #### `POST /api/routines/docs?name={file name}`
 
-Upload a reference document as the raw request body. Only Markdown (`.md`,
-`.markdown`) and plain text (`.txt`, `.text`) files are read for now,
-chosen by the file name's extension; anything else is `415
-unsupported_media_type` ("I can only read Markdown (.md) or plain text
-(.txt) files for routines right now. ..."). Text must be UTF-8 (a byte order
-mark is dropped). Over `max_upload_bytes` is `413 too_large`. The file is
-saved as an ordinary [Library item](#libraryitem) (`kind: "artifact"`,
-title = the file name) with its text extracted once, and emits
-`entities.changed` `["library"]`. Returns `{"doc": {"id", "title", "mime",
-"size", "chars"}}`; attach it with `doc_ids`.
+Upload a reference document as the raw request body. The type comes from
+the file name's extension, and the text is extracted once, at upload:
+
+| Type | Extensions | Extracted as | `summary` |
+|---|---|---|---|
+| Spreadsheet | `.xlsx`, `.xlsm`, `.xls`, `.ods` | Each worksheet as a Markdown table under a `## <sheet name>` heading (an empty sheet says so). Formulas give their cached values; dates read `YYYY-MM-DD HH:MM`; empty rows and columns are dropped; the first non-empty row is the header. | `3 sheets · 120 rows` |
+| CSV / TSV | `.csv`, `.tsv`, `.tab` | One Markdown table (RFC 4180 quoting; a `.csv` separated by semicolons or tabs is detected from its first line). | `120 rows · 5 columns` |
+| PDF | `.pdf` | The text layer, page by page under `[Page N]` lines. No OCR: a PDF without text is `422 no_text`. PDFs that open without a password are read; ones that need one are `422 encrypted`. | `12 pages` |
+| Word | `.docx`, `.odt` | Paragraphs, headings as `#` lines, list items as `- ` / `1. ` lines (indented by level), tables as Markdown tables. Tracked deletions, comments and field codes are left out. | `1,240 words` |
+| Text | `.md`, `.markdown`, `.txt`, `.text` | As written. UTF-8, or UTF-16 with a byte order mark; anything else is read as Windows-1252. | `1,240 words` |
+| JSON | `.json` | Pretty-printed in a ```` ```json ```` block. | `12 items` / `5 fields` |
+| HTML | `.html`, `.htm` | Readable text: headings as `#` lines, list items as `- ` lines; scripts, styles and `<head>` dropped. | `1,240 words` |
+| RTF | `.rtf` | Plain text (fonts, pictures, headers and other metadata dropped). | `1,240 words` |
+
+Limits: up to 1,000 rows after the header and 50 columns per table, cells
+up to 300 characters, 50 sheets per workbook, 500 PDF pages, and 200,000
+characters of text per document; each limit leaves a note in the text
+(for example `[Showing the first 1,000 of 5,321 rows.]`). Zipped formats
+may unpack to at most 256 MiB in at most 20,000 parts, and PDF streams to
+32 MiB each. One file is read at a time, for at most 30 seconds. Over
+`max_upload_bytes` is `413 too_large`. When the routine runs, the text of
+all its documents together is capped at 40,000 characters; a document cut
+there says so (`[Truncated: ...]`).
+
+Errors (each with a first-person `message` to show as is):
+
+| Status | `code` | When |
+|---|---|---|
+| 415 | `unsupported_media_type` | Not one of the types above. The message says what to do (for example "That's an older Word file (.doc). Open it in Word, save it as .docx, and upload that."). |
+| 422 | `encrypted` | Password-protected or encrypted. |
+| 422 | `unreadable` | Damaged, or not what its extension says. |
+| 422 | `empty` | No text in it. |
+| 422 | `no_text` | A PDF without a text layer (a scan). |
+| 422 | `too_complex` | Over the unpacking or time limits above. |
+| 503 | `busy` | Another file was still being read for 30 seconds. |
+
+The file is saved as an ordinary [Library item](#libraryitem) (`kind:
+"artifact"`, title = the file name, `mime` for its type) with its text
+and summary, and emits `entities.changed` `["library"]`. Returns
+`{"doc": {"id", "title", "mime", "size", "chars", "summary"}}`; attach it
+with `doc_ids`. Uploading a new copy creates a new document with fresh
+text; the app swaps it in for an attached document with the same name.
 
 #### `DELETE /api/routines/{id}/docs/{doc_id}`
 
@@ -3688,6 +3722,7 @@ changes are re-sent as `message.updated`.
 | `created_at`, `updated_at` | int | |
 | `file_name` | | (not in JSON) |
 | `extracted_text` | | (not in JSON) Text of a routine document, extracted once at upload. |
+| `extract_summary` | | (not in JSON) Its summary ("3 sheets · 120 rows"), shown as the routine document's `summary`. |
 
 ### Routine
 
@@ -3718,7 +3753,8 @@ waiting for the owner's first OK; `active`; `paused`; `done`),
 PM", in the routine's time zone), `upcoming` (up to 3 `{"at", "text"}`),
 `schedule_text` (e.g. "Every Sat · 5:30 PM", "Monthly on the last Friday ·
 9:00 AM"), `run_count`, `created_by` (`owner` or `iris`), `created_at`,
-`updated_at`, `docs` (`[{"id", "title", "mime", "size", "chars"}]`),
+`updated_at`, `docs` (`[{"id", "title", "mime", "size", "chars", "summary"}]`;
+`summary` is empty for documents uploaded before summaries existed),
 `last_run` (`{"status", "reason", "summary", "scheduled_for",
 "finished_at"}` of the last finished run, or null), `open_run` (`{"id",
 "status", "card_message_id", "expires_at"}` of a run going or waiting, or

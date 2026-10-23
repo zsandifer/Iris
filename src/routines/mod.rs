@@ -585,11 +585,15 @@ pub struct Doc {
     pub size: i64,
     /// Characters of extracted text.
     pub chars: i64,
+    /// What was read, for the documents list ("3 sheets · 120 rows",
+    /// "12 pages"); empty for documents uploaded before summaries.
+    pub summary: String,
 }
 
 pub fn list_docs(conn: &Connection, routine_id: &str) -> rusqlite::Result<Vec<Doc>> {
     let mut stmt = conn.prepare(
-        "SELECT l.id, l.title, l.mime, l.size, length(COALESCE(l.extracted_text, ''))
+        "SELECT l.id, l.title, l.mime, l.size, length(COALESCE(l.extracted_text, '')),
+                COALESCE(l.extract_summary, '')
          FROM routine_docs d JOIN library_items l ON l.id = d.library_item_id
          WHERE d.routine_id = ?1 ORDER BY d.created_at, l.id",
     )?;
@@ -600,6 +604,7 @@ pub fn list_docs(conn: &Connection, routine_id: &str) -> rusqlite::Result<Vec<Do
             mime: r.get(2)?,
             size: r.get(3)?,
             chars: r.get(4)?,
+            summary: r.get(5)?,
         })
     })?
     .collect()

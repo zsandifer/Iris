@@ -683,6 +683,11 @@ CREATE TABLE proactive_messages (
 CREATE INDEX proactive_messages_recent ON proactive_messages(user_id, created_at);
 CREATE INDEX proactive_messages_message ON proactive_messages(message_id);
 "#,
+    r#"
+-- What was read from a routine document at upload, for the documents list
+-- ("3 sheets · 120 rows", "12 pages").
+ALTER TABLE library_items ADD COLUMN extract_summary TEXT;
+"#,
 ];
 
 /// Run `f` in a write transaction taken up front (`BEGIN IMMEDIATE`), so a

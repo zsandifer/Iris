@@ -14,16 +14,28 @@ publish = false
 aes-gcm = "0.11"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "ws", "tokio", "query"] }
 base64 = "0.23"
+# Routine documents: Excel and OpenDocument spreadsheets (.xlsx .xlsm .xls
+# .ods), read with cached formula values. Pure Rust, no default features.
+calamine = { version = "0.37", default-features = false }
 chacha20poly1305 = "0.11"
 croner = { version = "4.0.1", default-features = false, features = ["jiff"] }
+# Routine documents: legacy text encodings (Windows-1252 CSV, UTF-16 text).
+# Already in the tree through calamine.
+encoding_rs = "0.8"
 getrandom = "0.4.3"
 hkdf = "0.13"
 jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 libc = "0.2.190"
+# Routine documents: the text layer of PDFs, with decompression limits for
+# untrusted files. No default features (no rayon, no chrono).
+lopdf = { version = "0.46", default-features = false }
 p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
 # Blacks out private details in the agent's screenshots on Iris's side
 # (decode, paint, encode), never inside the page.
 png = "0.18.1"
+# Routine documents: Word (.docx) and OpenDocument text (.odt) are zipped
+# XML. Both already come with calamine; listed to use them directly.
+quick-xml = { version = "0.42", default-features = false }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.152"
@@ -31,6 +43,7 @@ sha2 = "0.11.0"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "process", "sync", "time", "io-util", "signal", "net", "fs"] }
 toml = "1.1.8"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

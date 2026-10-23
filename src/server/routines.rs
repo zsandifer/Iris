@@ -303,13 +303,27 @@ async fn upload_doc(
         .filter(|c| !c.is_control())
         .take(entities::MAX_TITLE)
         .collect();
-    let (kind, text) = docs::extract_text(&name, &body).map_err(|e| {
-        ApiError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_media_type",
-            e,
-        )
-    })?;
+    let docs::Extracted {
+        kind,
+        text,
+        summary,
+    } = docs::extract_bounded(name.clone(), body.to_vec())
+        .await
+        .map_err(|e| {
+            let status = match e {
+                docs::DocError::Unsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                docs::DocError::Busy => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::UNPROCESSABLE_ENTITY,
+            };
+            // The type and size, never the name or content.
+            crate::info!(
+                "routine document not read ({}): {} bytes, {:?}",
+                e.code(),
+                body.len(),
+                docs::doc_type(&name)
+            );
+            ApiError::new(status, e.code(), e.message())
+        })?;
     let id = new_id();
     let file_name = format!("{id}.{}", kind.ext());
     let lib = state.paths.library_dir();
@@ -340,8 +354,9 @@ async fn upload_doc(
                     },
                 )?;
                 c.execute(
-                    "UPDATE library_items SET extracted_text = ?2 WHERE id = ?1",
-                    rusqlite::params![item.id, text],
+                    "UPDATE library_items SET extracted_text = ?2, extract_summary = ?3
+                     WHERE id = ?1",
+                    rusqlite::params![item.id, text, summary],
                 )?;
                 Ok(routines::Doc {
                     id: item.id,
@@ -349,6 +364,7 @@ async fn upload_doc(
                     mime: item.mime,
                     size: item.size,
                     chars: text.chars().count() as i64,
+                    summary,
                 })
             })
         })
