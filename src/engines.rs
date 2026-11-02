@@ -111,7 +111,7 @@ pub const ENGINES: &[EngineSource] = &[
 /// and output, so it does not track npm's latest. This is Iris's browser
 /// server, not one of the agent CLIs, which are never pinned (AGENTS.md
 /// invariant 5). The workflow edits this line; keep it on one line.
-pub const PLAYWRIGHT_MCP_VERSION: &str = "0.0.83";
+pub const PLAYWRIGHT_MCP_VERSION: &str = "0.0.84";
 
 /// Iris's browser (not an AI engine, but installed and updated the same way).
 pub const BROWSER: EngineSource = EngineSource {
