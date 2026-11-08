@@ -16,7 +16,7 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "json
 base64 = "0.23"
 # Routine documents: Excel and OpenDocument spreadsheets (.xlsx .xlsm .xls
 # .ods), read with cached formula values. Pure Rust, no default features.
-calamine = { version = "0.37", default-features = false }
+calamine = { version = "0.38", default-features = false }
 chacha20poly1305 = "0.11"
 croner = { version = "4.0.1", default-features = false, features = ["jiff"] }
 # Routine documents: legacy text encodings (Windows-1252 CSV, UTF-16 text).
