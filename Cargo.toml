@@ -28,7 +28,7 @@ jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-sy
 libc = "0.2.190"
 # Routine documents: the text layer of PDFs, with decompression limits for
 # untrusted files. No default features (no rayon, no chrono).
-lopdf = { version = "0.46", default-features = false }
+lopdf = { version = "0.47", default-features = false }
 p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
 # Blacks out private details in the agent's screenshots on Iris's side
 # (decode, paint, encode), never inside the page.
